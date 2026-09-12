@@ -6,7 +6,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod parallel;
 pub use parallel::{
-    ComponentDistribution, EntryConfig, ParallelConfig, ParallelConfigError, SequenceParallel,
+    ComponentConfig, ComponentDistribution, ParallelConfig, ParallelConfigError, SequenceParallel,
 };
 
 use std::sync::{Arc, OnceLock};
@@ -17,28 +17,25 @@ use serde::{Deserialize, Serialize};
 /// Serializable statistics and observer-facing wire values.
 pub mod codec;
 mod events;
+mod media;
+pub use media::SharedMedia;
 /// Multimodal generation descriptors, resource bounds, and validation.
 pub mod generation;
 /// Counter-based Philox random-number generation.
 pub mod philox;
-/// Compact binary payloads carried by product values.
-pub mod product_blob;
 /// Deterministic token sampling and log-probability scoring.
 pub mod sampling;
 pub use codec::stats::WorkerForwardStats;
 pub use events::{
-    ArtifactEvent, ArtifactHandle, DiffusionRequest, DiffusionRequestError, Event, FinishReason,
-    MediaGeometry, MediaKind, PositionLogprobs, Request, RuntimeFamily, StopReason, TokenLogprob,
+    ArtifactEvent, DiffusionRequest, DiffusionRequestError, DiffusionSamplingParams,
+    EngineCoreOutput, FinishReason, MediaKind, PositionLogprobs, Request, RuntimeFamily,
+    StopReason, TokenLogprob,
 };
 pub use generation::{
-    ContextSegment, FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor,
-    GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor,
-    GenerationConstraint, GenerationConstraintParseError, GenerationFeatures, GenerationLimits,
-    GenerationPolicyDescriptor, GenerationRequest, GenerationRequestError,
-    GenerationResourceBounds, GenerationResourceError, GenerationResources, ImageIngestRecipe,
-    ImageIngestStep, ImageKvEffect, ImageSegment, SegmentPosition, TerminationPolicyDescriptor,
-    TriggerPolicyDescriptor, UndTokenAction, UndVisibility, VisibilityPolicyDescriptor,
-    encoder_cache_key,
+    CachePolicy, FeedbackNextToken, FeedbackSource, GenerationConstraint,
+    GenerationConstraintParseError, GenerationFeatures, GenerationLimits, GenerationRequest,
+    GenerationRequestError, GenerationResourceError, ImageEncoderInput, ImageGenerationConfig,
+    ImageIngestStep, ImageInput, ImageTrigger, MultimodalInputs, encoder_cache_key,
 };
 pub use sampling::{SampleOutput, score_token_logprobs, try_apply_sampling_counts};
 
@@ -151,9 +148,24 @@ pub struct RequestId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct TraceId(pub u64);
 
-/// Operation identity within a request program.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-pub struct OpId(pub u64);
+/// Logical computation identity, preserved when a scheduler batch is split across workers.
+/// The request index is the ordinal assigned at selection, before physical row packing.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+pub struct ComputationId {
+    pub batch_id: u64,
+    pub request_index: u32,
+}
+
+impl ComputationId {
+    pub const fn new(batch_id: u64, request_index: u32) -> Self {
+        Self {
+            batch_id,
+            request_index,
+        }
+    }
+}
 
 /// Understanding and generation branches of a multimodal model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -965,8 +977,8 @@ mod tests {
         // helpers map that error to a zero duration.
         let clock = UNIX_EPOCH - std::time::Duration::from_secs(5);
         let (frac, whole) = epoch_conversion(clock);
-        assert_eq!(frac, 0.0, "pre-epoch clamps fractional to 0.0");
-        assert_eq!(whole, 0, "pre-epoch clamps whole to 0");
+        assert_eq!(frac, 0.0, "pre-request_epoch clamps fractional to 0.0");
+        assert_eq!(whole, 0, "pre-request_epoch clamps whole to 0");
     }
 
     #[test]

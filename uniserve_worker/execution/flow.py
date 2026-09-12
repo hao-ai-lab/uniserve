@@ -10,14 +10,13 @@ import torch
 from uniserve_worker.execution.batch import (
     DrawLayout,
     FinishFlags,
+    ForwardMode,
     ImageParams,
-    OpCode,
-    Operation,
     OpStatus,
-    ProductKind,
-    ProductPayload,
-    ProductRef,
-    TokenSpan,
+    PipelineStage,
+    ScheduledRequest,
+    TensorPublication,
+    TensorRef,
 )
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.models.generation import BranchSource, LatentLayout
@@ -32,7 +31,7 @@ from uniserve_worker.runtime.request import Request
 from ..runtime.latent_pool import require_latent_pool
 from . import operations as operation_geometry
 from . import token
-from .forward_batch import FlowPatches, ModelPhase, TokenSelection
+from .forward_batch import FlowPatches, TokenSelection
 from .rng import flow_noise_seed, normal_noise
 from .rows import ForwardRow, LaneState, LatentExecution, OperationState, Outcome
 
@@ -62,7 +61,7 @@ def pack_forward(
 ) -> tuple[ForwardRow, ...]:
     """Pack diffusion prefix or denoise state into the matching model-forward row."""
 
-    if state.operation.kind is not OpCode.DIFFUSION_STEP:
+    if state.operation.kind is not PipelineStage.DENOISING:
         return ()
     if state.phase == "initial":
         _initialize(
@@ -188,16 +187,10 @@ def _initialize(
     scope = state.lane
     flow = model_runner.generation()
     request_id = operation.request_key.request_id
-    conditioning = tuple(
-        reference for reference in operation.inputs if reference.kind is ProductKind.KV
-    )
-    latent_inputs = tuple(
-        reference for reference in operation.inputs if reference.kind is ProductKind.LATENT
-    )
-    latent_outputs = tuple(
-        reference for reference in operation.outputs if reference.kind is ProductKind.LATENT
-    )
-    if len(conditioning) != 1 or len(latent_inputs) != 1 or len(latent_outputs) != 1:
+    conditioning = operation.kv_input
+    latent_input = operation.latent_input
+    latent_output = operation.latent_output
+    if conditioning is None or latent_input is None or latent_output is None:
         raise invalid_descriptor(
             "flow operation requires exact conditioning and one latent input/output generation"
         )
@@ -207,20 +200,18 @@ def _initialize(
     if publications is None:
         raise invalid_descriptor("flow conditioning requires cache publication storage")
     publications.validate_conditioning(
-        request_id,
-        conditioning[0],
+        operation.request_key,
+        conditioning,
         request_pool_idx=request.request.request_pool_idx,
         group_id=cache[1],
         visible_length=cache[2],
-        publication=scope.cache_publication_inputs.get(conditioning[0]),
+        publication=scope.cache_publication_inputs.get(conditioning),
     )
     image = request.request.image
     if image is None:
         raise invalid_descriptor("flow operation has no admitted image parameters")
     if operation.rng is not None:
         raise invalid_descriptor("flow continuation must inherit transition RNG state")
-    latent_input = latent_inputs[0]
-    latent_output = latent_outputs[0]
     if (
         int(latent_input.generation) < 1
         or int(latent_output.generation) < 1
@@ -294,7 +285,7 @@ def _prepare_step(
     prefix_rows = []
     prefix_branches = []
     entries = data["entries"]
-    descriptors = scope.forward_rows.get(operation_geometry.operation_identity(operation), ())
+    descriptors = scope.forward_indices.get(operation_geometry.operation_identity(operation), ())
     if len(descriptors) < len(guide.branches):
         raise invalid_descriptor("media denoise has incomplete forward-row metadata")
     denoise_descriptors = descriptors[-len(guide.branches) :]
@@ -313,19 +304,26 @@ def _prepare_step(
         if copy_conditioning:
             entry = data["cache"]
         else:
-            slot = int(descriptor.request_pool_index)
+            slot = scope.lane.request_pool_indices[descriptor]
             page_tables = request_tables
             if page_tables is None:
                 raise invalid_descriptor("flow prefixes require request page tables")
             capacity = page_tables.allocated_length(slot)
             page_tables.pages(slot, 0)
             has_prefix_forward = any(
-                int(candidate.request_pool_index) == slot
-                and int(candidate.seq_len) == 0
-                and int(candidate.query_len) == len(prefix)
+                scope.lane.request_pool_indices[candidate] == slot
+                and (scope.lane.seq_lens[candidate] - scope.lane.query_lens[candidate]) == 0
+                and scope.lane.query_lens[candidate] == len(prefix)
                 for candidate in descriptors[: -len(guide.branches)]
             )
-            entry = (slot, 0, 0 if has_prefix_forward else int(descriptor.seq_len), capacity)
+            entry = (
+                slot,
+                0,
+                0
+                if has_prefix_forward
+                else (scope.lane.seq_lens[descriptor] - scope.lane.query_lens[descriptor]),
+                capacity,
+            )
         prefix_length = data["cache"][2] if copy_conditioning else len(prefix)
         if prefix_length > entry[3]:
             raise invalid_descriptor("flow prefix exceeds scheduler params")
@@ -423,14 +421,11 @@ def _finish(
     )
     state.outcome = Outcome(
         status=OpStatus.OK,
-        selected_point=1,
-        logical_lengths=operation_geometry.logical_lengths(
-            operation,
+        runtime=operation_geometry.execution_runtime(
             request,
             data["cache"],
-            latent_len=final_step,
+            flow_step=final_step,
         ),
-        token_span=TokenSpan(base=request.logical_position, len=0),
         finish_flags=FinishFlags(),
         product_generations=operation_geometry.output_generations(operation),
         products=products,
@@ -451,8 +446,8 @@ def _finish(
 
 
 def publish_latent_transfer(
-    operation: Operation,
-    product: ProductRef,
+    operation: ScheduledRequest,
+    product: TensorRef,
     row: LatentExecution,
     *,
     step: int,
@@ -461,7 +456,7 @@ def publish_latent_transfer(
     latent_pool: LatentPool | None,
     publication_transports: Mapping[str, Transport],
     config: WorkerConfig,
-) -> tuple[ProductPayload, ...]:
+) -> tuple[TensorPublication, ...]:
     """Publish a committed-candidate trajectory for an exact staged consumer."""
 
     transports = publication_transports
@@ -492,7 +487,7 @@ def publish_latent_transfer(
 
 
 def initial_latent(
-    operation: Operation,
+    operation: ScheduledRequest,
     height: int,
     width: int,
     target: torch.Tensor,
@@ -545,7 +540,7 @@ def flow_prefix(
 
 
 def prefix_row(
-    operation: Operation,
+    operation: ScheduledRequest,
     tokens: tuple[int, ...],
     entry: tuple[int, int, int, int],
     branch: Branch,
@@ -558,7 +553,7 @@ def prefix_row(
     return ForwardRow(
         operation=operation,
         request=request,
-        phase=ModelPhase.TEXT,
+        forward_mode=ForwardMode.PREFILL,
         token_ids=torch.tensor(tokens, dtype=torch.long),
         positions=positions,
         selection=TokenSelection.HIDDEN,
@@ -574,7 +569,7 @@ def prefix_row(
 
 
 def denoise_row(
-    operation: Operation,
+    operation: ScheduledRequest,
     conditioning_position: int,
     branch: Branch,
     entry: tuple[int, int, int, int],
@@ -606,7 +601,7 @@ def denoise_row(
     return ForwardRow(
         operation=operation,
         request=request,
-        phase=ModelPhase.DENOISE,
+        forward_mode=PipelineStage.DENOISING,
         flow_conditioning=conditioning,
         positions=latent_positions,
         timestep=timestep.reshape(1),

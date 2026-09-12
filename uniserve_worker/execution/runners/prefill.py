@@ -4,10 +4,12 @@ from collections.abc import Callable, Sequence
 
 import torch
 
+from uniserve_worker.execution.batch import ForwardMode
+
 from ...foundation.math import bucketed_length, ceil_div
 from ...runtime.cache_pool import CachePool
 from ..attention import physical_columns
-from ..forward_batch import ForwardBatch, ForwardOutput, ModelPhase, TokenSelection
+from ..forward_batch import ForwardBatch, ForwardOutput, TokenSelection
 from ..input_buffers import InputBuffers
 from .packed import PackedRunner, PrefillCapture
 
@@ -39,7 +41,7 @@ def stage_text(
     )
     attention = physical_columns(
         pages=pages,
-        seq_lens=prefixes,
+        prefix_lens=prefixes,
         query_lens=lengths,
         causal_rows=(True,) * rows,
         write_rows=(True,) * rows,
@@ -52,7 +54,7 @@ def stage_text(
         decode=decode,
     )
     return buffers.stage(
-        phase=ModelPhase.TEXT,
+        forward_mode=ForwardMode.DECODE if decode else ForwardMode.PREFILL,
         row_count=rows,
         request_pool_indices=slots or tuple(range(1, rows + 1)),
         decode_force_finish=(False,) * rows if decode else (),

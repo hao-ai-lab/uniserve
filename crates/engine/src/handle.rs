@@ -5,7 +5,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use tokio::sync::mpsc;
-use uniserve_core::{Event, Request, RequestId};
+use uniserve_core::{EngineCoreOutput, Request, RequestId};
 
 /// Pollable command ingress whose lifetime is independent of Worker membership.
 pub(crate) struct WakeSignal {
@@ -70,10 +70,10 @@ pub const EVENT_BUFFER_CAPACITY: usize = 64;
 pub enum EventSendError {
     #[error("generation event channel is full")]
     /// Returns the event rejected by a full bounded channel.
-    Full(Box<Event>),
+    Full(Box<EngineCoreOutput>),
     #[error("generation event channel is closed")]
     /// Returns the event rejected after the receiver closed.
-    Closed(Box<Event>),
+    Closed(Box<EngineCoreOutput>),
 }
 
 /// Cause recorded when an event receiver closes before terminal completion.
@@ -100,12 +100,12 @@ pub enum SubmitError {
 /// Bounded engine-to-caller event sender.
 #[derive(Clone)]
 pub struct EventTx {
-    inner: mpsc::Sender<Event>,
+    inner: mpsc::Sender<EngineCoreOutput>,
 }
 
 impl EventTx {
     /// Attempts to publish an event without waiting for channel capacity.
-    pub fn send(&self, event: Event) -> Result<(), EventSendError> {
+    pub fn send(&self, event: EngineCoreOutput) -> Result<(), EventSendError> {
         self.inner.try_send(event).map_err(|error| match error {
             mpsc::error::TrySendError::Full(event) => EventSendError::Full(Box::new(event)),
             mpsc::error::TrySendError::Closed(event) => EventSendError::Closed(Box::new(event)),
@@ -127,7 +127,7 @@ impl EventTx {
 /// the scheduler so an output-capacity-stalled lineage becomes runnable without
 /// polling.
 pub struct EventRx {
-    inner: mpsc::Receiver<Event>,
+    inner: mpsc::Receiver<EngineCoreOutput>,
     waker: uniserve_core::CommandWaker,
     cancellation: Option<EventCancellation>,
     text_tokens_received: usize,
@@ -143,7 +143,7 @@ struct EventCancellation {
 
 impl EventRx {
     /// Wraps a Tokio receiver without engine cancellation or wake integration.
-    pub fn from_receiver(inner: mpsc::Receiver<Event>) -> Self {
+    pub fn from_receiver(inner: mpsc::Receiver<EngineCoreOutput>) -> Self {
         Self {
             inner,
             waker: uniserve_core::CommandWaker::noop(),
@@ -160,7 +160,7 @@ impl EventRx {
     }
 
     /// Receives the next event and advances output acknowledgement state.
-    pub async fn recv(&mut self) -> Option<Event> {
+    pub async fn recv(&mut self) -> Option<EngineCoreOutput> {
         let event = self.inner.recv().await;
         match event.as_ref() {
             Some(event) => {
@@ -173,12 +173,12 @@ impl EventRx {
     }
 
     /// Receives the next event.
-    pub async fn next(&mut self) -> Option<Event> {
+    pub async fn next(&mut self) -> Option<EngineCoreOutput> {
         self.recv().await
     }
 
     /// Attempts to receive an event without waiting.
-    pub fn try_recv(&mut self) -> Result<Event, mpsc::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<EngineCoreOutput, mpsc::error::TryRecvError> {
         let event = self.inner.try_recv();
         if let Ok(event) = event.as_ref() {
             self.observe(event);
@@ -188,9 +188,9 @@ impl EventRx {
     }
 
     /// Updates acknowledgement and completion state for a received event.
-    fn observe(&mut self, event: &Event) {
+    fn observe(&mut self, event: &EngineCoreOutput) {
         match event {
-            Event::TextToken { .. } => {
+            EngineCoreOutput::TextToken { .. } => {
                 self.text_tokens_received = self.text_tokens_received.saturating_add(1);
                 if self
                     .cancellation
@@ -201,7 +201,9 @@ impl EventRx {
                     self.acknowledge_consumed_prefix();
                 }
             }
-            Event::Finished { .. } | Event::Rejected { .. } | Event::Error { .. } => {
+            EngineCoreOutput::Finished { .. }
+            | EngineCoreOutput::Rejected { .. }
+            | EngineCoreOutput::Error { .. } => {
                 self.finish();
             }
             _ => {}
@@ -434,38 +436,30 @@ impl EngineHandle {
 mod tests {
     use uniserve_core::FinishReason;
     use uniserve_core::{
-        ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint,
-        GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageParams,
-        RequestId, SamplingParams, UndVisibility,
+        GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, RequestId,
+        SamplingParams,
     };
 
     use super::*;
 
     fn test_request(request_id: u64) -> GenerationRequest {
         let constraint = GenerationConstraint::UndOnly;
-        let policy = GenerationPolicyDescriptor::default();
+        let policy = ImageGenerationConfig::default();
         GenerationRequest {
             request_id: RequestId(request_id),
-            context: vec![ContextSegment::UndTokens {
-                token_ids: vec![1, 2, 3],
-                visibility: UndVisibility::Internal,
-            }],
-            negative_context: Vec::new(),
+            prompt_token_ids: vec![1, 2, 3],
+            multimodal_inputs: Default::default(),
+            negative_prompt_token_ids: Vec::new(),
             constraint,
-            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
             sampling: SamplingParams::default(),
             image: ImageParams::default(),
             max_und_tokens: 32,
+            include_stop_token: false,
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
             cache: Default::default(),
-            policy,
-            resources: GenerationResourceBounds {
-                context_tokens: 3,
-                max_kv_tokens: 35,
-                ..GenerationResourceBounds::default()
-            },
+            image_generation: policy,
         }
     }
 
@@ -476,14 +470,14 @@ mod tests {
         let request = test_request(7);
 
         assert_eq!(request.request_id, RequestId(7));
-        assert_eq!(request.prompt_token_count(), 3);
+        assert_eq!(request.prompt_token_ids.len(), 3);
         assert_eq!(request.max_und_tokens, 32);
         assert_eq!(request.constraint, GenerationConstraint::UndOnly);
-        assert!(request.negative_context.is_empty());
+        assert!(request.negative_prompt_token_ids.is_empty());
         assert!(request.stop_strings.is_empty());
         assert!(request.stop_token_ids.is_empty());
         assert_eq!(request.priority, 0);
-        assert_eq!(request.context_image_count(), 0);
+        assert_eq!(request.multimodal_inputs.images.len(), 0);
         assert!(request.cache.read);
         assert!(request.cache.write);
         assert!(request.validate().is_ok());
@@ -516,13 +510,13 @@ mod tests {
             _ => panic!("expected Submit command"),
         };
         event_tx
-            .send(Event::TextToken {
+            .send(EngineCoreOutput::TextToken {
                 id: 7,
                 logprob: None,
             })
             .unwrap();
         event_tx
-            .send(Event::TextToken {
+            .send(EngineCoreOutput::TextToken {
                 id: 8,
                 logprob: None,
             })
@@ -530,7 +524,7 @@ mod tests {
 
         assert!(matches!(
             events.try_recv(),
-            Ok(Event::TextToken { id: 7, .. })
+            Ok(EngineCoreOutput::TextToken { id: 7, .. })
         ));
         drop(events);
 
@@ -675,11 +669,11 @@ mod tests {
         assert_eq!(FinishReason::MaxTokens, FinishReason::MaxTokens);
     }
 
-    /// A `Event::Finished` carries the finish reason and terminal token
+    /// A `EngineCoreOutput::Finished` carries the finish reason and terminal token
     /// counts as its payload (the type is not `PartialEq`, so match on it).
     #[test]
     fn gen_event_finished_carries_reason_and_counts() {
-        let event = Event::Finished {
+        let event = EngineCoreOutput::Finished {
             reason: FinishReason::Stop,
             stop_reason: Some(uniserve_core::StopReason::String("</s>".to_string())),
             prompt_tokens: 4,
@@ -688,7 +682,7 @@ mod tests {
         };
 
         match event {
-            Event::Finished {
+            EngineCoreOutput::Finished {
                 reason,
                 stop_reason,
                 prompt_tokens,

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ..execution.batch import BufferId, ProductRef, RequestKey
+from ..execution.batch import BufferId, RequestKey, TensorRef
 from ..foundation.errors import invalid_descriptor, resource_error
 from ..transfer.tickets import TransferTicket
 from .device import HostStagingRing, fill_cpu_ints
@@ -83,7 +83,7 @@ class LatentStaging:
 class LatentWrite:
     """A reserved import range, held until its physical read retires."""
 
-    product: ProductRef
+    product: TensorRef
     request_pool_idx: int
     page_table: tuple[int, ...]
     spans: tuple[torch.Tensor, ...]
@@ -336,7 +336,7 @@ class LatentPool:
 
     def reserve_publication(
         self,
-        product: ProductRef,
+        product: TensorRef,
         *,
         request_pool_idx: int,
         page_table: Sequence[int],
@@ -358,7 +358,7 @@ class LatentPool:
 
     def reserve_current_publication(
         self,
-        product: ProductRef,
+        product: TensorRef,
         *,
         request_pool_idx: int,
         page_table: Sequence[int],
@@ -395,7 +395,7 @@ class LatentPool:
 
     def _reserve_source(
         self,
-        product: ProductRef,
+        product: TensorRef,
         slot: int,
         bank: int,
         pages: tuple[int, ...],
@@ -640,7 +640,7 @@ class LatentPool:
 
     def reserve_import(
         self,
-        product: ProductRef,
+        product: TensorRef,
         *,
         request_pool_idx: int,
         page_table: Sequence[int],

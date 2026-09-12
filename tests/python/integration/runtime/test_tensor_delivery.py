@@ -12,15 +12,13 @@ import torch
 
 from uniserve_worker.execution.batch import (
     BufferAllocation,
+    ComputationId,
     DeviceDim,
     DType,
-    PointRange,
-    ProductKind,
-    ProductRef,
     RequestKey,
     ShapeBound,
     StaticDim,
-    StorageClass,
+    TensorRef,
     TensorTransfer,
     WorkerEndpoint,
 )
@@ -79,16 +77,13 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
     expected = torch.arange(48, dtype=torch.float32, device=device).reshape(6, 8)
     pieces = expected.chunk(2, dim=shard_axis)
     offsets = [(0, 0), (3, 0) if shard_axis == 0 else (0, 4)]
-    reference = ProductRef(
+    reference = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=1,
+        producer_op_id=ComputationId(1, 0),
         output_index=0,
         generation=1,
-        kind=ProductKind.TENSOR,
-        storage_class=StorageClass.DEVICE_TENSOR,
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(6), StaticDim(8))),
-        point_range=PointRange(),
     )
     arenas = [
         PersistentBuffers(byte_capacity=piece.numel() * piece.element_size(), devices=(device,))
@@ -442,16 +437,13 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
     peer, resident = expected.chunk(2, dim=shard_axis)
     offset = (3, 0) if shard_axis == 0 else (0, 4)
     region = TensorRegion(offset, tuple(resident.shape))
-    reference = ProductRef(
+    reference = TensorRef(
         RequestKey(1, 1, 1),
-        1,
+        ComputationId(1, 0),
         0,
         1,
-        ProductKind.TENSOR,
-        StorageClass.DEVICE_TENSOR,
         DType.F32,
         ShapeBound((DeviceDim(12), StaticDim(8))),
-        PointRange(),
     )
     allocation = BufferAllocation(reference.buffer_id, 0, reference.max_bytes)
     arena = PersistentBuffers(byte_capacity=reference.max_bytes, devices=(device,))
@@ -472,7 +464,7 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
         )[0]
         store.publish_write(write, resident)
         store.commit_writes((write,))
-        earlier = store.consume(reference, consumer_op_id=2, device=device)
+        earlier = store.consume(reference, consumer_op_id=ComputationId(2, 0), device=device)
         for _ in range(2):
             imports.append(
                 store.import_tensor(
@@ -488,7 +480,7 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
         _consume(imports[1].tickets)
         imports[1].commit()
         imports[1].close()
-        complete = store.consume(reference, consumer_op_id=3, device=device)
+        complete = store.consume(reference, consumer_op_id=ComputationId(3, 0), device=device)
         assert earlier.region == region and complete.region is None
         torch.testing.assert_close(earlier.tensor, resident, rtol=0, atol=0)
         torch.testing.assert_close(complete.tensor, expected, rtol=0, atol=0)
@@ -529,16 +521,13 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
 
 def test_full_region_publishes_complete_bounded_tensor() -> None:
     expected = torch.arange(48, dtype=torch.float32).reshape(6, 8)
-    reference = ProductRef(
+    reference = TensorRef(
         RequestKey(1, 1, 1),
-        1,
+        ComputationId(1, 0),
         0,
         1,
-        ProductKind.TENSOR,
-        StorageClass.DEVICE_TENSOR,
         DType.F32,
         ShapeBound((DeviceDim(12), StaticDim(8))),
-        PointRange(),
     )
     allocation = BufferAllocation(reference.buffer_id, 0, reference.max_bytes)
     arena = PersistentBuffers(byte_capacity=reference.max_bytes, devices=("cpu",))
@@ -552,7 +541,7 @@ def test_full_region_publishes_complete_bounded_tensor() -> None:
         )
         store.publish_write(write, expected)
         store.commit_writes((write,))
-        read = store.consume(reference, consumer_op_id=2, device="cpu")
+        read = store.consume(reference, consumer_op_id=ComputationId(2, 0), device="cpu")
         assert read.region is None
         torch.testing.assert_close(read.tensor, expected, rtol=0, atol=0)
         store.record_readers((read,))

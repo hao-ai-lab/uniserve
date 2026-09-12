@@ -8,14 +8,12 @@ from functools import partial
 
 import torch
 
+from uniserve_worker.execution.batch import ComputationId
+
 from ..execution.batch import (
     BufferId,
-    Checkpoint,
-    FixedCheckpoint,
-    KvTransferValue,
+    KvTransfer,
     Locator,
-    ProductKind,
-    ProductRef,
     RequestKey,
     TensorTransfer,
 )
@@ -30,11 +28,11 @@ __all__ = ["CachePublications"]
 
 @dataclass(frozen=True, slots=True)
 class _CachePublicationCommit:
-    """Holds semantic KV products and checkpoints prepared for atomic installation."""
+    """Publication indexes prepared for atomic visibility after execution."""
 
-    products: dict[ProductRef, KvTransferValue]
-    destination_bases: dict[tuple[int, str], tuple[Checkpoint, int]]
-    installed_bases: dict[tuple[int, str], tuple[Checkpoint, int]]
+    publications_by_buffer: dict[BufferId, KvTransfer]
+    destination_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]]
+    installed_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]]
 
 
 class CachePublications:
@@ -45,14 +43,14 @@ class CachePublications:
 
         self.pool = pool
         self.request_tables = request_tables
-        self._products: dict[ProductRef, KvTransferValue] = {}
-        self._destination_bases: dict[tuple[int, str], tuple[Checkpoint, int]] = {}
-        self._installed_bases: dict[tuple[int, str], tuple[Checkpoint, int]] = {}
+        self._publications: dict[BufferId, KvTransfer] = {}
+        self._destination_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]] = {}
+        self._installed_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]] = {}
 
-    def destination_base(self, request_id: int, destination: str) -> Checkpoint | None:
-        """Resolve the newest checkpoint published to one destination for a request."""
+    def destination_base(self, request_key: RequestKey, destination: str) -> BufferId | None:
+        """Resolve the newest publication published to one destination for a request."""
 
-        value = self._destination_bases.get((int(request_id), str(destination)))
+        value = self._destination_bases.get((request_key, str(destination)))
         return None if value is None else value[0]
 
     def publish(
@@ -61,28 +59,21 @@ class CachePublications:
         request_pool_idx: int,
         group_id: int,
         visible_length: int,
-        source_version: Checkpoint,
         destination: str,
-        expected_base: Checkpoint | None,
-        product: ProductRef,
+        expected_base: BufferId | None,
+        buffer: BufferId,
         transports: Mapping[str, Transport],
-    ) -> KvTransferValue:
-        """Export a visible KV extent as page-granular products and transport locators."""
+    ) -> KvTransfer:
+        """Export a visible KV extent under its exact buffer identity."""
 
-        if product.kind is not ProductKind.KV:
-            raise invalid_descriptor("KV publication product identity is invalid")
-        point = source_version.point
-        if not isinstance(point, FixedCheckpoint):
-            raise invalid_descriptor("KV publication source identity is invalid")
-        request_id = int(product.request_key.request_id)
-        installed = self._destination_bases.get((request_id, destination))
+        installed = self._destination_bases.get((buffer.owner, destination))
         if installed is None:
             if expected_base is not None:
                 raise invalid_descriptor("KV publication expected base is not installed")
             base_extent = 0
         else:
-            installed_version, base_extent = installed
-            if installed_version != expected_base:
+            installed_buffer, base_extent = installed
+            if installed_buffer != expected_base:
                 raise invalid_descriptor("KV publication expected base does not match destination")
         pages = self.request_tables.pages(request_pool_idx, group_id)
         visible = int(visible_length)
@@ -93,7 +84,7 @@ class CachePublications:
         suffix = visible - base_extent
         source = (
             self.pool.reserve_publication(
-                product, pages, group=group_id, start=base_extent, length=suffix
+                buffer, pages, group=group_id, start=base_extent, length=suffix
             )
             if suffix
             else None
@@ -143,12 +134,11 @@ class CachePublications:
         except BaseException:
             for locator in locators:
                 transports[locator.backend].release(locator)
-            self.pool.release_buffers((product.buffer_id,))
+            self.pool.release_buffers((buffer,))
             raise
-        publication = KvTransferValue(
-            generation=product.generation,
+        publication = KvTransfer(
             tensors=tuple(tensors),
-            source=source_version,
+            source=buffer,
             destination=destination,
             base=expected_base,
             base_extent=base_extent,
@@ -159,34 +149,34 @@ class CachePublications:
         )
         return publication
 
-    def publication(self, product: ProductRef) -> KvTransferValue:
-        """Require the resident KV publication identified by a logical product reference."""
+    def publication(self, buffer: BufferId) -> KvTransfer:
+        """Require the resident KV publication identified by a buffer identity."""
 
         try:
-            return self._products[product]
+            return self._publications[buffer]
         except KeyError:
-            raise invalid_descriptor("KV publication product is not resident") from None
+            raise invalid_descriptor("KV publication buffer is not resident") from None
 
-    def resident(self, product: ProductRef) -> KvTransferValue | None:
+    def resident(self, buffer: BufferId) -> KvTransfer | None:
         """Look up a resident KV publication without treating absence as an error."""
 
-        return self._products.get(product)
+        return self._publications.get(buffer)
 
     def validate_conditioning(
         self,
-        request_id: int,
-        product: ProductRef,
+        request_key: RequestKey,
+        buffer: BufferId,
         *,
         request_pool_idx: int,
         group_id: int,
         visible_length: int,
-        publication: KvTransferValue | None = None,
-    ) -> KvTransferValue:
-        """Verify that an installation product extends the request’s current compatible KV base."""
+        publication: KvTransfer | None = None,
+    ) -> KvTransfer:
+        """Verify that an installed buffer extends the request’s current compatible KV base."""
 
-        publication = self.publication(product) if publication is None else publication
-        if int(product.request_key.request_id) != int(request_id):
-            raise invalid_descriptor("KV conditioning product belongs to another request")
+        publication = self.publication(buffer) if publication is None else publication
+        if buffer.owner != request_key:
+            raise invalid_descriptor("KV conditioning buffer belongs to another request")
         if (
             int(visible_length) < publication.published_extent
             or int(group_id) != publication.group_id
@@ -197,15 +187,13 @@ class CachePublications:
         return publication
 
     def _validate_install(
-        self, source: ProductRef, publication: KvTransferValue, *, group_id: int
+        self, source: BufferId, publication: KvTransfer, *, group_id: int
     ) -> None:
         """Check semantic lineage and the raw representation before destination access."""
 
-        if source.kind is not ProductKind.KV or source.generation != publication.generation:
+        if source != publication.source:
             raise invalid_descriptor("KV installation source identity is invalid")
-        installed = self._installed_bases.get(
-            (int(source.request_key.request_id), publication.destination)
-        )
+        installed = self._installed_bases.get((source.owner, publication.destination))
         if publication.base is None:
             if installed is not None or publication.base_extent != 0:
                 raise invalid_descriptor("KV installation base is invalid")
@@ -226,8 +214,8 @@ class CachePublications:
 
     def prepare_install(
         self,
-        source: ProductRef,
-        publication: KvTransferValue,
+        source: BufferId,
+        publication: KvTransfer,
         *,
         request_pool_idx: int,
         group_id: int,
@@ -271,23 +259,22 @@ class CachePublications:
         *,
         request_pool_idx: int,
         group_id: int,
-        request_id: int,
-        source: ProductRef,
-        installed_product: ProductRef,
+        request_key: RequestKey,
+        source: BufferId,
+        installed_buffer: BufferId,
         write: CacheWrite,
-    ) -> KvTransferValue:
+    ) -> KvTransfer:
         """Adopt a completed physical import under its exact source and base version."""
 
         publication = write.publication
         if (
-            installed_product.kind is not ProductKind.KV
-            or installed_product.request_key != source.request_key
-            or int(source.request_key.request_id) != int(request_id)
-            or write.product != source
+            installed_buffer.owner != source.owner
+            or source.owner != request_key
+            or write.buffer != source
             or write.request_pool_idx != request_pool_idx
             or write.group_id != group_id
         ):
-            raise invalid_descriptor("installed KV product identity is invalid")
+            raise invalid_descriptor("installed KV buffer identity is invalid")
         self._validate_install(source, publication, group_id=group_id)
         if (
             self.request_tables.pages(request_pool_idx, group_id) != write.pages
@@ -305,56 +292,50 @@ class CachePublications:
 
     def prepare_commit(
         self,
-        publications: Sequence[tuple[ProductRef, KvTransferValue]],
-        installations: Sequence[tuple[ProductRef, ProductRef, KvTransferValue]],
+        publications: Sequence[tuple[BufferId, KvTransfer]],
+        installations: Sequence[tuple[BufferId, BufferId, KvTransfer]],
     ) -> _CachePublicationCommit:
         """Validate staged publications and build an atomic cache-installation commit."""
 
-        products = dict(self._products)
+        publications_by_buffer = dict(self._publications)
         destination_bases = dict(self._destination_bases)
         installed_bases = dict(self._installed_bases)
-        for product, publication in publications:
-            if product.kind is not ProductKind.KV:
-                raise invalid_descriptor("KV publication product identity is invalid")
-            existing = products.get(product)
+        for buffer, publication in publications:
+            if buffer != publication.source:
+                raise invalid_descriptor("KV publication buffer identity is invalid")
+            existing = publications_by_buffer.get(buffer)
             if existing is not None and existing != publication:
-                raise invalid_descriptor("KV publication conflicts with its product identity")
-            request_id = int(product.request_key.request_id)
-            destination_key = (request_id, publication.destination)
+                raise invalid_descriptor("KV publication conflicts with its buffer identity")
+            destination_key = (buffer.owner, publication.destination)
             current = destination_bases.get(destination_key)
             expected = (
                 None if publication.base is None else (publication.base, publication.base_extent)
             )
             if current != expected:
                 raise invalid_descriptor("KV publication base changed before publication")
-            products[product] = publication
+            publications_by_buffer[buffer] = publication
             destination_bases[destination_key] = (
                 publication.source,
                 publication.published_extent,
             )
-        for source, installed_product, publication in installations:
-            if (
-                source.kind is not ProductKind.KV
-                or installed_product.kind is not ProductKind.KV
-                or installed_product.request_key != source.request_key
-            ):
-                raise invalid_descriptor("installed KV product identity is invalid")
-            request_id = int(installed_product.request_key.request_id)
-            destination_key = (request_id, publication.destination)
+        for source, installed_buffer, publication in installations:
+            if source != publication.source or installed_buffer.owner != source.owner:
+                raise invalid_descriptor("installed KV buffer identity is invalid")
+            destination_key = (installed_buffer.owner, publication.destination)
             current = installed_bases.get(destination_key)
             expected = (
                 None if publication.base is None else (publication.base, publication.base_extent)
             )
             if current != expected:
                 raise invalid_descriptor("KV installation base changed before publication")
-            products[source] = publication
-            products[installed_product] = publication
+            publications_by_buffer[source] = publication
+            publications_by_buffer[installed_buffer] = publication
             installed_bases[destination_key] = (
                 publication.source,
                 publication.published_extent,
             )
         return _CachePublicationCommit(
-            products=products,
+            publications_by_buffer=publications_by_buffer,
             destination_bases=destination_bases,
             installed_bases=installed_bases,
         )
@@ -362,12 +343,12 @@ class CachePublications:
     def apply_commit(self, commit: _CachePublicationCommit) -> None:
         """Atomically replace publication indexes with a validated staged commit."""
 
-        self._products = commit.products
+        self._publications = commit.publications_by_buffer
         self._destination_bases = commit.destination_bases
         self._installed_bases = commit.installed_bases
 
     def release_operations(
-        self, releases: Sequence[tuple[RequestKey, int]]
+        self, releases: Sequence[tuple[RequestKey, ComputationId]]
     ) -> tuple[BufferId, ...]:
         """Forget semantic publications and identify buffers for the execution owner.
 
@@ -377,26 +358,26 @@ class CachePublications:
         publisher's storage.
         """
 
-        identities = {(key, int(op_id)) for key, op_id in releases}
-        products = tuple(
-            product
-            for product in self._products
-            if (product.request_key, int(product.producer_op_id)) in identities
+        identities = {(key, op_id) for key, op_id in releases}
+        publications_by_buffer = tuple(
+            buffer
+            for buffer in self._publications
+            if (buffer.owner, buffer.producer_op_id) in identities
         )
-        for product in products:
-            del self._products[product]
-        return tuple(product.buffer_id for product in products)
+        for buffer in publications_by_buffer:
+            del self._publications[buffer]
+        return publications_by_buffer
 
     def drop(self, request_id: int) -> None:
         """Discard semantic KV state while execution retires the request's registrations."""
 
         selected = tuple(
-            product
-            for product in self._products
-            if int(product.request_key.request_id) == int(request_id)
+            buffer
+            for buffer in self._publications
+            if int(buffer.owner.request_id) == int(request_id)
         )
-        for product in selected:
-            del self._products[product]
+        for buffer in selected:
+            del self._publications[buffer]
         for table in (self._destination_bases, self._installed_bases):
-            for key in tuple(key for key in table if key[0] == int(request_id)):
+            for key in tuple(key for key in table if int(key[0].request_id) == int(request_id)):
                 del table[key]

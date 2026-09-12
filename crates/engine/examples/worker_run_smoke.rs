@@ -9,14 +9,13 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uniserve_core::Event;
+use uniserve_core::EngineCoreOutput;
 use uniserve_core::{
-    ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
-    GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
-    UndVisibility,
+    GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, RequestId,
+    SamplingParams,
 };
 use uniserve_engine::{
-    Command, ControlTokens, EngineHandle, EngineLoop, Worker, WorkerExecutor, WorkerId,
+    Command, EngineHandle, Scheduler, SpecialTokenIds, WorkerExecutor, WorkerGroup, WorkerId,
     WorkerProcessArgs,
 };
 
@@ -24,29 +23,23 @@ type Rxs = HashMap<RequestId, uniserve_engine::EventRx>;
 
 fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<()> {
     let constraint = GenerationConstraint::UndOnly;
-    let policy = GenerationPolicyDescriptor::default();
+    let policy = ImageGenerationConfig::default();
     let request = GenerationRequest {
         request_id: RequestId(id),
-        context: vec![ContextSegment::UndTokens {
-            token_ids: vec![1, 2, 3],
-            visibility: UndVisibility::Internal,
-        }],
-        negative_context: Vec::new(),
+        prompt_token_ids: vec![1, 2, 3],
+        multimodal_inputs: Default::default(),
+        negative_prompt_token_ids: Vec::new(),
         constraint,
-        behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+
         sampling: SamplingParams::default(),
         image: ImageParams::default(),
         max_und_tokens: 16,
+        include_stop_token: false,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache: Default::default(),
-        policy,
-        resources: GenerationResourceBounds {
-            context_tokens: 3,
-            max_kv_tokens: 19,
-            ..GenerationResourceBounds::default()
-        },
+        image_generation: policy,
     };
     let rx = handle.submit(request).map_err(|e| anyhow::anyhow!(e))?;
     rxs.insert(RequestId(id), rx);
@@ -66,7 +59,7 @@ fn await_finished(rxs: &mut Rxs, ids: &[RequestId], deadline: Instant) -> Vec<Re
             if let Some(rx) = rxs.get_mut(id) {
                 while let Ok(ev) = rx.try_recv() {
                     saw_any = true;
-                    if matches!(ev, Event::Finished { .. }) {
+                    if matches!(ev, EngineCoreOutput::Finished { .. }) {
                         finished.push(*id);
                         break;
                     }
@@ -90,7 +83,7 @@ fn main() -> anyhow::Result<()> {
         stub: true,
         ..WorkerProcessArgs::default()
     };
-    let engine = Worker::spawn(uniserve_engine::WorkerProcessArgs {
+    let engine = WorkerGroup::spawn(uniserve_engine::WorkerProcessArgs {
         worker_id: "local".into(),
         python: "python3".into(),
         model: String::new(),
@@ -103,14 +96,13 @@ fn main() -> anyhow::Result<()> {
         max_batch_operations: 32,
         max_batch_tokens: 8192,
         attention_backend: uniserve_engine::AttentionBackend::Auto,
-        supported_ops: uniserve_worker_ipc::OpCode::ALL.to_vec(),
         transfer: Default::default(),
         ..worker_config
     })?;
     let engine =
         WorkerExecutor::try_new(vec![(WorkerId("local".into()), engine)], Default::default())?;
     let waker = engine.command_waker();
-    let sched = EngineLoop::new(Box::new(engine), ControlTokens::default(), 32);
+    let sched = Scheduler::new(Box::new(engine), SpecialTokenIds::default(), 32);
 
     let (tx, rx) = crossbeam_channel::unbounded::<Command>();
     let handle = EngineHandle::with_waker(tx, waker);

@@ -17,7 +17,7 @@ from uniserve_worker.nn.linear import (
     RowParallelLinear,
 )
 from uniserve_worker.nn.mesh import DeviceMesh
-from uniserve_worker.nn.parallel import EntryConfig, ParallelConfig, SequenceParallel
+from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig, SequenceParallel
 from uniserve_worker.nn.vocab_parallel_embedding import VocabParallelEmbedding
 from uniserve_worker.runtime.distributed import init_distributed_environment
 
@@ -37,13 +37,13 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
     )
     bindings = environment.initialize_entries(
         {
-            "denoiser": EntryConfig(
+            "denoiser": ComponentConfig(
                 (0, 1, 2, 3),
                 ParallelConfig(2, sequence_parallel=SequenceParallel("ulysses", (2,))),
             ),
-            "encoder": EntryConfig((3, 1), ParallelConfig(2)),
-            "output": EntryConfig((2,)),
-            "decoder": EntryConfig((3, 1), distribution="temporal_units", units_per_rank=2),
+            "encoder": ComponentConfig((3, 1), ParallelConfig(2)),
+            "output": ComponentConfig((2,)),
+            "decoder": ComponentConfig((3, 1), distribution="temporal_units", units_per_rank=2),
         },
     )
     meshes = bindings.meshes

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from uniserve_worker.execution.batch import ComputationId
 from uniserve_worker.foundation.errors import WorkerError, WorkerErrorCode, classify
 
 pytestmark = pytest.mark.unit
@@ -106,11 +107,11 @@ def test_to_mapping_emits_canonical_error_context():
         retryable=True,
         fatal=False,
         req_id=42,
-        op_id=7,
+        op_id=ComputationId(7, 0),
         op_kind="decode_und",
         phase="run",
         route="language",
-        operations=((5, 42, 3, 7),),
+        operations=((5, 42, 3, ComputationId(7, 0)),),
         details={"device": 0},
     )
 
@@ -125,8 +126,8 @@ def test_to_mapping_emits_canonical_error_context():
     assert snapshot["route"] == "language"
     assert snapshot["operations"] == [
         {
-            "request_key": {"authority_id": 5, "request_id": 42, "epoch": 3},
-            "op_id": 7,
+            "request_key": {"engine_id": 5, "request_id": 42, "request_epoch": 3},
+            "op_id": {"batch_id": 7, "request_index": 0},
         }
     ]
 

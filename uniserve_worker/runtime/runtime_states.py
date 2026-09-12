@@ -26,7 +26,6 @@ if triton is not None:
         future_tokens_ptr,
         penalty_counts_ptr,
         predicates_ptr,
-        selected_points_ptr,
         logical_lengths_ptr,
         sampling_positions_ptr,
         cache_lengths_ptr,
@@ -53,7 +52,6 @@ if triton is not None:
         )
         scalar = offsets == 0
         tl.store(predicates_ptr + row + offsets, 0, mask=scalar)
-        tl.store(selected_points_ptr + row + offsets, 0, mask=scalar)
         tl.store(logical_lengths_ptr + row + offsets, logical_length, mask=scalar)
         tl.store(sampling_positions_ptr + row + offsets, sampling_position, mask=scalar)
         tl.store(cache_lengths_ptr + row + offsets, valid_cache_length, mask=scalar)
@@ -63,16 +61,13 @@ if triton is not None:
         indices_ptr,
         tokens_ptr,
         predicates_in_ptr,
-        selected_in_ptr,
         future_tokens_ptr,
         predicates_out_ptr,
-        selected_out_ptr,
         logical_lengths_ptr,
         sampling_positions_ptr,
         cache_lengths_ptr,
         count,
         continuation_width: tl.constexpr,
-        has_selected: tl.constexpr,
         block_size: tl.constexpr,
     ):
         """Publish batched decode tokens and advance device-resident runtime coordinates."""
@@ -82,18 +77,12 @@ if triton is not None:
         indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
         tokens = tl.load(tokens_ptr + offsets, mask=mask, other=0).to(tl.int64)
         predicates = tl.load(predicates_in_ptr + offsets, mask=mask, other=0)
-        selected = (
-            tl.load(selected_in_ptr + offsets, mask=mask, other=1)
-            if has_selected
-            else tl.full((block_size,), 1, tl.int32)
-        )
         tl.store(
             future_tokens_ptr + indices * continuation_width,
             tokens & ((1 << 31) - 1),
             mask=mask,
         )
         tl.store(predicates_out_ptr + indices, predicates, mask=mask)
-        tl.store(selected_out_ptr + indices, selected, mask=mask)
         logical = tl.load(logical_lengths_ptr + indices, mask=mask, other=0)
         sampling = tl.load(sampling_positions_ptr + indices, mask=mask, other=0)
         cache = tl.load(cache_lengths_ptr + indices, mask=mask, other=0)
@@ -112,7 +101,6 @@ class RuntimeStateSnapshot:
     future_input_tokens: torch.Tensor
     penalty_counts: torch.Tensor
     predicate: bool
-    selected_point: int
     prompt_logits: torch.Tensor | None
 
 
@@ -173,7 +161,6 @@ class RuntimeStates:
         self.penalty_counts = tensors["penalty_counts"]
         self.prompt_logits = tensors["prompt_logits"]
         self.predicates = tensors["predicates"]
-        self.selected_points = tensors["selected_points"]
         self._ones_int32 = tensors["_ones_int32"]
         self._ones_int64 = tensors["_ones_int64"]
 
@@ -188,16 +175,13 @@ class RuntimeStates:
                     self._ones_int64,
                     self.future_input_tokens[:, 0],
                     self.predicates,
-                    self._ones_int32,
                     self.future_input_tokens,
                     self.predicates,
-                    self.selected_points,
                     self.logical_lengths,
                     self.sampling_positions,
                     self.valid_cache_lengths,
                     count=0,
                     continuation_width=self.continuation_width,
-                    has_selected=False,
                     block_size=block_size,
                 )
 
@@ -223,7 +207,6 @@ class RuntimeStates:
             "penalty_counts": TensorSchema((rows, vocab_size), torch.int32, fill=0),
             "prompt_logits": TensorSchema((rows, vocab_size), logits_dtype),
             "predicates": TensorSchema((rows,), torch.bool, fill=0),
-            "selected_points": TensorSchema((rows,), torch.int32, fill=0),
             "_ones_int32": TensorSchema((request_pool_size,), torch.int32, fill=1),
             "_ones_int64": TensorSchema((request_pool_size,), torch.int64, fill=1),
         }
@@ -257,7 +240,6 @@ class RuntimeStates:
         self.future_input_tokens.index_fill_(0, indices, 1)
         self.penalty_counts.index_fill_(0, indices, 0)
         self.predicates.index_fill_(0, indices, False)
-        self.selected_points.index_fill_(0, indices, 0)
         self._copy_or_zero(self.valid_cache_lengths, indices, valid_cache_lengths)
         self._copy_or_zero(self.logical_lengths, indices, logical_lengths)
         self._copy_or_zero(self.sampling_positions, indices, sampling_positions)
@@ -288,7 +270,6 @@ class RuntimeStates:
                 future_input_tokens=self.future_input_tokens[row].detach().cpu().contiguous(),
                 penalty_counts=self.penalty_counts[row].detach().cpu().contiguous(),
                 predicate=bool(self.predicates[row]),
-                selected_point=int(self.selected_points[row]),
                 prompt_logits=(
                     self.prompt_logits[row].detach().cpu().contiguous() if ready else None
                 ),
@@ -320,7 +301,6 @@ class RuntimeStates:
                 snapshot.penalty_counts.to(self.device, dtype=torch.int32)
             )
             self.predicates[index] = snapshot.predicate
-            self.selected_points[index] = snapshot.selected_point
             self.valid_cache_lengths[index] = snapshot.valid_cache_length
             self.logical_lengths[index] = snapshot.logical_length
             self.sampling_positions[index] = snapshot.sampling_position
@@ -336,7 +316,6 @@ class RuntimeStates:
         device_indices: torch.Tensor,
         tokens: torch.Tensor,
         predicates: torch.Tensor,
-        selected_points: torch.Tensor | None,
     ) -> None:
         """Commit device-selected decode transitions into request-indexed continuation tensors."""
 
@@ -359,26 +338,19 @@ class RuntimeStates:
             raise ValueError("decode runtime-state values are not aligned")
         ones_i32 = self._ones_int32[:count]
         ones_i64 = self._ones_int64[:count]
-        selected = ones_i32 if selected_points is None else selected_points.reshape(-1)
-        if int(selected.numel()) != count:
-            raise ValueError("decode selected points are not row-aligned")
         if triton is not None and self.device.type == "cuda" and triton_available(self.device):
             block_size = triton.next_power_of_2(count)
-            selected_input = ones_i32 if selected_points is None else selected
             _publish_decode_kernel[(1,)](
                 indices,
                 values[0],
                 values[1],
-                selected_input,
                 self.future_input_tokens,
                 self.predicates,
-                self.selected_points,
                 self.logical_lengths,
                 self.sampling_positions,
                 self.valid_cache_lengths,
                 count=count,
                 continuation_width=self.continuation_width,
-                has_selected=selected_points is not None,
                 block_size=block_size,
             )
             return
@@ -391,11 +363,6 @@ class RuntimeStates:
             0,
             indices,
             values[1].to(dtype=torch.bool),
-        )
-        self.selected_points.index_copy_(
-            0,
-            indices,
-            selected.to(dtype=torch.int32),
         )
         self.logical_lengths.index_add_(0, indices, ones_i32)
         self.sampling_positions.index_add_(0, indices, ones_i64)
@@ -479,7 +446,6 @@ class RuntimeStates:
                 self.future_input_tokens,
                 self.penalty_counts,
                 self.predicates,
-                self.selected_points,
                 self.logical_lengths,
                 self.sampling_positions,
                 self.valid_cache_lengths,
@@ -495,7 +461,6 @@ class RuntimeStates:
         self.future_input_tokens[row].fill_(1)
         self.penalty_counts[row].zero_()
         self.predicates[row].fill_(False)
-        self.selected_points[row].zero_()
         self.logical_lengths[row].fill_(logical_length)
         self.sampling_positions[row].fill_(sampling_position)
         self.valid_cache_lengths[row].fill_(valid_cache_length)

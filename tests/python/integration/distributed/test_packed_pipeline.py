@@ -10,13 +10,13 @@ import torch.multiprocessing as mp
 from uniserve_worker.backends.attention.fa4_cute import Fa4CuteAttentionBackend
 from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
+from uniserve_worker.execution.batch import ForwardMode
 from uniserve_worker.execution.forward_batch import (
     AttentionMode,
     AttentionSelection,
     ExpertRoute,
     FlowPatches,
     ForwardBatch,
-    ModelPhase,
     RouteSpan,
     TokenSelection,
 )
@@ -71,23 +71,23 @@ def _pool(model, device):
 
 def _prefill(device):
     return ForwardBatch(
-        phase=ModelPhase.TEXT,
+        forward_mode=ForwardMode.PREFILL,
         row_count=2,
-        forward_mode=AttentionMode.PAGED_VARLEN,
-        req_pool_indices=torch.tensor([1, 2], device=device),
-        seq_lens=torch.zeros(2, dtype=torch.int32, device=device),
+        attention_mode=AttentionMode.PAGED_VARLEN,
+        request_pool_indices=torch.tensor([1, 2], device=device),
+        prefix_lens=torch.zeros(2, dtype=torch.int32, device=device),
         query_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
         out_cache_loc=torch.tensor([64, 65, 66, 128, 129], device=device),
         block_table=torch.tensor([[1], [2]], dtype=torch.int32, device=device),
-        kv_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
         cu_seqlens_q=torch.tensor([0, 3, 5], dtype=torch.int32, device=device),
         cu_seqlens_k=torch.tensor([0, 3, 5], dtype=torch.int32, device=device),
         max_seqlen_q=3,
         max_seqlen_k=3,
-        seq_lens_cpu=(0, 0),
+        prefix_lens_cpu=(0, 0),
         query_lens_cpu=(3, 2),
         causal_rows_cpu=(True, True),
-        kv_lens_cpu=(3, 2),
+        seq_lens_cpu=(3, 2),
         token_row_indices=(0, 1),
         input_ids=torch.tensor([1, 3, 5, 7, 9], device=device),
         positions=torch.tensor([0, 1, 2, 0, 1], device=device),
@@ -172,8 +172,8 @@ def _mixed_batch(architecture, device):
     total = image_tokens + 2
     return replace(
         _prefill(device),
-        phase=ModelPhase.DENOISE,
-        forward_mode=AttentionMode.PACKED,
+        forward_mode=ForwardMode.MIXED,
+        attention_mode=AttentionMode.PACKED,
         query_lens=torch.tensor([2, image_tokens], dtype=torch.int32, device=device),
         out_cache_loc=torch.zeros(total, dtype=torch.int64, device=device),
         has_cache_writes=False,
@@ -194,7 +194,7 @@ def _mixed_batch(architecture, device):
         max_seqlen_q=max(2, image_tokens),
         max_seqlen_k=max(2, image_tokens),
         query_lens_cpu=(2, image_tokens),
-        kv_lens_cpu=(2, image_tokens),
+        seq_lens_cpu=(2, image_tokens),
         causal_rows_cpu=(True, False),
         binding=2,
         input_ids=torch.tensor([1, 3], device=device),
@@ -336,7 +336,7 @@ def _run_pipeline(
                     if architecture != "qwen":
                         batch = replace(
                             batch,
-                            forward_mode=AttentionMode.PACKED,
+                            attention_mode=AttentionMode.PACKED,
                             attention_indexes=torch.stack(
                                 (
                                     batch.positions,
@@ -363,17 +363,18 @@ def _run_pipeline(
 
                     batch = replace(
                         batch,
-                        forward_mode=AttentionMode.PAGED_DECODE,
+                        forward_mode=ForwardMode.DECODE,
+                        attention_mode=AttentionMode.PAGED_DECODE,
                         input_ids=torch.tensor([11, 13], device=device),
                         positions=torch.tensor([3, 2], device=device),
-                        seq_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
-                        kv_lens=torch.tensor([4, 3], dtype=torch.int32, device=device),
+                        prefix_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
+                        seq_lens=torch.tensor([4, 3], dtype=torch.int32, device=device),
                         query_lens=torch.ones(2, dtype=torch.int32, device=device),
                         out_cache_loc=torch.tensor([67, 130], device=device),
                         cu_seqlens_q=None,
                         cu_seqlens_k=None,
-                        seq_lens_cpu=(3, 2),
-                        kv_lens_cpu=(4, 3),
+                        prefix_lens_cpu=(3, 2),
+                        seq_lens_cpu=(4, 3),
                         query_lens_cpu=(1, 1),
                         token_selections=(TokenSelection.LAST_LOGITS,) * 2,
                         binding=1,
@@ -469,13 +470,13 @@ def _compare_long_packed_rows(model, reference, architecture, device):
     batch = replace(
         _prefill(device),
         row_count=len(lengths),
-        req_pool_indices=torch.arange(1, len(lengths) + 1, device=device),
-        forward_mode=AttentionMode.PACKED,
+        request_pool_indices=torch.arange(1, len(lengths) + 1, device=device),
+        attention_mode=AttentionMode.PACKED,
         input_ids=torch.ones(rows, device=device, dtype=torch.long),
         positions=positions,
-        seq_lens=torch.zeros(len(lengths), dtype=torch.int32, device=device),
+        prefix_lens=torch.zeros(len(lengths), dtype=torch.int32, device=device),
         query_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
-        kv_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
+        seq_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
         out_cache_loc=torch.empty(0, dtype=torch.long, device=device),
         has_cache_writes=False,
         block_table=torch.zeros((len(lengths), 1), dtype=torch.int32, device=device),
@@ -491,9 +492,9 @@ def _compare_long_packed_rows(model, reference, architecture, device):
         route_spans=spans,
         max_seqlen_q=128,
         max_seqlen_k=128,
-        seq_lens_cpu=(0,) * len(lengths),
+        prefix_lens_cpu=(0,) * len(lengths),
         query_lens_cpu=lengths,
-        kv_lens_cpu=lengths,
+        seq_lens_cpu=lengths,
         causal_rows_cpu=(False,) * len(lengths),
         token_row_indices=tuple(range(len(lengths))),
         token_selections=(TokenSelection.HIDDEN,) * len(lengths),

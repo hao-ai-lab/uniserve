@@ -15,18 +15,20 @@ import torch
 
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.batch import (
-    Domain,
+    COMPUTATIONS,
+    Computation,
+    ComputationId,
+    ForwardMode,
     ImageParams,
-    OpCode,
-    Operation,
+    PipelineStage,
     RequestKey,
     RunLane,
+    ScheduledRequest,
     StaticDim,
 )
 from uniserve_worker.execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
-    ModelPhase,
     TokenSelection,
 )
 from uniserve_worker.execution.runners.packed import (
@@ -138,19 +140,19 @@ def _invoke(
 ) -> ForwardOutput:
     """Call the model with staged identifiers, positions, and execution context."""
 
-    if batch.phase in {ModelPhase.TEXT, ModelPhase.DENOISE}:
+    if isinstance(batch.forward_mode, ForwardMode) or batch.forward_mode is PipelineStage.DENOISING:
         hidden = model.forward(ids, positions, batch)
         if not isinstance(hidden, torch.Tensor):
             raise TypeError("model text/denoise forward must return a tensor")
         result = model.project(hidden, batch)
-    elif batch.phase is ModelPhase.ENCODE_VISION:
+    elif batch.forward_mode is PipelineStage.VISION_ENCODING:
         result = model.encode(batch.encode_pixels, batch)
-    elif batch.phase is ModelPhase.ENCODE_LATENT:
+    elif batch.forward_mode is PipelineStage.LATENT_ENCODING:
         result = model.encoder_latent(batch.encode_pixels, batch)
-    elif batch.phase is ModelPhase.DECODE_LATENT:
+    elif batch.forward_mode is PipelineStage.IMAGE_DECODING:
         result = model.decode_latent(batch.decode_latents, batch)
     else:
-        raise TypeError(f"unsupported model phase {batch.phase.value!r}")
+        raise TypeError(f"unsupported model phase {batch.forward_mode.value!r}")
     if not isinstance(result, ForwardOutput):
         raise TypeError("concrete model phase must return ForwardOutput")
     return result
@@ -221,7 +223,7 @@ class ModelRunner:
         self.flow_cfg_branches: tuple[int, ...] = ()
         self._mixed_qualification: dict[MixedCapture, bool] = {}
         self._startup_complete = False
-        self._packed_bindings: dict[tuple[str, Domain], PackedRunner] = {}
+        self._packed_bindings: dict[tuple[str, Computation], PackedRunner] = {}
         self._packed: list[PackedRunner] = []
         self._owned_lanes: list[ExecutionLaneRuntime] = []
         self._geometry_cache: OrderedDict[Hashable, object] = OrderedDict()
@@ -374,7 +376,6 @@ class ModelRunner:
 
         from functools import partial
 
-        from ..execution.batch import OpCode
         from .runners.decode import prepare_decode
         from .runners.flow import FlowRunner
         from .runners.packed import PrefillCapture
@@ -400,8 +401,8 @@ class ModelRunner:
                     forward = partial(self.packed_forward, packed)
                     if (
                         phase == "prefill"
-                        and Domain.PREFILL in lane.domains
-                        and OpCode.AR_EXTEND in self.model.supported_work
+                        and ForwardMode.PREFILL in lane.computations
+                        and ForwardMode.PREFILL in self.model.supported_work
                     ):
                         shapes = (
                             packed.prefill_shapes
@@ -417,15 +418,15 @@ class ModelRunner:
                         )
                     elif (
                         phase == "decode"
-                        and Domain.DECODE in lane.domains
-                        and OpCode.AR_DECODE in self.model.supported_work
+                        and ForwardMode.DECODE in lane.computations
+                        and ForwardMode.DECODE in self.model.supported_work
                     ):
                         prepare_decode(
                             packed, packed.inputs, forward, packed=self.model.tensorized_mixed
                         )
                     elif (
                         phase == "flow"
-                        and Domain.FLOW in lane.domains
+                        and PipelineStage.DENOISING in lane.computations
                         and self.model.generation is not None
                         and latents is not None
                     ):
@@ -641,7 +642,6 @@ class ModelRunner:
         from ..bootstrap.capacity import device_total_bytes
         from ..config import DEFAULT_PREFILL_GRAPH_ROW_BUCKETS, graph_memory_budget_bytes
         from ..nn.diffusion.cfg import build_flow_cfg_plan
-        from .batch import OpCode
         from .runners.packed import (
             PrefillCapture,
             select_flow_captures,
@@ -661,15 +661,15 @@ class ModelRunner:
         # Derive fixed staging and graph catalogs from the intersection of model,
         # lane, cache, latent, and scheduler capacities.
         decode_lane = next(
-            (lane for lane in worker_config.lanes if Domain.DECODE in lane.domains),
+            (lane for lane in worker_config.lanes if ForwardMode.DECODE in lane.computations),
             None,
         )
         prefill_lane = next(
-            (lane for lane in worker_config.lanes if Domain.PREFILL in lane.domains),
+            (lane for lane in worker_config.lanes if ForwardMode.PREFILL in lane.computations),
             None,
         )
         flow_lane = next(
-            (lane for lane in worker_config.lanes if Domain.FLOW in lane.domains),
+            (lane for lane in worker_config.lanes if PipelineStage.DENOISING in lane.computations),
             None,
         )
         decode_max_operations = min(
@@ -753,7 +753,7 @@ class ModelRunner:
                         int(lane.max_batch_operations or max_rows),
                     )
                     for lane in worker_config.lanes
-                    if {Domain.DECODE, Domain.FLOW} <= set(lane.domains)
+                    if {ForwardMode.DECODE, PipelineStage.DENOISING} <= set(lane.computations)
                 ),
                 default=0,
             )
@@ -766,13 +766,13 @@ class ModelRunner:
                 or (
                     worker_config.lanes
                     and not any(
-                        {Domain.DECODE, Domain.FLOW} <= set(lane.domains)
+                        {ForwardMode.DECODE, PipelineStage.DENOISING} <= set(lane.computations)
                         for lane in worker_config.lanes
                     )
                 )
                 or not {
-                    OpCode.AR_DECODE,
-                    OpCode.DIFFUSION_STEP,
+                    ForwardMode.DECODE,
+                    PipelineStage.DENOISING,
                 }.issubset(variants)
             )
             else tuple(
@@ -801,7 +801,7 @@ class ModelRunner:
             device = binding.device
             lane = binding.lane
             stream = binding.stream
-            domains = binding.domains
+            computations = binding.computations
             owns_model_compute = str(device) == str(torch.device(worker_config.device))
 
             # Intersect global graph buckets with this physical lane's advertised capacity.
@@ -815,16 +815,18 @@ class ModelRunner:
                 tuple(
                     value for value in decode_graph_batch_sizes if int(value) <= lane_max_operations
                 )
-                if owns_model_compute and Domain.DECODE in domains
+                if owns_model_compute and ForwardMode.DECODE in computations
                 else ()
             )
             lane_prefill_buckets = (
                 tuple(value for value in prefill_graph_token_sizes if int(value) <= lane_max_tokens)
-                if owns_model_compute and Domain.PREFILL in domains
+                if owns_model_compute and ForwardMode.PREFILL in computations
                 else ()
             )
             lane_prefill_row_sizes = (
-                prefill_graph_row_sizes if owns_model_compute and Domain.PREFILL in domains else ()
+                prefill_graph_row_sizes
+                if owns_model_compute and ForwardMode.PREFILL in computations
+                else ()
             )
             lane_prefill_catalog = (
                 tuple(PrefillCapture(value, 1, 1) for value in lane_prefill_buckets)
@@ -859,7 +861,9 @@ class ModelRunner:
                 memory_budget_bytes=graph_budget,
                 decode_batch_sizes=lane_decode_buckets,
                 decode_predicates=(
-                    decode_predicates if owns_model_compute and Domain.DECODE in domains else None
+                    decode_predicates
+                    if owns_model_compute and ForwardMode.DECODE in computations
+                    else None
                 ),
                 decode_context_blocks=decode_context_blocks,
                 packed_context_blocks=geometry.max_blocks_per_row,
@@ -924,12 +928,12 @@ class ModelRunner:
             if lanes:
                 if len(canonical) != 1:
                     raise ValueError("Green Context lanes require one physical CUDA device")
-                missing = set(Domain).difference(
-                    domain for lane in lanes for domain in lane.domains
+                missing = set(COMPUTATIONS).difference(
+                    kind for lane in lanes for kind in lane.computations
                 )
                 if missing:
-                    names = ", ".join(sorted(domain.value for domain in missing))
-                    raise ValueError(f"lane configuration has no binding for domains: {names}")
+                    names = ", ".join(sorted(kind.value for kind in missing))
+                    raise ValueError(f"lane configuration has no binding for computations: {names}")
                 device = torch.device(canonical[0])
                 greens = create_green_contexts(lanes, device)
                 # Register every acquired context before allocating events or inputs.
@@ -993,8 +997,8 @@ class ModelRunner:
         self._packed.extend(packed_runners)
         for packed in packed_runners:
             assert packed.lane is not None
-            for domain in packed.lane.domains:
-                self._packed_bindings[(str(packed.lane.device), domain)] = packed
+            for kind in packed.lane.computations:
+                self._packed_bindings[(str(packed.lane.device), kind)] = packed
         startup.pop_all()
 
     @torch.inference_mode()
@@ -1035,7 +1039,7 @@ class ModelRunner:
             (
                 lane_runtime.lane_id,
                 lane_runtime.sm_count,
-                tuple(domain.value for domain in lane_runtime.domains),
+                tuple(kind.value for kind in lane_runtime.computations),
                 packed.startup_signature,
             )
             for packed in self._packed
@@ -1142,40 +1146,47 @@ class ModelRunner:
             raise invalid_descriptor("operation requires model image processing")
         return value
 
-    def operation_device(self, operation: Operation) -> torch.device:
+    def operation_device(self, operation: ScheduledRequest) -> torch.device:
         """Return the model or generation device assigned to an operation kind."""
 
         if operation.kind in {
-            OpCode.DIFFUSION_PREPARE,
-            OpCode.DIFFUSION_STEP,
-            OpCode.DIFFUSION_DECODE,
-            OpCode.MEDIA_APPEND,
-            OpCode.DIFFUSION_FINALIZE,
+            PipelineStage.LATENT_PREPARATION,
+            PipelineStage.DENOISING,
+            PipelineStage.VIDEO_DECODING,
+            PipelineStage.VIDEO_ENCODING,
+            PipelineStage.AUDIO_DECODING,
+            PipelineStage.AUDIO_ENCODING,
+            PipelineStage.MUXING,
+            PipelineStage.IMAGE_DECODING,
         }:
             return canonical_device(
                 self.worker_config.generation_device or self.worker_config.device
             )
         return canonical_device(self.worker_config.device)
 
-    def phase_device(self, phase: ModelPhase) -> torch.device:
+    def forward_device(self, forward_mode: ForwardMode | PipelineStage) -> torch.device:
         """Resolve the construction-time device assignment for a numerical phase."""
 
         config = self.worker_config
-        if phase in {ModelPhase.ENCODE_LATENT, ModelPhase.DECODE_LATENT}:
+        if forward_mode in {PipelineStage.LATENT_ENCODING, PipelineStage.IMAGE_DECODING}:
             return canonical_device(config.generation_device or config.device)
         return canonical_device(config.device)
 
     def plan_launches(self, lanes: tuple[RunLane, ...]) -> tuple[RunLane, ...]:
         """Resolve compatible mixed computation without merging logical operation identities."""
 
-        decode = next((lane for lane in lanes if lane.domain is Domain.DECODE), None)
-        flow = next((lane for lane in lanes if lane.domain is Domain.FLOW), None)
+        decode = next(
+            (lane for lane in lanes if lane.operations[0].kind is ForwardMode.DECODE), None
+        )
+        flow = next(
+            (lane for lane in lanes if lane.operations[0].kind is PipelineStage.DENOISING), None
+        )
         if (
             decode is not None
             and flow is not None
             and self.model.tensorized_mixed
             and {operation.kind for lane in (decode, flow) for operation in lane.operations}
-            == {OpCode.AR_DECODE, OpCode.DIFFUSION_STEP}
+            == {ForwardMode.DECODE, PipelineStage.DENOISING}
             and self.allows_mixed(self._mixed_bucket((decode, flow)))
         ):
             launch_id = min(decode.launch_id, flow.launch_id)
@@ -1196,8 +1207,8 @@ class ModelRunner:
                 continue
             variants = {operation.kind for lane in group_lanes for operation in lane.operations}
             if not self.model.tensorized_mixed or variants != {
-                OpCode.AR_DECODE,
-                OpCode.DIFFUSION_STEP,
+                ForwardMode.DECODE,
+                PipelineStage.DENOISING,
             }:
                 raise invalid_descriptor(
                     "tensorized mixed submission exceeds the supported mixed buckets"
@@ -1212,47 +1223,47 @@ class ModelRunner:
         """Resolve a shared captured-graph bucket for a compatible mixed lane group."""
 
         decode_rows = sum(
-            operation.kind is OpCode.AR_DECODE for lane in lanes for operation in lane.operations
+            operation.kind is ForwardMode.DECODE for lane in lanes for operation in lane.operations
         )
         flow_operations = tuple(
             operation
             for lane in lanes
             for operation in lane.operations
-            if operation.kind is OpCode.DIFFUSION_STEP
+            if operation.kind is PipelineStage.DENOISING
         )
         latent_params = {
-            (params.request_key, int(params.op_id)): params
+            (params.request_key, params.op_id): params
             for lane in lanes
             for params in lane.latent_params
         }
-        branch_counts: dict[tuple[RequestKey, int], int] = defaultdict(int)
+        branch_counts: dict[tuple[RequestKey, ComputationId], int] = defaultdict(int)
         generation = self.model.generation
         if flow_operations and generation is None:
             raise invalid_descriptor("tensorized mixed flow has no generation runtime")
         for lane in lanes:
             for index, operation in enumerate(lane.operations):
-                params = latent_params.get((operation.request_key, int(operation.op_id)))
+                params = latent_params.get((operation.request_key, operation.op_id))
                 query_len = (
                     None
                     if params is None or generation is None
                     else generation.physical_tokens(int(params.height), int(params.width))
                 )
-                branch_counts[(operation.request_key, int(operation.op_id))] = min(
+                branch_counts[(operation.request_key, operation.op_id)] = min(
                     0 if generation is None else int(generation.max_cfg_branches),
                     sum(
-                        row.operation_index == index
-                        and (query_len is None or int(row.query_len) == int(query_len))
-                        for row in lane.forward_rows
+                        operation_index == index
+                        and (query_len is None or lane.query_lens[row] == int(query_len))
+                        for row, operation_index in enumerate(lane.forward_operation_indices)
                     ),
                 )
         geometries = {
             (
-                int(latent_params[(operation.request_key, int(operation.op_id))].height),
-                int(latent_params[(operation.request_key, int(operation.op_id))].width),
-                branch_counts[(operation.request_key, int(operation.op_id))],
+                int(latent_params[(operation.request_key, operation.op_id)].height),
+                int(latent_params[(operation.request_key, operation.op_id)].width),
+                branch_counts[(operation.request_key, operation.op_id)],
             )
             for operation in flow_operations
-            if (operation.request_key, int(operation.op_id)) in latent_params
+            if (operation.request_key, operation.op_id) in latent_params
         }
         if len(geometries) != 1 or len(latent_params) != len(flow_operations):
             raise invalid_descriptor("tensorized mixed flow rows disagree on physical geometry")
@@ -1283,17 +1294,20 @@ class ModelRunner:
             list
         )
         for index, (task, scope) in enumerate(tasks):
-            target = self.phase_device(task.phase)
-            packed = self._packed_bindings.get((str(target), scope.lane.domain))
+            target = self.forward_device(task.forward_mode)
+            packed = self._packed_bindings.get((str(target), task.operation.kind))
             if packed is None:
                 raise invalid_descriptor(
-                    f"execution has no {scope.lane.domain.value!r} binding for {target}"
+                    f"execution has no {task.operation.kind.value!r} binding for {target}"
                 )
             phase = (
                 "textual"
-                if task.phase in {ModelPhase.TEXT, ModelPhase.DENOISE}
+                if (
+                    isinstance(task.forward_mode, ForwardMode)
+                    or task.forward_mode is PipelineStage.DENOISING
+                )
                 and self.model.tensorized_mixed
-                else task.phase.value
+                else task.forward_mode.value
             )
             shape = ()
             if not (self.model.tensorized_mixed and not self.uses_lanes):
@@ -1308,9 +1322,13 @@ class ModelRunner:
         events: list[tuple[torch.device, torch.cuda.Event]] = []
         for group in grouped.values():
             rows = tuple(task for _index, task, _scope in group)
-            if len({task.kind for task in rows}) > 1 and not self.model.tensorized_mixed:
+            if (
+                any(task.forward_mode is PipelineStage.DENOISING for task in rows)
+                and any(isinstance(task.forward_mode, ForwardMode) for task in rows)
+                and not self.model.tensorized_mixed
+            ):
                 raise invalid_descriptor("tensorized mixed submission is outside the model limits")
-            target = self.phase_device(rows[0].phase)
+            target = self.forward_device(rows[0].forward_mode)
             for _index, _task, scope in group:
                 scope.completion.register_device(target)
             result = self.run_forward_group(
@@ -1338,9 +1356,15 @@ class ModelRunner:
 
         from .attention import columns, dense_columns
 
-        target = self.phase_device(tasks[0].phase)
+        target = self.forward_device(tasks[0].forward_mode)
         scope.completion.register_device(target)
-        textual = all(task.phase in {ModelPhase.TEXT, ModelPhase.DENOISE} for task in tasks)
+        textual = all(
+            (
+                isinstance(task.forward_mode, ForwardMode)
+                or task.forward_mode is PipelineStage.DENOISING
+            )
+            for task in tasks
+        )
         attention = (
             columns(
                 tasks, cache=cache, tables=tables, states=states, packed=self.model.tensorized_mixed
@@ -1353,7 +1377,6 @@ class ModelRunner:
             device=target,
             attention=attention,
             graph_eligible=scope.graph_eligible and textual,
-            domain=scope.lane.domain,
         )
         if int(result.request_pool_indices.numel()) != len(tasks):
             raise RuntimeError("model runner returned without aligned request slots")
@@ -1369,7 +1392,6 @@ class ModelRunner:
         device: torch.device | str,
         attention: AttentionInputs,
         graph_eligible: bool,
-        domain: Domain,
     ) -> ForwardResult:
         """Stage forward rows, choose eager or CUDA graph execution, invoke the model, and validate outputs."""
 
@@ -1378,28 +1400,30 @@ class ModelRunner:
             raise ValueError("model runner received an empty call")
         started = time.perf_counter_ns()
         target = torch.device(device)
-        phases = frozenset(task.phase for task in tasks)
-        if phases <= {ModelPhase.TEXT, ModelPhase.DENOISE}:
-            phase = ModelPhase.DENOISE if ModelPhase.DENOISE in phases else ModelPhase.TEXT
-        elif len(phases) == 1:
-            phase = next(iter(phases))
+        modes = frozenset(task.forward_mode for task in tasks)
+        if len(modes) == 1:
+            forward_mode = next(iter(modes))
+        elif all(
+            isinstance(mode, ForwardMode) or mode is PipelineStage.DENOISING for mode in modes
+        ):
+            forward_mode = ForwardMode.MIXED
         else:
-            raise ValueError("one model call cannot mix unrelated execution phases")
+            raise ValueError("one model call cannot mix unrelated computations")
         operations = tuple(
             (
-                task.operation.request_key.authority_id,
+                task.operation.request_key.engine_id,
                 task.operation.request_key.request_id,
-                task.operation.request_key.epoch,
+                task.operation.request_key.request_epoch,
                 task.operation.op_id,
             )
             for task in tasks
         )
-        packed = self._packed_bindings.get((str(target), domain))
+        packed = self._packed_bindings.get((str(target), tasks[0].operation.kind))
         if packed is None:
             raise InputError(
-                f"model runner has no {domain.value!r} execution lane for {target}",
+                f"model runner has no {tasks[0].operation.kind.value!r} execution lane for {target}",
                 phase="input_staging",
-                route=phase.value,
+                route=forward_mode.value,
                 operations=operations,
             )
         lane_runtime = packed.lane
@@ -1416,7 +1440,7 @@ class ModelRunner:
             )
             with stream_context:
                 batch = buffers.stage(
-                    phase=phase,
+                    forward_mode=forward_mode,
                     row_count=len(tasks),
                     request_pool_indices=tuple(task.request_pool_idx for task in tasks),
                     decode_force_finish=(
@@ -1518,7 +1542,7 @@ class ModelRunner:
             output_event = lane_runtime.record_output()
             if output_event is not None:
                 torch.cuda.current_stream(target).wait_event(output_event)
-            raise _input_failure(error, phase, operations) from error
+            raise _input_failure(error, forward_mode, operations) from error
 
         def invoke(value: ForwardBatch) -> ForwardOutput:
             return self.packed_forward(packed, value)
@@ -1545,7 +1569,7 @@ class ModelRunner:
             output_event = lane_runtime.record_output()
             duration_us = (time.perf_counter_ns() - started) // 1000
             observation = RunObservation(
-                route=phase.value,
+                route=forward_mode.value,
                 row_count=len(tasks),
                 row_kind_counts=tuple(sorted(counts.items())),
                 path=path,
@@ -1573,7 +1597,7 @@ class ModelRunner:
                 output_event = lane_runtime.record_output()
             if output_event is not None:
                 torch.cuda.current_stream(target).wait_event(output_event)
-            raise _execution_failure(error, phase, operations) from error
+            raise _execution_failure(error, forward_mode, operations) from error
 
 
 def _kind_counts(tasks: tuple[ForwardRow, ...]) -> dict[str, int]:
@@ -1581,7 +1605,18 @@ def _kind_counts(tasks: tuple[ForwardRow, ...]) -> dict[str, int]:
 
     result: dict[str, int] = {}
     for task in tasks:
-        result[task.kind] = result.get(task.kind, 0) + 1
+        # Preserve public row labels while deriving them from actual computation.
+        mode = task.forward_mode
+        label = (
+            "token"
+            if isinstance(mode, ForwardMode)
+            else "flow"
+            if mode is PipelineStage.DENOISING
+            else "decode"
+            if mode is PipelineStage.IMAGE_DECODING
+            else "encode"
+        )
+        result[label] = result.get(label, 0) + 1
     return result
 
 
@@ -1613,8 +1648,8 @@ def _validate_outputs(
 
 def _input_failure(
     error: BaseException,
-    phase: ModelPhase,
-    operations: tuple[tuple[int, int, int, int], ...],
+    forward_mode: ForwardMode | PipelineStage,
+    operations: tuple[tuple[int, int, int, ComputationId], ...],
 ) -> InputError:
     """Classify invalid model inputs with their phase and operation identities."""
 
@@ -1623,15 +1658,15 @@ def _input_failure(
     return InputError(
         str(error) or type(error).__name__,
         phase="input_staging",
-        route=phase.value,
+        route=forward_mode.value,
         operations=operations,
     )
 
 
 def _execution_failure(
     error: BaseException,
-    phase: ModelPhase,
-    operations: tuple[tuple[int, int, int, int], ...],
+    forward_mode: ForwardMode | PipelineStage,
+    operations: tuple[tuple[int, int, int, ComputationId], ...],
 ) -> WorkerError:
     """Classify a model failure and attach the active phase and operation identities."""
 
@@ -1645,7 +1680,7 @@ def _execution_failure(
         return ResourceError(
             str(error) or type(error).__name__,
             phase="graph_or_device",
-            route=phase.value,
+            route=forward_mode.value,
             operations=operations,
             retryable=classified.retryable,
             fatal=classified.fatal,
@@ -1653,7 +1688,7 @@ def _execution_failure(
     return ComputeError(
         str(error) or type(error).__name__,
         phase="neural_execution",
-        route=phase.value,
+        route=forward_mode.value,
         operations=operations,
     )
 

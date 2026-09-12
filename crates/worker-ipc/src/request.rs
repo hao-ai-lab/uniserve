@@ -141,7 +141,7 @@ pub struct ErrorOperationIdentity {
     /// Request lineage owning the failed operation.
     pub request_key: RequestKey,
     /// Failed operation identity.
-    pub op_id: OpId,
+    pub op_id: ComputationId,
 }
 
 /// Structured worker failure with optional operation identities.

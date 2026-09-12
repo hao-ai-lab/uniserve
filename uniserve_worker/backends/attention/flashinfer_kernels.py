@@ -245,7 +245,7 @@ def _decode_effective_seqlens(
     current_tokens = int(current_tokens)
     if current_tokens == 0:
         return cache_seqlens
-    shared = getattr(plan, "kv_lens", None)
+    shared = getattr(plan, "seq_lens", None)
     if (
         current_tokens == 1
         and isinstance(shared, torch.Tensor)

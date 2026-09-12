@@ -8,11 +8,10 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve_worker.execution.batch import OpCode
+from uniserve_worker.execution.batch import ForwardMode
 from uniserve_worker.execution.forward_batch import (
     AttentionMode,
     ForwardBatch,
-    ModelPhase,
     TokenSelection,
 )
 from uniserve_worker.models.bagel import BagelConfig, BagelForConditionalGeneration, LLMConfig
@@ -107,7 +106,7 @@ def _sensenova_config() -> NeoChatConfig:
 def _text_batch(
     query_lens: tuple[int, ...],
     *,
-    forward_mode: AttentionMode,
+    attention_mode: AttentionMode,
 ) -> ForwardBatch:
     rows = len(query_lens)
     total = sum(query_lens)
@@ -116,30 +115,32 @@ def _text_batch(
         dtype=torch.int32,
     )
     return ForwardBatch(
-        phase=ModelPhase.TEXT,
+        forward_mode=ForwardMode.DECODE
+        if attention_mode is AttentionMode.PAGED_DECODE
+        else ForwardMode.PREFILL,
         row_count=rows,
-        forward_mode=forward_mode,
-        req_pool_indices=torch.arange(1, rows + 1),
-        seq_lens=torch.zeros(rows, dtype=torch.int32),
+        attention_mode=attention_mode,
+        request_pool_indices=torch.arange(1, rows + 1),
+        prefix_lens=torch.zeros(rows, dtype=torch.int32),
         query_lens=torch.tensor(query_lens, dtype=torch.int32),
         out_cache_loc=torch.zeros(total, dtype=torch.int64),
         block_table=torch.zeros((rows, 1), dtype=torch.int32),
-        kv_lens=torch.tensor(query_lens, dtype=torch.int32),
-        cu_seqlens_q=(cumulative if forward_mode is AttentionMode.PAGED_VARLEN else None),
-        cu_seqlens_k=(cumulative if forward_mode is AttentionMode.PAGED_VARLEN else None),
+        seq_lens=torch.tensor(query_lens, dtype=torch.int32),
+        cu_seqlens_q=(cumulative if attention_mode is AttentionMode.PAGED_VARLEN else None),
+        cu_seqlens_k=(cumulative if attention_mode is AttentionMode.PAGED_VARLEN else None),
         output_indices=(
             torch.tensor(
                 [sum(query_lens[: index + 1]) - 1 for index in range(rows)],
                 dtype=torch.int64,
             )
-            if forward_mode is AttentionMode.PAGED_VARLEN
+            if attention_mode is AttentionMode.PAGED_VARLEN
             else None
         ),
         max_seqlen_q=max(query_lens),
         max_seqlen_k=max(query_lens),
-        seq_lens_cpu=(0,) * rows,
+        prefix_lens_cpu=(0,) * rows,
         query_lens_cpu=query_lens,
-        kv_lens_cpu=query_lens,
+        seq_lens_cpu=query_lens,
         token_row_indices=tuple(range(rows)),
         input_ids=torch.zeros(total, dtype=torch.long),
         positions=torch.arange(total, dtype=torch.long),
@@ -174,9 +175,9 @@ def test_qwen_constructs_runtime_behavior_from_checkpoint_configuration():
     assert model.cache_geometry.num_layers == 1
     assert model.text_max_tokens == 128
     assert model.supported_work == {
-        OpCode.AR_EXTEND,
-        OpCode.AR_DECODE,
-        OpCode.AR_VERIFY,
+        ForwardMode.PREFILL,
+        ForwardMode.DECODE,
+        ForwardMode.VERIFY,
     }
 
 
@@ -184,7 +185,7 @@ def test_qwen_decode_projection_preserves_row_alignment():
     model = Qwen3ForCausalLM(_qwen_config(), layer_config=_layer_config())
     weight = _projection_weight(model.lm_head)
     hidden = torch.arange(32, dtype=torch.float32).view(4, 8)
-    batch = _text_batch((1, 1, 1, 1), forward_mode=AttentionMode.PAGED_DECODE)
+    batch = _text_batch((1, 1, 1, 1), attention_mode=AttentionMode.PAGED_DECODE)
 
     output = model.project(hidden, batch).materialize()
 
@@ -196,7 +197,7 @@ def test_sensenova_decode_projection_preserves_row_alignment():
     model = NEOChatModel(_sensenova_config(), layer_config=_layer_config())
     weight = _projection_weight(model.language_model.lm_head)
     hidden = torch.arange(32, dtype=torch.float32).view(4, 8)
-    batch = _text_batch((1, 1, 1, 1), forward_mode=AttentionMode.PAGED_DECODE)
+    batch = _text_batch((1, 1, 1, 1), attention_mode=AttentionMode.PAGED_DECODE)
 
     output = model.project(hidden, batch).materialize()
 
@@ -208,7 +209,7 @@ def test_qwen_prefill_selects_the_last_logit_for_each_ragged_row():
     model = Qwen3ForCausalLM(_qwen_config(), layer_config=_layer_config())
     weight = _projection_weight(model.lm_head)
     hidden = torch.arange(56, dtype=torch.float32).view(7, 8)
-    batch = _text_batch((2, 5), forward_mode=AttentionMode.PAGED_VARLEN)
+    batch = _text_batch((2, 5), attention_mode=AttentionMode.PAGED_VARLEN)
 
     output = model.project(hidden, batch).materialize()
 
@@ -232,7 +233,7 @@ def test_model_projection_preserves_mixed_token_selections(architecture):
     weight = _projection_weight(head)
     hidden = torch.arange(80, dtype=torch.float32).view(10, 8)
     batch = replace(
-        _text_batch((2, 5, 3), forward_mode=AttentionMode.PAGED_VARLEN),
+        _text_batch((2, 5, 3), attention_mode=AttentionMode.PAGED_VARLEN),
         token_selections=(
             TokenSelection.HIDDEN,
             TokenSelection.ALL_LOGITS,

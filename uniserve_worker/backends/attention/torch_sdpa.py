@@ -60,7 +60,9 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         """Gather each visible paged KV row, append current K/V, and apply PyTorch SDPA."""
 
         plan = context
-        base_lens = getattr(plan, "seq_lens_cpu", None)
+        # Supplied K/V is appended at the prefix boundary. With no K/V input,
+        # the caller already wrote the query interval into the resident cache.
+        base_lens = getattr(plan, "prefix_lens_cpu" if k is not None else "seq_lens_cpu", None)
         if base_lens is None:
             raise ValueError("torch_sdpa paged decode requires host-known sequence lengths")
         del cache_seqlens
@@ -130,7 +132,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
             query_lens = tuple(right - left for left, right in zip(offsets, offsets[1:]))
         else:
             offsets = _offsets_from_lengths(query_lens)
-        host_prefix_lens = getattr(plan, "seq_lens_cpu", None)
+        host_prefix_lens = getattr(plan, "prefix_lens_cpu", None)
         if host_prefix_lens is None:
             host_prefix_lens = _integer_values(prefix_lens, "prefix lengths")
         if (
@@ -208,7 +210,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
             # reading device cumulative-length tensors back to the host.
             plan = context
             query_lens = getattr(plan, "query_lens_cpu", None)
-            kv_lens = getattr(plan, "kv_lens_cpu", None)
+            kv_lens = getattr(plan, "seq_lens_cpu", None)
             if query_lens is None or kv_lens is None:
                 raise ValueError(
                     "torch_sdpa paged varlen requires host-known query_lens_cpu and kv_seqlens_cpu"
@@ -268,7 +270,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         del max_seqlen_q, max_seqlen_k, use_prefix_bounds
         plan = context
         query_lens = getattr(plan, "query_lens_cpu", None)
-        key_lens = getattr(plan, "kv_lens_cpu", None)
+        key_lens = getattr(plan, "seq_lens_cpu", None)
         if q.ndim == 3:
             if query_lens is None:
                 if cu_seqlens_q is None:

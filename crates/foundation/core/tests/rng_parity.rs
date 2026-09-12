@@ -58,9 +58,15 @@ fn emit_sampling_rng_parity_fixture() {
     // output and its derived sampling decisions.
     let mut cases = Vec::new();
     for &session_seed in &session_seeds {
-        for &(authority_id, request_id, epoch) in &identities {
+        for &(engine_id, request_id, request_epoch) in &identities {
             for &draw_layout in &draw_layouts {
-                let key = sampling_key(session_seed, authority_id, request_id, epoch, draw_layout);
+                let key = sampling_key(
+                    session_seed,
+                    engine_id,
+                    request_id,
+                    request_epoch,
+                    draw_layout,
+                );
                 for &(semantic_token_index, processor_stage, draw_index) in &coordinates {
                     let counter = [
                         semantic_token_index as u32,
@@ -73,9 +79,9 @@ fn emit_sampling_rng_parity_fixture() {
                         sampling_uniform(key, semantic_token_index, processor_stage, draw_index);
                     cases.push(serde_json::json!({
                         "session_seed": session_seed,
-                        "authority_id": authority_id,
+                        "engine_id": engine_id,
                         "request_id": request_id,
-                        "epoch": epoch,
+                        "request_epoch": request_epoch,
                         "draw_layout": draw_layout,
                         "semantic_token_index": semantic_token_index,
                         "processor_stage": processor_stage,

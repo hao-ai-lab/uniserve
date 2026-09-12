@@ -1,14 +1,13 @@
 //! Demonstrates worker startup, capability negotiation, and shared-memory execution.
 use std::collections::HashMap;
 
-use uniserve_core::Event;
+use uniserve_core::EngineCoreOutput;
 use uniserve_core::{
-    ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
-    GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
-    TriggerPolicyDescriptor, UndVisibility,
+    GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, ImageTrigger,
+    RequestId, SamplingParams,
 };
 use uniserve_engine::{
-    AttentionBackend, ControlTokens, EngineLoop, Executor, Worker, WorkerExecutor, WorkerId,
+    AttentionBackend, Executor, Scheduler, SpecialTokenIds, WorkerExecutor, WorkerGroup, WorkerId,
     WorkerProcessArgs,
 };
 
@@ -22,7 +21,7 @@ fn main() -> anyhow::Result<()> {
         stub: true,
         ..WorkerProcessArgs::default()
     };
-    let engine = Worker::spawn(WorkerProcessArgs {
+    let engine = WorkerGroup::spawn(WorkerProcessArgs {
         worker_id: "local".into(),
         python: "python3".into(),
         model: String::new(),
@@ -35,7 +34,6 @@ fn main() -> anyhow::Result<()> {
         max_batch_operations: 32,
         max_batch_tokens: 8192,
         attention_backend: AttentionBackend::Auto,
-        supported_ops: uniserve_worker_ipc::OpCode::ALL.to_vec(),
         transfer: Default::default(),
         ..worker_config
     })?;
@@ -43,10 +41,10 @@ fn main() -> anyhow::Result<()> {
         WorkerExecutor::try_new(vec![(WorkerId("local".into()), engine)], Default::default())?;
     println!("info from worker: {:?}", engine.info());
 
-    let ctrl = ControlTokens {
-        ..ControlTokens::default()
+    let ctrl = SpecialTokenIds {
+        ..SpecialTokenIds::default()
     };
-    let mut sched = EngineLoop::new(Box::new(engine), ctrl, 32);
+    let mut sched = Scheduler::new(Box::new(engine), ctrl, 32);
 
     let mut rxs: HashMap<RequestId, (&str, uniserve_engine::EventRx)> = HashMap::new();
     // we drive step directly here instead of the run thread
@@ -71,9 +69,9 @@ fn main() -> anyhow::Result<()> {
         while let Ok(ev) = rx.try_recv() {
             let e = counts.entry(*id).or_insert((0, 0, false));
             match ev {
-                Event::TextToken { .. } => e.0 += 1,
-                Event::ImageDone { .. } => e.1 += 1,
-                Event::Finished { .. } => e.2 = true,
+                EngineCoreOutput::TextToken { .. } => e.0 += 1,
+                EngineCoreOutput::ImageDone { .. } => e.1 += 1,
+                EngineCoreOutput::Finished { .. } => e.2 = true,
                 _ => {}
             }
         }
@@ -98,20 +96,18 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn generation_request(id: u64, constraint: GenerationConstraint) -> GenerationRequest {
-    let policy = GenerationPolicyDescriptor {
-        trigger: TriggerPolicyDescriptor::Token { token_id: 1 },
-        gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
-        ..GenerationPolicyDescriptor::default()
+    let policy = ImageGenerationConfig {
+        trigger: ImageTrigger::Token { token_id: 1 },
+        requires_text_for_image: false,
+        ..ImageGenerationConfig::default()
     };
     GenerationRequest {
         request_id: RequestId(id),
-        context: vec![ContextSegment::UndTokens {
-            token_ids: vec![1, 2, 3],
-            visibility: UndVisibility::Internal,
-        }],
-        negative_context: Vec::new(),
+        prompt_token_ids: vec![1, 2, 3],
+        multimodal_inputs: Default::default(),
+        negative_prompt_token_ids: Vec::new(),
         constraint,
-        behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+
         sampling: SamplingParams::default(),
         image: ImageParams {
             steps: 4,
@@ -120,15 +116,11 @@ fn generation_request(id: u64, constraint: GenerationConstraint) -> GenerationRe
             ..Default::default()
         },
         max_und_tokens: 20,
+        include_stop_token: false,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache: Default::default(),
-        policy,
-        resources: GenerationResourceBounds {
-            context_tokens: 3,
-            max_kv_tokens: 23,
-            ..GenerationResourceBounds::default()
-        },
+        image_generation: policy,
     }
 }

@@ -1,44 +1,15 @@
 //! In-process engine construction, submission, and lifecycle management.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
-use tracing::warn;
+use std::sync::Arc;
 
 use super::error::{Error, Result};
-use super::media::MediaSubmission;
 use uniserve_core::{GenerationLimits, ModelDtype, Request, RequestId, RuntimeFamily};
 use uniserve_engine::{EngineCore, EngineHandle, EventRx, Executor};
-
-use crate::serving::TokenizedGenerateReqInput;
 
 /// In-process engine client owned by the server layer.
 pub struct EngineClient {
     core: Arc<EngineCore>,
-    active: SharedActiveRequests,
-    _stats_guard: Arc<()>,
-}
-
-type ActiveRequests = HashMap<String, RequestId>;
-type SharedActiveRequests = Arc<Mutex<ActiveRequests>>;
-
-/// Locks the active-request registry.
-fn lock_active(active: &Mutex<ActiveRequests>) -> std::sync::MutexGuard<'_, ActiveRequests> {
-    match active.lock() {
-        Ok(guard) => guard,
-        Err(error) => {
-            warn!("in-process active request map lock poisoned");
-            error.into_inner()
-        }
-    }
-}
-
-/// Removes the active request.
-fn remove_active_request(active: &Mutex<ActiveRequests>, request_id: &str, rid: RequestId) {
-    let mut active = lock_active(active);
-    if active.get(request_id) == Some(&rid) {
-        active.remove(request_id);
-    }
+    pub(crate) requests: Arc<super::requests::RequestRegistry>,
 }
 
 impl EngineClient {
@@ -86,15 +57,14 @@ impl EngineClient {
     fn from_core(core: EngineCore) -> Result<Self> {
         let core = Arc::new(core);
 
-        let active: SharedActiveRequests = Arc::new(Mutex::new(HashMap::new()));
-        let stats_guard = Arc::new(());
+        let requests = Arc::new(super::requests::RequestRegistry::default());
         {
             let stats = Arc::clone(core.stats());
             let block_size = core.info().kv_block_size();
             let model_name = core.model_name().to_string();
-            let guard = Arc::downgrade(&stats_guard);
+            let guard = Arc::downgrade(&core);
             tokio::spawn(async move {
-                let mut reporter = uniserve_engine::SchedStatsReporter::default();
+                let mut reporter = uniserve_engine::SchedulerStatsReporter::default();
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
@@ -113,11 +83,7 @@ impl EngineClient {
             });
         }
 
-        Ok(Self {
-            core,
-            active,
-            _stats_guard: stats_guard,
-        })
+        Ok(Self { core, requests })
     }
 }
 
@@ -172,100 +138,79 @@ impl EngineClient {
         !self.core.is_dead()
     }
 
-    /// Returns the terminal health error, if the engine failed.
-    pub fn health_error(&self) -> Option<Arc<Error>> {
-        None
-    }
-
-    /// Submits one tokenized generation request and returns its event receiver.
-    pub async fn submit_generation(&self, input: &TokenizedGenerateReqInput) -> Result<EventRx> {
-        self.submit_generation_request(input.request_id.to_string(), input.request.clone())
-            .await
-    }
-
-    /// Maps an external request identity to an engine identity and submits the canonical request.
-    async fn submit_generation_request(
+    /// Reserves a unique request ID before preprocessing. The caller must submit
+    /// the returned ID or complete its decoded-response lifecycle on failure.
+    pub fn register_request(
         &self,
         external_request_id: String,
-        mut request: uniserve_core::GenerationRequest,
-    ) -> Result<EventRx> {
+        output_identity: Option<crate::serving::ModelEventIdentity>,
+    ) -> Result<RequestId> {
         let rid = self.core.next_request_id();
-        request.request_id = rid;
+        if !self
+            .requests
+            .register(external_request_id.clone().into(), rid, output_identity)
         {
-            let mut active = lock_active(&self.active);
-            if active.contains_key(&external_request_id) {
-                return Err(Error::DuplicateRequestId {
-                    request_id: external_request_id,
-                });
-            }
-            active.insert(external_request_id.clone(), rid);
+            return Err(Error::DuplicateRequestId {
+                request_id: external_request_id,
+            });
         }
+        Ok(rid)
+    }
+
+    /// Submits the owned tokenized request under its previously reserved identity.
+    pub async fn submit_generation(
+        &self,
+        external_request_id: String,
+        request: uniserve_core::GenerationRequest,
+    ) -> Result<EventRx> {
+        let rid = request.request_id;
+        self.requests.claim_submission(&external_request_id, rid)?;
         let request = match self.core.runtime_family() {
             RuntimeFamily::Ar => Request::Ar(request),
             RuntimeFamily::Umm => Request::Umm(request),
             RuntimeFamily::Diffusion => {
-                remove_active_request(&self.active, &external_request_id, rid);
+                self.requests.release_engine(&external_request_id, rid);
                 return Err(Error::ClientClosed {
                     message: "text generation is unavailable for a diffusion runtime".to_string(),
                 });
             }
         };
         let mut scheduler_rx = self.core.submit(request).map_err(|error| {
-            remove_active_request(&self.active, &external_request_id, rid);
+            self.requests.release_engine(&external_request_id, rid);
             Error::from(error)
         })?;
-        let active = Arc::clone(&self.active);
-        let active_id = external_request_id.clone();
+        let requests = Arc::clone(&self.requests);
         scheduler_rx.set_on_finish(move || {
-            remove_active_request(&active, &active_id, rid);
+            requests.release_engine(&external_request_id, rid);
         });
         Ok(scheduler_rx)
     }
 
     /// Submits one terminal media request and returns its event receiver.
-    pub async fn submit_media(&self, submission: MediaSubmission) -> Result<EventRx> {
-        let MediaSubmission {
-            external_request_id,
-            prompt_token_ids,
-            seed,
-            priority,
-            geometry,
-            ..
-        } = submission;
-        let rid = self.core.next_request_id();
-        {
-            let mut active = lock_active(&self.active);
-            if active.contains_key(&external_request_id) {
-                return Err(Error::DuplicateRequestId {
-                    request_id: external_request_id,
-                });
-            }
-            active.insert(external_request_id.clone(), rid);
-        }
+    pub async fn submit_media(
+        &self,
+        external_request_id: String,
+        mut request: uniserve_core::DiffusionRequest,
+    ) -> Result<EventRx> {
+        let rid = self.register_request(external_request_id.clone(), None)?;
+        self.requests.claim_submission(&external_request_id, rid)?;
         if self.core.runtime_family() != RuntimeFamily::Diffusion {
-            remove_active_request(&self.active, &external_request_id, rid);
+            self.requests.release_engine(&external_request_id, rid);
             return Err(Error::ClientClosed {
                 message: "diffusion generation is unavailable for this runtime".to_string(),
             });
         }
-        let request = uniserve_core::DiffusionRequest {
-            request_id: rid,
-            prompt_token_ids,
-            seed,
-            priority,
-            geometry,
-        };
+        request.request_id = rid;
         let mut scheduler_rx = self
             .core
             .submit(Request::Diffusion(request))
             .map_err(|error| {
-                remove_active_request(&self.active, &external_request_id, rid);
+                self.requests.release_engine(&external_request_id, rid);
                 Error::from(error)
             })?;
-        let active = Arc::clone(&self.active);
-        let active_id = external_request_id.clone();
+        let requests = Arc::clone(&self.requests);
         scheduler_rx.set_on_finish(move || {
-            remove_active_request(&active, &active_id, rid);
+            requests.release_engine(&external_request_id, rid);
         });
         Ok(scheduler_rx)
     }
@@ -277,9 +222,11 @@ impl EngineClient {
         S: AsRef<str>,
     {
         let handle = self.handle();
-        let active = lock_active(&self.active);
         for id in ids {
-            if let Some(rid) = active.get(id.as_ref()).copied() {
+            if let Some(rid) = self
+                .requests
+                .mark_control(id.as_ref(), crate::serving::RequestLifecycleState::Aborting)
+            {
                 handle.abort(rid);
             }
         }
@@ -293,9 +240,11 @@ impl EngineClient {
         S: AsRef<str>,
     {
         let handle = self.handle();
-        let active = lock_active(&self.active);
         for id in ids {
-            if let Some(rid) = active.get(id.as_ref()).copied() {
+            if let Some(rid) = self.requests.mark_control(
+                id.as_ref(),
+                crate::serving::RequestLifecycleState::Cancelling,
+            ) {
                 handle.cancel(rid);
             }
         }
@@ -313,10 +262,9 @@ impl EngineClient {
 mod tests {
     use crate::engine_client::EngineClient;
     use uniserve_core::{
-        ContextSegment, Event, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
-        GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
-        GenerationRequest, GenerationResourceBounds, ImageIngestRecipe, ImageKvEffect, ImageParams,
-        RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
+        EngineCoreOutput, FeedbackNextToken, FeedbackSource, GenerationConstraint,
+        GenerationRequest, ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageParams,
+        ImageTrigger, SamplingParams,
     };
     use uniserve_engine::EngineConfig;
 
@@ -331,32 +279,27 @@ mod tests {
         .expect("connect in-process sim engine");
 
         let constraint = GenerationConstraint::UndOnly;
-        let policy = GenerationPolicyDescriptor::default();
+        let policy = ImageGenerationConfig::default();
         let generation = GenerationRequest {
-            request_id: RequestId(0),
-            context: vec![ContextSegment::UndTokens {
-                token_ids: vec![1, 2, 3, 4],
-                visibility: UndVisibility::Internal,
-            }],
-            negative_context: Vec::new(),
+            request_id: client
+                .register_request("req-text".to_string(), None)
+                .expect("reserve request"),
+            prompt_token_ids: vec![1, 2, 3, 4],
+            multimodal_inputs: Default::default(),
+            negative_prompt_token_ids: Vec::new(),
             constraint,
-            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
             sampling: SamplingParams::default(),
             image: ImageParams::default(),
             max_und_tokens: 64,
+            include_stop_token: false,
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
             cache: Default::default(),
-            policy,
-            resources: GenerationResourceBounds {
-                context_tokens: 4,
-                max_kv_tokens: 68,
-                ..Default::default()
-            },
+            image_generation: policy,
         };
         let mut stream = client
-            .submit_generation_request("req-text".to_string(), generation)
+            .submit_generation("req-text".to_string(), generation)
             .await
             .expect("submit request");
 
@@ -364,13 +307,16 @@ mod tests {
         let mut finish = None;
         while let Some(event) = stream.next().await {
             match event {
-                Event::TextToken { .. } => tokens += 1,
-                Event::Finished { reason, .. } => {
+                EngineCoreOutput::TextToken { .. } => tokens += 1,
+                EngineCoreOutput::Finished { reason, .. } => {
                     finish = Some(reason);
                     break;
                 }
-                Event::Rejected { message } => panic!("request rejected: {message}"),
-                Event::Error { message } => panic!("engine error: {message}"),
+                EngineCoreOutput::Rejected { message } => panic!("request rejected: {message}"),
+                EngineCoreOutput::Error { message }
+                | EngineCoreOutput::ArtifactUnavailable { message } => {
+                    panic!("engine error: {message}")
+                }
                 _ => {}
             }
         }
@@ -399,58 +345,47 @@ mod tests {
         .expect("connect in-process sim engine");
 
         let constraint = GenerationConstraint::GenOnly;
-        let policy = GenerationPolicyDescriptor {
-            trigger: TriggerPolicyDescriptor::Token { token_id: 1000 },
-            gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
-            feedback: Some(GeneratedImageFeedbackRecipe {
-                source: FeedbackSource::DeviceProduct,
-                next_und_token: FeedbackNextToken::EndOfImage,
-                ingest: ImageIngestRecipe::vit_only(2, ImageKvEffect::WorkerDefined),
-                sample_continuation: true,
-            }),
-            ..GenerationPolicyDescriptor::default()
-        };
-        let mut request = GenerationRequest {
-            request_id: RequestId(0),
-            context: vec![ContextSegment::UndTokens {
-                token_ids: vec![1, 2, 3],
-                visibility: UndVisibility::Internal,
+        let policy = ImageGenerationConfig {
+            trigger: ImageTrigger::Token { token_id: 1000 },
+            requires_text_for_image: false,
+            feedback_source: Some(FeedbackSource::DeviceProduct),
+            feedback_next_token: FeedbackNextToken::EndOfImage,
+            num_feedback_positions: 2,
+            feedback_encoders: vec![ImageEncoderInput {
+                encoder: ImageIngestStep::VitEncode,
+                num_kv_tokens: None,
+                max_kv_tokens: None,
             }],
-            negative_context: Vec::new(),
+            sample_feedback_continuation: true,
+            ..ImageGenerationConfig::default()
+        };
+        let request = GenerationRequest {
+            request_id: client
+                .register_request("req-image".to_string(), None)
+                .expect("reserve request"),
+            prompt_token_ids: vec![1, 2, 3],
+            multimodal_inputs: Default::default(),
+            negative_prompt_token_ids: Vec::new(),
             constraint,
-            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
             sampling: SamplingParams::default(),
             image: ImageParams {
                 steps: 4,
                 ..ImageParams::default()
             },
             max_und_tokens: 0,
+            include_stop_token: false,
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
             cache: Default::default(),
-            policy,
-            resources: GenerationResourceBounds {
-                context_tokens: 3,
-                max_kv_tokens: 3,
-                ..GenerationResourceBounds::default()
-            },
+            image_generation: policy,
         };
-        request.resources =
-            GenerationResourceBounds::conservative(uniserve_core::GenerationResources {
-                context: &request.context,
-                negative_context: &request.negative_context,
-                behavior: &request.behavior,
-                policy: &request.policy,
-                image: &request.image,
-                max_und_tokens: request.max_und_tokens,
-                cache: &request.cache,
-                limits: &client.generation_limits(),
-            })
+        request
+            .validate_resources(&client.generation_limits())
             .expect("request resources must fit the in-process runtime");
 
         let mut stream = client
-            .submit_generation_request("req-image".to_string(), request)
+            .submit_generation("req-image".to_string(), request)
             .await
             .expect("submit generation request");
 
@@ -460,16 +395,19 @@ mod tests {
         let mut finished = false;
         while let Some(ev) = stream.next().await {
             match ev {
-                Event::ImageBegin { .. } => begins += 1,
-                Event::ImageStep { .. } => steps += 1,
-                Event::ImageDone { .. } => dones += 1,
-                Event::Finished { images, .. } => {
+                EngineCoreOutput::ImageBegin { .. } => begins += 1,
+                EngineCoreOutput::ImageStep { .. } => steps += 1,
+                EngineCoreOutput::ImageDone { .. } => dones += 1,
+                EngineCoreOutput::Finished { images, .. } => {
                     assert_eq!(images, 1, "expected exactly one image");
                     finished = true;
                     break;
                 }
-                Event::Rejected { message } => panic!("request rejected: {message}"),
-                Event::Error { message } => panic!("engine error: {message}"),
+                EngineCoreOutput::Rejected { message } => panic!("request rejected: {message}"),
+                EngineCoreOutput::Error { message }
+                | EngineCoreOutput::ArtifactUnavailable { message } => {
+                    panic!("engine error: {message}")
+                }
                 _ => {}
             }
         }

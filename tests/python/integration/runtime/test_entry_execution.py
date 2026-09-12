@@ -11,33 +11,30 @@ from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.batch import (
     Bounds,
     BufferAllocation,
+    ComputationId,
     DeviceDim,
-    DiffusionRequestParams,
+    DiffusionSamplingParams,
     DType,
-    MediaGeometry,
     NewRequest,
-    OpCode,
-    Operation,
     OpStatus,
-    PointRange,
-    ProductKind,
-    ProductPayload,
-    ProductRef,
+    PipelineStage,
     RequestKey,
     Run,
+    ScheduledRequest,
     ShapeBound,
     Start,
     StaticDim,
-    StorageClass,
+    TensorPublication,
+    TensorRef,
     TensorSpec,
-    TransferHandle,
+    TransferMode,
 )
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.execution.output import finalize_run_result
 from uniserve_worker.foundation.errors import ComputeError, InputError
 from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry
 from uniserve_worker.models.stub import StubModel
-from uniserve_worker.nn.parallel import EntryConfig
+from uniserve_worker.nn.parallel import ComponentConfig
 from uniserve_worker.transfer.layout import fetch_tensor
 
 pytestmark = pytest.mark.integration
@@ -55,32 +52,29 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
             ),
         ),
     }
-    model.supported_work = model.supported_work | {OpCode.ENCODER_TEXT}
+    model.supported_work = model.supported_work | {PipelineStage.TEXT_ENCODING}
     with torch.no_grad():
         model.text_encoder.weight.copy_(torch.arange(128).reshape(32, 4))
     worker = execution_worker(
         model,
-        components=(("text_encoder", EntryConfig((0,))), ("output", EntryConfig((0,)))),
+        components=(("text_encoder", ComponentConfig((0,))), ("output", ComponentConfig((0,)))),
     )
     worker.runner.bind_module("text_encoder", model.text_encoder)
     key = RequestKey(1, 1, 1)
     prompt = (3, 8, 1)
-    reference = ProductRef(
+    reference = TensorRef(
         key,
-        1,
+        ComputationId(1, 0),
         0,
         1,
-        ProductKind.TENSOR,
-        StorageClass.DEVICE_TENSOR,
         DType.F32,
         ShapeBound((StaticDim(1), StaticDim(3), StaticDim(4))),
-        PointRange(),
     )
-    operation = Operation.registered(
+    operation = ScheduledRequest(
         request_key=key,
-        op_id=1,
-        parent=None,
-        kind=OpCode.ENCODER_TEXT,
+        op_id=ComputationId(1, 0),
+        predecessor=None,
+        kind=PipelineStage.TEXT_ENCODING,
         entry="text_encoder",
         bounds=Bounds(),
         outputs=(reference,),
@@ -94,7 +88,8 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
                 NewRequest.create(
                     key,
                     request_pool_idx=1,
-                    diffusion=DiffusionRequestParams(prompt, 1000, MediaGeometry(22, 3, 3, 4)),
+                    diffusion=DiffusionSamplingParams(22, 3, 4, 1000),
+                    prompt_token_ids=prompt,
                 )
             ),
         ),
@@ -115,8 +110,8 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
         assert completion.op_id == operation.op_id
         (product,) = report.products
         assert product.product == reference
-        assert isinstance(product.payload, TransferHandle)
-        tensor = product.payload.value.tensor
+
+        tensor = product.value.tensor
         destination = torch.empty(1, 3, 4)
         tickets = fetch_tensor(
             tensor,
@@ -136,12 +131,12 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
         torch.testing.assert_close(destination, expected.float(), atol=0, rtol=0)
         from dataclasses import replace
 
-        copied = replace(reference, producer_op_id=2)
-        consumer = Operation.registered(
+        copied = replace(reference, producer_op_id=ComputationId(2, 0))
+        consumer = ScheduledRequest(
             request_key=key,
-            op_id=2,
-            parent=None,
-            kind=OpCode.TRANSFER_PRODUCT,
+            op_id=ComputationId(2, 0),
+            predecessor=None,
+            kind=TransferMode.TENSOR,
             entry="output",
             bounds=Bounds(max_transfer_bytes=reference.max_bytes),
             inputs=(reference,),
@@ -149,11 +144,11 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
         )
         prepared = worker.prepare_execute(
             Run(
-                batch_id=3,
+                batch_id=2,
                 run_id=3,
                 collective_seq=3,
                 operations=(consumer,),
-                input_products=(ProductPayload(reference, product.payload),),
+                input_products=(TensorPublication(reference, product.value),),
                 buffer_allocations=(
                     BufferAllocation(reference.buffer_id, 0, reference.max_bytes),
                     BufferAllocation(copied.buffer_id, 256, copied.max_bytes),
@@ -165,7 +160,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
         assert ready.wait(5)
         result = finalize_run_result(worker.execute_prepared(prepared))
         assert result.completions[0].status is OpStatus.OK
-        copied_value = result.products[0].payload.value.tensor
+        copied_value = result.products[0].value.tensor
         tickets = fetch_tensor(
             copied_value,
             destination,
@@ -253,7 +248,7 @@ def test_worker_reports_entry_result_bounds_with_its_static_membership():
             TensorSpec("features", DType.BF16, ShapeBound((DeviceDim(128), StaticDim(512)))),
         ),
     }
-    worker = execution_worker(model, components=(("projection", EntryConfig((0,))),))
+    worker = execution_worker(model, components=(("projection", ComponentConfig((0,))),))
     try:
         info = worker.info.to_mapping()
         (entry,) = WorkerInfo.from_mapping(info).components
@@ -279,7 +274,7 @@ def test_worker_binds_dense_attention_without_requesting_kv_storage():
     model = ExecutionModel()
     model.architecture = "DenseAttention"
     model.resource_geometry = ResourceGeometry(kv=False)
-    model.supported_work = frozenset({OpCode.DIFFUSION_DECODE})
+    model.supported_work = frozenset({PipelineStage.VIDEO_DECODING})
     model.decoder = DenseEntry()
     model.entry_outputs = {
         "decoder": (
@@ -308,7 +303,7 @@ def test_worker_binds_dense_attention_without_requesting_kv_storage():
         worker_id="decoder",
         pipeline_depth=3,
         completion_payload_bytes=1 << 16,
-        components=(("decoder", EntryConfig((0,))),),
+        components=(("decoder", ComponentConfig((0,))),),
     )
     try:
         info = WorkerInfo.from_mapping(worker.info.to_mapping())

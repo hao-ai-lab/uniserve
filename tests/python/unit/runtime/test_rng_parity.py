@@ -20,9 +20,7 @@ from uniserve_worker.execution.rng import (
     sampling_uniform,
 )
 
-_FIXTURE = (
-    Path(__file__).resolve().parents[2] / "generated" / "sampling_rng_parity.json"
-)
+_FIXTURE = Path(__file__).resolve().parents[2] / "generated" / "sampling_rng_parity.json"
 
 
 def _bits(value: float) -> int:
@@ -45,9 +43,9 @@ def test_sampling_rng_matches_the_rust_reference() -> None:
     for case in fixture["cases"]:
         key = sampling_key(
             case["session_seed"],
-            case["authority_id"],
+            case["engine_id"],
             case["request_id"],
-            case["epoch"],
+            case["request_epoch"],
             case["draw_layout"],
         )
         assert key == case["key"]

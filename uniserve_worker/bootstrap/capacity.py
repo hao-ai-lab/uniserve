@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 
 from ..config import WorkerConfig
-from ..execution.batch import DeviceDim, TensorSpec
+from ..execution.batch import DeviceDim, PipelineStage, TensorSpec
 from ..execution.bounded_storage import TensorSchema
 from ..execution.input_buffers import InputGeometry
 from ..foundation.errors import unsupported_setup
@@ -21,9 +21,6 @@ from ..nn.mesh import Communicator, EntryBindings
 from ..runtime.cache_pool import CachePool
 from ..runtime.device import canonical_device, device_memory_budget
 from ..runtime.device_products import DeviceProducts, device_product_capacity_bytes
-
-if TYPE_CHECKING:
-    from ..models.video import MediaExecutionPlan
 
 _DEVICE_PRODUCTS_PER_OPERATION = 6
 _DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
@@ -139,7 +136,7 @@ def local_product_storage_bytes(
     entry_outputs: Mapping[str, tuple[TensorSpec, ...]],
     *,
     bindings: EntryBindings | None,
-    plan: MediaExecutionPlan | None,
+    pipeline_components: Mapping[PipelineStage, str],
     max_unresolved_ops: int,
 ) -> int:
     """Size persistent products from placement, consumers and the output horizon.
@@ -151,20 +148,27 @@ def local_product_storage_bytes(
     consumers finish. Alignment follows PersistentBuffers' allocation contract.
     """
 
-    from ..models.video import MediaPlanRepeat
-
     if max_unresolved_ops < 1:
         raise ValueError("product storage requires a positive output horizon")
     consumers: dict[str, set[str]] = {}
-    streamed: set[str] = set()
-    if plan is not None:
-        stages = {stage.name: stage for stage in plan.stages}
-        for stage in stages.values():
-            if stage.input_from is not None:
-                source = stages[stage.input_from].entry
-                consumers.setdefault(source, set()).add(stage.entry)
-            if stage.repeat is MediaPlanRepeat.VIDEO_UNITS:
-                streamed.add(stage.entry)
+    # These are the concrete persistent Tensor consumers of the video path.
+    # Denoising state is resident; write stages consume decoded output buffers.
+    for source_stage, destination_stage in (
+        (PipelineStage.TEXT_ENCODING, PipelineStage.LATENT_PREPARATION),
+        (PipelineStage.DENOISING, PipelineStage.VIDEO_DECODING),
+        (PipelineStage.DENOISING, PipelineStage.AUDIO_DECODING),
+        (PipelineStage.VIDEO_DECODING, PipelineStage.VIDEO_ENCODING),
+        (PipelineStage.AUDIO_DECODING, PipelineStage.AUDIO_ENCODING),
+    ):
+        source = pipeline_components.get(source_stage)
+        destination = pipeline_components.get(destination_stage)
+        if source is not None and destination is not None:
+            consumers.setdefault(source, set()).add(destination)
+    streamed = {
+        component
+        for stage in (PipelineStage.VIDEO_DECODING, PipelineStage.VIDEO_ENCODING)
+        if (component := pipeline_components.get(stage)) is not None
+    }
     total = 0
     for entry, outputs in entry_outputs.items():
         if bindings is not None:
@@ -288,10 +292,7 @@ def request_tensor_arena_capacity(
         latent_pool_bytes=0,
         device_products=device_products,
         device_product_bytes=(
-            device_product_capacity_bytes(
-                device_products, 1, selected_points_per_operation=1, max_value_bytes=1
-            )
-            + relay_bytes
+            device_product_capacity_bytes(device_products, 1, max_value_bytes=1) + relay_bytes
         ),
         transfer_bytes=max(1, state_slots * product_bytes_per_request),
         transfer_tickets=max(1, min(slots, _MAX_TRANSFER_ENTRIES)),
@@ -330,7 +331,7 @@ def model_arena_capacity(
             product_bytes_per_request=local_product_storage_bytes(
                 model.entry_outputs,
                 bindings=model.bindings,
-                plan=model.media_plan,
+                pipeline_components=model.pipeline_components,
                 max_unresolved_ops=request_tensor_window(depth, request_pool_size),
             ),
         )
@@ -382,7 +383,6 @@ def model_arena_capacity(
     device_product_bytes = device_product_capacity_bytes(
         device_products,
         device_count,
-        selected_points_per_operation=1,
         max_value_bytes=1,
     )
     device_product_bytes += (
@@ -531,7 +531,7 @@ def resolve_request_capacity(
                 product_bytes = local_product_storage_bytes(
                     model.entry_outputs,
                     bindings=model.bindings,
-                    plan=model.media_plan,
+                    pipeline_components=model.pipeline_components,
                     max_unresolved_ops=request_tensor_window(pipeline_depth, count),
                 )
                 arena = request_tensor_arena_capacity(

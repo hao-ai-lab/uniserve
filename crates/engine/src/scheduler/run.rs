@@ -1,10 +1,48 @@
 //! Engine-loop construction, event parking, and owner-thread execution.
 
 use super::*;
+use uniserve_worker_ipc::{ForwardMode, PipelineStage};
 
-impl EngineLoop {
+/// Intersects model requirements with capacities actually loaded by the worker.
+fn resolve_generation_limits(
+    mut limits: uniserve_core::GenerationLimits,
+    info: &WorkerInfo,
+) -> uniserve_core::GenerationLimits {
+    let supports = |kind| info.supported_ops.contains(&kind);
+    let mut available = uniserve_core::GenerationFeatures::empty();
+    if supports(Computation::Forward(ForwardMode::Prefill))
+        && supports(Computation::Forward(ForwardMode::Decode))
+    {
+        available.insert(uniserve_core::GenerationFeatures::UNDERSTANDING);
+    }
+    if supports(Computation::Pipeline(PipelineStage::VisionEncoding)) {
+        available.insert(uniserve_core::GenerationFeatures::VISION_ENCODE);
+    }
+    if supports(Computation::Pipeline(PipelineStage::LatentEncoding)) {
+        available.insert(uniserve_core::GenerationFeatures::LATENT_ENCODE);
+    }
+    if supports(Computation::Pipeline(PipelineStage::LatentPreparation))
+        && supports(Computation::Pipeline(PipelineStage::Denoising))
+        && supports(Computation::Pipeline(PipelineStage::ImageDecoding))
+    {
+        available.insert(uniserve_core::GenerationFeatures::IMAGE_GENERATION);
+    }
+    limits.features &= available;
+    limits.max_latent_units = limits.max_latent_units.min(info.latent_capacity_units());
+    let latent_bound = limits.max_latent_units.min(u64::from(u32::MAX)) as u32;
+    limits.max_vae_grid_tokens = limits.max_vae_grid_tokens.min(latent_bound);
+    limits.max_vit_grid_tokens = limits.max_vit_grid_tokens.min(info.max_batch_tokens);
+    limits.max_latent_feature_bytes = limits.max_latent_feature_bytes.min(info.buffer_pool_bytes);
+    limits.max_vision_feature_bytes = limits.max_vision_feature_bytes.min(info.buffer_pool_bytes);
+    if info.buffer_pool_bytes == 0 {
+        limits.encoder_cache_entries = 0;
+    }
+    limits
+}
+
+impl Scheduler {
     /// Constructs an engine loop with the default scheduler configuration.
-    pub fn new(executor: Box<dyn Executor>, ctrl: ControlTokens, max_batch: usize) -> Self {
+    pub fn new(executor: Box<dyn Executor>, ctrl: SpecialTokenIds, max_batch: usize) -> Self {
         Self::with_config(
             executor,
             ctrl,
@@ -18,7 +56,7 @@ impl EngineLoop {
     /// Constructs an engine loop with an explicit scheduling policy.
     pub fn with_policy(
         executor: Box<dyn Executor>,
-        ctrl: ControlTokens,
+        ctrl: SpecialTokenIds,
         max_batch: usize,
         policy: SchedulingPolicy,
     ) -> Self {
@@ -40,7 +78,7 @@ impl EngineLoop {
     /// Panics when the executor exposes an invalid aggregate capacity view.
     pub fn with_config(
         executor: Box<dyn Executor>,
-        ctrl: ControlTokens,
+        ctrl: SpecialTokenIds,
         config: SchedulerConfig,
     ) -> Self {
         let info = executor
@@ -51,16 +89,18 @@ impl EngineLoop {
         // Capability families are mutually ordered from diffusion-only through
         // unified multimodal support to autoregressive-only execution.
         let work = &info.supported_ops;
-        let family =
-            if work.contains(&OpCode::DiffusionPrepare) && !work.contains(&OpCode::ArDecode) {
-                RuntimeFamily::Diffusion
-            } else if work.contains(&OpCode::DiffusionStep)
-                || (work.contains(&OpCode::EncoderVision) || work.contains(&OpCode::EncoderLatent))
-            {
-                RuntimeFamily::Umm
-            } else {
-                RuntimeFamily::Ar
-            };
+        let family = if work.contains(&Computation::Pipeline(PipelineStage::LatentPreparation))
+            && !work.contains(&Computation::Forward(ForwardMode::Decode))
+        {
+            RuntimeFamily::Diffusion
+        } else if work.contains(&Computation::Pipeline(PipelineStage::Denoising))
+            || (work.contains(&Computation::Pipeline(PipelineStage::VisionEncoding))
+                || work.contains(&Computation::Pipeline(PipelineStage::LatentEncoding)))
+        {
+            RuntimeFamily::Umm
+        } else {
+            RuntimeFamily::Ar
+        };
 
         Self::with_config_for_family(executor, ctrl, config, family)
     }
@@ -68,21 +108,31 @@ impl EngineLoop {
     /// Constructs an engine loop for an explicit runtime family.
     pub fn with_config_for_family(
         executor: Box<dyn Executor>,
-        ctrl: ControlTokens,
+        ctrl: SpecialTokenIds,
         config: SchedulerConfig,
         family: RuntimeFamily,
     ) -> Self {
-        let profile = match family {
-            RuntimeFamily::Ar => RuntimeProfile::ar(uniserve_core::ModelDtype::BFloat16),
-            RuntimeFamily::Diffusion => {
-                RuntimeProfile::diffusion(uniserve_core::ModelDtype::BFloat16)
-            }
-            RuntimeFamily::Umm => RuntimeProfile::umm(
-                uniserve_core::ModelDtype::BFloat16,
-                sim_umm_generation_limits(),
-            ),
+        let generation_limits = match family {
+            RuntimeFamily::Umm => sim_umm_generation_limits(),
+            RuntimeFamily::Ar | RuntimeFamily::Diffusion => uniserve_core::GenerationLimits {
+                features: if family == RuntimeFamily::Ar {
+                    uniserve_core::GenerationFeatures::UNDERSTANDING
+                } else {
+                    uniserve_core::GenerationFeatures::empty()
+                },
+                latent_downsample: 1,
+                max_cfg_branches: 1,
+                ..Default::default()
+            },
         };
-        Self::with_runtime_profile(executor, ctrl, config, family, profile)
+        Self::with_model_limits(
+            executor,
+            ctrl,
+            config,
+            family,
+            uniserve_core::ModelDtype::BFloat16,
+            generation_limits,
+        )
     }
 
     /// Constructs an engine loop from explicit scheduler and model capabilities.
@@ -92,18 +142,20 @@ impl EngineLoop {
     /// # Panics
     ///
     /// Panics when the executor exposes an invalid aggregate capacity view.
-    pub fn with_runtime_profile(
+    pub fn with_model_limits(
         executor: Box<dyn Executor>,
-        ctrl: ControlTokens,
+        ctrl: SpecialTokenIds,
         mut config: SchedulerConfig,
         family: RuntimeFamily,
-        profile: RuntimeProfile,
+        model_dtype: uniserve_core::ModelDtype,
+        generation_limits: uniserve_core::GenerationLimits,
     ) -> Self {
         let info = executor
             .info()
             .runtime_info()
             .expect("executor exposes a valid runtime capacity view");
-        let profile = profile.resolved(&info);
+        let generation_limits = resolve_generation_limits(generation_limits, &info);
+        let latent_dtype = worker_float_dtype(Some(model_dtype));
 
         // Queue and batch limits cannot exceed the physical executor envelope.
         let max_batch_ops = info.max_batch_ops as usize;
@@ -115,8 +167,12 @@ impl EngineLoop {
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
 
         // Unified runtimes reserve one physical slot for the image flow lineage.
-        let flow_slot_reserve =
-            usize::from(info.uses_kv() && info.supported_ops.contains(&OpCode::DiffusionStep));
+        let flow_slot_reserve = usize::from(
+            info.uses_kv()
+                && info
+                    .supported_ops
+                    .contains(&Computation::Pipeline(PipelineStage::Denoising)),
+        );
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity
             .saturating_sub(flow_slot_reserve)
@@ -132,25 +188,20 @@ impl EngineLoop {
         }
 
         // Memory and scheduler statistics share the resolved worker capacities.
-        let kv = worker_kv_state(&info);
-        let stats = Arc::new(SchedStats::default());
+        let cache = KVCacheManager::from_worker_info(&info);
+        let stats = Arc::new(SchedulerStats::default());
         stats.kv_cache.num_blocks.store(
-            kv.as_ref().map_or(0, |state| state.usable_blocks),
+            cache.as_ref().map_or(0, |state| state.usable_blocks),
             Ordering::Relaxed,
-        );
-        let memory = Memory::with_buffer_capacity(
-            &info,
-            info.buffer_pool_bytes,
-            profile.encoder_cache_entries,
         );
 
         // Environment switches select scheduling behavior without changing the
-        // model capability profile.
+        // model capabilities.
         let denoise_step_burst = denoise_step_burst_from_env();
         let flow_exclusive_batch = env::var(FLOW_EXCLUSIVE_BATCH_ENV)
             .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "TRUE"));
 
-        let mut trace_sink = crate::runtime::bench_trace::RuntimeTraceSink::from_env();
+        let mut trace_sink = crate::scheduler::bench_trace::RuntimeTraceSink::from_env();
         if let Some(sink) = trace_sink.as_mut() {
             sink.record(&json!({
                 "event": "run_started",
@@ -175,45 +226,63 @@ impl EngineLoop {
                     "queue_depth": info.queue_depth,
                     "latent_page_units": info.latent_page_units,
                     "latent_pages": info.latent_pages,
-                    "latent_dtype": &profile.latent_dtype,
-                    "latent_downsample": profile.generation_limits.latent_downsample,
-                    "max_vae_grid_tokens": profile.generation_limits.max_vae_grid_tokens,
-                    "max_vit_grid_tokens": profile.generation_limits.max_vit_grid_tokens,
-                    "commit_marker_tokens": profile.generation_limits.commit_marker_tokens,
-                    "max_cfg_branches": profile.generation_limits.max_cfg_branches,
+                    "latent_dtype": &latent_dtype,
+                    "latent_downsample": generation_limits.latent_downsample,
+                    "max_vae_grid_tokens": generation_limits.max_vae_grid_tokens,
+                    "max_vit_grid_tokens": generation_limits.max_vit_grid_tokens,
+                    "commit_marker_tokens": generation_limits.commit_marker_tokens,
+                    "max_cfg_branches": generation_limits.max_cfg_branches,
                 },
             }));
         }
 
         // Runtime state remains single-owner; executors receive immutable batch
-        // snapshots assembled from these queues and cursors.
-        let latent_dtype = profile.latent_dtype;
+        // inputs assembled from these queues and request records.
 
         Self {
             executor,
             pending_submissions: VecDeque::new(),
             worker_affinity: HashMap::new(),
+            cache,
+            encoder_cache: crate::kv::EncoderCacheManager::new(
+                generation_limits.encoder_cache_entries as usize,
+            ),
+            reserved_encoder_entries: 0,
+            request_pool: RequestPool::new(info.request_slots as usize),
+            latent_pool: LatentPool::new(info.latent_pages, info.latent_page_units),
+            reserved_blocks: 0,
+            buffer_pool: BufferPool::new(info.buffer_pool_bytes),
+            encoder_buffers: HashMap::new(),
             info,
-            profile,
-            memory,
+            generation_limits,
             family,
             ctrl,
-            logits_pipeline: crate::runtime::logits::default_pipeline(),
             waiting: HashMap::new(),
             waiting_media: HashMap::new(),
             running: HashMap::new(),
             running_media: HashMap::new(),
             retiring_requests: HashMap::new(),
-            inflight: InflightWindow::new(transfer_capacity),
+            transfer_capacity,
+            num_pending_transfers: 0,
+            batch_id: 0,
+            next_arrival_seq: 1,
+            pending_operations: HashMap::new(),
+            pending_completions: HashMap::new(),
+            pending_finishes: HashMap::new(),
+            pending_batches: HashMap::new(),
             denoise_step_burst,
             latent_dtype,
             pending_commands: VecDeque::new(),
             pending_buffer_frees: HashMap::new(),
-            authority_id: 1,
-            next_op_id: 1,
+            engine_id: 1,
             next_product_generation: 1,
-            next_epoch: 1,
-            scheduler: Scheduler::new(config),
+            next_request_epoch: 1,
+            waiting_order: VecDeque::new(),
+            waiting_media_order: VecDeque::new(),
+            running_order: Vec::new(),
+            output: output::OutputSender::default(),
+            prefer_media: true,
+            config,
             flow_exclusive_batch,
             fatal: false,
             trace_sink,
@@ -224,49 +293,56 @@ impl EngineLoop {
 
     /// Returns the active scheduling policy.
     pub fn policy(&self) -> SchedulingPolicy {
-        self.scheduler.config.policy
+        self.config.policy
     }
 
     /// Returns the effective scheduler configuration.
     pub fn config(&self) -> &SchedulerConfig {
-        &self.scheduler.config
+        &self.config
     }
 
     /// Enables or disables reusable prefix caching.
     pub fn set_prefix_cache(&mut self, on: bool) {
-        self.memory.set_prefix_cache(on);
+        if let Some(cache) = self.cache.as_mut() {
+            cache.set_prefix_cache(on);
+        }
     }
 
     /// Selects the hash algorithm used for prefix-cache keys.
     pub fn set_hash_algo(&mut self, algo: HashAlgo) {
-        self.memory.set_hash_algo(algo);
+        if let Some(cache) = self.cache.as_mut() {
+            cache.set_hash_algo(algo);
+        }
     }
     /// Configures the per-step token budget.
     pub fn set_token_budget(&mut self, tokens: usize) {
-        self.scheduler.config.max_num_batched_tokens = tokens.max(1);
+        self.config.max_num_batched_tokens = tokens.max(1);
     }
 
     /// Sets the token threshold above which prefill is chunked.
     pub fn set_long_prefill_threshold(&mut self, n: usize) {
-        self.scheduler.config.long_prefill_threshold = n.max(1);
+        self.config.long_prefill_threshold = n.max(1);
     }
 
     /// Sets the resident sequence limit within the worker slot capacity.
     pub fn set_max_num_seqs(&mut self, n: usize) {
         let flow_slot_reserve = usize::from(
-            self.info.uses_kv() && self.info.supported_ops.contains(&OpCode::DiffusionStep),
+            self.info.uses_kv()
+                && self
+                    .info
+                    .supported_ops
+                    .contains(&Computation::Pipeline(PipelineStage::Denoising)),
         );
         let capacity = self
-            .memory
-            .request_slots
+            .request_pool
             .capacity()
             .saturating_sub(flow_slot_reserve)
             .max(1);
-        self.scheduler.config.max_num_seqs = n.clamp(1, capacity);
+        self.config.max_num_seqs = n.clamp(1, capacity);
     }
     /// Caps waiting and terminal-output-retained request state.
     pub fn set_max_num_waiting(&mut self, n: usize) {
-        self.scheduler.config.max_num_waiting = n.clamp(1, MAX_NUM_WAITING);
+        self.config.max_num_waiting = n.clamp(1, MAX_NUM_WAITING);
     }
 
     /// Returns the executor's aggregate worker capabilities.
@@ -274,13 +350,13 @@ impl EngineLoop {
         &self.info
     }
 
-    /// Returns the resolved model runtime profile.
-    pub fn runtime_profile(&self) -> &RuntimeProfile {
-        &self.profile
+    /// Returns the model limits supported by the loaded execution workers.
+    pub fn generation_limits(&self) -> &uniserve_core::GenerationLimits {
+        &self.generation_limits
     }
 
     /// Returns a shared handle to scheduler counters.
-    pub fn stats_handle(&self) -> Arc<SchedStats> {
+    pub fn stats_handle(&self) -> Arc<SchedulerStats> {
         self.stats.clone()
     }
 
@@ -311,9 +387,9 @@ impl EngineLoop {
 
     /// Returns the number of pending requests.
     pub(super) fn pending_request_count(&self) -> usize {
-        self.scheduler
-            .waiting_len()
-            .saturating_add(self.scheduler.waiting_media_len())
+        self.waiting_order
+            .len()
+            .saturating_add(self.waiting_media_order.len())
     }
 
     /// Runs the owner-thread control loop, blocking only when fully idle.
@@ -384,7 +460,7 @@ impl EngineLoop {
         self.stats
             .general
             .in_flight
-            .store(self.inflight.batch_started.len(), Ordering::Relaxed);
+            .store(self.pending_batches.len(), Ordering::Relaxed);
         self.publish_cache_stats();
     }
 }

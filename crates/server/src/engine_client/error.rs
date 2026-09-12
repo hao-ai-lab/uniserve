@@ -20,6 +20,12 @@ pub enum Error {
         /// Conflicting external request identifier.
         request_id: String,
     },
+    /// Submission does not match the reserved request incarnation.
+    #[error("request `{request_id}` has no matching registration")]
+    UnknownRequestId {
+        /// External identity supplied by the caller.
+        request_id: String,
+    },
     #[error(transparent)]
     /// The engine rejected request submission.
     Submit(#[from] uniserve_engine::SubmitError),

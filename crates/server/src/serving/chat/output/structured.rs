@@ -1,19 +1,7 @@
-//! Converts semantic assistant updates into structured chat events.
-//!
-//! The processor preserves block order while assembling incremental reasoning,
-//! text, and tool-call content.
+//! Incremental assistant block assembly into the public request output.
 
-use crate::serving::text::DecodedLogprobs;
-use asynk_strim_attr::{TryYielder, try_stream};
-use futures::{StreamExt as _, pin_mut};
-
-use super::processor::AssistantEvent;
-use crate::serving::chat::Error;
-use crate::serving::chat::Result;
-use crate::serving::chat::output::FinishReason;
-use crate::serving::chat::{
-    AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall, ChatEvent,
-};
+use crate::serving::RequestOutput;
+use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, Error, Result};
 
 /// One currently open assistant text-like block being assembled from streamed
 /// deltas.
@@ -40,12 +28,12 @@ struct OpenToolCall {
 
 /// Per-stream block assembly state.
 ///
-/// The adapter maintains at most one open text block and one open tool call,
+/// The processor maintains at most one open text block and one open tool call,
 /// and appends deltas to them until the semantic kind changes or the stream
 /// terminates.
-struct StructuredEventState {
-    /// Final assistant message assembled so far.
-    message: AssistantMessage,
+pub(crate) struct OutputProcessor {
+    /// Number of blocks already delivered to the output consumer.
+    num_completed_blocks: usize,
     /// Currently open text or reasoning block, if any.
     open_text_block: Option<OpenTextBlock>,
     /// Currently open tool call, if any.
@@ -54,11 +42,11 @@ struct StructuredEventState {
     next_tool_call_index: usize,
 }
 
-impl StructuredEventState {
+impl OutputProcessor {
     /// Creates one fresh assembly state for a new streamed response.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            message: AssistantMessage::default(),
+            num_completed_blocks: 0,
             open_text_block: None,
             open_tool_call: None,
             next_tool_call_index: 0,
@@ -66,31 +54,19 @@ impl StructuredEventState {
     }
 
     /// Converts one parsed text delta into zero or more structured chat events.
-    fn process_text_delta(
+    pub(crate) fn process_text_delta(
         &mut self,
         kind: AssistantBlockKind,
         delta: String,
-    ) -> Result<Vec<ChatEvent>> {
+    ) -> Vec<RequestOutput> {
         let mut events = Vec::new();
         self.close_open_tool_call(&mut events);
         self.push_text_delta(kind, delta, &mut events);
-        Ok(events)
-    }
-
-    /// Forwards per-update sample metadata without attaching it to text blocks.
-    fn process_logprobs_delta(
-        &mut self,
-        logprobs: Option<DecodedLogprobs>,
-        token_ids: Vec<u32>,
-    ) -> Result<Vec<ChatEvent>> {
-        Ok(vec![ChatEvent::LogprobsDelta {
-            logprobs,
-            token_ids,
-        }])
+        events
     }
 
     /// Starts one new tool call, closing any incompatible open block first.
-    fn start_tool_call(&mut self, id: String, name: String) -> Result<Vec<ChatEvent>> {
+    pub(crate) fn start_tool_call(&mut self, id: String, name: String) -> Vec<RequestOutput> {
         let mut events = Vec::new();
         self.close_open_text_block(&mut events);
         self.close_open_tool_call(&mut events);
@@ -103,12 +79,12 @@ impl StructuredEventState {
             name: name.clone(),
             arguments: String::new(),
         });
-        events.push(ChatEvent::ToolCallStart { index, id, name });
-        Ok(events)
+        events.push(RequestOutput::ToolCallStart { index, id, name });
+        events
     }
 
     /// Appends one incremental tool-call arguments delta.
-    fn push_tool_call_arguments(&mut self, delta: String) -> Result<Vec<ChatEvent>> {
+    pub(crate) fn push_tool_call_arguments(&mut self, delta: String) -> Result<Vec<RequestOutput>> {
         let mut events = Vec::new();
         let Some(open_tool_call) = self.open_tool_call.as_mut() else {
             return Err(Error::ToolCallStreamInvariant {
@@ -116,33 +92,19 @@ impl StructuredEventState {
             });
         };
         open_tool_call.arguments.push_str(&delta);
-        events.push(ChatEvent::ToolCallArgumentsDelta {
+        events.push(RequestOutput::ToolCallArgumentsDelta {
             index: open_tool_call.index,
             delta,
         });
         Ok(events)
     }
 
-    /// Closes any open block and emit the terminal `Done` event.
-    fn finish(
-        &mut self,
-        prompt_token_count: usize,
-        output_token_count: usize,
-        internal_token_count: usize,
-        finish_reason: FinishReason,
-    ) -> Result<Vec<ChatEvent>> {
+    /// Closes the remaining blocks before the caller emits terminal usage.
+    pub(crate) fn finish(&mut self) -> Vec<RequestOutput> {
         let mut events = Vec::new();
         self.close_open_text_block(&mut events);
         self.close_open_tool_call(&mut events);
-        events.push(ChatEvent::Done {
-            message: self.message.clone(),
-            prompt_token_count,
-            output_token_count,
-            visible_output_token_count: output_token_count.saturating_sub(internal_token_count),
-            internal_token_count,
-            finish_reason,
-        });
-        Ok(events)
+        events
     }
 
     /// Appends one semantic text delta to the current block, or open a new block
@@ -151,7 +113,7 @@ impl StructuredEventState {
         &mut self,
         kind: AssistantBlockKind,
         delta: String,
-        events: &mut Vec<ChatEvent>,
+        events: &mut Vec<RequestOutput>,
     ) {
         if delta.is_empty() {
             return;
@@ -161,30 +123,26 @@ impl StructuredEventState {
             // If there's a currently open block of the same kind, append to it.
             Some(open_block) if open_block.kind == kind => {
                 open_block.text.push_str(&delta);
-                events.push(ChatEvent::BlockDelta {
-                    index: open_block.index,
-                    kind,
-                    delta,
-                });
+                push_delta(events, kind, delta);
             }
             // Otherwise, close the currently open block (if any) and start a
             // new one.
             _ => {
                 self.close_open_text_block(events);
-                let index = self.message.content.len();
+                let index = self.num_completed_blocks;
                 self.open_text_block = Some(OpenTextBlock {
                     index,
                     kind,
                     text: delta.clone(),
                 });
-                events.push(ChatEvent::BlockStart { index, kind });
-                events.push(ChatEvent::BlockDelta { index, kind, delta });
+                events.push(RequestOutput::OutputBlockStart { index, kind });
+                push_delta(events, kind, delta);
             }
         }
     }
 
     /// Finalizes the currently open text block, if present.
-    fn close_open_text_block(&mut self, events: &mut Vec<ChatEvent>) {
+    fn close_open_text_block(&mut self, events: &mut Vec<RequestOutput>) {
         let Some(open_block) = self.open_text_block.take() else {
             return;
         };
@@ -200,99 +158,39 @@ impl StructuredEventState {
                 unreachable!("tool calls must not be assembled as text blocks")
             }
         };
-        self.message.push_block(block.clone());
-        events.push(ChatEvent::BlockEnd {
+        self.num_completed_blocks += 1;
+        events.push(RequestOutput::OutputBlockEnd {
             index: open_block.index,
             block,
         });
     }
 
     /// Finalizes the currently open tool call, if present.
-    fn close_open_tool_call(&mut self, events: &mut Vec<ChatEvent>) {
+    fn close_open_tool_call(&mut self, events: &mut Vec<RequestOutput>) {
         let Some(open_tool_call) = self.open_tool_call.take() else {
             return;
         };
 
-        let call = AssistantToolCall {
+        self.num_completed_blocks += 1;
+        events.push(RequestOutput::ToolCallEnd {
+            index: open_tool_call.index,
             id: open_tool_call.id,
             name: open_tool_call.name,
             arguments: open_tool_call.arguments,
-        };
-        self.message
-            .push_block(AssistantContentBlock::ToolCall(call.clone()));
-        events.push(ChatEvent::ToolCallEnd {
-            index: open_tool_call.index,
-            call,
         });
     }
 }
 
-/// Wraps one parsed assistant stream in the public structured chat event
-/// stream.
-#[try_stream]
-pub async fn structured_chat_event_stream(
-    stream: impl futures::Stream<Item = Result<AssistantEvent>> + Send,
-    mut y: TryYielder<ChatEvent, Error>,
-) -> Result<()> {
-    pin_mut!(stream);
-
-    let mut state = StructuredEventState::new();
-
-    while let Some(event) = stream.next().await.transpose()? {
-        match event {
-            AssistantEvent::Start {
-                prompt_token_ids,
-                prompt_logprobs,
-                queued_at,
-                scheduled_at,
-            } => {
-                y.yield_ok(ChatEvent::Start {
-                    prompt_token_ids,
-                    prompt_logprobs,
-                    queued_at,
-                    scheduled_at,
-                })
-                .await;
-            }
-            AssistantEvent::TextDelta { kind, delta } => {
-                for next in state.process_text_delta(kind, delta)? {
-                    y.yield_ok(next).await;
-                }
-            }
-            AssistantEvent::SampleDelta {
-                logprobs,
-                token_ids,
-            } => {
-                for next in state.process_logprobs_delta(logprobs, token_ids)? {
-                    y.yield_ok(next).await;
-                }
-            }
-            AssistantEvent::ToolCallStart { id, name } => {
-                for next in state.start_tool_call(id, name)? {
-                    y.yield_ok(next).await;
-                }
-            }
-            AssistantEvent::ToolCallArgumentsDelta { delta } => {
-                for next in state.push_tool_call_arguments(delta)? {
-                    y.yield_ok(next).await;
-                }
-            }
-            AssistantEvent::Done {
-                prompt_token_count,
-                output_token_count,
-                internal_token_count,
-                finish_reason,
-            } => {
-                for next in state.finish(
-                    prompt_token_count,
-                    output_token_count,
-                    internal_token_count,
-                    finish_reason,
-                )? {
-                    y.yield_ok(next).await;
-                }
-            }
-        }
-    }
-    Ok(())
+/// Text and reasoning are distinct public deltas; block indices are carried
+/// by the opening and closing events.
+fn push_delta(events: &mut Vec<RequestOutput>, kind: AssistantBlockKind, text: String) {
+    events.push(match kind {
+        AssistantBlockKind::Text => RequestOutput::TextDelta {
+            text,
+            token_ids: Vec::new(),
+            logprobs: None,
+        },
+        AssistantBlockKind::Reasoning => RequestOutput::ReasoningDelta { text },
+        AssistantBlockKind::ToolCall => unreachable!("tool calls use argument deltas"),
+    });
 }

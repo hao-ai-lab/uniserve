@@ -106,7 +106,7 @@ macro_rules! ipc_error {
 }
 
 /// IPC version this build emits on every [`Header`].
-pub const IPC_VERSION: u16 = 36;
+pub const IPC_VERSION: u16 = 58;
 
 /// Returns whether this build can decode a peer-advertised IPC `version`.
 pub fn is_supported_ipc_version(version: u16) -> bool {
@@ -121,14 +121,12 @@ pub fn is_supported_ipc_version(version: u16) -> bool {
 /// [`ZeroCopySend`], so padding would copy uninitialized bytes across the
 /// process boundary and make logically equal headers bytewise unstable. The
 /// layout is exactly
-/// `3*u64 + 3*u32 + u16 + 2*u8 = 40` bytes with no holes.
+/// `2*u64 + 3*u32 + u16 + 2*u8 = 32` bytes with no holes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     /// Physical run identity, or zero for non-run requests.
     pub run_id: u64,
-    /// Operation identity, or zero for run-level frames.
-    pub op_id: u64,
     /// Request-response correlation identity.
     pub call_id: u64,
     /// Encoded payload length in bytes.
@@ -150,7 +148,6 @@ impl Default for Header {
     fn default() -> Self {
         Self {
             run_id: 0,
-            op_id: 0,
             call_id: 0,
             len: 0,
             reserved0: 0,
@@ -167,7 +164,7 @@ unsafe impl ZeroCopySend for Header {}
 // This assertion binds the C representation to the sum of its field sizes so
 // zero-copy transmission cannot include implicit padding.
 const _: () = assert!(
-    std::mem::size_of::<Header>() == 3 * 8 + 3 * 4 + 2 + 2,
+    std::mem::size_of::<Header>() == 2 * 8 + 3 * 4 + 2 + 2,
     "Header must be padding-free for zero-copy transmission"
 );
 
@@ -533,8 +530,7 @@ impl ServerEndpoint {
 /// Builds the IPC header that accompanies `req`.
 ///
 /// `call_id` is the authoritative request/response correlation key. The
-/// `run_id` and `op_id` fields are diagnostic hints populated from the run and
-/// its first operation. The decoded payload is authoritative for runs that
+/// `run_id` field is a diagnostic hint populated from the run. The decoded payload is authoritative for runs that
 /// carry multiple operation identities.
 pub fn header_for_request(req: &WorkerRequest) -> Header {
     let mut h = Header {
@@ -544,10 +540,6 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
     };
     if let Some(run) = req.run() {
         h.run_id = run.run_id;
-        // Only the first operation contributes the diagnostic header hint.
-        if let Some(operation) = run.operations().next() {
-            h.op_id = operation.op_id.0;
-        }
     }
     h
 }
@@ -555,8 +547,7 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
 /// Builds the IPC header that accompanies `resp`.
 ///
 /// `call_id` is the authoritative request/response correlation key. The
-/// `run_id` and `op_id` fields are diagnostic hints populated from the result
-/// and its first completion. The decoded payload is authoritative when a result
+/// `run_id` field is a diagnostic hint populated from the result. The decoded payload is authoritative when a result
 /// aggregates multiple operation identities.
 pub fn header_for_response(resp: &WorkerResponse) -> Header {
     let mut h = Header {
@@ -566,10 +557,6 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
     };
     if let Some(report) = resp.report() {
         h.run_id = report.run_id;
-        // Only the first completion contributes the diagnostic header hint.
-        if let Some(completion) = report.completions().next() {
-            h.op_id = completion.op_id.0;
-        }
     }
     h
 }
@@ -671,11 +658,5 @@ mod tests {
             ..Default::default()
         };
         assert!(verify_header_len(h, 0).is_err());
-    }
-
-    #[test]
-    fn header_is_padding_free() {
-        // 3 u64 + 3 u32 + 1 u16 + 2 u8, with no implicit padding.
-        assert_eq!(std::mem::size_of::<Header>(), 3 * 8 + 3 * 4 + 2 + 2);
     }
 }

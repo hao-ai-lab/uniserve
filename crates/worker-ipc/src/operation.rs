@@ -2,63 +2,148 @@
 
 use super::*;
 
-/// `(authority_id, request_id, epoch)`. The epoch advances whenever an admitted
+/// `(engine_id, request_id, request_epoch)`. The epoch advances whenever an admitted
 /// identity is reused, so no operation or product reference aliases across
 /// requests or epochs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestKey {
-    /// Authority namespace that allocates request identifiers.
-    pub authority_id: u64,
-    /// Identifier assigned to the request within its authority namespace.
+    /// Engine instance that allocates request identifiers.
+    pub engine_id: u64,
+    /// Identifier assigned to the request within its engine instance.
     pub request_id: RequestId,
     /// Admission generation that distinguishes reuse of the same request identifier.
-    pub epoch: u64,
+    pub request_epoch: u64,
 }
 
 impl RequestKey {
-    /// Constructs an identity from authority, request, and admission epoch.
-    pub const fn new(authority_id: u64, request_id: RequestId, epoch: u64) -> Self {
+    /// Constructs an identity from engine, request, and admission epoch.
+    pub const fn new(engine_id: u64, request_id: RequestId, request_epoch: u64) -> Self {
         Self {
-            authority_id,
+            engine_id,
             request_id,
-            epoch,
+            request_epoch,
         }
     }
 }
 
-/// Worker-private execution modes carried by a physical [`Run`].
+/// The numerical mode of an autoregressive or mixed model forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
-pub enum OpCode {
-    /// Extends an autoregressive prefix with prompt tokens.
-    ArExtend = 0,
-    /// Produces the next autoregressive token.
-    ArDecode = 1,
-    /// Verifies speculative autoregressive tokens.
-    ArVerify = 2,
-    /// Encodes image input into vision features.
-    EncoderVision = 3,
-    /// Encodes input into latent features.
-    EncoderLatent = 4,
-    /// Publishes a product for another execution stage.
-    TransferProduct = 5,
-    /// Publishes paged KV state for another worker pool.
-    TransferKvPublish = 6,
-    /// Installs published paged KV state in the destination pool.
-    TransferKvInstall = 7,
-    /// Initializes a diffusion trajectory.
-    DiffusionPrepare = 8,
-    /// Advances a diffusion trajectory.
-    DiffusionStep = 9,
-    /// Finalizes a diffusion trajectory for decoding.
-    DiffusionFinalize = 10,
-    /// Decodes a completed diffusion trajectory into media.
-    DiffusionDecode = 11,
-    /// Encodes prompt tokens into a conditioning tensor.
-    EncoderText = 12,
-    /// Consumes decoded media units into their ordered output stream.
-    MediaAppend = 13,
+pub enum ForwardMode {
+    Prefill,
+    Decode,
+    Verify,
+    Mixed,
+}
+
+impl ForwardMode {
+    pub const ALL: [Self; 4] = [Self::Prefill, Self::Decode, Self::Verify, Self::Mixed];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::Verify => "verify",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
+/// A concrete encoder, diffusion, decoder, or media-output computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum PipelineStage {
+    VisionEncoding,
+    LatentEncoding,
+    TextEncoding,
+    LatentPreparation,
+    Denoising,
+    ImageDecoding,
+    VideoDecoding,
+    AudioDecoding,
+    VideoEncoding,
+    AudioEncoding,
+    Muxing,
+}
+
+impl PipelineStage {
+    pub const ALL: [Self; 11] = [
+        Self::VisionEncoding,
+        Self::LatentEncoding,
+        Self::TextEncoding,
+        Self::LatentPreparation,
+        Self::Denoising,
+        Self::ImageDecoding,
+        Self::VideoDecoding,
+        Self::AudioDecoding,
+        Self::VideoEncoding,
+        Self::AudioEncoding,
+        Self::Muxing,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VisionEncoding => "vision_encoding",
+            Self::LatentEncoding => "latent_encoding",
+            Self::TextEncoding => "text_encoding",
+            Self::LatentPreparation => "latent_preparation",
+            Self::Denoising => "denoising",
+            Self::ImageDecoding => "image_decoding",
+            Self::VideoDecoding => "video_decoding",
+            Self::AudioDecoding => "audio_decoding",
+            Self::VideoEncoding => "video_encoding",
+            Self::AudioEncoding => "audio_encoding",
+            Self::Muxing => "muxing",
+        }
+    }
+}
+
+impl PipelineStage {
+    /// Fixed stages needed to produce video and audio.
+    pub const VIDEO: [Self; 8] = [
+        Self::TextEncoding,
+        Self::LatentPreparation,
+        Self::Denoising,
+        Self::VideoDecoding,
+        Self::AudioDecoding,
+        Self::VideoEncoding,
+        Self::AudioEncoding,
+        Self::Muxing,
+    ];
+}
+
+/// The storage action performed between concrete producers and consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum TransferMode {
+    Tensor,
+    KvPublish,
+    KvInstall,
+}
+
+impl TransferMode {
+    pub const ALL: [Self; 3] = [Self::Tensor, Self::KvPublish, Self::KvInstall];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tensor => "tensor",
+            Self::KvPublish => "kv_publish",
+            Self::KvInstall => "kv_install",
+        }
+    }
+}
+
+/// Exactly one computation classification. The sum preserves the distinct
+/// forward, pipeline, and storage contracts without parallel opcode metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Computation {
+    Forward(ForwardMode),
+    Pipeline(PipelineStage),
+    Transfer(TransferMode),
 }
 
 /// Configured or resolved worker attention implementation.
@@ -172,143 +257,48 @@ impl<'de> Deserialize<'de> for AttentionBackend {
 #[error("unsupported attention backend {0:?}")]
 pub struct AttentionBackendParseError(String);
 
-impl OpCode {
-    /// Physical run kinds supported by the protocol.
-    pub const ALL: [Self; 14] = [
-        Self::ArExtend,
-        Self::ArDecode,
-        Self::ArVerify,
-        Self::EncoderVision,
-        Self::EncoderLatent,
-        Self::TransferProduct,
-        Self::TransferKvPublish,
-        Self::TransferKvInstall,
-        Self::DiffusionPrepare,
-        Self::DiffusionStep,
-        Self::DiffusionFinalize,
-        Self::DiffusionDecode,
-        Self::EncoderText,
-        Self::MediaAppend,
+impl Computation {
+    /// Computations accepted as individual scheduled request items.
+    pub const ALL: [Self; 17] = [
+        Self::Forward(ForwardMode::Prefill),
+        Self::Forward(ForwardMode::Decode),
+        Self::Forward(ForwardMode::Verify),
+        Self::Pipeline(PipelineStage::VisionEncoding),
+        Self::Pipeline(PipelineStage::LatentEncoding),
+        Self::Pipeline(PipelineStage::TextEncoding),
+        Self::Pipeline(PipelineStage::LatentPreparation),
+        Self::Pipeline(PipelineStage::Denoising),
+        Self::Pipeline(PipelineStage::ImageDecoding),
+        Self::Pipeline(PipelineStage::VideoDecoding),
+        Self::Pipeline(PipelineStage::AudioDecoding),
+        Self::Pipeline(PipelineStage::VideoEncoding),
+        Self::Pipeline(PipelineStage::AudioEncoding),
+        Self::Pipeline(PipelineStage::Muxing),
+        Self::Transfer(TransferMode::Tensor),
+        Self::Transfer(TransferMode::KvPublish),
+        Self::Transfer(TransferMode::KvInstall),
     ];
 
-    /// Returns whether this variant advances the authoritative request lineage.
     pub const fn advances_state(self) -> bool {
         matches!(
             self,
-            Self::ArExtend
-                | Self::ArDecode
-                | Self::ArVerify
-                | Self::DiffusionPrepare
-                | Self::DiffusionStep
+            Self::Forward(_)
+                | Self::Pipeline(PipelineStage::LatentPreparation | PipelineStage::Denoising)
         )
     }
 
-    /// Returns whether this work requires a host-resolved semantic parent.
-    pub const fn requires_fixed_parent(self) -> bool {
-        matches!(self, Self::TransferKvPublish)
-    }
-
-    /// Returns the device execution domain that owns this work leaf.
-    pub const fn domain(self) -> Domain {
-        match self {
-            Self::ArDecode | Self::ArVerify => Domain::Decode,
-            Self::DiffusionPrepare
-            | Self::DiffusionStep
-            | Self::DiffusionDecode
-            | Self::DiffusionFinalize
-            | Self::MediaAppend => Domain::Flow,
-            Self::ArExtend
-            | Self::EncoderText
-            | Self::EncoderVision
-            | Self::EncoderLatent
-            | Self::TransferProduct
-            | Self::TransferKvPublish
-            | Self::TransferKvInstall => Domain::Prefill,
-        }
-    }
-
-    /// Returns the stable wire name for this physical run kind.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::ArExtend => "ar_extend",
-            Self::ArDecode => "ar_decode",
-            Self::ArVerify => "ar_verify",
-            Self::EncoderVision => "encoder_vision",
-            Self::EncoderText => "encoder_text",
-            Self::EncoderLatent => "encoder_latent",
-            Self::TransferProduct => "transfer_product",
-            Self::TransferKvPublish => "transfer_kv_publish",
-            Self::TransferKvInstall => "transfer_kv_install",
-            Self::DiffusionPrepare => "diffusion_prepare",
-            Self::DiffusionStep => "diffusion_step",
-            Self::DiffusionFinalize => "diffusion_finalize",
-            Self::DiffusionDecode => "diffusion_decode",
-            Self::MediaAppend => "media_append",
+            Self::Forward(mode) => mode.as_str(),
+            Self::Pipeline(stage) => stage.as_str(),
+            Self::Transfer(mode) => mode.as_str(),
         }
     }
-}
-
-/// One exact state point.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
-pub enum CheckpointPoint {
-    /// Host-selected semantic point.
-    Fixed(u32),
-    /// Point selected by device execution.
-    DeviceSelected,
-}
-
-/// Names one exact state point of a producer operation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Checkpoint {
-    /// Operation that produces the checkpoint.
-    pub op_id: OpId,
-    /// Semantic point within the producing operation.
-    pub point: CheckpointPoint,
-}
-
-impl Checkpoint {
-    /// Constructs the fixed admission-root checkpoint for an operation.
-    pub const fn admission_root(op_id: OpId) -> Self {
-        Self {
-            op_id,
-            point: CheckpointPoint::Fixed(0),
-        }
-    }
-
-    /// Returns whether this checkpoint names a host-known fixed point.
-    pub fn is_fixed(&self) -> bool {
-        matches!(self.point, CheckpointPoint::Fixed(_))
-    }
-
-    /// Validates checkpoint identity and point constraints.
-    pub fn validate(&self) -> ValidationResult<()> {
-        ensure_valid!(
-            self.op_id.0 > 0 || matches!(self.point, CheckpointPoint::Fixed(0)),
-            "checkpoint operation id is invalid"
-        );
-        Ok(())
-    }
-}
-
-/// The device execution class used for static lane binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum Domain {
-    /// Prompt and encoder work that expands request state.
-    Prefill = 0,
-    /// Latency-sensitive autoregressive token work.
-    Decode = 1,
-    /// Diffusion trajectory work.
-    Flow = 2,
 }
 
 /// Hard resource maxima the scheduler reserves before an operation runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Bounds {
-    /// Maximum semantic points the operation may advance.
-    pub max_points: u32,
     /// Maximum tokens the operation may process or produce.
     pub max_tokens: u32,
     /// Maximum paged-KV blocks the operation may consume.
@@ -345,170 +335,276 @@ pub struct Rng {
     pub draw_layout: DrawLayout,
 }
 
-/// Executable tag, data dependencies and authorized bounds for a bounded operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OpPayload {
-    pub code: OpCode,
-    pub bounds: Bounds,
-    pub inputs: Vec<ProductRef>,
-    pub outputs: Vec<ProductRef>,
-    pub predicate: Option<ProductRef>,
-    pub rng: Option<Rng>,
-    pub control_seq: u64,
+/// Branch-local token processor inputs for one sampling operation.
+///
+/// Token ids in every field are strictly increasing. `allowed_token_ids`
+/// distinguishes no whitelist (`None`) from a present empty whitelist, which
+/// deterministically represents an invalid all-masked distribution. Penalty
+/// token counts are not carried here: they are a device-resident committed base
+/// plus bounded per-operation deltas folded after sampling accepts tokens, so no host
+/// token history participates in a successor's sampling input.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SamplingState {
+    /// Optional whitelist of token identifiers eligible for sampling.
+    pub allowed_token_ids: Option<Vec<u32>>,
+    /// Token identifiers excluded from sampling.
+    pub suppressed_token_ids: Vec<u32>,
+    /// Token identifiers that terminate generation when selected.
+    pub finish_token_ids: Vec<u32>,
+    /// Token identifiers that advance a structured-generation transition.
+    pub transition_token_ids: Vec<u32>,
+    /// Whether the current grammar state requires immediate termination.
+    pub force_finish: bool,
 }
 
-impl OpPayload {
-    pub fn new(
-        code: OpCode,
-        bounds: Bounds,
-        inputs: Vec<ProductRef>,
-        outputs: Vec<ProductRef>,
-        predicate: Option<ProductRef>,
-        rng: Option<Rng>,
-        control_seq: u64,
-    ) -> Self {
-        Self {
-            code,
-            bounds,
-            inputs,
-            outputs,
-            predicate,
-            rng,
-            control_seq,
+impl SamplingState {
+    /// Sorts and deduplicates token identifier sets for deterministic encoding.
+    pub fn canonicalize(&mut self) {
+        if let Some(allowed) = &mut self.allowed_token_ids {
+            allowed.sort_unstable();
+            allowed.dedup();
         }
-    }
-
-    fn fields(
-        &self,
-    ) -> (
-        &Bounds,
-        &[ProductRef],
-        &[ProductRef],
-        Option<&ProductRef>,
-        Option<Rng>,
-        u64,
-    ) {
-        (
-            &self.bounds,
-            &self.inputs,
-            &self.outputs,
-            self.predicate.as_ref(),
-            self.rng,
-            self.control_seq,
-        )
+        self.suppressed_token_ids.sort_unstable();
+        self.suppressed_token_ids.dedup();
+        self.finish_token_ids.sort_unstable();
+        self.finish_token_ids.dedup();
+        self.transition_token_ids.sort_unstable();
+        self.transition_token_ids.dedup();
     }
 }
 
-/// One immutable unit of registered work.
+/// One immutable computation with its identity, data dependencies, and output limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Operation {
+pub struct ScheduledRequest {
     /// Request lineage that owns the operation.
     pub request_key: RequestKey,
-    /// Request-local operation identifier.
-    pub op_id: OpId,
-    /// Exact state dependency, absent for computation determined only by its inputs.
-    pub parent: Option<Checkpoint>,
+    /// Logical batch and selection ordinal of the completed computation.
+    pub op_id: ComputationId,
+    /// Execution-order dependency; zero identifies admission, absent for independent work.
+    pub predecessor: Option<ComputationId>,
     /// Computation entry bound within the selected Worker.
     pub entry: String,
-    /// Family-specific products, bounds, and control state.
-    pub payload: OpPayload,
+    /// Computation performed by this operation.
+    pub code: Computation,
+    /// Scheduler-declared limits for the computation and its outputs.
+    pub bounds: Bounds,
+    /// Data dependencies consumed in input order.
+    pub inputs: Vec<TensorRef>,
+    /// Outputs allocated to this producer.
+    pub outputs: Vec<TensorRef>,
+    /// Source token scalar transported between computation entries.
+    pub token_input: Option<TensorRef>,
+    /// Sampled token and continuation bit in one I64 scalar.
+    pub token_output: Option<TensorRef>,
+    /// Vision features consumed by multimodal forward.
+    pub vision_input: Option<TensorRef>,
+    /// VAE features consumed by multimodal forward.
+    pub latent_feature_input: Option<TensorRef>,
+    /// Features produced by the selected image encoder.
+    pub encoder_output: Option<TensorRef>,
+    /// Diffusion trajectory consumed by this computation.
+    pub latent_input: Option<TensorRef>,
+    /// Diffusion trajectory produced by this computation.
+    pub latent_output: Option<TensorRef>,
+    /// Resident image consumed by feedback encoding.
+    pub image_input: Option<TensorRef>,
+    /// Decoded image retained for feedback.
+    pub image_output: Option<TensorRef>,
+    /// Boolean device completion consumed by a dependent computation.
+    pub completion_output: Option<TensorRef>,
+    /// Boolean device decision that selects an image transition.
+    pub transition_output: Option<TensorRef>,
+    /// Device predicate that enables execution.
+    pub predicate: Option<TensorRef>,
+    /// Deterministic sampling coordinates.
+    pub rng: Option<Rng>,
+    /// Host-side sampler constraints for this computation; absent uses admission defaults.
+    pub sampling_state: Option<SamplingState>,
+    /// Host-known prompt, draft, or decode input tokens in model input order.
+    /// Empty when continuation reads its predecessor's device token.
+    pub input_token_ids: Vec<u32>,
+    /// Encoded source image in base64, consumed by a vision or latent encoder.
+    /// Dispatch and in-flight matching share these immutable bytes.
+    pub input_image: Option<std::sync::Arc<str>>,
+    /// Published or installed cache extent consumed by this computation.
+    pub kv_input: Option<BufferId>,
+    /// Identity under which this computation publishes or installs cache state.
+    pub kv_output: Option<BufferId>,
 }
 
-impl Operation {
-    /// Derives the execution code from the closed payload tag.
-    pub const fn kind(&self) -> OpCode {
-        self.payload.code
+impl ScheduledRequest {
+    /// Tensor dependencies in the computation signature, excluding its predicate.
+    pub fn tensor_inputs(&self) -> impl Iterator<Item = &TensorRef> {
+        self.inputs
+            .iter()
+            .chain(self.token_input.iter())
+            .chain(self.vision_input.iter())
+            .chain(self.latent_feature_input.iter())
+            .chain(self.latent_input.iter())
+            .chain(self.image_input.iter())
     }
 
-    /// Marks a payload immutable for subsequent scheduler deltas.
-    pub const fn sealed(self) -> Self {
-        self
+    /// All tensor declarations owned by this computation.
+    pub fn tensor_outputs(&self) -> impl Iterator<Item = &TensorRef> {
+        self.outputs
+            .iter()
+            .chain(self.token_output.iter())
+            .chain(self.completion_output.iter())
+            .chain(self.transition_output.iter())
+            .chain(self.encoder_output.iter())
+            .chain(self.latent_output.iter())
+            .chain(self.image_output.iter())
     }
 
-    /// Returns the static execution domain for this payload.
-    pub const fn domain(&self) -> Domain {
-        self.kind().domain()
+    /// Mutable declarations while assigning computation identities before submission.
+    pub fn tensor_outputs_mut(&mut self) -> impl Iterator<Item = &mut TensorRef> {
+        self.outputs
+            .iter_mut()
+            .chain(self.token_output.iter_mut())
+            .chain(self.completion_output.iter_mut())
+            .chain(self.transition_output.iter_mut())
+            .chain(self.encoder_output.iter_mut())
+            .chain(self.latent_output.iter_mut())
+            .chain(self.image_output.iter_mut())
     }
+
+    /// Tensor inputs that require persistent destination storage.
+    pub fn buffer_inputs(&self) -> impl Iterator<Item = &TensorRef> {
+        self.inputs
+            .iter()
+            .chain(self.vision_input.iter())
+            .chain(self.latent_feature_input.iter())
+            .chain(self.image_input.iter())
+    }
+
+    /// Tensor outputs backed by scheduler-allocated persistent buffers.
+    pub fn buffer_outputs(&self) -> impl Iterator<Item = &TensorRef> {
+        self.outputs
+            .iter()
+            .chain(self.encoder_output.iter())
+            .chain(self.image_output.iter())
+    }
+
+    /// Exact data and predicate dependencies, independent of physical representation.
+    pub fn input_buffers(&self) -> impl Iterator<Item = BufferId> + '_ {
+        self.tensor_inputs()
+            .chain(self.predicate.iter())
+            .map(TensorRef::buffer_id)
+            .chain(self.kv_input)
+    }
+
+    /// Resource identities published by this computation.
+    pub fn output_buffers(&self) -> impl Iterator<Item = BufferId> + '_ {
+        self.tensor_outputs()
+            .map(TensorRef::buffer_id)
+            .chain(self.kv_output)
+    }
+
     /// Returns whether successful execution advances request state.
     pub const fn advances_state(&self) -> bool {
-        self.kind().advances_state()
+        self.code.advances_state()
     }
-    /// Returns the scheduler-declared resource maxima.
-    pub fn bounds(&self) -> &Bounds {
-        self.payload.fields().0
-    }
-    /// Returns product references consumed by the operation.
-    pub fn inputs(&self) -> &[ProductRef] {
-        self.payload.fields().1
-    }
-    /// Returns product references produced by the operation.
-    pub fn outputs(&self) -> &[ProductRef] {
-        self.payload.fields().2
-    }
-    /// Returns mutable input references for transport lowering.
-    pub fn inputs_mut(&mut self) -> &mut Vec<ProductRef> {
-        &mut self.payload.inputs
-    }
-
-    /// Returns mutable output references for transport lowering.
-    pub fn outputs_mut(&mut self) -> &mut Vec<ProductRef> {
-        &mut self.payload.outputs
-    }
-
-    /// Returns the optional predicate product controlling execution.
-    pub fn predicate(&self) -> Option<&ProductRef> {
-        self.payload.fields().3
-    }
-    /// Replaces the optional predicate product.
-    pub fn set_predicate(&mut self, value: Option<ProductRef>) {
-        self.payload.predicate = value;
-    }
-
-    /// Returns deterministic random coordinates when the operation samples.
-    pub fn rng(&self) -> Option<Rng> {
-        self.payload.fields().4
-    }
-    /// Returns the request control sequence observed by this operation.
-    pub fn control_seq(&self) -> u64 {
-        self.payload.fields().5
-    }
-
     /// Validates family-specific products, bounds, predicates, and RNG state.
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish operation identity, family, lineage, and declared capacity.
-        ensure_valid!(self.op_id.0 > 0, "operation id must be positive");
+        ensure_valid!(self.op_id.batch_id > 0, "operation id must be positive");
+        ensure_valid!(
+            self.code != Computation::Forward(ForwardMode::Mixed),
+            "mixed forward mode requires a model batch, not an individual computation"
+        );
         ensure_valid!(!self.entry.is_empty(), "operation entry must not be empty");
 
         ensure_valid!(
             !(self.advances_state()
-                || self.kind() == OpCode::TransferKvInstall
-                || self
-                    .inputs()
-                    .iter()
-                    .any(|value| value.kind == ProductKind::Latent))
-                || self.parent.is_some(),
+                || self.code == Computation::Transfer(TransferMode::KvInstall)
+                || self.latent_input.is_some())
+                || self.predecessor.is_some(),
             "state-changing operation requires a predecessor"
         );
-        if let Some(parent) = &self.parent {
-            parent.validate()?;
-        } else {
+        if let Some(predecessor) = self.predecessor {
             ensure_valid!(
-                self.control_seq() == 0,
-                "computation without a predecessor has no state control sequence"
+                predecessor.batch_id != 0 || predecessor.request_index == 0,
+                "admission predecessor must use index zero"
+            );
+            ensure_valid!(
+                predecessor < self.op_id,
+                "predecessor must precede operation"
             );
         }
         ensure_valid!(
-            !self.kind().requires_fixed_parent()
-                || self.parent.as_ref().is_some_and(Checkpoint::is_fixed),
-            "operation requires a fixed semantic parent"
+            self.input_token_ids.len() <= self.bounds.max_tokens as usize,
+            "input token count exceeds the computation token bound"
         );
-        self.bounds_are_finite()?;
+        if let Some(state) = &self.sampling_state {
+            for ids in [
+                state.allowed_token_ids.as_deref(),
+                Some(state.suppressed_token_ids.as_slice()),
+                Some(state.finish_token_ids.as_slice()),
+                Some(state.transition_token_ids.as_slice()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                ensure_valid!(
+                    ids.windows(2).all(|pair| pair[0] < pair[1]),
+                    "sampling-state token ids are not canonical"
+                );
+            }
+        }
+
+        if let Some(image) = &self.input_image {
+            ensure_valid!(
+                !image.is_empty()
+                    && matches!(
+                        self.code,
+                        Computation::Pipeline(
+                            PipelineStage::VisionEncoding | PipelineStage::LatentEncoding
+                        )
+                    )
+                    && self.image_input.is_none(),
+                "encoded image requires an image encoder without another image source"
+            );
+        }
 
         // Every output must be uniquely owned by this producer and fit the
         // resource class reserved for the operation.
-        let mut output_indices = HashSet::with_capacity(self.outputs().len());
-        for output in self.outputs() {
+        let mut output_indices = HashSet::with_capacity(self.outputs.len());
+        let publishes_kv = matches!(
+            self.code,
+            Computation::Transfer(TransferMode::KvPublish | TransferMode::KvInstall)
+        );
+        ensure_valid!(
+            self.kv_output.is_some() == publishes_kv,
+            "KV publication or installation requires one cache output identity"
+        );
+        if let Some(output) = self.kv_output {
+            output.validate()?;
+            ensure_valid!(
+                output.owner == self.request_key && output.producer_op_id == self.op_id,
+                "KV output is not owned by its producing computation"
+            );
+            output_indices.insert(output.output_index);
+        }
+        let consumes_kv = matches!(
+            self.code,
+            Computation::Transfer(TransferMode::KvInstall)
+                | Computation::Pipeline(
+                    PipelineStage::LatentPreparation | PipelineStage::Denoising
+                )
+        );
+        if let Some(input) = self.kv_input {
+            input.validate()?;
+            ensure_valid!(
+                consumes_kv && input.owner == self.request_key,
+                "KV input is incompatible with its computation or request"
+            );
+        }
+        ensure_valid!(
+            self.code != Computation::Transfer(TransferMode::KvInstall) || self.kv_input.is_some(),
+            "KV installation requires a source publication"
+        );
+
+        for output in self.tensor_outputs() {
             output.validate()?;
             ensure_valid!(
                 output.request_key == self.request_key && output.producer_op_id == self.op_id,
@@ -519,74 +615,69 @@ impl Operation {
                 "an output product has no logical generation"
             );
             ensure_valid!(
-                output.point_range.max_points <= self.bounds().max_points.max(1),
-                "an output product exceeds the operation point bound"
-            );
-            match output.storage_class {
-                StorageClass::LatentArena => ensure_valid!(
-                    output.max_bytes() <= self.bounds().max_latent_bytes,
-                    "a latent-arena output exceeds the operation latent-byte bound"
-                ),
-                StorageClass::HostStaging | StorageClass::PinnedOutput => ensure_valid!(
-                    output.max_bytes() <= self.bounds().max_completion_bytes,
-                    "a host-visible output exceeds the operation completion-byte bound"
-                ),
-                StorageClass::PagedKv => ensure_valid!(
-                    output.max_bytes() <= self.bounds().max_transfer_bytes,
-                    "a paged-KV output exceeds the operation transfer-byte bound"
-                ),
-                _ => {}
-            }
-            ensure_valid!(
                 output_indices.insert(output.output_index),
                 "operation repeats an output index"
             );
         }
 
-        // Inputs are request-local except for shareable encoder features.
-        for input in self.inputs() {
+        for output in self
+            .encoder_output
+            .iter()
+            .chain(self.latent_output.iter())
+            .chain(self.image_output.iter())
+        {
+            ensure_valid!(
+                output.max_bytes() <= self.bounds.max_latent_bytes,
+                "image or trajectory output exceeds its declared byte capacity"
+            );
+        }
+        if let Some(input) = &self.token_input {
+            ensure_valid!(
+                self.code == Computation::Transfer(TransferMode::Tensor),
+                "token transfer input requires a tensor-transfer computation"
+            );
+            ensure_valid!(
+                input.dtype == DType::I64 && input.shape_bound.max_elements() == 1,
+                "token transfer input requires one int64 element"
+            );
+        }
+        for tensor in self.token_output.iter() {
+            ensure_valid!(
+                tensor.dtype == DType::I64 && tensor.shape_bound.max_elements() == 1,
+                "device token relay requires one int64 element"
+            );
+        }
+        for tensor in self
+            .completion_output
+            .iter()
+            .chain(self.transition_output.iter())
+        {
+            ensure_valid!(
+                tensor.dtype == DType::U8 && tensor.shape_bound.max_elements() == 1,
+                "device completion requires one uint8 element"
+            );
+        }
+
+        // Only encoder features can be shared across request lineages.
+        for input in self.tensor_inputs() {
             input.validate()?;
             ensure_valid!(
                 input.request_key == self.request_key
-                    || matches!(
-                        input.kind,
-                        ProductKind::VisionFeature | ProductKind::LatentFeature
-                    ),
-                "a request-local input product belongs to another request lineage"
+                    || Some(input) == self.vision_input.as_ref()
+                    || Some(input) == self.latent_feature_input.as_ref(),
+                "request-local tensor belongs to another request lineage"
             );
         }
-
-        // Predicates are generation-tagged device decisions in this lineage.
-        if let Some(predicate) = self.predicate() {
+        if let Some(predicate) = &self.predicate {
             predicate.validate()?;
             ensure_valid!(
                 predicate.request_key == self.request_key,
-                "operation predicate belongs to another request lineage"
+                "computation predicate belongs to another request lineage"
             );
-            let continuation_token = predicate.kind == ProductKind::Token
-                && predicate.dtype == DType::U32
-                && predicate.shape_bound.max_elements() == 1;
             ensure_valid!(
-                predicate.generation > 0
-                    && matches!(
-                        predicate.storage_class,
-                        StorageClass::DeviceTensor | StorageClass::RequestRelay
-                    )
-                    && (predicate.kind == ProductKind::Completion || continuation_token),
-                "operation predicate is not a generation-tagged device decision product"
-            );
-        }
-        Ok(())
-    }
-
-    /// Validates resource bounds that depend on state-advancement semantics.
-    fn bounds_are_finite(&self) -> ValidationResult<()> {
-        // Bounds are unsigned integers; the invariant enforced here is that a
-        // state-advancing operation can advance by at least one point.
-        if self.advances_state() {
-            ensure_valid!(
-                self.bounds().max_points >= 1,
-                "a state-advancing operation must admit at least one point"
+                matches!(predicate.dtype, DType::U8 | DType::I64)
+                    && predicate.shape_bound.max_elements() == 1,
+                "device predicate requires a boolean or packed continuation scalar"
             );
         }
         Ok(())
@@ -621,29 +712,6 @@ pub enum ErrorCode {
     Cancelled = 3,
     /// An invariant failed within the worker.
     Internal = 4,
-}
-
-/// Accounting lengths carried by a completion. These are accounting fields, not
-/// state identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-pub struct LogicalLengths {
-    /// Number of logical tokens committed for the request.
-    pub token_len: u32,
-    /// Number of KV tokens visible to successor operations.
-    pub kv_visible_len: u32,
-    /// Number of KV tokens materialized on the device.
-    pub kv_computed_len: u32,
-    /// Number of logical latent units committed for the request.
-    pub latent_len: u32,
-}
-
-/// The span of tokens an operation contributed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-pub struct TokenSpan {
-    /// First logical token position contributed by the operation.
-    pub base: u32,
-    /// Number of tokens contributed by the operation.
-    pub len: u32,
 }
 
 /// Device-observed finish candidates for a token operation.
@@ -703,185 +771,66 @@ pub struct MediaOutput {
     pub bytes: u64,
 }
 
-/// Common scalar outputs produced by an operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ResultData {
-    /// Logical request lengths after the operation.
-    pub logical_lengths: LogicalLengths,
-    /// Token positions contributed by the operation.
-    pub token_span: TokenSpan,
-    /// Token identifiers committed by the operation.
-    pub committed_tokens: Vec<u32>,
-    /// Device-observed terminal conditions.
-    pub finish_flags: FinishFlags,
-    /// Materialized media artifact, when produced.
-    pub media_output: Option<MediaOutput>,
-}
-
-/// Cursor and terminal state produced by a diffusion operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct DiffusionResult {
-    /// Common operation result fields.
-    pub data: ResultData,
-    /// Cursor for the next diffusion operation.
-    pub next_cursor: u32,
-    /// Whether the diffusion request has reached a terminal state.
-    pub done: bool,
-}
-
-/// Completion payload selected by the run kind.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "family", content = "value")]
-pub enum ResultPayload {
-    /// Autoregressive operation result.
-    Ar(ResultData),
-    /// Multimodal encoder result.
-    Encoder(ResultData),
-    /// Diffusion operation result with trajectory state.
-    Diffusion(DiffusionResult),
-    /// Cross-stage transfer result.
-    Transfer(ResultData),
-}
-
-impl ResultPayload {
-    /// Returns whether this result payload accepts `kind`.
-    pub const fn family_matches(&self, kind: OpCode) -> bool {
-        matches!(
-            (self, kind),
-            (
-                Self::Ar(_),
-                OpCode::ArExtend | OpCode::ArDecode | OpCode::ArVerify
-            ) | (
-                Self::Encoder(_),
-                OpCode::EncoderVision | OpCode::EncoderLatent | OpCode::EncoderText
-            ) | (
-                Self::Diffusion(_),
-                OpCode::DiffusionPrepare
-                    | OpCode::DiffusionStep
-                    | OpCode::DiffusionDecode
-                    | OpCode::DiffusionFinalize
-                    | OpCode::MediaAppend
-            ) | (
-                Self::Transfer(_),
-                OpCode::TransferProduct | OpCode::TransferKvPublish | OpCode::TransferKvInstall
-            )
-        )
-    }
-
-    /// Wraps common result data in the payload family required by `kind`.
-    pub fn for_kind(kind: OpCode, data: ResultData) -> Self {
-        match kind {
-            OpCode::ArExtend | OpCode::ArDecode | OpCode::ArVerify => Self::Ar(data),
-            OpCode::EncoderVision | OpCode::EncoderLatent | OpCode::EncoderText => {
-                Self::Encoder(data)
-            }
-            OpCode::DiffusionPrepare
-            | OpCode::DiffusionStep
-            | OpCode::DiffusionDecode
-            | OpCode::DiffusionFinalize
-            | OpCode::MediaAppend => Self::Diffusion(DiffusionResult {
-                done: data.finish_flags.eos
-                    || data.finish_flags.length
-                    || data.finish_flags.stop
-                    || data.media_output.is_some(),
-                data,
-                next_cursor: 0,
-            }),
-            OpCode::TransferProduct | OpCode::TransferKvPublish | OpCode::TransferKvInstall => {
-                Self::Transfer(data)
-            }
-        }
-    }
-
-    /// Returns common result data independently of the family variant.
-    fn data(&self) -> &ResultData {
-        match self {
-            Self::Ar(data) | Self::Encoder(data) | Self::Transfer(data) => data,
-            Self::Diffusion(result) => &result.data,
-        }
-    }
-
-    /// Returns mutable access to common result data.
-    pub fn data_mut(&mut self) -> &mut ResultData {
-        match self {
-            Self::Ar(data) | Self::Encoder(data) | Self::Transfer(data) => data,
-            Self::Diffusion(result) => &mut result.data,
-        }
-    }
-}
-
 /// The fixed-layout record a worker emits once for every operation, after its
 /// copy event is query-ready and its pinned fields are validated on the host.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelOutput {
     /// Request lineage completed by the operation.
     pub request_key: RequestKey,
     /// Request-local operation identifier.
-    pub op_id: OpId,
-    /// Generation of the completion slot written by the worker.
-    pub completion_slot_generation: u32,
+    pub op_id: ComputationId,
     /// Terminal execution status.
     pub status: OpStatus,
-    /// Semantic point selected by device execution.
-    pub selected_point: u32,
     /// Allocation generations for products emitted by the operation.
     pub product_generations: Vec<u32>,
     /// Error classification when `status` is [`OpStatus::Error`].
     pub error_code: Option<ErrorCode>,
     /// Worker timing measurements for the operation.
     pub timing_counters: TimingCounters,
-    /// Family-specific result data.
-    pub payload: ResultPayload,
+    /// Computation that produced this result; must match the submitted operation.
+    pub code: Computation,
+    /// Model position for the next input, including image-feedback position advances.
+    pub position: u32,
+    /// Accepted KV prefix available to a successor.
+    pub kv_visible_len: u32,
+    /// KV extent initialized by execution, including rejected speculative positions.
+    pub kv_computed_len: u32,
+    /// Completed denoising steps, independent of latent tensor dimensions.
+    pub num_completed_steps: u32,
+    /// Token identifiers accepted by the sampler.
+    pub committed_tokens: Vec<u32>,
+    /// Natural-log probability of the final accepted token, when requested.
+    pub sampled_logprob: Option<f32>,
+    /// Ranked candidates for the final accepted token.
+    pub top_logprobs: Vec<TokenLogprob>,
+    /// Ranked candidates for each scored prompt position, in input order.
+    pub prompt_logprobs: Vec<Vec<TokenLogprob>>,
+    /// Device-observed terminal conditions.
+    pub finish_flags: FinishFlags,
+    /// Completed artifact and its external storage lifetime, when produced.
+    pub media_output: Option<MediaOutput>,
+    /// Physical KV publication, including this rank's tensor locations.
+    pub kv_output: Option<KvTransfer>,
 }
 
 impl ModelOutput {
-    /// Returns logical lengths from the family-specific payload.
-    pub fn logical_lengths(&self) -> &LogicalLengths {
-        &self.payload.data().logical_lengths
-    }
-    /// Returns mutable logical lengths from the family-specific payload.
-    pub fn logical_lengths_mut(&mut self) -> &mut LogicalLengths {
-        &mut self.payload.data_mut().logical_lengths
-    }
-    /// Returns the committed token span from the family-specific payload.
-    pub fn token_span(&self) -> TokenSpan {
-        self.payload.data().token_span
-    }
-    /// Returns mutable access to the committed token span.
-    pub fn token_span_mut(&mut self) -> &mut TokenSpan {
-        &mut self.payload.data_mut().token_span
-    }
-    /// Returns committed token identifiers from the family-specific payload.
-    pub fn committed_tokens(&self) -> &[u32] {
-        &self.payload.data().committed_tokens
-    }
-    /// Returns mutable committed token storage.
-    pub fn committed_tokens_mut(&mut self) -> &mut Vec<u32> {
-        &mut self.payload.data_mut().committed_tokens
-    }
-    /// Returns terminal flags from the family-specific payload.
-    pub fn finish_flags(&self) -> FinishFlags {
-        self.payload.data().finish_flags
-    }
-    /// Returns mutable terminal flags from the family-specific payload.
-    pub fn finish_flags_mut(&mut self) -> &mut FinishFlags {
-        &mut self.payload.data_mut().finish_flags
-    }
-    /// Returns media metadata when the operation materialized an artifact.
-    pub fn media_output(&self) -> Option<&MediaOutput> {
-        self.payload.data().media_output.as_ref()
-    }
-
-    /// Validates completion identity, status, payload, and product generations.
+    /// Validates completion identity, status, accepted lengths, and product generations.
     pub fn validate(&self) -> ValidationResult<()> {
-        ensure_valid!(self.op_id.0 > 0, "completion op id must be positive");
+        ensure_valid!(self.op_id.batch_id > 0, "completion op id must be positive");
+        if let Some(publication) = &self.kv_output {
+            publication.validate()?;
+            ensure_valid!(
+                self.status == OpStatus::Ok
+                    && self.code == Computation::Transfer(TransferMode::KvPublish)
+                    && publication.source.owner == self.request_key
+                    && publication.source.producer_op_id == self.op_id,
+                "KV publication does not belong to its successful completion"
+            );
+        }
+
         ensure_valid!(
-            self.logical_lengths().kv_visible_len <= self.logical_lengths().kv_computed_len,
+            self.kv_visible_len <= self.kv_computed_len,
             "completion selected KV length exceeds computed length"
-        );
-        ensure_valid!(
-            self.completion_slot_generation > 0,
-            "completion slot generation must be positive"
         );
         match self.status {
             OpStatus::Error => ensure_valid!(
@@ -895,19 +844,15 @@ impl ModelOutput {
         }
         if self.status == OpStatus::Predicated {
             ensure_valid!(
-                self.token_span().len == 0
-                    && self.committed_tokens().is_empty()
-                    && self.product_generations.is_empty(),
+                self.committed_tokens.as_slice().is_empty() && self.product_generations.is_empty(),
                 "a predicated completion must select its parent without semantic output"
             );
             ensure_valid!(
-                !self.finish_flags().eos
-                    && !self.finish_flags().length
-                    && !self.finish_flags().stop,
+                !self.finish_flags.eos && !self.finish_flags.length && !self.finish_flags.stop,
                 "a predicated completion must not select a terminal outcome"
             );
         }
-        if let Some(output) = self.media_output() {
+        if let Some(output) = self.media_output.as_ref() {
             output.handle.validate()?;
             ensure_valid!(
                 output.bytes > 0,
@@ -916,34 +861,6 @@ impl ModelOutput {
         }
         Ok(())
     }
-}
-
-/// What to do with a committed selected point's public output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum Disposition {
-    /// Expose committed output to the public event stream.
-    Publish = 0,
-    /// Keep committed output for downstream execution without publishing it.
-    Retain = 1,
-    /// Release committed output without publishing it.
-    Discard = 2,
-}
-
-/// Why a request lineage is being closed at a cutoff.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum CloseReason {
-    /// The request reached its normal terminal condition.
-    Completed = 0,
-    /// The caller cancelled the request.
-    Cancelled = 1,
-    /// Execution terminated because of an error.
-    Error = 2,
-    /// Scheduling preemption terminated the request lineage.
-    Preempted = 3,
 }
 
 /// Ordered request and buffer commands carried with logical work.
@@ -955,48 +872,16 @@ pub enum BatchCommand {
         /// Static request state installed by the worker.
         request: NewRequest,
     },
-    /// Commit a selected fixed point and expose public output up to a limit.
-    Commit {
-        /// Request lineage receiving the commit.
-        request_key: RequestKey,
-        /// Monotonic request-control sequence.
-        control_seq: u64,
-        /// Checkpoint that must currently own the request lineage.
-        expected_parent: Checkpoint,
-        /// Fixed checkpoint selected for commit.
-        selected: Checkpoint,
-        /// Exclusive public-event sequence limit exposed by the commit.
-        public_event_limit: u64,
-        /// Policy for the selected checkpoint's public output.
-        disposition: Disposition,
-    },
-    /// Finish a lineage at a fixed cutoff, dominating every uncommitted descendant.
+    /// Close an exact request epoch after admitted work and physical readers finish.
     Finish {
-        /// Request lineage being closed.
         request_key: RequestKey,
-        /// Monotonic request-control sequence.
-        control_seq: u64,
-        /// Last fixed checkpoint retained by the request.
-        cutoff: Checkpoint,
-        /// Terminal reason recorded for the request.
-        reason: CloseReason,
-        /// Persistent products whose allocations remain owned outside this request.
-        /// They stay readable until a subsequent explicit Free command.
+        /// Products that remain readable under independent ownership until Free.
         retained_buffers: Vec<BufferId>,
     },
     /// Free one exact persistent product after its final consumer.
     Free {
         /// Persistent buffer identity to release.
         buffer: BufferId,
-    },
-    /// Retire physical request state without selecting or publishing a checkpoint.
-    /// Used after terminal failure or on auxiliary owners of a finished request.
-    /// Acknowledgement still waits for operations, readers and storage reset.
-    Retire {
-        /// Exact request epoch whose rank-local resources are being retired.
-        request_key: RequestKey,
-        /// Persistent allocations retained by independent owners until Free.
-        retained_buffers: Vec<BufferId>,
     },
 }
 
@@ -1005,9 +890,7 @@ impl BatchCommand {
     pub fn request_key(&self) -> RequestKey {
         match self {
             Self::Start { request } => request.request_key,
-            Self::Commit { request_key, .. }
-            | Self::Finish { request_key, .. }
-            | Self::Retire { request_key, .. } => *request_key,
+            Self::Finish { request_key, .. } => *request_key,
             Self::Free { buffer } => buffer.owner,
         }
     }
@@ -1016,57 +899,22 @@ impl BatchCommand {
     pub const fn variant_index(&self) -> u8 {
         match self {
             Self::Start { .. } => 0,
-            Self::Commit { .. } => 1,
-            Self::Finish { .. } => 2,
-            Self::Free { .. } => 3,
-            Self::Retire { .. } => 4,
+            Self::Finish { .. } => 1,
+            Self::Free { .. } => 2,
         }
     }
 
-    /// Returns the control sequence for commit and close commands.
-    pub const fn control_seq(&self) -> Option<u64> {
-        match self {
-            Self::Commit { control_seq, .. } | Self::Finish { control_seq, .. } => {
-                Some(*control_seq)
-            }
-            Self::Start { .. } | Self::Free { .. } | Self::Retire { .. } => None,
-        }
-    }
-
-    /// Validates command identity, cutoff, and resource constraints.
+    /// Validates command identity and retained resource constraints.
     pub fn validate(&self) -> ValidationResult<()> {
         match self {
             Self::Start { request } => request.validate()?,
-            Self::Commit {
-                expected_parent,
-                selected,
-                ..
-            } => {
-                expected_parent.validate()?;
-                selected.validate()?;
-                ensure_valid!(
-                    selected.is_fixed(),
-                    "a commit control must select a fixed version"
-                );
-            }
-            Self::Finish { cutoff, .. } => {
-                cutoff.validate()?;
-                ensure_valid!(
-                    cutoff.is_fixed(),
-                    "a finish command must name a fixed cutoff version"
-                );
-            }
+            Self::Finish { .. } => {}
             Self::Free { buffer } => buffer.validate()?,
-            Self::Retire { .. } => {}
         }
         if let Self::Finish {
             request_key,
             retained_buffers,
             ..
-        }
-        | Self::Retire {
-            request_key,
-            retained_buffers,
         } = self
         {
             let mut retained = std::collections::HashSet::new();
@@ -1106,29 +954,7 @@ pub struct UmmRequestParams {
     pub image: ImageParams,
 }
 
-/// Fixed geometry for a media-generation request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MediaGeometry {
-    /// Number of frames produced by the request.
-    pub frame_count: u32,
-    /// Number of decoder work units in the terminal media stage.
-    pub video_units: u32,
-    /// Number of prompt tokens supplied to the diffusion model.
-    pub prompt_tokens: u32,
-    /// Number of denoising steps in the trajectory.
-    pub denoise_steps: u32,
-}
-
-/// Static diffusion parameters admitted for one request lineage.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiffusionRequestParams {
-    /// Tokenized text conditioning for the trajectory.
-    pub prompt_token_ids: Vec<u32>,
-    /// Request-level random seed.
-    pub seed: u64,
-    /// Fixed media and trajectory dimensions.
-    pub geometry: MediaGeometry,
-}
+pub use uniserve_core::DiffusionSamplingParams;
 
 /// Request-start framing. Carries the per-domain parameters a request
 /// needs before its operations run.
@@ -1144,7 +970,9 @@ pub struct NewRequest {
     /// Unified-multimodal request parameters, when applicable.
     pub umm: Option<UmmRequestParams>,
     /// Diffusion request parameters, when applicable.
-    pub diffusion: Option<DiffusionRequestParams>,
+    pub diffusion: Option<DiffusionSamplingParams>,
+    /// Tokenized conditioning supplied at diffusion admission.
+    pub prompt_token_ids: Vec<u32>,
 }
 
 impl NewRequest {
@@ -1166,6 +994,7 @@ impl NewRequest {
             ar,
             umm,
             diffusion: None,
+            prompt_token_ids: Vec::new(),
         };
         Ok(admission)
     }
@@ -1174,7 +1003,8 @@ impl NewRequest {
     pub fn new_media(
         request_key: RequestKey,
         request_pool_idx: u32,
-        diffusion: DiffusionRequestParams,
+        prompt_token_ids: Vec<u32>,
+        diffusion: DiffusionSamplingParams,
     ) -> ValidationResult<Self> {
         ensure_valid!(request_pool_idx > 0, "request-pool index must be positive");
         let admission = Self {
@@ -1183,6 +1013,7 @@ impl NewRequest {
             ar: None,
             umm: None,
             diffusion: Some(diffusion),
+            prompt_token_ids,
         };
         admission.validate()?;
         Ok(admission)
@@ -1210,17 +1041,15 @@ impl NewRequest {
         }
         if let Some(diffusion) = &self.diffusion {
             ensure_valid!(
-                !diffusion.prompt_token_ids.is_empty(),
+                !self.prompt_token_ids.is_empty(),
                 "diffusion prompt tokens must not be empty"
             );
             ensure_valid!(
-                diffusion.geometry.frame_count > 0
-                    && diffusion.geometry.video_units > 0
-                    && diffusion.geometry.prompt_tokens > 0
-                    && usize::try_from(diffusion.geometry.prompt_tokens).ok()
-                        == Some(diffusion.prompt_token_ids.len())
-                    && diffusion.geometry.denoise_steps > 0,
-                "diffusion request geometry is invalid"
+                diffusion.num_frames > 0
+                    && diffusion.num_decode_chunks > 0
+                    && self.prompt_token_ids.len() <= u32::MAX as usize
+                    && diffusion.num_inference_steps > 0,
+                "diffusion parameters are invalid"
             );
         }
         Ok(())
@@ -1288,35 +1117,103 @@ impl CachePageAllocation {
     }
 }
 
-/// Row-aligned model-forward metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RowGeometry {
-    /// Index of the operation represented by this model row.
-    pub operation_index: u32,
-    /// Scheduler-assigned request-state row.
-    pub request_pool_index: u32,
-    /// Total sequence length visible to attention.
-    pub seq_len: u32,
-    /// Number of query tokens evaluated by the row.
-    pub query_len: u32,
-    /// Whether the query interval is persisted in the cache after the visible prefix.
-    pub write_kv: bool,
+/// Aligned columns defining the model's forward rows, independent of wire framing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardBatch {
+    /// Physical operation index for each row; logical computation IDs remain unchanged.
+    #[serde(rename = "forward_operation_indices")]
+    pub operation_indices: Vec<u32>,
+    /// Scheduler-owned request slots, including alternative CFG prefixes.
+    pub request_pool_indices: Vec<u32>,
+    /// Total attention lengths (cached prefix plus query), not allocated capacities.
+    pub seq_lens: Vec<u32>,
+    /// Query tokens evaluated by each row.
+    pub query_lens: Vec<u32>,
+    /// Whether the query interval persists in KV after its visible prefix.
+    pub write_kv: Vec<bool>,
 }
 
-impl RowGeometry {
-    /// Validates row ranges against the run's operation count.
-    pub fn validate(self, operation_count: usize) -> ValidationResult<()> {
+impl ForwardBatch {
+    /// Append one model row to every column in the same order.
+    pub fn push(
+        &mut self,
+        operation_index: u32,
+        request_pool_index: u32,
+        seq_len: u32,
+        query_len: u32,
+        write_kv: bool,
+    ) {
+        self.operation_indices.push(operation_index);
+        self.request_pool_indices.push(request_pool_index);
+        self.seq_lens.push(seq_len);
+        self.query_lens.push(query_len);
+        self.write_kv.push(write_kv);
+    }
+
+    /// Move forward inputs into a physical batch, offsetting only physical row ownership.
+    pub fn append(&mut self, other: Self, operation_offset: u32) {
+        self.operation_indices
+            .extend(other.operation_indices.into_iter().map(|index| {
+                index
+                    .checked_add(operation_offset)
+                    .expect("physical operation index fits u32")
+            }));
+        self.request_pool_indices.extend(other.request_pool_indices);
+        self.seq_lens.extend(other.seq_lens);
+        self.query_lens.extend(other.query_lens);
+        self.write_kv.extend(other.write_kv);
+    }
+
+    /// Select a rank's operations and map their forward rows to the local operation array.
+    pub fn select(&self, operations: &[usize]) -> Self {
+        let mut selected = Self::default();
+        for (row, index) in self.operation_indices.iter().enumerate() {
+            if let Some(local) = operations
+                .iter()
+                .position(|operation| *operation == *index as usize)
+            {
+                selected.push(
+                    local as u32,
+                    self.request_pool_indices[row],
+                    self.seq_lens[row],
+                    self.query_lens[row],
+                    self.write_kv[row],
+                );
+            }
+        }
+        selected
+    }
+
+    /// Validate column alignment and numerical ranges before indexing model inputs.
+    pub fn validate(&self, operation_count: usize) -> ValidationResult<()> {
+        let rows = self.operation_indices.len();
         ensure_valid!(
-            (self.operation_index as usize) < operation_count,
-            "forward row operation index is outside its lane"
+            self.request_pool_indices.len() == rows
+                && self.seq_lens.len() == rows
+                && self.query_lens.len() == rows
+                && self.write_kv.len() == rows,
+            "forward input columns have different lengths"
         );
         ensure_valid!(
-            self.request_pool_index > 0,
-            "forward row carries the reserved request slot"
+            self.operation_indices
+                .iter()
+                .all(|index| (*index as usize) < operation_count),
+            "forward operation index is outside its batch"
         );
         ensure_valid!(
-            self.query_len > 0,
-            "forward row query length must be positive"
+            self.request_pool_indices.iter().all(|slot| *slot > 0),
+            "forward input carries the reserved request slot"
+        );
+        ensure_valid!(
+            self.query_lens.iter().all(|length| *length > 0),
+            "forward query length must be positive"
+        );
+        ensure_valid!(
+            self.seq_lens
+                .iter()
+                .zip(&self.query_lens)
+                .all(|(total, query)| total >= query),
+            "forward sequence length is shorter than its query"
         );
         Ok(())
     }
@@ -1328,7 +1225,7 @@ pub struct LatentParams {
     /// Request lineage that owns the trajectory.
     pub request_key: RequestKey,
     /// Operation that addresses the trajectory.
-    pub op_id: OpId,
+    pub op_id: ComputationId,
     /// Physical latent pages in logical order; empty for request-owned tensors.
     pub page_table: Vec<u32>,
     /// Logical units stored in pages; zero when the trajectory uses request tensors.
@@ -1347,7 +1244,7 @@ impl LatentParams {
     /// Validates latent page identities, shape, and byte bounds.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            self.op_id.0 > 0,
+            self.op_id.batch_id > 0,
             "latent params operation id must be positive"
         );
         ensure_valid!(
@@ -1364,36 +1261,13 @@ impl LatentParams {
     }
 }
 
-/// Independent media stream selected by decoding or ordered output consumption.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum MediaTrack {
-    /// Overlapping temporal video units.
-    Video = 0,
-    /// Interleaved audio samples.
-    Audio = 1,
-}
-
-impl MediaTrack {
-    /// Stable name used by physical request descriptors.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Video => "video",
-            Self::Audio => "audio",
-        }
-    }
-}
-
 /// Cursor and unit bounds for one diffusion decode operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecodeRange {
     /// Request lineage that owns the media output.
     pub request_key: RequestKey,
     /// Decode operation receiving the params.
-    pub op_id: OpId,
-    /// Independent media stream addressed by this range.
-    pub track: MediaTrack,
+    pub op_id: ComputationId,
     /// First decoder unit assigned to the operation.
     pub cursor: u32,
     /// Maximum decoder units the operation may process.
@@ -1404,16 +1278,12 @@ impl DecodeRange {
     /// Validates decode identity and unit capacity.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            self.op_id.0 > 0,
+            self.op_id.batch_id > 0,
             "decode params operation id must be positive"
         );
         ensure_valid!(
             self.max_units > 0,
             "decode params unit bound must be positive"
-        );
-        ensure_valid!(
-            self.track != MediaTrack::Audio || (self.cursor == 0 && self.max_units == 1),
-            "audio decode range must address its single sample stream"
         );
         Ok(())
     }
@@ -1455,13 +1325,14 @@ pub struct Run {
     /// Monotonic sequence shared by collective participants.
     pub collective_seq: u64,
     /// Operations executed by this invocation.
-    pub operations: Vec<Operation>,
+    pub operations: Vec<ScheduledRequest>,
     /// Complete scheduler-owned KV page tables required by the operations.
     pub block_tables: Vec<BlockTable>,
     /// Physical KV pages newly allocated for this invocation.
     pub new_cache_pages: Vec<CachePageAllocation>,
-    /// Row-aligned model-forward metadata.
-    pub forward_rows: Vec<RowGeometry>,
+    /// Columnar model inputs carried directly by the worker message.
+    #[serde(flatten)]
+    pub forward: ForwardBatch,
     /// Scheduler-owned latent trajectory allocations.
     pub latent_params: Vec<LatentParams>,
     /// Scheduler-owned media decode allocations.
@@ -1470,13 +1341,19 @@ pub struct Run {
     pub buffer_allocations: Vec<BufferAllocation>,
     /// Ordered request-state and buffer-lifetime commands.
     pub commands: Vec<BatchCommand>,
-    /// Host-supplied input product values matched by `ProductRef` identity.
-    pub input_products: Vec<ProductPayload>,
+    /// Host-supplied input product values matched by `TensorRef` identity.
+    pub input_products: Vec<TensorPublication>,
+    /// Imported KV publications consumed by explicit cache installation computations.
+    pub kv_inputs: Vec<KvTransfer>,
 }
 
 impl Run {
     /// Constructs a run with admissions and operations using default metadata.
-    pub fn new(batch_id: u64, admissions: Vec<NewRequest>, operations: Vec<Operation>) -> Self {
+    pub fn new(
+        batch_id: u64,
+        admissions: Vec<NewRequest>,
+        operations: Vec<ScheduledRequest>,
+    ) -> Self {
         Self {
             batch_id,
             run_id: batch_id,
@@ -1484,7 +1361,7 @@ impl Run {
             operations,
             block_tables: Vec::new(),
             new_cache_pages: Vec::new(),
-            forward_rows: Vec::new(),
+            forward: ForwardBatch::default(),
             latent_params: Vec::new(),
             decode_ranges: Vec::new(),
             buffer_allocations: Vec::new(),
@@ -1493,11 +1370,12 @@ impl Run {
                 .map(|request| BatchCommand::Start { request })
                 .collect(),
             input_products: Vec::new(),
+            kv_inputs: Vec::new(),
         }
     }
 
     /// Iterates over operations in submission order.
-    pub fn operations(&self) -> impl Iterator<Item = &Operation> {
+    pub fn operations(&self) -> impl Iterator<Item = &ScheduledRequest> {
         self.operations.iter()
     }
 
@@ -1521,7 +1399,7 @@ impl Run {
     }
 
     /// Attaches resolved input products to the run.
-    pub fn with_input_products(mut self, input_products: Vec<ProductPayload>) -> Self {
+    pub fn with_input_products(mut self, input_products: Vec<TensorPublication>) -> Self {
         self.input_products = input_products;
         self
     }
@@ -1538,8 +1416,17 @@ impl Run {
             "run collective sequence must be positive"
         );
 
+        let mut computation_ids = HashSet::with_capacity(self.operations.len());
         for operation in &self.operations {
             operation.validate()?;
+            ensure_valid!(
+                operation.op_id.batch_id == self.batch_id,
+                "computation identity belongs to another logical batch"
+            );
+            ensure_valid!(
+                computation_ids.insert(operation.op_id),
+                "a submission batch repeats a computation identity"
+            );
         }
 
         let operations = self
@@ -1585,9 +1472,7 @@ impl Run {
             );
         }
 
-        for row in &self.forward_rows {
-            row.validate(self.operations.len())?;
-        }
+        self.forward.validate(self.operations.len())?;
 
         // Latent pages are exclusive across every trajectory placed in a run.
         let mut latent_ids = HashSet::with_capacity(self.latent_params.len());
@@ -1603,12 +1488,10 @@ impl Run {
                 .get(&identity)
                 .ok_or_else(|| invalid_message!("latent params does not name a run operation"))?;
             let addresses_trajectory = matches!(
-                operation.kind(),
-                OpCode::DiffusionPrepare | OpCode::DiffusionStep
-            ) || operation
-                .inputs()
-                .iter()
-                .any(|value| value.kind == ProductKind::Latent);
+                operation.code,
+                Computation::Pipeline(PipelineStage::LatentPreparation)
+                    | Computation::Pipeline(PipelineStage::Denoising)
+            ) || operation.latent_input.is_some();
             ensure_valid!(
                 addresses_trajectory,
                 "latent params names work without a trajectory"
@@ -1624,12 +1507,10 @@ impl Run {
 
         for operation in &self.operations {
             let needs_latent = matches!(
-                operation.kind(),
-                OpCode::DiffusionPrepare | OpCode::DiffusionStep
-            ) || operation
-                .inputs()
-                .iter()
-                .any(|value| value.kind == ProductKind::Latent);
+                operation.code,
+                Computation::Pipeline(PipelineStage::LatentPreparation)
+                    | Computation::Pipeline(PipelineStage::Denoising)
+            ) || operation.latent_input.is_some();
             ensure_valid!(
                 !needs_latent || latent_ids.contains(&(operation.request_key, operation.op_id)),
                 "operation that addresses a trajectory has no latent params"
@@ -1650,17 +1531,36 @@ impl Run {
                 .ok_or_else(|| invalid_message!("decode params does not name a run operation"))?;
             ensure_valid!(
                 matches!(
-                    operation.kind(),
-                    OpCode::DiffusionDecode | OpCode::MediaAppend
+                    operation.code,
+                    Computation::Pipeline(
+                        PipelineStage::VideoDecoding
+                            | PipelineStage::AudioDecoding
+                            | PipelineStage::VideoEncoding
+                            | PipelineStage::AudioEncoding
+                    )
                 ),
                 "decode params does not name media decode work"
+            );
+            ensure_valid!(
+                !matches!(
+                    operation.code,
+                    Computation::Pipeline(
+                        PipelineStage::AudioDecoding | PipelineStage::AudioEncoding
+                    )
+                ) || (params.cursor == 0 && params.max_units == 1),
+                "audio decode range must address its single sample stream"
             );
         }
 
         for operation in &self.operations {
             let needs_range = matches!(
-                operation.kind(),
-                OpCode::DiffusionDecode | OpCode::MediaAppend
+                operation.code,
+                Computation::Pipeline(
+                    PipelineStage::VideoDecoding
+                        | PipelineStage::AudioDecoding
+                        | PipelineStage::VideoEncoding
+                        | PipelineStage::AudioEncoding
+                )
             );
             ensure_valid!(
                 !needs_range || decode_ids.contains(&(operation.request_key, operation.op_id)),
@@ -1690,11 +1590,7 @@ impl Run {
         );
 
         for operation in &self.operations {
-            for output in operation
-                .outputs()
-                .iter()
-                .filter(|output| output.uses_persistent_buffer())
-            {
+            for output in operation.buffer_outputs() {
                 let params = self
                     .buffer_allocations
                     .iter()
@@ -1730,17 +1626,16 @@ impl Run {
 
         // A repeated control identity must carry exactly the same command.
         let mut command_identities: std::collections::HashMap<
-            (RequestKey, Option<u64>, u8, Option<u32>),
+            (RequestKey, u8, Option<BufferId>),
             BatchCommand,
         > = std::collections::HashMap::new();
         for command in &self.commands {
             command.validate()?;
             let identity = (
                 command.request_key(),
-                command.control_seq(),
                 command.variant_index(),
                 match command {
-                    BatchCommand::Free { buffer } => Some(buffer.generation),
+                    BatchCommand::Free { buffer } => Some(*buffer),
                     _ => None,
                 },
             );
@@ -1764,25 +1659,10 @@ impl Run {
             .operations()
             .flat_map(|operation| {
                 operation
-                    .inputs()
-                    .iter()
-                    .chain(operation.predicate().into_iter())
+                    .tensor_inputs()
+                    .chain(operation.predicate.as_ref().into_iter())
             })
             .collect::<HashSet<_>>();
-
-        for operation in self.operations() {
-            for input in operation
-                .inputs()
-                .iter()
-                .filter(|input| input.storage_class == StorageClass::HostStaging)
-            {
-                ensure_valid!(
-                    input.request_key == operation.request_key
-                        && input.producer_op_id == operation.op_id,
-                    "a host-staging input is not owned by its consuming operation"
-                );
-            }
-        }
 
         let mut supplied_inputs = HashSet::with_capacity(self.input_products.len());
         for payload in &self.input_products {
@@ -1790,32 +1670,38 @@ impl Run {
                 declared_inputs.contains(&payload.product),
                 "an input product payload is not declared by any operation"
             );
-            if payload.product.storage_class == StorageClass::HostStaging {
-                ensure_valid!(
-                    matches!(payload.value, InlineValue::Bytes(_)),
-                    "host-staging input cannot carry a cross-stage transfer handle"
-                );
-            } else {
-                ensure_valid!(
-                    matches!(payload.value, InlineValue::Transfer(_)),
-                    "cross-stage product input has no transfer handle"
-                );
-            }
             ensure_valid!(
                 supplied_inputs.insert(&payload.product),
                 "a submission batch repeats an input product payload"
             );
-            payload.validate_input_value()?;
+            payload.validate()?;
         }
 
-        for input in declared_inputs {
-            if input.storage_class == StorageClass::HostStaging {
-                ensure_valid!(
-                    supplied_inputs.contains(input),
-                    "a host-staging operation input has no product payload"
-                );
-            }
+        let mut kv_sources = HashSet::new();
+        for publication in &self.kv_inputs {
+            publication.validate()?;
+            ensure_valid!(
+                kv_sources.insert(publication.source),
+                "run repeats a KV input"
+            );
+            let consumers = self
+                .operations()
+                .filter(|operation| operation.kv_input == Some(publication.source))
+                .collect::<Vec<_>>();
+            ensure_valid!(
+                consumers.len() == 1
+                    && consumers[0].code == Computation::Transfer(TransferMode::KvInstall),
+                "KV transfer requires one installation consumer"
+            );
+            let bytes = publication.tensors.iter().try_fold(0_u64, |sum, tensor| {
+                Ok::<_, ValidationError>(sum.saturating_add(tensor.validate()?))
+            })?;
+            ensure_valid!(
+                bytes <= consumers[0].bounds.max_transfer_bytes,
+                "KV input exceeds its installation transfer-byte bound"
+            );
         }
+
         Ok(())
     }
 }
@@ -1830,7 +1716,7 @@ pub struct RunResult {
     /// Operation completions contained in this fragment.
     pub completions: Vec<ModelOutput>,
     /// Product values published by completed operations.
-    pub products: Vec<ProductPayload>,
+    pub products: Vec<TensorPublication>,
     /// Visibility result for atomic product registration.
     pub registration: RegistrationAck,
     /// Aggregate worker execution time in microseconds, when measured.
@@ -1838,7 +1724,7 @@ pub struct RunResult {
     /// Model-forward statistics, when reported by the worker.
     pub forward_stats: Option<WorkerForwardStats>,
     /// Whether all operations and command-owned physical resources have retired.
-    /// Free/Finish/Retire runs publish a separate empty terminal fragment after any
+    /// Free/Finish runs publish a separate empty terminal fragment after any
     /// operation fragments, even when retirement is immediately ready.
     pub done: bool,
 }
@@ -1850,7 +1736,7 @@ impl RunResult {
     }
 
     /// Iterates over resolved product payloads in report order.
-    pub fn products(&self) -> impl Iterator<Item = &ProductPayload> {
+    pub fn products(&self) -> impl Iterator<Item = &TensorPublication> {
         self.products.iter()
     }
 
@@ -1864,12 +1750,16 @@ impl RunResult {
         for completion in &self.completions {
             completion.validate()?;
             ensure_valid!(
-                identities.insert((completion.request_key, completion.op_id)),
+                completion.op_id.batch_id == self.batch_id,
+                "completion identity belongs to another logical batch"
+            );
+            ensure_valid!(
+                identities.insert(completion.op_id),
                 "completion report repeats an operation"
             );
         }
         for payload in &self.products {
-            payload.validate_output_value()?;
+            payload.validate()?;
         }
         Ok(())
     }

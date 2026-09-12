@@ -11,7 +11,13 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
-from uniserve_worker.execution.batch import Domain
+from uniserve_worker.execution.batch import (
+    COMPUTATIONS,
+    Computation,
+    ForwardMode,
+    PipelineStage,
+    TransferMode,
+)
 from uniserve_worker.foundation.errors import invalid_descriptor
 
 __all__ = [
@@ -183,13 +189,37 @@ def graph_memory_budget_bytes(total_device_bytes: int) -> int:
     return max(0, int(float(max(0, int(total_device_bytes))) * DEFAULT_GRAPH_MEMORY_FRACTION))
 
 
+# JSON lane selectors resolve at startup. Execution binds concrete computations,
+# so independent pipeline stages never acquire a second scheduling classification.
+LANE_COMPUTATION_GROUPS: dict[str, tuple[Computation, ...]] = {
+    "prefill": (
+        ForwardMode.PREFILL,
+        PipelineStage.VISION_ENCODING,
+        PipelineStage.LATENT_ENCODING,
+        PipelineStage.TEXT_ENCODING,
+        *TransferMode,
+    ),
+    "decode": (ForwardMode.DECODE, ForwardMode.VERIFY),
+    "flow": (
+        PipelineStage.LATENT_PREPARATION,
+        PipelineStage.DENOISING,
+        PipelineStage.IMAGE_DECODING,
+        PipelineStage.VIDEO_DECODING,
+        PipelineStage.AUDIO_DECODING,
+        PipelineStage.VIDEO_ENCODING,
+        PipelineStage.AUDIO_ENCODING,
+        PipelineStage.MUXING,
+    ),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class LaneConfig:
-    """Assigns domains, SM budget, and optional capacity overrides to one execution lane."""
+    """Assigns computations, SM budget, and optional capacity overrides to one execution lane."""
 
     lane_id: str
     sm_budget: int
-    domains: tuple[Domain, ...]
+    computations: tuple[Computation, ...]
     kv_capacity_tokens: int | None = None
     latent_capacity_units: int | None = None
     max_batch_operations: int | None = None
@@ -197,14 +227,16 @@ class LaneConfig:
     max_inflight: int | None = None
 
     def __post_init__(self) -> None:
-        """Normalize lane domains and validate SM and capacity overrides."""
+        """Validate lane computations and validate SM and capacity overrides."""
 
         if not self.lane_id or any(character.isspace() for character in self.lane_id):
             raise ValueError("lane id must be a non-empty token")
         if int(self.sm_budget) < 1:
             raise ValueError("lane SM budget must be positive")
-        if not self.domains or len(set(self.domains)) != len(self.domains):
-            raise ValueError("lane domains must be non-empty and unique")
+        if not self.computations or len(set(self.computations)) != len(self.computations):
+            raise ValueError("lane computations must be non-empty and unique")
+        if any(kind not in COMPUTATIONS for kind in self.computations):
+            raise ValueError("lane must bind concrete computations")
         for name in (
             "kv_capacity_tokens",
             "latent_capacity_units",
@@ -430,11 +462,17 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
         domains = data.get("domains")
         if not isinstance(domains, list):
             raise ValueError(f"lane {index}.domains must be a JSON list")
+        if any(
+            not isinstance(name, str) or name not in LANE_COMPUTATION_GROUPS for name in domains
+        ):
+            raise ValueError(f"lane {index}.domains must name prefill, decode, or flow")
         result.append(
             LaneConfig(
                 lane_id=str(data.get("lane_id", "")),
                 sm_budget=int(data.get("sm_budget", 0)),
-                domains=tuple(Domain(str(item)) for item in domains),
+                computations=tuple(
+                    kind for name in domains for kind in LANE_COMPUTATION_GROUPS[name]
+                ),
                 kv_capacity_tokens=_json_optional_int(data, "kv_capacity_tokens"),
                 latent_capacity_units=_json_optional_int(data, "latent_capacity_units"),
                 max_batch_operations=_json_optional_int(data, "max_batch_operations"),
@@ -444,9 +482,9 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
         )
     if len({lane.lane_id for lane in result}) != len(result):
         raise ValueError("lane ids must be unique")
-    domains = tuple(domain for lane in result for domain in lane.domains)
-    if len(set(domains)) != len(domains):
-        raise ValueError("execution domains must have one lane binding")
+    computations = tuple(kind for lane in result for kind in lane.computations)
+    if len(set(computations)) != len(computations):
+        raise ValueError("computations must have one execution lane binding")
     return tuple(result)
 
 

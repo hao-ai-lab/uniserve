@@ -5,13 +5,15 @@ from collections.abc import Callable
 
 import torch
 
+from uniserve_worker.execution.batch import ForwardMode, PipelineStage
+
 from ...foundation.math import bucketed_length, ceil_div
 from ...models.generation import GenerationPipeline
 from ...nn.diffusion.cfg import build_flow_cfg_plan
 from ...runtime.latent_pool import LatentPool
 from ..attention import physical_columns
 from ..flow import denoise_geometry
-from ..forward_batch import ForwardBatch, ForwardOutput, ModelPhase, TokenSelection
+from ..forward_batch import ForwardBatch, ForwardOutput, TokenSelection
 from ..input_buffers import InputBuffers
 from .packed import FlowCapture, MixedCapture, PackedRunner
 from .prefill import stage_text
@@ -229,7 +231,7 @@ class FlowRunner:
         all_pages = (*token_pages, *pages)
         attention = physical_columns(
             pages=all_pages,
-            seq_lens=(*(1,) * text, *map(len, prefixes)),
+            prefix_lens=(*(1,) * text, *map(len, prefixes)),
             query_lens=(*(1,) * text, *queries),
             causal_rows=(*(True,) * text, *(False,) * rows),
             write_rows=(*(True,) * text, *(False,) * rows),
@@ -243,7 +245,7 @@ class FlowRunner:
             packed=self.tensorized,
         )
         return self.buffers.stage(
-            phase=ModelPhase.DENOISE,
+            forward_mode=ForwardMode.MIXED if text else PipelineStage.DENOISING,
             row_count=text + rows,
             request_pool_indices=(
                 *range(1, text + 1),

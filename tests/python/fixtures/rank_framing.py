@@ -1,11 +1,15 @@
 """A real CPU Worker behind deterministic IPC result fragmentation."""
 
+import os
 from collections import deque
+from pathlib import Path
 
 from uniserve_worker.bootstrap.cli import create_worker_cli_parser
 from uniserve_worker.bootstrap.config import WorkerProcessArgs
 from uniserve_worker.bootstrap.ipc import WorkerIpcEndpoint
+from uniserve_worker.execution.batch import MediaOutput, PosixShmArtifact
 from uniserve_worker.execution.output import finalize_run_result
+from uniserve_worker.media.storage import publish_media_bytes
 from uniserve_worker.worker import Worker
 
 
@@ -33,6 +37,22 @@ def main():
                     break
                 if kind == "submit":
                     report = finalize_run_result(worker.execute(request["run"])).to_mapping()
+                    media_case = os.environ.get("UNISERVE_TEST_MEDIA_RESPONSE")
+                    media_rank = 1 if media_case == "rank-output" else 0
+                    if media_case and config.execution.rank == media_rank and report["completions"]:
+                        completion = report["completions"][0]
+                        payload = b"generated media content"
+                        name = publish_media_bytes(payload)
+                        Path(os.environ["UNISERVE_TEST_MEDIA_NAME"]).write_text(name)
+                        completion["media_output"] = MediaOutput(
+                            handle=PosixShmArtifact(name),
+                            bytes=len(payload) + (1 if media_case == "short-storage" else 0),
+                        ).to_mapping()
+                        if media_case == "unknown-operation":
+                            completion["op_id"] = {
+                                **completion["op_id"],
+                                "request_index": 1000,
+                            }
                     fragments = deque()
                     if config.execution.rank == 0 and len(report["completions"]) > 1:
                         for index, completion in enumerate(report["completions"]):

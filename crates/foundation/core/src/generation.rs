@@ -1,14 +1,12 @@
-//! Generation policies, resource bounds, and scheduler-facing request values.
+//! Tokenized generation requests, image configuration, and capacity calculations.
 //!
-//! These data-only descriptors define generation behavior before the scheduler
-//! plans worker operations. Runtime ownership and model execution remain outside
-//! this boundary.
+//! Requests own their input data and effective parameters. The engine owns
+//! mutable computation progress, output delivery, and physical allocations.
 
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Modality;
 use crate::{ImageParams, ImageParamsError, RequestId, SamplingParams, SamplingParamsError};
 
 /// Output constraint applied to the default generation paradigm.
@@ -60,114 +58,38 @@ pub struct GenerationConstraintParseError {
     pub value: String,
 }
 
-/// Whether an Und token segment is user-visible or internal control/context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UndVisibility {
-    /// Publishes tokens to the caller.
-    #[default]
-    Visible,
-    /// Retains tokens as model-control context.
-    Internal,
+/// Positioned media consumed alongside the already-tokenized positive prompt.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MultimodalInputs {
+    /// Input images in nondecreasing prompt-token position order.
+    pub images: Vec<ImageInput>,
 }
 
-/// One context segment in the lowered request.
+/// An encoded image and the model's requirements for adding it to context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum ContextSegment {
-    /// Ordered understanding tokens.
-    UndTokens {
-        /// Vocabulary token identities.
-        token_ids: Vec<u32>,
-        /// Caller visibility of the segment.
-        #[serde(default)]
-        visibility: UndVisibility,
-    },
-    /// Input image and its model-specific ingest recipe.
-    Image {
-        /// Encoded image payload and logical params.
-        image: ImageSegment,
-        /// Encoder operations used to ingest the image.
-        ingest: ImageIngestRecipe,
-    },
-}
-
-/// Input image bytes plus params in the rendered context stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageSegment {
+pub struct ImageInput {
     /// Stable content hash used for encoder-cache identity.
     pub hash: u64,
     /// Base64-encoded input image.
     pub b64: String,
-    /// Logical position in the rendered context.
-    pub position: SegmentPosition,
+    /// Exclusive prompt-token position at the end of this image's marker gap.
+    /// Equal positions preserve input order, including multiple images at one marker.
+    pub position: u32,
+    /// Required encoder stages and their logical and physical contributions.
+    /// Logical positions contributed after all encoders finish; independent of KV length.
+    pub num_positions: u32,
+    pub encoders: Vec<ImageEncoderInput>,
 }
 
-/// Logical params of an image segment in the already-rendered Und stream.
+/// One encoder input and its physical KV contribution.
+/// `num_kv_tokens` is exact when known. Otherwise `max_kv_tokens` bounds
+/// the worker-selected length; absent limits use the loaded encoder capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum SegmentPosition {
-    /// The image encoder output fills the gap ending at this token index.
-    AtToken {
-        /// Exclusive token position at the end of the image gap.
-        position: u32,
-    },
-    /// The image is appended after all Und tokens emitted by the context.
-    Append,
-}
-
-/// Model-description recipe for turning an image segment into context.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ImageIngestRecipe {
-    /// Ordered encoder stages.
-    pub steps: Vec<ImageIngestStep>,
-    /// Logical model positions contributed by the image.
-    pub logical_positions: u32,
-    /// Physical KV effect corresponding to each encoder stage.
-    pub step_kv_tokens: Vec<ImageKvEffect>,
-    /// Model branch that consumes the encoded image.
-    pub modality: Modality,
-}
-
-impl ImageIngestRecipe {
-    /// Builds a single-step vision-encoder recipe.
-    pub fn vit_only(logical_positions: u32, kv_tokens: ImageKvEffect) -> Self {
-        Self {
-            steps: vec![ImageIngestStep::VitEncode],
-            logical_positions,
-            step_kv_tokens: vec![kv_tokens],
-            modality: Modality::Und,
-        }
-    }
-
-    /// Builds a latent-encoder followed by vision-encoder recipe.
-    pub fn vae_then_vit(
-        logical_positions: u32,
-        vae_kv_tokens: ImageKvEffect,
-        vit_kv_tokens: ImageKvEffect,
-    ) -> Self {
-        Self {
-            steps: vec![ImageIngestStep::VaeEncode, ImageIngestStep::VitEncode],
-            logical_positions,
-            step_kv_tokens: vec![vae_kv_tokens, vit_kv_tokens],
-            modality: Modality::Und,
-        }
-    }
-
-    /// Returns the declared KV effect for one ingest step.
-    pub fn kv_effect(&self, step_index: usize) -> Option<ImageKvEffect> {
-        self.step_kv_tokens.get(step_index).copied()
-    }
-
-    /// Returns stable per-step keys for reusable worker-side encoder outputs.
-    pub fn encoder_cache_keys(&self, image_hash: u64) -> Vec<u64> {
-        self.steps
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(step_index, step)| encoder_cache_key(image_hash, step_index, step))
-            .collect()
-    }
+pub struct ImageEncoderInput {
+    /// Model encoder consuming this image. List order determines context write order.
+    pub encoder: ImageIngestStep,
+    pub num_kv_tokens: Option<u32>,
+    pub max_kv_tokens: Option<u32>,
 }
 
 /// One image ingest worker step.
@@ -180,10 +102,10 @@ pub enum ImageIngestStep {
     VitEncode,
 }
 
-/// Derives the cache identity of one step in an image-ingest recipe.
+/// Derives the cache identity of one ordered image encoder.
 pub fn encoder_cache_key(image_hash: u64, step_index: usize, step: ImageIngestStep) -> u64 {
     // Apply FNV-1a to the complete domain tuple in a fixed byte order. Including
-    // the stage index distinguishes repeated encoder kinds within one recipe.
+    // the stage index distinguishes repeated encoder kinds within one image input.
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in image_hash
         .to_le_bytes()
@@ -198,37 +120,6 @@ pub fn encoder_cache_key(image_hash: u64, step_index: usize, step: ImageIngestSt
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-/// Physical KV effect of an image ingest operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum ImageKvEffect {
-    /// Uses the runtime-advertised bound for this encoder stage.
-    WorkerDefined,
-    /// Produces an exact number of physical KV tokens.
-    Exact {
-        /// Exact physical KV token count.
-        tokens: u32,
-    },
-    /// Produces a worker-selected count up to a fixed maximum.
-    Bounded {
-        /// Maximum physical KV token count.
-        max_tokens: u32,
-    },
-}
-
-/// Generated-image feedback recipe supplied by the model description.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GeneratedImageFeedbackRecipe {
-    /// Product representation fed into the encoder.
-    pub source: FeedbackSource,
-    /// Understanding token used after feedback ingestion.
-    pub next_und_token: FeedbackNextToken,
-    /// Encoder stages used to ingest the generated image.
-    pub ingest: ImageIngestRecipe,
-    /// Whether feedback state samples its continuation token.
-    pub sample_continuation: bool,
 }
 
 /// Product channel through which a materialized image reaches feedback encode.
@@ -258,10 +149,10 @@ pub enum FeedbackNextToken {
     },
 }
 
-/// Model-description token-trigger matching lowered to scheduler-readable data.
+/// Token conditions for switching text decoding to image generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
-pub enum TriggerPolicyDescriptor {
+pub enum ImageTrigger {
     /// Disables image-branch triggering.
     Disabled,
     /// Opens the branch after one exact token.
@@ -283,7 +174,7 @@ pub enum TriggerPolicyDescriptor {
     },
 }
 
-impl TriggerPolicyDescriptor {
+impl ImageTrigger {
     /// Matches a branch-opening trigger during ordinary Und generation.
     pub fn matches_generated(&self, generated: &[u32]) -> bool {
         match self {
@@ -341,191 +232,65 @@ impl TriggerPolicyDescriptor {
     }
 }
 
-/// Scheduler action for generated Und tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UndTokenAction {
-    /// Publishes understanding tokens.
-    Emit,
-    /// Retains understanding tokens as internal context.
-    KeepInternal,
-    /// Rejects constraints that require understanding output.
-    Reject,
-}
-
-/// Visibility rules per output constraint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VisibilityPolicyDescriptor {
-    /// Action for unconstrained generation.
-    pub default: UndTokenAction,
-    /// Action for understanding-only generation.
-    pub und_only: UndTokenAction,
-    /// Action for image-only generation.
-    pub gen_only: UndTokenAction,
-}
-
-impl Default for VisibilityPolicyDescriptor {
-    /// Returns visibility rules that emit understanding output for eligible requests.
-    fn default() -> Self {
-        Self {
-            default: UndTokenAction::Emit,
-            und_only: UndTokenAction::Emit,
-            gen_only: UndTokenAction::KeepInternal,
-        }
-    }
-}
-
-/// Termination rules express whether branch completion finishes or continues.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TerminationPolicyDescriptor {
-    /// Whether EOS ends the request.
-    pub eos_finishes: bool,
-    /// Whether configured stop conditions end the request.
-    pub stop_finishes: bool,
-    /// Whether the matched stop token is published.
-    #[serde(default)]
-    pub emit_stop_token: bool,
-    /// Whether the generated-token bound ends the request.
-    pub max_tokens_finishes: bool,
-    /// Whether image commit completes an image-only request.
-    pub gen_commit_finishes_gen_only: bool,
-    /// Whether unconstrained generation resumes after image commit.
-    pub gen_commit_continues_default: bool,
-}
-
-impl Default for TerminationPolicyDescriptor {
-    /// Returns terminal defaults for text bounds and image-only completion.
-    fn default() -> Self {
-        Self {
-            eos_finishes: true,
-            stop_finishes: true,
-            emit_stop_token: false,
-            max_tokens_finishes: true,
-            gen_commit_finishes_gen_only: true,
-            gen_commit_continues_default: true,
-        }
-    }
-}
-
-/// How a Gen-only request reaches its first Gen branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GenOnlyStartPolicyDescriptor {
-    /// Internal Und decoding until the model trigger opens Gen.
-    #[default]
-    DiscoverTrigger,
-    /// Enter Gen immediately after all context segments are prepared.
-    Immediate,
-}
-
-/// Model-description generation policy consumed by the scheduler planner.
+/// Model-specific conditions for starting image generation and encoding its result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GenerationPolicyDescriptor {
-    /// Model tokens that open an image-generation branch.
-    pub trigger: TriggerPolicyDescriptor,
-    /// Entry behavior for image-only requests.
-    #[serde(default)]
-    pub gen_only_start: GenOnlyStartPolicyDescriptor,
-    /// Constraint-specific understanding-token visibility.
-    pub visibility: VisibilityPolicyDescriptor,
-    /// Request termination rules.
-    pub termination: TerminationPolicyDescriptor,
-    /// Generated-image feedback pipeline, when supported.
-    pub feedback: Option<GeneratedImageFeedbackRecipe>,
+pub struct ImageGenerationConfig {
+    /// Tokens or suffixes that switch text decoding to image generation.
+    pub trigger: ImageTrigger,
+    /// Whether image-only requests generate internal text before their first image.
+    /// When false, image computation starts after prompt and input-image encoding.
+    pub requires_text_for_image: bool,
+    /// Encoder inputs and continuation required after a generated image.
+    pub feedback_source: Option<FeedbackSource>,
+    /// Encoder order and KV contributions of a completed image entering context.
+    pub feedback_encoders: Vec<ImageEncoderInput>,
+    /// Logical positions added after the final feedback encoder.
+    pub num_feedback_positions: u32,
+    /// Continuation input used when feedback does not sample a token.
+    pub feedback_next_token: FeedbackNextToken,
+    /// Whether the final feedback KV write samples the next text token.
+    pub sample_feedback_continuation: bool,
 }
 
-/// Constraint-resolved behavior consumed by scheduler lifecycle planning.
-///
-/// The explicit decisions give admission and scheduling one shared
-/// interpretation of the request constraint and model policy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GenerationBehaviorDescriptor {
-    /// Whether the runtime executes understanding decode.
-    pub und_decode: bool,
-    /// Resolved handling for understanding tokens.
-    pub und_tokens: UndTokenAction,
-    /// Whether the request may produce images.
-    pub gen_output: bool,
-    /// Whether image generation starts immediately after context preparation.
-    pub start_gen_after_context: bool,
-    /// Whether committed images feed back into model context.
-    pub generated_image_feedback: bool,
-    /// Whether understanding decode resumes after image commit.
-    pub continue_after_gen_commit: bool,
-    /// Whether image commit completes the request.
-    pub finish_after_gen_commit: bool,
-}
-
-impl GenerationBehaviorDescriptor {
-    /// Resolves scheduler actions for a request constraint and model policy.
-    pub fn resolve(constraint: GenerationConstraint, policy: &GenerationPolicyDescriptor) -> Self {
-        // Resolve caller visibility independently from the mechanism that opens
-        // the image-generation branch.
-        let und_tokens = match constraint {
-            GenerationConstraint::Default => policy.visibility.default,
-            GenerationConstraint::UndOnly => policy.visibility.und_only,
-            GenerationConstraint::GenOnly => policy.visibility.gen_only,
-        };
-        let start_gen_after_context = matches!(constraint, GenerationConstraint::GenOnly)
-            && policy.gen_only_start == GenOnlyStartPolicyDescriptor::Immediate;
-        let gen_output = !matches!(constraint, GenerationConstraint::UndOnly)
-            && (!matches!(policy.trigger, TriggerPolicyDescriptor::Disabled)
-                || start_gen_after_context);
-
-        // Image commit is terminal for image-only requests and may return to
-        // understanding decode for unconstrained requests.
-        let finish_after_gen_commit = gen_output
-            && matches!(constraint, GenerationConstraint::GenOnly)
-            && policy.termination.gen_commit_finishes_gen_only;
-        let continue_after_gen_commit = gen_output
-            && matches!(constraint, GenerationConstraint::Default)
-            && policy.termination.gen_commit_continues_default;
-
-        Self {
-            und_decode: !start_gen_after_context
-                && (und_tokens != UndTokenAction::Reject || gen_output),
-            und_tokens,
-            gen_output,
-            start_gen_after_context,
-            generated_image_feedback: gen_output
-                && continue_after_gen_commit
-                && policy.feedback.is_some(),
-            continue_after_gen_commit,
-            finish_after_gen_commit,
-        }
+impl ImageGenerationConfig {
+    /// Returns whether the requested output can reach an image-generation branch.
+    fn generates_images(&self, constraint: GenerationConstraint) -> bool {
+        constraint != GenerationConstraint::UndOnly
+            && (!matches!(self.trigger, ImageTrigger::Disabled)
+                || (constraint == GenerationConstraint::GenOnly && !self.requires_text_for_image))
     }
 
-    /// Returns whether understanding tokens are visible to the caller.
-    pub fn emits_und(&self) -> bool {
-        self.und_tokens == UndTokenAction::Emit
+    /// Returns whether completed images reenter the context for continued text.
+    fn feeds_back_images(&self, constraint: GenerationConstraint) -> bool {
+        self.generates_images(constraint)
+            && constraint == GenerationConstraint::Default
+            && self.feedback_source.is_some()
     }
 
     /// Returns the runtime features required by the reachable generation graph.
     pub fn required_features(
         &self,
-        policy: &GenerationPolicyDescriptor,
+        constraint: GenerationConstraint,
         context_image_steps: impl IntoIterator<Item = ImageIngestStep>,
     ) -> GenerationFeatures {
         // Understanding execution is the common control path for every request.
         let mut needs = GenerationFeatures::UNDERSTANDING;
 
-        // Context images require the encoder stages declared by their recipes.
+        // Context images require the encoder stages declared by their inputs.
         for step in context_image_steps {
             needs.insert(match step {
                 ImageIngestStep::VaeEncode => GenerationFeatures::LATENT_ENCODE,
                 ImageIngestStep::VitEncode => GenerationFeatures::VISION_ENCODE,
             });
         }
-        if self.gen_output {
+        if self.generates_images(constraint) {
             needs.insert(GenerationFeatures::IMAGE_GENERATION);
         }
 
         // Feedback can make additional encoder stages reachable after image
         // materialization.
-        if self.generated_image_feedback
-            && let Some(feedback) = &policy.feedback
-        {
-            for step in feedback.ingest.steps.iter().copied() {
+        if self.feeds_back_images(constraint) {
+            for step in self.feedback_encoders.iter().map(|input| input.encoder) {
                 needs.insert(match step {
                     ImageIngestStep::VaeEncode => GenerationFeatures::LATENT_ENCODE,
                     ImageIngestStep::VitEncode => GenerationFeatures::VISION_ENCODE,
@@ -575,47 +340,6 @@ impl std::fmt::Display for GenerationFeatures {
     }
 }
 
-/// Conservative request-level resource declaration produced by compilation.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct GenerationResourceBounds {
-    /// Understanding tokens present in the positive context.
-    pub context_tokens: usize,
-    /// Maximum physical KV tokens retained by the request.
-    pub max_kv_tokens: usize,
-    /// Maximum latent allocation units for one generated image.
-    pub max_image_latent_units: u64,
-    /// Maximum latent allocation bytes for one generated image.
-    pub max_image_latent_bytes: u64,
-    /// Maximum VAE feature product bytes.
-    pub max_latent_feature_bytes: u64,
-    /// Maximum vision feature product bytes.
-    pub max_vision_feature_bytes: u64,
-    /// Encoder cache entries the context may pin concurrently.
-    pub encoder_cache_keys: Vec<u64>,
-    /// Whether generated-image feedback makes the request non-replayable.
-    pub generated_feedback_makes_non_replayable: bool,
-}
-
-/// Inputs used to derive conservative resources for one generation graph.
-pub struct GenerationResources<'a> {
-    /// Positive generation context.
-    pub context: &'a [ContextSegment],
-    /// Negative image-generation conditioning context.
-    pub negative_context: &'a [ContextSegment],
-    /// Constraint-resolved branch behavior.
-    pub behavior: &'a GenerationBehaviorDescriptor,
-    /// Model-specific generation policy.
-    pub policy: &'a GenerationPolicyDescriptor,
-    /// Image-generation parameters.
-    pub image: &'a ImageParams,
-    /// Maximum understanding tokens generated by the request.
-    pub max_und_tokens: usize,
-    /// Prefix and encoder-cache policy.
-    pub cache: &'a GenerationCachePolicyDescriptor,
-    /// Runtime-advertised capability limits.
-    pub limits: &'a GenerationLimits,
-}
-
 /// Worker and scheduler limits needed to compile a bounded generation graph.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GenerationLimits {
@@ -625,9 +349,9 @@ pub struct GenerationLimits {
     pub max_latent_units: u64,
     /// Pixel-to-latent spatial downsample factor.
     pub latent_downsample: u32,
-    /// Maximum VAE grid tokens for a worker-defined effect.
+    /// Maximum VAE grid tokens for a worker-selected length.
     pub max_vae_grid_tokens: u32,
-    /// Maximum vision grid tokens for a worker-defined effect.
+    /// Maximum vision grid tokens for a worker-selected length.
     pub max_vit_grid_tokens: u32,
     /// Maximum VAE feature product size in bytes.
     pub max_latent_feature_bytes: u64,
@@ -654,295 +378,243 @@ impl GenerationLimits {
     }
 }
 
-impl GenerationResourceBounds {
-    /// Derives conservative resource maxima for a bounded generation graph.
-    pub fn conservative(inputs: GenerationResources<'_>) -> Result<Self, GenerationResourceError> {
-        let GenerationResources {
-            context,
-            negative_context,
-            behavior,
-            policy,
-            image,
-            max_und_tokens,
-            cache,
-            limits,
-        } = inputs;
+impl GenerationRequest {
+    /// Returns whether generated text belongs in the requested output modalities.
+    pub fn emits_text(&self) -> bool {
+        self.constraint != GenerationConstraint::GenOnly
+    }
 
-        // Text and image KV contributions are accounted independently because
-        // each image ingest step may declare a different physical token effect.
-        let context_tokens = context
+    /// Returns whether text decoding is needed, including internal image-control text.
+    pub fn decodes_text(&self) -> bool {
+        !self.starts_with_image()
+    }
+
+    /// Returns whether the requested modalities and model permit image output.
+    pub fn generates_images(&self) -> bool {
+        self.image_generation.generates_images(self.constraint)
+    }
+
+    /// Returns whether image-only generation starts immediately after the prompt.
+    pub fn starts_with_image(&self) -> bool {
+        self.constraint == GenerationConstraint::GenOnly
+            && !self.image_generation.requires_text_for_image
+    }
+
+    /// Returns whether a generated image must be encoded into subsequent context.
+    pub fn feeds_back_images(&self) -> bool {
+        self.image_generation.feeds_back_images(self.constraint)
+    }
+
+    /// Returns whether text generation resumes after a completed image.
+    pub fn continues_after_image(&self) -> bool {
+        self.generates_images() && self.constraint == GenerationConstraint::Default
+    }
+
+    /// Returns whether a completed image finishes this request.
+    pub fn finishes_after_image(&self) -> bool {
+        self.generates_images() && self.constraint == GenerationConstraint::GenOnly
+    }
+
+    /// Maximum physical KV tokens required by the input, output budget, and image feedback.
+    /// Saturation preserves conservative admission for host-sized token budgets.
+    pub fn max_kv_tokens(
+        &self,
+        limits: &GenerationLimits,
+    ) -> Result<usize, GenerationResourceError> {
+        let input_images = self
+            .multimodal_inputs
+            .images
             .iter()
-            .map(|segment| match segment {
-                ContextSegment::UndTokens { token_ids, .. } => token_ids.len(),
-                ContextSegment::Image { .. } => 0,
-            })
-            .sum::<usize>();
-        let negative_tokens = negative_context
-            .iter()
-            .map(|segment| match segment {
-                ContextSegment::UndTokens { token_ids, .. } => token_ids.len(),
-                ContextSegment::Image { .. } => 0,
-            })
-            .sum::<usize>();
-        let input_image_kv_tokens = context.iter().try_fold(0usize, |total, segment| {
-            let ContextSegment::Image { ingest, .. } = segment else {
-                return Ok(total);
+            .try_fold(0usize, |total, image| {
+                Ok(total.saturating_add(encoder_kv_bound(&image.encoders, limits)?))
+            })?;
+        let feedback =
+            if self.continues_after_image() && self.image_generation.feedback_source.is_some() {
+                encoder_kv_bound(&self.image_generation.feedback_encoders, limits)?
+                    .saturating_mul(self.image.max_images as usize)
+            } else {
+                0
             };
-            Ok(total.saturating_add(ingest_kv_bound(ingest, limits)?))
-        })?;
+        Ok(self
+            .prompt_token_ids
+            .len()
+            .saturating_add(self.max_und_tokens)
+            .saturating_add(input_images)
+            .saturating_add(feedback)
+            .saturating_add(if self.generates_images() {
+                self.negative_prompt_token_ids.len()
+            } else {
+                0
+            }))
+    }
 
-        // Generated-image feedback repeats its ingest contract once per maximum
-        // output image and therefore contributes to worst-case KV capacity.
-        let feedback_kv_per_image = if behavior.generated_image_feedback {
-            match policy.feedback.as_ref() {
-                Some(feedback) => ingest_kv_bound(&feedback.ingest, limits)?,
-                None => return Err(GenerationResourceError::MissingFeedback),
-            }
+    /// Encoder-cache entries that admission reserves for the ordered input encoders.
+    /// Each ingest step retains its reservation even if another image has the same hash.
+    pub fn num_encoder_cache_entries(&self) -> usize {
+        if self.cache.read || self.cache.write {
+            self.multimodal_inputs
+                .images
+                .iter()
+                .map(|image| image.encoders.len())
+                .fold(0usize, usize::saturating_add)
         } else {
             0
-        };
-        let generated_feedback_kv_tokens =
-            feedback_kv_per_image.saturating_mul(image.max_images as usize);
+        }
+    }
 
-        // Determine feature storage requirements from the exact ingest steps
-        // reachable through context images or generated feedback.
-        let feedback_ingest = behavior
-            .generated_image_feedback
-            .then(|| policy.feedback.as_ref().map(|feedback| &feedback.ingest))
-            .flatten();
-        let uses_ingest_step = |step| {
-            context.iter().any(|segment| {
-                matches!(
-                    segment,
-                    ContextSegment::Image { ingest, .. } if ingest.steps.contains(&step)
-                )
-            }) || feedback_ingest.is_some_and(|ingest| ingest.steps.contains(&step))
-        };
-        let uses_latent_features = uses_ingest_step(ImageIngestStep::VaeEncode);
-        let uses_vision_features = uses_ingest_step(ImageIngestStep::VitEncode);
-        if uses_latent_features && limits.max_latent_feature_bytes == 0 {
+    /// Validated latent grid size for one generated image, or zero for text-only work.
+    pub fn image_latent_units(
+        &self,
+        limits: &GenerationLimits,
+    ) -> Result<u64, GenerationResourceError> {
+        if !self.generates_images() {
+            return Ok(0);
+        }
+        if limits.latent_downsample == 0 {
+            return Err(GenerationResourceError::MissingRuntimeBound {
+                resource: "latent_downsample",
+            });
+        }
+        if !self.image.width.is_multiple_of(limits.latent_downsample)
+            || !self.image.height.is_multiple_of(limits.latent_downsample)
+        {
+            return Err(GenerationResourceError::ImageDimensionAlignment {
+                width: self.image.width,
+                height: self.image.height,
+                latent_downsample: limits.latent_downsample,
+            });
+        }
+        if limits.max_latent_units == 0 {
+            return Err(GenerationResourceError::MissingRuntimeBound {
+                resource: "max_latent_units",
+            });
+        }
+        let units = u64::from(self.image.width / limits.latent_downsample)
+            .saturating_mul(u64::from(self.image.height / limits.latent_downsample));
+        if units > limits.max_latent_units {
+            return Err(GenerationResourceError::LatentCapacity {
+                requested: units,
+                available: limits.max_latent_units,
+            });
+        }
+        Ok(units)
+    }
+
+    /// Allocation bytes for one image latent using the loaded model's byte density.
+    pub fn image_latent_bytes(
+        &self,
+        limits: &GenerationLimits,
+    ) -> Result<u64, GenerationResourceError> {
+        if !self.generates_images() {
+            return Ok(0);
+        }
+        let units = self.image_latent_units(limits)?;
+        if limits.max_vae_grid_tokens == 0 || limits.max_latent_feature_bytes == 0 {
             return Err(GenerationResourceError::MissingRuntimeBound {
                 resource: "max_latent_feature_bytes",
             });
         }
-        if uses_vision_features && limits.max_vision_feature_bytes == 0 {
-            return Err(GenerationResourceError::MissingRuntimeBound {
-                resource: "max_vision_feature_bytes",
-            });
-        }
+        let bytes_per_unit = limits
+            .max_latent_feature_bytes
+            .div_ceil(u64::from(limits.max_vae_grid_tokens));
+        Ok(units.saturating_mul(bytes_per_unit))
+    }
 
-        // Cache capacity covers every distinct encoder step that this request
-        // may pin concurrently.
-        let encoder_cache_keys = if cache.read || cache.write {
-            context
+    /// Checks reachable encoder work, image geometry, and guidance against loaded capacity.
+    /// Admission separately acquires KV, cache entries, and latent storage from their pools.
+    pub fn validate_resources(
+        &self,
+        limits: &GenerationLimits,
+    ) -> Result<(), GenerationResourceError> {
+        self.max_kv_tokens(limits)?;
+        let feedback = (self.continues_after_image()
+            && self.image_generation.feedback_source.is_some())
+        .then_some(self.image_generation.feedback_encoders.as_slice());
+        for (step, bytes, resource) in [
+            (
+                ImageIngestStep::VaeEncode,
+                limits.max_latent_feature_bytes,
+                "max_latent_feature_bytes",
+            ),
+            (
+                ImageIngestStep::VitEncode,
+                limits.max_vision_feature_bytes,
+                "max_vision_feature_bytes",
+            ),
+        ] {
+            let used = self
+                .multimodal_inputs
+                .images
                 .iter()
-                .flat_map(|segment| match segment {
-                    ContextSegment::Image { image, ingest } => {
-                        ingest.encoder_cache_keys(image.hash)
-                    }
-                    ContextSegment::UndTokens { .. } => Vec::new(),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        if !encoder_cache_keys.is_empty() {
+                .any(|image| image.encoders.iter().any(|input| input.encoder == step))
+                || feedback.is_some_and(|inputs| inputs.iter().any(|input| input.encoder == step));
+            if used && bytes == 0 {
+                return Err(GenerationResourceError::MissingRuntimeBound { resource });
+            }
+        }
+        let entries = self.num_encoder_cache_entries();
+        if entries > 0 {
             if limits.encoder_cache_entries == 0 {
                 return Err(GenerationResourceError::MissingRuntimeBound {
                     resource: "encoder_cache_entries",
                 });
             }
-            if encoder_cache_keys.len() > limits.encoder_cache_entries as usize {
+            if entries > limits.encoder_cache_entries as usize {
                 return Err(GenerationResourceError::EncoderCacheCapacity {
-                    requested: encoder_cache_keys.len(),
+                    requested: entries,
                     available: limits.encoder_cache_entries,
                 });
             }
         }
-
-        // Media generation validates grid alignment and runtime capacities
-        // before deriving latent storage from the requested image dimensions.
-        if behavior.gen_output && limits.latent_downsample == 0 {
-            return Err(GenerationResourceError::MissingRuntimeBound {
-                resource: "latent_downsample",
-            });
-        }
-        if behavior.gen_output
-            && (!image.width.is_multiple_of(limits.latent_downsample)
-                || !image.height.is_multiple_of(limits.latent_downsample))
-        {
-            return Err(GenerationResourceError::ImageDimensionAlignment {
-                width: image.width,
-                height: image.height,
-                latent_downsample: limits.latent_downsample,
-            });
-        }
-        if behavior.gen_output && limits.max_latent_units == 0 {
-            return Err(GenerationResourceError::MissingRuntimeBound {
-                resource: "max_latent_units",
-            });
-        }
-        if behavior.gen_output && limits.max_cfg_branches == 0 {
-            return Err(GenerationResourceError::MissingRuntimeBound {
-                resource: "max_cfg_branches",
-            });
-        }
-
-        let latent_downsample = limits.latent_downsample.max(1);
-        let requested_latent_units = u64::from(image.width / latent_downsample)
-            .saturating_mul(u64::from(image.height / latent_downsample));
-        if behavior.gen_output && requested_latent_units > limits.max_latent_units {
-            return Err(GenerationResourceError::LatentCapacity {
-                requested: requested_latent_units,
-                available: limits.max_latent_units,
-            });
-        }
-
-        // The worker's feature-byte maximum establishes a conservative byte
-        // density for the requested latent grid.
-        let image_latent_bytes = if behavior.gen_output {
-            if limits.max_vae_grid_tokens == 0 || limits.max_latent_feature_bytes == 0 {
+        self.image_latent_bytes(limits)?;
+        if self.generates_images() {
+            if limits.max_cfg_branches == 0 {
                 return Err(GenerationResourceError::MissingRuntimeBound {
-                    resource: "max_latent_feature_bytes",
+                    resource: "max_cfg_branches",
                 });
             }
-            let bytes_per_unit = limits
-                .max_latent_feature_bytes
-                .div_ceil(u64::from(limits.max_vae_grid_tokens));
-            requested_latent_units.saturating_mul(bytes_per_unit)
-        } else {
-            0
-        };
-        let requested_cfg_branches = u64::from(image.cfg_branch_count());
-        if behavior.gen_output && requested_cfg_branches > u64::from(limits.max_cfg_branches) {
-            return Err(GenerationResourceError::CfgBranchCapacity {
-                requested: requested_cfg_branches,
-                available: limits.max_cfg_branches,
-            });
-        }
-
-        // Saturating sums keep the declaration conservative even when an input
-        // approaches the host representation limit.
-        Ok(Self {
-            context_tokens,
-            max_kv_tokens: context_tokens
-                .saturating_add(max_und_tokens)
-                .saturating_add(input_image_kv_tokens)
-                .saturating_add(generated_feedback_kv_tokens)
-                .saturating_add(behavior.gen_output.then_some(negative_tokens).unwrap_or(0)),
-            max_image_latent_units: if behavior.gen_output {
-                requested_latent_units
-            } else {
-                0
-            },
-            max_image_latent_bytes: image_latent_bytes,
-            max_latent_feature_bytes: if uses_latent_features {
-                limits.max_latent_feature_bytes
-            } else {
-                0
-            },
-            max_vision_feature_bytes: if uses_vision_features {
-                limits.max_vision_feature_bytes
-            } else {
-                0
-            },
-            encoder_cache_keys,
-            generated_feedback_makes_non_replayable: behavior.generated_image_feedback,
-        })
-    }
-
-    /// Checks that this declaration covers every required resource maximum.
-    pub fn validate_covers(&self, required: &Self) -> Result<(), GenerationResourceError> {
-        // Compare scalar capacities through one table so every undersized field
-        // produces the same structured diagnostic.
-        for (resource, declared, required) in [
-            (
-                "max_kv_tokens",
-                self.max_kv_tokens as u64,
-                required.max_kv_tokens as u64,
-            ),
-            (
-                "max_image_latent_units",
-                self.max_image_latent_units,
-                required.max_image_latent_units,
-            ),
-            (
-                "max_image_latent_bytes",
-                self.max_image_latent_bytes,
-                required.max_image_latent_bytes,
-            ),
-            (
-                "max_latent_feature_bytes",
-                self.max_latent_feature_bytes,
-                required.max_latent_feature_bytes,
-            ),
-            (
-                "max_vision_feature_bytes",
-                self.max_vision_feature_bytes,
-                required.max_vision_feature_bytes,
-            ),
-        ] {
-            if declared < required {
-                return Err(GenerationResourceError::DeclaredBoundTooSmall {
-                    resource,
-                    declared,
-                    required,
+            let branches = u64::from(self.image.cfg_branch_count());
+            if branches > u64::from(limits.max_cfg_branches) {
+                return Err(GenerationResourceError::CfgBranchCapacity {
+                    requested: branches,
+                    available: limits.max_cfg_branches,
                 });
             }
-        }
-
-        // Replayability is a capability declaration rather than a numeric
-        // capacity and therefore requires a separate implication check.
-        if required.generated_feedback_makes_non_replayable
-            && !self.generated_feedback_makes_non_replayable
-        {
-            return Err(GenerationResourceError::MissingNonReplayableDeclaration);
         }
         Ok(())
     }
 }
 
-/// Computes the worst-case KV contribution of every configured image-ingest step.
-fn ingest_kv_bound(
-    ingest: &ImageIngestRecipe,
+/// Computes physical capacity from the concrete encoder inputs and loaded limits.
+fn encoder_kv_bound(
+    inputs: &[ImageEncoderInput],
     limits: &GenerationLimits,
 ) -> Result<usize, GenerationResourceError> {
-    // Stage/effect alignment is required before the two vectors can be folded
-    // into one conservative bound.
-    if ingest.steps.len() != ingest.step_kv_tokens.len() {
-        return Err(GenerationResourceError::ImageIngestKvArity {
-            steps: ingest.steps.len(),
-            effects: ingest.step_kv_tokens.len(),
-        });
-    }
-    ingest
-        .steps
-        .iter()
-        .copied()
-        .zip(ingest.step_kv_tokens.iter().copied())
-        .try_fold(0usize, |total, (step, effect)| {
-            let fallback = match step {
-                ImageIngestStep::VaeEncode => limits.max_vae_grid_tokens,
-                ImageIngestStep::VitEncode => limits.max_vit_grid_tokens,
-            };
-            let step_bound = kv_effect_bound(effect, fallback, step.as_str())?;
-            Ok(total.saturating_add(step_bound))
-        })
+    inputs.iter().try_fold(0usize, |total, input| {
+        Ok(total.saturating_add(input.kv_token_capacity(limits)? as usize))
+    })
 }
 
-/// Resolves an exact, bounded, or runtime-defined KV contribution.
-fn kv_effect_bound(
-    effect: ImageKvEffect,
-    fallback: u32,
-    operation: &'static str,
-) -> Result<usize, GenerationResourceError> {
-    match effect {
-        ImageKvEffect::Exact { tokens } => Ok(tokens as usize),
-        ImageKvEffect::Bounded { max_tokens } => Ok(max_tokens as usize),
-        ImageKvEffect::WorkerDefined if fallback > 0 => Ok(fallback as usize),
-        ImageKvEffect::WorkerDefined => {
-            Err(GenerationResourceError::UnboundedImageKv { operation })
+impl ImageEncoderInput {
+    /// Maximum KV contribution of this encoder, resolving dynamic lengths from the model.
+    pub fn kv_token_capacity(
+        &self,
+        limits: &GenerationLimits,
+    ) -> Result<u32, GenerationResourceError> {
+        let capacity = match self.encoder {
+            ImageIngestStep::VaeEncode => limits.max_vae_grid_tokens,
+            ImageIngestStep::VitEncode => limits.max_vit_grid_tokens,
+        };
+        let tokens = self
+            .num_kv_tokens
+            .or(self.max_kv_tokens)
+            .unwrap_or(capacity);
+        if tokens == 0 {
+            return Err(GenerationResourceError::UnboundedImageKv {
+                operation: self.encoder.as_str(),
+            });
         }
+        Ok(tokens)
     }
 }
 
@@ -959,23 +631,12 @@ impl ImageIngestStep {
 /// Failures while deriving bounded generation resources.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GenerationResourceError {
-    /// Image ingest stages and KV effects have different lengths.
-    #[error("image ingest declares {steps} steps but {effects} KV effects")]
-    ImageIngestKvArity {
-        /// Number of encoder stages.
-        steps: usize,
-        /// Number of declared KV effects.
-        effects: usize,
-    },
-    /// A worker-defined image KV effect has no runtime maximum.
-    #[error("{operation} has a worker-defined KV effect but the runtime declares no bound")]
+    /// A worker-selected image KV length has no declared or loaded maximum.
+    #[error("{operation} has a worker-selected KV length but the runtime declares no bound")]
     UnboundedImageKv {
         /// Encoder operation missing a bound.
         operation: &'static str,
     },
-    /// Continuation requires an image-feedback recipe.
-    #[error("generated image continuation requires a feedback resource recipe")]
-    MissingFeedback,
     /// Image generation requires a runtime resource maximum that is zero.
     #[error("image generation requires the runtime to declare {resource}")]
     MissingRuntimeBound {
@@ -993,12 +654,6 @@ pub enum GenerationResourceError {
         height: u32,
         /// Required latent downsample factor.
         latent_downsample: u32,
-    },
-    /// Resource-bound arithmetic overflowed.
-    #[error("{resource} overflowed while computing the request resource bound")]
-    ResourceOverflow {
-        /// Resource whose bound overflowed.
-        resource: &'static str,
     },
     /// Requested latent grid exceeds runtime capacity.
     #[error("requested image latent units ({requested}) exceed runtime capacity ({available})")]
@@ -1024,24 +679,11 @@ pub enum GenerationResourceError {
         /// Available cache entry count.
         available: u32,
     },
-    /// A caller-declared resource maximum is below the computed requirement.
-    #[error("declared {resource} bound ({declared}) is below the required bound ({required})")]
-    DeclaredBoundTooSmall {
-        /// Name of the undersized resource.
-        resource: &'static str,
-        /// Caller-declared maximum.
-        declared: u64,
-        /// Computed required maximum.
-        required: u64,
-    },
-    /// Image feedback omits its non-replayable declaration.
-    #[error("generated image feedback must be declared non-replayable")]
-    MissingNonReplayableDeclaration,
 }
 
 /// Scheduler-relevant prefix-cache behavior resolved during compilation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GenerationCachePolicyDescriptor {
+pub struct CachePolicy {
     /// Whether admission may reuse cached prefixes or encoder outputs.
     pub read: bool,
     /// Whether completed context may populate caches.
@@ -1050,7 +692,7 @@ pub struct GenerationCachePolicyDescriptor {
     pub isolation_key: Option<u64>,
 }
 
-impl Default for GenerationCachePolicyDescriptor {
+impl Default for CachePolicy {
     /// Returns a shared-cache policy with reads and writes enabled.
     fn default() -> Self {
         Self {
@@ -1063,20 +705,20 @@ impl Default for GenerationCachePolicyDescriptor {
 
 /// Validated scheduler-facing generation request.
 ///
-/// The value contains immutable request data and conservative resource bounds;
-/// submission channels and mutable runtime state live in the engine.
+/// The value contains immutable request inputs. Capacity requirements are derived
+/// from these inputs and loaded model limits; the engine owns actual reservations.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationRequest {
     /// Engine request identity.
     pub request_id: RequestId,
-    /// Ordered positive model context.
-    pub context: Vec<ContextSegment>,
-    /// Negative conditioning context used by image generation.
-    pub negative_context: Vec<ContextSegment>,
+    /// Final positive model prompt, including template and image-marker tokens.
+    pub prompt_token_ids: Vec<u32>,
+    /// Final negative conditioning tokens used by image generation.
+    pub negative_prompt_token_ids: Vec<u32>,
+    /// Media positions refer directly to `prompt_token_ids`.
+    pub multimodal_inputs: MultimodalInputs,
     /// Requested understanding/image output constraint.
     pub constraint: GenerationConstraint,
-    /// Constraint-resolved scheduler behavior.
-    pub behavior: GenerationBehaviorDescriptor,
     /// Text sampling parameters.
     pub sampling: SamplingParams,
     /// Image-generation parameters.
@@ -1090,57 +732,23 @@ pub struct GenerationRequest {
     /// Scheduler priority.
     pub priority: i32,
     /// Prefix and encoder-cache policy.
-    pub cache: GenerationCachePolicyDescriptor,
-    /// Model-specific trigger, visibility, feedback, and termination policy.
-    pub policy: GenerationPolicyDescriptor,
-    /// Conservative resource declaration checked during admission.
-    pub resources: GenerationResourceBounds,
+    pub cache: CachePolicy,
+    /// Whether a matched stopping token is included in public text output.
+    pub include_stop_token: bool,
+    /// Model-specific image trigger and feedback requirements.
+    pub image_generation: ImageGenerationConfig,
 }
 
 impl GenerationRequest {
-    /// Collects understanding-token context in logical order.
-    pub fn prompt_token_ids(&self) -> Vec<u32> {
-        self.context
-            .iter()
-            .flat_map(|segment| match segment {
-                ContextSegment::UndTokens { token_ids, .. } => token_ids.as_slice(),
-                ContextSegment::Image { .. } => &[],
-            })
-            .copied()
-            .collect()
-    }
-
-    /// Counts understanding tokens in the positive context.
-    pub fn prompt_token_count(&self) -> usize {
-        self.context
-            .iter()
-            .map(|segment| match segment {
-                ContextSegment::UndTokens { token_ids, .. } => token_ids.len(),
-                ContextSegment::Image { .. } => 0,
-            })
-            .sum()
-    }
-
-    /// Counts image segments in the positive context.
-    pub fn context_image_count(&self) -> usize {
-        self.context
-            .iter()
-            .filter(|segment| matches!(segment, ContextSegment::Image { .. }))
-            .count()
-    }
-
-    /// Validates policy consistency, context layout, and declared bounds.
+    /// Validates image conditions, input positions, and sampling.
     pub fn validate(&self) -> Result<(), GenerationRequestError> {
         // Validate request-wide policy and parameter invariants before walking
-        // the ordered context.
-        if self.context.is_empty() {
+        // the positioned multimodal inputs.
+        if self.prompt_token_ids.is_empty() && self.multimodal_inputs.images.is_empty() {
             return Err(GenerationRequestError::EmptyContext);
         }
-        if self.max_und_tokens == 0 && !self.behavior.finish_after_gen_commit {
+        if self.max_und_tokens == 0 && !self.finishes_after_image() {
             return Err(GenerationRequestError::ZeroMaxUndTokens);
-        }
-        if self.behavior != GenerationBehaviorDescriptor::resolve(self.constraint, &self.policy) {
-            return Err(GenerationRequestError::BehaviorPolicyMismatch);
         }
 
         self.sampling
@@ -1149,113 +757,66 @@ impl GenerationRequest {
         self.image
             .validate()
             .map_err(GenerationRequestError::InvalidImage)?;
-        if self.behavior.und_decode && self.sampling.min_tokens > self.max_und_tokens {
+        if self.decodes_text() && self.sampling.min_tokens > self.max_und_tokens {
             return Err(GenerationRequestError::MinTokensExceedsMaximum {
                 min_tokens: self.sampling.min_tokens,
                 max_und_tokens: self.max_und_tokens,
             });
         }
-        if matches!(self.constraint, GenerationConstraint::GenOnly) && !self.behavior.gen_output {
+        if matches!(self.constraint, GenerationConstraint::GenOnly) && !self.generates_images() {
             return Err(GenerationRequestError::GenOnlyCannotProduceImage);
         }
 
-        // Trigger and continuation policies must form a finite scheduler graph.
-        if !self.policy.termination.max_tokens_finishes {
-            return Err(GenerationRequestError::NonTerminalMaxTokensPolicy);
-        }
-        match &self.policy.trigger {
-            TriggerPolicyDescriptor::Suffix { token_ids } if token_ids.is_empty() => {
+        // Trigger sequences must be nonempty and image continuation needs an encoder.
+        match &self.image_generation.trigger {
+            ImageTrigger::Suffix { token_ids } if token_ids.is_empty() => {
                 return Err(GenerationRequestError::EmptyTriggerPattern);
             }
-            TriggerPolicyDescriptor::RoundCloseThenSuffix {
+            ImageTrigger::RoundCloseThenSuffix {
                 close_token_ids,
                 trigger_token_ids,
             } if close_token_ids.is_empty() || trigger_token_ids.is_empty() => {
                 return Err(GenerationRequestError::EmptyTriggerPattern);
             }
-            TriggerPolicyDescriptor::Disabled
-            | TriggerPolicyDescriptor::Token { .. }
-            | TriggerPolicyDescriptor::Suffix { .. }
-            | TriggerPolicyDescriptor::RoundCloseThenSuffix { .. } => {}
+            ImageTrigger::Disabled
+            | ImageTrigger::Token { .. }
+            | ImageTrigger::Suffix { .. }
+            | ImageTrigger::RoundCloseThenSuffix { .. } => {}
         }
-        if self.policy.trigger.requires_round_close() && !self.policy.termination.eos_finishes {
-            return Err(GenerationRequestError::NonTerminalRoundClosePolicy);
-        }
-        if self.behavior.continue_after_gen_commit {
-            let feedback = self
-                .policy
-                .feedback
-                .as_ref()
-                .ok_or(GenerationRequestError::MissingFeedbackRecipe)?;
-            if feedback.next_und_token == FeedbackNextToken::None {
-                return Err(GenerationRequestError::IncompleteFeedbackRecipe);
+        if self.continues_after_image() {
+            if self.image_generation.feedback_source.is_none() {
+                return Err(GenerationRequestError::MissingImageFeedback);
+            }
+            if self.image_generation.feedback_next_token == FeedbackNextToken::None {
+                return Err(GenerationRequestError::MissingFeedbackToken);
             }
         }
-        if let Some(feedback) = &self.policy.feedback {
-            validate_ingest_recipe(&feedback.ingest)?;
+        if self.image_generation.feedback_source.is_some() {
+            validate_image_encoders(
+                &self.image_generation.feedback_encoders,
+                self.image_generation.num_feedback_positions,
+            )?;
         }
 
-        // Validate segment params while deriving the context-dependent cache
-        // identities and token count used by the resource declaration.
-        let context_tokens = self.prompt_token_count();
-        let mut seen_tokens = 0usize;
-        let mut expected_encoder_cache_keys = Vec::new();
-        for segment in &self.context {
-            match segment {
-                ContextSegment::UndTokens { token_ids, .. } => {
-                    seen_tokens = seen_tokens.saturating_add(token_ids.len());
-                }
-                ContextSegment::Image { image, ingest } => {
-                    if image.b64.is_empty() {
-                        return Err(GenerationRequestError::EmptyImagePayload);
-                    }
-                    validate_ingest_recipe(ingest)?;
-                    let expected_position = match image.position {
-                        SegmentPosition::AtToken { position } => position as usize,
-                        SegmentPosition::Append => context_tokens,
-                    };
-                    if expected_position != seen_tokens {
-                        return Err(GenerationRequestError::ImagePositionMismatch {
-                            expected: seen_tokens,
-                            actual: expected_position,
-                        });
-                    }
-                    if self.cache.read || self.cache.write {
-                        expected_encoder_cache_keys.extend(ingest.encoder_cache_keys(image.hash));
-                    }
-                }
+        // Image positions belong to the final token vector. The input order is
+        // also the order of encoder contributions when positions are equal.
+        let context_tokens = self.prompt_token_ids.len();
+        let mut previous_position = 0;
+        for image in &self.multimodal_inputs.images {
+            if image.b64.is_empty() {
+                return Err(GenerationRequestError::EmptyImagePayload);
             }
-        }
-
-        // Negative conditioning is text-only because image ingest belongs to
-        // the positive model context.
-        if self
-            .negative_context
-            .iter()
-            .any(|segment| matches!(segment, ContextSegment::Image { .. }))
-        {
-            return Err(GenerationRequestError::ImageInNegativeContext);
-        }
-
-        // Resource fields are supplied independently and must agree exactly
-        // with the validated positive context.
-        if self.resources.context_tokens != context_tokens {
-            return Err(GenerationRequestError::ContextTokenBoundMismatch {
-                expected: context_tokens,
-                actual: self.resources.context_tokens,
-            });
-        }
-        if self.resources.max_kv_tokens < context_tokens {
-            return Err(GenerationRequestError::MaxKvBelowContext {
-                context_tokens,
-                max_kv_tokens: self.resources.max_kv_tokens,
-            });
-        }
-        if self.resources.encoder_cache_keys != expected_encoder_cache_keys {
-            return Err(GenerationRequestError::EncoderCacheKeysMismatch {
-                expected: expected_encoder_cache_keys,
-                actual: self.resources.encoder_cache_keys.clone(),
-            });
+            validate_image_encoders(&image.encoders, image.num_positions)?;
+            if image.position as usize > context_tokens {
+                return Err(GenerationRequestError::ImagePositionBeyondPrompt {
+                    position: image.position,
+                    prompt_tokens: context_tokens,
+                });
+            }
+            if image.position < previous_position {
+                return Err(GenerationRequestError::UnorderedImageInputs);
+            }
+            previous_position = image.position;
         }
 
         // Empty stop strings would match every output position and do not form
@@ -1265,54 +826,28 @@ impl GenerationRequest {
         }
         Ok(())
     }
-
-    /// Recomputes required resources under `limits` and checks the declaration.
-    pub fn validate_resources(
-        &self,
-        limits: &GenerationLimits,
-    ) -> Result<(), GenerationResourceError> {
-        let required = GenerationResourceBounds::conservative(GenerationResources {
-            context: &self.context,
-            negative_context: &self.negative_context,
-            behavior: &self.behavior,
-            policy: &self.policy,
-            image: &self.image,
-            max_und_tokens: self.max_und_tokens,
-            cache: &self.cache,
-            limits,
-        })?;
-        self.resources.validate_covers(&required)
-    }
 }
 
-/// Validates an image-ingest recipe's stage alignment and positive bounds.
-fn validate_ingest_recipe(recipe: &ImageIngestRecipe) -> Result<(), GenerationRequestError> {
-    if recipe.steps.is_empty() {
-        return Err(GenerationRequestError::EmptyImageIngestRecipe);
+/// Validates an image's encoder inputs and logical position contribution.
+fn validate_image_encoders(
+    inputs: &[ImageEncoderInput],
+    num_positions: u32,
+) -> Result<(), GenerationRequestError> {
+    if inputs.is_empty() {
+        return Err(GenerationRequestError::MissingImageEncoders);
     }
-    if recipe.steps.len() != recipe.step_kv_tokens.len() {
-        return Err(GenerationRequestError::ImageIngestKvArity {
-            steps: recipe.steps.len(),
-            effects: recipe.step_kv_tokens.len(),
-        });
-    }
-    if recipe.logical_positions == 0 {
+    if num_positions == 0 {
         return Err(GenerationRequestError::ZeroImageLogicalPositions);
     }
-    recipe
-        .step_kv_tokens
-        .iter()
-        .copied()
-        .try_for_each(validate_kv_effect)
-}
-
-/// Validates that an explicit image KV effect contributes a positive bound.
-fn validate_kv_effect(effect: ImageKvEffect) -> Result<(), GenerationRequestError> {
-    if matches!(
-        effect,
-        ImageKvEffect::Exact { tokens: 0 } | ImageKvEffect::Bounded { max_tokens: 0 }
-    ) {
-        return Err(GenerationRequestError::ZeroImageKvBound);
+    for input in inputs {
+        if input.num_kv_tokens == Some(0) || input.max_kv_tokens == Some(0) {
+            return Err(GenerationRequestError::ZeroImageKvBound);
+        }
+        if let (Some(tokens), Some(max_tokens)) = (input.num_kv_tokens, input.max_kv_tokens)
+            && tokens > max_tokens
+        {
+            return Err(GenerationRequestError::ImageKvExceedsCapacity { tokens, max_tokens });
+        }
     }
     Ok(())
 }
@@ -1320,92 +855,50 @@ fn validate_kv_effect(effect: ImageKvEffect) -> Result<(), GenerationRequestErro
 /// Validation failures for a scheduler-facing generation request.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum GenerationRequestError {
-    /// The positive context contains no segments.
-    #[error("generation context must contain at least one segment")]
+    /// The positive input contains neither tokens nor images.
+    #[error("generation input must contain tokens or images")]
     EmptyContext,
-    /// Image ingest stages and KV effects have different lengths.
-    #[error("image ingest declares {steps} steps but {effects} KV effects")]
-    ImageIngestKvArity {
-        /// Number of encoder stages.
-        steps: usize,
-        /// Number of declared KV effects.
-        effects: usize,
-    },
     /// Understanding decode has a zero token budget.
     #[error("max_und_tokens must be positive")]
     ZeroMaxUndTokens,
-    /// Resolved behavior disagrees with the request constraint and policy.
-    #[error("resolved generation behavior does not match constraint and policy")]
-    BehaviorPolicyMismatch,
     /// An image context segment declares no encoder stages.
-    #[error("image context segment has an empty ingest recipe")]
-    EmptyImageIngestRecipe,
-    /// Negative conditioning contains an image segment.
-    #[error("negative context may contain only Und token segments")]
-    ImageInNegativeContext,
-    /// An image context segment carries no encoded payload.
-    #[error("image segment payload must not be empty")]
+    #[error("image input has no encoders")]
+    MissingImageEncoders,
+    /// An input image carries no encoded payload.
+    #[error("image payload must not be empty")]
     EmptyImagePayload,
-    /// An image segment does not follow the preceding understanding tokens.
-    #[error(
-        "image segment params does not match ordered context: expected {expected}, got {actual}"
-    )]
-    ImagePositionMismatch {
-        /// Position implied by preceding context segments.
-        expected: usize,
-        /// Position declared by the image segment.
-        actual: usize,
+    /// An image refers beyond the final positive prompt.
+    #[error("image position {position} exceeds the {prompt_tokens}-token prompt")]
+    ImagePositionBeyondPrompt {
+        /// Exclusive token position of the image marker.
+        position: u32,
+        /// Length of the final token vector.
+        prompt_tokens: usize,
     },
-    /// An image ingest recipe contributes no logical model positions.
-    #[error("image ingest and feedback recipes must consume at least one logical position")]
+    /// Images would be consumed in a different order than their prompt positions.
+    #[error("input images must follow prompt-token position order")]
+    UnorderedImageInputs,
+    /// An image input contributes no logical model positions.
+    #[error("image inputs and feedback must consume at least one logical position")]
     ZeroImageLogicalPositions,
-    /// A bounded image KV effect has a zero maximum.
-    #[error("bounded image KV effects must be positive")]
+    /// An explicit image KV length or capacity is zero.
+    #[error("image KV lengths and capacities must be positive")]
     ZeroImageKvBound,
+    /// An exact image contribution must fit its declared capacity.
+    #[error("image KV length {tokens} exceeds capacity {max_tokens}")]
+    ImageKvExceedsCapacity { tokens: u32, max_tokens: u32 },
     /// A suffix or round-close trigger contains no tokens.
     #[error("generation trigger patterns must not be empty")]
     EmptyTriggerPattern,
     /// Image-only generation cannot open an image branch.
     #[error("gen_only request cannot produce an image under the resolved policy")]
     GenOnlyCannotProduceImage,
-    /// Image continuation has no feedback recipe.
-    #[error("default generation continuation requires a feedback recipe")]
-    MissingFeedbackRecipe,
+    /// Image continuation has no feedback input.
+    #[error("default generation continuation requires image feedback")]
+    MissingImageFeedback,
     /// Image feedback has no understanding continuation token.
     #[error("default generation feedback requires a continuation token")]
-    IncompleteFeedbackRecipe,
-    /// The maximum-token policy does not terminate at the request bound.
-    #[error("max-token policy must terminate at the declared request bound")]
-    NonTerminalMaxTokensPolicy,
-    /// A round-close trigger is paired with non-terminal round closure.
-    #[error("round-close trigger policy requires terminal round closure")]
-    NonTerminalRoundClosePolicy,
-    /// Declared context-token count disagrees with the context.
-    #[error("resource context-token bound mismatch: expected {expected}, got {actual}")]
-    ContextTokenBoundMismatch {
-        /// Token count derived from the context.
-        expected: usize,
-        /// Declared context-token count.
-        actual: usize,
-    },
-    /// Declared KV bound cannot contain the positive context.
-    #[error("max_kv_tokens ({max_kv_tokens}) is below context tokens ({context_tokens})")]
-    MaxKvBelowContext {
-        /// Tokens present in the positive context.
-        context_tokens: usize,
-        /// Declared maximum KV tokens.
-        max_kv_tokens: usize,
-    },
-    /// Declared encoder-cache keys disagree with image ingest recipes.
-    #[error(
-        "encoder-cache key declaration does not match context: expected {expected:?}, got {actual:?}"
-    )]
-    EncoderCacheKeysMismatch {
-        /// Keys derived from image context segments.
-        expected: Vec<u64>,
-        /// Keys declared in request resources.
-        actual: Vec<u64>,
-    },
+    MissingFeedbackToken,
     /// A configured stop string is empty.
     #[error("stop strings must not be empty")]
     EmptyStopString,
@@ -1425,15 +918,17 @@ pub enum GenerationRequestError {
     },
 }
 
-impl Default for GenerationPolicyDescriptor {
-    /// Returns a text-only policy with visible understanding output.
+impl Default for ImageGenerationConfig {
+    /// Disables image generation until the model configures a trigger or immediate start.
     fn default() -> Self {
         Self {
-            trigger: TriggerPolicyDescriptor::Disabled,
-            gen_only_start: GenOnlyStartPolicyDescriptor::default(),
-            visibility: VisibilityPolicyDescriptor::default(),
-            termination: TerminationPolicyDescriptor::default(),
-            feedback: None,
+            trigger: ImageTrigger::Disabled,
+            requires_text_for_image: true,
+            feedback_source: None,
+            feedback_next_token: FeedbackNextToken::None,
+            num_feedback_positions: 0,
+            feedback_encoders: Vec::new(),
+            sample_feedback_continuation: false,
         }
     }
 }
@@ -1458,86 +953,69 @@ mod tests {
     }
 
     fn complete_request() -> GenerationRequest {
-        let policy = GenerationPolicyDescriptor {
-            trigger: TriggerPolicyDescriptor::RoundCloseThenSuffix {
+        let policy = ImageGenerationConfig {
+            trigger: ImageTrigger::RoundCloseThenSuffix {
                 close_token_ids: vec![2, 3],
                 trigger_token_ids: vec![40, 41],
             },
-            visibility: VisibilityPolicyDescriptor {
-                default: UndTokenAction::Emit,
-                und_only: UndTokenAction::Emit,
-                gen_only: UndTokenAction::KeepInternal,
-            },
-            termination: TerminationPolicyDescriptor::default(),
-            feedback: Some(GeneratedImageFeedbackRecipe {
-                source: FeedbackSource::ArtifactProduct,
-                next_und_token: FeedbackNextToken::Token { token_id: 12 },
-                ingest: ImageIngestRecipe::vae_then_vit(
-                    1,
-                    ImageKvEffect::Bounded { max_tokens: 64 },
-                    ImageKvEffect::Bounded { max_tokens: 64 },
-                ),
-                sample_continuation: false,
-            }),
-            ..GenerationPolicyDescriptor::default()
-        };
-        let constraint = GenerationConstraint::Default;
-        let mut request = GenerationRequest {
-            request_id: RequestId(7),
-            context: vec![
-                ContextSegment::UndTokens {
-                    token_ids: vec![1, 2],
-                    visibility: UndVisibility::Internal,
+            feedback_source: Some(FeedbackSource::ArtifactProduct),
+            feedback_next_token: FeedbackNextToken::Token { token_id: 12 },
+            num_feedback_positions: 1,
+            feedback_encoders: vec![
+                ImageEncoderInput {
+                    encoder: ImageIngestStep::VaeEncode,
+                    num_kv_tokens: None,
+                    max_kv_tokens: Some(64),
                 },
-                ContextSegment::Image {
-                    image: ImageSegment {
-                        hash: 17,
-                        b64: "aW1hZ2U=".into(),
-                        position: SegmentPosition::AtToken { position: 2 },
-                    },
-                    ingest: ImageIngestRecipe::vae_then_vit(
-                        1,
-                        ImageKvEffect::Bounded { max_tokens: 64 },
-                        ImageKvEffect::Exact { tokens: 32 },
-                    ),
-                },
-                ContextSegment::UndTokens {
-                    token_ids: vec![3, 4],
-                    visibility: UndVisibility::Visible,
+                ImageEncoderInput {
+                    encoder: ImageIngestStep::VitEncode,
+                    num_kv_tokens: None,
+                    max_kv_tokens: Some(64),
                 },
             ],
-            negative_context: vec![ContextSegment::UndTokens {
-                token_ids: vec![9],
-                visibility: UndVisibility::Internal,
-            }],
-            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+            sample_feedback_continuation: false,
+            ..ImageGenerationConfig::default()
+        };
+        let constraint = GenerationConstraint::Default;
+        GenerationRequest {
+            request_id: RequestId(7),
+            prompt_token_ids: vec![1, 2, 3, 4],
+            negative_prompt_token_ids: vec![9],
+            multimodal_inputs: MultimodalInputs {
+                images: vec![ImageInput {
+                    hash: 17,
+                    b64: "aW1hZ2U=".into(),
+                    position: 2,
+                    num_positions: 1,
+                    encoders: vec![
+                        ImageEncoderInput {
+                            encoder: ImageIngestStep::VaeEncode,
+                            num_kv_tokens: None,
+                            max_kv_tokens: Some(64),
+                        },
+                        ImageEncoderInput {
+                            encoder: ImageIngestStep::VitEncode,
+                            num_kv_tokens: Some(32),
+                            max_kv_tokens: None,
+                        },
+                    ],
+                }],
+            },
             constraint,
             sampling: SamplingParams::default(),
             image: ImageParams::default(),
             max_und_tokens: 16,
+            include_stop_token: false,
             stop_strings: vec!["stop".into()],
             stop_token_ids: vec![2],
             priority: 3,
-            cache: GenerationCachePolicyDescriptor {
+            cache: CachePolicy {
                 read: false,
                 write: false,
                 isolation_key: Some(91),
             },
-            policy,
-            resources: GenerationResourceBounds::default(),
-        };
-        request.resources = GenerationResourceBounds::conservative(GenerationResources {
-            context: &request.context,
-            negative_context: &request.negative_context,
-            behavior: &request.behavior,
-            policy: &request.policy,
-            image: &request.image,
-            max_und_tokens: request.max_und_tokens,
-            cache: &request.cache,
-            limits: &runtime_limits(),
-        })
-        .expect("bounded request fixture");
-        request
+            image_generation: policy,
+        }
     }
 
     #[test]
@@ -1555,89 +1033,26 @@ mod tests {
 
     #[test]
     fn encoder_cache_keys_are_stable_and_step_scoped() {
-        let recipe = ImageIngestRecipe::vae_then_vit(
-            1,
-            ImageKvEffect::WorkerDefined,
-            ImageKvEffect::WorkerDefined,
-        );
-        let keys = recipe.encoder_cache_keys(17);
-        assert_eq!(keys.len(), 2);
-        assert_ne!(keys[0], keys[1]);
-        assert_eq!(
-            keys[1],
-            encoder_cache_key(17, 1, ImageIngestStep::VitEncode)
-        );
-        assert_ne!(keys, recipe.encoder_cache_keys(18));
-    }
-
-    #[test]
-    fn default_visibility_hides_gen_only_und_tokens() {
-        let policy = VisibilityPolicyDescriptor::default();
-        assert_eq!(policy.default, UndTokenAction::Emit);
-        assert_eq!(policy.und_only, UndTokenAction::Emit);
-        assert_eq!(policy.gen_only, UndTokenAction::KeepInternal);
-    }
-
-    #[test]
-    fn behavior_is_resolved_before_scheduler_admission() {
-        let policy = GenerationPolicyDescriptor {
-            trigger: TriggerPolicyDescriptor::Token { token_id: 42 },
-            feedback: Some(GeneratedImageFeedbackRecipe {
-                source: FeedbackSource::DeviceProduct,
-                next_und_token: FeedbackNextToken::EndOfImage,
-                ingest: ImageIngestRecipe::vit_only(2, ImageKvEffect::WorkerDefined),
-                sample_continuation: true,
-            }),
-            ..GenerationPolicyDescriptor::default()
-        };
-        let default = GenerationBehaviorDescriptor::resolve(GenerationConstraint::Default, &policy);
-        assert!(default.gen_output);
-        assert!(default.generated_image_feedback);
-        assert!(default.continue_after_gen_commit);
-
-        let und_only =
-            GenerationBehaviorDescriptor::resolve(GenerationConstraint::UndOnly, &policy);
-        assert!(!und_only.gen_output);
-        assert!(und_only.emits_und());
-
-        let gen_only =
-            GenerationBehaviorDescriptor::resolve(GenerationConstraint::GenOnly, &policy);
-        assert!(gen_only.gen_output);
-        assert!(!gen_only.start_gen_after_context);
-        assert!(gen_only.und_decode);
-        assert!(!gen_only.emits_und());
-        assert!(gen_only.finish_after_gen_commit);
-
-        let immediate_policy = GenerationPolicyDescriptor {
-            trigger: TriggerPolicyDescriptor::Disabled,
-            gen_only_start: GenOnlyStartPolicyDescriptor::Immediate,
-            ..GenerationPolicyDescriptor::default()
-        };
-        let immediate =
-            GenerationBehaviorDescriptor::resolve(GenerationConstraint::GenOnly, &immediate_policy);
-        assert!(immediate.gen_output);
-        assert!(immediate.start_gen_after_context);
-        assert!(!immediate.und_decode);
-        assert!(immediate.finish_after_gen_commit);
-        assert_eq!(
-            immediate.required_features(&immediate_policy, []),
-            GenerationFeatures::UNDERSTANDING | GenerationFeatures::IMAGE_GENERATION
-        );
+        let first = encoder_cache_key(17, 0, ImageIngestStep::VaeEncode);
+        assert_eq!(first, encoder_cache_key(17, 0, ImageIngestStep::VaeEncode));
+        assert_ne!(first, encoder_cache_key(18, 0, ImageIngestStep::VaeEncode));
+        assert_ne!(first, encoder_cache_key(17, 1, ImageIngestStep::VaeEncode));
+        assert_ne!(first, encoder_cache_key(17, 0, ImageIngestStep::VitEncode));
     }
 
     #[test]
     fn trigger_descriptors_match_only_their_declared_boundary() {
-        let token = TriggerPolicyDescriptor::Token { token_id: 7 };
+        let token = ImageTrigger::Token { token_id: 7 };
         assert!(token.matches_generated(&[1, 7]));
         assert!(!token.matches_generated(&[7, 1]));
 
-        let suffix = TriggerPolicyDescriptor::Suffix {
+        let suffix = ImageTrigger::Suffix {
             token_ids: vec![4, 5],
         };
         assert!(suffix.matches_generated(&[1, 4, 5]));
         assert!(!suffix.matches_round_close(&[1, 4, 5], 9));
 
-        let round = TriggerPolicyDescriptor::RoundCloseThenSuffix {
+        let round = ImageTrigger::RoundCloseThenSuffix {
             close_token_ids: vec![9, 10],
             trigger_token_ids: vec![4, 5],
         };
@@ -1664,111 +1079,65 @@ mod tests {
         request.cache.read = true;
         request.cache.write = true;
         request.image.max_images = 2;
-        let bounds = GenerationResourceBounds::conservative(GenerationResources {
-            context: &request.context,
-            negative_context: &request.negative_context,
-            behavior: &request.behavior,
-            policy: &request.policy,
-            image: &request.image,
-            max_und_tokens: request.max_und_tokens,
-            cache: &request.cache,
-            limits: &runtime_limits(),
-        })
-        .expect("bounded resources");
-
-        assert_eq!(bounds.context_tokens, 4);
-        assert_eq!(bounds.max_kv_tokens, 4 + 16 + 64 + 32 + 2 * (64 + 64) + 1);
-        assert_eq!(bounds.max_image_latent_units, 1_024);
-        assert_eq!(bounds.encoder_cache_keys.len(), 2);
-        assert!(bounds.generated_feedback_makes_non_replayable);
+        request
+            .validate_resources(&runtime_limits())
+            .expect("supported image input");
+        assert_eq!(
+            request.max_kv_tokens(&runtime_limits()).unwrap(),
+            4 + 16 + 64 + 32 + 2 * (64 + 64) + 1
+        );
+        assert_eq!(
+            request.image_latent_units(&runtime_limits()).unwrap(),
+            1_024
+        );
+        assert_eq!(request.num_encoder_cache_entries(), 2);
     }
 
     #[test]
     fn conservative_resources_use_each_exact_image_ingest_step() {
         let mut request = complete_request();
-        request.context = vec![
-            ContextSegment::UndTokens {
-                token_ids: vec![1; 35],
-                visibility: UndVisibility::Internal,
-            },
-            ContextSegment::Image {
-                image: ImageSegment {
-                    hash: 17,
-                    b64: "aW1hZ2U=".into(),
-                    position: SegmentPosition::AtToken { position: 35 },
+        request.prompt_token_ids = vec![1; 35];
+        request.multimodal_inputs.images = vec![ImageInput {
+            hash: 17,
+            b64: "aW1hZ2U=".into(),
+            position: 35,
+            num_positions: 1,
+            encoders: vec![
+                ImageEncoderInput {
+                    encoder: ImageIngestStep::VaeEncode,
+                    num_kv_tokens: Some(1_026),
+                    max_kv_tokens: None,
                 },
-                ingest: ImageIngestRecipe::vae_then_vit(
-                    1,
-                    ImageKvEffect::Exact { tokens: 1_026 },
-                    ImageKvEffect::Exact { tokens: 1_371 },
-                ),
-            },
-        ];
-        request.behavior.gen_output = false;
-        request.behavior.generated_image_feedback = false;
-        request.policy.feedback = None;
+                ImageEncoderInput {
+                    encoder: ImageIngestStep::VitEncode,
+                    num_kv_tokens: Some(1_371),
+                    max_kv_tokens: None,
+                },
+            ],
+        }];
+        request.constraint = GenerationConstraint::UndOnly;
+        request.image_generation.feedback_source = None;
+        request.image_generation.feedback_encoders.clear();
         request.max_und_tokens = 256;
 
-        let bounds = GenerationResourceBounds::conservative(GenerationResources {
-            context: &request.context,
-            negative_context: &request.negative_context,
-            behavior: &request.behavior,
-            policy: &request.policy,
-            image: &request.image,
-            max_und_tokens: request.max_und_tokens,
-            cache: &request.cache,
-            limits: &runtime_limits(),
-        })
-        .expect("exact per-step image resources");
-
-        assert_eq!(bounds.max_kv_tokens, 35 + 256 + 1_026 + 1_371);
-        assert_eq!(bounds.max_kv_tokens.div_ceil(64), 42);
+        assert_eq!(
+            request.max_kv_tokens(&runtime_limits()).unwrap(),
+            35 + 256 + 1_026 + 1_371
+        );
     }
 
     #[test]
-    fn resource_compilation_rejects_unbounded_worker_kv_and_capacity_overflow() {
+    fn request_capacity_rejects_unbounded_encoders_and_insufficient_model_limits() {
         let mut request = complete_request();
-        let ContextSegment::Image { ingest, .. } = &mut request.context[1] else {
-            panic!("image fixture");
-        };
-        ingest.step_kv_tokens[1] = ImageKvEffect::WorkerDefined;
+        let input = &mut request.multimodal_inputs.images[0].encoders[1];
+        input.num_kv_tokens = None;
+        input.max_kv_tokens = None;
         let mut limits = runtime_limits();
         limits.max_vit_grid_tokens = 0;
         assert_eq!(
-            GenerationResourceBounds::conservative(GenerationResources {
-                context: &request.context,
-                negative_context: &request.negative_context,
-                behavior: &request.behavior,
-                policy: &request.policy,
-                image: &request.image,
-                max_und_tokens: request.max_und_tokens,
-                cache: &request.cache,
-                limits: &limits,
-            }),
+            request.validate_resources(&limits),
             Err(GenerationResourceError::UnboundedImageKv {
                 operation: "vit_encode",
-            })
-        );
-
-        let mut invalid_request = complete_request();
-        let ContextSegment::Image { ingest, .. } = &mut invalid_request.context[1] else {
-            panic!("image fixture");
-        };
-        ingest.step_kv_tokens.pop();
-        assert_eq!(
-            GenerationResourceBounds::conservative(GenerationResources {
-                context: &invalid_request.context,
-                negative_context: &invalid_request.negative_context,
-                behavior: &invalid_request.behavior,
-                policy: &invalid_request.policy,
-                image: &invalid_request.image,
-                max_und_tokens: invalid_request.max_und_tokens,
-                cache: &invalid_request.cache,
-                limits: &runtime_limits(),
-            }),
-            Err(GenerationResourceError::ImageIngestKvArity {
-                steps: 2,
-                effects: 1,
             })
         );
 
@@ -1778,10 +1147,52 @@ mod tests {
             request.validate_resources(&limits),
             Err(GenerationResourceError::LatentCapacity { .. })
         ));
+
+        let mut limits = runtime_limits();
+        limits.max_vision_feature_bytes = 0;
+        assert_eq!(
+            request.validate_resources(&limits),
+            Err(GenerationResourceError::MissingRuntimeBound {
+                resource: "max_vision_feature_bytes",
+            })
+        );
+
+        let mut limits = runtime_limits();
+        limits.max_latent_feature_bytes = 0;
+        assert_eq!(
+            request.validate_resources(&limits),
+            Err(GenerationResourceError::MissingRuntimeBound {
+                resource: "max_latent_feature_bytes",
+            })
+        );
+
+        let mut limits = runtime_limits();
+        limits.max_cfg_branches = 1;
+        assert_eq!(
+            request.validate_resources(&limits),
+            Err(GenerationResourceError::CfgBranchCapacity {
+                requested: 2,
+                available: 1,
+            })
+        );
+
+        request.cache.read = true;
+        let mut limits = runtime_limits();
+        limits.encoder_cache_entries = 1;
+        assert_eq!(
+            request.validate_resources(&limits),
+            Err(GenerationResourceError::EncoderCacheCapacity {
+                requested: 2,
+                available: 1,
+            })
+        );
+        // Disabling cache use removes its reservation; encoder computation remains.
+        request.cache.read = false;
+        request.validate_resources(&limits).unwrap();
     }
 
     #[test]
-    fn resource_compilation_requires_runtime_aligned_image_dimensions() {
+    fn request_capacity_requires_runtime_aligned_image_dimensions() {
         let request = complete_request();
         let mut limits = runtime_limits();
         limits.latent_downsample = 24;
@@ -1797,43 +1208,37 @@ mod tests {
     }
 
     #[test]
-    fn declared_resources_must_cover_the_required_envelope() {
-        let mut request = complete_request();
-        request.resources.max_kv_tokens -= 1;
-        assert!(matches!(
-            request.validate_resources(&runtime_limits()),
-            Err(GenerationResourceError::DeclaredBoundTooSmall {
-                resource: "max_kv_tokens",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn request_validation_rejects_policy_drift_and_invalid_image_boundaries() {
-        let mut behavior_drift = complete_request();
-        behavior_drift.behavior.gen_output = false;
-        assert_eq!(
-            behavior_drift.validate(),
-            Err(GenerationRequestError::BehaviorPolicyMismatch)
-        );
-
+    fn request_validation_rejects_invalid_image_boundaries() {
         let mut empty_ingest = complete_request();
-        let ContextSegment::Image { ingest, .. } = &mut empty_ingest.context[1] else {
-            panic!("image fixture");
-        };
-        ingest.steps.clear();
+        empty_ingest.multimodal_inputs.images[0].encoders.clear();
         assert_eq!(
             empty_ingest.validate(),
-            Err(GenerationRequestError::EmptyImageIngestRecipe)
+            Err(GenerationRequestError::MissingImageEncoders)
         );
 
-        let mut negative_image = complete_request();
-        negative_image.negative_context = vec![negative_image.context[1].clone()];
-        assert_eq!(
-            negative_image.validate(),
-            Err(GenerationRequestError::ImageInNegativeContext)
-        );
+        // Exact contributions and capacities are validated before admission.
+        for (tokens, capacity, error) in [
+            (Some(0), None, GenerationRequestError::ZeroImageKvBound),
+            (None, Some(0), GenerationRequestError::ZeroImageKvBound),
+            (
+                Some(65),
+                Some(64),
+                GenerationRequestError::ImageKvExceedsCapacity {
+                    tokens: 65,
+                    max_tokens: 64,
+                },
+            ),
+        ] {
+            let mut request = complete_request();
+            let input = &mut request.multimodal_inputs.images[0].encoders[0];
+            input.num_kv_tokens = tokens;
+            input.max_kv_tokens = capacity;
+            assert_eq!(request.validate(), Err(error));
+        }
+
+        let mut exact_capacity = complete_request();
+        exact_capacity.multimodal_inputs.images[0].encoders[0].num_kv_tokens = Some(64);
+        assert_eq!(exact_capacity.validate(), Ok(()));
 
         let mut invalid_sampling = complete_request();
         invalid_sampling.sampling.top_p = 0.0;
@@ -1861,20 +1266,22 @@ mod tests {
         ));
 
         let mut misplaced_image = complete_request();
-        let ContextSegment::Image { image, .. } = &mut misplaced_image.context[1] else {
-            panic!("image fixture");
-        };
-        image.position = SegmentPosition::AtToken { position: 1 };
-        assert!(matches!(
+        misplaced_image.multimodal_inputs.images[0].position = 5;
+        assert_eq!(
             misplaced_image.validate(),
-            Err(GenerationRequestError::ImagePositionMismatch { .. })
-        ));
+            Err(GenerationRequestError::ImagePositionBeyondPrompt {
+                position: 5,
+                prompt_tokens: 4
+            })
+        );
 
-        let mut invalid_resources = complete_request();
-        invalid_resources.resources.encoder_cache_keys.push(1);
-        assert!(matches!(
-            invalid_resources.validate(),
-            Err(GenerationRequestError::EncoderCacheKeysMismatch { .. })
-        ));
+        let mut unordered_images = complete_request();
+        let mut preceding = unordered_images.multimodal_inputs.images[0].clone();
+        preceding.position = 1;
+        unordered_images.multimodal_inputs.images.push(preceding);
+        assert_eq!(
+            unordered_images.validate(),
+            Err(GenerationRequestError::UnorderedImageInputs)
+        );
     }
 }

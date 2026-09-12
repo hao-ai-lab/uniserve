@@ -150,9 +150,7 @@ class AttentionBackend:
     accepts_dense_mask: bool = False
     dense_dtypes: frozenset[torch.dtype] = frozenset()
 
-    def supports_head_geometry(
-        self, q_head_dim: int, k_head_dim: int, v_head_dim: int
-    ) -> bool:
+    def supports_head_geometry(self, q_head_dim: int, k_head_dim: int, v_head_dim: int) -> bool:
         """Return whether the backend implements the supplied query, key, and value head widths."""
 
         if not self.head_geometries:
@@ -166,11 +164,16 @@ class AttentionBackend:
             return False
         implementation = type(self)
         if mode is AttentionMode.DENSE:
-            supported = bool(self.dense_ranks) and implementation.forward is not AttentionBackend.forward
+            supported = (
+                bool(self.dense_ranks) and implementation.forward is not AttentionBackend.forward
+            )
         elif mode is AttentionMode.PAGED_DECODE:
             supported = implementation.forward_paged is not AttentionBackend.forward_paged
         elif mode is AttentionMode.PAGED_VARLEN:
-            supported = self.paged_varlen and implementation.forward_varlen is not AttentionBackend.forward_varlen
+            supported = (
+                self.paged_varlen
+                and implementation.forward_varlen is not AttentionBackend.forward_varlen
+            )
         elif mode is AttentionMode.PACKED:
             supported = implementation.forward_segmented is not AttentionBackend.forward_segmented
         else:
@@ -279,15 +282,14 @@ class AttentionBackend:
             return type(self).forward_visible_end is not AttentionBackend.forward_visible_end
         if isinstance(req, VarlenAttention):
             if req.block_table is not None:
-                return self.supports(AttentionMode.PAGED_VARLEN) and self._paged_storage_supported(req)
+                return self.supports(AttentionMode.PAGED_VARLEN) and self._paged_storage_supported(
+                    req
+                )
             return self.supports_varlen()
         if isinstance(req, PagedDecodeAttention):
             if self.single_ar_decode and not self._is_one_ar_decode(req):
                 return False
-            return (
-                self.supports(AttentionMode.PAGED_DECODE)
-                and self._paged_storage_supported(req)
-            )
+            return self.supports(AttentionMode.PAGED_DECODE) and self._paged_storage_supported(req)
         if not isinstance(req, DenseAttention):
             return False
         if not self.supports(AttentionMode.DENSE):
@@ -313,7 +315,9 @@ class AttentionBackend:
         )
 
         if not self.can_run(req):
-            raise RuntimeError(f"bound attention backend {self.name!r} rejects the request geometry")
+            raise RuntimeError(
+                f"bound attention backend {self.name!r} rejects the request geometry"
+            )
         if isinstance(req, VisibleEndAttention) and req.prefix_k is not None:
             if (
                 req.prefix_v is None
@@ -438,7 +442,11 @@ class AttentionBackend:
 
         from ...ops.requests import PagedDecodeAttention, VisibleEndAttention
 
-        if isinstance(req, VisibleEndAttention) and req.prefix_k is not None and req.prefix_v is not None:
+        if (
+            isinstance(req, VisibleEndAttention)
+            and req.prefix_k is not None
+            and req.prefix_v is not None
+        ):
             return int(req.prefix_k.shape[-1]), int(req.prefix_v.shape[-1])
         if isinstance(req, PagedDecodeAttention):
             k = req.current_k if req.current_k is not None else req.k
@@ -457,7 +465,9 @@ class AttentionBackend:
         if req.q.ndim == 3:
             plan = req.ctx
             query_lens = getattr(plan, "query_lens_cpu", ()) or ()
-            if getattr(plan, "forward_mode", None) is AttentionMode.PAGED_DECODE and len(query_lens) == int(req.q.shape[0]):
+            if getattr(plan, "attention_mode", None) is AttentionMode.PAGED_DECODE and len(
+                query_lens
+            ) == int(req.q.shape[0]):
                 return all(int(length) == 1 for length in query_lens)
             return int(req.q.shape[0]) == 1
         return req.q.ndim == 4 and int(req.q.shape[2]) == 1

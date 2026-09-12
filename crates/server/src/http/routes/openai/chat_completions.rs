@@ -4,10 +4,9 @@ use std::sync::Arc;
 
 use crate::openai::ChatCompletionRequest;
 use crate::openai::chat_completions::{
-    chat_completion_chunk_stream, chat_completion_sse_stream, collect_chat_completion,
-    lower_chat_request,
+    ChatResponseContext, chat_completion_chunk_stream, chat_completion_sse_stream,
+    collect_chat_completion,
 };
-use crate::openai::serve_error_to_api;
 use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -18,7 +17,7 @@ use tracing_futures::Instrument as _;
 
 use crate::AppState;
 use crate::http::routes::openai::utils::validated_json::ValidatedJson;
-use crate::http::utils::{resolve_request_context, unix_timestamp};
+use crate::http::utils::{resolve_request_id, unix_timestamp};
 use crate::openai::ApiError;
 
 /// Validates one chat completion request and run it through the serving runtime.
@@ -28,12 +27,9 @@ pub(crate) async fn chat_completions(
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     let stream = body.stream;
-    let request_context = resolve_request_context(&headers);
-    let (input, response) =
-        match lower_chat_request(body, state.served_model_name(), request_context) {
-            Ok(lowered) => lowered,
-            Err(error) => return ApiError::from(error).into_response(),
-        };
+    let request_id = format!("chatcmpl-{}", resolve_request_id(&headers));
+    let response =
+        ChatResponseContext::from_request(&body, request_id.clone(), state.served_model_name());
     let request_span = tracing::info_span!(
         "chat_completions",
         request_id = %response.request_id,
@@ -45,12 +41,12 @@ pub(crate) async fn chat_completions(
 
     let serve_stream = match state
         .runtime()
-        .generate(input)
+        .generate_chat(request_id.into(), body)
         .instrument(request_span.clone())
         .await
     {
         Ok(stream) => stream,
-        Err(error) => return ApiError::from(serve_error_to_api(error)).into_response(),
+        Err(error) => return error.into_response(),
     };
 
     if stream {

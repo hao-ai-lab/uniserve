@@ -1,32 +1,31 @@
 //! GPU-free executor for scheduler and frontend behavior.
 //!
 //! The simulator consumes the same typed admissions and operations as worker
-//! executors. It enforces lifecycle, version, and replay invariants and returns
-//! resolved products with stable request, operation, and point identities.
+//! executors. It enforces request identity, lifecycle, and dependency invariants
+//! and reports accepted tokens, progress, and synthetic media.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
 
 use crate::executor::{
-    Batch, BatchResult, Executor, ExecutorInfo, ExecutorSubmitError, LogicalResultTracker,
-    WorkerId, lower_batch,
+    BatchResult, Executor, ExecutorInfo, ExecutorSubmitError, ScheduleBatch, WorkerId,
+    logical_result,
 };
-use crate::worker::RunSubmitError;
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use uniserve_core::philox;
-use uniserve_core::product_blob::{LogprobBlob, RankedToken};
 use uniserve_core::{
-    CommandWaker, ImageParams, RequestId, SampleOutput, SamplingParams, try_apply_sampling_counts,
+    CommandWaker, ImageParams, RequestId, SampleOutput, SamplingParams, TokenLogprob,
+    try_apply_sampling_counts,
 };
 use uniserve_worker_ipc::{
-    CheckpointPoint, DrawLayout, ErrorCode, InlineValue, LogicalLengths, ModelOutput, NewRequest,
-    OpCode, OpStatus, Operation, ProductKind, ProductPayload, ProductRef, RegistrationAck,
-    ResultData, ResultPayload, Run as PhysicalRun, RunResult, SamplingState, TimingCounters,
-    TokenSpan, WorkerInfo, decode_sampling_state_bytes,
+    Computation, DrawLayout, ErrorCode, FinishFlags, ModelOutput, NewRequest, OpStatus,
+    RegistrationAck, RunResult, SamplingState, ScheduledRequest, TensorRef, TimingCounters,
+    WorkerInfo,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -36,7 +35,7 @@ const DEFAULT_DENOISE_STEPS: u16 = 50;
 const DEFAULT_IMAGE_HW: (u32, u32) = (512, 512);
 
 enum Job {
-    Batch(PhysicalRun),
+    Batch(ScheduleBatch),
     Shutdown,
 }
 
@@ -45,15 +44,13 @@ pub struct SimExecutor {
     executor_info: ExecutorInfo,
     depth: usize,
     to_worker: Sender<Job>,
-    from_worker: Receiver<anyhow::Result<RunResult>>,
+    from_worker: Receiver<anyhow::Result<(BatchResult, Vec<uniserve_worker_ipc::BatchCommand>)>>,
     progress_tx: Sender<()>,
     progress_rx: Receiver<()>,
     in_flight: usize,
     handle: Option<JoinHandle<()>>,
-    next_collective_seq: u64,
-    logical_results: LogicalResultTracker,
     admissions: HashSet<uniserve_worker_ipc::RequestKey>,
-    products: HashSet<ProductRef>,
+    products: HashSet<TensorRef>,
 }
 
 impl SimExecutor {
@@ -80,7 +77,23 @@ impl SimExecutor {
                 while let Ok(job) = jobs.recv() {
                     match job {
                         Job::Batch(batch) => {
-                            if results_tx.send(engine.execute(batch)).is_err() {
+                            let commands = batch.commands.clone();
+                            let result = engine.execute(batch).and_then(|report| {
+                                report.validate()?;
+                                anyhow::ensure!(
+                                    report.done,
+                                    "simulator execution must return a complete batch"
+                                );
+                                Ok((
+                                    logical_result(
+                                        crate::executor::WorkerResult::receive(report),
+                                        true,
+                                        &commands,
+                                    ),
+                                    commands,
+                                ))
+                            });
+                            if results_tx.send(result).is_err() {
                                 break;
                             }
                         }
@@ -98,8 +111,6 @@ impl SimExecutor {
             progress_rx,
             in_flight: 0,
             handle: Some(handle),
-            next_collective_seq: 1,
-            logical_results: LogicalResultTracker::default(),
             admissions: HashSet::new(),
             products: HashSet::new(),
         }
@@ -115,24 +126,11 @@ impl SimExecutor {
 }
 
 impl SimExecutor {
-    /// Submits the run.
-    fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), RunSubmitError> {
-        if self.in_flight >= self.depth {
-            return Err(RunSubmitError::WouldBlock(batch));
-        }
-        batch
-            .validate()
-            .map_err(anyhow::Error::from)
-            .map_err(RunSubmitError::Failed)?;
-        self.to_worker
-            .send(Job::Batch(batch))
-            .map_err(|_| RunSubmitError::Failed(anyhow::anyhow!("sim executor thread gone")))?;
-        self.in_flight += 1;
-        Ok(())
-    }
-
     /// Returns the result of a submitted physical run.
-    fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<RunResult>> {
+    fn poll_run(
+        &mut self,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<(BatchResult, Vec<uniserve_worker_ipc::BatchCommand>)>> {
         if self.handle.is_none() {
             let _ = self.progress_rx.recv_timeout(timeout);
             return Ok(None);
@@ -195,14 +193,14 @@ impl Executor for SimExecutor {
     }
 
     /// Lowers and submits a logical batch while preserving executor backpressure semantics.
-    fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError> {
+    fn submit(&mut self, batch: ScheduleBatch) -> Result<(), ExecutorSubmitError> {
         if self.handle.is_none() {
             return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
                 "Executor is closed"
             )));
         }
-        for op in &batch.ops {
-            if !self.is_ready(&op.target.0) {
+        for (_, placement) in &batch.requests {
+            if !self.is_ready(&placement.worker) {
                 return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
                     "Worker cannot accept this request"
                 )));
@@ -211,41 +209,27 @@ impl Executor for SimExecutor {
         if self.in_flight >= self.depth {
             return Err(ExecutorSubmitError::WouldBlock(batch));
         }
-        let run = lower_batch(&batch, &mut self.next_collective_seq)
-            .map_err(ExecutorSubmitError::Failed)?;
-        self.logical_results
-            .register(&batch)
-            .map_err(ExecutorSubmitError::Failed)?;
-        match self.submit_run(run) {
-            Ok(()) => {
-                self.admissions
-                    .extend(batch.admissions().map(|request| request.request_key));
-                self.products.extend(
-                    batch
-                        .ops
-                        .iter()
-                        .flat_map(|op| op.payload.outputs.iter().cloned()),
-                );
-                Ok(())
-            }
-            Err(RunSubmitError::WouldBlock(_)) => {
-                self.logical_results.unregister(batch.id);
-                Err(ExecutorSubmitError::WouldBlock(batch))
-            }
-            Err(RunSubmitError::Failed(error)) => {
-                self.logical_results.unregister(batch.id);
-                Err(ExecutorSubmitError::Failed(error))
-            }
-        }
+        batch.validate().map_err(ExecutorSubmitError::Failed)?;
+        self.admissions
+            .extend(batch.admissions().map(|request| request.request_key));
+        self.products.extend(
+            batch
+                .requests
+                .iter()
+                .flat_map(|(operation, _)| operation.tensor_outputs().cloned()),
+        );
+        self.to_worker.send(Job::Batch(batch)).map_err(|_| {
+            ExecutorSubmitError::Failed(anyhow::anyhow!("sim executor thread gone"))
+        })?;
+        self.in_flight += 1;
+        Ok(())
     }
 
     /// Polls for the next completed worker operation.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
-        let Some(report) = self.poll_run(timeout)? else {
+        let Some((result, commands)) = self.poll_run(timeout)? else {
             return Ok(None);
         };
-        let commands = self.logical_results.commands(report.batch_id).to_vec();
-        let result = self.logical_results.apply(report)?;
         for receipt in &result.command_results {
             if receipt.outcome == crate::executor::CommandOutcome::Failed {
                 continue;
@@ -266,10 +250,6 @@ impl Executor for SimExecutor {
                     request_key,
                     retained_buffers,
                     ..
-                }
-                | BatchCommand::Retire {
-                    request_key,
-                    retained_buffers,
                 } => {
                     self.admissions.remove(request_key);
                     self.products.retain(|product| {
@@ -296,29 +276,15 @@ impl Drop for SimExecutor {
     }
 }
 
-/// The completion and its resolved product values recorded for a committed
-/// operation, replayed verbatim when the same operation is resubmitted.
-#[derive(Clone)]
-struct RecordedCompletion {
-    operation: Operation,
-    completion: ModelOutput,
-    products: Vec<ProductPayload>,
-}
-
-/// One lineage's authoritative state: the last committed fixed point, the
-/// synthetic token cursor, denoise progress, and the terminal record of every
-/// committed operation for replay.
+/// Current synthetic execution state and products retained for their consumers.
 #[derive(Clone)]
 struct SimRequestState {
     admission: NewRequest,
-    point_index: u32,
     logical_position: u32,
     kv_visible_len: u32,
-    kv_published_len: u32,
     emitted: usize,
     flow_step: u16,
-    predicate_values: HashMap<ProductRef, bool>,
-    terminal: BTreeMap<u64, RecordedCompletion>,
+    predicate_values: HashMap<TensorRef, bool>,
     /// Committed penalty counts in ascending token order.
     ///
     /// Each generated token folds in during execution, allowing a successor to
@@ -336,14 +302,11 @@ impl SimRequestState {
             .map_or(0, |branch| branch.initial_position);
         Self {
             admission,
-            point_index: 0,
             logical_position: prefix_len,
             kv_visible_len: prefix_len,
-            kv_published_len: 0,
             emitted: 0,
             flow_step: 0,
             predicate_values: HashMap::new(),
-            terminal: BTreeMap::new(),
             penalty_counts: BTreeMap::new(),
         }
     }
@@ -388,7 +351,7 @@ impl SimEngine {
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
         let info = WorkerInfo {
-            supported_ops: OpCode::ALL.to_vec(),
+            supported_ops: Computation::ALL.to_vec(),
             latent_page_units: 64,
             latent_pages: 1_025,
             buffer_pool_bytes: 257_u64 * (256 << 20),
@@ -438,7 +401,7 @@ impl SimEngine {
         vocab: usize,
         text_len: usize,
         fake_eos: u32,
-        operation: &Operation,
+        operation: &ScheduledRequest,
         request: &SimRequestState,
         index: usize,
         state: Option<&SamplingState>,
@@ -448,7 +411,7 @@ impl SimEngine {
         match request.sampling() {
             Some(sampling) => {
                 let draw = if sampling.temperature > 0.0 {
-                    let rng = operation.rng().ok_or_else(|| {
+                    let rng = operation.rng.ok_or_else(|| {
                         anyhow::anyhow!("stochastic sampling operation has no RNG coordinates")
                     })?;
                     anyhow::ensure!(
@@ -461,9 +424,9 @@ impl SimEngine {
                     );
                     let key = philox::sampling_key(
                         rng.seed,
-                        operation.request_key.authority_id,
+                        operation.request_key.engine_id,
                         request_id.0,
-                        operation.request_key.epoch,
+                        operation.request_key.request_epoch,
                         philox::DRAW_LAYOUT_TARGET,
                     );
                     philox::sampling_uniform(key, rng.semantic_index_base, 0, 0)
@@ -474,14 +437,11 @@ impl SimEngine {
                 // state: the successor reads the committed base folded from
                 // ancestral tokens before any of them is host-observed.
                 let recent_counts = request.recent_counts();
+                // Per-step masks omit an unchanged request allowlist. A dynamic
+                // suppression delta must still preserve that admitted constraint.
                 let allowed = state
                     .and_then(|value| value.allowed_token_ids.as_deref())
-                    .or_else(|| {
-                        state
-                            .is_none()
-                            .then_some(sampling.allowed_token_ids.as_deref())
-                            .flatten()
-                    });
+                    .or(sampling.allowed_token_ids.as_deref());
                 let suppress = state
                     .map(|value| value.suppressed_token_ids.as_slice())
                     .filter(|tokens| !tokens.is_empty());
@@ -522,80 +482,60 @@ impl SimEngine {
         vocab: usize,
         text_len: usize,
         fake_eos: u32,
-        operation: &Operation,
+        operation: &ScheduledRequest,
         request: &mut SimRequestState,
-        input_products: &[ProductPayload],
-    ) -> anyhow::Result<(ModelOutput, Vec<ProductPayload>)> {
-        let point_index = request.point_index;
-        let selected_point = u32::from(operation.advances_state());
+    ) -> anyhow::Result<ModelOutput> {
         let mut record = ModelOutput {
+            sampled_logprob: None,
+            top_logprobs: Vec::new(),
+            prompt_logprobs: Vec::new(),
             request_key: operation.request_key,
             op_id: operation.op_id,
-            completion_slot_generation: ((operation.op_id.0 - 1) % u64::from(u32::MAX) + 1) as u32,
             status: OpStatus::Ok,
-            selected_point,
             product_generations: operation
-                .outputs()
-                .iter()
+                .tensor_outputs()
                 .map(|out| out.generation)
                 .collect(),
             error_code: None,
             timing_counters: TimingCounters::default(),
-            payload: ResultPayload::for_kind(operation.kind(), ResultData::default()),
+            code: operation.code,
+            position: 0,
+            kv_visible_len: 0,
+            kv_computed_len: 0,
+            num_completed_steps: 0,
+            committed_tokens: Vec::new(),
+            finish_flags: FinishFlags::default(),
+            media_output: None,
+            kv_output: None,
         };
-        record.logical_lengths_mut().token_len = request.logical_position;
-        set_kv_lengths(
-            record.logical_lengths_mut(),
-            request.kv_visible_len,
-            request.kv_visible_len,
-            request.kv_published_len,
-        );
-        let mut products = Vec::new();
+        record.position = request.logical_position;
+        set_kv_lengths(&mut record, request.kv_visible_len);
 
-        match operation.kind() {
-            work @ (OpCode::ArExtend | OpCode::ArDecode | OpCode::ArVerify) => {
-                let visual_state = operation.inputs().iter().any(|input| {
-                    matches!(
-                        input.kind,
-                        ProductKind::VisionFeature | ProductKind::LatentFeature
-                    )
-                });
-                let samples_token = operation
-                    .outputs()
-                    .iter()
-                    .any(|output| output.kind == ProductKind::Token);
+        match operation.code {
+            work @ (Computation::Forward(ForwardMode::Prefill)
+            | Computation::Forward(ForwardMode::Decode)
+            | Computation::Forward(ForwardMode::Verify)) => {
+                let visual_state =
+                    operation.vision_input.is_some() || operation.latent_feature_input.is_some();
+                let samples_token = operation.token_output.is_some();
                 if visual_state {
                     request.kv_visible_len = request
                         .kv_visible_len
-                        .saturating_add(operation.bounds().max_tokens);
-                    set_kv_lengths(
-                        record.logical_lengths_mut(),
-                        request.kv_visible_len,
-                        request.kv_visible_len,
-                        request.kv_published_len,
-                    );
-                    if operation
-                        .outputs()
-                        .iter()
-                        .any(|output| output.kind == ProductKind::Completion)
-                    {
+                        .saturating_add(operation.bounds.max_tokens);
+                    set_kv_lengths(&mut record, request.kv_visible_len);
+                    if operation.completion_output.is_some() {
                         request.emitted = 0;
                     }
                 }
                 if !visual_state && !samples_token {
                     request.kv_visible_len = request
                         .kv_visible_len
-                        .saturating_add(operation.bounds().max_tokens);
-                    record.logical_lengths_mut().token_len = request.logical_position;
-                    set_kv_lengths(
-                        record.logical_lengths_mut(),
-                        request.kv_visible_len,
-                        request.kv_visible_len,
-                        request.kv_published_len,
-                    );
+                        .saturating_add(operation.bounds.max_tokens);
+                    record.position = request.logical_position;
+                    set_kv_lengths(&mut record, request.kv_visible_len);
                 } else if samples_token {
                     let index = request.emitted;
-                    let sampling_state = operation_sampling_state(operation, input_products)?;
+                    let sampling_state = operation.sampling_state.as_ref();
                     let Some(output) = Self::sample(
                         vocab,
                         text_len,
@@ -603,21 +543,20 @@ impl SimEngine {
                         operation,
                         request,
                         index,
-                        sampling_state.as_ref(),
+                        sampling_state,
                     )?
                     else {
                         record.status = OpStatus::Error;
-                        record.selected_point = point_index;
                         record.product_generations.clear();
                         record.error_code = Some(ErrorCode::InvalidOperation);
-                        return Ok((record, Vec::new()));
+                        return Ok(record);
                     };
-                    record.finish_flags_mut().eos = output.token == fake_eos;
-                    if let Some(state) = sampling_state.as_ref() {
-                        record.finish_flags_mut().stop =
+                    record.finish_flags.eos = output.token == fake_eos;
+                    if let Some(state) = sampling_state {
+                        record.finish_flags.stop =
                             state.finish_token_ids.binary_search(&output.token).is_ok()
-                                && !record.finish_flags().eos;
-                        record.finish_flags_mut().length = state.force_finish;
+                                && !record.finish_flags.eos;
+                        record.finish_flags.length = state.force_finish;
                     }
                     let admitted_stops = request
                         .admission
@@ -625,122 +564,106 @@ impl SimEngine {
                         .as_ref()
                         .map_or(&[][..], |und| und.finish_token_ids.as_slice());
                     let continuation = admitted_stops.binary_search(&output.token).is_err()
-                        && sampling_state.as_ref().is_none_or(|state| {
+                        && sampling_state.is_none_or(|state| {
                             !state.force_finish
                                 && state.finish_token_ids.binary_search(&output.token).is_err()
                         });
-                    if let Some(token_product) = operation
-                        .outputs()
-                        .iter()
-                        .find(|output| output.kind == ProductKind::Token)
-                    {
+                    if let Some(token_product) = operation.token_output.as_ref() {
                         request
                             .predicate_values
                             .insert(token_product.clone(), continuation);
                     }
-                    let transition = sampling_state.as_ref().is_some_and(|state| {
+                    let transition = sampling_state.is_some_and(|state| {
                         state
                             .transition_token_ids
                             .binary_search(&output.token)
                             .is_ok()
                     });
-                    for completion in operation.outputs().iter().filter(|candidate| {
-                        candidate.kind == ProductKind::Completion
-                            && matches!(candidate.output_index, 4 | 6)
-                    }) {
+                    for completion in operation.transition_output.iter() {
                         request
                             .predicate_values
                             .insert(completion.clone(), transition);
                     }
-                    *record.token_span_mut() = TokenSpan {
-                        base: index as u32,
-                        len: 1,
-                    };
-                    record.logical_lengths_mut().token_len = 1;
+                    record.position = 1;
                     if !visual_state {
                         let query_tokens = match work {
-                            OpCode::ArExtend => operation.bounds().max_tokens,
-                            OpCode::ArDecode | OpCode::ArVerify => 1,
+                            Computation::Forward(ForwardMode::Prefill) => {
+                                operation.bounds.max_tokens
+                            }
+                            Computation::Forward(ForwardMode::Decode)
+                            | Computation::Forward(ForwardMode::Verify) => 1,
                             _ => unreachable!(),
                         };
                         request.logical_position =
                             request.logical_position.saturating_add(query_tokens);
                         request.kv_visible_len =
                             request.kv_visible_len.saturating_add(query_tokens);
-                        record.logical_lengths_mut().token_len = request.logical_position;
-                        set_kv_lengths(
-                            record.logical_lengths_mut(),
-                            request.kv_visible_len,
-                            request.kv_visible_len,
-                            request.kv_published_len,
-                        );
+                        record.position = request.logical_position;
+                        set_kv_lengths(&mut record, request.kv_visible_len);
                     }
                     match work {
-                        OpCode::ArExtend => request.emitted = request.emitted.max(1),
-                        OpCode::ArDecode | OpCode::ArVerify => {
+                        Computation::Forward(ForwardMode::Prefill) => {
+                            request.emitted = request.emitted.max(1)
+                        }
+                        Computation::Forward(ForwardMode::Decode)
+                        | Computation::Forward(ForwardMode::Verify) => {
                             request.emitted = request.emitted.saturating_add(1)
                         }
                         _ => unreachable!(),
                     }
-                    *record.committed_tokens_mut() = vec![output.token];
+                    record.committed_tokens = vec![output.token];
                     // Fold the generated token into the device-resident penalty
                     // base so the next operation's penalties see it before this
                     // one is host-observed. A false-predicate no-op never reaches
                     // this branch, so a retracted point is never folded.
                     request.fold_penalty_token(output.token);
-                    let blob = LogprobBlob {
-                        sampled_logprob: request
-                            .sampling()
-                            .is_some_and(SamplingParams::generated_logprobs_requested)
-                            .then_some(output.logprob),
-                        top_logprobs: output
-                            .top
-                            .iter()
-                            .map(|(token_id, logprob, rank)| RankedToken {
-                                token_id: *token_id,
-                                logprob: *logprob,
-                                rank: *rank,
-                            })
-                            .collect(),
-                        prompt_logprobs: Vec::new(),
-                    };
-                    if !blob.is_empty() {
-                        products.push(ProductPayload {
-                            product: output_ref(operation, ProductKind::Logprob)?,
-                            value: InlineValue::Bytes(blob.encode()),
-                        });
-                    }
+                    record.sampled_logprob = request
+                        .sampling()
+                        .is_some_and(SamplingParams::generated_logprobs_requested)
+                        .then_some(output.logprob);
+                    record.top_logprobs = output
+                        .top
+                        .iter()
+                        .map(|(token_id, logprob, rank)| TokenLogprob {
+                            token_id: *token_id,
+                            logprob: *logprob,
+                            rank: *rank,
+                        })
+                        .collect();
                 }
             }
-            OpCode::EncoderText | OpCode::EncoderVision | OpCode::EncoderLatent => {}
-            work @ (OpCode::TransferProduct
-            | OpCode::TransferKvPublish
-            | OpCode::TransferKvInstall) => {
-                if work == OpCode::TransferKvPublish {
-                    request.kv_published_len = request.kv_visible_len;
-                }
-                set_kv_lengths(
-                    record.logical_lengths_mut(),
-                    request.kv_visible_len,
-                    request.kv_visible_len,
-                    request.kv_published_len,
-                );
+            Computation::Pipeline(PipelineStage::TextEncoding)
+            | Computation::Pipeline(PipelineStage::VisionEncoding)
+            | Computation::Pipeline(PipelineStage::LatentEncoding) => {}
+            Computation::Transfer(TransferMode::Tensor)
+            | Computation::Transfer(TransferMode::KvPublish)
+            | Computation::Transfer(TransferMode::KvInstall) => {
+                set_kv_lengths(&mut record, request.kv_visible_len);
             }
-            OpCode::DiffusionPrepare => {}
-            OpCode::DiffusionStep => {
-                let steps = operation.bounds().max_tokens.max(1) as u16;
+            Computation::Pipeline(PipelineStage::LatentPreparation) => {}
+            Computation::Pipeline(PipelineStage::Denoising) => {
+                let steps = operation.bounds.max_tokens.max(1) as u16;
                 request.flow_step = request.flow_step.saturating_add(steps);
                 let total = request
                     .image()
                     .map(|image| image.steps)
                     .unwrap_or(DEFAULT_DENOISE_STEPS);
-                record.logical_lengths_mut().latent_len = u32::from(request.flow_step);
+                record.num_completed_steps = u32::from(request.flow_step);
                 // Denoise completion surfaces as a length finish once the flow has
                 // advanced through every scheduled step.
-                record.finish_flags_mut().length = request.flow_step >= total;
+                record.finish_flags.length = request.flow_step >= total;
             }
-            OpCode::DiffusionDecode | OpCode::MediaAppend => {}
-            OpCode::DiffusionFinalize => {
+            Computation::Pipeline(
+                PipelineStage::VideoDecoding
+                | PipelineStage::AudioDecoding
+                | PipelineStage::VideoEncoding
+                | PipelineStage::AudioEncoding
+                | PipelineStage::Muxing,
+            ) => {}
+            Computation::Forward(ForwardMode::Mixed) => {
+                anyhow::bail!("mixed forward mode requires a model batch")
+            }
+            Computation::Pipeline(PipelineStage::ImageDecoding) => {
                 request.flow_step = 0;
                 if let Some(image) = request.image().cloned() {
                     let (height, width) = if image.height > 0 && image.width > 0 {
@@ -749,18 +672,26 @@ impl SimEngine {
                         DEFAULT_IMAGE_HW
                     };
                     let png_base64 = synthetic_png_b64(width, height)?;
-                    products.push(ProductPayload {
-                        product: output_ref(operation, ProductKind::Artifact)?,
-                        value: InlineValue::Bytes(png_base64.into_bytes()),
+                    use std::io::Write;
+                    let mut storage = tempfile::Builder::new()
+                        .prefix("uniserve-image-")
+                        .tempfile_in("/dev/shm")?;
+                    storage.write_all(png_base64.as_bytes())?;
+                    let (_file, path) = storage.keep()?;
+                    record.media_output = Some(uniserve_worker_ipc::MediaOutput {
+                        handle: uniserve_worker_ipc::ArtifactHandle::PosixShm {
+                            name: path.file_name().unwrap().to_str().unwrap().to_owned(),
+                        },
+                        bytes: png_base64.len() as u64,
                     });
                 }
             }
         }
 
         for completion in operation
-            .outputs()
+            .completion_output
             .iter()
-            .filter(|output| output.kind == ProductKind::Completion)
+            .chain(operation.transition_output.iter())
         {
             request
                 .predicate_values
@@ -768,54 +699,33 @@ impl SimEngine {
                 .or_insert(true);
         }
 
-        // Every declared output surfaces as a resolvable product for the host.
-        // The Artifact/Logprob payloads above carry real bytes; the remaining
-        // declared KV, token, latent, and feature references surface as
-        // presence-only entries addressed by identity, since the host does not
-        // consume their values.
-        for output in operation.outputs() {
-            if products
-                .iter()
-                .any(|payload| payload.product.output_index == output.output_index)
-            {
-                continue;
-            }
-            products.push(ProductPayload {
-                product: output.clone(),
-                value: InlineValue::Bytes(Vec::new()),
-            });
-        }
-
-        Ok((record, products))
+        Ok(record)
     }
 
     /// Builds a completion for an operation resolved entirely by its execution predicate.
-    fn predicated_completion(operation: &Operation, request: &SimRequestState) -> ModelOutput {
+    fn predicated_completion(
+        operation: &ScheduledRequest,
+        request: &SimRequestState,
+    ) -> ModelOutput {
         ModelOutput {
+            sampled_logprob: None,
+            top_logprobs: Vec::new(),
+            prompt_logprobs: Vec::new(),
             request_key: operation.request_key,
             op_id: operation.op_id,
-            completion_slot_generation: ((operation.op_id.0 - 1) % u64::from(u32::MAX) + 1) as u32,
             status: OpStatus::Predicated,
-            selected_point: request.point_index,
             product_generations: Vec::new(),
             error_code: None,
             timing_counters: TimingCounters::default(),
-            payload: ResultPayload::for_kind(
-                operation.kind(),
-                ResultData {
-                    logical_lengths: LogicalLengths {
-                        token_len: request.logical_position,
-                        kv_visible_len: request.kv_visible_len,
-                        kv_computed_len: request.kv_visible_len,
-                        ..LogicalLengths::default()
-                    },
-                    token_span: TokenSpan {
-                        base: request.emitted.min(u32::MAX as usize) as u32,
-                        len: 0,
-                    },
-                    ..ResultData::default()
-                },
-            ),
+            code: operation.code,
+            position: request.logical_position,
+            kv_visible_len: request.kv_visible_len,
+            kv_computed_len: request.kv_visible_len,
+            num_completed_steps: u32::from(request.flow_step),
+            committed_tokens: Vec::new(),
+            finish_flags: FinishFlags::default(),
+            media_output: None,
+            kv_output: None,
         }
     }
 
@@ -894,52 +804,10 @@ impl SimEngine {
     }
 }
 
-/// Decodes the branch-local state declared for one sampling operation.
-fn operation_sampling_state(
-    operation: &Operation,
-    input_products: &[ProductPayload],
-) -> anyhow::Result<Option<SamplingState>> {
-    let mut references = operation
-        .inputs()
-        .iter()
-        .filter(|input| input.kind == ProductKind::SamplingState);
-    let Some(reference) = references.next() else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        references.next().is_none(),
-        "operation has multiple sampling-state inputs"
-    );
-    let payload = input_products
-        .iter()
-        .find(|payload| payload.product == *reference)
-        .ok_or_else(|| anyhow::anyhow!("operation sampling-state input has no payload"))?;
-    let bytes = payload
-        .value
-        .bytes()
-        .ok_or_else(|| anyhow::anyhow!("sampling state cannot be a transfer handle"))?;
-    Ok(Some(decode_sampling_state_bytes(bytes)?))
-}
-
 /// Sets every logical KV frontier to the visible token position.
-fn set_kv_lengths(lengths: &mut LogicalLengths, visible: u32, _committed: u32, _published: u32) {
+fn set_kv_lengths(lengths: &mut ModelOutput, visible: u32) {
     lengths.kv_visible_len = visible;
     lengths.kv_computed_len = visible;
-}
-
-/// Returns the declared output-product reference for a completion value.
-fn output_ref(operation: &Operation, kind: ProductKind) -> anyhow::Result<ProductRef> {
-    operation
-        .outputs()
-        .iter()
-        .find(|output| output.kind == kind)
-        .cloned()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "operation {:?} has no declared {kind:?} output",
-                operation.op_id
-            )
-        })
 }
 
 /// Encodes a deterministic RGB gradient as a base64 PNG artifact.
@@ -978,19 +846,16 @@ impl SimEngine {
         &self.info
     }
 
-    /// Executes one physical run against deterministic in-memory model state.
-    fn execute(&mut self, batch: PhysicalRun) -> anyhow::Result<RunResult> {
+    /// Executes selected computations in order against deterministic model state.
+    fn execute(&mut self, batch: ScheduleBatch) -> anyhow::Result<RunResult> {
         batch.validate()?;
-        let batch_id = batch.batch_id;
-        let run_id = batch.run_id;
+        let batch_id = batch.id;
+        let run_id = batch.id;
         let closed = batch
             .commands
             .iter()
             .filter_map(|control| match control {
-                uniserve_worker_ipc::BatchCommand::Finish { request_key, .. }
-                | uniserve_worker_ipc::BatchCommand::Retire { request_key, .. } => {
-                    Some(request_key.request_id)
-                }
+                uniserve_worker_ipc::BatchCommand::Finish { request_key, .. } => Some(*request_key),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1010,13 +875,20 @@ impl SimEngine {
                 }
             }
         }
-        let input_products = batch.input_products;
+        for command in &batch.commands {
+            if let uniserve_worker_ipc::BatchCommand::Free { buffer } = command {
+                if let Some(request) = self.requests.get_mut(&buffer.owner.request_id) {
+                    request
+                        .predicate_values
+                        .retain(|product, _| product.buffer_id() != *buffer);
+                }
+            }
+        }
         let vocab = self.vocab;
         let text_len = self.text_len;
         let fake_eos = self.fake_eos;
-        let mut completions = Vec::with_capacity(batch.operations.len());
-        let mut products = Vec::new();
-        for operation in batch.operations {
+        let mut completions = Vec::with_capacity(batch.requests.len());
+        for (operation, _) in batch.requests {
             let request = self
                 .requests
                 .get_mut(&operation.request_key.request_id)
@@ -1026,118 +898,71 @@ impl SimEngine {
                         operation.request_key.request_id.0
                     )
                 })?;
-            if let Some(recorded) = request.terminal.get(&operation.op_id.0) {
-                anyhow::ensure!(
-                    recorded.operation == operation,
-                    "operation {} conflicts with its terminal record",
-                    operation.op_id.0
-                );
-                completions.push(recorded.completion.clone());
-                products.extend(recorded.products.clone());
-                continue;
-            }
             anyhow::ensure!(
                 operation.request_key == request.admission.request_key,
                 "operation identity {:?} does not match its admitted lineage",
                 operation.request_key
             );
-            if let Some(parent) = &operation.parent {
-                match &parent.point {
-                    CheckpointPoint::Fixed(point) => {
-                        anyhow::ensure!(
-                            *point == request.point_index,
-                            "operation {} ({}) parent point {} does not match request point {}",
-                            operation.op_id.0,
-                            operation.kind().as_str(),
-                            point,
-                            request.point_index
-                        );
-                    }
-                    CheckpointPoint::DeviceSelected => {
-                        // A device-relay successor roots on its predecessor's
-                        // selected point before host observation. By the time it
-                        // runs, the predecessor has committed and advanced this
-                        // request, so its point is the current request point and its
-                        // terminal record names the referenced producer. The base
-                        // point is the request's tracked point, not the absent
-                        // device point index.
-                        let producer_op_id = parent.op_id.0;
-                        let recorded = request.terminal.get(&producer_op_id).ok_or_else(|| {
+            let predicate_value = operation
+                .predicate
+                .as_ref()
+                .as_ref()
+                .map(|predicate| {
+                    request
+                        .predicate_values
+                        .get(predicate)
+                        .copied()
+                        .ok_or_else(|| {
                             anyhow::anyhow!(
-                                "device parent names unknown predecessor op {producer_op_id}"
+                                "computation {:?} predicate names an unresolved product",
+                                operation.op_id
                             )
-                        })?;
-                        anyhow::ensure!(
-                            recorded.completion.selected_point == request.point_index,
-                            "device parent predecessor is not the request's committed point"
-                        );
-                    }
-                }
-            }
-
-            if let Some(predicate) = operation.predicate().as_ref() {
-                let predicate_value = request
+                        })
+                })
+                .transpose()?;
+            // Binding the input captures its value. The producer relay then has
+            // no future acquisition owner, just as in the physical Worker.
+            if let Some(predecessor) = operation.predecessor {
+                request
                     .predicate_values
-                    .get(predicate)
-                    .copied()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "operation {} predicate names an unresolved product",
-                            operation.op_id.0
-                        )
-                    })?;
+                    .retain(|product, _| product.producer_op_id != predecessor);
+            }
+            if let Some(predicate) = operation.predicate.as_ref() {
+                request.predicate_values.remove(predicate);
+            }
+            if let Some(predicate_value) = predicate_value {
                 if !predicate_value {
-                    for output in operation.outputs() {
+                    for output in operation.tensor_outputs() {
                         request.predicate_values.insert(output.clone(), false);
                     }
                     let completion = Self::predicated_completion(&operation, request);
-                    request.terminal.insert(
-                        operation.op_id.0,
-                        RecordedCompletion {
-                            operation: operation.clone(),
-                            completion: completion.clone(),
-                            products: Vec::new(),
-                        },
-                    );
                     completions.push(completion);
                     continue;
                 }
             }
 
-            let (completion, op_products) = Self::execute_operation(
-                vocab,
-                text_len,
-                fake_eos,
-                &operation,
-                request,
-                &input_products,
-            )?;
-            if operation.advances_state() && completion.status == OpStatus::Ok {
-                request.point_index = completion.selected_point;
-            }
-            request.terminal.insert(
-                operation.op_id.0,
-                RecordedCompletion {
-                    operation,
-                    completion: completion.clone(),
-                    products: op_products.clone(),
-                },
-            );
+            let completion =
+                Self::execute_operation(vocab, text_len, fake_eos, &operation, request)?;
             completions.push(completion);
-            products.extend(op_products);
         }
         let report = RunResult {
             batch_id,
             run_id,
             completions,
-            products,
+            products: Vec::new(),
             registration: RegistrationAck { visible: true },
             worker_exec_us: None,
             forward_stats: None,
             done: true,
         };
-        for request_id in closed {
-            self.drop_request(request_id)?;
+        for request_key in closed {
+            if self
+                .requests
+                .get(&request_key.request_id)
+                .is_some_and(|request| request.admission.request_key == request_key)
+            {
+                self.drop_request(request_key.request_id)?;
+            }
         }
         Ok(report)
     }
@@ -1153,8 +978,8 @@ impl SimEngine {
 mod tests {
     use super::*;
     use uniserve_worker_ipc::{
-        ArRequestParams, Bounds, Checkpoint, DType, OpId, OpPayload, PointRange, ProductRef,
-        RequestKey, ShapeBound, StorageClass,
+        ArRequestParams, Bounds, ComputationId, DType, ForwardBatch, RequestKey, ShapeBound,
+        TensorRef,
     };
 
     fn request_key() -> RequestKey {
@@ -1176,76 +1001,103 @@ mod tests {
         .expect("admission")
     }
 
-    fn token_outputs(op_id: OpId) -> Vec<ProductRef> {
-        [
-            (ProductKind::Token, DType::U32, Vec::new()),
-            (ProductKind::SelectedPoint, DType::U32, Vec::new()),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(index, (kind, dtype, dims))| ProductRef {
+    fn token_output(op_id: ComputationId) -> TensorRef {
+        TensorRef {
             request_key: request_key(),
             producer_op_id: op_id,
-            output_index: index as u16,
-            generation: index as u32 + 1,
-            kind,
-            storage_class: StorageClass::RequestRelay,
-            dtype,
-            shape_bound: ShapeBound { dims },
-            point_range: PointRange {
-                base_point: 0,
-                max_points: 1,
-            },
-        })
-        .collect()
+            output_index: 0,
+            generation: 1,
+            dtype: DType::I64,
+            shape_bound: ShapeBound::default(),
+        }
     }
 
-    fn batch(run_id: u64, op_id: u64) -> PhysicalRun {
+    fn batch(run_id: u64, request_index: u32) -> ScheduleBatch {
         let request_key = request_key();
         let admission = admission();
-        let parent = Checkpoint::admission_root(OpId(1));
-        let operation = Operation {
+        let parent = ComputationId::new(0, 0);
+        let operation = ScheduledRequest {
+            token_input: None,
+
+            token_output: Some(token_output(ComputationId::new(run_id, request_index))),
+            vision_input: None,
+            latent_feature_input: None,
+            encoder_output: None,
+            latent_input: None,
+            latent_output: None,
+            image_input: None,
+            image_output: None,
+            completion_output: None,
+            transition_output: None,
+
+            input_image: None,
+            kv_input: None,
+            kv_output: None,
+            input_token_ids: Vec::new(),
+            sampling_state: None,
             request_key,
-            op_id: OpId(op_id),
-            parent: Some(parent),
+            op_id: ComputationId::new(run_id, request_index),
+            predecessor: Some(parent),
             entry: "model".into(),
-            payload: OpPayload::new(
-                OpCode::ArExtend,
-                Bounds {
-                    max_points: 1,
-                    max_tokens: 2,
-                    ..Bounds::default()
+            code: Computation::Forward(ForwardMode::Prefill),
+            bounds: Bounds {
+                max_tokens: 2,
+                ..Bounds::default()
+            },
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            predicate: None,
+            rng: None,
+        };
+        ScheduleBatch::new(
+            run_id,
+            vec![(
+                operation,
+                crate::executor::RequestPlacement {
+                    worker: WorkerId("sim".into()),
+                    block_tables: Vec::new(),
+                    new_cache_pages: Vec::new(),
+                    forward: ForwardBatch::default(),
+                    latent: None,
+                    decode: None,
+                    buffers: Vec::new(),
                 },
-                Vec::new(),
-                token_outputs(OpId(op_id)),
-                None,
-                None,
-                0,
-            ),
-        }
-        .sealed();
-        PhysicalRun::new(run_id, vec![admission], vec![operation])
+            )],
+            vec![uniserve_worker_ipc::BatchCommand::Start { request: admission }],
+            Vec::new(),
+        )
     }
 
     #[test]
-    fn duplicate_operation_replays_one_committed_record() {
-        let mut engine = SimEngine::new();
-        let first = engine.execute(batch(4, 17)).expect("first execution");
-        let replay = engine.execute(batch(5, 17)).expect("replay execution");
-        assert_eq!(first.completions, replay.completions);
-    }
-
-    #[test]
-    fn extend_commits_the_greedy_synthetic_token() {
-        // The synthetic distribution's natural token for request 9 at index 0 is
-        // `1000 + (9*7 + 0) % 5000 = 1063`; greedy default sampling commits it.
-        let mut engine = SimEngine::new();
-        let report = engine.execute(batch(1, 3)).expect("execution");
-        let completion = report.completions().next().unwrap();
-        assert_eq!(report.completions().count(), 1);
-        assert_eq!(completion.committed_tokens(), vec![1063]);
-        assert_eq!(completion.selected_point, 1);
-        assert!(report.registration.visible);
+    fn same_request_computations_preserve_coordinates_and_sequential_tokens() {
+        let mut executor = SimExecutor::new(SimEngine::new());
+        let mut selected = batch(1, 3);
+        let mut successor = batch(1, 4).requests.remove(0);
+        successor.0.predecessor = Some(ComputationId::new(1, 3));
+        selected.requests.push(successor);
+        executor.submit(selected).expect("submit logical batch");
+        let report = executor
+            .poll(Duration::from_secs(5))
+            .expect("poll")
+            .expect("result");
+        assert!(report.done);
+        let outputs = report
+            .results
+            .iter()
+            .map(|result| &result.output)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| output.op_id)
+                .collect::<Vec<_>>(),
+            vec![ComputationId::new(1, 3), ComputationId::new(1, 4)]
+        );
+        // Greedy synthetic tokens are 1000 + request_id * 7 + accepted index.
+        assert_eq!(outputs[0].committed_tokens, vec![1063]);
+        assert_eq!(outputs[1].committed_tokens, vec![1064]);
+        assert_eq!(outputs[1].kv_visible_len, 4);
+        executor.close().expect("close simulator");
     }
 
     #[test]

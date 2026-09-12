@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve_worker.execution.batch import OpCode
+from uniserve_worker.execution.batch import ForwardMode
 from uniserve_worker.execution.forward_batch import AttentionMode, ExpertRoute, RouteSpan
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.foundation.math import bucketed_length
@@ -43,12 +43,12 @@ def columns(
         raise invalid_descriptor("one attention call cannot mix KV groups")
     group_id = groups.pop()
     query_lens = tuple(int(task.query_tokens) for task in tasks)
-    seq_lens = tuple(int(task.seq_len) for task in tasks)
-    if any(length < 1 for length in query_lens) or any(length < 0 for length in seq_lens):
+    prefix_lens = tuple(int(task.seq_len) for task in tasks)
+    if any(length < 1 for length in query_lens) or any(length < 0 for length in prefix_lens):
         raise invalid_descriptor("forward attention lengths are invalid")
     causal_rows = tuple(bool(task.causal) for task in tasks)
     pure_decode = all(
-        task.operation.kind is OpCode.AR_DECODE
+        task.operation.kind is ForwardMode.DECODE
         and task.token_ids is not None
         and task.query_tokens == 1
         for task in tasks
@@ -57,7 +57,7 @@ def columns(
     pages = tuple(tables.pages(task.request_pool_idx, group_id) for task in tasks)
     capacities = tuple(tables.allocated_length(task.request_pool_idx) for task in tasks)
     for task, prefix, query, capacity, row_pages in zip(
-        tasks, seq_lens, query_lens, capacities, pages, strict=True
+        tasks, prefix_lens, query_lens, capacities, pages, strict=True
     ):
         resulting = prefix + (query if task.write_kv else 0)
         if resulting > capacity:
@@ -78,10 +78,10 @@ def columns(
             and tables.page_tables.device == states.device
         ):
             return {
-                "forward_mode": AttentionMode.REQUEST_INDEXED_DECODE,
-                "seq_lens_cpu": seq_lens,
+                "attention_mode": AttentionMode.REQUEST_INDEXED_DECODE,
+                "prefix_lens_cpu": prefix_lens,
                 "query_lens_cpu": query_lens,
-                "kv_lens_cpu": tuple(length + 1 for length in seq_lens),
+                "seq_lens_cpu": tuple(length + 1 for length in prefix_lens),
                 "causal_rows_cpu": causal_rows,
                 "causal": len(set(causal_rows)) == 1 and causal_rows[0],
                 "group_id": group_id,
@@ -95,7 +95,7 @@ def columns(
             }
     return physical_columns(
         pages=pages,
-        seq_lens=seq_lens,
+        prefix_lens=prefix_lens,
         query_lens=query_lens,
         causal_rows=causal_rows,
         write_rows=tuple(task.write_kv for task in tasks),
@@ -119,7 +119,7 @@ def columns(
 def physical_columns(
     *,
     pages: Sequence[Sequence[int]],
-    seq_lens: tuple[int, ...],
+    prefix_lens: tuple[int, ...],
     query_lens: tuple[int, ...],
     causal_rows: tuple[bool, ...],
     write_rows: tuple[bool, ...],
@@ -141,19 +141,19 @@ def physical_columns(
             block_table[row, : len(row_pages)] = torch.tensor(row_pages, dtype=torch.int32)
     out_cache_loc = _output_locations(
         pages,
-        seq_lens,
+        prefix_lens,
         query_lens,
         write_rows,
         block_size,
     )
     common: AttentionColumns = {
-        "forward_mode": AttentionMode.PAGED_VARLEN,
-        "seq_lens": torch.tensor(seq_lens, dtype=torch.int32),
+        "attention_mode": AttentionMode.PAGED_VARLEN,
+        "prefix_lens": torch.tensor(prefix_lens, dtype=torch.int32),
         "query_lens": torch.tensor(query_lens, dtype=torch.int32),
         "out_cache_loc": out_cache_loc,
         "has_cache_writes": any(write_rows),
         "block_table": block_table,
-        "seq_lens_cpu": seq_lens,
+        "prefix_lens_cpu": prefix_lens,
         "query_lens_cpu": query_lens,
         "causal_rows_cpu": causal_rows,
         "causal": len(set(causal_rows)) == 1 and causal_rows[0],
@@ -167,23 +167,23 @@ def physical_columns(
             token_rows,
             text_local_indices,
             query_lens,
-            seq_lens,
+            prefix_lens,
             width,
             block_size,
             causal_rows,
         )
-    kv_lens = tuple(prefix + query for prefix, query in zip(seq_lens, query_lens, strict=True))
-    common["kv_lens"] = torch.tensor(kv_lens, dtype=torch.int32)
-    common["kv_lens_cpu"] = kv_lens
+    seq_lens = tuple(prefix + query for prefix, query in zip(prefix_lens, query_lens, strict=True))
+    common["seq_lens"] = torch.tensor(seq_lens, dtype=torch.int32)
+    common["seq_lens_cpu"] = seq_lens
     common["max_seqlen_k"] = width * block_size
     if decode:
-        common["forward_mode"] = AttentionMode.PAGED_DECODE
+        common["attention_mode"] = AttentionMode.PAGED_DECODE
         return common
     common.update(
         {
-            "forward_mode": AttentionMode.PAGED_VARLEN,
+            "attention_mode": AttentionMode.PAGED_VARLEN,
             "cu_seqlens_q": _cumulative(query_lens),
-            "cu_seqlens_k": _cumulative(kv_lens),
+            "cu_seqlens_k": _cumulative(seq_lens),
             "output_indices": torch.tensor(
                 tuple(sum(query_lens[: index + 1]) - 1 for index in range(len(query_lens))),
                 dtype=torch.int64,
@@ -199,14 +199,14 @@ def dense_columns(row_count: int, query_lens: Sequence[int]) -> AttentionColumns
 
     lengths = tuple(int(value) for value in query_lens)
     return {
-        "forward_mode": AttentionMode.DENSE,
-        "seq_lens": torch.zeros(row_count, dtype=torch.int32),
+        "attention_mode": AttentionMode.DENSE,
+        "prefix_lens": torch.zeros(row_count, dtype=torch.int32),
         "query_lens": torch.tensor(lengths, dtype=torch.int32),
         "out_cache_loc": torch.zeros(sum(lengths), dtype=torch.int64),
         "has_cache_writes": False,
-        "seq_lens_cpu": (0,) * row_count,
+        "prefix_lens_cpu": (0,) * row_count,
         "query_lens_cpu": lengths,
-        "kv_lens_cpu": lengths,
+        "seq_lens_cpu": lengths,
         "causal_rows_cpu": (),
     }
 
@@ -217,7 +217,7 @@ def _packed_columns(
     token_rows: tuple[bool, ...],
     text_local_indices: tuple[tuple[int, ...], ...],
     query_lens: tuple[int, ...],
-    seq_lens: tuple[int, ...],
+    prefix_lens: tuple[int, ...],
     width: int,
     block_size: int,
     causal_rows: tuple[bool, ...],
@@ -274,7 +274,7 @@ def _packed_columns(
         append_span(ExpertRoute.FLOW, query - cursor)
     common.update(
         {
-            "forward_mode": AttentionMode.PACKED,
+            "attention_mode": AttentionMode.PACKED,
             "attention_indexes": torch.cat(indexes, dim=1),
             "route_spans": tuple(spans),
             "visible_end": visible,
@@ -282,7 +282,9 @@ def _packed_columns(
             "max_seqlen_q": max_query,
             "max_seqlen_k": width * block_size,
             "fully_visible": not any(causal_rows),
-            "kv_lens_cpu": seq_lens,
+            "seq_lens_cpu": tuple(
+                prefix + query for prefix, query in zip(prefix_lens, query_lens, strict=True)
+            ),
         }
     )
     return common
@@ -290,7 +292,7 @@ def _packed_columns(
 
 def _output_locations(
     pages: Sequence[Sequence[int]],
-    seq_lens: Sequence[int],
+    prefix_lens: Sequence[int],
     query_lens: Sequence[int],
     write_rows: Sequence[bool],
     block_size: int,
@@ -299,7 +301,7 @@ def _output_locations(
 
     values: list[int] = []
     for row_pages, prefix, query, write in zip(
-        pages, seq_lens, query_lens, write_rows, strict=True
+        pages, prefix_lens, query_lens, write_rows, strict=True
     ):
         for offset in range(query):
             if not write:
@@ -340,8 +342,10 @@ def _binding_identity(tasks: Sequence[ForwardRow]) -> int:
     hasher = hashlib.blake2b(digest_size=8)
     for task in tasks:
         hasher.update(int(task.operation.request_key.request_id).to_bytes(8, "little"))
-        hasher.update(int(task.operation.request_key.epoch).to_bytes(8, "little"))
-        hasher.update(int(task.operation.op_id).to_bytes(8, "little"))
+        hasher.update(int(task.operation.request_key.request_epoch).to_bytes(8, "little"))
+        hasher.update(task.operation.request_key.engine_id.to_bytes(8, "little"))
+        hasher.update(task.operation.op_id.batch_id.to_bytes(8, "little"))
+        hasher.update(task.operation.op_id.request_index.to_bytes(4, "little"))
     return int.from_bytes(hasher.digest(), "little")
 
 

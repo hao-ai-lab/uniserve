@@ -5,7 +5,6 @@ mod tool;
 
 use self::reasoning::reasoning_event_stream;
 use self::tool::tool_event_stream;
-use super::structured::structured_chat_event_stream;
 use crate::profile::reasoning::Qwen3ReasoningParser;
 use crate::profile::tools::Qwen3XmlToolParser;
 use crate::serving::chat::{ChatRequest, ChatToolChoice};
@@ -56,24 +55,14 @@ impl Qwen3ChatOutputProcessor {
         })
     }
 
-    /// Transforms a committed token stream into structured chat
-    /// events through three sequential stages once text decoding has
-    /// already happened:
-    ///
-    /// 1. [`reasoning_event_stream`] — reasoning/content separation
-    /// 2. [`tool_event_stream`] — tool-call parsing
-    /// 3. [`structured_chat_event_stream`] — final block assembly
-    pub fn process(
+    /// Parses decoded text into reasoning, visible text, and incremental tool calls.
+    pub fn parse(
         self,
         decoded: impl futures::Stream<
             Item = crate::serving::text::Result<crate::serving::text::DecodedTextEvent>,
         > + Send,
-    ) -> ChatResult<impl futures::Stream<Item = ChatResult<crate::serving::chat::ChatEvent>> + Send>
-    {
+    ) -> impl futures::Stream<Item = ChatResult<super::processor::AssistantEvent>> + Send {
         let reasoning = reasoning_event_stream(decoded, self.reasoning_parser);
-        let tool = tool_event_stream(reasoning, self.tool_parser);
-        let structured = structured_chat_event_stream(tool);
-
-        Ok(structured)
+        tool_event_stream(reasoning, self.tool_parser)
     }
 }

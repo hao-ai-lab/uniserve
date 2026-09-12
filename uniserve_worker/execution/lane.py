@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from uniserve_worker.config import LaneConfig
-from uniserve_worker.execution.batch import Domain
+from uniserve_worker.execution.batch import COMPUTATIONS, Computation
 from uniserve_worker.foundation.resources import close_resources
 
 
@@ -88,10 +88,10 @@ class ExecutionLaneRuntime:
         return None if self.lane is None else self.lane.lane_id
 
     @property
-    def domains(self) -> tuple[Domain, ...]:
-        """List domains admitted by the bound lane, or all domains on the default stream."""
+    def computations(self) -> tuple[Computation, ...]:
+        """List computations bound to this lane, or all computations on the default stream."""
 
-        return tuple(Domain) if self.lane is None else self.lane.domains
+        return COMPUTATIONS if self.lane is None else self.lane.computations
 
     def verify_stream(self) -> None:
         """Verify that the active CUDA stream and context still match the lane binding."""
@@ -165,13 +165,13 @@ def create_green_contexts(
         raise ExecutionLaneError("execution lanes require a CUDA device")
     if len({lane.lane_id for lane in lanes}) != len(lanes):
         raise ExecutionLaneError("lane ids must be unique")
-    bound_domains: set[Domain] = set()
+    bound_computations: set[Computation] = set()
     for lane in lanes:
-        overlap = bound_domains.intersection(lane.domains)
+        overlap = bound_computations.intersection(lane.computations)
         if overlap:
             names = ", ".join(sorted(value.value for value in overlap))
-            raise ExecutionLaneError(f"execution domains have multiple lane bindings: {names}")
-        bound_domains.update(lane.domains)
+            raise ExecutionLaneError(f"computations have multiple execution lane bindings: {names}")
+        bound_computations.update(lane.computations)
 
     torch.cuda.init()
     index = device.index if device.index is not None else torch.cuda.current_device()

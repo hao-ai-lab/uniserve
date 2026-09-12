@@ -30,7 +30,7 @@ def test_paged_prefill_replay_tracks_lengths_and_page_remapping(causal):
         cu_seqlens_q=torch.empty(4, dtype=torch.int32, device=device),
         cu_seqlens_k=torch.empty(4, dtype=torch.int32, device=device),
         query_lens=torch.empty(3, dtype=torch.int32, device=device),
-        kv_lens=torch.empty(3, dtype=torch.int32, device=device),
+        seq_lens=torch.empty(3, dtype=torch.int32, device=device),
     )
     backend = FlashInferAttentionBackend(
         tuning=FlashInferTuningConfig(workspace_size=64 * 1024 * 1024, prefill_backend="fa2")
@@ -46,14 +46,14 @@ def test_paged_prefill_replay_tracks_lengths_and_page_remapping(causal):
         ((257, 1, 1), (321, 68, 1), ((3, 1, 6, 7, 8, 9), (0, 5, 0, 0, 0, 0), (2, 0, 0, 0, 0, 0))),
     )
 
-    def stage(query_lens, kv_lens, pages):
+    def stage(query_lens, seq_lens, pages):
         context.query_lens_cpu = query_lens
-        context.kv_lens_cpu = kv_lens
+        context.seq_lens_cpu = seq_lens
         for name, data in (
             ("query_lens", query_lens),
-            ("kv_lens", kv_lens),
+            ("seq_lens", seq_lens),
             ("cu_seqlens_q", tuple(accumulate(query_lens, initial=0))),
-            ("cu_seqlens_k", tuple(accumulate(kv_lens, initial=0))),
+            ("cu_seqlens_k", tuple(accumulate(seq_lens, initial=0))),
             ("block_table", pages),
         ):
             target = getattr(context, name)
@@ -67,17 +67,17 @@ def test_paged_prefill_replay_tracks_lengths_and_page_remapping(causal):
             cu_seqlens_q=context.cu_seqlens_q,
             cu_seqlens_k=context.cu_seqlens_k,
             max_seqlen_q=max(context.query_lens_cpu),
-            max_seqlen_k=max(context.kv_lens_cpu),
+            max_seqlen_k=max(context.seq_lens_cpu),
             causal=causal,
             scale=width**-0.5,
             block_table=context.block_table,
             context=context,
         )
 
-    def reference(query_lens, kv_lens, pages):
+    def reference(query_lens, seq_lens, pages):
         outputs = []
         start = 0
-        for query_count, kv_count, row_pages in zip(query_lens, kv_lens, pages, strict=True):
+        for query_count, kv_count, row_pages in zip(query_lens, seq_lens, pages, strict=True):
             row_query = query[start : start + query_count].transpose(0, 1).double()
             row_key = keys[list(row_pages)].flatten(0, 1)[:kv_count].transpose(0, 1).double()
             row_value = values[list(row_pages)].flatten(0, 1)[:kv_count].transpose(0, 1).double()

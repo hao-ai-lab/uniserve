@@ -14,9 +14,8 @@ from ...backends.attention.video_sparse import video_sparse_selected_tiles
 from ...execution.batch import (
     DecodeRange,
     DeviceDim,
+    DiffusionSamplingParams,
     DType,
-    MediaGeometry,
-    MediaTrack,
     ShapeBound,
     StaticDim,
     TensorSpec,
@@ -806,7 +805,7 @@ def tensor_output_layout(
             TensorRegion((start, 0), (count, width)),
         )
     if entry == "video_decoder":
-        if decode is None or decode.track is not MediaTrack.VIDEO:
+        if decode is None:
             raise ValueError("video reconstruction requires a temporal range")
         rank = bindings.entries[entry].ranks.index(bindings.process_group.rank)
         if rank >= decode.max_units:
@@ -821,7 +820,9 @@ def tensor_output_layout(
     raise ValueError(f"H3 entry {entry!r} has no Tensor result")
 
 
-def warmup_geometries(capacity: H3Layout, denoise_steps: int) -> tuple[MediaGeometry, ...]:
+def warmup_geometries(
+    capacity: H3Layout, denoise_steps: int
+) -> tuple[tuple[DiffusionSamplingParams, int], ...]:
     """Return unique representative request shapes within the configured capacity."""
 
     max_rows = int(capacity.packed.text_indices.numel())
@@ -831,7 +832,7 @@ def warmup_geometries(capacity: H3Layout, denoise_steps: int) -> tuple[MediaGeom
         *((capacity.frame_count, count) for count in (129, 193, 257)),
         (capacity.frame_count, max_rows),
     )
-    result: list[MediaGeometry] = []
+    result: list[tuple[DiffusionSamplingParams, int]] = []
     keys: set[tuple[int, int]] = set()
     for frames, token_count in shapes:
         key = (frames, ((token_count + 63) // 64) * 64)
@@ -839,11 +840,14 @@ def warmup_geometries(capacity: H3Layout, denoise_steps: int) -> tuple[MediaGeom
             continue
         keys.add(key)
         result.append(
-            MediaGeometry(
-                frame_count=frames,
-                video_units=len(reconstruction_unit_frames(frames)),
-                prompt_tokens=token_count,
-                denoise_steps=denoise_steps,
+            (
+                DiffusionSamplingParams(
+                    num_frames=frames,
+                    num_decode_chunks=len(reconstruction_unit_frames(frames)),
+                    num_inference_steps=denoise_steps,
+                    seed=0,
+                ),
+                token_count,
             )
         )
     return tuple(result)

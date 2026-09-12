@@ -1,38 +1,36 @@
 //! Request admission, resource reservation, and waiting-queue insertion.
 
 use super::*;
+use uniserve_worker_ipc::ForwardMode;
 
-impl EngineLoop {
+impl Scheduler {
     /// Validates and queues one token-generation request or rejects it synchronously.
     pub(super) fn enqueue(&mut self, req: GenerationRequest, event_tx: EventTx) {
-        if self.memory.cache.is_none() {
+        if self.cache.is_none() {
             self.trace_record(json!({
                 "event": "request_rejected",
                 "at_s": now(),
                 "request_id": req.request_id.0,
                 "reason": "missing_kv_resources",
             }));
-            let _ = event_tx.send(Event::Rejected {
+            let _ = event_tx.send(EngineCoreOutput::Rejected {
                 message: "generation request requires worker KV resources".into(),
             });
             return;
         }
-        let context = match RuntimeContext::lower(&req) {
-            Ok(context) => context,
-            Err(error) => {
-                self.trace_record(json!({
-                    "event": "request_rejected",
-                    "at_s": now(),
-                    "request_id": req.request_id.0,
-                    "reason": "invalid_request",
-                    "detail": format!("{error:?}"),
-                }));
-                let _ = event_tx.send(Event::Rejected {
-                    message: format!("invalid generation request: {error:?}"),
-                });
-                return;
-            }
-        };
+        if let Err(error) = req.validate() {
+            self.trace_record(json!({
+                "event": "request_rejected",
+                "at_s": now(),
+                "request_id": req.request_id.0,
+                "reason": "invalid_request",
+                "detail": format!("{error:?}"),
+            }));
+            let _ = event_tx.send(EngineCoreOutput::Rejected {
+                message: format!("invalid generation request: {error:?}"),
+            });
+            return;
+        }
         if let Some(feature) = self.missing_required_feature(&req) {
             self.trace_record(json!({
                 "event": "request_rejected",
@@ -41,23 +39,23 @@ impl EngineLoop {
                 "reason": "missing_worker_feature",
                 "detail": format!("{feature}"),
             }));
-            let _ = event_tx.send(Event::Rejected {
+            let _ = event_tx.send(EngineCoreOutput::Rejected {
                 message: format!(
                     "generation request requires worker feature `{feature}`, but the worker does not support it"
                 ),
             });
             return;
         }
-        if let Err(error) = req.validate_resources(&self.profile.generation_limits) {
+        if let Err(error) = req.validate_resources(&self.generation_limits) {
             self.trace_record(json!({
                 "event": "request_rejected",
                 "at_s": now(),
                 "request_id": req.request_id.0,
-                "reason": "invalid_resource_declaration",
+                "reason": "model_capacity_exceeded",
                 "detail": error.to_string(),
             }));
-            let _ = event_tx.send(Event::Rejected {
-                message: format!("invalid generation resource declaration: {error}"),
+            let _ = event_tx.send(EngineCoreOutput::Rejected {
+                message: format!("invalid generation resource requirements: {error}"),
             });
             return;
         }
@@ -65,89 +63,116 @@ impl EngineLoop {
         // queue grow without bound under overload —
         // an unbounded burst would otherwise OOM the process and take down every
         // in-flight request. Reject the new submit with a typed event.
-        let waiting = self.pending_request_count() + self.scheduler.output.retained_len();
-        if waiting >= self.scheduler.config.max_num_waiting {
+        let waiting = self.pending_request_count() + self.output.retained_len();
+        if waiting >= self.config.max_num_waiting {
             self.trace_record(json!({
                 "event": "request_rejected",
                 "at_s": now(),
                 "request_id": req.request_id.0,
                 "reason": "queue_full",
                 "waiting": waiting,
-                "max_num_waiting": self.scheduler.config.max_num_waiting,
+                "max_num_waiting": self.config.max_num_waiting,
                 "behavior": {
-                    "und_decode": req.behavior.und_decode,
-                    "und_tokens": format!("{:?}", req.behavior.und_tokens),
-                    "gen_output": req.behavior.gen_output,
-                    "generated_image_feedback": req.behavior.generated_image_feedback,
+                    "und_decode": req.decodes_text(),
+                    "und_tokens": format!("{:?}", req.emits_text()),
+                    "gen_output": req.generates_images(),
+                    "generated_image_feedback": req.feeds_back_images(),
                 },
-                "prompt_tokens": context.prompt_ids.len(),
+                "prompt_tokens": req.prompt_token_ids.len(),
             }));
-            let _ = event_tx.send(Event::Rejected {
+            let _ = event_tx.send(EngineCoreOutput::Rejected {
                 message: "scheduler waiting queue is full".into(),
             });
             return;
         }
         let worst = req
-            .resources
-            .max_kv_tokens
+            .max_kv_tokens(&self.generation_limits)
+            .expect("request capacity was validated before queueing")
             .div_ceil(self.info.kv_block_size() as usize);
         // Multimodal requests reserve their configured bounded KV envelope at
         // admission so excess concurrency queues instead of exhausting KV.
-        let reserve_worstcase = !context.images.is_empty() || req.behavior.gen_output;
+        let reserve_worstcase = !req.multimodal_inputs.images.is_empty() || req.generates_images();
         // A request with staged images usually encodes them before prefill.
         // Context-image requests prefill the text before each image position,
         // then encode the image into that marker gap.
-        let phase0 = Phase::Prefill;
         let finish_token_ids = finish_token_ids(&req, &self.ctrl.eos);
-        let st = ReqState {
+        let st = RequestState {
             finish_token_ids,
             allocations: None,
             flow_prefix: None,
-            epoch: self.next_epoch,
-            version: 0,
-            resolved_producer_op_id: 0,
-            committed_version: 0,
-            committed_producer_op_id: 0,
-            control_seq: 0,
-            public_event_limit: 0,
-            token_cutoffs: BTreeMap::new(),
-            pending_commits: VecDeque::new(),
-            cancel_cutoff: None,
-            latest_device_version: None,
+            request_epoch: self.next_request_epoch,
+            last_state_op_id: ComputationId::default(),
+            latest_token: None,
             speculative_chain_invalidated: false,
-            cursor: GenerationCursor::new(phase0, worst, reserve_worstcase),
-            context,
+            phase: Phase::Prefill,
+            num_computed_prompt_tokens: 0,
+            num_ingested_images: 0,
+            image_encoder_index: 0,
+            input_image_features: None,
+            round_closing: false,
+            logical_position: 0,
+            kv_visible_len: 0,
+            next_token: 0,
+            num_generated_tokens: 0,
+            image_id: 0,
+            num_generated_images: 0,
+            image_reservation_pending: false,
+            num_completed_denoise_steps: 0,
+            image_conditioning: None,
+            image_latent: None,
+            feedback_encoder_index: 0,
+            feedback_source: None,
+            feedback_features: None,
+            worker_registered: false,
+            num_kv_blocks_sent: 0,
+            reserve_worstcase,
+            max_reserved_kv_blocks: worst,
+            prefix_block_hashes: Vec::new(),
+            prefix_cached: false,
+            generated_token_ids: Vec::new(),
+            round_token_ids: Vec::new(),
+            text_tokens_since_image: 0,
+            feedback_image_b64: None,
+            replayable: true,
+            encoder_cache_pins: Vec::new(),
+            transient_encoder_products: Vec::new(),
             output: RequestOutput::new(event_tx),
             queued_at: now(),
             terminal_intent: super::TerminalIntent::None,
             req,
         };
-        self.next_epoch = self.next_epoch.saturating_add(1);
+        self.next_request_epoch = self.next_request_epoch.saturating_add(1);
         self.trace_request_queued(&st, "pending");
         let request_id = st.req.request_id;
-        self.scheduler
-            .enqueue(request_id, st.req.priority, st.queued_at);
+        let position = match self.config.policy {
+            SchedulingPolicy::Fcfs => self.waiting_order.len(),
+            SchedulingPolicy::Priority => self.waiting_order.partition_point(|id| {
+                let queued = &self.waiting[id];
+                (queued.req.priority, queued.queued_at) <= (st.req.priority, st.queued_at)
+            }),
+        };
+        self.waiting_order.insert(position, request_id);
         self.waiting.insert(request_id, st);
     }
 
     /// Resolve storage from loaded numerical result contracts before admission.
     fn media_tensor_specs(
         &self,
-        geometry: uniserve_core::MediaGeometry,
+        geometry: uniserve_core::DiffusionSamplingParams,
+        num_prompt_tokens: u32,
     ) -> Option<Vec<(String, u32, DType, ShapeBound)>> {
-        use uniserve_worker_ipc::MediaStageRole;
+        use uniserve_worker_ipc::PipelineStage;
 
-        let plan = self.info.media_plan.as_ref()?;
         let mut specs = Vec::new();
         for (role, outputs) in [
-            (MediaStageRole::Encode, 1),
-            (MediaStageRole::Denoise, 2),
-            (MediaStageRole::VideoDecode, 1),
-            (MediaStageRole::AudioDecode, 1),
+            (PipelineStage::TextEncoding, 1),
+            (PipelineStage::Denoising, 2),
+            (PipelineStage::VideoDecoding, 1),
+            (PipelineStage::AudioDecoding, 1),
         ] {
-            let stage = plan.stage_by_role(role)?;
+            let entry = self.info.pipeline_components.get(&role)?;
             let (_, bound, info) = self
-                .entry_candidates(stage.operation, &stage.entry)
+                .entry_candidates(Computation::Pipeline(role), entry)
                 .next()?;
             let component = info
                 .components
@@ -158,30 +183,30 @@ impl EngineLoop {
             }
             for (index, output) in component.outputs.iter().enumerate() {
                 let mut shape = output.shape_bound.clone();
-                if role == MediaStageRole::Encode {
+                if role == PipelineStage::TextEncoding {
                     let mut selected = false;
                     for dim in &mut shape.dims {
                         if let DimBound::Device { max } = *dim {
-                            if geometry.prompt_tokens == 0 || geometry.prompt_tokens > max {
+                            if num_prompt_tokens == 0 || num_prompt_tokens > max {
                                 return None;
                             }
-                            *dim = DimBound::Static(geometry.prompt_tokens);
+                            *dim = DimBound::Static(num_prompt_tokens);
                             selected = true;
                         }
                     }
                     if !selected {
                         return None;
                     }
-                } else if role == MediaStageRole::VideoDecode {
+                } else if role == PipelineStage::VideoDecoding {
                     let Some(DimBound::Device { max }) = shape.dims.first().copied() else {
                         return None;
                     };
-                    if geometry.video_units == 0 || geometry.video_units > max {
+                    if geometry.num_decode_chunks == 0 || geometry.num_decode_chunks > max {
                         return None;
                     }
-                    shape.dims[0] = DimBound::Static(geometry.video_units);
+                    shape.dims[0] = DimBound::Static(geometry.num_decode_chunks);
                 }
-                specs.push((stage.entry.clone(), index as u32, output.dtype, shape));
+                specs.push((entry.clone(), index as u32, output.dtype, shape));
             }
         }
         Some(specs)
@@ -191,96 +216,81 @@ impl EngineLoop {
     pub(super) fn enqueue_media(&mut self, submission: PendingMedia) {
         let request = &submission.request;
         if let Err(message) = request.validate() {
-            let _ = submission.event_tx.send(Event::Rejected {
+            let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
                 message: message.to_string(),
             });
             return;
         }
-        let Some(plan) = self.info.media_plan.as_ref() else {
-            let _ = submission.event_tx.send(Event::Rejected {
-                message: "worker does not declare a terminal media plan".to_string(),
+        if self.info.pipeline_components.is_empty() {
+            let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
+                message: "worker does not provide video pipeline components".to_string(),
             });
             return;
-        };
-        if plan
-            .stages
-            .iter()
-            .any(|stage| !self.info.supported_ops.contains(&stage.operation))
+        }
+        if request.sampling.num_inference_steps != self.info.num_inference_steps {
+            let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
+                message: "request prediction count disagrees with the loaded model".to_string(),
+            });
+            return;
+        }
+        if self
+            .media_tensor_specs(request.sampling, request.prompt_token_ids.len() as u32)
+            .is_none()
         {
-            let _ = submission.event_tx.send(Event::Rejected {
-                message: "worker does not support its declared media plan".to_string(),
-            });
-            return;
-        }
-        if request.geometry.denoise_steps != plan.denoise_steps() {
-            let _ = submission.event_tx.send(Event::Rejected {
-                message: "request prediction count disagrees with the loaded media plan"
-                    .to_string(),
-            });
-            return;
-        }
-        if self.media_tensor_specs(request.geometry).is_none() {
-            let _ = submission.event_tx.send(Event::Rejected {
+            let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
                 message: "loaded media entries cannot represent the requested tensor geometry"
                     .into(),
             });
             return;
         }
         if self.info.request_slots < 2 {
-            let _ = submission.event_tx.send(Event::Rejected {
+            let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
                 message: "worker does not provide two resident media state slots".to_string(),
             });
             return;
         }
-        if self.scheduler.waiting_len()
-            + self.scheduler.waiting_media_len()
-            + self.scheduler.output.retained_len()
-            >= self.scheduler.config.max_num_waiting
+        if self.waiting_order.len() + self.waiting_media_order.len() + self.output.retained_len()
+            >= self.config.max_num_waiting
         {
-            let _ = submission.event_tx.send(Event::Rejected {
+            let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
                 message: "scheduler waiting queue is full".to_string(),
             });
             return;
         }
         let request_id = submission.request.request_id;
         self.waiting_media.insert(request_id, submission);
-        self.scheduler.enqueue_media(request_id);
+        self.waiting_media_order.push_back(request_id);
     }
 
     /// Admits queued media requests while request and product storage remain available.
     pub(super) fn admit_media(&mut self) {
-        while self.running_request_count() < self.scheduler.config.max_num_seqs {
-            let Some(id) = self.scheduler.pop_media() else {
+        while self.running_request_count() < self.config.max_num_seqs {
+            let Some(id) = self.waiting_media_order.pop_front() else {
                 break;
             };
             let submission = self
                 .waiting_media
                 .remove(&id)
                 .expect("scheduler media order names runtime state");
-            let epoch = self.next_epoch;
-            let request_key = RequestKey::new(self.authority_id, id, epoch);
-            let geometry = submission.request.geometry;
-            let plan = self
-                .info
-                .media_plan
-                .as_ref()
-                .expect("queued media retains a validated execution plan");
-            if plan.stages.iter().any(|stage| {
+            let request_epoch = self.next_request_epoch;
+            let request_key = RequestKey::new(self.engine_id, id, request_epoch);
+            let geometry = submission.request.sampling;
+            if self.info.pipeline_components.iter().any(|(stage, entry)| {
                 !self
-                    .entry_candidates(stage.operation, &stage.entry)
+                    .entry_candidates(Computation::Pipeline(*stage), entry)
                     .any(|(worker, _, _)| self.executor.is_ready(worker))
             }) {
                 self.waiting_media.insert(id, submission);
-                self.scheduler.push_media_front(id);
+                self.waiting_media_order.push_front(id);
                 break;
             }
-            let Ok(request_slot) = self.memory.alloc(request_key, MemoryLayout::RequestSlot) else {
+            let Ok(request_slot) = self.request_pool.allocate(request_key) else {
                 self.waiting_media.insert(id, submission);
-                self.scheduler.push_media_front(id);
+                self.waiting_media_order.push_front(id);
                 break;
             };
             let specs = self
-                .media_tensor_specs(geometry)
+                .media_tensor_specs(geometry, submission.request.prompt_token_ids.len() as u32)
                 .expect("queued media has valid result geometry");
             let mut tensors = HashMap::new();
             let mut reserved = true;
@@ -288,13 +298,7 @@ impl EngineLoop {
                 let bytes = shape_bound
                     .max_elements()
                     .saturating_mul(dtype.element_bytes());
-                let Ok(allocation) = self.memory.alloc(
-                    request_key,
-                    MemoryLayout::Buffer {
-                        bytes,
-                        alignment: 256,
-                    },
-                ) else {
+                let Ok(allocation) = self.buffer_pool.allocate(request_key, bytes, 256) else {
                     reserved = false;
                     break;
                 };
@@ -309,90 +313,64 @@ impl EngineLoop {
             }
             if !reserved {
                 for tensor in tensors.into_values() {
-                    self.memory.free(tensor.allocation);
+                    self.free_allocation(tensor.allocation);
                 }
-                self.memory.free(request_slot);
+                self.free_allocation(request_slot);
                 self.waiting_media.insert(id, submission);
-                self.scheduler.push_media_front(id);
+                self.waiting_media_order.push_front(id);
                 break;
             }
-            let encoder_op = OpId(self.next_op_id.max(1));
-            let encode_entry = &plan
-                .stage_by_role(uniserve_worker_ipc::MediaStageRole::Encode)
-                .expect("validated media plan has an encode stage")
-                .entry;
-            let encoded = &tensors[&(encode_entry.clone(), 0)];
-            let conditioning = ProductRef {
-                request_key,
-                producer_op_id: encoder_op,
-                output_index: 0,
-                generation: 1,
-                kind: ProductKind::Tensor,
-                storage_class: StorageClass::DeviceTensor,
-                dtype: encoded.dtype,
-                shape_bound: encoded.shape_bound.clone(),
-                point_range: PointRange::default(),
-            };
-            self.next_op_id = encoder_op.0.saturating_add(1);
             let allocations = MediaAllocations {
                 request_slot,
                 tensors,
             };
             let request_pool_idx = allocations.request_slot();
-            self.next_epoch = self.next_epoch.saturating_add(1);
+            self.next_request_epoch = self.next_request_epoch.saturating_add(1);
             let admission = NewRequest::new_media(
                 request_key,
                 request_pool_idx,
-                DiffusionRequestParams {
-                    prompt_token_ids: submission.request.prompt_token_ids.clone(),
-                    seed: submission.request.seed,
-                    geometry: MediaGeometry {
-                        frame_count: submission.request.geometry.frame_count,
-                        video_units: submission.request.geometry.video_units,
-                        prompt_tokens: submission.request.geometry.prompt_tokens,
-                        denoise_steps: submission.request.geometry.denoise_steps,
-                    },
-                },
+                submission.request.prompt_token_ids.clone(),
+                submission.request.sampling,
             )
             .expect("validated media admission");
-            let root = Checkpoint::admission_root(OpId(0));
+            let root = ComputationId::new(0, 0);
             self.running_media.insert(
                 id,
                 MediaFlowState {
                     request: submission.request,
                     event_tx: submission.event_tx,
                     allocations,
-                    conditioning,
+                    conditioning: None,
                     latents: Vec::new(),
                     video_segments: BTreeMap::new(),
                     audio: None,
                     admission,
-                    admission_state: DiffusionRequestParamsState::Unsubmitted,
-                    committed: MediaCursor::default(),
-                    projected: MediaCursor::default(),
-                    fixed_parent: root.clone(),
-                    projected_parent: root,
+                    admission_state: WorkerRegistration::Unsubmitted,
+                    text_encoding_scheduled: false,
+                    latent_preparation_scheduled: false,
+                    num_scheduled_steps: 0,
+                    num_completed_steps: 0,
+                    num_scheduled_decode_chunks: 0,
+                    num_scheduled_video_chunks: 0,
+                    num_encoded_video_chunks: 0,
+                    audio_decoding_scheduled: false,
+                    audio_encoding_scheduled: false,
+                    audio_encoded: false,
+                    muxing_scheduled: false,
+                    muxed: false,
+                    predecessor: root,
                     terminal_intent: TerminalIntent::None,
                     artifact: None,
                 },
             );
-            self.scheduler.running_order.push(id);
+            self.running_order.push(id);
         }
     }
 
     /// Returns the number of configured VAE workers.
     pub(super) fn num_vae(&self, ip: &uniserve_core::ImageParams) -> u64 {
-        let dl = u64::from(self.profile.generation_limits.latent_downsample).max(1);
+        let dl = u64::from(self.generation_limits.latent_downsample).max(1);
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
-    }
-
-    /// Caps image grid tokens to the configured VAE limit.
-    pub(super) fn cap_max_vae_grid_tokens(&self) -> usize {
-        if self.profile.generation_limits.max_vae_grid_tokens > 0 {
-            self.profile.generation_limits.max_vae_grid_tokens as usize
-        } else {
-            self.info.latent_capacity_units().min(usize::MAX as u64) as usize
-        }
     }
 
     /// Returns a required runtime feature that the worker lacks.
@@ -400,14 +378,15 @@ impl EngineLoop {
         &self,
         request: &GenerationRequest,
     ) -> Option<uniserve_core::GenerationFeatures> {
-        let context_steps = request.context.iter().flat_map(|segment| match segment {
-            uniserve_core::ContextSegment::Image { ingest, .. } => ingest.steps.clone(),
-            uniserve_core::ContextSegment::UndTokens { .. } => Vec::new(),
-        });
+        let context_steps = request
+            .multimodal_inputs
+            .images
+            .iter()
+            .flat_map(|image| image.encoders.iter().map(|input| input.encoder));
         let needs = request
-            .behavior
-            .required_features(&request.policy, context_steps);
-        self.profile.generation_limits.covers(needs).err()
+            .image_generation
+            .required_features(request.constraint, context_steps);
+        self.generation_limits.covers(needs).err()
     }
 
     /// Returns whether the worker tracks image-latent capacity.
@@ -417,13 +396,13 @@ impl EngineLoop {
 
     /// Returns the worker used image-latent capacity.
     pub(super) fn worker_image_latent_used(&self) -> u64 {
-        (self.memory.latent_pages.used_pages() as u64)
+        (self.latent_pool.used_pages() as u64)
             .saturating_mul(u64::from(self.info.latent_page_units))
     }
 
     /// Computes image-latent capacity required by a request.
-    pub(super) fn worker_image_latent_units_for(&self, st: &ReqState) -> u64 {
-        let downsample = (self.profile.generation_limits.latent_downsample as u64).max(1);
+    pub(super) fn worker_image_latent_units_for(&self, st: &RequestState) -> u64 {
+        let downsample = (self.generation_limits.latent_downsample as u64).max(1);
         let (height, width) = (st.req.image.height, st.req.image.width);
         ceil_div_u64((height as u64).max(1), downsample)
             * ceil_div_u64((width as u64).max(1), downsample)
@@ -436,7 +415,7 @@ impl EngineLoop {
             .get(&id)
             .map(|state| {
                 (
-                    state.context.negative_prompt_ids.len(),
+                    state.req.negative_prompt_token_ids.len(),
                     cfg_branch_count(&state.req.image) > 1,
                 )
             })
@@ -452,19 +431,12 @@ impl EngineLoop {
         let Some(state) = self.running.get(&id) else {
             return false;
         };
-        let request_key = RequestKey::new(self.authority_id, id, state.epoch);
-        let Ok(request_slot) = self.memory.alloc(request_key, MemoryLayout::RequestSlot) else {
+        let request_key = RequestKey::new(self.engine_id, id, state.request_epoch);
+        let Ok(request_slot) = self.request_pool.allocate(request_key) else {
             return false;
         };
-        let groups = self.memory.cache().block_pool.num_groups() as u32;
-        let Ok(kv) = self.memory.alloc(
-            request_key,
-            MemoryLayout::Kv {
-                tokens: prefix_tokens as u32,
-                groups,
-            },
-        ) else {
-            self.memory.free(request_slot);
+        let Ok(kv) = self.cache().allocate(request_key, prefix_tokens as u32) else {
+            self.free_allocation(request_slot);
             return false;
         };
         let new_pages = kv
@@ -480,7 +452,7 @@ impl EngineLoop {
             buffers: HashMap::new(),
         };
         let Some(state) = self.running.get_mut(&id) else {
-            allocations.free(&mut self.memory);
+            allocations.free(self);
             return false;
         };
         state.flow_prefix = Some(FlowPrefixState {
@@ -498,7 +470,7 @@ impl EngineLoop {
             .get_mut(&id)
             .and_then(|state| state.flow_prefix.take());
         if let Some(prefix) = prefix {
-            prefix.allocations.free(&mut self.memory);
+            prefix.allocations.free(self);
         }
     }
 
@@ -511,7 +483,7 @@ impl EngineLoop {
             .running
             .iter()
             .filter(|(id, state)| {
-                state.terminal_intent.is_terminal() && !self.inflight.contains(**id)
+                state.terminal_intent.is_terminal() && !self.has_pending_operations(**id)
             })
             .map(|(id, state)| (*id, state.terminal_intent.clone()))
             .collect();
@@ -524,29 +496,24 @@ impl EngineLoop {
             self.finish(id, reason);
         }
         let media = self
-            .scheduler
             .running_order
             .iter()
             .filter_map(|id| {
                 self.media_state(*id)
                     .filter(|state| {
                         state.terminal_intent.is_terminal()
-                            && !self.inflight.contains(state.request.request_id)
+                            && !self.has_pending_operations(state.request.request_id)
                     })
                     .map(|state| (state.request.request_id, state.terminal_intent.clone()))
             })
             .collect::<Vec<_>>();
         for (id, intent) in media {
-            let (event, reason) = match intent {
-                TerminalIntent::Failure(message) => {
-                    (DiffusionTerminal::Failed(message), CloseReason::Error)
-                }
-                TerminalIntent::Finish(reason) => {
-                    (DiffusionTerminal::Finished(reason), CloseReason::Cancelled)
-                }
+            let event = match intent {
+                TerminalIntent::Failure(message) => DiffusionTerminal::Failed(message),
+                TerminalIntent::Finish(reason) => DiffusionTerminal::Finished(reason),
                 TerminalIntent::None => continue,
             };
-            self.finish_media(id, event, reason, None);
+            self.finish_media(id, event);
         }
     }
 
@@ -557,28 +524,27 @@ impl EngineLoop {
     pub(super) fn admit(&mut self) {
         let bs = self.info.kv_block_size() as usize;
         loop {
-            if self.running_request_count() >= self.scheduler.config.max_num_seqs
-                || self.memory.request_slots.is_empty()
+            if self.running_request_count() >= self.config.max_num_seqs
+                || self.request_pool.is_empty()
             {
                 break;
             }
-            let Some(head_id) = self.scheduler.peek() else {
+            let Some(head_id) = self.waiting_order.front().copied() else {
                 break;
             };
             let head = self
                 .waiting
                 .get(&head_id)
                 .expect("scheduler waiting order names runtime state");
-            if head.cursor.resources.reserve_worstcase {
-                let need = head.cursor.resources.worstcase_blocks;
-                let encoder_entries = head.req.resources.encoder_cache_keys.len();
+            if head.reserve_worstcase {
+                let need = head.max_reserved_kv_blocks;
+                let encoder_entries = head.req.num_encoder_cache_entries();
                 let encoder_ok = self
-                    .memory
                     .reserved_encoder_entries
                     .saturating_add(encoder_entries)
-                    <= self.memory.encoder_cache.budget();
-                if need > self.memory.usable_blocks() {
-                    let id = self.scheduler.pop().unwrap();
+                    <= self.encoder_cache.budget();
+                if need > self.usable_blocks() {
+                    let id = self.waiting_order.pop_front().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
                     self.trace_record(json!({
                         "event": "request_rejected",
@@ -586,33 +552,33 @@ impl EngineLoop {
                         "request_id": st.req.request_id.0,
                         "reason": "too_large",
                         "needed_blocks": need,
-                        "usable_blocks": self.memory.usable_blocks(),
-                        "generation": &st.req.behavior,
-                        "prompt_tokens": st.context.prompt_ids.len(),
+                        "usable_blocks": self.usable_blocks(),
+                        "generation": Self::generation_trace(&st.req),
+                        "prompt_tokens": st.req.prompt_token_ids.len(),
                     }));
-                    let _ = st.output.event_tx.send(Event::Rejected {
+                    let _ = st.output.event_tx.send(EngineCoreOutput::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
                 }
-                if self.memory.free_blocks() >= need && encoder_ok {
+                if self.free_blocks() >= need && encoder_ok {
                     let Some((target, _)) = self.prefill_target(head) else {
                         break;
                     };
-                    let id = self.scheduler.pop().unwrap();
+                    let id = self.waiting_order.pop_front().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
                     let id = st.req.request_id;
                     self.admit_running(st, target);
                     // Physically allocate the worst case now: nothing can take
                     // these blocks, so this request can never fail mid-flight.
                     self.ensure_request_capacity(id, need * bs);
-                    self.memory.reserved_blocks += need;
+                    self.reserved_blocks += need;
                     continue;
                 }
             } else {
-                let n = head.context.prompt_ids.len();
-                let text_usable_blocks = (0..self.memory.cache().block_pool.num_groups())
-                    .map(|group| self.memory.cache().block_pool.group_capacity(group))
+                let n = head.req.prompt_token_ids.len();
+                let text_usable_blocks = (0..self.cache().block_pool.num_groups())
+                    .map(|group| self.cache().block_pool.group_capacity(group))
                     .min()
                     .unwrap_or_default();
                 let Some((target, prefix_hit)) = self.prefill_target(head) else {
@@ -623,15 +589,15 @@ impl EngineLoop {
                 let cached_prefix_tokens = cached_prefix_blocks.saturating_mul(bs);
                 let uncached_remaining = n.saturating_sub(cached_prefix_tokens);
                 let first_uncached_chunk = uncached_remaining
-                    .min(self.scheduler.config.long_prefill_threshold)
-                    .min(self.scheduler.config.max_num_batched_tokens)
+                    .min(self.config.long_prefill_threshold)
+                    .min(self.config.max_num_batched_tokens)
                     .max(1);
                 let first_chunk_blocks = cached_prefix_tokens
                     .saturating_add(first_uncached_chunk)
                     .div_ceil(bs)
                     .saturating_sub(cached_prefix_blocks);
                 if n > text_usable_blocks * bs {
-                    let id = self.scheduler.pop().unwrap();
+                    let id = self.waiting_order.pop_front().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
                     self.trace_record(json!({
                         "event": "request_rejected",
@@ -640,20 +606,19 @@ impl EngineLoop {
                         "reason": "too_large",
                         "needed_blocks": first_chunk_blocks,
                         "usable_blocks": text_usable_blocks,
-                        "generation": &st.req.behavior,
-                        "prompt_tokens": st.context.prompt_ids.len(),
+                        "generation": Self::generation_trace(&st.req),
+                        "prompt_tokens": st.req.prompt_token_ids.len(),
                     }));
-                    let _ = st.output.event_tx.send(Event::Rejected {
+                    let _ = st.output.event_tx.send(EngineCoreOutput::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
                 }
                 let capacity_available = prefix_hit.cached_free_blocks.len()
-                    == self.memory.cache().block_pool.num_groups()
+                    == self.cache().block_pool.num_groups()
                     && prefix_hit.cached_free_blocks.iter().enumerate().all(
                         |(group, cached_free)| {
-                            self.memory
-                                .cache()
+                            self.cache()
                                 .block_pool
                                 .free_blocks_in_group(group)
                                 .saturating_sub(*cached_free)
@@ -661,7 +626,7 @@ impl EngineLoop {
                         },
                     );
                 if capacity_available {
-                    let id = self.scheduler.pop().unwrap();
+                    let id = self.waiting_order.pop_front().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
                     self.admit_running(st, target);
                     continue;
@@ -678,15 +643,15 @@ impl EngineLoop {
     /// Probes the prefix cache on the configured prefill owner.
     fn prefill_target(
         &self,
-        state: &ReqState,
+        state: &RequestState,
     ) -> Option<((crate::WorkerId, String), crate::kv::PrefixHit)> {
-        let cache = self.memory.cache();
-        self.worker_candidates(OpCode::ArExtend)
+        let cache = self.cache();
+        self.worker_candidates(Computation::Forward(ForwardMode::Prefill))
             .filter(|(worker, _, _)| self.executor.is_ready(worker))
             .map(|(worker, entry, info)| {
                 let hit = cache.coordinator.probe_prefix(
                     &cache.block_pool,
-                    state.effective_prompt(),
+                    &state.req.prompt_token_ids,
                     state.req.cache.read,
                     state.has_context_images(),
                     state.req.cache.isolation_key,
@@ -698,9 +663,13 @@ impl EngineLoop {
     }
 
     /// Reserves request resources and moves one validated request into the runnable set.
-    pub(super) fn admit_running(&mut self, mut st: ReqState, target: (crate::WorkerId, String)) {
+    pub(super) fn admit_running(
+        &mut self,
+        mut st: RequestState,
+        target: (crate::WorkerId, String),
+    ) {
         let id = st.req.request_id;
-        let request_key = RequestKey::new(self.authority_id, id, st.epoch);
+        let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
         let source = self
             .executor
             .info()
@@ -717,18 +686,12 @@ impl EngineLoop {
         // Admission owns the request row and an initially empty table for every
         // KV group before the request enters the runnable set.
         let request_slot = self
-            .memory
-            .alloc(request_key, MemoryLayout::RequestSlot)
+            .request_pool
+            .allocate(request_key)
             .expect("admission checked request-slot capacity");
         let kv = self
-            .memory
-            .alloc(
-                request_key,
-                MemoryLayout::Kv {
-                    tokens: 0,
-                    groups: self.memory.cache().block_pool.num_groups() as u32,
-                },
-            )
+            .cache()
+            .allocate(request_key, 0)
             .expect("empty KV allocation is valid");
         st.allocations = Some(RequestAllocations {
             request_slot,
@@ -756,15 +719,15 @@ impl EngineLoop {
             .fetch_max(queue_wait_us, Ordering::Relaxed);
 
         // Snapshot trace fields before moving the request into runtime storage.
-        let generation = st.req.behavior.clone();
-        let phase = st.cursor.phase;
-        let prompt_tokens = st.context.prompt_ids.len();
+        let generation = Self::generation_trace(&st.req);
+        let phase = st.phase;
+        let prompt_tokens = st.req.prompt_token_ids.len();
         let max_tokens = st.req.max_und_tokens;
         let priority = st.req.priority;
-        let reserve_worstcase = st.cursor.resources.reserve_worstcase;
-        let worstcase_blocks = st.cursor.resources.worstcase_blocks;
-        let encoder_entries = st.req.resources.encoder_cache_keys.len();
-        if st.output.enqueue(Event::Scheduled {
+        let reserve_worstcase = st.reserve_worstcase;
+        let worstcase_blocks = st.max_reserved_kv_blocks;
+        let encoder_entries = st.req.num_encoder_cache_entries();
+        if st.output.enqueue(EngineCoreOutput::Scheduled {
             queued_at: q,
             scheduled_at,
         }) {
@@ -774,9 +737,8 @@ impl EngineLoop {
         // Running order, resource reservations, and runtime ownership advance
         // together so the next scheduling pass observes one coherent admission.
         self.running.insert(id, st);
-        self.scheduler.running_order.push(id);
-        self.memory.reserved_encoder_entries = self
-            .memory
+        self.running_order.push(id);
+        self.reserved_encoder_entries = self
             .reserved_encoder_entries
             .saturating_add(encoder_entries);
 
@@ -794,17 +756,16 @@ impl EngineLoop {
             "reserve_worstcase": reserve_worstcase,
             "worstcase_blocks": worstcase_blocks,
             "running": self.running.len(),
-            "pending": self.scheduler.waiting_len(),
-            "free_blocks": self.memory.free_blocks(),
-            "reserved_blocks": self.memory.reserved_blocks,
-            "reserved_encoder_entries": self.memory.reserved_encoder_entries,
+            "pending": self.waiting_order.len(),
+            "free_blocks": self.free_blocks(),
+            "reserved_blocks": self.reserved_blocks,
+            "reserved_encoder_entries": self.reserved_encoder_entries,
         }));
 
         // Prefix-cache acquisition pins every reused block to this request's
         // newly installed block tables.
-        let memory = &self.memory;
         if let Some(st) = self.running.get_mut(&id) {
-            let kv = memory.cache();
+            let kv = self.cache.as_ref().expect("generation has a KV cache");
             acquire_cached_prefix(&kv.coordinator, st, &kv.block_pool, &self.stats, &source);
         }
     }
@@ -813,12 +774,12 @@ impl EngineLoop {
 /// Acquires a complete cross-group prefix hit and records cache accounting on the request.
 fn acquire_cached_prefix(
     coordinator: &KvCacheCoordinator,
-    state: &mut ReqState,
+    state: &mut RequestState,
     pool: &BlockPool,
-    stats: &SchedStats,
+    stats: &SchedulerStats,
     source: &uniserve_worker_ipc::WorkerEndpoint,
 ) {
-    let prompt = state.effective_prompt().to_vec();
+    let prompt = state.req.prompt_token_ids.clone();
     let has_context_images = state.has_context_images();
     let cache_read = state.req.cache.read;
     let isolation_key = state.req.cache.isolation_key;
@@ -852,9 +813,8 @@ fn acquire_cached_prefix(
         .prefix
         .hit_tokens
         .fetch_add((hit.cached_blocks * block_size) as u64, Ordering::Relaxed);
-    state.cursor.replay.block_hashes = hit.block_hashes;
-    state.cursor.replay.prefix_cached_blocks = hit.cached_blocks;
-    state.cursor.ingest.prompt_cursor = (hit.cached_blocks * block_size) as u32;
-    state.cursor.und.logical_pos = state.cursor.ingest.prompt_cursor;
-    state.cursor.und.physical_kv_len = state.cursor.ingest.prompt_cursor;
+    state.prefix_block_hashes = hit.block_hashes;
+    state.num_computed_prompt_tokens = (hit.cached_blocks * block_size) as u32;
+    state.logical_position = state.num_computed_prompt_tokens;
+    state.kv_visible_len = state.num_computed_prompt_tokens;
 }

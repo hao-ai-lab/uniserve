@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ..execution.batch import OpCode
+from uniserve_worker.execution.batch import ForwardMode
+
 from ..execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
@@ -276,9 +277,9 @@ class Qwen3ForCausalLM(ExecutionModel):
         self.architecture = "Qwen3ForCausalLM"
         self.supported_work = frozenset(
             {
-                OpCode.AR_EXTEND,
-                OpCode.AR_DECODE,
-                OpCode.AR_VERIFY,
+                ForwardMode.PREFILL,
+                ForwardMode.DECODE,
+                ForwardMode.VERIFY,
             }
         )
         self.cache_geometry = CacheGeometry(

@@ -10,11 +10,12 @@ from typing import cast
 import torch
 
 from uniserve_worker.config import WorkerConfig
+from uniserve_worker.execution.batch import COMPUTATIONS, Computation
 from uniserve_worker.nn.mesh import Communicator
-from uniserve_worker.nn.parallel import EntryConfig
+from uniserve_worker.nn.parallel import ComponentConfig
 
 from ..config import graph_memory_budget_bytes, graph_padding_block_count
-from ..execution.batch import OpCode, WorkerEndpoint
+from ..execution.batch import WorkerEndpoint
 from ..execution.input_buffers import InputGeometry
 from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..foundation.math import ceil_div
@@ -75,7 +76,7 @@ def configuration_identity(
     model: ExecutionModel,
     worker_config: WorkerConfig,
     layout: WorkerLayout,
-    components: tuple[tuple[str, EntryConfig], ...],
+    components: tuple[tuple[str, ComponentConfig], ...],
     attention_identity: str | None,
 ) -> str:
     """Identify resolved params, numerical storage, operators, and shape bounds.
@@ -166,9 +167,9 @@ def build_worker_layout(
     completion_payload_bytes: int = 1 << 20,
     endpoint: WorkerEndpoint | None = None,
     capacity_group: Communicator | None = None,
-    allowed_work_variants: frozenset[OpCode] | None = None,
+    allowed_work_variants: frozenset[Computation] | None = None,
     transfer_backends: tuple[str, ...] = ("local",),
-    components: tuple[tuple[str, EntryConfig], ...] = (),
+    components: tuple[tuple[str, ComponentConfig], ...] = (),
     attention_identity: str | None = None,
 ) -> WorkerLayout:
     """Resolve resource geometry and the exact capacity report used by the worker.
@@ -225,7 +226,7 @@ def build_worker_layout(
 
     info = replace(
         layout.info,
-        supported_ops=tuple(code for code in OpCode if code in supported_ops),
+        supported_ops=tuple(code for code in COMPUTATIONS if code in supported_ops),
         transfer_backends=transfer_backends,
         max_batch_ops=max_operations,
         max_batch_tokens=max_tokens,
@@ -381,7 +382,7 @@ def _token_worker_layout(
             capacity = replace(
                 capacity, num_blocks=blocks, token_capacity=blocks * capacity.block_size
             )
-    supported_ops = tuple(code for code in OpCode if code in model.supported_work)
+    supported_ops = tuple(code for code in COMPUTATIONS if code in model.supported_work)
     info = WorkerInfo(
         model_name=model_name,
         endpoint=endpoint,
@@ -421,7 +422,8 @@ def _token_worker_layout(
         latent_pages=num_latent_pages,
         buffer_pool_bytes=buffer_pool_bytes,
         max_unresolved_ops=unresolved_window,
-        media_plan=getattr(model, "media_plan", None),
+        pipeline_components=dict(model.pipeline_components),
+        num_inference_steps=model.num_inference_steps,
     )
     arena = model_arena_capacity(
         model,
@@ -477,7 +479,7 @@ def _request_tensor_worker_layout(
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),
-        supported_ops=tuple(code for code in OpCode if code in model.supported_work),
+        supported_ops=tuple(code for code in COMPUTATIONS if code in model.supported_work),
         queue_depth=depth,
         max_batch_ops=max_operations,
         max_batch_tokens=max_operations,
@@ -487,7 +489,8 @@ def _request_tensor_worker_layout(
         latent_pages=0,
         buffer_pool_bytes=slots * model.product_storage_bytes,
         max_unresolved_ops=unresolved_window,
-        media_plan=getattr(model, "media_plan", None),
+        pipeline_components=dict(model.pipeline_components),
+        num_inference_steps=model.num_inference_steps,
     )
     return WorkerLayout(
         info=info,
@@ -511,7 +514,7 @@ def _request_tensor_worker_layout(
         * local_product_storage_bytes(
             model.entry_outputs,
             bindings=model.bindings,
-            plan=model.media_plan,
+            pipeline_components=model.pipeline_components,
             max_unresolved_ops=unresolved_window,
         ),
         latent_width=1,

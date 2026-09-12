@@ -7,8 +7,8 @@ use tracing::warn;
 
 use crate::profile::tools::{Qwen3XmlToolParser, ToolCallDelta, ToolParserOutput};
 use crate::serving::chat::AssistantBlockKind;
+use crate::serving::chat::output::processor::AssistantEvent;
 use crate::serving::chat::output::processor::generate_tool_call_id;
-use crate::serving::chat::output::processor::{AssistantEvent, ReasoningEvent};
 use crate::serving::chat::{Error, Result};
 
 struct ToolState {
@@ -146,14 +146,14 @@ fn push_text_delta(events: &mut Vec<AssistantEvent>, kind: AssistantBlockKind, d
 #[try_stream]
 /// Converts assistant text events into tool-call-aware events.
 pub async fn tool_event_stream(
-    stream: impl futures::Stream<Item = Result<ReasoningEvent>> + Send,
+    stream: impl futures::Stream<Item = Result<AssistantEvent>> + Send,
     parser: Option<Qwen3XmlToolParser>,
     mut y: TryYielder<AssistantEvent, Error>,
 ) -> Result<()> {
     let Some(parser) = parser else {
         pin_mut!(stream);
         while let Some(event) = stream.next().await.transpose()? {
-            y.yield_ok(event.into()).await;
+            y.yield_ok(event).await;
         }
         return Ok(());
     };
@@ -162,7 +162,9 @@ pub async fn tool_event_stream(
     let mut state = ToolState::new(parser);
     while let Some(event) = stream.next().await.transpose()? {
         match event {
-            ReasoningEvent::Start {
+            event @ (AssistantEvent::ToolCallStart { .. }
+            | AssistantEvent::ToolCallArgumentsDelta { .. }) => y.yield_ok(event).await,
+            AssistantEvent::Start {
                 prompt_token_ids,
                 prompt_logprobs,
                 queued_at,
@@ -176,12 +178,12 @@ pub async fn tool_event_stream(
                 })
                 .await;
             }
-            ReasoningEvent::TextDelta { kind, delta } => {
+            AssistantEvent::TextDelta { kind, delta } => {
                 for next in state.process_text_delta(kind, delta)? {
                     y.yield_ok(next).await;
                 }
             }
-            ReasoningEvent::SampleDelta {
+            AssistantEvent::SampleDelta {
                 logprobs,
                 token_ids,
             } => {
@@ -191,7 +193,7 @@ pub async fn tool_event_stream(
                 })
                 .await;
             }
-            ReasoningEvent::Done {
+            AssistantEvent::Done {
                 prompt_token_count,
                 output_token_count,
                 internal_token_count,

@@ -12,29 +12,27 @@ import torch
 
 from uniserve_worker.execution.batch import (
     BufferId,
+    ComputationId,
     FinishFlags,
-    KvTransferValue,
+    ForwardMode,
+    KvTransfer,
     LatentParams,
     Locator,
-    LogicalLengths,
-    Operation,
     OpStatus,
-    ProductPayload,
-    ProductRef,
+    PipelineStage,
     RequestKey,
-    RowGeometry,
     Run,
     RunLane,
     RunResult,
     SamplingParams,
-    SamplingState,
-    TokenSpan,
+    ScheduledRequest,
+    TensorPublication,
     TransferValue,
 )
-from uniserve_worker.execution.forward_batch import FlowPatches, ModelPhase, TokenSelection
+from uniserve_worker.execution.forward_batch import FlowPatches, TokenSelection
 from uniserve_worker.execution.output import (
     CpuJob,
-    ImagePayload,
+    ImageEncoding,
     LogprobOutputRow,
     OutputBuffer,
     SamplingOutputRow,
@@ -56,23 +54,23 @@ from uniserve_worker.runtime.latent_pool import (
     LatentStaging,
     LatentWrite,
 )
-from uniserve_worker.runtime.request import RequestDraft
+from uniserve_worker.runtime.request import RequestDraft, RequestRuntime
 from uniserve_worker.transfer.tickets import TransferTicket
 
 if TYPE_CHECKING:
     from .model_runner import RunObservation
     from .video import VideoOutputRingLease
 
-OperationIdentity: TypeAlias = tuple[RequestKey, int]
+OperationIdentity: TypeAlias = tuple[RequestKey, ComputationId]
 
 
 @dataclass(slots=True)
 class ForwardRow:
     """Carries one operation’s staged tokens, positions, media tensors, routing, and cache coordinates."""
 
-    operation: Operation
+    operation: ScheduledRequest
     request: RequestDraft
-    phase: ModelPhase
+    forward_mode: ForwardMode | PipelineStage
     token_ids: torch.Tensor | None = None
     token_embeddings: torch.Tensor | None = None
     token_embedding_mask: torch.Tensor | None = None
@@ -110,18 +108,6 @@ class ForwardRow:
             return int(self.image_tokens)
         return 0
 
-    @property
-    def kind(self) -> str:
-        """Classify the row as token, flow, encode, or latent-decode work."""
-
-        if self.token_ids is not None:
-            return "token"
-        if self.latent is not None and self.image_tokens > 0:
-            return "flow"
-        if self.encode_pixels is not None:
-            return "encode"
-        return "decode"
-
 
 @dataclass(frozen=True, slots=True)
 class SampleRow:
@@ -145,7 +131,7 @@ class SampleRow:
 class SampleWork:
     """Carries logits, RNG draws, penalties, predicates, and publication targets for one sampling task."""
 
-    operation: Operation
+    operation: ScheduledRequest
     logits: torch.Tensor
     rows: tuple[SampleRow, ...]
     draws: torch.Tensor | None
@@ -174,7 +160,6 @@ class SampleBatchVectors:
     valid: torch.Tensor
     active: torch.Tensor
     continuation: torch.Tensor
-    selected_points: torch.Tensor | None
     penalty_bases: tuple[torch.Tensor | None, ...]
 
 
@@ -185,8 +170,8 @@ class SampleResult:
     completion: SamplingOutputRow
     device_token: torch.Tensor | None
     logprobs: LogprobOutputRow | None
-    device_accepted_tokens: torch.Tensor | None = None
-    device_selected_point: torch.Tensor | None = None
+    device_accepted_draft_count: torch.Tensor | None = None
+    device_accepted_token_count: torch.Tensor | None = None
     device_valid: torch.Tensor | None = None
     device_active: torch.Tensor | None = None
     prompt_logprobs: tuple[LogprobOutputRow, ...] = ()
@@ -204,7 +189,6 @@ class RuntimePublication:
     slot: int
     token: torch.Tensor
     predicate: torch.Tensor
-    selected_point: torch.Tensor
     logical_position: int | torch.Tensor
     sampling_position: int | torch.Tensor
     penalty_base: torch.Tensor | None
@@ -220,7 +204,6 @@ class DecodeRuntimePublication:
     device_slots: torch.Tensor
     tokens: torch.Tensor
     predicates: torch.Tensor
-    selected_points: torch.Tensor | None
     penalty_bases: tuple[torch.Tensor | None, ...]
     valid: torch.Tensor
     active: torch.Tensor
@@ -236,10 +219,10 @@ class PromptLogitsPublication:
 
 @dataclass(slots=True)
 class PreparedTransferInput:
-    """Retain one canonical product descriptor and its bounded physical reads."""
+    """Retain one buffer's transfer metadata and bounded physical reads."""
 
-    product: ProductRef
-    value: TransferValue
+    buffer: BufferId
+    value: TransferValue | KvTransfer
     tickets: tuple[TransferTicket, ...]
     buffers: tuple[torch.Tensor | tuple[torch.Tensor, ...], ...]
     destination: (
@@ -297,7 +280,7 @@ class PreparedTransferInput:
         else:
             for ticket in self.tickets:
                 ticket.result()
-        if isinstance(self.value, KvTransferValue):
+        if isinstance(self.value, KvTransfer):
             raise RuntimeError("KV inputs are consumed through their physical cache reservation")
         representations = (self.value.tensor,)
         tensors: list[torch.Tensor] = []
@@ -546,7 +529,7 @@ class PreparedExecution:
 class LaneLayout:
     """Aligned operation, request, sequence, weight, and identity columns for one lane."""
 
-    operations: tuple[Operation, ...]
+    operations: tuple[ScheduledRequest, ...]
     requests: tuple[RequestDraft, ...]
     seq_lens: tuple[int, ...]
     identities: tuple[OperationIdentity, ...]
@@ -585,16 +568,12 @@ class LaneState:
     request_candidates: tuple[RequestDraft, ...]
     request_rows: dict[int, RequestDraft]
     completion: OutputBuffer
-    input_tokens: dict[ProductRef, tuple[int, ...]] = field(default_factory=dict)
-    input_images: dict[ProductRef, str] = field(default_factory=dict)
-    forward_rows: dict[OperationIdentity, tuple[RowGeometry, ...]] = field(default_factory=dict)
+    forward_indices: dict[OperationIdentity, tuple[int, ...]] = field(default_factory=dict)
     layout: LaneLayout | None = None
-    prepared_transfers: dict[ProductRef, PreparedTransferInput] = field(default_factory=dict)
-    cache_publication_inputs: dict[ProductRef, KvTransferValue] = field(default_factory=dict)
-    cache_publications: list[tuple[ProductRef, KvTransferValue]] = field(default_factory=list)
-    cache_installations: list[tuple[ProductRef, ProductRef, KvTransferValue]] = field(
-        default_factory=list
-    )
+    prepared_transfers: dict[BufferId, PreparedTransferInput] = field(default_factory=dict)
+    cache_publication_inputs: dict[BufferId, KvTransfer] = field(default_factory=dict)
+    cache_publications: list[tuple[BufferId, KvTransfer]] = field(default_factory=list)
+    cache_installations: list[tuple[BufferId, BufferId, KvTransfer]] = field(default_factory=list)
     stage_publications: dict[BufferId, tuple[Locator, ...]] = field(default_factory=dict)
     published: list[Locator] = field(default_factory=list)
     observations: list[RunObservation] = field(default_factory=list)
@@ -605,7 +584,6 @@ class LaneState:
     encoder_writes: list[EncoderWrite] = field(default_factory=list)
     operation_writes: dict[OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
     token_writes: dict[OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
-    selected_point_writes: dict[OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
     transition_writes: dict[OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
     propagated_predicate_writes: dict[OperationIdentity, tuple[DeviceProductWrite, ...]] = field(
         default_factory=dict
@@ -614,7 +592,6 @@ class LaneState:
         default_factory=dict
     )
     predicated_operations: frozenset[OperationIdentity] = frozenset()
-    sampling_states: dict[OperationIdentity, SamplingState] = field(default_factory=dict)
     runtime_publications: list[RuntimePublication | DecodeRuntimePublication] = field(
         default_factory=list
     )
@@ -650,24 +627,22 @@ class Outcome:
 
     ``committed_tokens`` are the tokens selected by the sampler and copied to
     completion storage. ``products`` are the operation's host-facing payloads
-    (a materialized image artifact,
-    requested logprobs) carried by the completion report under their product
+    such as a materialized image artifact, carried by the completion report under their product
     references.
     """
 
     status: OpStatus
-    selected_point: int
-    logical_lengths: LogicalLengths
-    token_span: TokenSpan
+    runtime: RequestRuntime
     finish_flags: FinishFlags
     product_generations: tuple[int, ...]
     committed_tokens: tuple[int, ...] = ()
     sampling: SamplingOutputRow | None = None
-    products: tuple[ProductPayload, ...] = ()
+    logprobs: LogprobOutputRow | None = None
+    prompt_logprobs: tuple[LogprobOutputRow, ...] = ()
+    products: tuple[TensorPublication, ...] = ()
+    kv_output: KvTransfer | None = None
     selection: SpeculativeSelection | None = None
-    completion_tasks: tuple[CpuJob | ImagePayload, ...] = ()
-    next_cursor: int = 0
-    done: bool = False
+    completion_tasks: tuple[CpuJob | ImageEncoding, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -676,20 +651,15 @@ class StateOutcome:
 
     committed_tokens: tuple[int, ...] = ()
     sampling: SamplingOutputRow | None = None
-    products: tuple[ProductPayload, ...] = ()
-
-    @property
-    def sampled_tokens(self) -> int:
-        """Count committed prefix tokens plus one deferred sampling position."""
-
-        return len(self.committed_tokens) + int(self.sampling is not None)
+    logprobs: LogprobOutputRow | None = None
+    prompt_logprobs: tuple[LogprobOutputRow, ...] = ()
 
 
 @dataclass(slots=True)
 class OperationState:
     """Tracks one operation from candidate preparation through result publication."""
 
-    operation: Operation
+    operation: ScheduledRequest
     lane: LaneState
     phase: str = "initial"
     data: dict[str, Any] = field(default_factory=dict)
@@ -700,14 +670,17 @@ class OperationState:
 
 def dependencies_ready(
     state: OperationState,
-    producers: dict[ProductRef, OperationState],
+    producers: dict[BufferId, OperationState],
 ) -> bool:
     """Return whether every declared product input has a completed local producer."""
 
     return all(
         producer.outcome is not None
-        for reference in state.operation.inputs
-        if (producer := producers.get(reference)) is not None
+        for buffer in (
+            *(reference.buffer_id for reference in state.operation.tensor_inputs()),
+            *((state.operation.kv_input,) if state.operation.kv_input is not None else ()),
+        )
+        if (producer := producers.get(buffer)) is not None
     )
 
 

@@ -1,7 +1,7 @@
-"""Depth-one ``Operation``/``Run`` builders for worker forward-behavior tests.
+"""Depth-one ``ScheduledRequest``/``Run`` builders for worker forward-behavior tests.
 
 Each builder produces the records the scheduler supplies at depth one: an
-:class:`NewRequest`, an :class:`Operation` whose ``parent`` names committed state,
+:class:`NewRequest`, an :class:`ScheduledRequest` whose ``predecessor`` names accepted execution progress,
 and the host-staged token payload consumed by token work.
 """
 
@@ -11,6 +11,7 @@ import time
 from collections.abc import Sequence
 
 from uniserve_worker.execution.batch import (
+    COMPUTATIONS,
     ArRequestParams,
     AttentionRegime,
     BatchCommand,
@@ -19,39 +20,31 @@ from uniserve_worker.execution.batch import (
     BufferAllocation,
     BufferId,
     CachePageAllocation,
-    Checkpoint,
-    Commit,
+    ComputationId,
     DeviceDim,
-    Disposition,
-    Domain,
     DrawLayout,
     DType,
-    EncodeMode,
-    FixedCheckpoint,
+    ForwardMode,
     ImageParams,
+    KvTransfer,
     LatentParams,
+    ModelOutput,
     NewRequest,
-    OpCode,
-    Operation,
     OpStatus,
-    PointRange,
-    ProductKind,
-    ProductPayload,
-    ProductRef,
+    PipelineStage,
     RequestKey,
     Rng,
-    RowGeometry,
     Run,
     RunLane,
     RunResult,
     SamplingParams,
+    ScheduledRequest,
     ShapeBound,
     Start,
-    StaticDim,
-    StorageClass,
-    TokenMode,
+    TensorPublication,
+    TensorRef,
+    TransferMode,
     UmmRequestParams,
-    encode_token_product_bytes,
 )
 from uniserve_worker.execution.output import (
     finalize_run_result,
@@ -61,13 +54,12 @@ from uniserve_worker.execution.output import (
 AUTHORITY = 0
 _BLOCK_TABLES: dict[RequestKey, list[int]] = {}
 _REQUEST_POOL_INDICES: dict[RequestKey, int] = {}
-_PAGES_TO_ZERO: dict[tuple[RequestKey, int], tuple[int, ...]] = {}
+_PAGES_TO_ZERO: dict[tuple[RequestKey, ComputationId], tuple[int, ...]] = {}
 _UNBOUND_PAGES: dict[RequestKey, list[int]] = {}
 _IMAGE_PARAMS: dict[RequestKey, ImageParams] = {}
-_OP_KV_LENGTHS: dict[tuple[RequestKey, int], tuple[int, int, int, int]] = {}
-_OP_KV_RESULTS: dict[tuple[RequestKey, int], int] = {}
-_OP_KV_VERIFY_BASES: dict[tuple[RequestKey, int], int] = {}
-_LATENT_STEPS: dict[ProductRef, int] = {}
+_OP_KV_LENGTHS: dict[tuple[RequestKey, ComputationId], tuple[int, int, int, int]] = {}
+_OP_KV_RESULTS: dict[tuple[RequestKey, ComputationId], int] = {}
+_LATENT_STEPS: dict[TensorRef, int] = {}
 _MAX_CFG_BRANCHES = 1
 _REQUEST_POOL_SIZE = 1
 _CACHE_PAGES = 1
@@ -108,31 +100,28 @@ def _reset_request(rk: RequestKey) -> None:
     _ALTERNATIVE_SLOTS.pop(rk, None)
     _ALTERNATIVE_PAGES.pop(rk, None)
     _IMAGE_PARAMS.pop(rk, None)
-    for table in (_PAGES_TO_ZERO, _OP_KV_LENGTHS, _OP_KV_RESULTS, _OP_KV_VERIFY_BASES):
+    for table in (_PAGES_TO_ZERO, _OP_KV_LENGTHS, _OP_KV_RESULTS):
         for identity in tuple(identity for identity in table if identity[0] == rk):
             table.pop(identity, None)
     for product in tuple(product for product in _LATENT_STEPS if product.request_key == rk):
         _LATENT_STEPS.pop(product, None)
     for buffer in tuple(buffer for buffer in _BUFFER_ALLOCATIONS if buffer.owner == rk):
         _BUFFER_ALLOCATIONS.pop(buffer, None)
-    _OP_KV_RESULTS[(rk, 0)] = 0
+    _OP_KV_RESULTS[(rk, ComputationId(0, 0))] = 0
 
 
 def _kv_page(value: int) -> int:
     return int(value) + 1
 
 
-def _latent_params(operation: Operation) -> LatentParams:
+def _latent_params(operation: ScheduledRequest) -> LatentParams:
     image = _IMAGE_PARAMS[operation.request_key]
     latent_units = max(
         1,
         (int(image.height) // _LATENT_DOWNSAMPLE) * (int(image.width) // _LATENT_DOWNSAMPLE),
     )
     page_count = (latent_units + _LATENT_PAGE_UNITS - 1) // _LATENT_PAGE_UNITS
-    latent_input = next(
-        (product for product in operation.inputs if product.kind is ProductKind.LATENT),
-        None,
-    )
+    latent_input = operation.latent_input
     start_step = 0 if latent_input is None else _LATENT_STEPS.get(latent_input, 0)
     return LatentParams(
         request_key=operation.request_key,
@@ -143,20 +132,17 @@ def _latent_params(operation: Operation) -> LatentParams:
         width=int(image.width),
         start_step=start_step,
         step_count=(
-            int(operation.bounds.max_tokens) if operation.kind is OpCode.DIFFUSION_STEP else 0
+            int(operation.bounds.max_tokens) if operation.kind is PipelineStage.DENOISING else 0
         ),
     )
 
 
-def _parent_kv_length(rk: RequestKey, parent: Checkpoint) -> int:
-    identity = (rk, int(parent.op_id))
-    if identity in _OP_KV_VERIFY_BASES:
-        return _OP_KV_VERIFY_BASES[identity] + int(parent.point.point_index)
-    return _OP_KV_RESULTS.get(identity, 0)
+def _parent_kv_length(rk: RequestKey, predecessor: ComputationId) -> int:
+    return _OP_KV_RESULTS.get((rk, predecessor), 0)
 
 
-def record_kv_result(rk: RequestKey, op_id: int, visible_length: int) -> None:
-    _OP_KV_RESULTS[(rk, int(op_id))] = int(visible_length)
+def record_kv_result(rk: RequestKey, op_id: ComputationId, visible_length: int) -> None:
+    _OP_KV_RESULTS[(rk, op_id)] = int(visible_length)
 
 
 def bind_request_allocation(
@@ -177,11 +163,11 @@ def bind_request_allocation(
 
 def _record_existing_kv(
     rk: RequestKey,
-    op_id: int,
-    parent: Checkpoint,
+    op_id: ComputationId,
+    predecessor: ComputationId,
     input_length: int,
 ) -> int:
-    prefix = _parent_kv_length(rk, parent)
+    prefix = _parent_kv_length(rk, predecessor)
     resulting = prefix + int(input_length)
     block_table = _BLOCK_TABLES.get(rk, ())
     _OP_KV_LENGTHS[(rk, op_id)] = (prefix, int(input_length), prefix, resulting)
@@ -225,8 +211,9 @@ def execution_run(
     *,
     run_id: int,
     admissions: Sequence[NewRequest] = (),
-    operations: Sequence[Operation] = (),
-    input_products: Sequence[ProductPayload] = (),
+    operations: Sequence[ScheduledRequest] = (),
+    input_products: Sequence[TensorPublication] = (),
+    kv_inputs: Sequence[KvTransfer] = (),
     commands: Sequence[BatchCommand] = (),
     block_tables: Sequence[BlockTable] = (),
     new_cache_pages: Sequence[CachePageAllocation] = (),
@@ -238,8 +225,8 @@ def execution_run(
             _IMAGE_PARAMS[admission.request_key] = admission.umm.image
         _REQUEST_POOL_INDICES[admission.request_key] = int(admission.request_pool_idx)
     for operation in operations:
-        for product in (*operation.inputs, *operation.outputs):
-            if not product.uses_persistent_buffer() or product.buffer_id in _BUFFER_ALLOCATIONS:
+        for product in (*operation.buffer_inputs(), *operation.buffer_outputs()):
+            if product.buffer_id in _BUFFER_ALLOCATIONS:
                 continue
             required = int(product.max_bytes)
             offset = 0
@@ -254,13 +241,13 @@ def execution_run(
                 offset,
                 required,
             )
-    by_route: dict[int, list[Operation]] = {0: list(operations)} if operations else {}
+    by_route: dict[int, list[ScheduledRequest]] = {0: list(operations)} if operations else {}
     lanes: list[RunLane] = []
     explicit_tables = {
         (int(table.request_pool_idx), int(table.group_id)): table for table in block_tables
     }
 
-    def table_for(operation: Operation) -> BlockTable | None:
+    def table_for(operation: ScheduledRequest) -> BlockTable | None:
         slot = _REQUEST_POOL_INDICES.get(
             operation.request_key,
             int(operation.request_key.request_id) + 1,
@@ -276,26 +263,25 @@ def execution_run(
 
     lane_id = 1
     for group_id, (route, routed) in enumerate(sorted(by_route.items()), start=1):
-        domains = tuple(domain for domain in Domain if any(op.domain is domain for op in routed))
+        kinds = tuple(kind for kind in COMPUTATIONS if any(op.kind is kind for op in routed))
         variants = {operation.kind for operation in routed}
         attention = (
             AttentionRegime.HYBRID
-            if any(variant.value == "diffusion_step" for variant in variants)
+            if PipelineStage.DENOISING in variants
             else AttentionRegime.CAUSAL
-            if any(
-                variant.value.startswith("token_") or variant.value == "draft"
-                for variant in variants
-            )
+            if any(isinstance(variant, ForwardMode) for variant in variants)
             else AttentionRegime.NONE
         )
-        for domain in domains:
-            domain_operations = tuple(
-                operation for operation in routed if operation.domain is domain
-            )
+        for kind in kinds:
+            member_operations = tuple(operation for operation in routed if operation.kind is kind)
             tables: dict[tuple[int, int], BlockTable] = {}
             allocations: dict[tuple[int, int], set[int]] = {}
-            forward_rows: list[RowGeometry] = []
-            for operation_index, operation in enumerate(domain_operations):
+            forward_operation_indices: list[int] = []
+            request_pool_indices: list[int] = []
+            seq_lens: list[int] = []
+            query_lens: list[int] = []
+            write_kv: list[bool] = []
+            for operation_index, operation in enumerate(member_operations):
                 table = table_for(operation)
                 if table is not None:
                     identity = (table.request_pool_idx, table.group_id)
@@ -305,16 +291,12 @@ def execution_run(
                         allocations.setdefault(identity, set()).update(pages)
                 lengths = _OP_KV_LENGTHS.get((operation.request_key, operation.op_id))
                 if lengths is not None and lengths[1] > 0:
-                    forward_rows.append(
-                        RowGeometry(
-                            operation_index,
-                            _REQUEST_POOL_INDICES[operation.request_key],
-                            lengths[2],
-                            lengths[1],
-                            True,
-                        )
-                    )
-                if operation.kind is OpCode.DIFFUSION_STEP:
+                    forward_operation_indices.append(operation_index)
+                    request_pool_indices.append(_REQUEST_POOL_INDICES[operation.request_key])
+                    seq_lens.append(lengths[2] + lengths[1])
+                    query_lens.append(lengths[1])
+                    write_kv.append(True)
+                if operation.kind is PipelineStage.DENOISING:
                     image = _IMAGE_PARAMS[operation.request_key]
                     main_slot = _REQUEST_POOL_INDICES[operation.request_key]
                     main_len = 0 if lengths is None else lengths[2]
@@ -350,9 +332,11 @@ def execution_run(
                         if alt_pages:
                             allocations.setdefault((alt_slot, 0), set()).update(alt_pages)
                         if negative:
-                            forward_rows.append(
-                                RowGeometry(operation_index, alt_slot, 0, len(negative), True)
-                            )
+                            forward_operation_indices.append(operation_index)
+                            request_pool_indices.append(alt_slot)
+                            seq_lens.append(len(negative))
+                            query_lens.append(len(negative))
+                            write_kv.append(True)
                         alternative = (alt_slot, len(negative))
                     for branch in range(branches):
                         slot, seq_len = (
@@ -360,9 +344,11 @@ def execution_run(
                             if branch == 0 or alternative is None
                             else alternative
                         )
-                        forward_rows.append(
-                            RowGeometry(operation_index, slot, seq_len, query_len, False)
-                        )
+                        forward_operation_indices.append(operation_index)
+                        request_pool_indices.append(slot)
+                        seq_lens.append(seq_len + query_len)
+                        query_lens.append(query_len)
+                        write_kv.append(False)
             for allocation in new_cache_pages:
                 identity = (allocation.request_pool_idx, allocation.group_id)
                 allocations.setdefault(identity, set()).update(allocation.page_ids)
@@ -371,46 +357,50 @@ def execution_run(
                     lane_id=lane_id,
                     launch_id=group_id,
                     collective_seq=int(run_id) * 1024 + group_id + 1,
-                    domain=domain,
                     route=route,
                     attention=attention,
                     shape_class=0,
-                    operations=domain_operations,
+                    operations=member_operations,
                     block_tables=tuple(tables.values()),
                     new_cache_pages=tuple(
                         CachePageAllocation(slot, group, tuple(sorted(pages)))
                         for (slot, group), pages in allocations.items()
                         if pages
                     ),
-                    forward_rows=tuple(forward_rows),
+                    forward_operation_indices=tuple(forward_operation_indices),
+                    request_pool_indices=tuple(request_pool_indices),
+                    seq_lens=tuple(seq_lens),
+                    query_lens=tuple(query_lens),
+                    write_kv=tuple(write_kv),
                     latent_params=tuple(
                         _latent_params(operation)
-                        for operation in domain_operations
-                        if operation.kind in {OpCode.DIFFUSION_PREPARE, OpCode.DIFFUSION_STEP}
-                        or any(product.kind is ProductKind.LATENT for product in operation.inputs)
+                        for operation in member_operations
+                        if operation.kind
+                        in {PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING}
+                        or operation.latent_input is not None
                     ),
                     buffer_allocations=tuple(
                         {
                             product.buffer_id: _BUFFER_ALLOCATIONS[product.buffer_id]
-                            for operation in domain_operations
-                            for product in (*operation.inputs, *operation.outputs)
-                            if product.uses_persistent_buffer()
+                            for operation in member_operations
+                            for product in (*operation.buffer_inputs(), *operation.buffer_outputs())
                         }.values()
                     ),
                 )
             )
             lane_id += 1
     return Run(
-        batch_id=int(run_id),
+        batch_id=operations[0].op_id.batch_id if operations else int(run_id),
         run_id=int(run_id),
         lanes=tuple(lanes),
         input_products=tuple(input_products),
+        kv_inputs=tuple(kv_inputs),
         commands=tuple(Start(request) for request in admissions) + tuple(commands),
     )
 
 
-def request_key(request_id: int, epoch: int = 1) -> RequestKey:
-    return RequestKey(AUTHORITY, request_id, epoch)
+def request_key(request_id: int, request_epoch: int = 1) -> RequestKey:
+    return RequestKey(AUTHORITY, request_id, request_epoch)
 
 
 def ar_params(
@@ -418,15 +408,15 @@ def ar_params(
     *,
     block_ids: Sequence[int] = (),
     prefix_len: int = 0,
-    epoch: int = 1,
+    request_epoch: int = 1,
     sampling: SamplingParams | None = None,
 ) -> NewRequest:
-    rk = request_key(request_id, epoch)
+    rk = request_key(request_id, request_epoch)
     _reset_request(rk)
     _BLOCK_TABLES[rk] = [_kv_page(value) for value in block_ids]
     _UNBOUND_PAGES[rk] = list(_BLOCK_TABLES[rk])
     _REQUEST_POOL_INDICES[rk] = request_id + 1
-    _OP_KV_RESULTS[(rk, 0)] = int(prefix_len)
+    _OP_KV_RESULTS[(rk, ComputationId(0, 0))] = int(prefix_len)
     return NewRequest.create(
         rk,
         request_pool_idx=request_id + 1,
@@ -441,8 +431,8 @@ def ar_params(
     )
 
 
-def umm_params(request_id: int, image: ImageParams, *, epoch: int = 1) -> NewRequest:
-    rk = request_key(request_id, epoch)
+def umm_params(request_id: int, image: ImageParams, *, request_epoch: int = 1) -> NewRequest:
+    rk = request_key(request_id, request_epoch)
     _reset_request(rk)
     _IMAGE_PARAMS[rk] = image
     _REQUEST_POOL_INDICES[rk] = request_id + 1
@@ -453,10 +443,10 @@ def umm_params(request_id: int, image: ImageParams, *, epoch: int = 1) -> NewReq
     )
 
 
-def root_parent(admission: NewRequest) -> Checkpoint:
-    """The admission-root fixed version a request's first operation parents on."""
+def root_parent(admission: NewRequest) -> ComputationId:
+    """The ordering sentinel for a request's first state operation."""
 
-    return Checkpoint(0, FixedCheckpoint(0))
+    return ComputationId(0, 0)
 
 
 def finalized_report(report: RunResult) -> RunResult:
@@ -468,70 +458,35 @@ def finalized_report(report: RunResult) -> RunResult:
     return finalize_run_result(report)
 
 
-def commit_for_completion(
-    operation: Operation,
-    report: RunResult,
-    *,
-    expected_parent: Checkpoint | None = None,
-    control_seq: int | None = None,
-    public_event_limit: int = 0,
-) -> Commit:
-    if not operation.advances_state:
-        raise ValueError("only a state-advancing completion can be committed")
+def record_completion(operation: ScheduledRequest, report: RunResult) -> ModelOutput:
+    """Observe accepted output and carry its visible KV extent into the next test input."""
+
     resolved = finalized_report(report)
     matches = tuple(
         record
         for record in resolved.completions
-        if record.request_key == operation.request_key and int(record.op_id) == int(operation.op_id)
+        if record.request_key == operation.request_key and record.op_id == operation.op_id
     )
     if len(matches) != 1 or matches[0].status is not OpStatus.OK:
         raise ValueError("operation has no unique successful completion")
     record = matches[0]
-    selected = Checkpoint(
-        int(operation.op_id),
-        FixedCheckpoint(int(record.selected_point)),
-    )
-    _OP_KV_RESULTS[(operation.request_key, int(operation.op_id))] = int(
-        record.logical_lengths.kv_visible_len
-    )
-    return Commit(
-        request_key=operation.request_key,
-        control_seq=(int(operation.control_seq) + 1 if control_seq is None else int(control_seq)),
-        expected_parent=operation.parent if expected_parent is None else expected_parent,
-        selected=selected,
-        public_event_limit=public_event_limit,
-        disposition=Disposition.PUBLISH,
-    )
-
-
-def _token_input_ref(rk: RequestKey, op_id: int, token_count: int) -> ProductRef:
-    return ProductRef(
-        request_key=rk,
-        producer_op_id=op_id,
-        output_index=(1 << 16) - 1,
-        generation=op_id * 3,
-        kind=ProductKind.TOKEN,
-        storage_class=StorageClass.HOST_STAGING,
-        dtype=DType.U32,
-        shape_bound=ShapeBound((StaticDim(max(1, int(token_count))),)),
-        point_range=PointRange(),
-    )
+    record_kv_result(operation.request_key, operation.op_id, record.kv_visible_len)
+    return record
 
 
 def token_operation(
     rk: RequestKey,
     *,
-    op_id: int,
-    parent: Checkpoint,
-    mode: TokenMode,
+    op_id: ComputationId,
+    predecessor: ComputationId,
+    mode: ForwardMode,
     tokens: Sequence[int],
     block_table_delta: Sequence[int] = (),
-    predicate: ProductRef | None = None,
+    predicate: TensorRef | None = None,
     logprobs: bool = False,
     rng: Rng | None = None,
-    control_seq: int = 0,
-) -> tuple[Operation, ProductPayload]:
-    """A token operation plus the input token product the worker decodes for it."""
+) -> ScheduledRequest:
+    """Build a token computation with its actual model input IDs."""
 
     block_table = _BLOCK_TABLES.setdefault(rk, [])
     added = [_kv_page(value) for value in block_table_delta]
@@ -542,7 +497,7 @@ def token_operation(
     pending.extend(added)
     _PAGES_TO_ZERO[(rk, op_id)] = tuple(pending)
     pending.clear()
-    prefix_length = _parent_kv_length(rk, parent)
+    prefix_length = _parent_kv_length(rk, predecessor)
     input_length = len(tokens)
     _OP_KV_LENGTHS[(rk, op_id)] = (
         prefix_length,
@@ -550,190 +505,116 @@ def token_operation(
         prefix_length,
         prefix_length + input_length,
     )
-    if mode is TokenMode.VERIFY:
-        _OP_KV_VERIFY_BASES[(rk, op_id)] = prefix_length
-    else:
+    if mode is not ForwardMode.VERIFY:
         _OP_KV_RESULTS[(rk, op_id)] = prefix_length + input_length
 
-    reference = _token_input_ref(rk, op_id, len(tokens))
-    token_output = ProductRef(
+    token_output = TensorRef(
         request_key=rk,
         producer_op_id=op_id,
         output_index=0,
-        generation=op_id * 4 + 1,
-        kind=ProductKind.TOKEN,
-        storage_class=StorageClass.REQUEST_RELAY,
-        dtype=DType.U32,
+        generation=op_id.batch_id * 4 + 1,
+        dtype=DType.I64,
         shape_bound=ShapeBound(),
-        point_range=PointRange(
-            base_point=0,
-            max_points=(len(tokens) if mode is TokenMode.VERIFY else 1),
-        ),
     )
-    max_points = len(tokens) if mode is TokenMode.VERIFY else 1
-    selected_point_output = ProductRef(
-        request_key=rk,
-        producer_op_id=op_id,
-        output_index=1,
-        generation=op_id * 6 + 2,
-        kind=ProductKind.SELECTED_POINT,
-        storage_class=StorageClass.REQUEST_RELAY,
-        dtype=DType.U32,
-        shape_bound=ShapeBound(),
-        point_range=PointRange(base_point=0, max_points=max_points),
-    )
-    outputs = [token_output]
-    if mode is TokenMode.VERIFY:
-        outputs.append(selected_point_output)
-    if logprobs:
-        outputs.append(
-            ProductRef(
-                request_key=rk,
-                producer_op_id=op_id,
-                output_index=2,
-                generation=op_id * 6 + 6,
-                kind=ProductKind.LOGPROB,
-                storage_class=StorageClass.HOST_STAGING,
-                dtype=DType.U8,
-                shape_bound=ShapeBound((StaticDim((1 << 16) - 1),)),
-                point_range=PointRange(),
-            )
-        )
-    operation = Operation.registered(
+    operation = ScheduledRequest(
         request_key=rk,
         op_id=op_id,
-        parent=parent,
-        kind=OpCode.token(mode),
+        predecessor=predecessor,
+        kind=mode,
         bounds=Bounds(
-            max_points=max_points,
             max_tokens=max(1, len(tokens)),
             max_kv_pages=len(added),
             max_completion_bytes=((1 << 16) - 1 if logprobs else 0),
         ),
-        inputs=(reference,),
-        outputs=tuple(outputs),
+        input_token_ids=tuple(int(value) for value in tokens),
+        token_output=token_output,
         predicate=predicate,
         rng=rng,
-        control_seq=control_seq,
     )
-    payload = ProductPayload(
-        product=reference,
-        payload=encode_token_product_bytes(tuple(int(value) for value in tokens)),
-    )
-    return operation, payload
+    return operation
 
 
 def encode_operation(
     rk: RequestKey,
     *,
-    op_id: int,
-    parent: Checkpoint,
+    op_id: ComputationId,
+    predecessor: ComputationId,
     image_base64: str | None,
     encoder_handle: int,
-    mode: EncodeMode = EncodeMode.VISION,
-    source_product: ProductRef | None = None,
-    control_seq: int = 0,
-) -> tuple[Operation, ProductPayload | None]:
-    """An encode operation plus its input image product.
+    mode: PipelineStage = PipelineStage.VISION_ENCODING,
+    source_product: TensorRef | None = None,
+) -> ScheduledRequest:
+    """An encoder computation with an encoded image or a resident image source.
 
     The scheduler stamps the encode output reference's ``generation`` with the
     content-stable encoder handle; the worker echoes it in
     ``completion.product_generations``.
     """
 
-    kind = ProductKind.VISION_FEATURE if mode is EncodeMode.VISION else ProductKind.LATENT_FEATURE
     if (image_base64 is None) == (source_product is None):
         raise ValueError("encode operation requires exactly one image source")
-    image_bytes = None if image_base64 is None else image_base64.encode("utf-8")
-    image_ref = source_product
-    if image_ref is None:
-        assert image_bytes is not None
-        image_ref = ProductRef(
-            request_key=rk,
-            producer_op_id=op_id,
-            output_index=0xFFFF,
-            generation=op_id * 3 + 2,
-            kind=ProductKind.ARTIFACT,
-            storage_class=StorageClass.HOST_STAGING,
-            dtype=DType.U8,
-            shape_bound=ShapeBound((StaticDim(len(image_bytes)),)),
-            point_range=PointRange(),
-        )
-    output_ref = ProductRef(
+    output_ref = TensorRef(
         request_key=rk,
         producer_op_id=op_id,
         output_index=0,
         generation=int(encoder_handle),
-        kind=kind,
-        storage_class=StorageClass.LATENT_ARENA,
         dtype=DType.BF16,
         shape_bound=ShapeBound((DeviceDim(4_096),)),
-        point_range=PointRange(),
     )
-    operation = Operation.registered(
+    operation = ScheduledRequest(
         request_key=rk,
         op_id=op_id,
-        parent=parent,
-        kind=OpCode.encoder(mode),
-        bounds=Bounds(max_points=1, max_tokens=64, max_latent_bytes=8_192),
-        inputs=(image_ref,),
-        outputs=(output_ref,),
-        control_seq=control_seq,
+        predecessor=predecessor,
+        kind=mode,
+        bounds=Bounds(max_tokens=64, max_latent_bytes=8_192),
+        input_image=image_base64,
+        image_input=source_product,
+        encoder_output=output_ref,
     )
-    payload = (
-        None if image_bytes is None else ProductPayload(product=image_ref, payload=image_bytes)
-    )
-    return operation, payload
+    return operation
 
 
 def diffusion_prepare_operation(
     rk: RequestKey,
     *,
-    op_id: int,
-    parent: Checkpoint,
-    conditioning: ProductRef,
+    op_id: ComputationId,
+    predecessor: ComputationId,
+    conditioning: BufferId,
     seed: int = 29,
     image_index: int = 1,
-    control_seq: int = 0,
-) -> tuple[Operation, ProductRef]:
+) -> tuple[ScheduledRequest, TensorRef]:
     image = _IMAGE_PARAMS[rk]
-    latent = ProductRef(
+    latent = TensorRef(
         request_key=rk,
         producer_op_id=op_id,
         output_index=0,
-        generation=op_id * 3 + 1,
-        kind=ProductKind.LATENT,
-        storage_class=StorageClass.LATENT_ARENA,
+        generation=op_id.batch_id * 3 + 1,
         dtype=DType.BF16,
         shape_bound=ShapeBound((DeviceDim(3 * int(image.height) * int(image.width)),)),
-        point_range=PointRange(),
     )
-    ready = ProductRef(
+    ready = TensorRef(
         request_key=rk,
         producer_op_id=op_id,
         output_index=1,
-        generation=op_id * 3 + 2,
-        kind=ProductKind.COMPLETION,
-        storage_class=StorageClass.REQUEST_RELAY,
-        dtype=DType.U32,
+        generation=op_id.batch_id * 3 + 2,
+        dtype=DType.U8,
         shape_bound=ShapeBound(),
-        point_range=PointRange(),
     )
-    _record_existing_kv(rk, op_id, parent, 0)
-    operation = Operation.registered(
+    _record_existing_kv(rk, op_id, predecessor, 0)
+    operation = ScheduledRequest(
         request_key=rk,
         op_id=op_id,
-        parent=parent,
-        kind=OpCode.DIFFUSION_PREPARE,
-        bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=latent.max_bytes),
-        inputs=(conditioning,),
-        outputs=(latent, ready),
+        predecessor=predecessor,
+        kind=PipelineStage.LATENT_PREPARATION,
+        bounds=Bounds(max_tokens=1, max_latent_bytes=latent.max_bytes),
+        kv_input=conditioning,
+        latent_output=latent,
+        completion_output=ready,
         rng=Rng(
             seed=int(seed),
             semantic_index_base=int(image_index),
             draw_layout=DrawLayout.FLOW_NOISE,
         ),
-        control_seq=control_seq,
     )
     _LATENT_STEPS[latent] = 0
     return operation, latent
@@ -742,34 +623,30 @@ def diffusion_prepare_operation(
 def diffusion_step_operation(
     rk: RequestKey,
     *,
-    op_id: int,
-    parent: Checkpoint,
-    conditioning: ProductRef,
-    latent: ProductRef,
+    op_id: ComputationId,
+    predecessor: ComputationId,
+    conditioning: BufferId,
+    latent: TensorRef,
     steps: int,
-    control_seq: int = 0,
-) -> tuple[Operation, ProductRef]:
-    output = ProductRef(
+) -> tuple[ScheduledRequest, TensorRef]:
+    output = TensorRef(
         request_key=rk,
         producer_op_id=op_id,
         output_index=0,
-        generation=op_id * 3 + 1,
-        kind=ProductKind.LATENT,
-        storage_class=StorageClass.LATENT_ARENA,
+        generation=op_id.batch_id * 3 + 1,
         dtype=DType.BF16,
         shape_bound=latent.shape_bound,
-        point_range=PointRange(),
     )
-    _record_existing_kv(rk, op_id, parent, 0)
-    operation = Operation.registered(
+    _record_existing_kv(rk, op_id, predecessor, 0)
+    operation = ScheduledRequest(
         request_key=rk,
         op_id=op_id,
-        parent=parent,
-        kind=OpCode.DIFFUSION_STEP,
-        bounds=Bounds(max_points=1, max_tokens=int(steps), max_latent_bytes=output.max_bytes),
-        inputs=(conditioning, latent),
-        outputs=(output,),
-        control_seq=control_seq,
+        predecessor=predecessor,
+        kind=PipelineStage.DENOISING,
+        bounds=Bounds(max_tokens=int(steps), max_latent_bytes=output.max_bytes),
+        kv_input=conditioning,
+        latent_input=latent,
+        latent_output=output,
     )
     _LATENT_STEPS[output] = _LATENT_STEPS.get(latent, 0) + int(steps)
     return operation, output
@@ -778,30 +655,23 @@ def diffusion_step_operation(
 def kv_publication_operation(
     rk: RequestKey,
     *,
-    op_id: int,
-    parent: Checkpoint,
-    control_seq: int = 0,
-) -> tuple[Operation, ProductRef]:
-    product = ProductRef(
-        request_key=rk,
+    op_id: ComputationId,
+    predecessor: ComputationId,
+) -> tuple[ScheduledRequest, BufferId]:
+    product = BufferId(
+        owner=rk,
         producer_op_id=op_id,
         output_index=0,
-        generation=op_id * 3 + 1,
-        kind=ProductKind.KV,
-        storage_class=StorageClass.PAGED_KV,
-        dtype=DType.U8,
-        shape_bound=ShapeBound((DeviceDim(1 << 20),)),
-        point_range=PointRange(),
+        generation=op_id.batch_id * 3 + 1,
     )
-    _record_existing_kv(rk, op_id, parent, 0)
-    operation = Operation.registered(
+    _record_existing_kv(rk, op_id, predecessor, 0)
+    operation = ScheduledRequest(
         request_key=rk,
         op_id=op_id,
-        parent=parent,
-        kind=OpCode.TRANSFER_KV_PUBLISH,
-        bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
-        outputs=(product,),
-        control_seq=control_seq,
+        predecessor=predecessor,
+        kind=TransferMode.KV_PUBLISH,
+        bounds=Bounds(max_transfer_bytes=1 << 20),
+        kv_output=product,
     )
     return operation, product
 
@@ -809,108 +679,79 @@ def kv_publication_operation(
 def diffusion_finalize_operation(
     rk: RequestKey,
     *,
-    op_id: int,
-    parent: Checkpoint,
-    latent: ProductRef,
+    op_id: ComputationId,
+    predecessor: ComputationId,
+    latent: TensorRef,
     feedback_source: bool = False,
-    control_seq: int = 0,
-) -> Operation:
-    outputs: tuple[ProductRef, ...] = (
-        ProductRef(
+) -> ScheduledRequest:
+    image_output = None
+    if feedback_source:
+        image_output = TensorRef(
             request_key=rk,
             producer_op_id=op_id,
-            output_index=0,
-            generation=op_id * 3,
-            kind=ProductKind.ARTIFACT,
-            storage_class=StorageClass.PINNED_OUTPUT,
-            dtype=DType.U8,
-            shape_bound=ShapeBound((DeviceDim(65_536),)),
-            point_range=PointRange(),
-        ),
-    )
-    if feedback_source:
-        outputs += (
-            ProductRef(
-                request_key=rk,
-                producer_op_id=op_id,
-                output_index=1,
-                generation=op_id * 3 + 1,
-                kind=ProductKind.ARTIFACT,
-                storage_class=StorageClass.LATENT_ARENA,
-                dtype=DType.BF16,
-                shape_bound=ShapeBound((DeviceDim(3 * 16 * 16),)),
-                point_range=PointRange(),
-            ),
+            output_index=1,
+            generation=op_id.batch_id * 3 + 1,
+            dtype=DType.BF16,
+            shape_bound=ShapeBound((DeviceDim(3 * 16 * 16),)),
         )
-    return Operation.registered(
+    return ScheduledRequest(
         request_key=rk,
         op_id=op_id,
-        parent=parent,
-        kind=OpCode.DIFFUSION_FINALIZE,
+        predecessor=predecessor,
+        kind=PipelineStage.IMAGE_DECODING,
         bounds=Bounds(
             max_latent_bytes=(3 * 16 * 16 * 2 if feedback_source else 0),
             max_completion_bytes=65_536,
         ),
-        inputs=(latent,),
-        outputs=outputs,
-        control_seq=control_seq,
+        latent_input=latent,
+        image_output=image_output,
     )
 
 
 def visual_state_operation(
     rk: RequestKey,
     *,
-    op_id: int,
-    parent: Checkpoint,
-    feature: ProductRef,
+    op_id: ComputationId,
+    predecessor: ComputationId,
+    feature: TensorRef,
     sample_continuation: bool,
     max_tokens: int,
-    control_seq: int = 0,
-) -> Operation:
-    outputs: tuple[ProductRef, ...] = (
-        ProductRef(
+) -> ScheduledRequest:
+    completion = TensorRef(
+        request_key=rk,
+        producer_op_id=op_id,
+        output_index=0,
+        generation=op_id.batch_id * 3,
+        dtype=DType.U8,
+        shape_bound=ShapeBound(),
+    )
+    token = None
+    if sample_continuation:
+        token = TensorRef(
             request_key=rk,
             producer_op_id=op_id,
-            output_index=0,
-            generation=op_id * 3,
-            kind=ProductKind.COMPLETION,
-            storage_class=StorageClass.REQUEST_RELAY,
-            dtype=DType.U8,
+            output_index=1,
+            generation=op_id.batch_id * 3 + 1,
+            dtype=DType.I64,
             shape_bound=ShapeBound(),
-            point_range=PointRange(),
-        ),
-    )
-    if sample_continuation:
-        outputs += (
-            ProductRef(
-                request_key=rk,
-                producer_op_id=op_id,
-                output_index=1,
-                generation=op_id * 3 + 1,
-                kind=ProductKind.TOKEN,
-                storage_class=StorageClass.REQUEST_RELAY,
-                dtype=DType.U32,
-                shape_bound=ShapeBound(),
-                point_range=PointRange(),
-            ),
         )
-    _record_existing_kv(rk, op_id, parent, max_tokens)
-    return Operation.registered(
+    _record_existing_kv(rk, op_id, predecessor, max_tokens)
+    return ScheduledRequest(
         request_key=rk,
         op_id=op_id,
-        parent=parent,
-        kind=OpCode.token(TokenMode.EXTEND),
-        bounds=Bounds(max_points=1, max_tokens=max_tokens),
-        inputs=(feature,),
-        outputs=outputs,
-        control_seq=control_seq,
+        predecessor=predecessor,
+        kind=ForwardMode.PREFILL,
+        bounds=Bounds(max_tokens=max_tokens),
+        vision_input=feature,
+        completion_output=completion,
+        token_output=token,
     )
 
 
 __all__ = [
     "AUTHORITY",
     "bind_request_allocation",
-    "commit_for_completion",
+    "record_completion",
     "encode_operation",
     "execution_run",
     "finalized_report",

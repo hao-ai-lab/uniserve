@@ -1,10 +1,10 @@
 //! Chat request validation, lowering, and response construction.
 
-mod convert;
+mod context;
 mod response;
 mod validate;
 
-pub use convert::{ChatResponseContext, lower_chat_request};
+pub use context::ChatResponseContext;
 pub use response::{
     chat_completion_chunk_stream, chat_completion_sse_stream, collect_chat_completion,
 };

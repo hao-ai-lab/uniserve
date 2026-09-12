@@ -13,15 +13,15 @@ from typing import Final, cast
 
 import torch
 
+from uniserve_worker.execution.batch import ComputationId
+
 from ..execution.batch import (
     BufferAllocation,
     BufferId,
     DType,
-    ProductKind,
-    ProductRef,
     RequestKey,
     StaticDim,
-    StorageClass,
+    TensorRef,
     TensorTransfer,
     WorkerEndpoint,
 )
@@ -35,8 +35,6 @@ from .persistent_buffers import PersistentBufferBinding, PersistentBuffers
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
 _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
     DType.U8: torch.uint8,
-    DType.U16: torch.int32,
-    DType.U32: torch.long,
     DType.I32: torch.int32,
     DType.I16: torch.int16,
     DType.I64: torch.long,
@@ -56,18 +54,6 @@ _TORCH_DTYPE_BYTES: Final[dict[torch.dtype, int]] = {
     torch_dtype: int(torch.empty((), dtype=torch_dtype).element_size())
     for torch_dtype in _DEVICE_TORCH_DTYPES
 }
-_DEVICE_PRODUCT_KINDS: Final[frozenset[ProductKind]] = frozenset(
-    {
-        ProductKind.TOKEN,
-        ProductKind.ARTIFACT,
-        ProductKind.COMPLETION,
-        ProductKind.SELECTED_POINT,
-        ProductKind.TENSOR,
-    }
-)
-_REQUEST_RELAY_KINDS: Final[frozenset[ProductKind]] = frozenset(
-    {ProductKind.TOKEN, ProductKind.COMPLETION, ProductKind.SELECTED_POINT}
-)
 
 
 def device_product_storage(dtype: DType) -> tuple[str, int]:
@@ -80,16 +66,14 @@ def device_product_capacity_bytes(
     slot_capacity: int,
     device_count: int,
     *,
-    selected_points_per_operation: int,
     max_value_bytes: int,
 ) -> int:
     """Return the fixed backing bound for one ``DeviceProducts`` owner."""
 
     slots = int(slot_capacity)
     devices = int(device_count)
-    points = int(selected_points_per_operation)
     value_bytes = int(max_value_bytes)
-    if min(slots, devices, points, value_bytes) < 1:
+    if min(slots, devices, value_bytes) < 1:
         raise ValueError("device-product geometry must be positive")
     scalar_bytes = slots * devices * sum(dict(_DTYPE_STORAGE.values()).values())
     return scalar_bytes + slots * devices * value_bytes
@@ -105,20 +89,20 @@ def _invariant(message: str) -> WorkerError:
     )
 
 
-_ReferenceKey = tuple[int, int, int, int, int]
-_OperationKey = tuple[RequestKey, int]
+_ReferenceKey = tuple[int, int, int, ComputationId, int]
+_OperationKey = tuple[RequestKey, ComputationId]
 _SlotStorageKey = tuple[str, tuple[int, ...], torch.dtype]
 
 
-def _reference_key(reference: ProductRef) -> _ReferenceKey:
+def _reference_key(reference: TensorRef) -> _ReferenceKey:
     """Build the generation-tagged lookup key for a product reference."""
 
     key = reference.request_key
     return (
-        int(key.authority_id),
+        int(key.engine_id),
         int(key.request_id),
-        int(key.epoch),
-        int(reference.producer_op_id),
+        int(key.request_epoch),
+        reference.producer_op_id,
         int(reference.output_index),
     )
 
@@ -129,7 +113,7 @@ def _device_dtype(dtype: DType) -> torch.dtype:
     return _DEVICE_DTYPES[dtype]
 
 
-def _device_shape(reference: ProductRef) -> tuple[int, ...]:
+def _device_shape(reference: TensorRef) -> tuple[int, ...]:
     """Resolve a product's bounded tensor dimensions to a concrete shape."""
 
     dims = tuple(
@@ -153,21 +137,6 @@ def _resolved_device(device: torch.device | str) -> torch.device:
     return canonical_device(device)
 
 
-def _validate_owner(reference: ProductRef) -> None:
-    """Validate that a product reference declares complete producer ownership."""
-
-    if reference.kind not in _DEVICE_PRODUCT_KINDS:
-        raise invalid_descriptor("product kind does not belong to DeviceProducts")
-    if reference.kind is ProductKind.ARTIFACT:
-        valid = reference.storage_class is StorageClass.LATENT_ARENA
-    elif reference.storage_class is StorageClass.REQUEST_RELAY:
-        valid = reference.kind in _REQUEST_RELAY_KINDS
-    else:
-        valid = reference.storage_class is StorageClass.DEVICE_TENSOR
-    if not valid:
-        raise invalid_descriptor("device product has an incompatible storage class")
-
-
 @dataclass(slots=True)
 class _DeviceSlot:
     """Tracks ownership, generation, storage geometry, and relay binding for one device-product slot."""
@@ -179,7 +148,7 @@ class _DeviceSlot:
     tensor: torch.Tensor | None = None
     shape: tuple[int, ...] | None = None
     dtype: torch.dtype | None = None
-    relay_lane: tuple[str, int, RequestKey, int, int] | None = None
+    relay_lane: tuple[str, int, RequestKey, ComputationId, int] | None = None
     persistent_buffer: PersistentBufferBinding | None = None
 
 
@@ -211,7 +180,7 @@ class DeviceProductMetadata:
 class DeviceProductWrite:
     """One table-issued physical binding retained through producer submission."""
 
-    reference: ProductRef
+    reference: TensorRef
     slot: _DeviceSlot
     physical_generation: int
     binding_id: int
@@ -242,13 +211,13 @@ class DeviceProductRead:
     """One generation-validated device read retained until its stream snapshots it."""
 
     tensor: torch.Tensor
-    consumer_op_id: int
+    consumer_op_id: ComputationId
     _write: DeviceProductWrite = field(repr=False, compare=False)
     region: TensorRegion | None = None
     _recorded: bool = field(default=False, repr=False, compare=False)
 
     @property
-    def reference(self) -> ProductRef:
+    def reference(self) -> TensorRef:
         """Expose the immutable logical product identity guarded by this read lease."""
 
         return self._write.reference
@@ -384,11 +353,9 @@ class DeviceProducts:
         self._free_slot_queues: dict[str, deque[int]] = {}
         self._compatible_free_slots: dict[_SlotStorageKey, deque[int]] = {}
         self._scalar_arenas: dict[tuple[str, torch.dtype], torch.Tensor] = {}
-        self._relay_arenas: dict[tuple[str, ProductKind, torch.dtype, int], torch.Tensor] = {}
-        self._relay_slots: dict[
-            tuple[str, int, int, ProductKind, torch.dtype, int], _DeviceSlot
-        ] = {}
-        self._relay_operation_lanes: dict[tuple[str, int, RequestKey, int], int] = {}
+        self._relay_arenas: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
+        self._relay_slots: dict[tuple[str, int, int, torch.dtype, int], _DeviceSlot] = {}
+        self._relay_operation_lanes: dict[tuple[str, int, RequestKey, ComputationId], int] = {}
 
         # Logical references point at generation-tagged physical writes. The
         # shared event pool owns readiness events until every reader releases.
@@ -414,7 +381,7 @@ class DeviceProducts:
             ]
             tensors.extend(
                 tensor
-                for (owner, _kind, _dtype, _width), tensor in self._relay_arenas.items()
+                for (owner, _dtype, _width), tensor in self._relay_arenas.items()
                 if owner == name
             )
             tensors.extend(
@@ -499,12 +466,12 @@ class DeviceProducts:
 
     def bind_outputs(
         self,
-        bindings: tuple[tuple[ProductRef, torch.device | str], ...],
+        bindings: tuple[tuple[TensorRef, torch.device | str], ...],
         *,
         request_slots: Mapping[RequestKey, int] | None = None,
         buffer_allocations: Mapping[BufferId, BufferAllocation] | None = None,
-        regions: Mapping[ProductRef, TensorRegion] | None = None,
-        shapes: Mapping[ProductRef, tuple[int, ...]] | None = None,
+        regions: Mapping[TensorRef, TensorRegion] | None = None,
+        shapes: Mapping[TensorRef, tuple[int, ...]] | None = None,
     ) -> tuple[DeviceProductWrite, ...]:
         """Reserve compatible device slots for operation outputs as one atomic binding batch."""
 
@@ -518,12 +485,12 @@ class DeviceProducts:
 
     def bind_output_batch(
         self,
-        bindings: tuple[tuple[ProductRef, torch.device | str], ...],
+        bindings: tuple[tuple[TensorRef, torch.device | str], ...],
         *,
         request_slots: Mapping[RequestKey, int] | None = None,
         buffer_allocations: Mapping[BufferId, BufferAllocation] | None = None,
-        regions: Mapping[ProductRef, TensorRegion] | None = None,
-        shapes: Mapping[ProductRef, tuple[int, ...]] | None = None,
+        regions: Mapping[TensorRef, TensorRegion] | None = None,
+        shapes: Mapping[TensorRef, tuple[int, ...]] | None = None,
     ) -> DeviceProductBindingBatch:
         """Atomically bind outputs and retain their direct scalar range."""
 
@@ -531,62 +498,33 @@ class DeviceProducts:
         if not device_bindings:
             return DeviceProductBindingBatch(())
 
-        # Storage classes select disjoint ownership arenas. Mixing classes in a
-        # group would make rollback and publication semantics ambiguous.
+        # Validate logical extents before acquiring any physical storage.
         for reference, _device in device_bindings:
-            _validate_owner(reference)
             region = None if regions is None else regions.get(reference)
             logical_shape = (
                 _device_shape(reference)
                 if shapes is None
                 else shapes.get(reference, _device_shape(reference))
             )
-            bounds = reference.shape_bound.dims
-            if (
-                shapes is not None
-                and reference in shapes
-                and (
-                    len(logical_shape) != len(bounds)
-                    or any(
-                        extent < 1
-                        or (
-                            extent != dim.extent
-                            if isinstance(dim, StaticDim)
-                            else extent > dim.bound
-                        )
-                        for extent, dim in zip(logical_shape, bounds, strict=True)
-                    )
-                )
-            ):
+            if not reference.shape_bound.contains_shape(logical_shape):
                 raise invalid_descriptor("tensor binding shape disagrees with its logical bounds")
-            if region is not None and (
-                reference.kind is not ProductKind.TENSOR or not region.within(logical_shape)
-            ):
+            if region is not None and not region.within(logical_shape):
                 raise invalid_descriptor("tensor binding region disagrees with its logical bounds")
-        relay = tuple(
-            reference.storage_class is StorageClass.REQUEST_RELAY
-            for reference, _device in device_bindings
-        )
-        if any(relay):
-            if not all(relay):
-                raise invalid_descriptor("request-relay bindings cannot share a generic group")
-            if request_slots is None:
-                raise invalid_descriptor("request-relay binding has no stable request slot")
-            return self._bind_relay_outputs(device_bindings, request_slots)
+        # Allocation records select physical ownership. Tensor identity carries
+        # no semantic role or duplicate storage-class tag.
         persistent = tuple(
-            reference.uses_persistent_buffer() for reference, _device in device_bindings
+            buffer_allocations is not None and reference.buffer_id in buffer_allocations
+            for reference, _device in device_bindings
         )
         if any(persistent):
             if not all(persistent):
                 raise invalid_descriptor("persistent-buffer bindings cannot share a generic group")
-            if buffer_allocations is None:
-                raise invalid_descriptor("persistent output has no buffer allocation")
+            assert buffer_allocations is not None
             return self._bind_persistent_outputs(
-                device_bindings,
-                buffer_allocations,
-                regions,
-                shapes,
+                device_bindings, buffer_allocations, regions, shapes
             )
+        if request_slots is not None:
+            return self._bind_relay_outputs(device_bindings, request_slots)
         first_reference, first_raw_device = device_bindings[0]
         first_device_object = _resolved_device(first_raw_device)
         first_shape = _device_shape(first_reference)
@@ -641,7 +579,7 @@ class DeviceProducts:
             reclaimed = False
             by_device: dict[
                 str,
-                list[tuple[int, ProductRef, torch.device, tuple[int, ...], torch.dtype]],
+                list[tuple[int, TensorRef, torch.device, tuple[int, ...], torch.dtype]],
             ] = {}
             for index, (reference, device, shape, dtype) in enumerate(requested):
                 by_device.setdefault(str(device), []).append(
@@ -718,10 +656,10 @@ class DeviceProducts:
 
     def _bind_persistent_outputs(
         self,
-        bindings: tuple[tuple[ProductRef, torch.device | str], ...],
+        bindings: tuple[tuple[TensorRef, torch.device | str], ...],
         allocations: Mapping[BufferId, BufferAllocation],
-        regions: Mapping[ProductRef, TensorRegion] | None,
-        shapes: Mapping[ProductRef, tuple[int, ...]] | None,
+        regions: Mapping[TensorRef, TensorRegion] | None,
+        shapes: Mapping[TensorRef, tuple[int, ...]] | None,
     ) -> DeviceProductBindingBatch:
         """Bind logical outputs to caller-placed persistent buffers transactionally."""
 
@@ -830,14 +768,14 @@ class DeviceProducts:
 
     def _bind_relay_outputs(
         self,
-        bindings: tuple[tuple[ProductRef, torch.device | str], ...],
+        bindings: tuple[tuple[TensorRef, torch.device | str], ...],
         request_slots: Mapping[RequestKey, int],
     ) -> DeviceProductBindingBatch:
         """Bind product references to stable request-and-lane relay slots for graph-safe output."""
 
         if self.request_capacity < 1 or self.relay_depth < 1:
             raise resource_error("worker has no request-relay arena")
-        fields: dict[tuple[str, int, RequestKey, int, ProductKind, torch.dtype], int] = {}
+        fields: dict[tuple[str, int, RequestKey, ComputationId, torch.dtype], int] = {}
         requested_rows = []
         for reference, raw_device in bindings:
             device = _resolved_device(raw_device)
@@ -847,8 +785,7 @@ class DeviceProducts:
                 str(device),
                 request_slot,
                 reference.request_key,
-                int(reference.producer_op_id),
-                reference.kind,
+                reference.producer_op_id,
                 dtype,
             )
             field = fields.get(field_key, 0)
@@ -885,13 +822,13 @@ class DeviceProducts:
                 if key in candidate_keys:
                     raise invalid_descriptor("request-relay output already has a candidate")
 
-            operation_lanes: dict[tuple[str, int, RequestKey, int], int] = {}
+            operation_lanes: dict[tuple[str, int, RequestKey, ComputationId], int] = {}
             for reference, device, request_slot, _dtype, _field in requested:
                 operation = (
                     str(device),
                     request_slot,
                     reference.request_key,
-                    int(reference.producer_op_id),
+                    reference.producer_op_id,
                 )
                 lane = self._relay_operation_lanes.get(operation)
                 if lane is None:
@@ -910,21 +847,20 @@ class DeviceProducts:
                 operation_lanes[operation] = lane
 
             writes: list[DeviceProductWrite] = []
-            installed_operations: set[tuple[str, int, RequestKey, int]] = set()
+            installed_operations: set[tuple[str, int, RequestKey, ComputationId]] = set()
             try:
                 for reference, device, request_slot, dtype, field in requested:
                     operation = (
                         str(device),
                         request_slot,
                         reference.request_key,
-                        int(reference.producer_op_id),
+                        reference.producer_op_id,
                     )
                     lane = operation_lanes[operation]
                     slot = self._relay_slot_locked(
                         device,
                         request_slot,
                         lane,
-                        reference.kind,
                         dtype,
                         field,
                         operation,
@@ -964,7 +900,7 @@ class DeviceProducts:
 
         return not any(
             slot.owner is not None
-            for (name, row, candidate, _kind, _dtype, _field), slot in self._relay_slots.items()
+            for (name, row, candidate, _dtype, _field), slot in self._relay_slots.items()
             if name == device_name and row == request_slot and candidate == lane
         )
 
@@ -973,18 +909,17 @@ class DeviceProducts:
         device: torch.device,
         request_slot: int,
         lane: int,
-        kind: ProductKind,
         dtype: torch.dtype,
         field: int,
-        operation: tuple[str, int, RequestKey, int],
+        operation: tuple[str, int, RequestKey, ComputationId],
     ) -> _DeviceSlot:
         """Resolve or create one stable scalar relay slot inside its geometry-specific arena."""
 
         device_name = str(device)
-        key = (device_name, request_slot, lane, kind, dtype, int(field))
+        key = (device_name, request_slot, lane, dtype, int(field))
         slot = self._relay_slots.get(key)
         if slot is None:
-            arena_key = (device_name, kind, dtype, int(field))
+            arena_key = (device_name, dtype, int(field))
             arena = self._relay_arenas.get(arena_key)
             if arena is None:
                 elements = (self.request_capacity + 1) * self.relay_depth
@@ -1009,7 +944,7 @@ class DeviceProducts:
 
     def _release_relay_operation_locked(
         self,
-        operation: tuple[str, int, RequestKey, int],
+        operation: tuple[str, int, RequestKey, ComputationId],
     ) -> None:
         """Release the stable relay-lane association for one completed operation."""
 
@@ -1022,14 +957,14 @@ class DeviceProducts:
     def bind_output_groups(
         self,
         groups: tuple[
-            tuple[tuple[ProductRef, torch.device | str], ...],
+            tuple[tuple[TensorRef, torch.device | str], ...],
             ...,
         ],
         *,
         request_slots: Mapping[RequestKey, int] | None = None,
         buffer_allocations: Mapping[BufferId, BufferAllocation] | None = None,
-        regions: Mapping[ProductRef, TensorRegion] | None = None,
-        shapes: Mapping[ProductRef, tuple[int, ...]] | None = None,
+        regions: Mapping[TensorRef, TensorRegion] | None = None,
+        shapes: Mapping[TensorRef, tuple[int, ...]] | None = None,
     ) -> tuple[DeviceProductBindingBatch, ...]:
         """Atomically bind output groups while preserving direct producer ranges."""
 
@@ -1057,7 +992,7 @@ class DeviceProducts:
     def _plan_compatible_slots_locked(
         self,
         device_name: str,
-        requested: list[tuple[int, ProductRef, torch.device, tuple[int, ...], torch.dtype]],
+        requested: list[tuple[int, TensorRef, torch.device, tuple[int, ...], torch.dtype]],
         *,
         reclaimed: bool,
     ) -> tuple[list[_DeviceSlot], bool]:
@@ -1078,7 +1013,7 @@ class DeviceProducts:
 
     def _bind_homogeneous_outputs(
         self,
-        bindings: tuple[tuple[ProductRef, torch.device | str], ...],
+        bindings: tuple[tuple[TensorRef, torch.device | str], ...],
         device: torch.device,
         shape: tuple[int, ...],
         dtype: torch.dtype,
@@ -1251,26 +1186,14 @@ class DeviceProducts:
         target = entry.slot.tensor
         if target is None:
             raise _invariant("device product has no physical tensor")
-        if entry.reference.kind is ProductKind.TENSOR:
-            if value.dtype != target.dtype:
-                raise invalid_descriptor("tensor product changes its declared dtype")
-            if entry.region is not None:
-                shape_matches = tuple(value.shape) == entry.region.shape
-            else:
-                bounds = entry.reference.shape_bound.dims
-                shape_matches = (
-                    value.numel() == 1
-                    if not bounds
-                    else len(value.shape) == len(bounds)
-                    and all(
-                        extent == bound.extent
-                        if isinstance(bound, StaticDim)
-                        else 0 < extent <= bound.bound
-                        for extent, bound in zip(value.shape, bounds, strict=True)
-                    )
-                )
-            if not shape_matches:
-                raise invalid_descriptor("tensor product changes its declared shape")
+        if value.dtype != target.dtype:
+            raise invalid_descriptor("tensor publication changes its declared dtype")
+        if entry.region is not None:
+            shape_matches = tuple(value.shape) == entry.region.shape
+        else:
+            shape_matches = entry.reference.shape_bound.contains_shape(tuple(value.shape))
+        if not shape_matches:
+            raise invalid_descriptor("tensor publication changes its declared shape")
         flat = value.detach().reshape(-1)
         if flat.numel() > target.numel():
             raise _invariant("device product exceeds its registered shape bound")
@@ -1555,9 +1478,9 @@ class DeviceProducts:
 
     def consume(
         self,
-        reference: ProductRef,
+        reference: TensorRef,
         *,
-        consumer_op_id: int,
+        consumer_op_id: ComputationId,
         device: torch.device | str | None = None,
     ) -> DeviceProductRead:
         """Acquire a generation-safe read of a published product on the consumer device."""
@@ -1567,7 +1490,7 @@ class DeviceProducts:
     def consume_batch(
         self,
         requests: tuple[
-            tuple[ProductRef, int, torch.device | str | None],
+            tuple[TensorRef, ComputationId, torch.device | str | None],
             ...,
         ],
         *,
@@ -1581,7 +1504,7 @@ class DeviceProducts:
         if shared_target is not None:
             target_name = str(shared_target)
             with self._lock:
-                shared_resolved: list[tuple[DeviceProductWrite, torch.Tensor, int]] = []
+                shared_resolved: list[tuple[DeviceProductWrite, torch.Tensor, ComputationId]] = []
                 for reference, consumer_op_id, requested_device in requests:
                     entry = self._require_locked(reference)
                     if entry.released or entry.logical_references < 1:
@@ -1609,7 +1532,7 @@ class DeviceProducts:
                         if entry.actual_shape == entry.slot.shape
                         else storage.reshape(-1)[: entry.actual_extent].reshape(entry.actual_shape)
                     )
-                    shared_resolved.append((entry, tensor, int(consumer_op_id)))
+                    shared_resolved.append((entry, tensor, consumer_op_id))
 
                 if shared_target.type == "cuda":
                     first_event = shared_resolved[0][0].producer_event
@@ -1652,7 +1575,9 @@ class DeviceProducts:
                 )
         assert shared_target is None
         with self._lock:
-            resolved: list[tuple[DeviceProductWrite, torch.Tensor, torch.device, int]] = []
+            resolved: list[
+                tuple[DeviceProductWrite, torch.Tensor, torch.device, ComputationId]
+            ] = []
             for reference, consumer_op_id, requested_device in requests:
                 entry = self._require_locked(reference)
                 if entry.released or entry.logical_references < 1:
@@ -1676,7 +1601,7 @@ class DeviceProducts:
                 )
                 if target != storage.device:
                     raise invalid_descriptor("device product consumer names a different device")
-                resolved.append((entry, tensor, target, int(consumer_op_id)))
+                resolved.append((entry, tensor, target, consumer_op_id))
 
             first_entry, _tensor, first_target, _consumer_op_id = resolved[0]
             if first_target.type == "cuda":
@@ -1770,7 +1695,7 @@ class DeviceProducts:
                     event = completion.producer_event
                     if (
                         read.tensor.device != target
-                        or int(completion.reference.producer_op_id) != int(read.consumer_op_id)
+                        or completion.reference.producer_op_id != read.consumer_op_id
                         or (
                             target.type == "cuda"
                             and (
@@ -1807,12 +1732,12 @@ class DeviceProducts:
                             target,
                         )
                     return
-            write_fences: dict[int, DeviceProductWrite] = {}
+            write_fences: dict[ComputationId, DeviceProductWrite] = {}
             for write in after_writes:
                 entry = self._require_write_locked(write)
                 if not entry.producer_recorded:
                     continue
-                write_fences.setdefault(int(entry.reference.producer_op_id), entry)
+                write_fences.setdefault(entry.reference.producer_op_id, entry)
             if declared_target is not None:
                 target = declared_target
                 entries = []
@@ -1826,7 +1751,7 @@ class DeviceProducts:
                     stream_id = int(stream.cuda_stream)
                     pending: list[DeviceProductWrite] = []
                     for read, entry in entries:
-                        completion_fence = write_fences.get(int(read.consumer_op_id))
+                        completion_fence = write_fences.get(read.consumer_op_id)
                         if (
                             completion_fence is not None
                             and completion_fence.producer_event is not None
@@ -1864,7 +1789,7 @@ class DeviceProducts:
                 stream_id = int(stream.cuda_stream)
                 pending = []
                 for read, entry in entries:
-                    completion_fence = write_fences.get(int(read.consumer_op_id))
+                    completion_fence = write_fences.get(read.consumer_op_id)
                     if (
                         completion_fence is not None
                         and completion_fence.producer_event is not None
@@ -1883,13 +1808,13 @@ class DeviceProducts:
 
     def release_operations(
         self,
-        releases: Iterable[tuple[RequestKey, int]],
+        releases: Iterable[tuple[RequestKey, ComputationId]],
     ) -> None:
         """Release all product ownership associated with completed operation identities."""
 
         with self._lock:
             for request_key, raw_op_id in releases:
-                op_id = int(raw_op_id)
+                op_id = raw_op_id
                 operation_key = (request_key, op_id)
                 operation_writes = self._operation_writes.pop(operation_key, None)
                 entries = list(
@@ -1898,9 +1823,9 @@ class DeviceProducts:
                     else (() if operation_writes is None else (operation_writes,))
                 )
                 direct_key = (
-                    int(request_key.authority_id),
+                    int(request_key.engine_id),
                     int(request_key.request_id),
-                    int(request_key.epoch),
+                    int(request_key.request_epoch),
                     op_id,
                     0,
                 )
@@ -1943,7 +1868,7 @@ class DeviceProducts:
             for entry in (*self._entries.values(), *self._candidates.values()):
                 if entry.reference.request_key in selected:
                     if entry.reference.buffer_id in retained:
-                        if not entry.reference.uses_persistent_buffer():
+                        if entry.slot.persistent_buffer is None:
                             raise invalid_descriptor("finish cannot retain request-slot storage")
                     else:
                         self._release_entry_locked(entry)
@@ -2040,7 +1965,7 @@ class DeviceProducts:
 
     def import_tensor(
         self,
-        reference: ProductRef,
+        reference: TensorRef,
         tensor: TensorTransfer,
         *,
         device: torch.device | str,
@@ -2107,9 +2032,7 @@ class DeviceProducts:
                     ((reference, target_device),),
                     request_slots=request_slots,
                     buffer_allocations=buffer_allocations,
-                    shapes={reference: tensor.shape}
-                    if reference.kind is ProductKind.TENSOR
-                    else None,
+                    shapes={reference: tensor.shape},
                 )[0]
                 destination = self.producer_write_views((write,))[0]
                 destination = destination.reshape(-1)[: math.prod(tensor.shape)].reshape(
@@ -2211,7 +2134,7 @@ class DeviceProducts:
                 self.abandon_writes((write,))
             self._reclaim_ready_locked()
 
-    def physical_generation(self, reference: ProductRef) -> int:
+    def physical_generation(self, reference: TensorRef) -> int:
         """Resolve a resident logical product to its current physical slot generation."""
 
         with self._lock:
@@ -2249,7 +2172,7 @@ class DeviceProducts:
                 self._entries[key] = entry
                 operation_key = (
                     entry.reference.request_key,
-                    int(entry.reference.producer_op_id),
+                    entry.reference.producer_op_id,
                 )
                 operation_writes = self._operation_writes.get(operation_key)
                 if operation_writes is None:
@@ -2261,7 +2184,7 @@ class DeviceProducts:
                 entry._indexed = True
                 self._candidates.pop(entry.binding_id)
 
-    def _require_locked(self, reference: ProductRef) -> DeviceProductWrite:
+    def _require_locked(self, reference: TensorRef) -> DeviceProductWrite:
         """Resolve a live generation-tagged product write or raise a descriptor error."""
 
         key = _reference_key(reference)
@@ -2598,7 +2521,7 @@ class DeviceProducts:
         reference = entry.reference
         operation_key = (
             reference.request_key,
-            int(reference.producer_op_id),
+            reference.producer_op_id,
         )
         operation_writes = self._operation_writes.get(operation_key)
         if operation_writes is entry:
@@ -2685,7 +2608,7 @@ class DeviceProducts:
         entries: list[DeviceProductWrite] = []
         aligned_reads: list[DeviceProductRead] = []
         if len(reads) == len(writes) and all(
-            int(read.consumer_op_id) == int(write.reference.producer_op_id)
+            read.consumer_op_id == write.reference.producer_op_id
             for read, write in zip(reads, writes, strict=True)
         ):
             for read in reads:
@@ -2697,9 +2620,9 @@ class DeviceProducts:
                 entries.append(entry)
                 aligned_reads.append(read)
         else:
-            consumer_ops = {int(write.reference.producer_op_id) for write in writes}
+            consumer_ops = {write.reference.producer_op_id for write in writes}
             for read in reads:
-                if read._recorded or int(read.consumer_op_id) not in consumer_ops:
+                if read._recorded or read.consumer_op_id not in consumer_ops:
                     continue
                 entry = self._require_read_locked(read)
                 if entry.slot.device_name != str(device):

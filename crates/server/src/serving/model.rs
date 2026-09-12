@@ -1,10 +1,9 @@
 //! Load-time model resolution and model-owned request tokenization.
 //!
-//! [`ResolvedModel`] binds tokenizer assets, generation policy, geometry, and
-//! output processing. Its [`ResolvedModel::tokenize`] method lowers
-//! [`GenerateReqInput`] into [`TokenizedGenerateReqInput`].
+//! [`InputProcessor`] binds tokenizer assets, generation policy, geometry, and
+//! output processing. [`InputProcessor::preprocess_text_request`] produces a [`GenerationRequest`]
+//! and the [`ResponseOptions`] retained by the frontend.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,25 +12,19 @@ use crate::profile::assets::{ResolvedModelFiles, resolve_model_file};
 use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
-use crate::profile::{
-    CommonModelProfile, ModelDescription, ModelIdentity, ModelProfile, ProfileOverrides,
-};
+use crate::profile::{ModelConfig, ModelDescription, ModelParameters, SamplingDefaults};
 use thiserror::Error;
 use uniserve_core::{
-    ContextSegment as CoreContextSegment, GenerationBehaviorDescriptor,
-    GenerationCachePolicyDescriptor, GenerationConstraint, GenerationFeatures, GenerationLimits,
-    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageParams,
-    RequestId, SamplingParams, UndVisibility,
+    CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
+    ImageGenerationConfig, ImageParams, RequestId, SamplingParams,
 };
 
-use crate::serving::chat::{
-    ChatRequest, ChatTemplateLoadOptions, HfChatRenderer, Qwen3ChatOutputProcessor,
-};
+use crate::serving::chat::{ChatTemplateLoadOptions, HfChatRenderer, Qwen3ChatOutputProcessor};
 use crate::serving::input::{
-    GenerateReqInput, ModelEventIdentity, OutputDetail, OutputProcessorPolicy, PromptInput,
-    TokenizedGenerateReqInput,
+    ModelEventIdentity, OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions,
+    TextPromptRequest,
 };
-use crate::serving::text::{SamplingHints, TextDecodeOptions, resolve_max_tokens};
+use crate::serving::text::{TextDecodeOptions, resolve_max_tokens};
 use crate::serving::{
     CacheAccounting, ResourceAccounting, Result, ServeError, cache_isolation_key,
 };
@@ -163,65 +156,15 @@ pub struct ModelSupport {
     pub sampling_controls: Vec<ServedSamplingControl>,
 }
 
-/// The closed load-bound model owner.
-pub enum ResolvedModel {
-    /// Text-generation model with chat support.
-    Text(Qwen3Desc),
-    /// Multimodal understanding and image-generation model.
-    Omni(OmniDesc),
-    /// Media-generation model.
-    Media(MiniMaxH3Desc),
-}
-
-/// Resolved multimodal model description.
-pub enum OmniDesc {
-    /// SenseNova multimodal model.
-    SenseNova(SenseNovaDesc),
-    /// Bagel multimodal model.
-    Bagel(BagelDesc),
-}
-
-/// Typed assets awaiting validation against the running worker limits.
-pub enum ResolvedAssets {
-    /// Text-model assets.
-    Text {
-        /// Resolved common model profile.
-        profile: CommonModelProfile,
-        /// Tokenizer bound to the model vocabulary.
-        tokenizer: DynTokenizer,
-        /// Renderer bound to the model chat template.
-        renderer: HfChatRenderer,
-    },
-    /// Multimodal-model assets.
-    Omni {
-        /// Resolved common model profile.
-        profile: CommonModelProfile,
-        /// Tokenizer bound to the model vocabulary.
-        tokenizer: DynTokenizer,
-        /// Renderer bound to the model chat template.
-        renderer: HfChatRenderer,
-        /// Profile-specific image preprocessing and generation policy.
-        preprocessing: OmniPreprocessing,
-    },
-    /// Media-generation model assets.
-    Media {
-        /// Resolved common model profile.
-        profile: CommonModelProfile,
-        /// Tokenizer bound to the model vocabulary.
-        tokenizer: DynTokenizer,
-        /// Maximum generated video duration in seconds.
-        max_video_seconds: f64,
-        /// Number of scheduled predictions in the validated checkpoint contract.
-        denoise_steps: u32,
-    },
-}
-
-/// Profile-specific multimodal preprocessing implementation.
-pub enum OmniPreprocessing {
-    /// SenseNova image preprocessing and generation policy.
-    SenseNova(SenseNovaProfile),
-    /// Bagel image preprocessing and generation policy.
-    Bagel(BagelProfile),
+/// Owns the tokenizer and template resources used to produce final engine inputs.
+/// Runtime capabilities are fixed at construction, before this value is shared.
+pub struct InputProcessor {
+    pub(super) config: ModelConfig,
+    pub(super) tokenizer: DynTokenizer,
+    pub(super) renderer: Option<HfChatRenderer>,
+    pub(super) limits: GenerationLimits,
+    sampling_controls: Vec<ServedSamplingControl>,
+    parse_reasoning: bool,
 }
 
 #[derive(Debug, Error)]
@@ -230,6 +173,9 @@ pub enum ModelResolutionError {
     /// Required numerical checkpoint metadata is missing or contradictory.
     #[error("invalid media checkpoint contract: {0}")]
     MediaContract(String),
+    /// A token-generating model has no chat-template resource.
+    #[error("text-generation model requires a chat template")]
+    MissingTemplate,
     /// Model files or profile metadata cannot be resolved.
     #[error(transparent)]
     Assets(#[from] crate::profile::assets::Error),
@@ -258,11 +204,12 @@ pub enum ModelResolutionError {
     },
 }
 
-impl ResolvedAssets {
-    /// Resolves assets and validates the selected model against engine capabilities.
+impl ModelConfig {
+    /// Loads model facts and the tokenizer/template resources needed by preprocessing.
     pub(crate) async fn load(
         config: &crate::Config,
-    ) -> std::result::Result<Self, ModelResolutionError> {
+    ) -> std::result::Result<(Self, DynTokenizer, Option<HfChatRenderer>), ModelResolutionError>
+    {
         let served_name = config
             .served_model_name
             .clone()
@@ -271,15 +218,7 @@ impl ResolvedAssets {
             let tokenizer_path =
                 resolve_model_file(&config.model, "tokenizer/tokenizer.json").await?;
             let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&tokenizer_path)?);
-            let mut profile = ModelProfile::minimax_h3(&served_name);
-            profile.common_mut().context_limits.max_model_tokens =
-                Some(config.engine.max_model_len.unwrap_or(16_384));
-            let ModelProfile::MiniMaxH3(profile) = profile else {
-                unreachable!("MiniMax H3 construction returns its matching closed variant")
-            };
-            let denoise_steps = config
-                .model_contract
-                .as_ref()
+            let num_inference_steps = config.model_contract.as_ref()
                 .and_then(|contract| contract.get("denoise_steps"))
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|steps| u32::try_from(steps).ok())
@@ -287,33 +226,38 @@ impl ResolvedAssets {
                 .ok_or_else(|| ModelResolutionError::MediaContract(
                     "resolve the checkpoint with the installed worker before building the server".to_owned()
                 ))?;
-            return Ok(Self::Media {
-                profile,
+            return Ok((
+                Self {
+                    served_name,
+                    parameters: ModelParameters::MiniMaxH3 {
+                        max_video_seconds: config.engine.max_video_seconds,
+                        num_inference_steps,
+                    },
+                    sampling_defaults: SamplingDefaults::default(),
+                    max_model_tokens: Some(config.engine.max_model_len.unwrap_or(16_384)),
+                    primary_eos_token_id: None,
+                    eos_token_ids: Default::default(),
+                },
                 tokenizer,
-                max_video_seconds: config.engine.max_video_seconds,
-                denoise_steps,
-            });
+                None,
+            ));
         }
-
         let files = ResolvedModelFiles::new(&config.model).await?;
         let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path)?);
-        let configuration = ProfileOverrides {
-            chat_template_override: config.chat_template.clone(),
-            max_model_tokens: config.engine.max_model_len,
-        };
-        let mut profile = ModelProfile::resolve(
+        let mut model = Self::from_files(
             config.model_description,
             &served_name,
             &files,
-            &configuration,
+            config.engine.max_model_len,
             tokenizer.as_ref(),
         )?;
-        let max_model_tokens = config
-            .engine
-            .max_model_len
-            .or(profile.common().context_limits.max_model_tokens)
-            .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN);
-        profile.common_mut().context_limits.max_model_tokens = Some(max_model_tokens);
+        model.max_model_tokens = Some(
+            config
+                .engine
+                .max_model_len
+                .or(model.max_model_tokens)
+                .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN),
+        );
         let renderer = HfChatRenderer::load(
             &files,
             ChatTemplateLoadOptions {
@@ -326,321 +270,134 @@ impl ResolvedAssets {
             },
             None,
         )?;
-        Ok(match profile {
-            ModelProfile::Qwen3(profile) => Self::Text {
-                profile,
-                tokenizer,
-                renderer,
-            },
-            ModelProfile::SenseNova(profile) => Self::Omni {
-                profile: profile.common,
-                tokenizer,
-                renderer,
-                preprocessing: OmniPreprocessing::SenseNova(profile.preprocessing),
-            },
-            ModelProfile::Bagel(profile) => Self::Omni {
-                profile: profile.common,
-                tokenizer,
-                renderer,
-                preprocessing: OmniPreprocessing::Bagel(profile.preprocessing),
-            },
-            ModelProfile::MiniMaxH3(_) => unreachable!("media assets return before file loading"),
-        })
+        Ok((model, tokenizer, Some(renderer)))
     }
 
-    /// Builds a resolved model from local assets and an engine snapshot.
-    pub fn from_files(
-        description: ModelDescription,
-        served_name: &str,
-        files: &ResolvedModelFiles,
-        configuration: &ProfileOverrides,
-        tokenizer: DynTokenizer,
-        renderer: HfChatRenderer,
-    ) -> std::result::Result<Self, ModelResolutionError> {
-        let profile = ModelProfile::resolve(
-            description,
-            served_name,
-            files,
-            configuration,
-            tokenizer.as_ref(),
-        )?;
-        Ok(match profile {
-            ModelProfile::Qwen3(profile) => Self::Text {
-                profile,
-                tokenizer,
-                renderer,
-            },
-            ModelProfile::SenseNova(profile) => Self::Omni {
-                profile: profile.common,
-                tokenizer,
-                renderer,
-                preprocessing: OmniPreprocessing::SenseNova(profile.preprocessing),
-            },
-            ModelProfile::Bagel(profile) => Self::Omni {
-                profile: profile.common,
-                tokenizer,
-                renderer,
-                preprocessing: OmniPreprocessing::Bagel(profile.preprocessing),
-            },
-            ModelProfile::MiniMaxH3(profile) => Self::Media {
-                profile,
-                tokenizer,
-                max_video_seconds: 15.0,
-                denoise_steps: 4,
-            },
-        })
-    }
-
-    /// Returns the model's common capability profile.
-    pub(crate) fn profile(&self) -> &CommonModelProfile {
-        match self {
-            Self::Text { profile, .. }
-            | Self::Omni { profile, .. }
-            | Self::Media { profile, .. } => profile,
-        }
-    }
-
-    /// Returns the maximum combined context and generated token count.
+    /// Model's effective startup context ceiling.
     pub(crate) fn max_model_tokens(&self) -> u32 {
-        self.profile()
-            .context_limits
-            .max_model_tokens
+        self.max_model_tokens
             .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN)
     }
 
-    /// Returns the request-state capacity advertised by the engine.
+    /// IPC payload capacity required by this model's request descriptors.
     pub(crate) fn request_slot_capacity(&self) -> usize {
-        if matches!(self, Self::Media { .. }) {
+        if matches!(self.parameters, ModelParameters::MiniMaxH3 { .. }) {
             EngineSettings::MEDIA_IPC_SLOT_CAP
         } else {
             1 << 20
         }
     }
 
-    /// Returns multimodal generation control tokens, when supported.
+    /// Vocabulary markers used by multimodal scheduling and prompt construction.
     pub(crate) fn generation_controls(&self) -> Option<&crate::profile::omni::GenerationControls> {
-        match self {
-            Self::Omni {
-                preprocessing: OmniPreprocessing::SenseNova(value),
-                ..
-            } => Some(&value.controls),
-            Self::Omni {
-                preprocessing: OmniPreprocessing::Bagel(value),
-                ..
-            } => Some(&value.controls),
-            Self::Text { .. } | Self::Media { .. } => None,
+        match &self.parameters {
+            ModelParameters::SenseNova(value) => Some(&value.controls),
+            ModelParameters::Bagel(value) => Some(&value.controls),
+            ModelParameters::Qwen3 | ModelParameters::MiniMaxH3 { .. } => None,
         }
     }
 
-    /// Builds the engine runtime profile required by this model.
-    pub(crate) fn runtime_profile(
+    /// Execution family selected by the loaded model settings.
+    pub(crate) fn runtime_family(&self) -> uniserve_core::RuntimeFamily {
+        match self.parameters {
+            ModelParameters::Qwen3 => uniserve_core::RuntimeFamily::Ar,
+            ModelParameters::SenseNova(_) | ModelParameters::Bagel(_) => {
+                uniserve_core::RuntimeFamily::Umm
+            }
+            ModelParameters::MiniMaxH3 { .. } => uniserve_core::RuntimeFamily::Diffusion,
+        }
+    }
+
+    /// Model requirements used at startup before intersecting loaded worker capacity.
+    pub(crate) fn generation_limits(
         &self,
         model_dtype: uniserve_core::ModelDtype,
-    ) -> uniserve_engine::RuntimeProfile {
-        match self {
-            Self::Text { .. } => uniserve_engine::RuntimeProfile::ar(model_dtype),
-            Self::Media { .. } => uniserve_engine::RuntimeProfile::diffusion(model_dtype),
-            Self::Omni {
-                preprocessing: OmniPreprocessing::SenseNova(_),
-                ..
-            } => uniserve_engine::RuntimeProfile::umm(
-                model_dtype,
-                SenseNovaProfile::runtime_limits(model_dtype),
-            ),
-            Self::Omni {
-                preprocessing: OmniPreprocessing::Bagel(_),
-                ..
-            } => uniserve_engine::RuntimeProfile::umm(
-                model_dtype,
-                BagelProfile::runtime_limits(model_dtype),
-            ),
+    ) -> uniserve_core::GenerationLimits {
+        match &self.parameters {
+            ModelParameters::Qwen3 => uniserve_core::GenerationLimits {
+                features: uniserve_core::GenerationFeatures::UNDERSTANDING,
+                latent_downsample: 1,
+                max_cfg_branches: 1,
+                ..Default::default()
+            },
+            ModelParameters::MiniMaxH3 { .. } => uniserve_core::GenerationLimits {
+                latent_downsample: 1,
+                max_cfg_branches: 1,
+                ..Default::default()
+            },
+            ModelParameters::SenseNova(_) => SenseNovaProfile::runtime_limits(model_dtype),
+            ModelParameters::Bagel(_) => BagelProfile::runtime_limits(model_dtype),
         }
     }
 }
 
-/// Text chat description: HF tokenization + chat template + fixed Qwen3 parser
-/// policy.
-pub struct Qwen3Desc {
-    identity: ModelIdentity,
-    tokenizer: DynTokenizer,
-    renderer: HfChatRenderer,
-    hints: SamplingHints,
-    limits: GenerationLimits,
-    sampling_controls: Vec<ServedSamplingControl>,
-    logprobs_supported: bool,
-    parse_reasoning: bool,
-}
-
-/// SenseNova omni description: image input, text output, image output, and
-/// repeated interleave through description-owned framing/ingest/output filter.
-pub struct SenseNovaDesc {
-    identity: ModelIdentity,
-    tokenizer: DynTokenizer,
-    renderer: HfChatRenderer,
-    preprocessing: SenseNovaProfile,
-    limits: GenerationLimits,
-    sampling_controls: Vec<ServedSamplingControl>,
-    default_max_output_tokens: Option<u32>,
-    max_model_tokens: u32,
-}
-
-/// BAGEL omni description: image input, text output, and image output.
-pub struct BagelDesc {
-    identity: ModelIdentity,
-    tokenizer: DynTokenizer,
-    renderer: HfChatRenderer,
-    preprocessing: BagelProfile,
-    limits: GenerationLimits,
-    sampling_controls: Vec<ServedSamplingControl>,
-    default_max_output_tokens: Option<u32>,
-    max_model_tokens: u32,
-}
-
-/// Resolved MiniMax H3 video-generation description.
-pub struct MiniMaxH3Desc {
-    identity: ModelIdentity,
-    tokenizer: DynTokenizer,
-    max_prompt_tokens: u32,
-    max_video_seconds: f64,
-    denoise_steps: u32,
-}
-
-impl ResolvedModel {
-    /// Resolves the configured assets into a validated model description.
-    ///
-    /// The typed description selects the variant; required description-owned
-    /// assets are checked before construction.
-    pub fn resolve(
-        assets: ResolvedAssets,
+impl InputProcessor {
+    /// Binds model resources to verified worker capabilities without rebuilding model data.
+    pub fn new(
+        mut config: ModelConfig,
+        tokenizer: DynTokenizer,
+        renderer: Option<HfChatRenderer>,
         limits: GenerationLimits,
         sampling_controls: Vec<ServedSamplingControl>,
         max_model_tokens: u32,
         parse_reasoning: bool,
     ) -> Result<Self> {
-        // Resolution validates each asset family against the runtime features
-        // required by its public serving contract.
-        match assets {
-            ResolvedAssets::Text {
-                profile,
-                tokenizer,
-                renderer,
-            } => {
-                validate_runtime_features(
-                    &profile.identity,
-                    &limits,
-                    GenerationFeatures::UNDERSTANDING,
-                )?;
-                let hints = sampling_hints(&profile, max_model_tokens);
-                let logprobs_supported =
-                    sampling_controls.contains(&ServedSamplingControl::Logprobs);
-                Ok(Self::Text(Qwen3Desc {
-                    identity: profile.identity,
-                    tokenizer,
-                    renderer,
-                    hints,
-                    limits,
-                    sampling_controls,
-                    logprobs_supported,
-                    parse_reasoning,
-                }))
+        let needs = match &config.parameters {
+            ModelParameters::Qwen3 => GenerationFeatures::UNDERSTANDING,
+            ModelParameters::SenseNova(profile) => {
+                configured_omni_needs(&profile.image_generation, &profile.image_encoders)
             }
-            ResolvedAssets::Omni {
-                profile,
-                tokenizer,
-                renderer,
-                preprocessing,
-            } => {
-                let (generation_policy, image_ingest) = match &preprocessing {
-                    OmniPreprocessing::SenseNova(value) => {
-                        (&value.generation_policy, &value.image_ingest)
-                    }
-                    OmniPreprocessing::Bagel(value) => {
-                        (&value.generation_policy, &value.image_ingest)
-                    }
-                };
-                validate_runtime_features(
-                    &profile.identity,
-                    &limits,
-                    configured_omni_needs(generation_policy, image_ingest),
-                )?;
-                let default_max_output_tokens = profile
-                    .context_limits
-                    .max_output_tokens
-                    .or(profile.generation_defaults.max_output_tokens);
-                // The preprocessing profile selects the concrete multimodal
-                // descriptor while sharing the validated identity and limits.
-                Ok(Self::Omni(match preprocessing {
-                    OmniPreprocessing::SenseNova(preprocessing) => {
-                        OmniDesc::SenseNova(SenseNovaDesc {
-                            identity: profile.identity,
-                            tokenizer,
-                            renderer,
-                            preprocessing,
-                            limits,
-                            sampling_controls,
-                            default_max_output_tokens,
-                            max_model_tokens,
-                        })
-                    }
-                    OmniPreprocessing::Bagel(preprocessing) => OmniDesc::Bagel(BagelDesc {
-                        identity: profile.identity,
-                        tokenizer,
-                        renderer,
-                        preprocessing,
-                        limits,
-                        sampling_controls,
-                        default_max_output_tokens,
-                        max_model_tokens,
-                    }),
-                }))
+            ModelParameters::Bagel(profile) => {
+                configured_omni_needs(&profile.image_generation, &profile.image_encoders)
             }
-            // Media assets carry all geometry limits needed by request lowering.
-            ResolvedAssets::Media {
-                profile,
-                tokenizer,
-                max_video_seconds,
-                denoise_steps,
-            } => Ok(Self::Media(MiniMaxH3Desc {
-                identity: profile.identity,
-                tokenizer,
-                max_prompt_tokens: max_model_tokens,
-                max_video_seconds,
-                denoise_steps,
-            })),
+            ModelParameters::MiniMaxH3 { .. } => GenerationFeatures::empty(),
+        };
+        validate_runtime_features(&config, &limits, needs)?;
+        if !matches!(config.parameters, ModelParameters::MiniMaxH3 { .. }) && renderer.is_none() {
+            return Err(ServeError::ModelResolution(
+                ModelResolutionError::MissingTemplate,
+            ));
         }
+        // Bind the actual worker ceiling once before sharing immutable model facts.
+        config.max_model_tokens = Some(max_model_tokens);
+        Ok(Self {
+            config,
+            tokenizer,
+            renderer,
+            limits,
+            sampling_controls,
+            parse_reasoning,
+        })
     }
 
-    /// Returns the model identity used by `/v1/models` and public events.
-    pub fn served_identity(&self) -> &ModelIdentity {
-        match self {
-            Self::Text(d) => &d.identity,
-            Self::Omni(OmniDesc::SenseNova(d)) => &d.identity,
-            Self::Omni(OmniDesc::Bagel(d)) => &d.identity,
-            Self::Media(d) => &d.identity,
-        }
+    /// Immutable facts of the loaded model.
+    pub fn config(&self) -> &ModelConfig {
+        &self.config
     }
 
-    /// Returns the public served-model name.
+    /// Public served-model name.
     pub fn served_model_name(&self) -> &str {
-        &self.served_identity().served_name
+        &self.config.served_name
     }
 
     /// Public duration, geometry and prompt limits from the serving description.
     pub fn video_capabilities(&self) -> serde_json::Value {
-        match self {
-            Self::Media(description) => {
-                let default_seconds = description.max_video_seconds.min(5.0);
+        match &self.config.parameters {
+            ModelParameters::MiniMaxH3 {
+                max_video_seconds, ..
+            } => {
+                let default_seconds = max_video_seconds.min(5.0);
                 let mut suggested_seconds = vec![default_seconds];
-                if description.max_video_seconds > default_seconds {
-                    suggested_seconds.push(description.max_video_seconds);
+                if *max_video_seconds > default_seconds {
+                    suggested_seconds.push(*max_video_seconds);
                 }
                 serde_json::json!({
                     "tasks": ["t2va"],
                     "default_seconds": default_seconds,
-                    "max_seconds": description.max_video_seconds,
+                    "max_seconds": *max_video_seconds,
                     "suggested_seconds": suggested_seconds,
                     "min_frames": 22, "fps": 24, "width": 1344, "height": 768,
-                    "max_prompt_tokens": description.max_prompt_tokens,
+                    "max_prompt_tokens": self.config.max_model_tokens(),
                     "request_fields": ["model", "prompt", "seconds", "seed"],
                 })
             }
@@ -648,116 +405,137 @@ impl ResolvedModel {
         }
     }
 
-    /// Resolves and validates requested video dimensions and frame count.
-    pub fn resolve_video_request_geometry(
+    /// Validates the video API request, tokenizes its prompt, and prepares the
+    /// checkpoint frame/chunk counts for direct engine submission.
+    pub fn preprocess_video_request(
         &self,
         request_id: &crate::serving::ServeRequestId,
-        prompt: &str,
-        seconds: f64,
-    ) -> Result<(uniserve_core::MediaGeometry, Vec<u32>)> {
-        let Self::Media(description) = self else {
-            return Err(ServeError::UnsupportedFeature {
-                request_id: request_id.clone(),
-                feature: "video_generation",
-            });
+        request: crate::openai::VideoGenerationRequest,
+    ) -> std::result::Result<uniserve_core::DiffusionRequest, crate::openai::ApiError> {
+        let crate::openai::VideoGenerationRequest {
+            model,
+            prompt,
+            seed,
+            seconds,
+        } = request;
+        crate::openai::utils::check_model_served(&model, self.served_model_name())?;
+        if prompt.trim().is_empty() {
+            return Err(crate::openai::ApiError::invalid_request(
+                "prompt must not be empty".to_string(),
+                Some("prompt"),
+            ));
+        }
+        let ModelParameters::MiniMaxH3 {
+            max_video_seconds,
+            num_inference_steps,
+        } = &self.config.parameters
+        else {
+            return Err(crate::openai::serve_error_to_api(
+                ServeError::UnsupportedFeature {
+                    request_id: request_id.clone(),
+                    feature: "video_generation",
+                },
+            ));
         };
         // Tokenize and bound the prompt before deriving any media allocation.
-        let prompt_token_ids = description
+        let prompt_token_ids = self
             .tokenizer
-            .encode(prompt, false)
+            .encode(&prompt, false)
             .map_err(|source| ServeError::Tokenize {
                 request_id: request_id.clone(),
                 source: crate::serving::TokenizeError::Tokenizer(source),
-            })?;
+            })
+            .map_err(crate::openai::serve_error_to_api)?;
         if prompt_token_ids.is_empty() {
-            return Err(ServeError::Tokenize {
+            return Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
                 request_id: request_id.clone(),
                 source: crate::serving::TokenizeError::Invalid(
                     "video prompt must contain at least one token".to_string(),
                 ),
-            });
+            }));
         }
-        if prompt_token_ids.len() > description.max_prompt_tokens as usize {
-            return Err(ServeError::ContextLengthExceeded {
-                request_id: request_id.clone(),
-                prompt_tokens: prompt_token_ids.len(),
-                max_tokens: description.max_prompt_tokens,
-            });
+        if prompt_token_ids.len() > self.config.max_model_tokens() as usize {
+            return Err(crate::openai::serve_error_to_api(
+                ServeError::ContextLengthExceeded {
+                    request_id: request_id.clone(),
+                    prompt_tokens: prompt_token_ids.len(),
+                    max_tokens: self.config.max_model_tokens(),
+                },
+            ));
         }
         // Duration is a public floating-point input and must be finite before
         // conversion to the fixed-width frame protocol.
-        if !seconds.is_finite() || seconds <= 0.0 || seconds > description.max_video_seconds {
-            return Err(ServeError::Tokenize {
+        if !seconds.is_finite() || seconds <= 0.0 || seconds > *max_video_seconds {
+            return Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
                 request_id: request_id.clone(),
                 source: crate::serving::TokenizeError::Invalid(format!(
                     "video duration must be finite, positive, and at most {} seconds",
-                    description.max_video_seconds
+                    *max_video_seconds
                 )),
-            });
+            }));
         }
         let raw_frames = (seconds * 24.0).round();
         if raw_frames < 1.0 || raw_frames > f64::from(u32::MAX - 16) {
-            return Err(ServeError::Tokenize {
+            return Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
                 request_id: request_id.clone(),
                 source: crate::serving::TokenizeError::Invalid(
                     "video duration cannot be represented by the configuration".to_string(),
                 ),
-            });
+            }));
         }
-        // H3 media geometry uses frame counts congruent to five modulo seventeen.
-        let raw_frames = raw_frames as u32;
-        let frame_count = raw_frames + (5 + 17 - raw_frames % 17) % 17;
+        let frame_count = align_num_frames(raw_frames as u32);
         if frame_count < 22 {
-            return Err(ServeError::Tokenize {
+            return Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
                 request_id: request_id.clone(),
                 source: crate::serving::TokenizeError::Invalid(
                     "video duration is shorter than the supported media geometry".to_string(),
                 ),
-            });
+            }));
         }
-        let prompt_tokens =
-            u32::try_from(prompt_token_ids.len()).map_err(|_| ServeError::Tokenize {
-                request_id: request_id.clone(),
-                source: crate::serving::TokenizeError::Invalid(
-                    "video prompt token count exceeds the protocol width".to_string(),
-                ),
-            })?;
-        // Reconstruction windows are part of the model's temporal geometry.
-        let video_units = (frame_count - 5) / 17;
-        Ok((
-            uniserve_core::MediaGeometry {
-                frame_count,
-                video_units,
-                prompt_tokens,
-                denoise_steps: description.denoise_steps,
-            },
+        // Each H3 VAE chunk consumes a temporal latent window and emits its
+        // non-overlapping frame interval; the model owns overlap reconstruction.
+        let num_decode_chunks = (frame_count - 5) / 17;
+        Ok(uniserve_core::DiffusionRequest {
+            request_id: uniserve_core::RequestId(0),
             prompt_token_ids,
-        ))
+            priority: 0,
+            sampling: uniserve_core::DiffusionSamplingParams {
+                num_frames: frame_count,
+                num_decode_chunks,
+                num_inference_steps: *num_inference_steps,
+                seed,
+            },
+        })
     }
 
     /// Builds the model identity stamped onto accepted events.
     pub fn event_identity(&self) -> ModelEventIdentity {
-        let identity = self.served_identity();
         ModelEventIdentity {
-            served_name: identity.served_name.clone(),
-            description: identity.description.id().to_string(),
+            served_name: self.config.served_name.clone(),
+            description: self.config.description().id().to_string(),
         }
     }
 
     /// Returns whether the model supports image output.
     pub fn supports_image_output(&self) -> bool {
-        matches!(self, Self::Omni(_))
+        matches!(
+            self.config.parameters,
+            ModelParameters::SenseNova(_) | ModelParameters::Bagel(_)
+        )
     }
 
     /// Returns whether the model supports image input.
     pub fn supports_image_input(&self) -> bool {
-        matches!(self, Self::Omni(_))
+        matches!(
+            self.config.parameters,
+            ModelParameters::SenseNova(_) | ModelParameters::Bagel(_)
+        )
     }
 
     /// Returns the route limits exposed by model discovery and enforced by
     /// request admission.
     pub fn support(&self) -> ModelSupport {
-        if matches!(self, Self::Media(_)) {
+        if matches!(self.config.parameters, ModelParameters::MiniMaxH3 { .. }) {
             return ModelSupport {
                 endpoints: vec![ServedEndpoint::VideoGenerations],
                 input_modalities: vec![ServedModality::Text],
@@ -769,34 +547,29 @@ impl ResolvedModel {
         let mut endpoints = vec![ServedEndpoint::ChatCompletions];
         let mut input_modalities = vec![ServedModality::Text];
         let mut output_modalities = vec![ServedModality::Text];
-        let sampling_controls = match self {
-            Self::Text(description) => description.sampling_controls.clone(),
-            Self::Omni(OmniDesc::SenseNova(description)) => description.sampling_controls.clone(),
-            Self::Omni(OmniDesc::Bagel(description)) => description.sampling_controls.clone(),
-            Self::Media(_) => unreachable!("media limits returned above"),
-        };
+        let sampling_controls = self.sampling_controls.clone();
         let mut features = vec![ServedFeature::Streaming, ServedFeature::Usage];
         if sampling_controls.contains(&ServedSamplingControl::Logprobs) {
             features.push(ServedFeature::Logprobs);
         }
-        match self {
-            Self::Text(_) => {
+        match &self.config.parameters {
+            ModelParameters::Qwen3 => {
                 features.push(ServedFeature::Reasoning);
                 features.push(ServedFeature::ToolCalling);
             }
-            Self::Omni(OmniDesc::SenseNova(_)) => {
+            ModelParameters::SenseNova(_) => {
                 endpoints.push(ServedEndpoint::ImageGenerations);
                 input_modalities.push(ServedModality::Image);
                 output_modalities.push(ServedModality::Image);
                 features.push(ServedFeature::Reasoning);
                 features.push(ServedFeature::RepeatedInterleave);
             }
-            Self::Omni(OmniDesc::Bagel(_)) => {
+            ModelParameters::Bagel(_) => {
                 endpoints.push(ServedEndpoint::ImageGenerations);
                 input_modalities.push(ServedModality::Image);
                 output_modalities.push(ServedModality::Image);
             }
-            Self::Media(_) => unreachable!("media limits returned above"),
+            ModelParameters::MiniMaxH3 { .. } => unreachable!("media limits returned above"),
         }
         ModelSupport {
             endpoints,
@@ -807,87 +580,274 @@ impl ResolvedModel {
         }
     }
 
-    /// Validates request features against the resolved route.
-    pub fn validate_request(&self, request: &GenerateReqInput) -> Result<()> {
-        let reject = |feature: &'static str| ServeError::UnsupportedFeature {
-            request_id: request.request_id.clone(),
+    /// Validates the prompt and requested modalities against the loaded model.
+    fn validate_generation_features(
+        &self,
+        request_id: &crate::serving::ServeRequestId,
+        prompt: &PromptInput,
+        has_input_image: bool,
+        modalities: crate::serving::ModalitySelection,
+    ) -> Result<()> {
+        let reject = |feature| ServeError::UnsupportedFeature {
+            request_id: request_id.clone(),
             feature,
         };
-        if matches!(self, Self::Media(_)) {
+        if matches!(self.config.parameters, ModelParameters::MiniMaxH3 { .. }) {
             return Err(reject("generation_endpoint"));
         }
-        let has_input_image = request.has_input_image();
         if has_input_image && !self.supports_image_input() {
             return Err(reject("image_input"));
         }
-        if request.modalities.includes_image() && !self.supports_image_output() {
+        if modalities.includes_image() && !self.supports_image_output() {
             return Err(reject("image_output"));
         }
         let declared = self.support();
-        if request.uses_tools() && !declared.features.contains(&ServedFeature::ToolCalling) {
-            return Err(reject("tool_calling"));
+        if let PromptInput::Chat(chat) = prompt {
+            let uses_tools = !chat.tools.is_empty()
+                || chat.messages.iter().any(|message| match message {
+                    crate::serving::chat::ChatMessage::Developer { tools, .. } => {
+                        tools.as_ref().is_some_and(|tools| !tools.is_empty())
+                    }
+                    crate::serving::chat::ChatMessage::Assistant { content } => {
+                        content.has_tool_calls()
+                    }
+                    crate::serving::chat::ChatMessage::ToolResponse { .. } => true,
+                    _ => false,
+                });
+            if uses_tools && !declared.features.contains(&ServedFeature::ToolCalling) {
+                return Err(reject("tool_calling"));
+            }
+            if chat.chat_options.reasoning_effort.is_some()
+                && !declared.features.contains(&ServedFeature::Reasoning)
+            {
+                return Err(reject("reasoning"));
+            }
         }
-        if request.requests_reasoning() && !declared.features.contains(&ServedFeature::Reasoning) {
-            return Err(reject("reasoning"));
-        }
-        let (limits, needs) = match self {
-            Self::Text(d) => (&d.limits, GenerationFeatures::UNDERSTANDING),
-            Self::Omni(OmniDesc::SenseNova(d)) => (
-                &d.limits,
-                omni_required_features(
-                    &d.preprocessing.generation_policy,
-                    &d.preprocessing.image_ingest,
-                    request,
-                ),
+        let needs = match &self.config.parameters {
+            ModelParameters::Qwen3 => GenerationFeatures::UNDERSTANDING,
+            ModelParameters::SenseNova(profile) => omni_required_features(
+                &profile.image_generation,
+                &profile.image_encoders,
+                has_input_image,
+                modalities,
             ),
-            Self::Omni(OmniDesc::Bagel(d)) => (
-                &d.limits,
-                omni_required_features(
-                    &d.preprocessing.generation_policy,
-                    &d.preprocessing.image_ingest,
-                    request,
-                ),
+            ModelParameters::Bagel(profile) => omni_required_features(
+                &profile.image_generation,
+                &profile.image_encoders,
+                has_input_image,
+                modalities,
             ),
-            Self::Media(_) => unreachable!("media generation was rejected above"),
+            ModelParameters::MiniMaxH3 { .. } => unreachable!("video endpoint checked above"),
         };
-        if let Err(feature) = limits.covers(needs) {
-            return Err(reject(feature.name()));
-        }
-        Ok(())
+        self.limits
+            .covers(needs)
+            .map_err(|feature| reject(feature.name()))
     }
 
-    /// Tokenizes a generation request with the resolved model pipeline.
-    pub fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
-        match self {
-            Self::Text(d) => d.tokenize(request),
-            Self::Omni(OmniDesc::SenseNova(d)) => d.tokenize(request),
-            Self::Omni(OmniDesc::Bagel(d)) => d.tokenize(request),
-            Self::Media(_) => Err(ServeError::UnsupportedFeature {
-                request_id: request.request_id,
-                feature: "generation_endpoint",
-            }),
-        }
+    /// Preprocesses a programmatic text prompt without a chat-template conversion.
+    pub fn preprocess_text_request(
+        &self,
+        request: TextPromptRequest,
+    ) -> Result<(GenerationRequest, ResponseOptions)> {
+        let TextPromptRequest {
+            request_id,
+            prompt,
+            images,
+            modalities,
+            sampling,
+            stop,
+            negative_text,
+            image_gen,
+            cache_namespace,
+            cache_salt,
+            bypass_cache_read,
+            no_cache_store,
+            priority,
+            output,
+            decode,
+        } = request;
+        let cache = CachePolicy {
+            read: !bypass_cache_read,
+            write: !no_cache_store,
+            isolation_key: cache_isolation_key(cache_namespace.as_deref(), cache_salt.as_deref()),
+        };
+        self.preprocess_generation(
+            request_id,
+            PromptInput::Text(prompt),
+            images,
+            modalities,
+            sampling,
+            stop,
+            negative_text,
+            image_gen,
+            cache,
+            priority,
+            output,
+            decode,
+        )
     }
+
+    /// Tokenizes model input and resolves its final engine and output requirements.
+    pub(super) fn preprocess_generation(
+        &self,
+        request_id: crate::serving::ServeRequestId,
+        prompt: PromptInput,
+        images: Vec<crate::serving::ImageInput>,
+        modalities: crate::serving::ModalitySelection,
+        sampling: crate::serving::SamplingConfig,
+        stop: crate::serving::StopConfig,
+        negative_text: Option<String>,
+        image_gen: Option<crate::serving::ImageGenControls>,
+        cache: CachePolicy,
+        priority: i32,
+        output: OutputDetail,
+        decode: crate::serving::DecodeControls,
+    ) -> Result<(GenerationRequest, ResponseOptions)> {
+        let has_input_image = !images.is_empty()
+            || matches!(&prompt, PromptInput::Chat(chat) if chat.has_multimodal());
+        self.validate_generation_features(&request_id, &prompt, has_input_image, modalities)?;
+        let constraint = crate::serving::omni::generation_constraint(modalities);
+        let mut generation = GenerationRequest {
+            request_id: RequestId(stable_hash(request_id.as_ref())),
+            prompt_token_ids: Vec::new(),
+            negative_prompt_token_ids: Vec::new(),
+            multimodal_inputs: Default::default(),
+            constraint,
+            sampling: SamplingParams {
+                seed: image_gen
+                    .as_ref()
+                    .and_then(|image| image.seed)
+                    .or_else(|| sampling.seed.and_then(|seed| seed.try_into().ok())),
+                ..SamplingParams::default()
+            },
+            image: ImageParams::default(),
+            max_und_tokens: 0,
+            include_stop_token: false,
+            stop_strings: stop.stop_strings.clone(),
+            stop_token_ids: stop.stop_token_ids.clone(),
+            priority,
+            cache,
+            image_generation: ImageGenerationConfig::default(),
+        };
+        let mut decode = TextDecodeOptions {
+            skip_special_tokens: decode.skip_special_tokens,
+            include_stop_str_in_output: decode.include_stop_string_in_output,
+            stop_strings: (!stop.stop_strings.is_empty()).then(|| stop.stop_strings.clone()),
+            min_tokens: sampling.min_tokens.unwrap_or(0),
+        };
+
+        // Each model fills its actual computation inputs in the same request.
+        // No partially prepared request is exposed to the submission boundary.
+        let (output_processor, max_kv_tokens, image_latent_units) =
+            (|| -> std::result::Result<_, crate::serving::TokenizeError> {
+                let output_processor = match &self.config.parameters {
+                    ModelParameters::Qwen3 => self.preprocess_qwen3_input(
+                        prompt,
+                        &sampling,
+                        &stop,
+                        &mut generation,
+                        &mut decode,
+                    )?,
+                    ModelParameters::SenseNova(profile) => {
+                        crate::serving::omni::preprocess_sensenova(
+                            profile,
+                            self,
+                            &request_id,
+                            prompt,
+                            images,
+                            negative_text,
+                            image_gen,
+                            &mut generation,
+                        )?
+                    }
+                    ModelParameters::Bagel(profile) => crate::serving::omni::preprocess_bagel(
+                        profile,
+                        self,
+                        &request_id,
+                        prompt,
+                        images,
+                        negative_text,
+                        image_gen,
+                        &mut generation,
+                    )?,
+                    ModelParameters::MiniMaxH3 { .. } => {
+                        unreachable!("generation features checked above")
+                    }
+                };
+                if matches!(self.config.parameters, ModelParameters::Qwen3) {
+                    generation.validate()?;
+                } else {
+                    crate::serving::omni::prepare_generation_resources(
+                        self,
+                        &sampling,
+                        &stop,
+                        &mut generation,
+                    )?;
+                }
+                Ok((
+                    output_processor,
+                    generation.max_kv_tokens(&self.limits)?,
+                    generation.image_latent_units(&self.limits)?,
+                ))
+            })()
+            .map_err(|source| ServeError::Tokenize {
+                request_id: request_id.clone(),
+                source,
+            })?;
+
+        let response = ResponseOptions {
+            request_id,
+            tokenizer: Arc::clone(&self.tokenizer),
+            // Detokenization needs the prompt after ownership moves to the engine.
+            prompt_token_ids: generation.prompt_token_ids.clone(),
+            decode,
+            emit_token_ids: matches!(output, OutputDetail::Tokens | OutputDetail::Logprobs),
+            prompt_logprobs_requested: generation.sampling.prompt_logprobs_requested(),
+            generated_logprobs_requested: generation.sampling.generated_logprobs_requested(),
+            output_processor,
+            identity: self.event_identity(),
+            cache: CacheAccounting {
+                read_enabled: generation.cache.read,
+                write_enabled: generation.cache.write,
+                encoder_pin_count: generation.num_encoder_cache_entries(),
+            },
+            resources: ResourceAccounting {
+                expected_kv_tokens: max_kv_tokens as u64,
+                image_latent_units: image_latent_units,
+                encoder_cache_pins: generation.num_encoder_cache_entries(),
+                replayable: !generation.feeds_back_images(),
+            },
+        };
+        Ok((generation, response))
+    }
+}
+
+/// Fast H3 reconstructs frame counts congruent to five modulo seventeen.
+/// The caller checks that adding at most sixteen frames cannot overflow.
+fn align_num_frames(num_frames: u32) -> u32 {
+    num_frames + (22 - num_frames % 17) % 17
 }
 
 /// Returns the multimodal resources required by the active profile.
 fn configured_omni_needs(
-    policy: &GenerationPolicyDescriptor,
-    image_ingest: &uniserve_core::ImageIngestRecipe,
+    policy: &ImageGenerationConfig,
+    image_encoders: &[uniserve_core::ImageEncoderInput],
 ) -> GenerationFeatures {
-    GenerationBehaviorDescriptor::resolve(GenerationConstraint::Default, policy)
-        .required_features(policy, image_ingest.steps.iter().copied())
+    policy.required_features(
+        GenerationConstraint::Default,
+        image_encoders.iter().map(|input| input.encoder),
+    )
 }
 
 /// Validates the runtime features.
 fn validate_runtime_features(
-    identity: &ModelIdentity,
+    config: &ModelConfig,
     limits: &GenerationLimits,
     needs: GenerationFeatures,
 ) -> Result<()> {
     limits.covers(needs).map_err(|feature| {
         ServeError::ModelResolution(ModelResolutionError::MissingFeature {
-            description: identity.description.id(),
+            description: config.description().id(),
             feature,
         })
     })
@@ -895,86 +855,41 @@ fn validate_runtime_features(
 
 /// Returns the runtime features required for multimodal serving.
 fn omni_required_features(
-    policy: &GenerationPolicyDescriptor,
-    image_ingest: &uniserve_core::ImageIngestRecipe,
-    request: &GenerateReqInput,
+    policy: &ImageGenerationConfig,
+    image_encoders: &[uniserve_core::ImageEncoderInput],
+    has_input_image: bool,
+    modalities: crate::serving::ModalitySelection,
 ) -> GenerationFeatures {
-    let has_input_image = request.has_input_image();
-    let constraint = crate::serving::omni::generation_constraint(request);
-    let behavior = GenerationBehaviorDescriptor::resolve(constraint, policy);
+    let constraint = crate::serving::omni::generation_constraint(modalities);
+
     let context_steps = if has_input_image {
-        image_ingest.steps.clone()
+        image_encoders
+            .iter()
+            .map(|input| input.encoder)
+            .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
-    behavior.required_features(policy, context_steps)
+    policy.required_features(constraint, context_steps)
 }
 
-/// Returns the model-specific sampling hints.
-fn sampling_hints(profile: &CommonModelProfile, max_model_tokens: u32) -> SamplingHints {
-    let primary = profile.stop_tokens.primary_eos_token_id;
-    let mut extra: BTreeSet<u32> = profile.stop_tokens.eos_token_ids.clone();
-    if let Some(primary) = primary {
-        extra.remove(&primary);
-    }
-    SamplingHints {
-        primary_eos_token_id: primary,
-        extra_eos_token_ids: extra,
-        default_temperature: profile.generation_defaults.temperature,
-        default_top_p: profile.generation_defaults.top_p,
-        default_top_k: profile.generation_defaults.top_k,
-        default_min_p: profile.generation_defaults.min_p,
-        default_repetition_penalty: profile.generation_defaults.repetition_penalty,
-        default_max_tokens: profile.generation_defaults.max_output_tokens,
-        max_model_len: Some(max_model_tokens),
-    }
-}
-
-impl Qwen3Desc {
-    /// Tokenizes a Qwen3 request and attaches its request identity to any failure.
-    fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
-        let request_id = request.request_id.clone();
-        self.tokenize_inner(request)
-            .map_err(|source| ServeError::Tokenize { request_id, source })
-    }
-
-    /// Renders input, resolves sampling and cache policy, and builds the canonical engine request.
-    fn tokenize_inner(
+impl InputProcessor {
+    /// Renders a Qwen prompt and fills its token, sampling, and KV requirements.
+    fn preprocess_qwen3_input(
         &self,
-        request: GenerateReqInput,
-    ) -> std::result::Result<TokenizedGenerateReqInput, crate::serving::TokenizeError> {
-        let (prompt_token_ids, output_processor, skip_special_tokens) = match &request.prompt {
+        prompt: PromptInput,
+        controls: &crate::serving::SamplingConfig,
+        stop: &crate::serving::StopConfig,
+        generation: &mut GenerationRequest,
+        decode: &mut TextDecodeOptions,
+    ) -> std::result::Result<OutputProcessorPolicy, crate::serving::TokenizeError> {
+        let (prompt_token_ids, output_processor, skip_special_tokens) = match prompt {
             PromptInput::Text(text) => {
-                let ids = self.tokenizer.encode(text, false)?;
-                (
-                    ids,
-                    OutputProcessorPolicy::None,
-                    request.decode.skip_special_tokens,
-                )
+                let ids = self.tokenizer.encode(&text, false)?;
+                (ids, OutputProcessorPolicy::None, decode.skip_special_tokens)
             }
-            PromptInput::Chat {
-                messages,
-                tools,
-                tool_choice,
-                reasoning_effort,
-            } => {
-                let mut chat_request = ChatRequest {
-                    messages: messages.clone(),
-                    chat_options: crate::serving::chat::ChatOptions {
-                        generation_prompt_mode:
-                            crate::serving::chat::GenerationPromptMode::StartNewAssistant,
-                        reasoning_effort: *reasoning_effort,
-                    },
-                    tools: tools.clone(),
-                    tool_choice: *tool_choice,
-                    decode_options: TextDecodeOptions {
-                        skip_special_tokens: request.decode.skip_special_tokens,
-                        include_stop_str_in_output: request.decode.include_stop_string_in_output,
-                        stop_strings: (!request.stop.stop_strings.is_empty())
-                            .then(|| request.stop.stop_strings.clone()),
-                        min_tokens: request.sampling.min_tokens.unwrap_or(0),
-                    },
-                };
+            PromptInput::Chat(mut chat_request) => {
+                chat_request.decode_options = decode.clone();
                 chat_request.validate()?;
                 // Build the processor once to apply parser-driven request
                 // adjustments (e.g. disabling special-token skipping).
@@ -983,7 +898,11 @@ impl Qwen3Desc {
                     std::sync::Arc::clone(&self.tokenizer),
                     self.parse_reasoning,
                 )?;
-                let rendered_text = self.renderer.render(&chat_request)?;
+                let rendered_text = self
+                    .renderer
+                    .as_ref()
+                    .expect("Qwen3 requires a chat renderer")
+                    .render(&chat_request)?;
                 let ids = self.tokenizer.encode(&rendered_text, false)?;
                 let skip = chat_request.decode_options.skip_special_tokens;
                 (ids, OutputProcessorPolicy::Qwen3(processor), skip)
@@ -991,117 +910,41 @@ impl Qwen3Desc {
         };
 
         let prompt_len = prompt_token_ids.len() as u32;
-        let lowered = self.lower_sampling(&request, prompt_len)?;
+        let (sampling, max_tokens, stop_token_ids) =
+            self.resolve_sampling(controls, stop, prompt_len)?;
 
-        let constraint = GenerationConstraint::UndOnly;
-        let mut policy = GenerationPolicyDescriptor::default();
-        policy.termination.emit_stop_token = request.decode.include_stop_string_in_output;
-        let isolation_key = cache_isolation_key(
-            request.cache.namespace.as_deref(),
-            request.cache.salt.as_deref(),
-        );
-        let cache = GenerationCachePolicyDescriptor {
-            read: !request.cache.bypass_read && !lowered.sampling.prompt_logprobs_requested(),
-            write: !request.cache.no_store,
-            isolation_key,
-        };
-        let prompt_logprobs_requested = lowered.sampling.prompt_logprobs_requested();
-        let generated_logprobs_requested = lowered.sampling.generated_logprobs_requested();
-        let max_und_tokens = lowered.max_tokens as usize;
-        let resources = GenerationResourceBounds {
-            context_tokens: prompt_len as usize,
-            max_kv_tokens: (prompt_len as usize).saturating_add(max_und_tokens),
-            ..GenerationResourceBounds::default()
-        };
-        let generation = GenerationRequest {
-            request_id: RequestId(stable_hash(request.request_id.as_ref())),
-            context: vec![CoreContextSegment::UndTokens {
-                token_ids: prompt_token_ids.clone(),
-                visibility: UndVisibility::Internal,
-            }],
-            negative_context: Vec::new(),
-            constraint,
-            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
-            sampling: lowered.sampling,
-            image: ImageParams::default(),
-            max_und_tokens,
-            stop_strings: request.stop.stop_strings.clone(),
-            stop_token_ids: lowered.stop_token_ids,
-            priority: request.scheduling.priority,
-            cache: cache.clone(),
-            policy,
-            resources: resources.clone(),
-        };
-        generation.validate()?;
-
-        let cache_accounting = CacheAccounting {
-            read_enabled: cache.read,
-            write_enabled: cache.write,
-            encoder_pin_count: 0,
-        };
-        let resource_accounting = ResourceAccounting {
-            expected_kv_tokens: resources.max_kv_tokens as u64,
-            image_latent_units: 0,
-            encoder_cache_pins: 0,
-            replayable: true,
-        };
-
-        let decode = TextDecodeOptions {
-            skip_special_tokens,
-            include_stop_str_in_output: request.decode.include_stop_string_in_output,
-            stop_strings: (!request.stop.stop_strings.is_empty())
-                .then(|| request.stop.stop_strings.clone()),
-            min_tokens: request.sampling.min_tokens.unwrap_or(0),
-        };
-
-        Ok(TokenizedGenerateReqInput {
-            request_id: request.request_id,
-            request: generation,
-            tokenizer: std::sync::Arc::clone(&self.tokenizer),
-            prompt_token_ids,
-            decode,
-            emit_token_ids: matches!(
-                request.output,
-                OutputDetail::Tokens | OutputDetail::Logprobs
-            ),
-            prompt_logprobs_requested,
-            generated_logprobs_requested,
-            skip_special_tokens,
-            output_processor,
-            identity: ModelEventIdentity {
-                served_name: self.identity.served_name.clone(),
-                description: self.identity.description.id().to_string(),
-            },
-            cache: cache_accounting,
-            resources: resource_accounting,
-        })
+        generation.prompt_token_ids = prompt_token_ids;
+        generation.sampling = sampling;
+        generation.stop_token_ids = stop_token_ids;
+        generation.max_und_tokens = max_tokens as usize;
+        generation.include_stop_token = decode.include_stop_str_in_output;
+        // Prompt logprobs require computation for every prompt token.
+        generation.cache.read &= !generation.sampling.prompt_logprobs_requested();
+        decode.skip_special_tokens = skip_special_tokens;
+        Ok(output_processor)
     }
 
     /// Resolves model defaults and request controls into validated engine sampling parameters.
-    fn lower_sampling(
+    fn resolve_sampling(
         &self,
-        request: &GenerateReqInput,
+        sampling: &crate::serving::SamplingConfig,
+        stop: &crate::serving::StopConfig,
         prompt_len: u32,
-    ) -> std::result::Result<LoweredSampling, crate::serving::TokenizeError> {
-        let sampling = &request.sampling;
-        let stop = &request.stop;
-        let hints = &self.hints;
+    ) -> std::result::Result<(SamplingParams, u32, Vec<u32>), crate::serving::TokenizeError> {
+        let defaults = &self.config.sampling_defaults;
 
-        let temperature = sampling
-            .temperature
-            .or(hints.default_temperature)
-            .unwrap_or(1.0);
-        let top_p = sampling.top_p.or(hints.default_top_p).unwrap_or(1.0);
-        let top_k = sampling.top_k.or(hints.default_top_k).unwrap_or(0);
-        let min_p = sampling.min_p.or(hints.default_min_p).unwrap_or(0.0);
+        let temperature = sampling.temperature.or(defaults.temperature).unwrap_or(1.0);
+        let top_p = sampling.top_p.or(defaults.top_p).unwrap_or(1.0);
+        let top_k = sampling.top_k.or(defaults.top_k).unwrap_or(0);
+        let min_p = sampling.min_p.or(defaults.min_p).unwrap_or(0.0);
         let repetition_penalty = sampling
             .repetition_penalty
-            .or(hints.default_repetition_penalty)
+            .or(defaults.repetition_penalty)
             .unwrap_or(1.0);
         let max_tokens = resolve_max_tokens(
             sampling.max_tokens,
-            hints.default_max_tokens,
-            hints.max_model_len,
+            defaults.max_output_tokens,
+            Some(self.config.max_model_tokens()),
             prompt_len,
         )?;
         let min_tokens = sampling.min_tokens.unwrap_or(0);
@@ -1110,7 +953,12 @@ impl Qwen3Desc {
 
         let mut stop_token_ids = stop.stop_token_ids.clone();
         if !sampling.ignore_eos {
-            for token_id in &hints.extra_eos_token_ids {
+            for token_id in self
+                .config
+                .eos_token_ids
+                .iter()
+                .filter(|token| Some(**token) != self.config.primary_eos_token_id)
+            {
                 if !stop_token_ids.contains(token_id) {
                     stop_token_ids.push(*token_id);
                 }
@@ -1176,64 +1024,16 @@ impl Qwen3Desc {
         core.validate()?;
 
         // Logprob feature gate.
-        if (stop.logprobs.is_some() || stop.prompt_logprobs.is_some()) && !self.logprobs_supported {
+        if (stop.logprobs.is_some() || stop.prompt_logprobs.is_some())
+            && !self
+                .sampling_controls
+                .contains(&ServedSamplingControl::Logprobs)
+        {
             return Err(crate::serving::TokenizeError::UnsupportedLogprobs);
         }
 
-        Ok(LoweredSampling {
-            sampling: core,
-            max_tokens,
-            stop_token_ids,
-        })
+        Ok((core, max_tokens, stop_token_ids))
     }
-}
-
-impl SenseNovaDesc {
-    /// Tokenizes a request with the SenseNova multimodal preprocessing pipeline.
-    fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
-        crate::serving::omni::tokenize_sensenova(
-            &self.preprocessing,
-            crate::serving::omni::RuntimeBinding {
-                tokenizer: std::sync::Arc::clone(&self.tokenizer),
-                renderer: &self.renderer,
-                limits: &self.limits,
-                default_max_output_tokens: self.default_max_output_tokens,
-                max_model_tokens: self.max_model_tokens,
-                identity: ModelEventIdentity {
-                    served_name: self.identity.served_name.clone(),
-                    description: self.identity.description.id().to_string(),
-                },
-            },
-            request,
-        )
-    }
-}
-
-impl BagelDesc {
-    /// Tokenizes a request with the Bagel multimodal preprocessing pipeline.
-    fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
-        crate::serving::omni::tokenize_bagel(
-            &self.preprocessing,
-            crate::serving::omni::RuntimeBinding {
-                tokenizer: std::sync::Arc::clone(&self.tokenizer),
-                renderer: &self.renderer,
-                limits: &self.limits,
-                default_max_output_tokens: self.default_max_output_tokens,
-                max_model_tokens: self.max_model_tokens,
-                identity: ModelEventIdentity {
-                    served_name: self.identity.served_name.clone(),
-                    description: self.identity.description.id().to_string(),
-                },
-            },
-            request,
-        )
-    }
-}
-
-struct LoweredSampling {
-    sampling: SamplingParams,
-    max_tokens: u32,
-    stop_token_ids: Vec<u32>,
 }
 
 /// Converts bad-word strings into token-ID sequences, encoding each word both
@@ -1262,7 +1062,7 @@ fn tokenize_bad_words(
     Ok((!all_token_ids.is_empty()).then_some(all_token_ids))
 }
 
-/// Computes a stable hash for cache isolation.
+/// Computes a deterministic identifier for a preprocessed request.
 fn stable_hash(value: &str) -> u64 {
     value
         .as_bytes()

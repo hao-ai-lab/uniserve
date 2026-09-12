@@ -1,8 +1,8 @@
 //! Model-aware admission, engine submission, and output streaming.
 //!
 //! Requests follow one ownership chain:
-//! `GenerateReqInput -> ResolvedModel::tokenize -> TokenizedGenerateReqInput ->
-//! EngineClient::submit_generation -> ServeEvent stream`.
+//! `HTTP schema / text prompt -> InputProcessor -> GenerationRequest ->
+//! EngineClient::submit_generation -> RequestOutput stream`.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -12,42 +12,40 @@ pub mod chat;
 mod input;
 mod model;
 mod omni;
+mod preprocessing;
 #[cfg(test)]
 mod test_support;
 /// Text tokenization, decoding, and sampling utilities.
 pub mod text;
 
 use std::borrow::Borrow;
-use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::ops::Deref;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 
-use crate::engine_client::{EngineClient, EventRx, MediaSubmission, StreamCancelCause};
+use crate::engine_client::requests::RequestRegistry;
+use crate::engine_client::{EngineClient, EventRx, StreamCancelCause};
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Notify;
-use uniserve_core::Event;
+use uniserve_core::EngineCoreOutput;
 
 pub use input::{
-    CacheBounds, DecodeControls, GenerateReqInput, ImageGenControls, ImageInput, ModalitySelection,
-    ModelEventIdentity, OutputDetail, OutputProcessorPolicy, PromptInput, SamplingConfig,
-    SchedulingBounds, StopConfig, TokenizedGenerateReqInput,
+    DecodeControls, ImageGenControls, ImageInput, ModalitySelection, ModelEventIdentity,
+    OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions, SamplingConfig, StopConfig,
+    TextPromptRequest,
 };
 pub use model::{
-    ModelSupport, ResolvedAssets, ResolvedModel, ServedEndpoint, ServedFeature, ServedModality,
+    InputProcessor, ModelSupport, ServedEndpoint, ServedFeature, ServedModality,
     ServedSamplingControl,
 };
 
-use crate::serving::chat::{
-    AssistantBlockKind, AssistantContentBlock, ChatEvent, Qwen3ChatOutputProcessor,
-};
+use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, Qwen3ChatOutputProcessor};
 use crate::serving::omni::{SenseNovaOutputProcessor, SenseNovaTextDelta};
 use crate::serving::text::output::stop_string_holdback_bytes;
 use crate::serving::text::{
@@ -124,39 +122,8 @@ impl From<ServeRequestId> for String {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-/// Stable identifier for one output candidate within a request.
-pub struct CandidateId(u32);
-
-impl CandidateId {
-    /// Identifier of the primary output candidate.
-    pub const PRIMARY: Self = Self(0);
-
-    /// Returns the numeric candidate identifier.
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-impl From<u32> for CandidateId {
-    /// Converts the source value into this type.
-    fn from(value: u32) -> Self {
-        Self(value)
-    }
-}
-
-impl From<CandidateId> for u32 {
-    /// Converts the source value into this type.
-    fn from(value: CandidateId) -> Self {
-        value.0
-    }
-}
-
 /// Boxed asynchronous stream of serving events.
-pub type ServeEventStream = Pin<Box<dyn Stream<Item = Result<ServeEvent>> + Send>>;
+pub type RequestOutputStream = Pin<Box<dyn Stream<Item = Result<RequestOutput>> + Send>>;
 /// Result type returned by serving-runtime operations.
 pub type Result<T> = std::result::Result<T, ServeError>;
 
@@ -180,6 +147,9 @@ pub enum TokenizeError {
     /// The lowered request violates the canonical generation contract.
     #[error(transparent)]
     Generation(#[from] uniserve_core::GenerationRequestError),
+    /// Requested computation exceeds loaded model capacity.
+    #[error(transparent)]
+    Capacity(#[from] uniserve_core::GenerationResourceError),
     /// Multimodal request controls or geometry are invalid.
     #[error(transparent)]
     Omni(#[from] crate::serving::omni::OmniError),
@@ -334,29 +304,15 @@ pub(crate) fn cache_isolation_key(namespace: Option<&str>, salt: Option<&str>) -
 /// Single-model serving runtime.
 pub struct ServingRuntime {
     runtime_id: u64,
-    model: Arc<ResolvedModel>,
+    model: Arc<InputProcessor>,
     engine: Arc<EngineClient>,
     _stats_logger: Option<Arc<crate::engine_client::generation::log_stats::StatsLogger>>,
     metrics: Arc<RuntimeLifecycleMetrics>,
-    requests: Arc<RuntimeRequestRegistry>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-/// Tokenized prompt and geometry for terminal video generation.
-pub struct VideoGenerationInput {
-    /// Caller-visible request identifier.
-    pub request_id: ServeRequestId,
-    /// Text prompt for video generation.
-    pub prompt: String,
-    /// Deterministic generation seed.
-    pub seed: u64,
-    /// Requested video duration in seconds.
-    pub seconds: f64,
 }
 
 impl ServingRuntime {
     /// Creates a serving runtime for one resolved model and engine client.
-    pub fn new(model: ResolvedModel, engine: Arc<EngineClient>, log_stats: bool) -> Self {
+    pub fn new(model: InputProcessor, engine: Arc<EngineClient>, log_stats: bool) -> Self {
         let stats_logger = log_stats.then(|| {
             Arc::new(
                 crate::engine_client::generation::log_stats::StatsLogger::start(
@@ -371,12 +327,11 @@ impl ServingRuntime {
             engine,
             _stats_logger: stats_logger,
             metrics: Arc::new(RuntimeLifecycleMetrics::default()),
-            requests: Arc::new(RuntimeRequestRegistry::default()),
         }
     }
 
     /// Returns the resolved model owned by this runtime.
-    pub fn model(&self) -> &ResolvedModel {
+    pub fn model(&self) -> &InputProcessor {
         &self.model
     }
 
@@ -390,48 +345,6 @@ impl ServingRuntime {
         &self.engine
     }
 
-    /// Submits a terminal video request to the engine.
-    pub async fn generate_video(&self, request: VideoGenerationInput) -> Result<EventRx> {
-        let submission = self.prepare_video(request)?;
-        self.engine
-            .submit_media(submission)
-            .await
-            .map_err(ServeError::Engine)
-    }
-
-    /// Validate and tokenize a video before transferring submission ownership.
-    pub fn prepare_video(&self, request: VideoGenerationInput) -> Result<MediaSubmission> {
-        if !self
-            .model
-            .support()
-            .endpoints
-            .contains(&ServedEndpoint::VideoGenerations)
-        {
-            return Err(ServeError::UnsupportedFeature {
-                request_id: request.request_id,
-                feature: "video_generation",
-            });
-        }
-        if request.prompt.trim().is_empty() {
-            return Err(ServeError::Tokenize {
-                request_id: request.request_id,
-                source: TokenizeError::Invalid("video prompt must not be empty".to_string()),
-            });
-        }
-        let (geometry, prompt_token_ids) = self.model.resolve_video_request_geometry(
-            &request.request_id,
-            &request.prompt,
-            request.seconds,
-        )?;
-        let submission = MediaSubmission::new(
-            request.request_id.to_string(),
-            prompt_token_ids,
-            request.seed,
-            geometry,
-        );
-        Ok(submission)
-    }
-
     /// Returns the process-local identity of this runtime instance.
     pub fn runtime_id(&self) -> u64 {
         self.runtime_id
@@ -440,107 +353,167 @@ impl ServingRuntime {
     /// Returns an aggregate point-in-time metrics snapshot.
     pub fn metrics_snapshot(&self) -> RuntimeMetricsSnapshot {
         let mut snapshot = self.metrics.snapshot();
-        snapshot.active = self.requests.active_count() as u64;
+        snapshot.active = self.engine.requests.active_count() as u64;
         snapshot
     }
 
     /// Returns current lifecycle statistics for one request.
     pub fn request_stats(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
-        self.requests.stats(request_id)
+        self.engine.requests.stats(request_id)
     }
 
     /// Waits for one request to leave the active registry and returns its final snapshot.
     pub async fn drain_request(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
-        self.requests.drain_request(request_id).await
+        self.engine.requests.drain_request(request_id).await
     }
 
     /// Waits until every active request leaves the runtime.
     pub async fn drain(&self) {
-        self.requests.drain().await;
+        self.engine.requests.drain().await;
     }
 
-    /// Generates a serving event stream for a validated request.
-    pub async fn generate(&self, request: GenerateReqInput) -> Result<ServeEventStream> {
-        let request_id = request.request_id.clone();
+    /// Preprocesses a chat request while retaining cancellation and identity ownership.
+    pub async fn generate_chat(
+        &self,
+        request_id: ServeRequestId,
+        request: crate::openai::ChatCompletionRequest,
+    ) -> crate::openai::Result<RequestOutputStream> {
+        crate::openai::chat_completions::validate_request_compat(
+            &request,
+            self.served_model_name(),
+        )?;
+        let input_id = request_id.clone();
+        self.generate_with(request_id, move |model| {
+            model.preprocess_chat_request(input_id, request)
+        })
+        .await
+    }
+
+    /// Preprocesses one image-generation API request and streams its output.
+    pub async fn generate_image(
+        &self,
+        request_id: ServeRequestId,
+        request: crate::openai::ImageGenerationRequest,
+    ) -> crate::openai::Result<RequestOutputStream> {
+        let input_id = request_id.clone();
+        self.generate_with(request_id, move |model| {
+            model.preprocess_image_request(input_id, request)
+        })
+        .await
+    }
+
+    /// Runs a programmatic text prompt, including model-specific context images.
+    pub async fn generate_text(
+        &self,
+        request: TextPromptRequest,
+    ) -> crate::openai::Result<RequestOutputStream> {
+        self.generate_with(request.request_id.clone(), move |model| {
+            model
+                .preprocess_text_request(request)
+                .map_err(crate::openai::serve_error_to_api)
+        })
+        .await
+    }
+
+    /// Owns the request across blocking preprocessing, submission, and public output.
+    async fn generate_with(
+        &self,
+        request_id: ServeRequestId,
+        preprocess: impl FnOnce(
+            &InputProcessor,
+        ) -> crate::openai::Result<(
+            uniserve_core::GenerationRequest,
+            ResponseOptions,
+        )> + Send
+        + 'static,
+    ) -> crate::openai::Result<RequestOutputStream> {
         let compile_started = Instant::now();
         let identity = self.model.event_identity();
 
-        if let Err(error) = self.model.validate_request(&request) {
-            self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
-            return Err(error);
-        }
-
-        if !self.requests.register(
+        let engine_request_id = self
+            .engine
+            .register_request(request_id.to_string(), Some(identity))
+            .map_err(|error| {
+                self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                match error {
+                    crate::engine_client::Error::DuplicateRequestId { .. } => {
+                        ServeError::DuplicateRequestId {
+                            request_id: request_id.clone(),
+                        }
+                    }
+                    error => ServeError::Engine(error),
+                }
+            })
+            .map_err(crate::openai::serve_error_to_api)?;
+        let mut lifecycle = LifecycleGuard::new(
             request_id.clone(),
-            identity.served_name.clone(),
-            identity.description.clone(),
-            0,
-            RequestLifecycleState::Compiling,
-        ) {
-            self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
-            return Err(ServeError::DuplicateRequestId { request_id });
-        }
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.engine.requests),
+        );
 
         let model = Arc::clone(&self.model);
         let tokenize_request_id = request_id.clone();
         let tokenize_result = tokio::select! {
-            terminal = self.requests.wait_for_control(&request_id) => {
-                return Ok(self.control_event_stream(request_id, terminal));
+            terminal = self.engine.requests.wait_for_control(&request_id) => {
+                return Ok(self.control_event_stream(request_id, terminal, lifecycle));
             }
-            tokenized = tokio::task::spawn_blocking(move || model.tokenize(request)) => {
-                tokenized.unwrap_or_else(|error| Err(ServeError::Tokenize {
+            tokenized = tokio::task::spawn_blocking(move || preprocess(&model)) => {
+                tokenized.unwrap_or_else(|error| Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
                     request_id: tokenize_request_id,
                     source: TokenizeError::Task(error),
-                }))
+                })))
             }
         };
-        let tokenized = match tokenize_result {
+        let mut tokenized = match tokenize_result {
             Ok(tokenized) => tokenized,
             Err(error) => {
-                self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
-                self.requests.complete(
-                    &request_id,
-                    RequestLifecycleState::Rejected,
+                lifecycle.terminal(
+                    LifecycleTerminal::Rejected,
                     compile_started.elapsed().as_micros() as u64,
                 );
                 return Err(error);
             }
         };
         let compile_duration_us = compile_started.elapsed().as_micros() as u64;
-        self.requests
+        self.engine
+            .requests
             .mark_submitting(&request_id, compile_duration_us);
 
-        self.submit_and_stream(tokenized, compile_duration_us).await
+        tokenized.0.request_id = engine_request_id;
+        self.submit_and_stream(tokenized, compile_duration_us, lifecycle)
+            .await
+            .map_err(crate::openai::serve_error_to_api)
     }
 
     /// Submits a tokenized request and wraps its output with model and lifecycle processing.
     async fn submit_and_stream(
         &self,
-        tokenized: TokenizedGenerateReqInput,
+        (request, response): (uniserve_core::GenerationRequest, ResponseOptions),
         compile_duration_us: u64,
-    ) -> Result<ServeEventStream> {
-        let request_id = tokenized.request_id.clone();
-        if let Some(terminal) = self.requests.control_terminal(&request_id) {
-            return Ok(self.control_event_stream(request_id, terminal));
+        mut lifecycle: LifecycleGuard,
+    ) -> Result<RequestOutputStream> {
+        let request_id = response.request_id.clone();
+        if let Some(terminal) = self.engine.requests.control_terminal(&request_id) {
+            return Ok(self.control_event_stream(request_id, terminal, lifecycle));
         }
 
-        let engine_stream = self.engine.submit_generation(&tokenized).await;
-
-        let TokenizedGenerateReqInput {
+        let ResponseOptions {
             request_id: _,
-            request: _,
             tokenizer,
             prompt_token_ids,
             decode,
             emit_token_ids,
             prompt_logprobs_requested,
             generated_logprobs_requested,
-            skip_special_tokens,
             output_processor,
             identity,
             cache,
             resources,
-        } = tokenized;
+        } = response;
+        let engine_stream = self
+            .engine
+            .submit_generation(request_id.to_string(), request)
+            .await;
 
         let event_context = EventContext {
             served_name: identity.served_name.clone(),
@@ -548,11 +521,10 @@ impl ServingRuntime {
             compile_duration_us,
             cache,
             resources,
-            skip_special_tokens,
             metrics: Arc::clone(&self.metrics),
         };
 
-        let stream_result: Result<ServeEventStream> = match engine_stream {
+        let stream_result: Result<RequestOutputStream> = match engine_stream {
             Ok(stream) => {
                 let assembly = StreamInput {
                     request_id: request_id.clone(),
@@ -565,7 +537,7 @@ impl ServingRuntime {
                     decode_options: decode,
                     stream,
                 };
-                let output: ServeEventStream = match output_processor {
+                let output: RequestOutputStream = match output_processor {
                     OutputProcessorPolicy::Qwen3(processor) => {
                         Box::pin(assemble_chat_event_stream(assembly, processor))
                     }
@@ -576,46 +548,37 @@ impl ServingRuntime {
             Err(error) => Err(ServeError::Engine(error)),
         };
 
-        if let Some(terminal) = self.requests.control_terminal(&request_id) {
+        if let Some(terminal) = self.engine.requests.control_terminal(&request_id) {
             if let Ok(stream) = stream_result {
                 drop(stream);
             }
             self.apply_engine_control(&request_id, terminal).await;
-            return Ok(self.control_event_stream(request_id, terminal));
+            return Ok(self.control_event_stream(request_id, terminal, lifecycle));
         }
         let stream = match stream_result {
             Ok(stream) => stream,
             Err(error) => {
-                self.metrics.failed.fetch_add(1, Ordering::Relaxed);
-                self.requests.complete(
-                    &request_id,
-                    RequestLifecycleState::Failed,
-                    compile_duration_us,
-                );
+                lifecycle.terminal(LifecycleTerminal::Failed, compile_duration_us);
                 return Err(error);
             }
         };
-        if !self.requests.accept(&request_id) {
+        if !self.engine.requests.accept(&request_id) {
             let terminal = self
+                .engine
                 .requests
                 .control_terminal(&request_id)
                 .unwrap_or(LifecycleTerminal::Cancelled);
             drop(stream);
             self.apply_engine_control(&request_id, terminal).await;
-            return Ok(self.control_event_stream(request_id, terminal));
+            return Ok(self.control_event_stream(request_id, terminal, lifecycle));
         }
         self.metrics.accepted.fetch_add(1, Ordering::Relaxed);
         let stream = Box::pin(control_aware_event_stream(
             request_id.clone(),
-            Arc::clone(&self.requests),
+            Arc::clone(&self.engine.requests),
             stream,
-        )) as ServeEventStream;
-        Ok(Box::pin(LifecycleTrackedStream::new(
-            request_id,
-            stream,
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.requests),
-        )))
+        )) as RequestOutputStream;
+        Ok(Box::pin(LifecycleTrackedStream::new(stream, lifecycle)))
     }
 
     /// Builds an immediately terminal stream for a request controlled before engine ownership.
@@ -623,25 +586,21 @@ impl ServingRuntime {
         &self,
         request_id: ServeRequestId,
         terminal: LifecycleTerminal,
-    ) -> ServeEventStream {
+        lifecycle: LifecycleGuard,
+    ) -> RequestOutputStream {
         let event = match terminal {
-            LifecycleTerminal::Aborted => ServeEvent::Aborted {
+            LifecycleTerminal::Aborted => RequestOutput::Aborted {
                 request_id: request_id.clone(),
             },
             LifecycleTerminal::Cancelled
             | LifecycleTerminal::Finished
             | LifecycleTerminal::Rejected
-            | LifecycleTerminal::Failed => ServeEvent::Cancelled {
+            | LifecycleTerminal::Failed => RequestOutput::Cancelled {
                 request_id: request_id.clone(),
             },
         };
-        let inner = Box::pin(futures::stream::iter([Ok(event)])) as ServeEventStream;
-        Box::pin(LifecycleTrackedStream::new(
-            request_id,
-            inner,
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.requests),
-        ))
+        let inner = Box::pin(futures::stream::iter([Ok(event)])) as RequestOutputStream;
+        Box::pin(LifecycleTrackedStream::new(inner, lifecycle))
     }
 
     /// Cancels a live request at its acknowledged output prefix.
@@ -650,12 +609,7 @@ impl ServingRuntime {
         request_id: impl Into<ServeRequestId>,
     ) -> std::result::Result<(), ServeControlError> {
         let request_id = request_id.into();
-        let engine_may_own_request = self
-            .requests
-            .mark_control(&request_id, RequestLifecycleState::Cancelling);
-        if engine_may_own_request {
-            self.engine.cancel_request(&request_id).await?;
-        }
+        self.engine.cancel_request(&request_id).await?;
         Ok(())
     }
 
@@ -666,12 +620,7 @@ impl ServingRuntime {
         reason: AbortReason,
     ) -> std::result::Result<(), ServeControlError> {
         let request_id = request_id.into();
-        let engine_may_own_request = self
-            .requests
-            .mark_control(&request_id, RequestLifecycleState::Aborting);
-        if engine_may_own_request {
-            self.engine.abort_request(&request_id).await?;
-        }
+        self.engine.abort_request(&request_id).await?;
         let _ = reason;
         Ok(())
     }
@@ -776,7 +725,7 @@ pub struct RequestStatsSnapshot {
 
 impl RequestStatsSnapshot {
     /// Creates a zeroed snapshot for a request entering engine submission.
-    fn submitting(
+    pub(crate) fn submitting(
         request_id: ServeRequestId,
         served_name: String,
         description: String,
@@ -802,348 +751,6 @@ impl RequestStatsSnapshot {
     }
 }
 
-#[derive(Default)]
-struct RequestRegistryState {
-    active: HashMap<ServeRequestId, RequestStatsSnapshot>,
-    completed: HashMap<ServeRequestId, RequestStatsSnapshot>,
-    completed_order: VecDeque<ServeRequestId>,
-}
-
-struct RuntimeRequestRegistry {
-    state: Mutex<RequestRegistryState>,
-    changed: Notify,
-    completed_retention: usize,
-}
-
-impl Default for RuntimeRequestRegistry {
-    /// Returns the default value.
-    fn default() -> Self {
-        Self {
-            state: Mutex::new(RequestRegistryState::default()),
-            changed: Notify::new(),
-            completed_retention: 1024,
-        }
-    }
-}
-
-impl RuntimeRequestRegistry {
-    /// Locks the shared state and recovers it after poisoning.
-    fn lock(&self) -> std::sync::MutexGuard<'_, RequestRegistryState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Registers a unique active request and clears any retained snapshot with the same identity.
-    fn register(
-        &self,
-        request_id: ServeRequestId,
-        served_name: String,
-        description: String,
-        compile_us: u64,
-        initial_state: RequestLifecycleState,
-    ) -> bool {
-        let mut state = self.lock();
-        if state.active.contains_key(&request_id) {
-            return false;
-        }
-        state.completed.remove(&request_id);
-        state.completed_order.retain(|id| id != &request_id);
-        let mut stats = RequestStatsSnapshot::submitting(
-            request_id.clone(),
-            served_name,
-            description,
-            compile_us,
-        );
-        stats.state = initial_state;
-        state.active.insert(request_id.clone(), stats);
-        true
-    }
-
-    /// Marks the request as submitting.
-    fn mark_submitting(&self, request_id: &str, compile_us: u64) {
-        if let Some(stats) = self.lock().active.get_mut(request_id) {
-            if !matches!(
-                stats.state,
-                RequestLifecycleState::Cancelling | RequestLifecycleState::Aborting
-            ) {
-                stats.state = RequestLifecycleState::Submitting;
-            }
-            stats.timings.compile_us = compile_us;
-        }
-    }
-
-    /// Accepts an engine submission into lifecycle tracking.
-    fn accept(&self, request_id: &str) -> bool {
-        let mut registry = self.lock();
-        let Some(stats) = registry.active.get_mut(request_id) else {
-            return false;
-        };
-        if matches!(
-            stats.state,
-            RequestLifecycleState::Cancelling | RequestLifecycleState::Aborting
-        ) {
-            return false;
-        }
-        stats.state = RequestLifecycleState::Accepted;
-        true
-    }
-
-    /// Applies monotonic cancellation or abort state and reports whether the engine may own work.
-    fn mark_control(&self, request_id: &str, state: RequestLifecycleState) -> bool {
-        let (engine_may_own_request, changed) = {
-            let mut registry = self.lock();
-            let Some(stats) = registry.active.get_mut(request_id) else {
-                return false;
-            };
-            let previous = stats.state;
-            let next = match (previous, state) {
-                (RequestLifecycleState::Aborting, _) => RequestLifecycleState::Aborting,
-                (RequestLifecycleState::Cancelling, RequestLifecycleState::Aborting) => {
-                    RequestLifecycleState::Aborting
-                }
-                (RequestLifecycleState::Cancelling, _) => RequestLifecycleState::Cancelling,
-                (_, requested) => requested,
-            };
-            let changed = next != previous;
-            stats.state = next;
-            (
-                previous != RequestLifecycleState::Compiling && changed,
-                changed,
-            )
-        };
-        if changed {
-            self.changed.notify_waiters();
-        }
-        engine_may_own_request
-    }
-
-    /// Returns the accepted control command terminal event.
-    fn control_terminal(&self, request_id: &str) -> Option<LifecycleTerminal> {
-        match self.lock().active.get(request_id).map(|stats| stats.state) {
-            Some(RequestLifecycleState::Cancelling) => Some(LifecycleTerminal::Cancelled),
-            Some(RequestLifecycleState::Aborting) => Some(LifecycleTerminal::Aborted),
-            _ => None,
-        }
-    }
-
-    /// Waits the for control.
-    async fn wait_for_control(&self, request_id: &str) -> LifecycleTerminal {
-        loop {
-            let changed = self.changed.notified();
-            if let Some(terminal) = self.control_terminal(request_id) {
-                return terminal;
-            }
-            changed.await;
-        }
-    }
-
-    /// Returns the terminal event emitted when the guard is dropped.
-    fn drop_terminal(&self, request_id: &str) -> LifecycleTerminal {
-        match self.lock().active.get(request_id).map(|stats| stats.state) {
-            Some(RequestLifecycleState::Aborting) => LifecycleTerminal::Aborted,
-            _ => LifecycleTerminal::Cancelled,
-        }
-    }
-
-    /// Incorporates one serving event into request statistics and surfaces pending control.
-    fn observe(
-        &self,
-        request_id: &str,
-        event: &ServeEvent,
-        elapsed_us: u64,
-    ) -> Option<LifecycleTerminal> {
-        let mut state = self.lock();
-        let stats = state.active.get_mut(request_id)?;
-
-        // External cancellation and abort state dominates every later stream
-        // observation and asks the caller to terminate the producer.
-        match stats.state {
-            RequestLifecycleState::Cancelling => return Some(LifecycleTerminal::Cancelled),
-            RequestLifecycleState::Aborting => return Some(LifecycleTerminal::Aborted),
-            _ => {}
-        }
-
-        // Each event updates only the lifecycle dimensions it authoritatively
-        // carries; the final usage event reconciles all cumulative counters.
-        match event {
-            ServeEvent::Accepted {
-                compile_duration_us,
-                prompt_token_count,
-                ..
-            } => {
-                stats.state = RequestLifecycleState::Accepted;
-                stats.prompt_tokens = (*prompt_token_count).min(u32::MAX as usize) as u32;
-                stats.timings.compile_us = *compile_duration_us;
-            }
-            ServeEvent::Scheduled {
-                queued_at,
-                scheduled_at,
-                cache,
-                resources,
-                ..
-            } => {
-                stats.state = RequestLifecycleState::Scheduled;
-                stats.cache = cache.clone();
-                stats.resources = resources.clone();
-                stats.timings.queue_us =
-                    (*queued_at).zip(*scheduled_at).map(|(queued, scheduled)| {
-                        ((scheduled - queued).max(0.0) * 1_000_000.0) as u64
-                    });
-            }
-            ServeEvent::TextDelta { token_ids, .. } => {
-                stats.state = RequestLifecycleState::Streaming;
-                stats.visible_output_tokens = stats
-                    .visible_output_tokens
-                    .saturating_add(token_ids.len().min(u32::MAX as usize) as u32);
-                stats
-                    .timings
-                    .first_visible_output_us
-                    .get_or_insert(elapsed_us);
-            }
-            // Internal tokens affect usage but never establish visible-output latency.
-            ServeEvent::InternalTextDelta { .. } => {
-                stats.state = RequestLifecycleState::Streaming;
-                stats.internal_tokens = stats.internal_tokens.saturating_add(1);
-            }
-            ServeEvent::ReasoningDelta { .. }
-            | ServeEvent::OutputBlockStart { .. }
-            | ServeEvent::OutputBlockEnd { .. }
-            | ServeEvent::ToolCallStart { .. }
-            | ServeEvent::ToolCallArgumentsDelta { .. }
-            | ServeEvent::ToolCallEnd { .. } => {
-                stats.state = RequestLifecycleState::Streaming;
-            }
-            // Image begin and commit are public media progress boundaries.
-            ServeEvent::ImageBegin {
-                elapsed_us: event_elapsed,
-                ..
-            }
-            | ServeEvent::ImageCommit {
-                elapsed_us: event_elapsed,
-                ..
-            } => {
-                stats.state = RequestLifecycleState::Streaming;
-                stats
-                    .timings
-                    .first_visible_output_us
-                    .get_or_insert(*event_elapsed);
-            }
-            ServeEvent::ImageStep { .. } => {
-                stats.state = RequestLifecycleState::Streaming;
-                stats.image_steps = stats.image_steps.saturating_add(1);
-            }
-            ServeEvent::ImageDone { .. } => {
-                stats.state = RequestLifecycleState::Streaming;
-                stats.image_count = stats.image_count.saturating_add(1);
-            }
-            // Terminal usage is the canonical aggregate produced by the assembler.
-            ServeEvent::Usage {
-                prompt_tokens,
-                visible_output_tokens,
-                internal_tokens,
-                image_count,
-                image_steps,
-                cache,
-                resources,
-                timings,
-            } => {
-                stats.prompt_tokens = *prompt_tokens;
-                stats.visible_output_tokens = *visible_output_tokens;
-                stats.internal_tokens = *internal_tokens;
-                stats.image_count = *image_count;
-                stats.image_steps = *image_steps;
-                stats.cache = cache.clone();
-                stats.resources = resources.clone();
-                stats.timings = timings.clone();
-            }
-            // Completion transitions are applied by `complete` after observation.
-            ServeEvent::Finished { .. }
-            | ServeEvent::Rejected { .. }
-            | ServeEvent::Cancelled { .. }
-            | ServeEvent::Aborted { .. }
-            | ServeEvent::Failed { .. } => {}
-        }
-        None
-    }
-
-    /// Moves an active request into retained terminal history with final timing.
-    fn complete(
-        &self,
-        request_id: &str,
-        terminal: RequestLifecycleState,
-        elapsed_us: u64,
-    ) -> Option<RequestLifecycleState> {
-        let mut state = self.lock();
-        let mut stats = state.active.remove(request_id)?;
-        let actual_terminal = match stats.state {
-            RequestLifecycleState::Cancelling => RequestLifecycleState::Cancelled,
-            RequestLifecycleState::Aborting => RequestLifecycleState::Aborted,
-            _ => terminal,
-        };
-        stats.state = actual_terminal;
-        stats.timings.total_us = stats.timings.total_us.max(elapsed_us);
-        Self::insert_completed(&mut state, stats, self.completed_retention);
-        drop(state);
-        self.changed.notify_waiters();
-        Some(actual_terminal)
-    }
-
-    /// Inserts the completed.
-    fn insert_completed(
-        state: &mut RequestRegistryState,
-        stats: RequestStatsSnapshot,
-        retention: usize,
-    ) {
-        let request_id = stats.request_id.clone();
-        state.completed_order.retain(|id| id != &request_id);
-        state.completed.insert(request_id.clone(), stats);
-        state.completed_order.push_back(request_id);
-        while state.completed_order.len() > retention {
-            if let Some(expired) = state.completed_order.pop_front() {
-                state.completed.remove(&expired);
-            }
-        }
-    }
-
-    /// Returns a snapshot of the current statistics.
-    fn stats(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
-        let state = self.lock();
-        state
-            .active
-            .get(request_id)
-            .or_else(|| state.completed.get(request_id))
-            .cloned()
-    }
-
-    /// Returns the number of active requests.
-    fn active_count(&self) -> usize {
-        self.lock().active.len()
-    }
-
-    /// Waits for a request to leave the active registry and returns its final statistics.
-    async fn drain_request(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
-        loop {
-            let changed = self.changed.notified();
-            if !self.lock().active.contains_key(request_id) {
-                return self.stats(request_id);
-            }
-            changed.await;
-        }
-    }
-
-    /// Drains completed entries from the tracker.
-    async fn drain(&self) {
-        loop {
-            let changed = self.changed.notified();
-            if self.active_count() == 0 {
-                return;
-            }
-            changed.await;
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct EventContext {
     served_name: String,
@@ -1151,7 +758,6 @@ struct EventContext {
     compile_duration_us: u64,
     cache: CacheAccounting,
     resources: ResourceAccounting,
-    skip_special_tokens: bool,
     metrics: Arc<RuntimeLifecycleMetrics>,
 }
 
@@ -1235,33 +841,28 @@ impl RuntimeMetricsSnapshot {
 struct LifecycleGuard {
     request_id: ServeRequestId,
     metrics: Arc<RuntimeLifecycleMetrics>,
-    requests: Arc<RuntimeRequestRegistry>,
+    requests: Arc<RequestRegistry>,
     started: Instant,
     terminal: bool,
 }
 
 struct LifecycleTrackedStream {
-    inner: ServeEventStream,
+    inner: RequestOutputStream,
     lifecycle: LifecycleGuard,
 }
 
 impl LifecycleTrackedStream {
-    /// Creates an initialized serving runtime component.
-    fn new(
-        request_id: ServeRequestId,
-        inner: ServeEventStream,
-        metrics: Arc<RuntimeLifecycleMetrics>,
-        requests: Arc<RuntimeRequestRegistry>,
-    ) -> Self {
-        Self {
-            inner,
-            lifecycle: LifecycleGuard::new(request_id, metrics, requests),
-        }
+    /// Transfers the preprocessing guard to the caller's response stream.
+    fn new(inner: RequestOutputStream, mut lifecycle: LifecycleGuard) -> Self {
+        // Runtime response timings begin when the output stream is exposed;
+        // preprocessing time is retained separately in request statistics.
+        lifecycle.started = Instant::now();
+        Self { inner, lifecycle }
     }
 }
 
 impl Stream for LifecycleTrackedStream {
-    type Item = Result<ServeEvent>;
+    type Item = Result<RequestOutput>;
 
     /// Polls the inner stream while enforcing control precedence and terminal accounting.
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
@@ -1275,14 +876,15 @@ impl Stream for LifecycleTrackedStream {
                 {
                     let terminal = self.lifecycle.terminal(control, elapsed_us);
                     event = control_terminal_event(&self.lifecycle.request_id, terminal);
+                    self.inner = Box::pin(futures::stream::empty());
                     return Poll::Ready(Some(Ok(event)));
                 }
                 let terminal = match &event {
-                    ServeEvent::Finished { .. } => Some(LifecycleTerminal::Finished),
-                    ServeEvent::Rejected { .. } => Some(LifecycleTerminal::Rejected),
-                    ServeEvent::Cancelled { .. } => Some(LifecycleTerminal::Cancelled),
-                    ServeEvent::Aborted { .. } => Some(LifecycleTerminal::Aborted),
-                    ServeEvent::Failed { .. } => Some(LifecycleTerminal::Failed),
+                    RequestOutput::Finished { .. } => Some(LifecycleTerminal::Finished),
+                    RequestOutput::Rejected { .. } => Some(LifecycleTerminal::Rejected),
+                    RequestOutput::Cancelled { .. } => Some(LifecycleTerminal::Cancelled),
+                    RequestOutput::Aborted { .. } => Some(LifecycleTerminal::Aborted),
+                    RequestOutput::Failed { .. } => Some(LifecycleTerminal::Failed),
                     _ => None,
                 };
                 if let Some(terminal) = terminal {
@@ -1290,6 +892,7 @@ impl Stream for LifecycleTrackedStream {
                     if actual != terminal {
                         event = control_terminal_event(&self.lifecycle.request_id, actual);
                     }
+                    self.inner = Box::pin(futures::stream::empty());
                 }
                 Poll::Ready(Some(Ok(event)))
             }
@@ -1298,6 +901,7 @@ impl Stream for LifecycleTrackedStream {
                 let actual = self
                     .lifecycle
                     .terminal(LifecycleTerminal::Failed, elapsed_us);
+                self.inner = Box::pin(futures::stream::empty());
                 if actual == LifecycleTerminal::Failed {
                     Poll::Ready(Some(Err(error)))
                 } else {
@@ -1332,7 +936,7 @@ impl LifecycleGuard {
     fn new(
         request_id: ServeRequestId,
         metrics: Arc<RuntimeLifecycleMetrics>,
-        requests: Arc<RuntimeRequestRegistry>,
+        requests: Arc<RequestRegistry>,
     ) -> Self {
         Self {
             request_id,
@@ -1367,7 +971,7 @@ impl LifecycleGuard {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LifecycleTerminal {
+pub(crate) enum LifecycleTerminal {
     Finished,
     Rejected,
     Cancelled,
@@ -1396,12 +1000,15 @@ fn lifecycle_terminal_for_state(state: RequestLifecycleState) -> Option<Lifecycl
 }
 
 /// Builds the terminal event for a control outcome.
-fn control_terminal_event(request_id: &ServeRequestId, terminal: LifecycleTerminal) -> ServeEvent {
+fn control_terminal_event(
+    request_id: &ServeRequestId,
+    terminal: LifecycleTerminal,
+) -> RequestOutput {
     match terminal {
-        LifecycleTerminal::Aborted => ServeEvent::Aborted {
+        LifecycleTerminal::Aborted => RequestOutput::Aborted {
             request_id: request_id.clone(),
         },
-        LifecycleTerminal::Cancelled => ServeEvent::Cancelled {
+        LifecycleTerminal::Cancelled => RequestOutput::Cancelled {
             request_id: request_id.clone(),
         },
         LifecycleTerminal::Finished | LifecycleTerminal::Rejected | LifecycleTerminal::Failed => {
@@ -1473,7 +1080,7 @@ pub struct RuntimeTimings {
 
 /// Runtime event consumed by the HTTP response layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ServeEvent {
+pub enum RequestOutput {
     /// The engine accepted a compiled request.
     Accepted {
         /// Caller-visible request identifier.
@@ -1506,8 +1113,6 @@ pub enum ServeEvent {
     },
     /// Newly decoded user-visible text.
     TextDelta {
-        /// Output candidate receiving the text.
-        candidate_id: CandidateId,
         /// Newly visible decoded text.
         text: String,
         /// Token identifiers represented by this update.
@@ -1517,22 +1122,16 @@ pub enum ServeEvent {
     },
     /// Newly decoded text consumed by a model protocol rather than exposed as output.
     InternalTextDelta {
-        /// Output candidate receiving the text.
-        candidate_id: CandidateId,
         /// Newly decoded internal text.
         text: String,
     },
     /// Newly decoded structured reasoning text.
     ReasoningDelta {
-        /// Output candidate receiving the reasoning.
-        candidate_id: CandidateId,
         /// Newly decoded reasoning text.
         text: String,
     },
     /// A structured assistant output block has opened.
     OutputBlockStart {
-        /// Output candidate containing the block.
-        candidate_id: CandidateId,
         /// Zero-based content-block index.
         index: usize,
         /// Semantic kind of the opened block.
@@ -1540,8 +1139,6 @@ pub enum ServeEvent {
     },
     /// A structured assistant output block has closed.
     OutputBlockEnd {
-        /// Output candidate containing the block.
-        candidate_id: CandidateId,
         /// Zero-based content-block index.
         index: usize,
         /// Complete normalized block content.
@@ -1549,8 +1146,6 @@ pub enum ServeEvent {
     },
     /// A structured function-tool call has opened.
     ToolCallStart {
-        /// Output candidate containing the tool call.
-        candidate_id: CandidateId,
         /// Zero-based tool-call index.
         index: usize,
         /// Request-local tool-call identifier.
@@ -1560,8 +1155,6 @@ pub enum ServeEvent {
     },
     /// Newly decoded serialized tool arguments.
     ToolCallArgumentsDelta {
-        /// Output candidate containing the tool call.
-        candidate_id: CandidateId,
         /// Zero-based tool-call index.
         index: usize,
         /// Newly decoded argument text.
@@ -1569,8 +1162,6 @@ pub enum ServeEvent {
     },
     /// A structured function-tool call has closed.
     ToolCallEnd {
-        /// Output candidate containing the tool call.
-        candidate_id: CandidateId,
         /// Zero-based tool-call index.
         index: usize,
         /// Request-local tool-call identifier.
@@ -1582,8 +1173,6 @@ pub enum ServeEvent {
     },
     /// Generation of one image has begun.
     ImageBegin {
-        /// Output candidate containing the image.
-        candidate_id: CandidateId,
         /// Request-local image identifier.
         image_id: String,
         /// Output width in pixels, when known.
@@ -1597,8 +1186,6 @@ pub enum ServeEvent {
     },
     /// One image-generation step has completed.
     ImageStep {
-        /// Output candidate containing the image.
-        candidate_id: CandidateId,
         /// Request-local image identifier.
         image_id: String,
         /// Completed step number.
@@ -1608,8 +1195,6 @@ pub enum ServeEvent {
     },
     /// Generated image state has been committed to the model context.
     ImageCommit {
-        /// Output candidate containing the image.
-        candidate_id: CandidateId,
         /// Request-local image identifier.
         image_id: String,
         /// Elapsed request duration in microseconds.
@@ -1617,8 +1202,6 @@ pub enum ServeEvent {
     },
     /// One generated image is complete and available to the response layer.
     ImageDone {
-        /// Output candidate containing the image.
-        candidate_id: CandidateId,
         /// Request-local image identifier.
         image_id: String,
         /// Output width in pixels, when reported.
@@ -1655,8 +1238,6 @@ pub enum ServeEvent {
     },
     /// The output candidate reached a terminal condition.
     Finished {
-        /// Completed output candidate.
-        candidate_id: CandidateId,
         /// Semantic terminal status.
         reason: FinishStatus,
         /// Optional model- or engine-provided terminal detail.
@@ -1745,9 +1326,9 @@ impl From<&FinishReason> for FinishStatus {
 /// Forwards events until the stream ends or an external control reaches terminal precedence.
 async fn control_aware_event_stream(
     request_id: ServeRequestId,
-    requests: Arc<RuntimeRequestRegistry>,
-    mut stream: ServeEventStream,
-    mut y: TryYielder<ServeEvent, ServeError>,
+    requests: Arc<RequestRegistry>,
+    mut stream: RequestOutputStream,
+    mut y: TryYielder<RequestOutput, ServeError>,
 ) -> Result<()> {
     loop {
         if let Some(terminal) = requests.control_terminal(&request_id) {
@@ -1764,11 +1345,11 @@ async fn control_aware_event_stream(
                     }
                     let terminal = matches!(
                         event,
-                        ServeEvent::Finished { .. }
-                            | ServeEvent::Rejected { .. }
-                            | ServeEvent::Cancelled { .. }
-                            | ServeEvent::Aborted { .. }
-                            | ServeEvent::Failed { .. }
+                        RequestOutput::Finished { .. }
+                            | RequestOutput::Rejected { .. }
+                            | RequestOutput::Cancelled { .. }
+                            | RequestOutput::Aborted { .. }
+                            | RequestOutput::Failed { .. }
                     );
                     y.yield_ok(event).await;
                     if terminal {
@@ -1807,30 +1388,25 @@ mod tests {
                 replayable: true,
                 ..ResourceAccounting::default()
             },
-            skip_special_tokens: false,
             metrics: Arc::new(RuntimeLifecycleMetrics::default()),
         }
-    }
-
-    fn bagel_output_policy() -> OutputProcessorPolicy {
-        OutputProcessorPolicy::Bagel
     }
 
     #[tokio::test]
     async fn assembler_attaches_ranked_logprobs_to_text_delta() {
         let tokenizer = crate::serving::test_support::configured_tokenizer();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.try_send(Event::Scheduled {
+        tx.try_send(EngineCoreOutput::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
         .unwrap();
-        tx.try_send(Event::TextToken {
+        tx.try_send(EngineCoreOutput::TextToken {
             id: b'a' as u32,
             logprob: Some(-0.25),
         })
         .unwrap();
-        tx.try_send(Event::TokenLogprobs {
+        tx.try_send(EngineCoreOutput::TokenLogprobs {
             id: b'a' as u32,
             candidates: vec![TokenLogprob {
                 token_id: b'a' as u32,
@@ -1839,7 +1415,7 @@ mod tests {
             }],
         })
         .unwrap();
-        tx.try_send(Event::Finished {
+        tx.try_send(EngineCoreOutput::Finished {
             reason: uniserve_core::FinishReason::MaxTokens,
             stop_reason: None,
             prompt_tokens: 1,
@@ -1861,14 +1437,14 @@ mod tests {
                 decode_options: TextDecodeOptions::default(),
                 stream: EventRx::from_receiver(rx),
             },
-            bagel_output_policy(),
+            OutputProcessorPolicy::None,
         )
         .collect::<Vec<_>>()
         .await;
         let delta = events
             .iter()
             .find_map(|event| match event {
-                Ok(ServeEvent::TextDelta {
+                Ok(RequestOutput::TextDelta {
                     text,
                     token_ids,
                     logprobs,
@@ -1885,7 +1461,7 @@ mod tests {
         assert!(events.iter().all(std::result::Result::is_ok));
         assert!(matches!(
             events.last(),
-            Some(Ok(ServeEvent::Finished {
+            Some(Ok(RequestOutput::Finished {
                 reason: FinishStatus::Length,
                 ..
             }))
@@ -1896,7 +1472,7 @@ mod tests {
     async fn assembler_publishes_an_image_with_its_next_text_token() {
         let tokenizer = crate::serving::test_support::configured_tokenizer();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.try_send(Event::Scheduled {
+        tx.try_send(EngineCoreOutput::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
@@ -1914,19 +1490,19 @@ mod tests {
                 decode_options: TextDecodeOptions::default(),
                 stream: EventRx::from_receiver(rx),
             },
-            bagel_output_policy(),
+            OutputProcessorPolicy::None,
         );
         tokio::pin!(events);
         assert!(matches!(
             events.next().await,
-            Some(Ok(ServeEvent::Accepted { .. }))
+            Some(Ok(RequestOutput::Accepted { .. }))
         ));
         assert!(matches!(
             events.next().await,
-            Some(Ok(ServeEvent::Scheduled { .. }))
+            Some(Ok(RequestOutput::Scheduled { .. }))
         ));
 
-        tx.send(Event::TextToken {
+        tx.send(EngineCoreOutput::TextToken {
             id: b'a' as u32,
             logprob: None,
         })
@@ -1934,11 +1510,13 @@ mod tests {
         .unwrap();
         assert!(matches!(
             events.next().await,
-            Some(Ok(ServeEvent::TextDelta { text, .. })) if text == "a"
+            Some(Ok(RequestOutput::TextDelta { text, .. })) if text == "a"
         ));
 
-        tx.send(Event::ImageCommit { image_id: 0 }).await.unwrap();
-        tx.send(Event::ImageDone {
+        tx.send(EngineCoreOutput::ImageCommit { image_id: 0 })
+            .await
+            .unwrap();
+        tx.send(EngineCoreOutput::ImageDone {
             image_id: 0,
             height: 1,
             width: 1,
@@ -1955,7 +1533,7 @@ mod tests {
             "the image became public before a continuation token arrived"
         );
 
-        tx.send(Event::TextToken {
+        tx.send(EngineCoreOutput::TextToken {
             id: b'b' as u32,
             logprob: None,
         })
@@ -1963,11 +1541,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             events.next().await,
-            Some(Ok(ServeEvent::ImageCommit { .. }))
+            Some(Ok(RequestOutput::ImageCommit { .. }))
         ));
         assert!(matches!(
             events.next().await,
-            Some(Ok(ServeEvent::ImageDone { .. }))
+            Some(Ok(RequestOutput::ImageDone { .. }))
         ));
     }
 }

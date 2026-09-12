@@ -5,117 +5,70 @@
 //! the request and product identities needed to correlate completions.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-pub use uniserve_core::{ComponentDistribution, EntryConfig, ParallelConfig, SequenceParallel};
+pub use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
 
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
+use uniserve_worker_ipc::{ForwardMode, PipelineStage};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use uniserve_worker_ipc::{
-    BatchCommand, BlockTable, BufferAllocation, CachePageAllocation, DecodeRange, LatentParams,
-    NewRequest, OpCode, OpId, OpPayload, Operation, ProductPayload, RequestKey, RowGeometry,
-    Run as PhysicalRun, RunResult, WorkerInfo,
+    BatchCommand, BlockTable, BufferAllocation, CachePageAllocation, Computation, ComputationId,
+    DecodeRange, ForwardBatch, LatentParams, NewRequest, RequestKey, Run as PhysicalRun, RunResult,
+    ScheduledRequest, TensorPublication, WorkerInfo,
 };
 
-/// One logical operation and its scheduler-authoritative physical execution.
+/// Physical placement selected by the scheduler for a computation.
+///
+/// The computation itself is the shared IPC `ScheduledRequest`. These fields describe
+/// its worker and allocations, which are gathered into physical batch arrays.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Op {
-    /// Operation identity within the request lineage.
-    pub id: OpId,
-    /// Request lineage that owns the operation.
-    pub request: RequestKey,
-    /// Expected committed parent checkpoint.
-    pub parent: Option<uniserve_worker_ipc::Checkpoint>,
-    /// Selected Worker instance and computation entry.
-    pub target: (WorkerId, String),
-    /// Typed operation parameters.
-    pub payload: OpPayload,
-    /// KV page tables visible to the operation.
+pub struct RequestPlacement {
+    /// Worker routing stays outside the computation sent across IPC.
+    pub worker: WorkerId,
+    /// KV tables and newly acquired pages used by this computation.
     pub block_tables: Vec<BlockTable>,
-    /// KV pages allocated for this operation.
     pub new_cache_pages: Vec<CachePageAllocation>,
-    /// Per-operation row geometry in the physical forward.
-    pub forward_rows: Vec<RowGeometry>,
-    /// Latent arena execution for trajectory operations.
+    /// Rows use a local operation index until gathered into the physical batch.
+    pub forward: ForwardBatch,
     pub latent: Option<LatentParams>,
-    /// Output execution for media decoding.
     pub decode: Option<DecodeRange>,
-    /// Persistent output-buffer allocations.
+    /// Persistent output spans; request retirement retains ownership of readers.
     pub buffers: Vec<BufferAllocation>,
-}
-
-impl Op {
-    pub const fn kind(&self) -> OpCode {
-        self.payload.code
-    }
-
-    /// Binds a logical operation to its Worker entry before assigning physical resources.
-    pub fn new(operation: Operation, target: (WorkerId, String)) -> Self {
-        Self {
-            target,
-            id: operation.op_id,
-            request: operation.request_key,
-            parent: operation.parent,
-            payload: operation.payload,
-            block_tables: Vec::new(),
-            new_cache_pages: Vec::new(),
-            forward_rows: Vec::new(),
-            latent: None,
-            decode: None,
-            buffers: Vec::new(),
-        }
-    }
-
-    /// Returns the owning request lineage.
-    pub const fn request_key(&self) -> RequestKey {
-        self.request
-    }
-
-    /// Returns the operation identity.
-    pub const fn id(&self) -> OpId {
-        self.id
-    }
-
-    /// Returns the parsed command as an executable operation.
-    pub(crate) fn into_operation(self) -> Operation {
-        Operation {
-            request_key: self.request,
-            op_id: self.id,
-            parent: self.parent,
-            entry: self.target.1,
-            payload: self.payload,
-        }
-    }
 }
 
 /// One logical executor submission. Physical runs are derived only inside an executor.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Batch {
+pub struct ScheduleBatch {
     /// Logical batch identity used to correlate partial completions.
     pub id: u64,
-    /// Operations in scheduler submission order.
-    pub ops: Vec<Op>,
+    /// Shared computations paired with physical placement in scheduler order.
+    pub requests: Vec<(ScheduledRequest, RequestPlacement)>,
     /// Ordered lifecycle and resource commands.
     pub commands: Vec<BatchCommand>,
-    /// Host-resident input product payloads.
-    pub inline: Vec<ProductPayload>,
+    /// Published transfer descriptors supplied by an external storage owner.
+    pub input_transfers: Vec<TensorPublication>,
+    /// External cache publications consumed by explicit KV installation.
+    pub kv_inputs: Vec<uniserve_worker_ipc::KvTransfer>,
 }
 
-impl Batch {
+impl ScheduleBatch {
     /// Constructs a logical executor submission.
     pub fn new(
         id: u64,
-        ops: Vec<Op>,
+        requests: Vec<(ScheduledRequest, RequestPlacement)>,
         commands: Vec<BatchCommand>,
-        inline: Vec<ProductPayload>,
+        input_transfers: Vec<TensorPublication>,
     ) -> Self {
         Self {
             id,
-            ops,
+            requests,
             commands,
-            inline,
+            input_transfers,
+            kv_inputs: Vec::new(),
         }
     }
 
@@ -129,93 +82,87 @@ impl Batch {
 
     /// Removes unstarted work for terminated epochs while preserving independent operations.
     /// Their resource descriptions stay attached to the removed operations. Close commands
-    /// become physical retirement; unexecuted commits cannot select semantic state.
+    /// retain their physical retirement and reader obligations.
     pub(crate) fn retire_requests(
         &mut self,
         requests: &std::collections::HashSet<RequestKey>,
-    ) -> Vec<Op> {
-        let (retired, active): (Vec<_>, Vec<_>) = std::mem::take(&mut self.ops)
+    ) -> Vec<(ScheduledRequest, RequestPlacement)> {
+        let (retired, active): (Vec<_>, Vec<_>) = std::mem::take(&mut self.requests)
             .into_iter()
-            .partition(|op| requests.contains(&op.request));
-        self.ops = active;
+            .partition(|(op, _)| requests.contains(&op.request_key));
+        self.requests = active;
         self.commands.retain_mut(|command| {
             if !requests.contains(&command.request_key()) {
                 return true;
             }
-            match command {
-                BatchCommand::Start { .. } | BatchCommand::Commit { .. } => false,
-                BatchCommand::Finish {
-                    request_key,
-                    retained_buffers,
-                    ..
-                } => {
-                    *command = BatchCommand::Retire {
-                        request_key: *request_key,
-                        retained_buffers: std::mem::take(retained_buffers),
-                    };
-                    true
-                }
-                BatchCommand::Retire { .. } | BatchCommand::Free { .. } => true,
-            }
+            !matches!(command, BatchCommand::Start { .. })
         });
         let inputs = self
-            .ops
+            .requests
             .iter()
-            .flat_map(|op| op.payload.inputs.iter().chain(op.payload.predicate.iter()))
+            .flat_map(|(op, _)| op.tensor_inputs().chain(op.predicate.iter()))
             .collect::<std::collections::HashSet<_>>();
-        self.inline
+        self.input_transfers
             .retain(|payload| inputs.contains(&payload.product));
+        self.kv_inputs.retain(|publication| {
+            self.requests
+                .iter()
+                .any(|(operation, _)| operation.kv_input == Some(publication.source))
+        });
         retired
     }
 
     /// Validates operation identities, execution ownership, and command payloads.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.ops.is_empty() || !self.commands.is_empty(),
+            !self.requests.is_empty() || !self.commands.is_empty(),
             "logical batch must carry at least one operation or command"
         );
 
-        let mut requests = std::collections::HashSet::with_capacity(self.ops.len());
-        let mut identities = std::collections::HashSet::with_capacity(self.ops.len());
-        for op in &self.ops {
-            let operation = op.clone().into_operation();
+        let mut requests = std::collections::HashSet::with_capacity(self.requests.len());
+        let mut identities = std::collections::HashSet::with_capacity(self.requests.len());
+        for (operation, placement) in &self.requests {
             operation.validate()?;
-            requests.insert(op.request_key());
-            WorkerId::new(op.target.0.0.clone())?;
             anyhow::ensure!(
-                !op.target.1.is_empty(),
+                operation.op_id.batch_id == self.id,
+                "computation identity belongs to another logical batch"
+            );
+            requests.insert(operation.request_key);
+            WorkerId::new(placement.worker.0.clone())?;
+            anyhow::ensure!(
+                !operation.entry.is_empty(),
                 "operation requires a computation entry"
             );
             anyhow::ensure!(
-                identities.insert((op.request_key(), op.id())),
+                identities.insert(operation.op_id),
                 "logical batch repeats an operation identity"
             );
-            for table in &op.block_tables {
+            placement.forward.validate(1)?;
+            for table in &placement.block_tables {
                 table.validate()?;
             }
-            for pages in &op.new_cache_pages {
+            for pages in &placement.new_cache_pages {
                 pages.validate()?;
             }
-            if let Some(latent) = &op.latent {
+            if let Some(latent) = &placement.latent {
                 latent.validate()?;
                 anyhow::ensure!(
-                    (latent.request_key, latent.op_id) == (op.request_key(), op.id()),
+                    (latent.request_key, latent.op_id) == (operation.request_key, operation.op_id),
                     "logical operation carries another operation's latent execution"
                 );
             }
-            if let Some(decode) = &op.decode {
+            if let Some(decode) = &placement.decode {
                 decode.validate()?;
                 anyhow::ensure!(
-                    (decode.request_key, decode.op_id) == (op.request_key(), op.id()),
+                    (decode.request_key, decode.op_id) == (operation.request_key, operation.op_id),
                     "logical operation carries another operation's decode execution"
                 );
             }
-            for buffer in &op.buffers {
+            for buffer in &placement.buffers {
                 buffer.validate()?;
                 anyhow::ensure!(
                     operation
-                        .outputs()
-                        .iter()
+                        .buffer_outputs()
                         .any(|output| output.buffer_id() == buffer.buffer),
                     "logical operation carries a buffer execution for another output"
                 );
@@ -239,8 +186,11 @@ impl Batch {
             command.validate()?;
         }
 
-        for inline in &self.inline {
-            inline.validate()?;
+        for transfer in &self.input_transfers {
+            transfer.validate()?;
+        }
+        for publication in &self.kv_inputs {
+            publication.validate()?;
         }
         Ok(())
     }
@@ -303,32 +253,43 @@ impl ExecutorInfo {
 
         // Route-specific capacities contribute only when a pool implements the
         // corresponding operation family.
-        let routed = |variant: OpCode| {
+        let routed = |variant: Computation| {
             self.workers
                 .iter()
                 .find(|(_, info)| info.supported_ops.contains(&variant))
                 .map(|(_, info)| info)
         };
-        let mut kv_indices = [OpCode::ArExtend, OpCode::ArDecode, OpCode::ArVerify]
-            .into_iter()
-            .filter_map(|variant| {
-                self.workers
-                    .iter()
-                    .position(|(_, info)| info.supported_ops.contains(&variant))
-            })
-            .collect::<Vec<_>>();
+        let mut kv_indices = [
+            Computation::Forward(ForwardMode::Prefill),
+            Computation::Forward(ForwardMode::Decode),
+            Computation::Forward(ForwardMode::Verify),
+        ]
+        .into_iter()
+        .filter_map(|variant| {
+            self.workers
+                .iter()
+                .position(|(_, info)| info.supported_ops.contains(&variant))
+        })
+        .collect::<Vec<_>>();
         kv_indices.sort_unstable();
         kv_indices.dedup();
 
         let seed_index = kv_indices.first().copied().unwrap_or(0);
         let mut merged = self.workers[seed_index].1.clone();
-        merged.media_plan = routed(OpCode::DiffusionStep).and_then(|info| info.media_plan.clone());
+        merged.pipeline_components = routed(Computation::Pipeline(PipelineStage::Denoising))
+            .map(|info| info.pipeline_components.clone())
+            .unwrap_or_default();
+        merged.num_inference_steps = routed(Computation::Pipeline(PipelineStage::Denoising))
+            .map_or(0, |info| info.num_inference_steps);
         anyhow::ensure!(
-            self.workers.iter().all(|(_, info)| !info
-                .supported_ops
-                .contains(&OpCode::DiffusionStep)
-                || info.media_plan == merged.media_plan),
-            "workers disagree on the numerical media plan"
+            self.workers.iter().all(|(_, info)| {
+                !info
+                    .supported_ops
+                    .contains(&Computation::Pipeline(PipelineStage::Denoising))
+                    || (info.pipeline_components == merged.pipeline_components
+                        && info.num_inference_steps == merged.num_inference_steps)
+            }),
+            "workers disagree on pipeline components or diffusion steps"
         );
         // Every KV stage must agree on layout. Capacity is the narrowest pool
         // because a lineage may traverse all routed KV stages.
@@ -376,7 +337,7 @@ impl ExecutorInfo {
         }
 
         // Aggregate global limits conservatively across all physical pools.
-        merged.supported_ops = OpCode::ALL
+        merged.supported_ops = Computation::ALL
             .into_iter()
             .filter(|variant| routed(*variant).is_some())
             .collect();
@@ -414,7 +375,7 @@ impl ExecutorInfo {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
-        let flow = routed(OpCode::DiffusionStep);
+        let flow = routed(Computation::Pipeline(PipelineStage::Denoising));
         merged.latent_page_units = flow.map_or(0, |info| info.latent_page_units);
         merged.latent_pages = flow.map_or(0, |info| info.latent_pages);
         merged.buffer_pool_bytes = self
@@ -430,12 +391,61 @@ impl ExecutorInfo {
 }
 
 /// One operation result returned from an executor-owned physical run.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct OpResult {
-    /// Validated completion record returned by the worker.
+    /// Validated completion values; media storage is carried by `media` below.
     pub output: uniserve_worker_ipc::ModelOutput,
-    /// Products published by the completed operation.
-    pub products: Vec<ProductPayload>,
+    /// Claimed immutable output storage, or its request-local acquisition error.
+    pub media: Result<Option<Arc<uniserve_core::SharedMedia>>, String>,
+}
+
+/// A decoded physical result that owns media before routing or rank validation.
+#[derive(Debug)]
+pub struct WorkerResult {
+    pub batch_id: u64,
+    pub run_id: u64,
+    pub results: Vec<OpResult>,
+    /// Tensor publications remain owned by the executor's transfer consumers.
+    pub products: Vec<TensorPublication>,
+    pub registration: uniserve_worker_ipc::RegistrationAck,
+    pub worker_exec_us: Option<u64>,
+    pub forward_stats: Option<uniserve_worker_ipc::WorkerForwardStats>,
+    pub done: bool,
+}
+
+impl WorkerResult {
+    /// Claims all media before any fallible correlation or aggregation step.
+    /// Acquisition failure belongs to the operation; independent results remain usable.
+    pub(crate) fn receive(report: RunResult) -> Self {
+        let results = report
+            .completions
+            .into_iter()
+            .map(|mut output| {
+                let media = output
+                    .media_output
+                    .take()
+                    .map(|media| {
+                        let uniserve_worker_ipc::ArtifactHandle::PosixShm { name } = media.handle;
+                        // SAFETY: publication transfers immutable storage after the writer closes.
+                        // The mapping owns the bytes even if this result is rejected downstream.
+                        unsafe { uniserve_core::SharedMedia::open(&name, media.bytes) }
+                            .map(Arc::new)
+                    })
+                    .transpose();
+                OpResult { output, media }
+            })
+            .collect();
+        Self {
+            batch_id: report.batch_id,
+            run_id: report.run_id,
+            results,
+            products: report.products,
+            registration: report.registration,
+            worker_exec_us: report.worker_exec_us,
+            forward_stats: report.forward_stats,
+            done: report.done,
+        }
+    }
 }
 
 /// Distinguishes applied control from physical retirement and unacknowledged failure.
@@ -458,7 +468,7 @@ pub struct CommandResult {
 }
 
 /// One independently ready subset of a logical batch.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct BatchResult {
     /// Logical batch identity assigned at submission.
     pub batch_id: u64,
@@ -476,11 +486,10 @@ pub struct BatchResult {
 
 /// Resolves and validates one logical completion against its submitted operation.
 pub(crate) fn logical_result(
-    report: RunResult,
+    report: WorkerResult,
     done: bool,
     commands: &[BatchCommand],
 ) -> BatchResult {
-    let mut results = Vec::new();
     let mut worker_exec_us = Vec::new();
     let mut forward_stats = Vec::new();
     if let Some(value) = report.worker_exec_us {
@@ -489,21 +498,9 @@ pub(crate) fn logical_result(
     if let Some(value) = report.forward_stats {
         forward_stats.push(value);
     }
-    for output in report.completions {
-        let products = report
-            .products
-            .iter()
-            .filter(|payload| {
-                payload.product.request_key == output.request_key
-                    && payload.product.producer_op_id == output.op_id
-            })
-            .cloned()
-            .collect();
-        results.push(OpResult { output, products });
-    }
     BatchResult {
         batch_id: report.batch_id,
-        results,
+        results: report.results,
         command_results: done
             .then(|| {
                 commands
@@ -524,182 +521,6 @@ pub(crate) fn logical_result(
     }
 }
 
-struct PendingLogicalResult {
-    remaining: std::collections::HashMap<(RequestKey, OpId), OpCode>,
-    commands: Vec<BatchCommand>,
-    command_outcomes: std::collections::HashMap<u32, CommandOutcome>,
-}
-
-/// Executor-local reconciliation from physical partial reports to logical batch results.
-#[derive(Default)]
-pub(crate) struct LogicalResultTracker {
-    pending: std::collections::HashMap<u64, PendingLogicalResult>,
-}
-
-impl LogicalResultTracker {
-    /// Lifecycle commands awaiting this batch's physical acknowledgement.
-    pub(crate) fn commands(&self, batch_id: u64) -> &[BatchCommand] {
-        self.pending
-            .get(&batch_id)
-            .map_or(&[], |pending| &pending.commands)
-    }
-
-    /// Registers the operation executor.
-    pub(crate) fn register(&mut self, batch: &Batch) -> anyhow::Result<()> {
-        let state = PendingLogicalResult {
-            remaining: batch
-                .ops
-                .iter()
-                .map(|op| ((op.request_key(), op.id()), op.kind()))
-                .collect(),
-            commands: batch.commands.clone(),
-            command_outcomes: std::collections::HashMap::new(),
-        };
-        anyhow::ensure!(
-            self.pending.insert(batch.id, state).is_none(),
-            "logical batch {} is already registered",
-            batch.id
-        );
-        Ok(())
-    }
-
-    /// Unregisters the operation executor.
-    pub(crate) fn unregister(&mut self, batch_id: u64) {
-        self.pending.remove(&batch_id);
-    }
-
-    /// Retires work that cannot return after endpoint loss or cancellation before dispatch.
-    /// This is host reconciliation, not a fabricated device completion.
-    pub(crate) fn retire(
-        &mut self,
-        batch_id: u64,
-        request: RequestKey,
-        op: OpId,
-    ) -> anyhow::Result<()> {
-        let state = self
-            .pending
-            .get_mut(&batch_id)
-            .context("retired operation has no logical batch")?;
-        anyhow::ensure!(
-            state.remaining.remove(&(request, op)).is_some(),
-            "retired operation is unknown or already completed"
-        );
-        Ok(())
-    }
-
-    /// Record affected controls without replacing a prior failed acknowledgement.
-    pub(crate) fn retire_commands(
-        &mut self,
-        batch_id: u64,
-        requests: &std::collections::HashSet<RequestKey>,
-    ) {
-        self.set_command_outcome(batch_id, requests, CommandOutcome::Retired);
-    }
-
-    /// A rejected command has not retired storage even though its run is terminal.
-    pub(crate) fn fail_commands(
-        &mut self,
-        batch_id: u64,
-        requests: &std::collections::HashSet<RequestKey>,
-    ) {
-        self.set_command_outcome(batch_id, requests, CommandOutcome::Failed);
-    }
-
-    fn set_command_outcome(
-        &mut self,
-        batch_id: u64,
-        requests: &std::collections::HashSet<RequestKey>,
-        outcome: CommandOutcome,
-    ) {
-        if let Some(state) = self.pending.get_mut(&batch_id) {
-            for (index, command) in state
-                .commands
-                .iter()
-                .filter(|command| !matches!(command, BatchCommand::Start { .. }))
-                .enumerate()
-            {
-                if requests.contains(&command.request_key()) {
-                    let current = state
-                        .command_outcomes
-                        .entry(index as u32)
-                        .or_insert(outcome);
-                    if outcome == CommandOutcome::Failed {
-                        *current = outcome;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Failed releases still own their physical routes and allocations.
-    pub(crate) fn failed_commands(&self, batch_id: u64) -> Vec<BatchCommand> {
-        self.pending
-            .get(&batch_id)
-            .into_iter()
-            .flat_map(|state| {
-                state
-                    .commands
-                    .iter()
-                    .filter(|command| !matches!(command, BatchCommand::Start { .. }))
-                    .enumerate()
-                    .filter_map(|(index, command)| {
-                        (state.command_outcomes.get(&(index as u32))
-                            == Some(&CommandOutcome::Failed))
-                        .then(|| command.clone())
-                    })
-            })
-            .collect()
-    }
-
-    /// Validates one physical result and merges it into its pending logical batch.
-    pub(crate) fn apply(&mut self, report: RunResult) -> anyhow::Result<BatchResult> {
-        report.validate()?;
-        let state = self.pending.get_mut(&report.batch_id).ok_or_else(|| {
-            anyhow::anyhow!(
-                "physical result names unknown logical batch {}",
-                report.batch_id
-            )
-        })?;
-        for output in report.completions() {
-            let kind = state
-                .remaining
-                .remove(&(output.request_key, output.op_id))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "physical result repeats or invents operation {:?}/{} in logical batch {}",
-                        output.request_key,
-                        output.op_id.0,
-                        report.batch_id
-                    )
-                })?;
-            anyhow::ensure!(
-                output.payload.family_matches(kind),
-                "physical result payload family disagrees with operation {:?}/{}",
-                output.request_key,
-                output.op_id.0
-            );
-        }
-        anyhow::ensure!(
-            !report.done || state.remaining.is_empty(),
-            "physical run ended before every logical operation completed"
-        );
-        let done = report.done && state.remaining.is_empty();
-        let commands = state.commands.clone();
-        let mut result = logical_result(report, done, &commands);
-        for command in &mut result.command_results {
-            command.outcome = state
-                .command_outcomes
-                .get(&command.command_index)
-                .copied()
-                .unwrap_or(CommandOutcome::Applied);
-        }
-        if done {
-            self.pending.remove(&result.batch_id);
-        }
-        Ok(result)
-    }
-}
-
 /// Dynamic error returned while polling or administering an executor.
 pub type ExecutorError = anyhow::Error;
 
@@ -708,7 +529,7 @@ pub type ExecutorError = anyhow::Error;
 pub enum ExecutorSubmitError {
     #[error("executor queue is full")]
     /// Returns ownership of a batch rejected by bounded queue capacity.
-    WouldBlock(Batch),
+    WouldBlock(ScheduleBatch),
     #[error(transparent)]
     /// Reports a terminal submission failure.
     Failed(#[from] anyhow::Error),
@@ -773,7 +594,7 @@ impl std::fmt::Display for TransferBackend {
 }
 
 impl FromStr for TransferBackend {
-    type Err = TransportMapError;
+    type Err = TransferConfigError;
 
     /// Parses the value from its string representation.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -781,7 +602,7 @@ impl FromStr for TransferBackend {
             "local" => Ok(Self::Local),
             "shm" => Ok(Self::Shm),
             "cuda_ipc" => Ok(Self::CudaIpc),
-            _ => Err(TransportMapError::message(format!(
+            _ => Err(TransferConfigError::message(format!(
                 "unsupported transfer backend {value:?}"
             ))),
         }
@@ -805,12 +626,12 @@ pub struct TransferEdge {
 
 /// Per-edge local data-plane transfer selection (`--transfer`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransportMap {
+pub struct TransferConfig {
     /// Explicit directed transfer edges.
     pub edges: Vec<TransferEdge>,
 }
 
-impl TransportMap {
+impl TransferConfig {
     /// Binds missing intra-Worker edges from the configured physical endpoints.
     ///
     /// Each rank is a separate process. Its self-edge uses local storage; CUDA
@@ -896,81 +717,80 @@ impl TransportMap {
     /// Select explicitly bound locations for a rank before admitting device work.
     pub(crate) fn bind_inputs(
         &self,
-        products: &mut [uniserve_worker_ipc::ProductPayload],
+        products: &mut [uniserve_worker_ipc::TensorPublication],
+        kv_inputs: &mut [uniserve_worker_ipc::KvTransfer],
         destination: &uniserve_worker_ipc::WorkerEndpoint,
     ) -> anyhow::Result<()> {
-        use uniserve_worker_ipc::{InlineValue, TransferHandle, TransferTransport};
+        use uniserve_worker_ipc::{TransferHandle, TransferTransport};
 
-        for payload in products {
-            let InlineValue::Transfer(handle) = &mut payload.value else {
-                continue;
-            };
-            let tensors = match handle {
-                TransferHandle::Encoder { tensor, .. }
-                | TransferHandle::DeviceProduct { tensor, .. }
-                | TransferHandle::Latent { tensor, .. } => std::slice::from_mut(tensor),
-                TransferHandle::Kv { tensors, .. } => tensors.as_mut_slice(),
-            };
-            for tensor in tensors {
-                tensor.locations.retain(|location| {
-                    let selected = self
-                        .edges
-                        .iter()
-                        .find(|edge| {
-                            edge.source_worker.0 == location.source.worker_id
-                                && edge
-                                    .source_rank
-                                    .is_none_or(|rank| rank == location.source.rank)
-                                && edge.destination_worker.0 == destination.worker_id
-                                && edge
-                                    .destination_rank
-                                    .is_none_or(|rank| rank == destination.rank)
-                        })
-                        .map(|edge| edge.transport)
-                        .or_else(|| {
-                            (&location.source == destination).then_some(TransferBackend::Local)
-                        });
-                    matches!(
-                        (selected, &location.transport),
-                        (
-                            Some(TransferBackend::Local),
-                            TransferTransport::Local { .. }
-                        ) | (
-                            Some(TransferBackend::Shm),
-                            TransferTransport::PosixShm { .. }
-                        ) | (
-                            Some(TransferBackend::CudaIpc),
-                            TransferTransport::CudaIpc { .. }
-                        )
+        let tensors = products
+            .iter_mut()
+            .map(|payload| &mut payload.value)
+            .flat_map(TransferHandle::tensors_mut)
+            .chain(
+                kv_inputs
+                    .iter_mut()
+                    .flat_map(|publication| &mut publication.tensors),
+            );
+        for tensor in tensors {
+            tensor.locations.retain(|location| {
+                let selected = self
+                    .edges
+                    .iter()
+                    .find(|edge| {
+                        edge.source_worker.0 == location.source.worker_id
+                            && edge
+                                .source_rank
+                                .is_none_or(|rank| rank == location.source.rank)
+                            && edge.destination_worker.0 == destination.worker_id
+                            && edge
+                                .destination_rank
+                                .is_none_or(|rank| rank == destination.rank)
+                    })
+                    .map(|edge| edge.transport)
+                    .or_else(|| {
+                        (&location.source == destination).then_some(TransferBackend::Local)
+                    });
+                matches!(
+                    (selected, &location.transport),
+                    (
+                        Some(TransferBackend::Local),
+                        TransferTransport::Local { .. }
+                    ) | (
+                        Some(TransferBackend::Shm),
+                        TransferTransport::PosixShm { .. }
+                    ) | (
+                        Some(TransferBackend::CudaIpc),
+                        TransferTransport::CudaIpc { .. }
                     )
-                });
-                anyhow::ensure!(
-                    !tensor.locations.is_empty(),
-                    "product has no location on a configured edge to {}:{}",
-                    destination.worker_id,
-                    destination.rank,
-                );
-            }
+                )
+            });
+            anyhow::ensure!(
+                !tensor.locations.is_empty(),
+                "product has no location on a configured edge to {}:{}",
+                destination.worker_id,
+                destination.rank,
+            );
         }
         Ok(())
     }
 
     /// Parses `source[:rank]->destination[:rank]=backend` directed bindings.
-    pub fn parse(s: &str) -> Result<Self, TransportMapError> {
+    pub fn parse(s: &str) -> Result<Self, TransferConfigError> {
         let mut edges = Vec::new();
 
-        let endpoint = |text: &str| -> Result<(WorkerId, Option<u32>), TransportMapError> {
+        let endpoint = |text: &str| -> Result<(WorkerId, Option<u32>), TransferConfigError> {
             let (worker, rank) = match text.trim().split_once(':') {
                 Some((worker, rank)) => (
                     worker,
                     Some(rank.parse::<u32>().map_err(|_| {
-                        TransportMapError::message("transfer rank must be a nonnegative integer")
+                        TransferConfigError::message("transfer rank must be a nonnegative integer")
                     })?),
                 ),
                 None => (text.trim(), None),
             };
             let worker = WorkerId::new(worker).map_err(|error| {
-                TransportMapError::message(format!("invalid transfer worker: {error}"))
+                TransferConfigError::message(format!("invalid transfer worker: {error}"))
             })?;
             Ok((worker, rank))
         };
@@ -979,10 +799,12 @@ impl TransportMap {
             // Parse and validate both endpoint identities before accepting the
             // transport so errors remain attributable to one edge.
             let (edge, backend) = entry.split_once('=').ok_or_else(|| {
-                TransportMapError::message(format!("transfer entry {entry:?} must be edge=backend"))
+                TransferConfigError::message(format!(
+                    "transfer entry {entry:?} must be edge=backend"
+                ))
             })?;
             let (src, dst) = edge.split_once("->").ok_or_else(|| {
-                TransportMapError::message(format!("transfer edge {edge:?} must be src->dst"))
+                TransferConfigError::message(format!("transfer edge {edge:?} must be src->dst"))
             })?;
             let (src, source_rank) = endpoint(src)?;
             let (dst, destination_rank) = endpoint(dst)?;
@@ -998,7 +820,7 @@ impl TransportMap {
                         || destination_rank.is_none()
                         || existing.destination_rank == destination_rank)
             }) {
-                return Err(TransportMapError::message(format!(
+                return Err(TransferConfigError::message(format!(
                     "duplicate transfer edge {edge:?}"
                 )));
             }
@@ -1016,8 +838,8 @@ impl TransportMap {
     }
 }
 
-impl FromStr for TransportMap {
-    type Err = TransportMapError;
+impl FromStr for TransferConfig {
+    type Err = TransferConfigError;
 
     /// Parses the value from its string representation.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -1028,9 +850,9 @@ impl FromStr for TransportMap {
 /// Error returned for an invalid transfer-transport mapping.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
-pub struct TransportMapError(String);
+pub struct TransferConfigError(String);
 
-impl TransportMapError {
+impl TransferConfigError {
     /// Returns the human-readable error message.
     fn message(message: impl Into<String>) -> Self {
         Self(message.into())
@@ -1076,9 +898,9 @@ pub struct WorkerFailure {
     /// Request epochs affected by the failed work or invalidated allocations.
     pub requests: Vec<RequestKey>,
     /// Accepted logical operations that will no longer produce a device completion.
-    pub retired: Vec<(u64, RequestKey, OpId)>,
-    /// Products whose published locations no longer cover their complete logical value.
-    pub products: Vec<uniserve_worker_ipc::ProductRef>,
+    pub retired: Vec<(u64, RequestKey, ComputationId)>,
+    /// Buffers whose published locations no longer cover their complete logical value.
+    pub buffers: Vec<uniserve_worker_ipc::BufferId>,
     /// Classified execution failure, if the ranks returned one before retirement.
     pub execution: Option<WorkerExecError>,
     /// Human-readable failure description.
@@ -1090,47 +912,26 @@ pub(crate) fn physical_run(
     batch_id: u64,
     run_id: u64,
     collective_seq: u64,
-    ops: Vec<Op>,
+    requests: Vec<(ScheduledRequest, RequestPlacement)>,
     commands: Vec<BatchCommand>,
-    inline: Vec<ProductPayload>,
+    input_products: Vec<TensorPublication>,
+    kv_inputs: Vec<uniserve_worker_ipc::KvTransfer>,
 ) -> anyhow::Result<PhysicalRun> {
     let mut block_tables = Vec::new();
     let mut new_cache_pages = Vec::new();
-    let mut forward_rows = Vec::new();
+    let mut forward = ForwardBatch::default();
     let mut latent_params = Vec::new();
     let mut decode_ranges = Vec::new();
     let mut buffer_allocations = Vec::new();
-    let mut operations = Vec::with_capacity(ops.len());
-    for (operation_index, op) in ops.into_iter().enumerate() {
-        let Op {
-            id,
-            request,
-            parent,
-            payload,
-            block_tables: op_block_tables,
-            new_cache_pages: op_new_cache_pages,
-            forward_rows: op_forward_rows,
-            latent,
-            decode,
-            buffers,
-            target,
-        } = op;
-        block_tables.extend(op_block_tables);
-        new_cache_pages.extend(op_new_cache_pages);
-        forward_rows.extend(op_forward_rows.into_iter().map(|mut row| {
-            row.operation_index = operation_index as u32;
-            row
-        }));
-        latent_params.extend(latent);
-        decode_ranges.extend(decode);
-        buffer_allocations.extend(buffers);
-        operations.push(Operation {
-            request_key: request,
-            op_id: id,
-            parent,
-            entry: target.1,
-            payload,
-        });
+    let mut operations = Vec::with_capacity(requests.len());
+    for (operation_index, (operation, placement)) in requests.into_iter().enumerate() {
+        block_tables.extend(placement.block_tables);
+        new_cache_pages.extend(placement.new_cache_pages);
+        forward.append(placement.forward, operation_index as u32);
+        latent_params.extend(placement.latent);
+        decode_ranges.extend(placement.decode);
+        buffer_allocations.extend(placement.buffers);
+        operations.push(operation);
     }
     let run = PhysicalRun {
         batch_id,
@@ -1139,33 +940,16 @@ pub(crate) fn physical_run(
         operations,
         block_tables,
         new_cache_pages,
-        forward_rows,
+        forward,
         latent_params,
         decode_ranges,
         buffer_allocations,
         commands,
-        input_products: inline,
+        input_products,
+        kv_inputs,
     };
     run.validate()?;
     Ok(run)
-}
-
-/// Lowers one logical batch into the physical worker framing without changing its work shape.
-pub(crate) fn lower_batch(
-    batch: &Batch,
-    next_collective_seq: &mut u64,
-) -> anyhow::Result<PhysicalRun> {
-    batch.validate()?;
-    let collective_seq = (*next_collective_seq).max(1);
-    *next_collective_seq = collective_seq.saturating_add(1);
-    physical_run(
-        batch.id,
-        batch.id,
-        collective_seq,
-        batch.ops.clone(),
-        batch.commands.clone(),
-        batch.inline.clone(),
-    )
 }
 
 /// The asynchronous, pipelined boundary the scheduler drives.
@@ -1179,7 +963,7 @@ pub trait Executor: Send {
     /// Whether every physical owner of a lifecycle command can accept its submission.
     fn command_has_capacity(&self, command: &BatchCommand) -> bool;
     /// Submits one logical batch without blocking for capacity.
-    fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError>;
+    fn submit(&mut self, batch: ScheduleBatch) -> Result<(), ExecutorSubmitError>;
     /// Waits up to `timeout` for one partial or terminal batch result.
     fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError>;
     /// Closes the executor and its physical workers.
@@ -1192,7 +976,7 @@ mod tests {
 
     #[test]
     fn transport_map_parses_edges() {
-        let t = TransportMap::parse("encoder->prefill=cuda_ipc,prefill->decode=shm").unwrap();
+        let t = TransferConfig::parse("encoder->prefill=cuda_ipc,prefill->decode=shm").unwrap();
         assert_eq!(
             t.edges[0],
             TransferEdge {
@@ -1204,16 +988,17 @@ mod tests {
             }
         );
         assert_eq!(t.edges[1].transport, TransferBackend::Shm);
-        assert!(TransportMap::parse("bad-entry").is_err());
-        assert!(TransportMap::parse("prefill->decode=tcp").is_err());
-        assert!(TransportMap::parse("prefill->decode=shm,prefill->decode=cuda_ipc").is_err());
-        let split = TransportMap::parse("encoder:0->denoiser:0=shm,encoder:0->denoiser:1=cuda_ipc")
-            .unwrap();
+        assert!(TransferConfig::parse("bad-entry").is_err());
+        assert!(TransferConfig::parse("prefill->decode=tcp").is_err());
+        assert!(TransferConfig::parse("prefill->decode=shm,prefill->decode=cuda_ipc").is_err());
+        let split =
+            TransferConfig::parse("encoder:0->denoiser:0=shm,encoder:0->denoiser:1=cuda_ipc")
+                .unwrap();
         assert_eq!(split.edges[1].source_rank, Some(0));
         assert_eq!(split.edges[1].destination_rank, Some(1));
-        assert!(TransportMap::parse("encoder:x->denoiser=shm").is_err());
+        assert!(TransferConfig::parse("encoder:x->denoiser=shm").is_err());
         assert!(
-            TransportMap::parse("encoder->denoiser=shm,encoder:0->denoiser:1=cuda_ipc").is_err()
+            TransferConfig::parse("encoder->denoiser=shm,encoder:0->denoiser:1=cuda_ipc").is_err()
         );
     }
 }

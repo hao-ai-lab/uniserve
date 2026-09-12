@@ -13,30 +13,26 @@ from typing import Any, Final, cast
 
 import torch
 
+from uniserve_worker.execution.batch import Computation, ComputationId
+
 from ..execution.batch import (
-    ArResult,
-    Checkpoint,
     CompletionState,
-    DiffusionResult,
-    EncoderResult,
     ErrorCode,
     FinishFlags,
-    FixedCheckpoint,
+    KvTransfer,
     LaneResult,
-    LogicalLengths,
     MediaOutput,
     ModelOutput,
-    OpCode,
     OpStatus,
+    PosixShmArtifact,
     RequestKey,
     RunResult,
     TimingCounters,
-    TokenSpan,
-    TransferResult,
 )
-from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
+from ..foundation.errors import WorkerError, WorkerErrorCode, resource_error
 from ..foundation.resources import close_resources
 from ..media.codec import uint8_image_to_png_base64_bytes
+from ..media.storage import publish_media_bytes
 from ..profiling import profile_range, timing_events_enabled
 from ..runtime.cpu import CpuTaskReservation
 from ..runtime.device import canonical_device
@@ -46,10 +42,9 @@ from ..runtime.request import RequestRuntime
 __all__ = [
     "CpuJob",
     "PendingOutput",
-    "ImagePayload",
+    "ImageEncoding",
     "LogprobCapture",
     "LogprobOutputRow",
-    "LogprobPayload",
     "SamplingCapture",
     "SamplingOutputRow",
     "ByteCapture",
@@ -839,20 +834,20 @@ class SamplingOutputRow:
 
         return self.capture.ready()
 
-    def materialize(self) -> tuple[tuple[int, ...], int, int]:
-        """Combine accepted draft tokens with the sampled continuation and return its committed extent."""
+    def materialize(self) -> tuple[int, ...]:
+        """Return accepted draft tokens and the continuation unless the accepted prefix terminates."""
 
         token = self.capture.token(int(self.index))
         accepted = self.capture.accepted(int(self.index))
         if not self.draft_tokens:
-            return (token,), 1, accepted
+            return (token,)
         if accepted < 0 or accepted > len(self.draft_tokens):
             raise RuntimeError("speculative acceptance count is outside the draft span")
         if self.terminal_prefix is not None and accepted >= self.terminal_prefix:
             tokens = self.draft_tokens[:accepted]
         else:
             tokens = (*self.draft_tokens[:accepted], token)
-        return tokens, len(tokens), accepted
+        return tokens
 
 
 class LogprobCapture:
@@ -1132,72 +1127,7 @@ class CpuJob:
             self._release_after_capture()
 
 
-class LogprobPayload:
-    """Owns asynchronously copied log-probability entries until wire serialization."""
-
-    __slots__ = ("selected", "prompt", "_value")
-
-    def __init__(
-        self,
-        selected: LogprobOutputRow | None,
-        prompt: tuple[LogprobOutputRow, ...] = (),
-    ) -> None:
-        """Collect selected and prompt log-probability rows for bounded serialization."""
-
-        self.selected = selected
-        self.prompt = prompt
-        self._value: bytes | None = None
-
-    def ready(self) -> bool:
-        """Return whether every selected and prompt log-probability capture is query-ready."""
-
-        if self._value is not None:
-            return True
-        return (self.selected is None or self.selected.ready()) and all(
-            position.ready() for position in self.prompt
-        )
-
-    def max_encoded_bytes(self) -> int:
-        """Calculate the exact upper bound for the binary log-probability payload."""
-
-        return (
-            (5 if self.selected is not None else 1)
-            + 4
-            + 12 * (0 if self.selected is None else self.selected.max_entries())
-            + 4
-            + sum(4 + 12 * position.max_entries() for position in self.prompt)
-        )
-
-    def finalize(self) -> bytes:
-        """Serialize selected and prompt log probabilities into the bounded binary wire format."""
-
-        if self._value is not None:
-            return self._value
-        if not self.ready():
-            raise RuntimeError("logprob payload was observed before query-ready")
-        selected = None if self.selected is None else self.selected.finalize()
-        logprob = None if selected is None else selected[0]
-        top = () if selected is None else selected[1]
-        out = bytearray(b"\x00" if logprob is None else b"\x01" + struct.pack("<f", logprob))
-        out += struct.pack("<I", len(top))
-        for token_id, value, rank in top:
-            out += struct.pack("<IfI", int(token_id), float(value), int(rank))
-        out += struct.pack("<I", len(self.prompt))
-        for position in self.prompt:
-            entries = position.finalize()[1]
-            out += struct.pack("<I", len(entries))
-            for token_id, value, rank in entries:
-                out += struct.pack("<IfI", int(token_id), float(value), int(rank))
-        self._value = bytes(out)
-        return self._value
-
-    def __bytes__(self) -> bytes:
-        """Serialize captured log-probability records to their binary payload."""
-
-        return self.finalize()
-
-
-class ImagePayload:
+class ImageEncoding:
     """Pinned D2H image capture followed by bounded asynchronous PNG encoding."""
 
     __slots__ = (
@@ -1242,11 +1172,6 @@ class ImagePayload:
                 return True
         return bool(self._future.done())
 
-    def max_encoded_bytes(self) -> int:
-        """Expose the byte capacity reserved for the encoded image payload."""
-
-        return self.max_bytes
-
     def finalize(self) -> bytes:
         """Return encoded image bytes, materializing the deferred host result when necessary."""
 
@@ -1262,14 +1187,9 @@ class ImagePayload:
         if not isinstance(value, bytes) or not value:
             raise RuntimeError("image encoding task produced an invalid payload")
         if len(value) > self.max_bytes:
-            raise RuntimeError("encoded image exceeds its registered product byte bound")
+            raise RuntimeError("encoded image exceeds its registered byte bound")
         self._value = value
         return self._value
-
-    def __bytes__(self) -> bytes:
-        """Return the encoded image artifact bytes."""
-
-        return self.finalize()
 
     def abandon(self) -> None:
         """Release encoding admission when its completion will not be consumed."""
@@ -1282,20 +1202,20 @@ class OutputRecord:
     """One unresolved output row retained outside the public wire model."""
 
     request_key: RequestKey
-    op_id: int
-    kind: OpCode
+    op_id: ComputationId
+    kind: Computation
     completion_slot_generation: int
     status: OpStatus
-    selected_point: int
-    logical_lengths: LogicalLengths
-    token_span: TokenSpan
+    runtime: RequestRuntime
     committed_tokens: tuple[int, ...]
     sampling: SamplingOutputRow | None
+    logprobs: LogprobOutputRow | None
+    prompt_logprobs: tuple[LogprobOutputRow, ...]
     finish_flags: FinishFlags
     product_generations: tuple[int, ...]
     error_code: ErrorCode | None
-    next_cursor: int = 0
-    done: bool = False
+
+    kv_output: KvTransfer | None = None
 
 
 class PendingOutput:
@@ -1313,10 +1233,10 @@ class PendingOutput:
         "_invalid_sampling",
         "_predicated",
         "_predicated_parent",
-        "_selected_point",
         "_selected_runtime",
         "_resolved_callback",
         "_completion_tasks",
+        "_reports_output",
         "_completion_error",
         "_media_output",
         "_value",
@@ -1327,12 +1247,12 @@ class PendingOutput:
         parent: CompletionState | None,
         buffer: OutputBuffer,
         row: int,
-        predicated_parent: Callable[[], tuple[Checkpoint | None, RequestRuntime]],
+        predicated_parent: Callable[[], RequestRuntime],
         *,
         status: OpStatus,
-        selected_point: int,
+        reports_output: bool,
         resolved_callback: Callable[[ModelOutput], None] | None = None,
-        completion_tasks: tuple[CpuJob | ImagePayload | LogprobPayload, ...] = (),
+        completion_tasks: tuple[CpuJob | ImageEncoding | LogprobOutputRow, ...] = (),
     ) -> None:
         """Bind deferred device, CPU, transport, and media work to one completion record."""
 
@@ -1346,13 +1266,11 @@ class PendingOutput:
         self._observed = False
         self._invalid_sampling = False
         self._predicated = status is OpStatus.PREDICATED
-        self._predicated_parent: Callable[[], tuple[Checkpoint | None, RequestRuntime]] | None = (
-            predicated_parent
-        )
-        self._selected_point = int(selected_point)
+        self._predicated_parent: Callable[[], RequestRuntime] | None = predicated_parent
         self._selected_runtime: RequestRuntime | None = None
         self._resolved_callback = resolved_callback
         self._completion_tasks = completion_tasks
+        self._reports_output = reports_output
         self._completion_error = False
         self._media_output: MediaOutput | None = None
         self._value: ModelOutput | None = None
@@ -1366,8 +1284,6 @@ class PendingOutput:
             raise RuntimeError("completion record generation does not match its output buffer")
         if (record.status is OpStatus.PREDICATED) != self._predicated:
             raise RuntimeError("completion record status changed during binding")
-        if int(record.selected_point) != int(self._selected_point):
-            raise RuntimeError("completion selected point changed during binding")
         self._record = record
         return self
 
@@ -1380,7 +1296,7 @@ class PendingOutput:
         return self._record.request_key
 
     @property
-    def op_id(self) -> int:
+    def op_id(self) -> ComputationId:
         """Identify the operation within the bound request generation."""
 
         if self._record is None:
@@ -1409,7 +1325,9 @@ class PendingOutput:
         for task in self._completion_tasks:
             if not task.ready():
                 return False
-        return True
+        if self._record.logprobs is not None and not self._record.logprobs.ready():
+            return False
+        return all(position.ready() for position in self._record.prompt_logprobs)
 
     def finalize(self) -> ModelOutput:
         """Materialize one operation result, publish payload handles, and attach measured timing."""
@@ -1430,10 +1348,20 @@ class PendingOutput:
                 try:
                     for task in self._completion_tasks:
                         result = task.finalize()
+                        if isinstance(task, ImageEncoding) and self._reports_output:
+                            payload = cast(bytes, result)
+                            result = MediaOutput(
+                                handle=PosixShmArtifact(name=publish_media_bytes(payload)),
+                                bytes=len(payload),
+                            )
                         if isinstance(result, MediaOutput):
                             if self._media_output is not None:
                                 raise RuntimeError("completion produced more than one media output")
                             self._media_output = result
+                    if record.logprobs is not None:
+                        record.logprobs.finalize()
+                    for position in record.prompt_logprobs:
+                        position.finalize()
                 except Exception:
                     self._completion_error = True
                 else:
@@ -1454,6 +1382,8 @@ class PendingOutput:
             self._observed = True
             self._buffer = None
             self._done = True
+            self._predicated_parent = None
+            self._resolved_callback = None
             timing = TimingCounters(
                 queued_us=self._completion_timing[0],
                 device_us=self._completion_timing[1],
@@ -1461,7 +1391,9 @@ class PendingOutput:
                 host_us=self._completion_timing[3],
             )
             materialized_record = (
-                replace(record, committed_tokens=(), sampling=None)
+                replace(
+                    record, committed_tokens=(), sampling=None, logprobs=None, prompt_logprobs=()
+                )
                 if self._completion_error or self._invalid_sampling or self._predicated
                 else record
             )
@@ -1480,7 +1412,6 @@ class PendingOutput:
                     raise RuntimeError("predicated operation lost its selected runtime state")
                 concrete = _predicated_record(
                     concrete,
-                    self._selected_point,
                     selected_runtime,
                 )
             concrete.validate()
@@ -1495,11 +1426,7 @@ class PendingOutput:
         predicated_parent = self._predicated_parent
         if predicated_parent is None:
             raise RuntimeError("predicated completion lost its parent resolver")
-        selected, runtime = predicated_parent()
-        point = None if selected is None else selected.point
-        if point is not None and not isinstance(point, FixedCheckpoint):
-            raise RuntimeError("predicated operation selected a non-fixed parent")
-        self._selected_point = 0 if point is None else int(point.point_index)
+        runtime = predicated_parent()
         self._selected_runtime = runtime
 
     def completion_timing(self) -> tuple[int, int, int, int]:
@@ -1537,13 +1464,6 @@ class PendingOutput:
         return self._completion_error
 
     @property
-    def selected_point(self) -> int:
-        """Expose the checkpoint point selected after predicate and sampling resolution."""
-
-        self.finalize()
-        return int(self._selected_point)
-
-    @property
     def selected_runtime(self) -> RequestRuntime:
         """Expose the request state selected by a predicated operation."""
 
@@ -1562,7 +1482,7 @@ class PendingOutput:
         """Release unobserved host work and retire the result through its device fence."""
 
         tasks, self._completion_tasks = self._completion_tasks, ()
-        actions = [task.abandon for task in tasks if isinstance(task, (CpuJob, ImagePayload))]
+        actions = [task.abandon for task in tasks if isinstance(task, (CpuJob, ImageEncoding))]
         buffer, self._buffer = self._buffer, None
         if buffer is not None and not self._observed:
             self._observed = True
@@ -1590,83 +1510,38 @@ def _concrete_record(
 ) -> ModelOutput:
     """Freeze a host-visible output record after resolving deferred sampling fields."""
 
-    lengths = record.logical_lengths
-    span = record.token_span
-    selected_point = int(record.selected_point)
+    runtime = record.runtime
     tokens = record.committed_tokens
     sampling = record.sampling
     if sampling is not None:
-        # Sampling decides both the accepted prefix and the selected checkpoint;
-        # logical token/cache lengths advance only by that accepted prefix.
-        tokens, selected_point, _accepted = sampling.materialize()
+        # Rejected draft positions remain initialized in KV but are invisible
+        # to the successor. Sampling determines the actual accepted prefix.
+        tokens = sampling.materialize()
+        accepted = len(tokens)
         if sampling.logical_base is not None:
-            lengths = replace(
-                lengths,
-                token_len=int(sampling.logical_base) + selected_point,
-            )
+            runtime = replace(runtime, logical_position=int(sampling.logical_base) + accepted)
         if sampling.kv_base is not None:
-            lengths = replace(
-                lengths,
-                kv_visible_len=int(sampling.kv_base) + selected_point,
-            )
-        span = replace(span, len=selected_point)
-    if type(lengths.token_len) is not int or any(
-        type(value) is not int
-        for value in (
-            lengths.kv_visible_len,
-            lengths.kv_computed_len,
-            lengths.latent_len,
-        )
-    ):
-        # Wire records contain builtin integers even when counters originated as
-        # scalar tensors or NumPy-compatible integer values.
-        lengths = LogicalLengths(
-            token_len=int(lengths.token_len),
-            kv_visible_len=int(lengths.kv_visible_len),
-            kv_computed_len=int(lengths.kv_computed_len),
-            latent_len=int(lengths.latent_len),
-        )
-    if type(span.base) is not int or type(span.len) is not int:
-        span = TokenSpan(base=int(span.base), len=int(span.len))
-    payload_type = (
-        ArResult
-        if record.kind in {OpCode.AR_EXTEND, OpCode.AR_DECODE, OpCode.AR_VERIFY}
-        else EncoderResult
-        if record.kind in {OpCode.ENCODER_VISION, OpCode.ENCODER_LATENT, OpCode.ENCODER_TEXT}
-        else DiffusionResult
-        if record.kind
-        in {
-            OpCode.DIFFUSION_PREPARE,
-            OpCode.DIFFUSION_STEP,
-            OpCode.DIFFUSION_DECODE,
-            OpCode.MEDIA_APPEND,
-            OpCode.DIFFUSION_FINALIZE,
-        }
-        else TransferResult
-    )
-
-    # Select the closed result schema from the operation family. Diffusion is
-    # the only family with trajectory cursor and terminal-state fields.
-    payload_args = (lengths, span, tokens, record.finish_flags, media_output)
-    payload = (
-        DiffusionResult(
-            *payload_args,
-            next_cursor=int(record.next_cursor),
-            done=bool(record.done),
-        )
-        if payload_type is DiffusionResult
-        else payload_type(*payload_args)
-    )
+            runtime = replace(runtime, kv_visible_len=int(sampling.kv_base) + accepted)
+    scores = None if record.logprobs is None else record.logprobs.finalize()
     return ModelOutput(
         request_key=record.request_key,
         op_id=record.op_id,
-        completion_slot_generation=record.completion_slot_generation,
         status=record.status,
-        selected_point=selected_point,
         product_generations=record.product_generations,
         error_code=record.error_code,
         timing_counters=timing,
-        payload=payload,
+        kind=record.kind,
+        position=int(runtime.logical_position),
+        kv_visible_len=int(runtime.kv_visible_len),
+        kv_computed_len=int(runtime.kv_computed_len),
+        num_completed_steps=int(runtime.flow_step),
+        committed_tokens=tokens,
+        sampled_logprob=None if scores is None else scores[0],
+        top_logprobs=() if scores is None else scores[1],
+        prompt_logprobs=tuple(position.finalize()[1] for position in record.prompt_logprobs),
+        finish_flags=record.finish_flags,
+        media_output=media_output,
+        kv_output=record.kv_output,
     )
 
 
@@ -1676,14 +1551,13 @@ def _invalid_sampling_record(record: ModelOutput) -> ModelOutput:
     return replace(
         record,
         status=OpStatus.ERROR,
-        selected_point=max(0, int(record.selected_point) - 1),
-        payload=replace(
-            record.payload,
-            token_span=replace(record.token_span, len=0),
-            committed_tokens=(),
-            finish_flags=FinishFlags(),
-        ),
+        committed_tokens=(),
+        sampled_logprob=None,
+        top_logprobs=(),
+        prompt_logprobs=(),
+        finish_flags=FinishFlags(),
         product_generations=(),
+        kv_output=None,
         error_code=ErrorCode.INVALID_OPERATION,
     )
 
@@ -1694,41 +1568,37 @@ def _completion_error_record(record: ModelOutput) -> ModelOutput:
     return replace(
         record,
         status=OpStatus.ERROR,
-        payload=replace(
-            record.payload,
-            token_span=replace(record.token_span, len=0),
-            committed_tokens=(),
-            finish_flags=FinishFlags(),
-        ),
+        committed_tokens=(),
+        sampled_logprob=None,
+        top_logprobs=(),
+        prompt_logprobs=(),
+        finish_flags=FinishFlags(),
         product_generations=(),
+        kv_output=None,
         error_code=ErrorCode.COMPUTE_ERROR,
     )
 
 
 def _predicated_record(
     record: ModelOutput,
-    selected_point: int,
     runtime: RequestRuntime,
 ) -> ModelOutput:
-    """Apply a resolved speculative point to one output record and request runtime."""
+    """Report the parent execution state for an operation suppressed by its predicate."""
 
     return replace(
         record,
         status=OpStatus.PREDICATED,
-        selected_point=int(selected_point),
-        payload=replace(
-            record.payload,
-            logical_lengths=LogicalLengths(
-                token_len=runtime.logical_position,
-                kv_visible_len=runtime.kv_visible_len,
-                kv_computed_len=runtime.kv_computed_len,
-                latent_len=0,
-            ),
-            token_span=replace(record.token_span, len=0),
-            committed_tokens=(),
-            finish_flags=FinishFlags(),
-        ),
+        position=int(runtime.logical_position),
+        kv_visible_len=int(runtime.kv_visible_len),
+        kv_computed_len=int(runtime.kv_computed_len),
+        num_completed_steps=int(runtime.flow_step),
+        committed_tokens=(),
+        sampled_logprob=None,
+        top_logprobs=(),
+        prompt_logprobs=(),
+        finish_flags=FinishFlags(),
         product_generations=(),
+        kv_output=None,
         error_code=None,
     )
 
@@ -1740,9 +1610,6 @@ def run_result_ready(report: RunResult) -> bool:
     for record in report.completions:
         if not _record_ready(record):
             return False
-    for product in report.products:
-        if not _completion_payload_ready(product.payload):
-            return False
     return report.retirement is None or report.retirement()
 
 
@@ -1752,22 +1619,7 @@ def lane_completion_ready(lane: LaneResult) -> bool:
     for record in lane.completions:
         if not _record_ready(record):
             return False
-    for product in lane.products:
-        if not _completion_payload_ready(product.payload):
-            return False
     return True
-
-
-def _completion_payload_ready(payload: object) -> bool:
-    """Return whether a completion payload's asynchronous work is readable."""
-
-    return (
-        not isinstance(
-            payload,
-            (ImagePayload, LogprobPayload),
-        )
-        or payload.ready()
-    )
 
 
 def finalize_run_result(report: RunResult) -> RunResult:
@@ -1781,44 +1633,16 @@ def finalize_run_result(report: RunResult) -> RunResult:
             for record in lane.completions
         )
         nonpublishing_ops = {
-            int(record.op_id) for record in completions if record.status is not OpStatus.OK
+            record.op_id for record in completions if record.status is not OpStatus.OK
         }
-        retained_products = tuple(
+        products = tuple(
             product
             for product in lane.products
-            if int(product.product.producer_op_id) not in nonpublishing_ops
+            if product.product.producer_op_id not in nonpublishing_ops
         )
-        products = tuple(
-            replace(product, payload=product.payload.finalize())
-            if isinstance(
-                product.payload,
-                (
-                    ImagePayload,
-                    LogprobPayload,
-                ),
-            )
-            and product.payload.ready()
-            else product
-            for product in retained_products
-        )
-        for product in products:
-            if isinstance(product.payload, bytes) and len(product.payload) > int(
-                product.product.max_bytes
-            ):
-                raise invalid_descriptor(
-                    "completion product exceeds its registered product byte bound"
-                )
         publication = lane.publication
-        publication_ready = (
-            publication is not None
-            and all(isinstance(record, ModelOutput) for record in completions)
-            and all(
-                not isinstance(
-                    product.payload,
-                    (ImagePayload, LogprobPayload),
-                )
-                for product in products
-            )
+        publication_ready = publication is not None and all(
+            isinstance(record, ModelOutput) for record in completions
         )
         if publication_ready:
             assert publication is not None

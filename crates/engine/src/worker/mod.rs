@@ -1,4 +1,4 @@
-//! Worker process configuration, IPC execution, rank aggregation, and recovery.
+//! WorkerGroup process configuration, IPC execution, rank aggregation, and recovery.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod death_watch;
@@ -7,11 +7,11 @@ mod instance;
 mod process;
 
 pub use executor::WorkerExecutor;
-pub use instance::Worker;
+pub use instance::WorkerGroup;
 use process::RankProcess;
 pub use process::{FlashInferBackend, FlashInferBackendParseError, LaneConfig};
 
-/// Backpressure and terminal failures returned by a Worker run submission.
+/// Backpressure and terminal failures returned by a WorkerGroup run submission.
 #[derive(Debug, thiserror::Error)]
 pub enum RunSubmitError {
     /// Returns the unaccepted physical submission when the instance has no capacity.
@@ -31,10 +31,10 @@ pub struct WorkerProcessArgs {
     pub python: std::path::PathBuf,
     /// Model identifier or local model path.
     pub model: String,
-    /// Ordered physical members of this Worker instance.
+    /// Ordered physical members of this WorkerGroup instance.
     pub ranks: Vec<crate::WorkerRank>,
     /// Computation entry membership and parallel geometry.
-    pub entries: std::collections::BTreeMap<String, crate::EntryConfig>,
+    pub entries: std::collections::BTreeMap<String, crate::ComponentConfig>,
     /// Maximum number of physical runs concurrently in flight per rank.
     pub pipeline_depth: usize,
     /// Request IPC slot capacity in bytes.
@@ -51,10 +51,11 @@ pub struct WorkerProcessArgs {
     pub max_batch_tokens: u32,
     /// Attention implementation selected for model execution.
     pub attention_backend: uniserve_worker_ipc::AttentionBackend,
-    /// Logical operation kinds exposed by the worker pool.
-    pub supported_ops: Vec<uniserve_worker_ipc::OpCode>,
+    /// Optional public worker capability selectors; empty uses the model default.
+    /// Startup resolves each selector to its concrete computation set.
+    pub capability_groups: Vec<String>,
     /// Product transport exposed by the worker pool.
-    pub transfer: crate::executor::TransportMap,
+    pub transfer: crate::executor::TransferConfig,
     /// Whether to launch the deterministic worker stub without model weights.
     pub stub: bool,
     /// Checkpoint loader format.
@@ -67,7 +68,7 @@ pub struct WorkerProcessArgs {
     pub checksum_manifest: Option<std::path::PathBuf>,
     /// Numeric data type used by model parameters and activations.
     pub model_dtype: uniserve_core::ModelDtype,
-    /// Worker-specific quantization policy.
+    /// WorkerGroup-specific quantization policy.
     pub quantization_config: serde_json::Value,
     /// Numeric data type used by the KV cache, when explicitly selected.
     pub kv_cache_dtype: Option<uniserve_core::KvCacheDtype>,

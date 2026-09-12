@@ -6,7 +6,7 @@ use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, IncrementalD
 use asynk_strim_attr::{TryYielder, try_stream};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
-use uniserve_core::{Event, PositionLogprobs};
+use uniserve_core::{EngineCoreOutput, PositionLogprobs};
 use uniserve_engine::EventRx;
 
 use super::finish::{FinishReason, StopReason};
@@ -297,7 +297,7 @@ pub async fn decoded_text_event_stream(
         match event {
             // Scheduling metadata may arrive before prompt logprobs; start is
             // emitted only after both prerequisites are complete.
-            Event::Scheduled {
+            EngineCoreOutput::Scheduled {
                 queued_at: queued,
                 scheduled_at: scheduled,
             } => {
@@ -314,7 +314,7 @@ pub async fn decoded_text_event_stream(
                     )
                     .await?;
             }
-            Event::PromptLogprobs { positions } => {
+            EngineCoreOutput::PromptLogprobs { positions } => {
                 if !prompt_logprobs_requested {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
@@ -341,7 +341,7 @@ pub async fn decoded_text_event_stream(
             }
             // Generated logprobs, when requested, defer decoding until the
             // matching TokenLogprobs event validates the token identity.
-            Event::TextToken { id, .. } => {
+            EngineCoreOutput::TextToken { id, .. } => {
                 state
                     .emit_start_if_ready(
                         &request_id,
@@ -382,7 +382,7 @@ pub async fn decoded_text_event_stream(
                     return Ok(());
                 }
             }
-            Event::TokenLogprobs { id, candidates } => {
+            EngineCoreOutput::TokenLogprobs { id, candidates } => {
                 let pending = state
                     .pending_token
                     .take()
@@ -416,7 +416,7 @@ pub async fn decoded_text_event_stream(
             }
             // A terminal event flushes decoder holdback only after every pending
             // token/logprob pair and all prompt metadata have resolved.
-            Event::Finished {
+            EngineCoreOutput::Finished {
                 reason,
                 stop_reason,
                 completion_tokens,
@@ -479,19 +479,21 @@ pub async fn decoded_text_event_stream(
             }
             // Rejection and engine errors are terminal protocol failures for the
             // text decoder and preserve the engine-supplied message.
-            Event::Rejected { message } | Event::Error { message } => {
+            EngineCoreOutput::Rejected { message }
+            | EngineCoreOutput::Error { message }
+            | EngineCoreOutput::ArtifactUnavailable { message } => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
                     message,
                 });
             }
             // Media lifecycle events cannot be represented by a text-only stream.
-            Event::ImageBegin { .. }
-            | Event::ImageStep { .. }
-            | Event::ImageCommit { .. }
-            | Event::ImageDone { .. }
-            | Event::Artifact(_)
-            | Event::MediaProgress { .. } => {
+            EngineCoreOutput::ImageBegin { .. }
+            | EngineCoreOutput::ImageStep { .. }
+            | EngineCoreOutput::ImageCommit { .. }
+            | EngineCoreOutput::ImageDone { .. }
+            | EngineCoreOutput::Artifact(_)
+            | EngineCoreOutput::MediaProgress { .. } => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
                     message: "text-only request received a non-text lifecycle event".to_string(),

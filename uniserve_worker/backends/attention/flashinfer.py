@@ -417,7 +417,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
                 causal,
                 scale,
                 query_lens_cpu=tuple(getattr(plan, "query_lens_cpu", ()) or ()),
-                kv_lens_cpu=tuple(getattr(plan, "kv_lens_cpu", ()) or ()),
+                kv_lens_cpu=tuple(getattr(plan, "seq_lens_cpu", ()) or ()),
             )
 
         self._prefill_plan_cache.plan_or_reuse(
@@ -456,7 +456,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         plan = context
         query_lens = tuple(int(value) for value in getattr(plan, "query_lens_cpu", ()) or ())
         causal_rows = tuple(bool(value) for value in getattr(plan, "causal_rows_cpu", ()) or ())
-        prefix_lens_cpu = tuple(int(value) for value in getattr(plan, "seq_lens_cpu", ()) or ())
+        prefix_lens_cpu = tuple(int(value) for value in getattr(plan, "prefix_lens_cpu", ()) or ())
         if (
             not query_lens
             or len(query_lens) != len(prefix_lens_cpu)
@@ -724,7 +724,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         batch_size = int(cu_seqlens_q.numel()) - 1
         if batch_size <= 0 or int(block_table.shape[0]) != batch_size:
             raise RuntimeError("paged prefill graph block table row count mismatch")
-        kv_seqlens = getattr(plan, "kv_lens", None)
+        kv_seqlens = getattr(plan, "seq_lens", None)
         if not isinstance(kv_seqlens, torch.Tensor) or tuple(kv_seqlens.shape) != (batch_size,):
             kv_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
         kv_seqlens = kv_seqlens.to(device=cu_seqlens_k.device, dtype=torch.int32).contiguous()
@@ -734,7 +734,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         query_lens = query_lens.to(device=cu_seqlens_q.device, dtype=torch.int32).contiguous()
         host_plan = _prefill_host_plan(
             tuple(getattr(plan, "query_lens_cpu", ()) or ()),
-            tuple(getattr(plan, "kv_lens_cpu", ()) or ()),
+            tuple(getattr(plan, "seq_lens_cpu", ()) or ()),
             batch_size,
             int(page_size),
         )
@@ -915,7 +915,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         """Allocate or reuse fixed-shape page metadata for decode graph preparation."""
 
         block_table = plan.block_table.to(dtype=torch.int32).contiguous()
-        cache_seqlens = plan.kv_lens.to(dtype=torch.int32).contiguous()
+        cache_seqlens = plan.seq_lens.to(dtype=torch.int32).contiguous()
         wrapper_key, wrapper = self._decode_cuda_graph_wrapper(
             block_table.device,
             batch_size=int(batch_size),
@@ -928,7 +928,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         cpu_last_page_len = _cpu_last_page_len(plan, int(batch_size), int(page_size))
         if cpu_indptr is None or cpu_last_page_len is None:
             raise ValueError("decode graph planning requires complete CPU KV lengths")
-        effective_seqlens = getattr(plan, "kv_lens", None)
+        effective_seqlens = getattr(plan, "seq_lens", None)
         if not isinstance(effective_seqlens, torch.Tensor) or tuple(effective_seqlens.shape) != (
             int(batch_size),
         ):

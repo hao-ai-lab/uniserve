@@ -15,7 +15,7 @@ from uniserve_worker.bootstrap.capacity import (
     tensor_slot_capacity,
 )
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
-from uniserve_worker.execution.batch import OpCode
+from uniserve_worker.execution.batch import ForwardMode, PipelineStage
 from uniserve_worker.execution.bounded_storage import TensorSchema
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.foundation.math import ceil_div
@@ -74,8 +74,8 @@ def test_worker_info_projects_model_behavior_and_resource_geometry():
     )
     info = layout.info
 
-    assert OpCode.AR_EXTEND in info.supported_ops
-    assert OpCode.DIFFUSION_STEP in info.supported_ops
+    assert ForwardMode.PREFILL in info.supported_ops
+    assert PipelineStage.DENOISING in info.supported_ops
     assert layout.max_vision_feature_bytes == (
         int(TEST_MODEL.max_vit_grid_tokens) * int(TEST_MODEL.hidden_size) * 2
     )
@@ -164,13 +164,10 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
         BufferAllocation,
         DeviceDim,
         DType,
-        PointRange,
-        ProductKind,
-        ProductRef,
         RequestKey,
         ShapeBound,
         StaticDim,
-        StorageClass,
+        TensorRef,
         TensorSpec,
     )
     from uniserve_worker.execution.bounded_storage import TensorSchema
@@ -182,7 +179,7 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
 
     model = ExecutionModel()
     model.architecture = "TensorEntryModel"
-    model.supported_work = frozenset((OpCode.ENCODER_TEXT, OpCode.DIFFUSION_STEP))
+    model.supported_work = frozenset((PipelineStage.TEXT_ENCODING, PipelineStage.DENOISING))
     model.resource_geometry = ResourceGeometry(
         kv=False, request_tensors={"state": TensorSchema((4,), torch.float32)}
     )
@@ -205,16 +202,13 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
                     dim.extent if isinstance(dim, StaticDim) else dim.bound
                     for dim in output.shape_bound.dims
                 )
-                product = ProductRef(
+                product = TensorRef(
                     RequestKey(1, request_id, 1),
                     op_id,
                     0,
                     1,
-                    ProductKind.TENSOR,
-                    StorageClass.DEVICE_TENSOR,
                     output.dtype,
                     output.shape_bound,
-                    PointRange(),
                 )
                 binding = arena.bind(
                     product,
@@ -251,16 +245,22 @@ def test_cuda_capacity_query_failure_is_not_an_empty_budget(monkeypatch) -> None
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
 def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(rank):
     from uniserve_worker.bootstrap.capacity import local_product_storage_bytes
-    from uniserve_worker.execution.batch import DeviceDim, DType, ShapeBound, StaticDim, TensorSpec
-    from uniserve_worker.models.video import MediaExecutionPlan, MediaPlanRepeat, MediaPlanStage
+    from uniserve_worker.execution.batch import (
+        DeviceDim,
+        DType,
+        PipelineStage,
+        ShapeBound,
+        StaticDim,
+        TensorSpec,
+    )
     from uniserve_worker.nn.mesh import DeviceMesh, EntryBindings
-    from uniserve_worker.nn.parallel import EntryConfig
+    from uniserve_worker.nn.parallel import ComponentConfig
 
     entries = {
-        "encode": EntryConfig((2,)),
-        "predict": EntryConfig((1,)),
-        "decode": EntryConfig((1, 3), distribution="temporal_units", units_per_rank=2),
-        "assemble": EntryConfig((0,)),
+        "encode": ComponentConfig((2,)),
+        "predict": ComponentConfig((1,)),
+        "decode": ComponentConfig((1, 3), distribution="temporal_units", units_per_rank=2),
+        "assemble": ComponentConfig((0,)),
     }
     bindings = EntryBindings(
         entries,
@@ -276,36 +276,27 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(rank)
         "predict": (TensorSpec("latents", DType.F32, ShapeBound((StaticDim(256),))),),
         "decode": (TensorSpec("frames", DType.F32, ShapeBound((DeviceDim(20), StaticDim(128)))),),
     }
-    plan = MediaExecutionPlan(
-        (
-            MediaPlanStage("conditioning", OpCode.ENCODER_TEXT, "encode"),
-            MediaPlanStage("denoise", OpCode.DIFFUSION_STEP, "predict", input_from="conditioning"),
-            MediaPlanStage(
-                "decode",
-                OpCode.DIFFUSION_DECODE,
-                "decode",
-                input_from="denoise",
-                repeat=MediaPlanRepeat.VIDEO_UNITS,
-            ),
-            MediaPlanStage(
-                "write",
-                OpCode.MEDIA_APPEND,
-                "assemble",
-                input_from="decode",
-                repeat=MediaPlanRepeat.VIDEO_UNITS,
-            ),
-        )
-    )
+    components = {
+        PipelineStage.TEXT_ENCODING: "encode",
+        PipelineStage.LATENT_PREPARATION: "predict",
+        PipelineStage.DENOISING: "predict",
+        PipelineStage.VIDEO_DECODING: "decode",
+        PipelineStage.VIDEO_ENCODING: "assemble",
+    }
     # Two outstanding groups each contain four 512-byte units. The output
     # assembler imports both groups although it executes neither producer.
     expected = {0: 4096, 1: 512 + 1024 + 4096, 2: 512, 3: 1024 + 4096}
     assert (
-        local_product_storage_bytes(outputs, bindings=bindings, plan=plan, max_unresolved_ops=2)
+        local_product_storage_bytes(
+            outputs, bindings=bindings, pipeline_components=components, max_unresolved_ops=2
+        )
         == expected[rank]
     )
     # A horizon beyond the complete trajectory never reserves extra units.
     expected_full = {0: 10_240, 1: 512 + 1024 + 10_240, 2: 512, 3: 1024 + 10_240}
     assert (
-        local_product_storage_bytes(outputs, bindings=bindings, plan=plan, max_unresolved_ops=8)
+        local_product_storage_bytes(
+            outputs, bindings=bindings, pipeline_components=components, max_unresolved_ops=8
+        )
         == expected_full[rank]
     )

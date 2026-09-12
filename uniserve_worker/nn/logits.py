@@ -65,7 +65,7 @@ def project_outputs(
         return output
 
     if (
-        batch.forward_mode is AttentionMode.PAGED_VARLEN
+        batch.attention_mode is AttentionMode.PAGED_VARLEN
         and batch.output_indices is not None
         and len(selections) == batch.row_count
         and all(selection is TokenSelection.LAST_LOGITS for selection in selections.values())

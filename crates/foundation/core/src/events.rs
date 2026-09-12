@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::RequestId;
+use crate::{RequestId, SharedMedia};
+use std::sync::Arc;
 
 /// Terminal cause for one engine generation lineage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,9 +58,8 @@ pub struct PositionLogprobs {
 }
 
 /// Typed event stream emitted by every engine runtime family.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Event {
+#[derive(Debug, Clone)]
+pub enum EngineCoreOutput {
     /// Reports scheduler admission timing.
     Scheduled {
         /// Unix timestamp when the request entered the queue.
@@ -133,6 +133,11 @@ pub enum Event {
     },
     /// Publishes a transport-backed media artifact.
     Artifact(ArtifactEvent),
+    /// Generated media could not be acquired from its published storage.
+    ArtifactUnavailable {
+        /// Storage error presented to the artifact consumer.
+        message: String,
+    },
     /// Terminates a successfully accepted request.
     Finished {
         /// Terminal generation cause.
@@ -182,50 +187,28 @@ pub enum RuntimeFamily {
     Umm,
 }
 
-/// One caller-visible artifact backed by an explicit transport handle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One caller-visible artifact retaining its immutable shared-memory mapping.
+#[derive(Debug, Clone)]
 pub struct ArtifactEvent {
     /// Semantic media type of the artifact.
     pub media_kind: MediaKind,
     /// MIME content type of the artifact payload.
     pub content_type: String,
-    /// Materialized payload length in bytes.
-    pub bytes: u64,
-    /// Transport handle for reading the payload.
-    pub artifact: ArtifactHandle,
+    /// Mapped payload retained through delivery, job retention, and active downloads.
+    pub media: Arc<SharedMedia>,
 }
 
-/// Process-independent handle for a materialized artifact.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "transport", content = "value")]
-pub enum ArtifactHandle {
-    /// Artifact stored in a POSIX shared-memory object.
-    PosixShm {
-        /// Shared-memory object name.
-        name: String,
-    },
-}
-
-impl ArtifactHandle {
-    /// Returns the POSIX shared-memory object name carried by this handle.
-    pub fn posix_shm_name(&self) -> &str {
-        match self {
-            Self::PosixShm { name } => name,
-        }
-    }
-}
-
-/// Immutable request-shaped media geometry resolved by the serving admission layer.
+/// Effective diffusion controls, resolved once by model preprocessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MediaGeometry {
-    /// Number of output frames.
-    pub frame_count: u32,
-    /// Number of overlapping video reconstruction windows, independent of rank count.
-    pub video_units: u32,
-    /// Number of prompt tokens represented by the request.
-    pub prompt_tokens: u32,
-    /// Number of diffusion denoising steps.
-    pub denoise_steps: u32,
+pub struct DiffusionSamplingParams {
+    /// Number of output frames after model-specific alignment.
+    pub num_frames: u32,
+    /// Overlapping VAE reconstruction chunks, independent of GPU rank count.
+    pub num_decode_chunks: u32,
+    /// Number of denoising steps in the trajectory.
+    pub num_inference_steps: u32,
+    /// Deterministic request-level noise seed.
+    pub seed: u64,
 }
 
 /// Media request. Final media bytes are returned through shared memory.
@@ -235,12 +218,10 @@ pub struct DiffusionRequest {
     pub request_id: RequestId,
     /// Tokenized media prompt.
     pub prompt_token_ids: Vec<u32>,
-    /// Deterministic diffusion seed.
-    pub seed: u64,
     /// Scheduler priority.
     pub priority: i32,
-    /// Fully resolved media geometry.
-    pub geometry: MediaGeometry,
+    /// Effective diffusion controls and model-preprocessed chunk count.
+    pub sampling: DiffusionSamplingParams,
 }
 
 impl DiffusionRequest {
@@ -250,16 +231,12 @@ impl DiffusionRequest {
             return Err(DiffusionRequestError::EmptyPromptTokens);
         }
 
-        // Geometry must describe positive work and carry the same logical
-        // prompt size as the token payload.
-        if self.geometry.frame_count == 0
-            || self.geometry.video_units == 0
-            || self.geometry.prompt_tokens == 0
-            || usize::try_from(self.geometry.prompt_tokens).ok()
-                != Some(self.prompt_token_ids.len())
-            || self.geometry.denoise_steps == 0
+        if self.sampling.num_frames == 0
+            || self.sampling.num_decode_chunks == 0
+            || self.sampling.num_inference_steps == 0
+            || self.prompt_token_ids.len() > u32::MAX as usize
         {
-            return Err(DiffusionRequestError::InvalidGeometry);
+            return Err(DiffusionRequestError::InvalidSampling);
         }
 
         Ok(())
@@ -272,9 +249,9 @@ pub enum DiffusionRequestError {
     /// The tokenized prompt contains no tokens.
     #[error("media prompt tokens must not be empty")]
     EmptyPromptTokens,
-    /// A geometry value is zero or disagrees with the prompt length.
-    #[error("media geometry is invalid")]
-    InvalidGeometry,
+    /// A diffusion bound is zero or exceeds the protocol width.
+    #[error("diffusion parameters are invalid")]
+    InvalidSampling,
 }
 
 /// Immutable request payload selected before it enters the engine.

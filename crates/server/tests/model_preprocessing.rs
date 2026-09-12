@@ -8,16 +8,12 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-use uniserve_core::{
-    ContextSegment, GenerationLimits, ImageIngestStep, ImageKvEffect, SegmentPosition,
-};
+use uniserve_core::{GenerationLimits, ImageIngestStep};
 use uniserve_server::profile::assets::ResolvedModelFiles;
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use uniserve_server::profile::{ModelDescription, ProfileOverrides};
-use uniserve_server::serving::chat::{
-    ChatContentPart, ChatMessage, ChatTemplateContentFormatOption, HfChatRenderer,
-};
-use uniserve_server::serving::{GenerateReqInput, ResolvedAssets, ResolvedModel, ServeRequestId};
+use uniserve_server::profile::{ModelConfig, ModelDescription};
+use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
+use uniserve_server::serving::{InputProcessor, ServeRequestId};
 
 const PNG_1X1: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -38,7 +34,7 @@ const SPECIAL_TOKENS: &[&str] = &[
 fn resolved_model(
     description: ModelDescription,
     model_type: &str,
-) -> (tempfile::TempDir, DynTokenizer, ResolvedModel) {
+) -> (tempfile::TempDir, DynTokenizer, InputProcessor) {
     try_resolved_model(description, model_type, runtime_limits()).unwrap()
 }
 
@@ -46,7 +42,7 @@ fn try_resolved_model(
     description: ModelDescription,
     model_type: &str,
     limits: GenerationLimits,
-) -> uniserve_server::serving::Result<(tempfile::TempDir, DynTokenizer, ResolvedModel)> {
+) -> uniserve_server::serving::Result<(tempfile::TempDir, DynTokenizer, InputProcessor)> {
     let directory = tempdir().unwrap();
     let mut vocab = Vocab::from_iter([("<unk>".to_string(), 0_u32)]);
     for codepoint in 1_u32..=127 {
@@ -105,17 +101,18 @@ fn try_resolved_model(
         ChatTemplateContentFormatOption::String,
     )
     .unwrap();
-    let assets = ResolvedAssets::from_files(
+    let config = ModelConfig::from_files(
         description,
         description.id(),
         &files,
-        &ProfileOverrides::default(),
-        Arc::clone(&tokenizer),
-        renderer,
+        None,
+        tokenizer.as_ref(),
     )
     .unwrap();
-    let model = ResolvedModel::resolve(
-        assets,
+    let model = InputProcessor::new(
+        config,
+        Arc::clone(&tokenizer),
+        Some(renderer),
         limits,
         uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
         4096,
@@ -139,15 +136,18 @@ fn runtime_limits() -> GenerationLimits {
     }
 }
 
-fn image_chat_request() -> GenerateReqInput {
-    GenerateReqInput::chat(
-        "image-params",
-        vec![ChatMessage::user(vec![
-            ChatContentPart::text("literal </img> before "),
-            ChatContentPart::image_url(format!("data:image/png;base64,{PNG_1X1}")),
-            ChatContentPart::text(" after"),
-        ])],
-    )
+fn image_chat_request(model: &str) -> uniserve_server::openai::ChatCompletionRequest {
+    serde_json::from_value(serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "literal </img> before "},
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{PNG_1X1}")}},
+            {"type": "text", "text": " after"}
+        ]}],
+        "seed": 9,
+        "image_config": {"seed": 17}
+    }))
+    .unwrap()
 }
 
 #[test]
@@ -210,65 +210,62 @@ fn model_resolution_requires_every_configured_runtime_branch() {
 #[test]
 fn sensenova_places_the_input_image_at_its_rendered_slot() {
     let (_directory, tokenizer, model) = resolved_model(ModelDescription::SenseNova, "neo_chat");
-    let request = image_chat_request();
-    model.validate_request(&request).unwrap();
-    let tokenized = model.tokenize(request).unwrap();
+    let request = image_chat_request(model.served_model_name());
+    let (generation, response) = model
+        .preprocess_chat_request(ServeRequestId::new("image-params"), request)
+        .unwrap();
+    assert_eq!(generation.sampling.seed, Some(17));
+    assert_eq!(generation.image.seed, Some(17));
     let end_image = tokenizer.token_to_id("</img>").unwrap();
-    let marker_positions = tokenized
+    let marker_positions = response
         .prompt_token_ids
         .iter()
         .enumerate()
         .filter_map(|(index, token)| (*token == end_image).then_some(index as u32))
         .collect::<Vec<_>>();
     assert_eq!(marker_positions.len(), 2);
-    let (params, steps) = tokenized
-        .request
-        .context
-        .iter()
-        .find_map(|segment| match segment {
-            ContextSegment::Image { image, ingest } => Some((image.position, &ingest.steps)),
-            ContextSegment::UndTokens { .. } => None,
-        })
-        .unwrap();
-    assert_eq!(
-        params,
-        SegmentPosition::AtToken {
-            position: marker_positions[1]
-        }
+    let image = &generation.multimodal_inputs.images[0];
+    let (position, steps) = (
+        image.position,
+        image
+            .encoders
+            .iter()
+            .map(|input| input.encoder)
+            .collect::<Vec<_>>(),
     );
+    assert_eq!(position, marker_positions[1]);
     assert_eq!(steps, &[ImageIngestStep::VitEncode]);
     assert_eq!(
-        tokenized
-            .request
-            .policy
-            .feedback
-            .unwrap()
-            .ingest
-            .step_kv_tokens,
-        vec![ImageKvEffect::Exact { tokens: 2305 }]
+        generation
+            .image_generation
+            .feedback_encoders
+            .iter()
+            .map(|input| input.num_kv_tokens)
+            .collect::<Vec<_>>(),
+        vec![Some(2305)]
     );
 }
 
 #[test]
 fn bagel_places_the_input_image_between_surrounding_chat_text() {
     let (_directory, _tokenizer, model) = resolved_model(ModelDescription::Bagel, "bagel");
-    let request = image_chat_request();
-    model.validate_request(&request).unwrap();
-    let tokenized = model.tokenize(request).unwrap();
-    let (params, steps) = tokenized
-        .request
-        .context
-        .iter()
-        .find_map(|segment| match segment {
-            ContextSegment::Image { image, ingest } => Some((image.position, &ingest.steps)),
-            ContextSegment::UndTokens { .. } => None,
-        })
+    let request = image_chat_request(model.served_model_name());
+    let (generation, response) = model
+        .preprocess_chat_request(ServeRequestId::new("image-params"), request)
         .unwrap();
-    let SegmentPosition::AtToken { position } = params else {
-        panic!("Bagel chat image must have a token position")
-    };
+    assert_eq!(generation.sampling.seed, Some(17));
+    assert_eq!(generation.image.seed, Some(17));
+    let image = &generation.multimodal_inputs.images[0];
+    let (position, steps) = (
+        image.position,
+        image
+            .encoders
+            .iter()
+            .map(|input| input.encoder)
+            .collect::<Vec<_>>(),
+    );
     assert!(position > 0);
-    assert!((position as usize) < tokenized.prompt_token_ids.len());
+    assert!((position as usize) < response.prompt_token_ids.len());
     assert_eq!(
         steps,
         &[ImageIngestStep::VaeEncode, ImageIngestStep::VitEncode]
@@ -276,15 +273,209 @@ fn bagel_places_the_input_image_between_surrounding_chat_text() {
 }
 
 #[test]
-fn minimax_video_geometry_carries_the_admitted_token_sequence() {
+fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
     let (_directory, tokenizer, model) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
     let prompt = "exact token sequence";
     let expected = tokenizer.encode(prompt, false).unwrap();
 
-    let (geometry, prompt_token_ids) = model
-        .resolve_video_request_geometry(&ServeRequestId::new("video"), prompt, 1.0)
+    let request = model
+        .preprocess_video_request(
+            &ServeRequestId::new("video"),
+            uniserve_server::openai::VideoGenerationRequest {
+                model: "minimax_h3".to_string(),
+                prompt: prompt.to_string(),
+                seconds: 1.0,
+                seed: 17,
+            },
+        )
         .unwrap();
 
-    assert_eq!(prompt_token_ids, expected);
-    assert_eq!(geometry.prompt_tokens as usize, prompt_token_ids.len());
+    assert_eq!(request.prompt_token_ids, expected);
+    assert_eq!(request.sampling.seed, 17);
+    assert_eq!(request.sampling.num_frames, 39);
+    assert_eq!(request.sampling.num_decode_chunks, 2);
+
+    let invalid = |model_name: &str, prompt: &str, seconds| {
+        model
+            .preprocess_video_request(
+                &ServeRequestId::new("video"),
+                uniserve_server::openai::VideoGenerationRequest {
+                    model: model_name.to_string(),
+                    prompt: prompt.to_string(),
+                    seconds,
+                    seed: 17,
+                },
+            )
+            .unwrap_err()
+    };
+    assert_eq!(
+        invalid("another-model", prompt, 1.0),
+        uniserve_server::openai::ApiError::ModelNotFound {
+            model: "another-model".to_string()
+        },
+    );
+    assert!(matches!(
+        invalid("minimax_h3", "  ", 1.0),
+        uniserve_server::openai::ApiError::InvalidRequest {
+            param: Some("prompt"),
+            ..
+        },
+    ));
+    for seconds in [0.0, -1.0, f64::NAN] {
+        assert!(matches!(
+            invalid("minimax_h3", prompt, seconds),
+            uniserve_server::openai::ApiError::InvalidRequest { .. },
+        ));
+    }
+}
+
+#[test]
+fn worker_context_capacity_limits_preprocessed_requests() {
+    let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::Qwen3, "qwen3");
+    let renderer = HfChatRenderer::new(
+        Some(CHAT_TEMPLATE.to_string()),
+        HashMap::new(),
+        ChatTemplateContentFormatOption::String,
+    )
+    .unwrap();
+    let processor = InputProcessor::new(
+        loaded.config().clone(),
+        tokenizer,
+        Some(renderer),
+        runtime_limits(),
+        uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
+        8,
+        true,
+    )
+    .unwrap();
+    assert_eq!(processor.config().max_model_tokens, Some(8));
+    let request = uniserve_server::serving::TextPromptRequest::new(
+        "context-capacity",
+        "This prompt exceeds eight tokens",
+    );
+    assert!(matches!(
+        processor.preprocess_text_request(request),
+        Err(uniserve_server::serving::ServeError::Tokenize {
+            source: uniserve_server::serving::TokenizeError::Text(
+                uniserve_server::serving::text::Error::PromptTooLong {
+                    max_model_len: 8,
+                    ..
+                }
+            ),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn sampling_defaults_preserve_explicit_zero_controls() {
+    let (_directory, _tokenizer, model) = resolved_model(ModelDescription::Qwen3, "qwen3");
+    let mut request: uniserve_server::openai::ChatCompletionRequest =
+        serde_json::from_value(serde_json::json!({
+            "model": "qwen3", "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+    let (default, _) = model
+        .preprocess_chat_request(ServeRequestId::new("sampling-defaults"), request.clone())
+        .unwrap();
+    assert_eq!(default.max_und_tokens, 128);
+    assert_eq!(default.sampling.temperature, 1.0);
+
+    request.temperature = Some(0.0);
+    let (greedy, _) = model
+        .preprocess_chat_request(ServeRequestId::new("sampling-defaults"), request.clone())
+        .unwrap();
+    assert_eq!(greedy.sampling.temperature, 0.0);
+    assert_eq!(greedy.max_und_tokens, 128);
+
+    request.max_completion_tokens = Some(0);
+    assert!(matches!(
+        model.preprocess_chat_request(ServeRequestId::new("sampling-defaults"), request),
+        Err(uniserve_server::openai::ApiError::InvalidRequest { .. })
+    ));
+}
+
+#[test]
+fn image_api_preserves_requested_dimensions_seed_and_guidance() {
+    for (description, model_type, width, height) in [
+        (ModelDescription::SenseNova, "neo_chat", 1536, 1536),
+        (ModelDescription::Bagel, "bagel", 512, 512),
+    ] {
+        let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
+        let request: uniserve_server::openai::ImageGenerationRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": description.id(),
+                "prompt": "a blue bird",
+                "negative_prompt": "blur",
+                "size": format!("{width}x{height}"),
+                "steps": 4,
+                "seed": 17,
+                "guidance_scale": 7.5,
+                "n": 1
+            }))
+            .unwrap();
+        let (generation, _) = processor
+            .preprocess_image_request(ServeRequestId::new("image-api"), request)
+            .unwrap();
+        assert_eq!(
+            generation.constraint,
+            uniserve_core::GenerationConstraint::GenOnly
+        );
+        assert_eq!(
+            (generation.image.width, generation.image.height),
+            (width, height)
+        );
+        assert_eq!(generation.image.steps, 4);
+        assert_eq!(generation.image.max_images, 1);
+        assert_eq!(generation.image.seed, Some(17));
+        assert_eq!(generation.sampling.seed, Some(17));
+        assert_eq!(generation.image.cfg_text_scale, 7.5);
+        assert_eq!(generation.image.negative_prompt, "blur");
+    }
+}
+
+#[test]
+fn cache_controls_preserve_isolation_and_prompt_logprob_requirements() {
+    use uniserve_server::serving::TextPromptRequest;
+
+    for (description, model_type) in [
+        (ModelDescription::Qwen3, "qwen3"),
+        (ModelDescription::SenseNova, "neo_chat"),
+        (ModelDescription::Bagel, "bagel"),
+    ] {
+        let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
+        let mut request = TextPromptRequest::new("cache-controls", "hello");
+        let (shared, _) = processor.preprocess_text_request(request.clone()).unwrap();
+        assert_eq!(shared.cache.isolation_key, None);
+        assert!(shared.cache.read && shared.cache.write);
+
+        request.cache_namespace = Some("ab".to_string());
+        request.cache_salt = Some("c".to_string());
+        let (isolated, _) = processor.preprocess_text_request(request.clone()).unwrap();
+        assert!(isolated.cache.isolation_key.is_some());
+        let (repeat, _) = processor.preprocess_text_request(request.clone()).unwrap();
+        assert_eq!(repeat.cache.isolation_key, isolated.cache.isolation_key);
+
+        // Namespace and salt are separate coordinates, even when their
+        // concatenated text is identical.
+        request.cache_namespace = Some("a".to_string());
+        request.cache_salt = Some("bc".to_string());
+        let (other, _) = processor.preprocess_text_request(request.clone()).unwrap();
+        assert_ne!(other.cache.isolation_key, isolated.cache.isolation_key);
+
+        request.bypass_cache_read = true;
+        request.no_cache_store = true;
+        let (disabled, response) = processor.preprocess_text_request(request.clone()).unwrap();
+        assert!(!disabled.cache.read && !disabled.cache.write);
+        assert!(!response.cache.read_enabled && !response.cache.write_enabled);
+        assert_eq!(disabled.cache.isolation_key, other.cache.isolation_key);
+
+        request.bypass_cache_read = false;
+        request.no_cache_store = false;
+        request.stop.prompt_logprobs = Some(0);
+        let (logprobs, response) = processor.preprocess_text_request(request).unwrap();
+        assert!(!logprobs.cache.read && logprobs.cache.write);
+        assert!(!response.cache.read_enabled && response.cache.write_enabled);
+        assert!(response.prompt_logprobs_requested);
+    }
 }

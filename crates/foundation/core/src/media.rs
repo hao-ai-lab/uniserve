@@ -1,12 +1,11 @@
 //! Immutable ownership of generated POSIX shared-memory artifacts.
 
-use axum::body::Bytes;
 use std::ffi::CString;
-use uniserve_core::ArtifactEvent;
 
-pub(crate) struct SharedMedia {
+#[derive(Debug)]
+pub struct SharedMedia {
     address: *mut libc::c_void,
-    pub(crate) bytes: usize,
+    bytes: usize,
 }
 
 // The mapping is immutable after publication and remains valid until the final Arc drops.
@@ -14,17 +13,23 @@ unsafe impl Send for SharedMedia {}
 unsafe impl Sync for SharedMedia {}
 
 impl SharedMedia {
-    /// Claims and maps a generated shared-memory artifact for response streaming.
-    pub(crate) fn open(artifact: &ArtifactEvent) -> Result<Self, String> {
-        let bytes = usize::try_from(artifact.bytes)
+    /// Claims an immutable POSIX shared-memory object and maps its published extent.
+    ///
+    /// Opening transfers ownership: the name is unlinked immediately, and bytes
+    /// remain readable until this mapping is dropped. Errors after opening also
+    /// release the named object. The publisher must stop writing before transfer.
+    ///
+    /// # Safety
+    ///
+    /// The publisher must relinquish all writes and resizing before this call,
+    /// and no process may modify the object while the mapping remains live.
+    pub unsafe fn open(name: &str, num_bytes: u64) -> Result<Self, String> {
+        let bytes = usize::try_from(num_bytes)
             .map_err(|_| "generated media is too large for this host".to_string())?;
-        if bytes == 0
-            || artifact.artifact.posix_shm_name().is_empty()
-            || artifact.artifact.posix_shm_name().contains('/')
-        {
+        if bytes == 0 || name.is_empty() || name.contains('/') {
             return Err("generated media has an invalid shared-memory locator".to_string());
         }
-        let name = CString::new(format!("/{}", artifact.artifact.posix_shm_name()))
+        let name = CString::new(format!("/{}", name))
             .map_err(|_| "generated media has an invalid shared-memory name".to_string())?;
         // SAFETY: name is a valid NUL-terminated POSIX shm name.
         let descriptor = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
@@ -34,7 +39,7 @@ impl SharedMedia {
                 std::io::Error::last_os_error()
             ));
         }
-        // The response is the sole consumer. Claim the object as soon as it is open; the
+        // Claim the object as soon as it is open; shared mapping owners retain the bytes. The
         // descriptor keeps the bytes alive across inspection and mapping failures.
         // SAFETY: name identifies the object opened above.
         if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
@@ -61,7 +66,7 @@ impl SharedMedia {
         if extent < 0
             || u64::try_from(extent)
                 .ok()
-                .is_none_or(|value| value < artifact.bytes)
+                .is_none_or(|value| value < num_bytes)
         {
             // SAFETY: descriptor is open.
             unsafe { libc::close(descriptor) };
@@ -90,12 +95,26 @@ impl SharedMedia {
         Ok(Self { address, bytes })
     }
 
-    /// Wraps bytes as an HTTP response-body frame.
-    pub(crate) fn chunk(&self, offset: usize, count: usize) -> Bytes {
-        // SAFETY: caller bounds offset/count to the mapping extent and the mapping is immutable.
-        let value =
-            unsafe { std::slice::from_raw_parts((self.address as *const u8).add(offset), count) };
-        Bytes::copy_from_slice(value)
+    /// Number of published bytes owned by this mapping.
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    /// Whether the published extent is empty; successful mappings are nonempty.
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    /// Borrows the immutable published extent for validation or response output.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: the mapping remains live for this borrow and is immutable after publication.
+        unsafe { std::slice::from_raw_parts(self.address.cast(), self.bytes) }
+    }
+}
+
+impl AsRef<[u8]> for SharedMedia {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 

@@ -12,10 +12,10 @@ const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 
 /// Renders the current process registry in OpenMetrics text format.
 pub(super) async fn scrape(State(state): State<Arc<AppState>>) -> Response {
-    let identity = state.runtime().model().served_identity();
+    let model = state.runtime().model().config();
     METRICS.serving.set_request_states(
         state.served_model_name(),
-        identity.description.id(),
+        model.description().id(),
         state.runtime().metrics_snapshot().state_counts(),
     );
     match METRICS.render() {

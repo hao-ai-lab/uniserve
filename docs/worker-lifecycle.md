@@ -58,7 +58,7 @@ with Worker.from_config(config) as worker:
 
 Each physical run is submitted once. `Submit` begins execution and returns the first available fragment; `Poll` claims only subsequent, undelivered fragments. A run can have one outstanding response. Terminal delivery and safe resource retirement release its state. Completed results cannot be collected again. Duplicate submissions return `InvalidDescriptor` before applying admissions, commands, or computation.
 
-IPC version 36 requires a matching Rust frontend and Python native extension. Version mismatch is rejected at the transport boundary; rebuild both artifacts together.
+IPC version 58 requires a matching Rust frontend and Python native extension. Version mismatch is rejected at the transport boundary; rebuild both artifacts together. Request identity is `(engine_id, request_id, request_epoch)`; retained buffers keep the exact originating identity across request-slot reuse. Each computation is identified by its logical `(batch_id, request_index)`, preserved when a batch is split into physical worker runs. The physical `run_id` orders submissions and polling independently of those producer coordinates.
 
 Physical `run_id` values strictly increase in each Worker's actual transport submission order. Worker stores one high-water mark for its lifetime; no completed-run history is retained. The Rust executor allocates physical IDs when dispatching to each Worker, independently of logical batch allocation. Logical batches may become ready out of order, and responses retain their original `batch_id`. ID gaps are valid. Counter exhaustion is an error. Waiting timeouts continue waiting on the original transport request; they never submit it again. Rank death uses the existing scoped failure and replacement handling, retiring affected work rather than resubmitting its physical run.
 
@@ -74,7 +74,7 @@ ModelRunner resolves configured devices and domains into immutable computation b
 
 Warmup, capture, eager execution, and graph replay use these same bindings. ModelRunner combines compatible rows within the submitted logical launch constraints and restores their original output order. Preparation and operation advancement receive explicit request, storage, transport, and computation dependencies; they do not inspect physical Lanes. Construction rejects unsupported or conflicting bindings rather than changing the requested graph or device policy.
 
-Cleanup drains computation and abandons unsubmitted output work. Submitted CPU jobs finish before their mux sessions close. Graphs and staging then release before physical Lane resources. Failures during partial binding construction roll back every acquired context and preserve the allocation error. Free, Finish, and Retire revoke logical acquisition while the storage and transfer owners retain existing readers until physical completion permits reuse.
+Cleanup drains computation and abandons unsubmitted output work. Submitted CPU jobs finish before their mux sessions close. Graphs and staging then release before physical Lane resources. Failures during partial binding construction roll back every acquired context and preserve the allocation error. Free and Finish revoke logical acquisition while the storage and transfer owners retain existing readers until physical completion permits reuse.
 
 ## Model loading and diagnostics
 

@@ -12,8 +12,9 @@ import torch
 from torch import nn
 
 from uniserve_worker.config import WorkerConfig
+from uniserve_worker.execution.batch import Computation, PipelineStage
 
-from ..execution.batch import DecodeRange, MediaGeometry, OpCode, TensorSpec
+from ..execution.batch import DecodeRange, DiffusionSamplingParams, TensorSpec
 from ..execution.bounded_storage import BoundedTensorStorage, TensorSchema
 from ..execution.forward_batch import AttentionSelection, ForwardBatch, ForwardOutput
 from ..foundation.errors import invalid_descriptor
@@ -27,7 +28,6 @@ if TYPE_CHECKING:
     from ..runtime.cache_pool import CachePool
     from .generation import GenerationPipeline
     from .inputs import ImageProcessor
-    from .video import MediaExecutionPlan
 
 _FLOAT_DTYPES = frozenset({"float16", "bfloat16", "float32"})
 _KV_DTYPES = frozenset({*_FLOAT_DTYPES, "float8_e4m3fn"})
@@ -123,7 +123,7 @@ class ExecutionModel(nn.Module):
     serving_dtype: str = "bfloat16"
     cache_geometry: CacheGeometry
     resource_geometry: ResourceGeometry
-    supported_work: frozenset[OpCode]
+    supported_work: frozenset[Computation]
     vocab_size: int
     hidden_size: int
     text_max_tokens: int
@@ -139,7 +139,8 @@ class ExecutionModel(nn.Module):
     # allocation, physical locations and reader lifetimes belong to the runtime.
     entry_outputs: Mapping[str, tuple[TensorSpec, ...]] = MappingProxyType({})
     bindings: EntryBindings | None = None
-    media_plan: MediaExecutionPlan | None = None
+    pipeline_components: Mapping[PipelineStage, str] = MappingProxyType({})
+    num_inference_steps: int = 0
     ordered_collective_execution: bool = False
 
     def bind_execution(self, runner: ModelRunner) -> None:
@@ -154,8 +155,9 @@ class ExecutionModel(nn.Module):
         self,
         entry: str,
         output_index: int,
-        media: MediaGeometry | None,
+        media: DiffusionSamplingParams | None,
         decode: DecodeRange | None,
+        num_prompt_tokens: int,
     ) -> TensorOutputLayout | None:
         """Describe numerical result geometry; return None when this rank has no result."""
 

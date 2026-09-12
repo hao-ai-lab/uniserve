@@ -33,18 +33,18 @@ DRAW_LAYOUT_FLOW_NOISE = 2
 
 def sampling_key(
     request_seed: int,
-    authority_id: int,
+    engine_id: int,
     request_id: int,
-    epoch: int,
+    request_epoch: int,
     draw_layout: int,
 ) -> int:
     """Return the 64-bit Philox key for one request lineage and draw space."""
 
     value = int(request_seed) & _U64
     for coordinate in (
-        int(authority_id),
+        int(engine_id),
         int(request_id),
-        int(epoch),
+        int(request_epoch),
         int(draw_layout),
     ):
         value = _splitmix_coordinate(value, coordinate)

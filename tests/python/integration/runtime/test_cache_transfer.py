@@ -10,18 +10,11 @@ import torch
 
 from tests.python.fixtures.shm_publication import serve_pending_publication
 from uniserve_worker.execution.batch import (
-    Checkpoint,
-    DType,
-    FixedCheckpoint,
-    KvTransferValue,
+    BufferId,
+    ComputationId,
+    KvTransfer,
     Locator,
-    PointRange,
-    ProductKind,
-    ProductRef,
     RequestKey,
-    ShapeBound,
-    StaticDim,
-    StorageClass,
     TensorTransfer,
 )
 from uniserve_worker.foundation.errors import WorkerError
@@ -64,12 +57,11 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
     try:
         assert parent.poll(30), "shared-memory publisher did not start"
         locator = Locator.from_mapping(parent.recv())
-        source = replace(_product(1), shape_bound=ShapeBound((StaticDim(8192),)))
+        source = _buffer(1)
         field = TensorTransfer(shape=shape, locations=(locator,))
-        publication = KvTransferValue(
-            generation=source.generation,
+        publication = KvTransfer(
             tensors=(field, field),
-            source=Checkpoint(1, FixedCheckpoint(256)),
+            source=source,
             destination="consumer",
             base=None,
             base_extent=0,
@@ -90,10 +82,10 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
         )
         assert parent.poll(30), "publisher did not receive the read"
         assert parent.recv() == "pending"
-        pool.imports.cancel_requests(frozenset((source.request_key,)))
+        pool.imports.cancel_requests(frozenset((source.owner,)))
         with pytest.raises(WorkerError, match="cancelled"):
             write.completion.result(timeout=5)
-        assert not pool.retirement_ready(requests=(source.request_key,))
+        assert not pool.retirement_ready(requests=(source.owner,))
         with pytest.raises(WorkerError, match="import destination"):
             pool.zero_pages(0, (1,))
 
@@ -106,7 +98,7 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
         process.join(30)
         assert process.exitcode == 0
         write.retirement.result(timeout=5)
-        assert pool.retirement_ready(requests=(source.request_key,))
+        assert pool.retirement_ready(requests=(source.owner,))
         pool.zero_pages(0, (1,))
         for actual in pool.read(0, (1,), start=0, length=256):
             assert torch.count_nonzero(actual).item() == 0
@@ -123,18 +115,96 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
         events.close()
 
 
-def _product(operation: int) -> ProductRef:
-    return ProductRef(
-        request_key=RequestKey(1, 1, 1),
-        producer_op_id=operation,
+def _buffer(operation: int) -> BufferId:
+    return BufferId(
+        owner=RequestKey(1, 1, 1),
+        producer_op_id=ComputationId(operation, 0),
         output_index=0,
         generation=operation,
-        kind=ProductKind.KV,
-        storage_class=StorageClass.PAGED_KV,
-        dtype=DType.U8,
-        shape_bound=ShapeBound((StaticDim(4096),)),
-        point_range=PointRange(),
     )
+
+
+def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> None:
+    pool = CachePool(
+        num_layers=1,
+        num_pages=2,
+        page_size=4,
+        num_kv_heads=1,
+        head_dim=1,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    tables = ReqToTokenPool(
+        group_count=1, request_pool_size=1, max_blocks_per_request=1, block_size=4, device="cpu"
+    )
+    tables.install(((1, 0, (1,), 4),))
+    publications = CachePublications(pool, tables)
+    first = _buffer(1)
+    second = replace(first, owner=replace(first.owner, request_epoch=first.owner.request_epoch + 1))
+    try:
+        for source in (first, second):
+            assert publications.destination_base(source.owner, "consumer") is None
+            # An empty extent is a valid publication: its identity and installed
+            # base still belong to one exact request incarnation.
+            publication = publications.publish(
+                request_pool_idx=1,
+                group_id=0,
+                visible_length=0,
+                destination="consumer",
+                expected_base=None,
+                buffer=source,
+                transports={},
+            )
+            publications.apply_commit(publications.prepare_commit(((source, publication),), ()))
+            for mismatched in (
+                replace(
+                    source,
+                    owner=replace(source.owner, request_epoch=source.owner.request_epoch + 1),
+                ),
+                replace(source, producer_op_id=ComputationId(2, 0)),
+                replace(source, output_index=1),
+            ):
+                with pytest.raises(WorkerError, match="source identity"):
+                    publications.prepare_install(
+                        mismatched,
+                        publication,
+                        request_pool_idx=1,
+                        group_id=0,
+                        page_ids=(1,),
+                        allocated_length=4,
+                        initialized_pages=(),
+                        transports={},
+                    )
+            write = publications.prepare_install(
+                source,
+                publication,
+                request_pool_idx=1,
+                group_id=0,
+                page_ids=(1,),
+                allocated_length=4,
+                initialized_pages=(),
+                transports={},
+            )
+            installed = replace(source, producer_op_id=ComputationId(3, 0))
+            result = publications.install(
+                request_pool_idx=1,
+                group_id=0,
+                request_key=source.owner,
+                source=source,
+                installed_buffer=installed,
+                write=write,
+            )
+            publications.apply_commit(
+                publications.prepare_commit((), ((source, installed, result),))
+            )
+            assert publications.publication(installed) == publication
+            assert publications.destination_base(source.owner, "consumer") == source
+        with pytest.raises(WorkerError, match="another request"):
+            publications.validate_conditioning(
+                second.owner, first, request_pool_idx=1, group_id=0, visible_length=0
+            )
+    finally:
+        pool.close()
 
 
 @pytest.mark.parametrize(
@@ -214,9 +284,8 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                     layer, pages[0], start=start, k=tensor * 2**layer, v=-tensor * 2**layer / 2
                 )
             extent = start + len(values)
-            source = _product(operation)
-            installed = _product(100 + operation)
-            checkpoint = Checkpoint(operation, FixedCheckpoint(extent))
+            source = _buffer(operation)
+            installed = _buffer(100 + operation)
             if device.startswith("cuda"):
                 torch.cuda.synchronize(device)
                 allocated = torch.cuda.memory_allocated(device)
@@ -225,10 +294,9 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                 request_pool_idx=1,
                 group_id=0,
                 visible_length=extent,
-                source_version=checkpoint,
                 destination="consumer",
                 expected_base=base,
-                product=source,
+                buffer=source,
                 transports={transports[0].name: transports[0]},
             )
             locators.extend(
@@ -271,9 +339,9 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
             result = publications[1].install(
                 request_pool_idx=1,
                 group_id=0,
-                request_id=1,
+                request_key=source.owner,
                 source=source,
-                installed_product=installed,
+                installed_buffer=installed,
                 write=write,
             )
             publications[1].apply_commit(
@@ -296,7 +364,7 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                 for field in untouched:
                     assert field is not None
                     assert torch.count_nonzero(field).item() == 0
-            base = checkpoint
+            base = source
     finally:
         for write in writes:
             pools[1].imports.abandon(write)
@@ -423,8 +491,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
     base = None
     try:
         for operation, (start, extent) in enumerate(((0, 3), (3, 6)), start=1):
-            source = _product(operation)
-            checkpoint = Checkpoint(operation, FixedCheckpoint(extent))
+            source = _buffer(operation)
             shards = []
             for pool, owner, transport in zip(
                 pools[:source_count], owners[:source_count], transports[:source_count], strict=True
@@ -443,10 +510,9 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                     request_pool_idx=1,
                     group_id=0,
                     visible_length=extent,
-                    source_version=checkpoint,
                     destination="consumer",
                     expected_base=base,
-                    product=source,
+                    buffer=source,
                     transports={backend: transport},
                 )
                 publications.append((pool, transport, source, shard))
@@ -487,13 +553,13 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                 )
                 writes.append((pool, write))
                 write.completion.result(timeout=30)
-                installed = _product(100 + operation)
+                installed = _buffer(100 + operation)
                 value = owner.install(
                     request_pool_idx=1,
                     group_id=0,
-                    request_id=1,
+                    request_key=source.owner,
                     source=source,
-                    installed_product=installed,
+                    installed_buffer=installed,
                     write=write,
                 )
                 owner.apply_commit(owner.prepare_commit((), ((source, installed, value),)))
@@ -506,15 +572,15 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                     )
                     torch.testing.assert_close(key, expected, rtol=0, atol=0)
                     torch.testing.assert_close(value, -expected / 2, rtol=0, atol=0)
-            base = checkpoint
+            base = source
     finally:
         for pool, write in writes:
             pool.imports.abandon(write)
-        for pool, transport, product, publication in publications:
+        for pool, transport, buffer, publication in publications:
             for tensor in publication.tensors:
                 for location in tensor.locations:
                     transport.release(location)
-            pool.release_buffers((product.buffer_id,))
+            pool.release_buffers((buffer,))
         for pool in pools:
             pool.imports.stop()
         for transport in transports:
@@ -570,18 +636,16 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
                 v=-values[:2, : pools[index].n_kv],
             )
         for operation, source_index, extent in ((1, 0, 2), (2, 1, 4)):
-            checkpoint = Checkpoint(operation, FixedCheckpoint(extent))
-            source = _product(operation)
+            source = _buffer(operation)
             if operation == 2:
                 pools[1].write(0, (1,), start=2, k=values[2:], v=-values[2:])
             publication = owners[source_index].publish(
                 request_pool_idx=1,
                 group_id=0,
                 visible_length=extent,
-                source_version=checkpoint,
                 destination="consumer",
                 expected_base=base,
-                product=source,
+                buffer=source,
                 transports={"local": transports[source_index]},
             )
             publications.append((source_index, source, publication))
@@ -600,13 +664,13 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
             )
             writes.append(write)
             write.completion.result(timeout=10)
-            installed = _product(100 + operation)
+            installed = _buffer(100 + operation)
             result = owners[2].install(
                 request_pool_idx=1,
                 group_id=0,
-                request_id=1,
+                request_key=source.owner,
                 source=source,
-                installed_product=installed,
+                installed_buffer=installed,
                 write=write,
             )
             owners[2].apply_commit(owners[2].prepare_commit((), ((source, installed, result),)))
@@ -614,30 +678,29 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
             torch.testing.assert_close(key, values[:extent, :2], rtol=0, atol=0)
             torch.testing.assert_close(value, -values[:extent, :2], rtol=0, atol=0)
             if operation == 1:
-                # A second producer represents the same checkpoint with a wider
-                # quantization group before publishing its successor generation.
-                other = _product(10)
+                # A replica publishes the same buffer identity with a wider
+                # quantization group before producing the next suffix.
+                other = source
                 replica = owners[1].publish(
                     request_pool_idx=1,
                     group_id=0,
                     visible_length=extent,
-                    source_version=checkpoint,
                     destination="consumer",
                     expected_base=None,
-                    product=other,
+                    buffer=other,
                     transports={"local": transports[1]},
                 )
                 publications.append((1, other, replica))
                 owners[1].apply_commit(owners[1].prepare_commit(((other, replica),), ()))
-            base = checkpoint
+            base = source
     finally:
         for write in writes:
             pools[2].imports.abandon(write)
-        for index, product, publication in publications:
+        for index, buffer, publication in publications:
             for tensor in publication.tensors:
                 for location in tensor.locations:
                     transports[index].release(location)
-            pools[index].release_buffers((product.buffer_id,))
+            pools[index].release_buffers((buffer,))
         for pool in pools:
             pool.imports.stop()
         for transport in transports:

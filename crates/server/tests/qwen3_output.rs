@@ -2,13 +2,14 @@
 
 use std::sync::Arc;
 
-use futures::stream;
+use futures::{StreamExt, stream};
 use tempfile::tempdir;
 use tokenizers::models::bpe::BPE;
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use uniserve_server::serving::chat::output::AssistantEvent;
 use uniserve_server::serving::chat::{
-    ChatRequest, ChatToolChoice, CollectedAssistantMessage, Qwen3ChatOutputProcessor, Tool,
+    AssistantBlockKind, ChatRequest, ChatToolChoice, Qwen3ChatOutputProcessor, Tool,
 };
 use uniserve_server::serving::text::{DecodedTextEvent, FinishReason, Finished};
 
@@ -79,17 +80,52 @@ async fn qwen3_processor_emits_reasoning_text_and_tool_calls()
             }),
         }),
     ]);
-    let output = processor.process(Box::pin(decoded))?;
-
-    let collected = CollectedAssistantMessage::collect("qwen3-output", output).await?;
-    assert_eq!(collected.message.reasoning().as_deref(), Some("hidden"));
-    assert_eq!(collected.message.text(), "beforebetweenafter");
-    let calls = collected.message.tool_calls().collect::<Vec<_>>();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].name, "lookup");
-    assert_eq!(calls[0].arguments, r#"{"q":"x"}"#);
-    assert_eq!(calls[1].name, "lookup");
-    assert_eq!(calls[1].arguments, r#"{"q":"y"}"#);
+    let output = processor.parse(decoded);
+    futures::pin_mut!(output);
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut calls = Vec::<(String, String)>::new();
+    let mut finished = false;
+    while let Some(event) = output.next().await {
+        match event? {
+            AssistantEvent::TextDelta {
+                kind: AssistantBlockKind::Text,
+                delta,
+            } => text.push_str(&delta),
+            AssistantEvent::TextDelta {
+                kind: AssistantBlockKind::Reasoning,
+                delta,
+            } => reasoning.push_str(&delta),
+            AssistantEvent::ToolCallStart { name, .. } => calls.push((name, String::new())),
+            AssistantEvent::ToolCallArgumentsDelta { delta } => {
+                calls
+                    .last_mut()
+                    .expect("tool arguments follow a named call")
+                    .1
+                    .push_str(&delta);
+            }
+            AssistantEvent::Done {
+                output_token_count,
+                finish_reason,
+                ..
+            } => {
+                assert_eq!(output_token_count, 1);
+                assert_eq!(finish_reason, FinishReason::stop_eos());
+                finished = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(finished);
+    assert_eq!(reasoning, "hidden");
+    assert_eq!(text, "beforebetweenafter");
+    assert_eq!(
+        calls,
+        vec![
+            ("lookup".to_string(), r#"{"q":"x"}"#.to_string()),
+            ("lookup".to_string(), r#"{"q":"y"}"#.to_string()),
+        ]
+    );
     Ok(())
 }
 
@@ -126,9 +162,29 @@ async fn disabled_reasoning_parsing_streams_delimiters_as_content()
             }),
         }),
     ]);
-    let output = processor.process(Box::pin(decoded))?;
-    let collected = CollectedAssistantMessage::collect("qwen3-raw-output", output).await?;
-    assert_eq!(collected.message.reasoning(), None);
-    assert_eq!(collected.message.text(), "<think>hi</think>after");
+    let output = processor.parse(decoded);
+    futures::pin_mut!(output);
+    let mut text = String::new();
+    let mut finished = false;
+    while let Some(event) = output.next().await {
+        match event? {
+            AssistantEvent::TextDelta { kind, delta } => {
+                assert_eq!(kind, AssistantBlockKind::Text);
+                text.push_str(&delta);
+            }
+            AssistantEvent::Done {
+                output_token_count,
+                finish_reason,
+                ..
+            } => {
+                assert_eq!(output_token_count, 2);
+                assert_eq!(finish_reason, FinishReason::stop_eos());
+                finished = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(finished);
+    assert_eq!(text, "<think>hi</think>after");
     Ok(())
 }

@@ -8,23 +8,16 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from uniserve_worker.execution.batch import PipelineStage
 from uniserve_worker.nn.mesh import EntryBindings
 
-from ...execution.batch import (
-    DecodeRange,
-    MediaGeometry,
-    MediaTrack,
-    OpCode,
-)
+from ...execution.batch import DecodeRange, DiffusionSamplingParams, MediaTrack
 from ...execution.bounded_storage import BoundedTensorStorage
 from ...execution.denoising import DenoisingStep
 from ...nn.diffusion.schedule import DiffusionSchedule
 from ...nn.parallel_attention import AttentionContextGeometry, AttentionContextWorkspace
 from ..runtime import ResourceGeometry, TensorOutputLayout
 from ..video import (
-    MediaExecutionPlan,
-    MediaPlanRepeat,
-    MediaPlanStage,
     VideoModel,
     VideoOutputGeometry,
 )
@@ -71,66 +64,21 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
     denoiser: MiniMaxH3Transformer | None
     video_assembler: H3VideoAssembler | None
 
-    media_plan = MediaExecutionPlan(
-        (
-            MediaPlanStage("encode", OpCode.ENCODER_TEXT, "text_encoder"),
-            MediaPlanStage(
-                "prepare",
-                OpCode.DIFFUSION_PREPARE,
-                "denoiser",
-                dependencies=("encode",),
-                input_from="encode",
-            ),
-            MediaPlanStage(
-                "denoise",
-                OpCode.DIFFUSION_STEP,
-                "denoiser",
-                dependencies=("prepare",),
-                repeat=MediaPlanRepeat.FIXED,
-                count=len(FASTH3_LADDER),
-            ),
-            MediaPlanStage(
-                "video_decode",
-                OpCode.DIFFUSION_DECODE,
-                "video_decoder",
-                dependencies=("denoise",),
-                input_from="denoise",
-                repeat=MediaPlanRepeat.VIDEO_UNITS,
-            ),
-            MediaPlanStage(
-                "audio_decode",
-                OpCode.DIFFUSION_DECODE,
-                "audio_decoder",
-                dependencies=("denoise",),
-                input_from="denoise",
-            ),
-            MediaPlanStage(
-                "video_append",
-                OpCode.MEDIA_APPEND,
-                "output",
-                dependencies=("denoise",),
-                input_from="video_decode",
-                repeat=MediaPlanRepeat.VIDEO_UNITS,
-            ),
-            MediaPlanStage(
-                "audio_append",
-                OpCode.MEDIA_APPEND,
-                "output",
-                dependencies=("denoise",),
-                input_from="audio_decode",
-            ),
-            MediaPlanStage(
-                "finalize",
-                OpCode.DIFFUSION_FINALIZE,
-                "output",
-                dependencies=("video_append", "audio_append"),
-            ),
-        )
-    )
+    pipeline_components = {
+        PipelineStage.TEXT_ENCODING: "text_encoder",
+        PipelineStage.LATENT_PREPARATION: "denoiser",
+        PipelineStage.DENOISING: "denoiser",
+        PipelineStage.VIDEO_DECODING: "video_decoder",
+        PipelineStage.AUDIO_DECODING: "audio_decoder",
+        PipelineStage.VIDEO_ENCODING: "output",
+        PipelineStage.AUDIO_ENCODING: "output",
+        PipelineStage.MUXING: "output",
+    }
+    num_inference_steps = len(FASTH3_LADDER)
     architecture = "MiniMaxH3Transformer3DModel"
     serving_dtype = "bfloat16"
     resource_geometry = ResourceGeometry(kv=False)
-    supported_work = media_plan.operations
+    supported_work = frozenset(pipeline_components)
     generation = None
     image_processor = None
     tensorized_mixed = False
@@ -150,7 +98,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
     ) -> DenoisingStep:
         """Compose the learned denoiser with the shared solver and pipeline feedback."""
 
-        if not 0 <= step < self.denoise_steps:
+        if not 0 <= step < self.num_inference_steps:
             raise ValueError("H3 denoise step is outside the four-evaluation ladder")
         assert self.denoiser is not None and metadata.scratch is not None
         assert metadata.transformer_metadata is not None
@@ -250,31 +198,37 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
 
         return build_h3_checkpoint(config, context)
 
-    def execution_key(self, geometry: MediaGeometry) -> tuple[int, int, int]:
+    def execution_key(
+        self, geometry: DiffusionSamplingParams, num_prompt_tokens: int
+    ) -> tuple[int, int, int]:
         """Validate admitted bounds and describe equivalent packed metadata."""
 
-        page_rows = ((geometry.prompt_tokens + 63) // 64) * 64
-        audio_frames = audio_latent_frames(geometry.frame_count)
+        page_rows = ((num_prompt_tokens + 63) // 64) * 64
+        audio_frames = audio_latent_frames(geometry.num_frames)
         if (
             page_rows > int(self.layout.packed.text_indices.numel())
-            or geometry.frame_count > self.layout.frame_count
+            or geometry.num_frames > self.layout.frame_count
             or audio_frames > self.layout.packed.audio_frames
         ):
             raise ValueError("H3 media geometry exceeds the configured model capacity")
-        units = reconstruction_unit_frames(geometry.frame_count)
-        if geometry.video_units != len(units) or geometry.denoise_steps != self.denoise_steps:
+        units = reconstruction_unit_frames(geometry.num_frames)
+        if (
+            geometry.num_decode_chunks != len(units)
+            or geometry.num_inference_steps != self.num_inference_steps
+        ):
             raise ValueError("the H3 worker received invalid computation bounds")
-        return geometry.frame_count, page_rows, audio_frames
+        return geometry.num_frames, page_rows, audio_frames
 
     def build_execution(
         self,
-        geometry: MediaGeometry,
+        geometry: DiffusionSamplingParams,
+        num_prompt_tokens: int,
         storage: BoundedTensorStorage,
         context: AttentionContextWorkspace | None,
     ) -> H3ComputeInputs:
         """Build immutable packed metadata for a validated public geometry cache key."""
 
-        frames, text_rows, audio_frames = self.execution_key(geometry)
+        frames, text_rows, audio_frames = self.execution_key(geometry, num_prompt_tokens)
         layout = H3Layout.build(
             self.bindings,
             frames=frames,
@@ -291,12 +245,10 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         )
 
     def request_tensors(
-        self, storage: BoundedTensorStorage, geometry: MediaGeometry, metadata: H3ComputeInputs
+        self, storage: BoundedTensorStorage, metadata: H3ComputeInputs
     ) -> H3Tensors:
         """Borrow mathematical inputs from the request's publicly owned tensor slot."""
 
-        if self.execution_key(geometry) != metadata.layout.shape_key:
-            raise ValueError("H3 tensor views disagree with their computation metadata")
         return bind_request_tensors(storage, metadata.layout)
 
     @torch.inference_mode()
@@ -323,14 +275,15 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         self,
         entry: str,
         output_index: int,
-        media: MediaGeometry | None,
+        media: DiffusionSamplingParams | None,
         decode: DecodeRange | None,
+        num_prompt_tokens: int,
     ) -> TensorOutputLayout | None:
         """Describe unique logical modality rows and temporal decoder results."""
 
         if media is None:
             raise ValueError("H3 tensor results require media geometry")
-        frames, text_rows, audio_frames = self.execution_key(media)
+        frames, text_rows, audio_frames = self.execution_key(media, num_prompt_tokens)
         return tensor_output_layout(
             self.bindings,
             entry,
@@ -338,7 +291,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             decode,
             frames=frames,
             text_rows=text_rows,
-            prompt_tokens=media.prompt_tokens,
+            prompt_tokens=num_prompt_tokens,
             audio_frames=audio_frames,
         )
 
@@ -388,13 +341,14 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             raise RuntimeError("video assembly was routed to a rank without the output component")
         return self.video_assembler.assemble(slot, execution, segments, start_unit, unit_count)
 
-    def output_geometry(self, geometry: MediaGeometry) -> VideoOutputGeometry:
+    def output_geometry(self, geometry: DiffusionSamplingParams) -> VideoOutputGeometry:
         """Describe the exact raster and sample timing required by the mathematics."""
 
-        self.execution_key(geometry)
+        if geometry.num_frames > self.layout.frame_count:
+            raise ValueError("H3 output exceeds configured frame capacity")
         return VideoOutputGeometry(
-            frame_count=geometry.frame_count,
-            unit_frames=reconstruction_unit_frames(geometry.frame_count),
+            frame_count=geometry.num_frames,
+            unit_frames=reconstruction_unit_frames(geometry.num_frames),
             width=PROFILE_WIDTH,
             height=PROFILE_HEIGHT,
             frame_rate=PROFILE_FPS,
@@ -448,13 +402,18 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             if runner.schedule is None or runner.denoise is None:
                 raise RuntimeError("denoiser warmup requires its execution owner and schedule")
             prepared: set[Hashable] = set()
-            for geometry in warmup_geometries(self.layout, self.denoise_steps):
-                key = self.execution_key(geometry)
+            for geometry, num_prompt_tokens in warmup_geometries(
+                self.layout, self.num_inference_steps
+            ):
+                key = self.execution_key(geometry, num_prompt_tokens)
                 if key in prepared:
                     continue
                 prepared.add(key)
                 execution = runner.prepare_geometry(
-                    key, lambda: self.build_execution(geometry, scratch, runner.context_workspace)
+                    key,
+                    lambda: self.build_execution(
+                        geometry, num_prompt_tokens, scratch, runner.context_workspace
+                    ),
                 )
                 views = execution.prepare_warmup_slots(storage, self.denoiser)
                 runner.denoise.warmup(views[0], execution, runner.schedule)

@@ -7,11 +7,11 @@ import torch
 
 from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
+from uniserve_worker.execution.batch import ForwardMode
 from uniserve_worker.execution.forward_batch import (
     AttentionMode,
     AttentionSelection,
     ForwardBatch,
-    ModelPhase,
     TokenSelection,
 )
 from uniserve_worker.execution.graph.full import FullCudaGraphBackend
@@ -117,19 +117,19 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind,
     tables = torch.zeros((rows, 4096), dtype=torch.int32, device=device)
     tables[:, :4].copy_(torch.arange(1, 13, dtype=torch.int32, device=device).view(rows, 4))
     batch = ForwardBatch(
-        phase=ModelPhase.TEXT,
+        forward_mode=ForwardMode.DECODE,
         row_count=rows,
-        forward_mode=AttentionMode.PAGED_DECODE,
-        req_pool_indices=torch.arange(1, rows + 1, device=device),
-        seq_lens=torch.tensor([62, 61, 60], dtype=torch.int32, device=device),
+        attention_mode=AttentionMode.PAGED_DECODE,
+        request_pool_indices=torch.arange(1, rows + 1, device=device),
+        prefix_lens=torch.tensor([62, 61, 60], dtype=torch.int32, device=device),
         query_lens=torch.ones(rows, dtype=torch.int32, device=device),
         out_cache_loc=torch.tensor([126, 381, 636], dtype=torch.int64, device=device),
         block_table=tables[:, :1319],
-        kv_lens=torch.tensor([63, 62, 61], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([63, 62, 61], dtype=torch.int32, device=device),
         max_seqlen_k=1319 * 64,
-        seq_lens_cpu=(62, 61, 60),
+        prefix_lens_cpu=(62, 61, 60),
         query_lens_cpu=(1,) * rows,
-        kv_lens_cpu=(63, 62, 61),
+        seq_lens_cpu=(63, 62, 61),
         token_row_indices=tuple(range(rows)),
         input_ids=torch.tensor([1, 3, 5], device=device),
         positions=torch.tensor([62, 61, 60], dtype=torch.int64, device=device),
@@ -164,19 +164,19 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind,
             (((198, 211, 200), (9, 11, 13)), ((199, 212, 201), (4, 2, 19)))
         ):
             batch.input_ids.copy_(torch.tensor(tokens, device=device))
-            batch.kv_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
-            batch.seq_lens.copy_(batch.kv_lens - 1)
-            batch.positions.copy_(batch.seq_lens)
-            page_columns = batch.seq_lens.long() // 64
+            batch.seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+            batch.prefix_lens.copy_(batch.seq_lens - 1)
+            batch.positions.copy_(batch.prefix_lens)
+            page_columns = batch.prefix_lens.long() // 64
             pages = batch.block_table.gather(1, page_columns[:, None])[:, 0]
-            batch.out_cache_loc.copy_(pages.long() * 64 + batch.seq_lens % 64)
+            batch.out_cache_loc.copy_(pages.long() * 64 + batch.prefix_lens % 64)
             # Eager invocations use distinct plan identities after metadata
             # changes; Graph replay owns its persistent binding separately.
             batch = replace(
                 batch,
                 binding=batch.binding + 10000,
-                kv_lens_cpu=lengths,
-                seq_lens_cpu=tuple(n - 1 for n in lengths),
+                seq_lens_cpu=lengths,
+                prefix_lens_cpu=tuple(n - 1 for n in lengths),
             )
             execution = runner.run(batch, forward, eligible=True)
             actual = execution.output

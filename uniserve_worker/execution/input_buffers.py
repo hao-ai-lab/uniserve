@@ -7,6 +7,7 @@ from typing import Literal, NotRequired, TypeAlias, TypedDict
 
 import torch
 
+from uniserve_worker.execution.batch import ForwardMode, PipelineStage
 from uniserve_worker.ops.staging import gather_request_decode_inputs
 from uniserve_worker.runtime.device import HostStagingRing, fill_cpu_bools, fill_cpu_ints
 
@@ -15,7 +16,6 @@ from .forward_batch import (
     AttentionMode,
     FlowPatches,
     ForwardBatch,
-    ModelPhase,
     RouteSpan,
     TokenSelection,
     packed_tensor_views,
@@ -25,18 +25,18 @@ from .forward_batch import (
 class AttentionColumns(TypedDict):
     """Materialized attention inputs copied into a lane's fixed tensor storage."""
 
-    forward_mode: Literal[
+    attention_mode: Literal[
         AttentionMode.DENSE,
         AttentionMode.PAGED_DECODE,
         AttentionMode.PAGED_VARLEN,
         AttentionMode.PACKED,
     ]
-    seq_lens: torch.Tensor
+    prefix_lens: torch.Tensor
     query_lens: torch.Tensor
     out_cache_loc: torch.Tensor
     has_cache_writes: bool
     block_table: NotRequired[torch.Tensor | None]
-    kv_lens: NotRequired[torch.Tensor | None]
+    seq_lens: NotRequired[torch.Tensor | None]
     cu_seqlens_q: NotRequired[torch.Tensor | None]
     cu_seqlens_k: NotRequired[torch.Tensor | None]
     output_indices: NotRequired[torch.Tensor | None]
@@ -47,9 +47,9 @@ class AttentionColumns(TypedDict):
     max_seqlen_k: NotRequired[int]
     causal: NotRequired[bool]
     causal_rows_cpu: NotRequired[tuple[bool, ...]]
-    seq_lens_cpu: NotRequired[tuple[int, ...]]
+    prefix_lens_cpu: NotRequired[tuple[int, ...]]
     query_lens_cpu: NotRequired[tuple[int, ...]]
-    kv_lens_cpu: NotRequired[tuple[int, ...]]
+    seq_lens_cpu: NotRequired[tuple[int, ...]]
     group_id: NotRequired[int]
     fully_visible: NotRequired[bool]
     binding: NotRequired[int]
@@ -58,10 +58,10 @@ class AttentionColumns(TypedDict):
 class RequestDecodeColumns(TypedDict):
     """Resident request columns gathered directly into decode staging storage."""
 
-    forward_mode: Literal[AttentionMode.REQUEST_INDEXED_DECODE]
-    seq_lens_cpu: tuple[int, ...]
+    attention_mode: Literal[AttentionMode.REQUEST_INDEXED_DECODE]
+    prefix_lens_cpu: tuple[int, ...]
     query_lens_cpu: tuple[int, ...]
-    kv_lens_cpu: tuple[int, ...]
+    seq_lens_cpu: tuple[int, ...]
     causal_rows_cpu: tuple[bool, ...]
     causal: bool
     group_id: int
@@ -186,7 +186,7 @@ class InputBuffers:
     def stage(
         self,
         *,
-        phase: ModelPhase,
+        forward_mode: ForwardMode | PipelineStage,
         row_count: int,
         request_pool_indices: tuple[int, ...],
         decode_force_finish: tuple[bool, ...] = (),
@@ -232,7 +232,7 @@ class InputBuffers:
             )
         ):
             raise ValueError("forward token columns are not aligned")
-        if attention["forward_mode"] is AttentionMode.REQUEST_INDEXED_DECODE:
+        if attention["attention_mode"] is AttentionMode.REQUEST_INDEXED_DECODE:
             if any(
                 (
                     flow_row_indices,
@@ -253,7 +253,7 @@ class InputBuffers:
             ):
                 raise ValueError("request-indexed decode cannot mix non-token rows")
             return self._stage_request_indexed_decode(
-                phase=phase,
+                forward_mode=forward_mode,
                 row_count=row_count,
                 request_pool_indices=request_pool_indices,
                 decode_force_finish=decode_force_finish,
@@ -266,7 +266,7 @@ class InputBuffers:
                 attention=attention,
             )
         self._scrub(
-            attention["forward_mode"],
+            attention["attention_mode"],
             embeddings=any(value is not None for value in token_embeddings),
         )
         request_slot, request_host = self._request_pool_indices_host.acquire()
@@ -382,16 +382,16 @@ class InputBuffers:
         )
         mask_view = None if embeddings_view is None else self.embedding_mask[:token_offset]
         return ForwardBatch(
-            phase=phase,
+            forward_mode=forward_mode,
             row_count=row_count,
-            forward_mode=staged_attention["forward_mode"],
-            req_pool_indices=self.request_pool_indices[:row_count],
-            seq_lens=staged_attention["seq_lens"],
+            attention_mode=staged_attention["attention_mode"],
+            request_pool_indices=self.request_pool_indices[:row_count],
+            prefix_lens=staged_attention["prefix_lens"],
             query_lens=staged_attention["query_lens"],
             out_cache_loc=staged_attention["out_cache_loc"],
             has_cache_writes=bool(staged_attention["has_cache_writes"]),
             block_table=staged_attention.get("block_table"),
-            kv_lens=staged_attention.get("kv_lens"),
+            seq_lens=staged_attention.get("seq_lens"),
             cu_seqlens_q=staged_attention.get("cu_seqlens_q"),
             cu_seqlens_k=staged_attention.get("cu_seqlens_k"),
             output_indices=staged_attention.get("output_indices"),
@@ -402,9 +402,9 @@ class InputBuffers:
             max_seqlen_k=int(staged_attention.get("max_seqlen_k", 0)),
             causal=bool(staged_attention.get("causal", True)),
             causal_rows_cpu=staged_attention.get("causal_rows_cpu", ()),
-            seq_lens_cpu=staged_attention.get("seq_lens_cpu", ()),
+            prefix_lens_cpu=staged_attention.get("prefix_lens_cpu", ()),
             query_lens_cpu=staged_attention.get("query_lens_cpu", ()),
-            kv_lens_cpu=staged_attention.get("kv_lens_cpu", ()),
+            seq_lens_cpu=staged_attention.get("seq_lens_cpu", ()),
             group_id=int(staged_attention.get("group_id", 0)),
             fully_visible=bool(staged_attention.get("fully_visible", False)),
             binding=int(staged_attention.get("binding", 0)),
@@ -441,7 +441,7 @@ class InputBuffers:
     def _stage_request_indexed_decode(
         self,
         *,
-        phase: ModelPhase,
+        forward_mode: ForwardMode | PipelineStage,
         row_count: int,
         request_pool_indices: tuple[int, ...],
         decode_force_finish: tuple[bool, ...],
@@ -467,8 +467,8 @@ class InputBuffers:
             or any(int(value.numel()) != 1 for value in token_positions)
             or any(value is not None for value in token_embeddings)
             or any(value is not None for value in token_embedding_masks)
+            or len(attention["prefix_lens_cpu"]) != row_count
             or len(attention["seq_lens_cpu"]) != row_count
-            or len(attention["kv_lens_cpu"]) != row_count
             or attention["query_lens_cpu"] != (1,) * row_count
         ):
             raise ValueError("request-indexed decode requires one plain token per row")
@@ -525,22 +525,22 @@ class InputBuffers:
         # Cache write locations are flattened page-and-offset coordinates; the
         # returned batch retains the two-dimensional table for attention reads.
         return ForwardBatch(
-            phase=phase,
+            forward_mode=forward_mode,
             row_count=row_count,
-            forward_mode=AttentionMode.PAGED_DECODE,
-            req_pool_indices=self.request_pool_indices[:row_count],
-            seq_lens=self.cache_lengths[:row_count],
+            attention_mode=AttentionMode.PAGED_DECODE,
+            request_pool_indices=self.request_pool_indices[:row_count],
+            prefix_lens=self.cache_lengths[:row_count],
             query_lens=self.query_lengths[:row_count],
             out_cache_loc=output_locations,
             has_cache_writes=True,
             block_table=self.block_tables[:row_count, :width],
-            kv_lens=self.kv_lengths[:row_count],
+            seq_lens=self.kv_lengths[:row_count],
             max_seqlen_k=width * int(attention["page_size"]),
             causal=bool(attention["causal"]),
             causal_rows_cpu=attention["causal_rows_cpu"],
-            seq_lens_cpu=attention["seq_lens_cpu"],
+            prefix_lens_cpu=attention["prefix_lens_cpu"],
             query_lens_cpu=attention["query_lens_cpu"],
-            kv_lens_cpu=attention["kv_lens_cpu"],
+            seq_lens_cpu=attention["seq_lens_cpu"],
             group_id=int(attention["group_id"]),
             binding=int(attention["binding"]),
             decode_force_finish=staged_decode_force_finish,
@@ -553,10 +553,10 @@ class InputBuffers:
     def stage_attention(self, attention: AttentionInputs) -> AttentionColumns:
         """Copy validated attention side tables into their fixed-address staging buffers."""
 
-        if attention["forward_mode"] is AttentionMode.REQUEST_INDEXED_DECODE:
+        if attention["attention_mode"] is AttentionMode.REQUEST_INDEXED_DECODE:
             raise ValueError("request-indexed decode must use fused input staging")
         staged = attention.copy()
-        staged["seq_lens"] = self._copy_vector(self.cache_lengths, attention["seq_lens"])
+        staged["prefix_lens"] = self._copy_vector(self.cache_lengths, attention["prefix_lens"])
         staged["query_lens"] = self._copy_vector(self.query_lengths, attention["query_lens"])
         staged["out_cache_loc"] = self._copy_vector(self.write_page_ids, attention["out_cache_loc"])
         block_table = attention.get("block_table")
@@ -565,11 +565,11 @@ class InputBuffers:
         )
         vectors: tuple[
             tuple[
-                Literal["kv_lens", "cu_seqlens_q", "cu_seqlens_k", "output_indices"], torch.Tensor
+                Literal["seq_lens", "cu_seqlens_q", "cu_seqlens_k", "output_indices"], torch.Tensor
             ],
             ...,
         ] = (
-            ("kv_lens", self.kv_lengths),
+            ("seq_lens", self.kv_lengths),
             ("cu_seqlens_q", self.cumulative_query_lengths),
             ("cu_seqlens_k", self.cumulative_kv_lengths),
             ("output_indices", self.output_indices),

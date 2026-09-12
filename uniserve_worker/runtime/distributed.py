@@ -22,7 +22,7 @@ from ..nn.mesh import (
     PeerTensorWorkspace,
     SymmetricMemoryWorkspace,
 )
-from ..nn.parallel import EntryConfig, ParallelConfig
+from ..nn.parallel import ComponentConfig, ParallelConfig
 from ..nn.parallel_attention import AttentionContextGeometry, AttentionContextWorkspace
 
 if TYPE_CHECKING:
@@ -80,7 +80,7 @@ class DistributedEnvironment:
             dist.group.WORLD if dist.is_initialized() else None,
         )
 
-    def initialize_entries(self, entries: Mapping[str, EntryConfig]) -> EntryBindings:
+    def initialize_entries(self, entries: Mapping[str, ComponentConfig]) -> EntryBindings:
         """Bind declared entries to their local meshes and shared process world."""
 
         meshes = initialize_model_parallel(

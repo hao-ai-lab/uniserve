@@ -13,9 +13,9 @@ import torch
 
 from tests.python.fixtures.depth_one import (
     ar_params,
-    commit_for_completion,
     execution_run,
     finalized_report,
+    record_completion,
     root_parent,
     token_operation,
 )
@@ -27,29 +27,20 @@ from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from uniserve_worker.execution.batch import (
     BlockTable,
     Bounds,
+    BufferId,
     CachePageAllocation,
-    Checkpoint,
-    CloseReason,
-    DeviceDim,
-    DType,
+    ComputationId,
     Finish,
+    ForwardMode,
     Free,
-    KvTransferValue,
+    KvTransfer,
     Locator,
     NewRequest,
-    OpCode,
-    Operation,
     OpStatus,
-    PointRange,
     PosixShmTransfer,
-    ProductKind,
-    ProductPayload,
-    ProductRef,
     RunResult,
-    ShapeBound,
-    StorageClass,
-    TokenMode,
-    TransferHandle,
+    ScheduledRequest,
+    TransferMode,
 )
 
 
@@ -82,11 +73,11 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 (producer, incoming, (8, 9)),
                 (worker, admission, (3, 4)),
             ):
-                extend, input_product = token_operation(
+                extend = token_operation(
                     request.request_key,
-                    op_id=1,
-                    parent=root_parent(request),
-                    mode=TokenMode.EXTEND,
+                    op_id=ComputationId(1, 0),
+                    predecessor=root_parent(request),
+                    mode=ForwardMode.PREFILL,
                     tokens=tokens,
                 )
                 extended = finalized_report(
@@ -95,31 +86,25 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                             run_id=1,
                             admissions=(request,),
                             operations=(extend,),
-                            input_products=(input_product,),
                         )
                     )
                 )
-                commit = commit_for_completion(extend, extended)
+                observation = record_completion(extend, extended)
                 publication, _product = _publication_operation(
                     request.request_key,
-                    op_id=2,
-                    parent=commit.selected,
-                    control_seq=commit.control_seq,
+                    op_id=ComputationId(2, 0),
+                    predecessor=observation.op_id,
                 )
                 published = finalized_report(
-                    owner.execute(
-                        execution_run(run_id=2, operations=(publication,), commands=(commit,))
-                    )
+                    owner.execute(execution_run(run_id=2, operations=(publication,), commands=()))
                 )
-                publications.append(published.products[0])
-                commits.append(commit)
+                publications.append(published.completions[0].kv_output)
+                commits.append(observation)
 
             source, resident = publications
-            assert isinstance(source.payload, TransferHandle)
-            assert isinstance(source.payload.value, KvTransferValue)
-            assert isinstance(resident.payload, TransferHandle)
-            assert isinstance(resident.payload.value, KvTransferValue)
-            old_locator = resident.payload.value.tensors[0].locations[0]
+            assert isinstance(source, KvTransfer)
+            assert isinstance(resident, KvTransfer)
+            old_locator = resident.tensors[0].locations[0]
             assert isinstance(old_locator.transport, PosixShmTransfer)
 
             # The external publisher owns real SHM bytes, but gates permission to
@@ -132,11 +117,9 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                         for locator in tensor.locations
                     ),
                 )
-                for tensor in source.payload.value.tensors
+                for tensor in source.tensors
             )
-            incoming_payload = replace(
-                source, payload=TransferHandle(replace(source.payload.value, tensors=tensors))
-            )
+            incoming_payload = replace(source, tensors=tensors)
             requests = {
                 _read_request(locator) for tensor in tensors for locator in tensor.locations
             }
@@ -168,38 +151,37 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 reader.connect("\0" + old_locator.transport.endpoint)
                 reader.sendall(_read_request(old_locator))
                 assert reader.recv(1) == b"G"
-                commit = commits[1]
+                observation = commits[1]
                 finish = Finish(
                     admission.request_key,
-                    commit.control_seq + 1,
-                    commit.selected,
-                    CloseReason.COMPLETED,
                 )
                 installation, installed = _installation_operation(
-                    incoming, op_id=3, parent=root_parent(incoming), source=source.product
+                    incoming,
+                    op_id=ComputationId(3, 0),
+                    predecessor=root_parent(incoming),
+                    source=source.source,
                 )
                 independent = ar_params(46, block_ids=(1,))
-                operation, independent_input = token_operation(
+                operation = token_operation(
                     independent.request_key,
-                    op_id=1,
-                    parent=root_parent(independent),
-                    mode=TokenMode.EXTEND,
+                    op_id=ComputationId(1, 0),
+                    predecessor=root_parent(independent),
+                    mode=ForwardMode.PREFILL,
                     tokens=(6, 7),
                 )
                 runs = (
                     execution_run(run_id=3, commands=(finish,)),
                     execution_run(
-                        run_id=5,
+                        run_id=4,
                         admissions=(incoming,),
                         operations=(installation,),
-                        input_products=(incoming_payload,),
+                        kv_inputs=(incoming_payload,),
                         **_installation_allocation(installation, 2),
                     ),
                     execution_run(
-                        run_id=4,
+                        run_id=5,
                         admissions=(independent,),
                         operations=(operation,),
-                        input_products=(independent_input,),
                     ),
                 )
                 ipc = QueuedWorkerIpc(
@@ -211,7 +193,7 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 reader_held = True
                 try:
                     response = ipc.receive()
-                    assert response["call_id"] == 4, response
+                    assert response["call_id"] == 5, response
                     completed = RunResult.from_mapping(response["result"])
                     assert completed.completions[0].status is OpStatus.OK
 
@@ -227,11 +209,10 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     # No new IPC request drives this transition: the completed
                     # physical import must wake the sleeping process itself.
                     response = ipc.receive()
-                    assert response["call_id"] == 5, response
+                    assert response["call_id"] == 4, response
                     report = RunResult.from_mapping(response["result"])
                     assert report.completions[0].status is OpStatus.OK
-                    assert report.completions[0].logical_lengths.kv_visible_len == 2
-                    assert report.products[0].product == installed
+                    assert report.completions[0].kv_visible_len == 2
                     serving.result(timeout=5)
                     for layer in range(worker.cache_pool.num_layers):
                         expected = producer.cache_pool.read(layer, (1,), start=0, length=2)
@@ -252,36 +233,31 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
 def _installation_operation(
     admission: NewRequest,
     *,
-    op_id: int,
-    parent: Checkpoint,
-    source: ProductRef,
-) -> tuple[Operation, ProductRef]:
-    product = ProductRef(
-        request_key=admission.request_key,
+    op_id: ComputationId,
+    predecessor: ComputationId,
+    source: BufferId,
+) -> tuple[ScheduledRequest, BufferId]:
+    product = BufferId(
+        owner=admission.request_key,
         producer_op_id=op_id,
         output_index=0,
-        generation=op_id * 10 + 1,
-        kind=ProductKind.KV,
-        storage_class=StorageClass.PAGED_KV,
-        dtype=DType.U8,
-        shape_bound=ShapeBound((DeviceDim(1 << 20),)),
-        point_range=PointRange(),
+        generation=op_id.batch_id * 10 + 1,
     )
     return (
-        Operation.registered(
+        ScheduledRequest(
             request_key=admission.request_key,
             op_id=op_id,
-            parent=parent,
-            kind=OpCode.TRANSFER_KV_INSTALL,
-            bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
-            inputs=(source,),
-            outputs=(product,),
+            predecessor=predecessor,
+            kind=TransferMode.KV_INSTALL,
+            bounds=Bounds(max_transfer_bytes=1 << 20),
+            kv_input=source,
+            kv_output=product,
         ),
         product,
     )
 
 
-def _installation_allocation(operation: Operation, length: int) -> dict[str, object]:
+def _installation_allocation(operation: ScheduledRequest, length: int) -> dict[str, object]:
     request_pool_idx = int(operation.request_key.request_id) + 1
     return {
         "block_tables": (BlockTable(request_pool_idx, 0, (1,), max(1, int(length))),),
@@ -292,11 +268,11 @@ def _installation_allocation(operation: Operation, length: int) -> dict[str, obj
 def test_tail_closure_precedes_exact_incremental_publication() -> None:
     worker = execution_worker()
     admission = ar_params(41, block_ids=(0,))
-    extend, extend_input = token_operation(
+    extend = token_operation(
         admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(1, 0),
+        predecessor=root_parent(admission),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
     first_result = worker.execute(
@@ -304,27 +280,25 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
             run_id=1,
             admissions=(admission,),
             operations=(extend,),
-            input_products=(extend_input,),
         )
     )
-    first_commit = commit_for_completion(extend, first_result)
-    closure_template, closure_input = token_operation(
+    first_observation = record_completion(extend, first_result)
+    closure_template = token_operation(
         admission.request_key,
-        op_id=2,
-        parent=first_commit.selected,
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(2, 0),
+        predecessor=first_observation.op_id,
+        mode=ForwardMode.PREFILL,
         tokens=(5,),
-        control_seq=first_commit.control_seq,
     )
-    closure = Operation.registered(
+    closure = ScheduledRequest(
         request_key=closure_template.request_key,
         op_id=closure_template.op_id,
-        parent=closure_template.parent,
+        predecessor=closure_template.predecessor,
         kind=closure_template.kind,
         bounds=closure_template.bounds,
         inputs=closure_template.inputs,
+        input_token_ids=closure_template.input_token_ids,
         outputs=(),
-        control_seq=closure_template.control_seq,
     )
     closure_result = finalized_report(
         worker.execute(
@@ -332,22 +306,20 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
                 run_id=2,
                 admissions=(),
                 operations=(closure,),
-                commands=(first_commit,),
-                input_products=(closure_input,),
+                commands=(),
             )
         )
     )
     closure_record = closure_result.completions[0]
-    assert closure_record.logical_lengths.token_len == 2
-    assert closure_record.logical_lengths.kv_visible_len == 3
-    assert closure_record.logical_lengths.kv_computed_len == 3
+    assert closure_record.position == 2
+    assert closure_record.kv_visible_len == 3
+    assert closure_record.kv_computed_len == 3
 
-    second_commit = commit_for_completion(closure, closure_result)
+    second_observation = record_completion(closure, closure_result)
     publication, publication_product = _publication_operation(
         admission.request_key,
-        op_id=3,
-        parent=second_commit.selected,
-        control_seq=second_commit.control_seq,
+        op_id=ComputationId(3, 0),
+        predecessor=second_observation.op_id,
     )
     publication_result = finalized_report(
         worker.execute(
@@ -355,39 +327,34 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
                 run_id=3,
                 admissions=(),
                 operations=(publication,),
-                commands=(second_commit,),
+                commands=(),
             )
         )
     )
 
-    assert publication_result.completions[0].selected_point == 0
-    assert publication_result.completions[0].logical_lengths.kv_visible_len == 3
-    payload = publication_result.products[0]
-    assert isinstance(payload.payload, TransferHandle)
-    snapshot = payload.payload.value
-    assert isinstance(snapshot, KvTransferValue)
-    assert payload.product == publication_product
-    assert snapshot.source == second_commit.selected
+    assert publication_result.completions[0].kv_visible_len == 3
+    snapshot = publication_result.completions[0].kv_output
+    assert isinstance(snapshot, KvTransfer)
+    assert snapshot.source == publication_product
     assert snapshot.base_extent == 0
     assert snapshot.published_extent == 3
 
-    suffix_template, suffix_input = token_operation(
+    suffix_template = token_operation(
         admission.request_key,
-        op_id=4,
-        parent=second_commit.selected,
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(4, 0),
+        predecessor=second_observation.op_id,
+        mode=ForwardMode.PREFILL,
         tokens=(6,),
-        control_seq=second_commit.control_seq,
     )
-    suffix_closure = Operation.registered(
+    suffix_closure = ScheduledRequest(
         request_key=suffix_template.request_key,
         op_id=suffix_template.op_id,
-        parent=suffix_template.parent,
+        predecessor=suffix_template.predecessor,
         kind=suffix_template.kind,
         bounds=suffix_template.bounds,
         inputs=suffix_template.inputs,
+        input_token_ids=suffix_template.input_token_ids,
         outputs=(),
-        control_seq=suffix_template.control_seq,
     )
     suffix_result = finalized_report(
         worker.execute(
@@ -395,18 +362,16 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
                 run_id=4,
                 admissions=(),
                 operations=(suffix_closure,),
-                input_products=(suffix_input,),
             )
         )
     )
-    assert suffix_result.completions[0].logical_lengths.kv_visible_len == 4
+    assert suffix_result.completions[0].kv_visible_len == 4
 
-    suffix_commit = commit_for_completion(suffix_closure, suffix_result)
+    suffix_observation = record_completion(suffix_closure, suffix_result)
     incremental, incremental_product = _publication_operation(
         admission.request_key,
-        op_id=5,
-        parent=suffix_commit.selected,
-        control_seq=suffix_commit.control_seq,
+        op_id=ComputationId(5, 0),
+        predecessor=suffix_observation.op_id,
     )
     incremental_result = finalized_report(
         worker.execute(
@@ -414,17 +379,14 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
                 run_id=5,
                 admissions=(),
                 operations=(incremental,),
-                commands=(suffix_commit,),
+                commands=(),
             )
         )
     )
-    incremental_payload = incremental_result.products[0]
-    assert isinstance(incremental_payload.payload, TransferHandle)
-    incremental_snapshot = incremental_payload.payload.value
-    assert isinstance(incremental_snapshot, KvTransferValue)
-    assert incremental_payload.product == incremental_product
-    assert incremental_snapshot.source == suffix_commit.selected
-    assert incremental_snapshot.base == second_commit.selected
+    incremental_snapshot = incremental_result.completions[0].kv_output
+    assert isinstance(incremental_snapshot, KvTransfer)
+    assert incremental_snapshot.source == incremental_product
+    assert incremental_snapshot.base == publication_product
     assert incremental_snapshot.base_extent == 3
     assert incremental_snapshot.published_extent == 4
 
@@ -434,11 +396,11 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
     consumer = execution_worker(transfer_backends=("shm",))
     released_consumer = execution_worker(transfer_backends=("shm",))
     admission = ar_params(42, block_ids=(0,))
-    extend, extend_input = token_operation(
+    extend = token_operation(
         admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(1, 0),
+        predecessor=root_parent(admission),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
     try:
@@ -447,37 +409,35 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
                 run_id=1,
                 admissions=(admission,),
                 operations=(extend,),
-                input_products=(extend_input,),
             )
         )
-        commit = commit_for_completion(extend, extended)
+        observation = record_completion(extend, extended)
         publication, source = _publication_operation(
             admission.request_key,
-            op_id=2,
-            parent=commit.selected,
-            control_seq=commit.control_seq,
+            op_id=ComputationId(2, 0),
+            predecessor=observation.op_id,
         )
         published = finalized_report(
             producer.execute(
                 execution_run(
                     run_id=2,
                     operations=(publication,),
-                    commands=(commit,),
+                    commands=(),
                 )
             )
         )
-        assert len(published.products) == 1
+        assert isinstance(published.completions[0].kv_output, KvTransfer)
         installation, installed = _installation_operation(
             admission,
-            op_id=3,
-            parent=root_parent(admission),
+            op_id=ComputationId(3, 0),
+            predecessor=root_parent(admission),
             source=source,
         )
         batch = execution_run(
             run_id=3,
             admissions=(admission,),
             operations=(installation,),
-            input_products=(published.products[0],),
+            kv_inputs=(published.completions[0].kv_output,),
             **_installation_allocation(installation, 2),
         )
         prepared = consumer.prepare_execute(batch)
@@ -488,30 +448,28 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         assert prepared.ready()
         report = finalized_report(consumer.execute_prepared(prepared))
         assert report.completions[0].status.value == "ok"
-        assert report.completions[0].logical_lengths.kv_visible_len == 2
-        assert report.products[0].product == installed
+        assert report.completions[0].kv_visible_len == 2
 
         # Republishing an unchanged visible extent carries a valid empty suffix.
         # Installation must preserve the cache and acknowledge its new product.
         repeated_publication, repeated_source = _publication_operation(
             admission.request_key,
-            op_id=4,
-            parent=commit.selected,
-            control_seq=commit.control_seq,
+            op_id=ComputationId(4, 0),
+            predecessor=observation.op_id,
         )
         repeated = finalized_report(
             producer.execute(execution_run(run_id=4, operations=(repeated_publication,)))
         )
         repeated_install, repeated_installed = _installation_operation(
             admission,
-            op_id=5,
-            parent=root_parent(admission),
+            op_id=ComputationId(5, 0),
+            predecessor=root_parent(admission),
             source=repeated_source,
         )
         repeated_batch = execution_run(
             run_id=5,
             operations=(repeated_install,),
-            input_products=(repeated.products[0],),
+            kv_inputs=(repeated.completions[0].kv_output,),
             block_tables=(BlockTable(admission.request_pool_idx, 0, (1,), 2),),
         )
         repeated_prepared = consumer.prepare_execute(repeated_batch)
@@ -519,20 +477,19 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         assert repeated_prepared.ready()
         repeated_report = finalized_report(consumer.execute_prepared(repeated_prepared))
         assert repeated_report.completions[0].status.value == "ok"
-        assert repeated_report.completions[0].logical_lengths.kv_visible_len == 2
-        assert repeated_report.products[0].product == repeated_installed
+        assert repeated_report.completions[0].kv_visible_len == 2
         finalized_report(
             producer.execute(
                 execution_run(
                     run_id=6,
-                    commands=(Free(source.buffer_id),),
+                    commands=(Free(source),),
                 )
             )
         )
         expired_install, _ = _installation_operation(
             admission,
-            op_id=4,
-            parent=root_parent(admission),
+            op_id=ComputationId(4, 0),
+            predecessor=root_parent(admission),
             source=source,
         )
         expired = released_consumer.prepare_execute(
@@ -540,7 +497,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
                 run_id=5,
                 admissions=(admission,),
                 operations=(expired_install,),
-                input_products=(published.products[0],),
+                kv_inputs=(published.completions[0].kv_output,),
                 **_installation_allocation(expired_install, 2),
             )
         )
@@ -561,11 +518,11 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
     producer = execution_worker(transfer_backends=("shm",))
     consumer = execution_worker(transfer_backends=("shm",))
     admission = ar_params(43, block_ids=(0,))
-    extend, extend_input = token_operation(
+    extend = token_operation(
         admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(1, 0),
+        predecessor=root_parent(admission),
+        mode=ForwardMode.PREFILL,
         tokens=(7, 8),
     )
     try:
@@ -574,22 +531,23 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
                 run_id=1,
                 admissions=(admission,),
                 operations=(extend,),
-                input_products=(extend_input,),
             )
         )
-        commit = commit_for_completion(extend, extended)
+        observation = record_completion(extend, extended)
         publication, source = _publication_operation(
             admission.request_key,
-            op_id=2,
-            parent=commit.selected,
-            control_seq=commit.control_seq,
+            op_id=ComputationId(2, 0),
+            predecessor=observation.op_id,
         )
-        published = finalized_report(
-            producer.execute(execution_run(run_id=2, operations=(publication,), commands=(commit,)))
-        ).products[0]
-        assert isinstance(published.payload, TransferHandle)
-        snapshot = published.payload.value
-        assert isinstance(snapshot, KvTransferValue)
+        published = (
+            finalized_report(
+                producer.execute(execution_run(run_id=2, operations=(publication,), commands=()))
+            )
+            .completions[0]
+            .kv_output
+        )
+        snapshot = published
+        assert isinstance(snapshot, KvTransfer)
         first = snapshot.tensors[0].locations[0]
         assert isinstance(first.transport, PosixShmTransfer)
         missing = replace(
@@ -599,14 +557,11 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             snapshot,
             tensors=(replace(snapshot.tensors[0], locations=(missing,)), *snapshot.tensors[1:]),
         )
-        payload = ProductPayload(
-            product=published.product,
-            payload=TransferHandle(broken),
-        )
+        payload = broken
         installation, _installed = _installation_operation(
             admission,
-            op_id=3,
-            parent=root_parent(admission),
+            op_id=ComputationId(3, 0),
+            predecessor=root_parent(admission),
             source=source,
         )
         prepared = consumer.prepare_execute(
@@ -614,7 +569,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
                 run_id=3,
                 admissions=(admission,),
                 operations=(installation,),
-                input_products=(payload,),
+                kv_inputs=(payload,),
                 **_installation_allocation(installation, 2),
             )
         )
@@ -631,8 +586,8 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
 
         retry, installed = _installation_operation(
             admission,
-            op_id=4,
-            parent=root_parent(admission),
+            op_id=ComputationId(4, 0),
+            predecessor=root_parent(admission),
             source=source,
         )
         prepared_retry = consumer.prepare_execute(
@@ -640,7 +595,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
                 run_id=4,
                 admissions=(admission,),
                 operations=(retry,),
-                input_products=(published,),
+                kv_inputs=(published,),
                 **_installation_allocation(retry, 2),
             )
         )
@@ -651,8 +606,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
         assert prepared_retry.ready()
         retry_report = finalized_report(consumer.execute_prepared(prepared_retry))
         assert retry_report.completions[0].status.value == "ok"
-        assert retry_report.completions[0].logical_lengths.kv_visible_len == 2
-        assert retry_report.products[0].product == installed
+        assert retry_report.completions[0].kv_visible_len == 2
     finally:
         producer.close()
         consumer.close()

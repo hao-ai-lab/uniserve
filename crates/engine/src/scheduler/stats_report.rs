@@ -1,14 +1,15 @@
 //! Converts live engine counters into serializable scheduler snapshots.
 //!
-//! [`SchedStatsReporter`] retains cumulative baselines and reports interval
+//! [`SchedulerStatsReporter`] retains cumulative baselines and reports interval
 //! deltas without resetting counters observed by other readers.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
-use crate::scheduler::SchedStats;
+use crate::scheduler::SchedulerStats;
+use uniserve_core::codec::stats;
 use uniserve_core::codec::stats::{
-    BaseCacheStats, DomainSchedulerStats, PrefixCacheStats, SchedulerStats, WorkerForwardStats,
+    BaseCacheStats, DomainSchedulerStats, PrefixCacheStats, WorkerForwardStats,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -33,7 +34,7 @@ struct DomainCumulative {
 /// Converts the scheduler's cumulative counters into per-update deltas for the
 /// snapshot shape (whose prefix-cache counters are increments, not totals).
 #[derive(Debug, Default)]
-pub struct SchedStatsReporter {
+pub struct SchedulerStatsReporter {
     last_prefix_queries: u64,
     last_prefix_hit_tokens: u64,
     last_queue_wait_count: u64,
@@ -46,12 +47,12 @@ pub struct SchedStatsReporter {
     last_domains: [DomainCumulative; 3],
 }
 
-impl SchedStatsReporter {
+impl SchedulerStatsReporter {
     /// Captures the live counters in one `SchedulerStats` update.
     ///
     /// `block_size` converts block-granular prefix-cache query counts into the
     /// token-granular counts the snapshot shape documents.
-    pub fn snapshot(&mut self, stats: &SchedStats, block_size: u32) -> SchedulerStats {
+    pub fn snapshot(&mut self, stats: &SchedulerStats, block_size: u32) -> stats::SchedulerStats {
         let num_blocks = stats.kv_cache.num_blocks.load(Ordering::Relaxed);
         let free_blocks = stats.kv_cache.free_blocks.load(Ordering::Relaxed);
         let kv_cache_usage = if num_blocks > 0 {
@@ -94,7 +95,7 @@ impl SchedStatsReporter {
         self.last_batch_roundtrip_us_total = batch_roundtrip_us_total;
         self.last_batch_timing_count = batch_timing_count;
 
-        SchedulerStats {
+        stats::SchedulerStats {
             num_running_reqs: stats.general.running.load(Ordering::Relaxed) as u64,
             num_waiting_reqs: stats.general.pending.load(Ordering::Relaxed) as u64,
             step_counter: stats.general.steps.load(Ordering::Relaxed),
@@ -123,7 +124,7 @@ impl SchedStatsReporter {
     }
 
     /// Converts cumulative per-domain counters into interval deltas.
-    fn domain_stats(&mut self, stats: &SchedStats) -> Vec<DomainSchedulerStats> {
+    fn domain_stats(&mut self, stats: &SchedulerStats) -> Vec<DomainSchedulerStats> {
         let domains = [
             ("prefill", &stats.domains.prefill),
             ("decode", &stats.domains.decode),
@@ -177,7 +178,7 @@ impl SchedStatsReporter {
     }
 
     /// Returns cumulative worker-forward statistics.
-    fn worker_forward_stats(&mut self, stats: &SchedStats) -> Option<WorkerForwardStats> {
+    fn worker_forward_stats(&mut self, stats: &SchedulerStats) -> Option<WorkerForwardStats> {
         let current = worker_forward_stats_snapshot(stats);
         let delta = delta_worker_forward_stats(&current, &self.last_worker_forward_stats);
         self.last_worker_forward_stats = current;
@@ -207,7 +208,7 @@ fn domain_cumulative(stats: &crate::scheduler::DomainStats) -> DomainCumulative 
 }
 
 /// Captures a coherent value snapshot of worker forward-pass counters.
-fn worker_forward_stats_snapshot(stats: &SchedStats) -> WorkerForwardStats {
+fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> WorkerForwardStats {
     let path_counts = stats
         .worker
         .spec_verify_path_counts
@@ -447,7 +448,7 @@ mod tests {
 
     #[test]
     fn snapshot_reports_deltas_and_usage() {
-        let stats = SchedStats::default();
+        let stats = SchedulerStats::default();
         stats.kv_cache.num_blocks.store(100, Ordering::Relaxed);
         stats.kv_cache.free_blocks.store(75, Ordering::Relaxed);
         stats.general.running.store(3, Ordering::Relaxed);
@@ -489,7 +490,7 @@ mod tests {
             .unwrap()
             .insert("greedy_device".into(), 4);
 
-        let mut reporter = SchedStatsReporter::default();
+        let mut reporter = SchedulerStatsReporter::default();
         let snapshot = reporter.snapshot(&stats, 256);
         assert_eq!(snapshot.num_running_reqs, 3);
         assert_eq!(snapshot.num_waiting_reqs, 2);
@@ -523,14 +524,14 @@ mod tests {
     }
 
     /// the two maps the worker computes (attention backend / cuda-graph
-    /// runtime mode) must survive the SchedStats -> snapshot snapshot/delta instead
+    /// runtime mode) must survive the SchedulerStats -> snapshot snapshot/delta instead
     /// of being silently dropped before they can reach Prometheus.
     /// the directly-measured per-batch worker compute time and host
     /// round-trip latency must surface as per-update deltas in the snapshot stats so
     /// they reach Prometheus.
     #[test]
     fn snapshot_surfaces_batch_timing() {
-        let stats = SchedStats::default();
+        let stats = SchedulerStats::default();
         stats
             .timing
             .worker_exec_us_total
@@ -541,7 +542,7 @@ mod tests {
             .store(1_500, Ordering::Relaxed);
         stats.timing.batch_timing_count.store(3, Ordering::Relaxed);
 
-        let mut reporter = SchedStatsReporter::default();
+        let mut reporter = SchedulerStatsReporter::default();
         let snapshot = reporter.snapshot(&stats, 256);
         assert_eq!(snapshot.worker_exec_us, 1_200);
         assert_eq!(snapshot.batch_roundtrip_us, 1_500);
@@ -556,7 +557,7 @@ mod tests {
 
     #[test]
     fn snapshot_surfaces_attention_backend_and_cuda_graph_runtime_mode_counts() {
-        let stats = SchedStats::default();
+        let stats = SchedulerStats::default();
         stats
             .worker
             .attention_backend_counts
@@ -570,7 +571,7 @@ mod tests {
             .unwrap()
             .insert("graph".into(), 5);
 
-        let mut reporter = SchedStatsReporter::default();
+        let mut reporter = SchedulerStatsReporter::default();
         let snapshot = reporter.snapshot(&stats, 256);
         let worker = snapshot.worker_forward_stats.expect("worker stats present");
         assert_eq!(worker.attention_backend_counts.get("flashinfer"), Some(&9));

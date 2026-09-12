@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING, Any, Mapping
 import torch
 import torch.nn as nn
 
-from ..execution.batch import OpCode
+from uniserve_worker.execution.batch import ForwardMode, PipelineStage, TransferMode
+
 from ..execution.forward_batch import (
     AttentionMode,
     ForwardBatch,
@@ -782,17 +783,17 @@ class BagelForConditionalGeneration(ExecutionModel):
         )
         self.supported_work = frozenset(
             {
-                OpCode.AR_EXTEND,
-                OpCode.AR_DECODE,
-                OpCode.AR_VERIFY,
-                OpCode.DIFFUSION_PREPARE,
-                OpCode.DIFFUSION_STEP,
-                OpCode.ENCODER_VISION,
-                OpCode.ENCODER_LATENT,
-                OpCode.DIFFUSION_FINALIZE,
-                OpCode.TRANSFER_PRODUCT,
-                OpCode.TRANSFER_KV_PUBLISH,
-                OpCode.TRANSFER_KV_INSTALL,
+                ForwardMode.PREFILL,
+                ForwardMode.DECODE,
+                ForwardMode.VERIFY,
+                PipelineStage.LATENT_PREPARATION,
+                PipelineStage.DENOISING,
+                PipelineStage.VISION_ENCODING,
+                PipelineStage.LATENT_ENCODING,
+                PipelineStage.IMAGE_DECODING,
+                TransferMode.TENSOR,
+                TransferMode.KV_PUBLISH,
+                TransferMode.KV_INSTALL,
             }
         )
         self.max_vit_grid_tokens = int(self.cfg.vit_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS
@@ -818,7 +819,7 @@ class BagelForConditionalGeneration(ExecutionModel):
         decode_positions: torch.Tensor | None = None
 
         # Paged decode has a compact positional contract and cannot carry flow rows.
-        if batch.forward_mode is AttentionMode.PAGED_DECODE:
+        if batch.attention_mode is AttentionMode.PAGED_DECODE:
             if batch.flow_row_indices:
                 raise TypeError("BAGEL paged decode accepts token rows only")
             decode_positions = positions

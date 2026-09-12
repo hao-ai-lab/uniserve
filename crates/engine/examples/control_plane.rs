@@ -6,19 +6,18 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
-use uniserve_core::Event;
+use uniserve_core::EngineCoreOutput;
 use uniserve_core::{
-    ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
-    GenerationBehaviorDescriptor, GenerationConstraint, GenerationLimits,
-    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageIngestRecipe,
-    ImageKvEffect, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
+    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
+    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageParams, ImageTrigger,
+    RequestId, SamplingParams,
 };
-use uniserve_engine::{ControlTokens, EngineHandle, EngineLoop, SimEngine, SimExecutor};
+use uniserve_engine::{EngineHandle, Scheduler, SimEngine, SimExecutor, SpecialTokenIds};
 
 fn main() {
-    let ctrl = ControlTokens::default();
+    let ctrl = SpecialTokenIds::default();
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let sched = EngineLoop::new(executor, ctrl, 32);
+    let sched = Scheduler::new(executor, ctrl, 32);
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(cmd_tx);
     let jh = thread::spawn(move || sched.run(cmd_rx));
@@ -28,67 +27,59 @@ fn main() {
     let mut mk = |constraint: GenerationConstraint| {
         let id = RequestId(next_id);
         next_id += 1;
-        let policy = GenerationPolicyDescriptor {
-            trigger: TriggerPolicyDescriptor::Token { token_id: 1000 },
-            gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
-            feedback: Some(GeneratedImageFeedbackRecipe {
-                source: FeedbackSource::DeviceProduct,
-                next_und_token: FeedbackNextToken::EndOfImage,
-                ingest: ImageIngestRecipe::vit_only(2, ImageKvEffect::WorkerDefined),
-                sample_continuation: true,
-            }),
-            ..GenerationPolicyDescriptor::default()
+        let policy = ImageGenerationConfig {
+            trigger: ImageTrigger::Token { token_id: 1000 },
+            requires_text_for_image: false,
+            feedback_source: Some(FeedbackSource::DeviceProduct),
+            feedback_next_token: FeedbackNextToken::EndOfImage,
+            num_feedback_positions: 2,
+            feedback_encoders: vec![ImageEncoderInput {
+                encoder: ImageIngestStep::VitEncode,
+                num_kv_tokens: None,
+                max_kv_tokens: None,
+            }],
+            sample_feedback_continuation: true,
+            ..ImageGenerationConfig::default()
         };
-        let context = vec![ContextSegment::UndTokens {
-            token_ids: vec![1, 2, 3],
-            visibility: UndVisibility::Internal,
-        }];
-        let behavior = GenerationBehaviorDescriptor::resolve(constraint, &policy);
+        let prompt_token_ids = vec![1, 2, 3];
+
         let image = ImageParams {
             steps: 6,
             ..Default::default()
         };
         let cache = Default::default();
-        let resources =
-            GenerationResourceBounds::conservative(uniserve_core::GenerationResources {
-                context: &context,
-                negative_context: &[],
-                behavior: &behavior,
-                policy: &policy,
-                image: &image,
-                max_und_tokens: 20,
-                cache: &cache,
-                limits: &GenerationLimits {
-                    features: uniserve_core::GenerationFeatures::UNDERSTANDING
-                        | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
-                    max_latent_units: 64,
-                    latent_downsample: 16,
-                    max_vae_grid_tokens: 64,
-                    max_vit_grid_tokens: 64,
-                    max_latent_feature_bytes: 1 << 20,
-                    max_vision_feature_bytes: 1 << 20,
-                    commit_marker_tokens: 2,
-                    max_cfg_branches: 3,
-                    encoder_cache_entries: 256,
-                },
-            })
-            .expect("bounded simulation request");
+        let limits = GenerationLimits {
+            features: uniserve_core::GenerationFeatures::UNDERSTANDING
+                | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
+            max_latent_units: 64,
+            latent_downsample: 16,
+            max_vae_grid_tokens: 64,
+            max_vit_grid_tokens: 64,
+            max_latent_feature_bytes: 1 << 20,
+            max_vision_feature_bytes: 1 << 20,
+            commit_marker_tokens: 2,
+            max_cfg_branches: 3,
+            encoder_cache_entries: 256,
+        };
         let request = GenerationRequest {
             request_id: id,
-            context,
-            negative_context: Vec::new(),
+            prompt_token_ids,
+            multimodal_inputs: Default::default(),
+            negative_prompt_token_ids: Vec::new(),
             constraint,
-            behavior,
             sampling: SamplingParams::default(),
             image,
             max_und_tokens: 20,
+            include_stop_token: false,
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
             cache,
-            policy,
-            resources,
+            image_generation: policy,
         };
+        request
+            .validate_resources(&limits)
+            .expect("bounded simulation request");
         (id, request)
     };
 
@@ -113,9 +104,9 @@ fn main() {
             while let Ok(ev) = rx.try_recv() {
                 let e = counts.entry(*id).or_insert((kind.clone(), 0, 0, false));
                 match ev {
-                    Event::TextToken { .. } => e.1 += 1,
-                    Event::ImageDone { .. } => e.2 += 1,
-                    Event::Finished { .. } if !e.3 => {
+                    EngineCoreOutput::TextToken { .. } => e.1 += 1,
+                    EngineCoreOutput::ImageDone { .. } => e.2 += 1,
+                    EngineCoreOutput::Finished { .. } if !e.3 => {
                         e.3 = true;
                         done += 1;
                     }

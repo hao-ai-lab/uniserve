@@ -150,7 +150,7 @@ class ParallelConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class EntryConfig:
+class ComponentConfig:
     """Ordered process membership and logical parallelism for one model component."""
 
     ranks: tuple[int, ...]
@@ -173,7 +173,7 @@ class EntryConfig:
             raise ValueError("temporal unit distribution requires a local decoder parallel_config")
 
     @classmethod
-    def from_dict(cls, value: dict[str, object]) -> EntryConfig:
+    def from_dict(cls, value: dict[str, object]) -> ComponentConfig:
         unknown = value.keys() - {"ranks", "parallel_config", "distribution", "units_per_rank"}
         if unknown:
             raise ValueError(f"unknown component fields: {sorted(unknown)}")
@@ -199,7 +199,9 @@ class EntryConfig:
         return value
 
 
-def parse_entries(value: dict[str, object], world_size: int) -> tuple[tuple[str, EntryConfig], ...]:
+def parse_entries(
+    value: dict[str, object], world_size: int
+) -> tuple[tuple[str, ComponentConfig], ...]:
     """Validate the authoritative expanded component assignments from the host."""
 
     components = []
@@ -208,7 +210,7 @@ def parse_entries(value: dict[str, object], world_size: int) -> tuple[tuple[str,
     for name, component in sorted(value.items()):
         if not name or not isinstance(component, dict):
             raise ValueError("entry configuration requires named component objects")
-        resolved = EntryConfig.from_dict(component)
+        resolved = ComponentConfig.from_dict(component)
         if any(rank >= world_size for rank in resolved.ranks):
             raise ValueError(f"component {name!r} contains ranks outside the process world")
         components.append((name, resolved))

@@ -16,7 +16,7 @@ import torch.distributed as dist
 
 from ..profiling import profile_range
 from .collective import stream_collectives, try_sum_reduction
-from .parallel import EntryConfig, ParallelConfig
+from .parallel import ComponentConfig, ParallelConfig
 
 RowChunkProducer = Callable[[slice, tuple[torch.Tensor, ...]], None]
 
@@ -841,7 +841,7 @@ class EntryBindings:
     share one logical output; sequence and temporal members retain their rows.
     """
 
-    entries: Mapping[str, EntryConfig]
+    entries: Mapping[str, ComponentConfig]
     meshes: Mapping[str, DeviceMesh]
     process_group: Communicator
 

@@ -21,46 +21,29 @@ mod video_jobs;
 use std::sync::Arc;
 
 use crate::engine_client::EngineClient;
+use crate::profile::ModelConfig;
 pub use crate::profile::ModelDescription;
 pub use crate::serving::chat::ChatTemplateContentFormatOption;
-use crate::serving::{ResolvedAssets, ResolvedModel, ServingRuntime};
+use crate::serving::{InputProcessor, ServingRuntime};
 use anyhow::{Context as _, Result};
 pub use config::{Config, EngineBackendKind, EngineSettings, HttpListenerMode};
 use tracing::info;
 pub use uniserve_engine::SchedulingPolicy;
-use uniserve_engine::{EngineConfig, SimEngine, SimExecutor, WorkerProcessArgs};
+use uniserve_engine::{EngineConfig, SimEngine, SimExecutor, SpecialTokenIds, WorkerProcessArgs};
 
 pub use crate::http::{ApiError, build_router, serve};
 pub use crate::state::AppState;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RuntimeControlTokens {
-    bos: u32,
-    eos: Vec<u32>,
-    start_of_image: u32,
-    end_of_image: u32,
-}
-
 /// Resolves canonical model control tokens for the selected engine backend.
-fn runtime_control_tokens(
-    assets: &ResolvedAssets,
-    backend: EngineBackendKind,
-) -> RuntimeControlTokens {
-    let controls = assets.generation_controls();
+fn special_token_ids(model: &ModelConfig, backend: EngineBackendKind) -> SpecialTokenIds {
+    let controls = model.generation_controls();
     let bos = controls.map_or(0, |value| value.bos);
-    let start_of_image = controls.map_or(0, |value| value.start_of_image);
     let end_of_image = controls.map_or(0, |value| value.end_of_image);
     let primary_eos = controls
         .map(|value| value.eos)
         .filter(|value| *value != 0)
-        .or(assets.profile().stop_tokens.primary_eos_token_id);
-    let mut eos = assets
-        .profile()
-        .stop_tokens
-        .eos_token_ids
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
+        .or(model.primary_eos_token_id);
+    let mut eos = model.eos_token_ids.iter().copied().collect::<Vec<_>>();
     if let Some(primary_eos) = primary_eos {
         eos.retain(|value| *value != primary_eos);
         eos.insert(0, primary_eos);
@@ -68,25 +51,24 @@ fn runtime_control_tokens(
     if backend == EngineBackendKind::Sim && eos.is_empty() {
         eos.push(151645);
     }
-    RuntimeControlTokens {
+    SpecialTokenIds {
         bos,
         eos,
-        start_of_image,
         end_of_image,
     }
 }
 
 /// Builds the shared application state for one resolved model and one engine client.
 pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
-    let assets = ResolvedAssets::load(config)
+    let (model_config, tokenizer, renderer) = ModelConfig::load(config)
         .await
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model))?;
-    let effective_max_model_len = assets.max_model_tokens();
-    let request_slot_capacity = assets.request_slot_capacity();
-    let control_tokens = runtime_control_tokens(&assets, config.engine.backend);
-    let runtime_profile = assets.runtime_profile(config.engine.worker_process.model_dtype.clone());
+    let effective_max_model_len = model_config.max_model_tokens();
+    let request_slot_capacity = model_config.request_slot_capacity();
+    let control_tokens = special_token_ids(&model_config, config.engine.backend);
+    let generation_limits =
+        model_config.generation_limits(config.engine.worker_process.model_dtype.clone());
 
-    let eos = control_tokens.eos.clone();
     info!(
         backend = ?config.engine.backend,
         workers = ?config.engine.workers,
@@ -114,12 +96,8 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         ..config.engine.worker_process.clone()
     };
     let engine_config = EngineConfig {
-        runtime_family: match &assets {
-            ResolvedAssets::Text { .. } => uniserve_core::RuntimeFamily::Ar,
-            ResolvedAssets::Omni { .. } => uniserve_core::RuntimeFamily::Umm,
-            ResolvedAssets::Media { .. } => uniserve_core::RuntimeFamily::Diffusion,
-        },
-        runtime_profile,
+        runtime_family: model_config.runtime_family(),
+        generation_limits,
         max_batch: config.engine.max_batch,
         max_num_batched_tokens: config.engine.max_num_batched_tokens,
         max_num_seqs: config.engine.max_num_seqs,
@@ -131,14 +109,16 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         transfer: config.engine.transfer.clone(),
         worker_process,
         bos: control_tokens.bos,
-        eos,
+        eos: control_tokens.eos,
         end_of_image: control_tokens.end_of_image,
     };
     let client = if config.engine.backend == EngineBackendKind::Sim {
         let mut sim = SimEngine::new();
         let special_tokens = [
             control_tokens.bos,
-            control_tokens.start_of_image,
+            model_config
+                .generation_controls()
+                .map_or(0, |tokens| tokens.start_of_image),
             control_tokens.end_of_image,
         ]
         .into_iter()
@@ -174,8 +154,10 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     }
     let snapshot = engine.snapshot();
     let route_max_model_len = effective_max_model_len.min(snapshot.max_model_len);
-    let model = ResolvedModel::resolve(
-        assets,
+    let model = InputProcessor::new(
+        model_config,
+        tokenizer,
+        renderer,
         snapshot.generation_limits,
         snapshot.sampling_controls,
         route_max_model_len,

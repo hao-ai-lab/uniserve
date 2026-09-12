@@ -5,10 +5,10 @@
 //! worker can reclaim its storage.
 
 use std::collections::{BTreeMap, HashMap};
-use uniserve_worker_ipc::ProductRef;
+use uniserve_worker_ipc::TensorRef;
 
 struct Entry {
-    product: ProductRef,
+    product: TensorRef,
     ref_cnt: u32,
     /// Monotonic access tick; larger values are more recent.
     lru: u64,
@@ -70,19 +70,23 @@ impl EncoderCacheManager {
     }
 
     /// Returns a resident output without changing LRU order or cache metrics.
-    pub(crate) fn peek_product(&self, hash: u64) -> Option<ProductRef> {
+    pub(crate) fn peek_product(&self, hash: u64) -> Option<TensorRef> {
         self.entries.get(&hash).map(|entry| entry.product.clone())
     }
 
     /// Revokes unavailable products from lookup while preserving active consumer pins.
-    pub(crate) fn invalidate_products(
+    pub(crate) fn invalidate_buffers(
         &mut self,
-        products: &std::collections::HashSet<ProductRef>,
-    ) -> Vec<ProductRef> {
+        buffers: &std::collections::HashSet<uniserve_worker_ipc::BufferId>,
+    ) -> Vec<TensorRef> {
         let hashes = self
             .entries
             .iter()
-            .filter_map(|(hash, entry)| products.contains(&entry.product).then_some(*hash))
+            .filter_map(|(hash, entry)| {
+                buffers
+                    .contains(&entry.product.buffer_id())
+                    .then_some(*hash)
+            })
             .collect::<Vec<_>>();
         let mut reclaimable = Vec::new();
         for hash in hashes {
@@ -108,7 +112,7 @@ impl EncoderCacheManager {
     }
 
     /// Looks up the exact product and measured KV effect needed to skip encoding.
-    pub(crate) fn lookup_product(&mut self, hash: u64) -> Option<ProductRef> {
+    pub(crate) fn lookup_product(&mut self, hash: u64) -> Option<TensorRef> {
         self.stats.queries += 1;
         let tick = self.next_tick();
         if let Some(e) = self.entries.get_mut(&hash) {
@@ -129,7 +133,7 @@ impl EncoderCacheManager {
 
     /// Removes the least-recently-used unpinned entry so its worker buffer can
     /// be freed before a replacement encoder operation is admitted.
-    pub(crate) fn evict_one(&mut self) -> Option<ProductRef> {
+    pub(crate) fn evict_one(&mut self) -> Option<TensorRef> {
         let (_, victim) = self.evictable.pop_first()?;
         let entry = self
             .entries
@@ -152,7 +156,7 @@ impl EncoderCacheManager {
     /// `max_num_seqs` requests) and is counted in `stats.over_budget_inserts` so
     /// the over-subscription is observable. Admission reserves encoder-product
     /// capacity before submitting the computation.
-    pub(crate) fn insert(&mut self, hash: u64, product: ProductRef) -> Option<ProductRef> {
+    pub(crate) fn insert(&mut self, hash: u64, product: TensorRef) -> Option<TensorRef> {
         if self.entries.contains_key(&hash) {
             let tick = self.next_tick();
             if let Some(existing) = self.entries.get_mut(&hash) {
@@ -217,7 +221,7 @@ impl EncoderCacheManager {
     }
 
     /// Acquires a cached entry, pinning it against eviction while the request uses it.
-    pub(crate) fn acquire(&mut self, hash: u64) -> Option<ProductRef> {
+    pub(crate) fn acquire(&mut self, hash: u64) -> Option<TensorRef> {
         let tick = self.next_tick();
         let e = self.entries.get_mut(&hash)?;
         let old_lru = e.lru;
@@ -233,7 +237,7 @@ impl EncoderCacheManager {
 
     /// Releases a reference. Active entries become evictable at zero references;
     /// retired entries are removed and return their worker handle for reclaim.
-    pub(crate) fn release(&mut self, hash: u64, product: &ProductRef) -> Option<ProductRef> {
+    pub(crate) fn release(&mut self, hash: u64, product: &TensorRef) -> Option<TensorRef> {
         if let Some(e) = self.entries.get_mut(&hash)
             && &e.product == product
             && e.ref_cnt > 0
@@ -271,21 +275,16 @@ impl EncoderCacheManager {
 mod tests {
     use super::*;
     use uniserve_core::RequestId;
-    use uniserve_worker_ipc::{
-        DType, OpId, PointRange, ProductKind, RequestKey, ShapeBound, StorageClass,
-    };
+    use uniserve_worker_ipc::{ComputationId, DType, RequestKey, ShapeBound};
 
-    fn product(generation: u32) -> ProductRef {
-        ProductRef {
+    fn product(generation: u32) -> TensorRef {
+        TensorRef {
             request_key: RequestKey::new(7, RequestId(u64::from(generation)), 3),
-            producer_op_id: OpId(u64::from(generation)),
+            producer_op_id: ComputationId::new(u64::from(generation), 0),
             output_index: 0,
             generation,
-            kind: ProductKind::VisionFeature,
-            storage_class: StorageClass::LatentArena,
             dtype: DType::BF16,
             shape_bound: ShapeBound::default(),
-            point_range: PointRange::default(),
         }
     }
 
@@ -333,8 +332,10 @@ mod tests {
         cache.insert(2, unpinned.clone());
         assert_eq!(cache.acquire(1), Some(pinned.clone()));
         assert_eq!(cache.acquire(1), Some(pinned.clone()));
-        let lost = [pinned.clone(), unpinned.clone()].into_iter().collect();
-        assert_eq!(cache.invalidate_products(&lost), vec![unpinned]);
+        let lost = [pinned.buffer_id(), unpinned.buffer_id()]
+            .into_iter()
+            .collect();
+        assert_eq!(cache.invalidate_buffers(&lost), vec![unpinned]);
         assert_eq!(cache.lookup_product(1), None);
         assert_eq!(cache.insert(1, replacement.clone()), None);
         assert_eq!(cache.release(1, &pinned), None);

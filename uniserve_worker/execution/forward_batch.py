@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from uniserve_worker.execution.batch import ForwardMode, PipelineStage
+
 if TYPE_CHECKING:
     from ..backends.attention.base import AttentionBackend
 
@@ -125,30 +127,23 @@ class FlowPatches:
             raise ValueError("flow noise scale must be scalar")
 
 
-class ModelPhase(StrEnum):
-    """Identifies the text, denoise, encoder, or latent-decoder phase executed by the model."""
-
-    TEXT = "text"
-    DENOISE = "denoise"
-    ENCODE_VISION = "encoder_vision"
-    ENCODE_LATENT = "encoder_latent"
-    DECODE_LATENT = "decode_latent"
-
-
 @dataclass(frozen=True, slots=True)
 class ForwardBatch:
     """One borrowed columnar view over execution-lane input buffers."""
 
-    phase: ModelPhase
+    forward_mode: ForwardMode | PipelineStage
     row_count: int
-    forward_mode: AttentionMode
-    req_pool_indices: torch.Tensor
-    seq_lens: torch.Tensor
+    attention_mode: AttentionMode
+    request_pool_indices: torch.Tensor
+    # Cached tokens precede the current query; total lengths include that query.
+    prefix_lens: torch.Tensor
     query_lens: torch.Tensor
     out_cache_loc: torch.Tensor
     has_cache_writes: bool = True
     block_table: torch.Tensor | None = None
-    kv_lens: torch.Tensor | None = None
+    # Packed attention reads prefix/current segments separately, so only paged
+    # decode and varlen need a materialized total-length device column.
+    seq_lens: torch.Tensor | None = None
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
     output_indices: torch.Tensor | None = None
@@ -159,9 +154,9 @@ class ForwardBatch:
     max_seqlen_k: int = 0
     causal: bool = True
     causal_rows_cpu: tuple[bool, ...] = ()
-    seq_lens_cpu: tuple[int, ...] = ()
+    prefix_lens_cpu: tuple[int, ...] = ()
     query_lens_cpu: tuple[int, ...] = ()
-    kv_lens_cpu: tuple[int, ...] = ()
+    seq_lens_cpu: tuple[int, ...] = ()
     group_id: int = 0
     fully_visible: bool = False
     binding: int = 0
@@ -193,10 +188,10 @@ class ForwardBatch:
 
         if self.row_count < 1:
             raise ValueError("forward batch must contain at least one row")
-        if int(self.req_pool_indices.numel()) != self.row_count:
+        if int(self.request_pool_indices.numel()) != self.row_count:
             raise ValueError("forward request indices do not align with rows")
         if (
-            int(self.seq_lens.numel()) != self.row_count
+            int(self.prefix_lens.numel()) != self.row_count
             or int(self.query_lens.numel()) != self.row_count
         ):
             raise ValueError("forward KV lengths do not align with rows")
@@ -214,8 +209,18 @@ class ForwardBatch:
             raise ValueError("forward row indexes are invalid")
         if len(self.token_row_indices) != len(self.token_selections):
             raise ValueError("forward token columns are not aligned")
-        if len(self.seq_lens_cpu) != self.row_count or len(self.query_lens_cpu) != self.row_count:
+        if any(
+            len(lengths) != self.row_count
+            for lengths in (self.prefix_lens_cpu, self.seq_lens_cpu, self.query_lens_cpu)
+        ):
             raise ValueError("forward host KV lengths do not align with rows")
+        if any(
+            prefix < 0 or query < 0 or total != prefix + query
+            for prefix, query, total in zip(
+                self.prefix_lens_cpu, self.query_lens_cpu, self.seq_lens_cpu, strict=True
+            )
+        ):
+            raise ValueError("forward sequence lengths must equal cached prefix plus query")
         flow_count = len(self.flow_row_indices)
         if any(
             len(values) != flow_count
@@ -238,12 +243,6 @@ class ForwardBatch:
         decode_count = len(self.decode_latents)
         if any(len(values) != decode_count for values in (self.decode_heights, self.decode_widths)):
             raise ValueError("forward decoder columns are not aligned")
-
-    @property
-    def request_pool_indices(self) -> torch.Tensor:
-        """Expose the one-based request slots aligned with forward rows."""
-
-        return self.req_pool_indices
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,9 +291,7 @@ class ForwardOutput:
         if len(self.vocabularies) != len(self.values):
             raise ValueError("vocabulary metadata must align with output rows")
         for value, partition in zip(self.values, self.vocabularies, strict=True):
-            if partition is not None and (
-                value.ndim != 2 or value.shape[-1] != partition.width
-            ):
+            if partition is not None and (value.ndim != 2 or value.shape[-1] != partition.width):
                 raise ValueError("vocabulary output rows disagree with their partition")
 
     def materialize(self) -> ForwardOutput:
@@ -360,7 +357,6 @@ __all__ = [
     "ForwardBatch",
     "ForwardOutput",
     "RouteSpan",
-    "ModelPhase",
     "TokenSelection",
     "VocabularyPartition",
     "packed_tensor_views",

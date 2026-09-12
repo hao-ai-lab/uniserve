@@ -6,14 +6,12 @@ mod error;
 /// Generation request lowering and submission support.
 pub mod generation;
 mod in_process;
-/// Media request submission values.
-pub mod media;
 /// Engine-statistics publication to serving metrics.
 pub mod metrics;
+pub(crate) mod requests;
 
 pub use error::{Error, Result};
 pub use in_process::EngineClient;
-pub use media::MediaSubmission;
 pub use uniserve_engine::EventRx;
 pub use uniserve_engine::StreamCancelCause;
 

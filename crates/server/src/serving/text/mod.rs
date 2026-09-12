@@ -5,8 +5,6 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use std::collections::BTreeSet;
-
 pub use error::{Error, Result};
 pub use output::{
     CollectedTextOutput, DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs,
@@ -17,30 +15,6 @@ mod error;
 /// Incremental decoded-text and log-probability output values.
 pub mod output;
 pub use crate::profile::tokenizer;
-
-/// Tokenizer/model-derived hints used to enrich sampling parameters before they
-/// are lowered into an engine request.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct SamplingHints {
-    /// Canonical model end-of-sequence token identifier.
-    pub primary_eos_token_id: Option<u32>,
-    /// Additional token identifiers treated as end-of-sequence markers.
-    pub extra_eos_token_ids: BTreeSet<u32>,
-    /// Model-provided default sampling temperature.
-    pub default_temperature: Option<f32>,
-    /// Model-provided default nucleus-sampling mass.
-    pub default_top_p: Option<f32>,
-    /// Model-provided default top-k candidate limit.
-    pub default_top_k: Option<u32>,
-    /// Model-provided default minimum relative token probability.
-    pub default_min_p: Option<f32>,
-    /// Model-provided default repetition penalty.
-    pub default_repetition_penalty: Option<f32>,
-    /// Model-provided default maximum generated-token count.
-    pub default_max_tokens: Option<u32>,
-    /// Model context window size (`max_position_embeddings`).
-    pub max_model_len: Option<u32>,
-}
 
 /// Resolves the effective `max_tokens` for generation.
 ///

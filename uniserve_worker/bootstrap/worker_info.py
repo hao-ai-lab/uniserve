@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from uniserve_worker.nn.parallel import EntryConfig
+from uniserve_worker.execution.batch import (
+    VIDEO_STAGES,
+    Computation,
+    ForwardMode,
+    PipelineStage,
+    computation,
+)
+from uniserve_worker.nn.parallel import ComponentConfig
 
-from ..execution.batch import OpCode, TensorSpec, WorkerEndpoint
+from ..execution.batch import TensorSpec, WorkerEndpoint
 from ..foundation.errors import invalid_descriptor, unsupported_setup
-from ..models.video import MediaExecutionPlan, MediaPlanRepeat, MediaPlanStage
 
 
 class RequestKind(StrEnum):
@@ -163,7 +169,7 @@ class EntryInfo:
     """Loaded entry membership and the tensor results its computation can publish."""
 
     name: str
-    config: EntryConfig
+    config: ComponentConfig
     outputs: tuple[TensorSpec, ...] = ()
 
     def __post_init__(self) -> None:
@@ -177,7 +183,7 @@ class EntryInfo:
         data = _map(value, where)
         return cls(
             name=_str(data.get("name"), f"{where}.name"),
-            config=EntryConfig.from_dict(
+            config=ComponentConfig.from_dict(
                 {key: value for key, value in data.items() if key not in {"name", "outputs"}}
             ),
             outputs=tuple(
@@ -201,7 +207,7 @@ class WorkerInfo:
     model_name: str
     endpoint: WorkerEndpoint
     world_size: int
-    supported_ops: tuple[OpCode, ...]
+    supported_ops: tuple[Computation, ...]
     queue_depth: int
     max_batch_ops: int
     max_batch_tokens: int
@@ -215,7 +221,8 @@ class WorkerInfo:
     components: tuple[EntryInfo, ...] = ()
     device: str = "cpu"
     transfer_backends: tuple[str, ...] = ("local",)
-    media_plan: MediaExecutionPlan | None = None
+    pipeline_components: dict[PipelineStage, str] = field(default_factory=dict)
+    num_inference_steps: int = 0
 
     def output_rank(self, entry: str) -> int:
         """Resolve the host publication owner from the operation's ordered entry.
@@ -231,12 +238,6 @@ class WorkerInfo:
         if self.world_size == 1:
             return 0
         raise unsupported_setup(f"computation entry {entry!r} has no publication owner")
-
-    @property
-    def denoise_steps(self) -> int:
-        """Return the learned-prediction count from the model's execution plan."""
-
-        return 0 if self.media_plan is None else self.media_plan.denoise_steps
 
     @property
     def latent_capacity_units(self) -> int:
@@ -272,7 +273,7 @@ class WorkerInfo:
         if self.world_size < 1 or self.endpoint.rank >= self.world_size:
             raise invalid_descriptor("endpoint rank must satisfy 0 <= rank < world_size")
         requires_kv = any(
-            variant in {OpCode.AR_EXTEND, OpCode.AR_DECODE, OpCode.AR_VERIFY}
+            variant in {ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY}
             for variant in self.supported_ops
         )
         if requires_kv and self.kv_cache is None:
@@ -288,10 +289,14 @@ class WorkerInfo:
             raise invalid_descriptor("worker info must support a work variant")
         if len(set(self.supported_ops)) != len(self.supported_ops):
             raise invalid_descriptor("worker info repeats a work variant")
-        if self.media_plan is not None and not self.media_plan.operations <= set(
-            self.supported_ops
-        ):
-            raise invalid_descriptor("media plan uses an operation the worker does not support")
+        if self.pipeline_components:
+            if self.num_inference_steps < 1 or set(self.pipeline_components) != set(VIDEO_STAGES):
+                raise invalid_descriptor("video components or diffusion step count are incomplete")
+            if any(
+                not component or stage not in self.supported_ops
+                for stage, component in self.pipeline_components.items()
+            ):
+                raise invalid_descriptor("pipeline component uses an unsupported operation")
         has_latent_geometry = bool(self.latent_page_units or self.latent_pages)
         if has_latent_geometry:
             if self.latent_page_units < 1 or self.latent_pages < 2:
@@ -305,7 +310,17 @@ class WorkerInfo:
 
         data = _map(value, where)
         return cls(
-            media_plan=_media_plan(data.get("media_plan"), f"{where}.media_plan"),
+            pipeline_components={
+                _enum(PipelineStage, stage, f"{where}.pipeline_components"): _str(
+                    component, f"{where}.pipeline_components"
+                )
+                for stage, component in _map(
+                    data.get("pipeline_components", {}), f"{where}.pipeline_components"
+                ).items()
+            },
+            num_inference_steps=_uint(
+                data.get("num_inference_steps", 0), f"{where}.num_inference_steps"
+            ),
             configuration_id=str(data.get("configuration_id", "")),
             components=tuple(
                 EntryInfo.from_mapping(item, f"{where}.components[{index}]")
@@ -322,7 +337,7 @@ class WorkerInfo:
             ),
             world_size=_uint(data.get("world_size"), f"{where}.world_size"),
             supported_ops=tuple(
-                _enum(OpCode, item, f"{where}.supported_ops[{index}]")
+                computation(item, f"{where}.supported_ops[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("supported_ops"), f"{where}.supported_ops")
                 )
@@ -346,7 +361,10 @@ class WorkerInfo:
         """Encode worker capabilities and resource bounds for IPC discovery."""
 
         return {
-            "media_plan": None if self.media_plan is None else self.media_plan.to_mapping(),
+            "pipeline_components": {
+                stage.value: component for stage, component in self.pipeline_components.items()
+            },
+            "num_inference_steps": self.num_inference_steps,
             "model_name": self.model_name,
             "endpoint": self.endpoint.to_mapping(),
             "device": self.device,
@@ -365,53 +383,6 @@ class WorkerInfo:
             "buffer_pool_bytes": self.buffer_pool_bytes,
             "max_unresolved_ops": self.max_unresolved_ops,
         }
-
-
-def _media_plan(value: object, where: str) -> MediaExecutionPlan | None:
-    """Decode the finite model-declared media graph from worker discovery."""
-
-    if value is None:
-        return None
-    data = _map(value, where)
-    try:
-        return MediaExecutionPlan(
-            tuple(
-                MediaPlanStage(
-                    name=_str(stage.get("name"), f"{where}.stages[{index}].name"),
-                    operation=_enum(
-                        OpCode,
-                        stage.get("operation"),
-                        f"{where}.stages[{index}].operation",
-                    ),
-                    entry=_str(stage.get("entry"), f"{where}.stages[{index}].entry"),
-                    dependencies=tuple(
-                        _str(item, f"{where}.stages[{index}].dependencies")
-                        for item in _seq(
-                            stage.get("dependencies"),
-                            f"{where}.stages[{index}].dependencies",
-                        )
-                    ),
-                    input_from=(
-                        None
-                        if stage.get("input_from") is None
-                        else _str(
-                            stage.get("input_from"),
-                            f"{where}.stages[{index}].input_from",
-                        )
-                    ),
-                    repeat=_enum(
-                        MediaPlanRepeat,
-                        stage.get("repeat"),
-                        f"{where}.stages[{index}].repeat",
-                    ),
-                    count=_uint(stage.get("count"), f"{where}.stages[{index}].count"),
-                )
-                for index, item in enumerate(_seq(data.get("stages"), f"{where}.stages"))
-                for stage in (_map(item, f"{where}.stages[{index}]"),)
-            )
-        )
-    except ValueError as error:
-        raise invalid_descriptor(str(error)) from error
 
 
 _E = TypeVar("_E", bound=StrEnum)

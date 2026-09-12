@@ -3,6 +3,8 @@
 //! The assembler applies model-selected output processing, tracks usage, and
 //! emits exactly one terminal result for each accepted request.
 
+use super::chat::output::AssistantEvent;
+use super::chat::output::structured::OutputProcessor;
 use super::*;
 
 /// Runtime output sink built from the model-supplied [`OutputProcessorPolicy`].
@@ -21,7 +23,7 @@ fn build_output_sink(
     prompt_token_ids: &[u32],
 ) -> Result<OutputSink> {
     match policy {
-        OutputProcessorPolicy::None | OutputProcessorPolicy::Bagel => Ok(OutputSink::Raw),
+        OutputProcessorPolicy::None => Ok(OutputSink::Raw),
         OutputProcessorPolicy::Qwen3(_) => unreachable!("Qwen3 uses the pull chat pipeline"),
         OutputProcessorPolicy::SenseNova(output_filter) => {
             let processor = SenseNovaOutputProcessor::new(
@@ -38,20 +40,6 @@ fn build_output_sink(
     }
 }
 
-struct ChatDone {
-    prompt_token_count: usize,
-    output_token_count: usize,
-    visible_output_token_count: usize,
-    internal_token_count: usize,
-    finish_reason: FinishReason,
-}
-
-enum MappedChatEvent {
-    Ignore,
-    Event(ServeEvent),
-    Done(ChatDone),
-}
-
 struct EmitContext<'a> {
     request_id: &'a ServeRequestId,
     event: &'a EventContext,
@@ -65,92 +53,6 @@ struct TerminalAccounting {
     image_steps: u32,
 }
 
-/// Maps one structured chat event into the transport-neutral serving event model.
-fn map_chat_event(event: ChatEvent) -> MappedChatEvent {
-    match event {
-        // Start metadata is consumed by the assembly loop before mapping.
-        ChatEvent::Start { .. } => MappedChatEvent::Ignore,
-        // Assistant content blocks preserve their processor-assigned indices.
-        ChatEvent::BlockStart { index, kind } => {
-            MappedChatEvent::Event(ServeEvent::OutputBlockStart {
-                candidate_id: CandidateId::PRIMARY,
-                index,
-                kind,
-            })
-        }
-        ChatEvent::BlockDelta { kind, delta, .. } => match kind {
-            AssistantBlockKind::Text => MappedChatEvent::Event(ServeEvent::TextDelta {
-                candidate_id: CandidateId::PRIMARY,
-                text: delta,
-                token_ids: Vec::new(),
-                logprobs: None,
-            }),
-            AssistantBlockKind::Reasoning => MappedChatEvent::Event(ServeEvent::ReasoningDelta {
-                candidate_id: CandidateId::PRIMARY,
-                text: delta,
-            }),
-            AssistantBlockKind::ToolCall => MappedChatEvent::Ignore,
-        },
-        // Logprobs travel independently from decoded text so either surface can
-        // be suppressed without altering token accounting.
-        ChatEvent::LogprobsDelta {
-            token_ids,
-            logprobs,
-        } => MappedChatEvent::Event(ServeEvent::TextDelta {
-            candidate_id: CandidateId::PRIMARY,
-            text: String::new(),
-            token_ids,
-            logprobs,
-        }),
-        ChatEvent::BlockEnd { index, block } => {
-            MappedChatEvent::Event(ServeEvent::OutputBlockEnd {
-                candidate_id: CandidateId::PRIMARY,
-                index,
-                block,
-            })
-        }
-        // Tool calls use explicit start, argument, and terminal events so
-        // streaming consumers can assemble structured calls incrementally.
-        ChatEvent::ToolCallStart { index, id, name } => {
-            MappedChatEvent::Event(ServeEvent::ToolCallStart {
-                candidate_id: CandidateId::PRIMARY,
-                index,
-                id,
-                name,
-            })
-        }
-        ChatEvent::ToolCallArgumentsDelta { index, delta } => {
-            MappedChatEvent::Event(ServeEvent::ToolCallArgumentsDelta {
-                candidate_id: CandidateId::PRIMARY,
-                index,
-                delta,
-            })
-        }
-        ChatEvent::ToolCallEnd { index, call } => MappedChatEvent::Event(ServeEvent::ToolCallEnd {
-            candidate_id: CandidateId::PRIMARY,
-            index,
-            id: call.id,
-            name: call.name,
-            arguments: call.arguments,
-        }),
-        // Terminal processor accounting becomes the common serving terminal.
-        ChatEvent::Done {
-            prompt_token_count,
-            output_token_count,
-            visible_output_token_count,
-            internal_token_count,
-            finish_reason,
-            ..
-        } => MappedChatEvent::Done(ChatDone {
-            prompt_token_count,
-            output_token_count,
-            visible_output_token_count,
-            internal_token_count,
-            finish_reason,
-        }),
-    }
-}
-
 /// Applies text filtering and emits visible, reasoning, and terminal updates in order.
 async fn emit_text_update(
     context: &EmitContext<'_>,
@@ -160,8 +62,8 @@ async fn emit_text_update(
     logprobs: Option<DecodedLogprobs>,
     finished: Option<crate::serving::text::Finished>,
     first_visible_output_us: &mut Option<u64>,
-    y: &mut TryYielder<ServeEvent, ServeError>,
-) -> Result<Option<ChatDone>> {
+    y: &mut TryYielder<RequestOutput, ServeError>,
+) -> Result<Option<crate::serving::text::Finished>> {
     let delta: SenseNovaTextDelta = match sink {
         OutputSink::SenseNova(processor) => processor.push(&text),
         OutputSink::Raw => SenseNovaTextDelta {
@@ -172,8 +74,7 @@ async fn emit_text_update(
 
     if !delta.reasoning.is_empty() {
         first_visible_output_us.get_or_insert_with(|| context.started.elapsed().as_micros() as u64);
-        y.yield_ok(ServeEvent::ReasoningDelta {
-            candidate_id: CandidateId::PRIMARY,
+        y.yield_ok(RequestOutput::ReasoningDelta {
             text: delta.reasoning,
         })
         .await;
@@ -186,23 +87,14 @@ async fn emit_text_update(
         || logprobs.is_some()
         || finished.is_some()
     {
-        y.yield_ok(ServeEvent::TextDelta {
-            candidate_id: CandidateId::PRIMARY,
+        y.yield_ok(RequestOutput::TextDelta {
             text: delta.visible,
             token_ids,
             logprobs,
         })
         .await;
     }
-    Ok(finished.map(|finished| ChatDone {
-        prompt_token_count: finished.prompt_token_count,
-        output_token_count: finished.output_token_count,
-        visible_output_token_count: finished
-            .output_token_count
-            .saturating_sub(finished.internal_token_count),
-        internal_token_count: finished.internal_token_count,
-        finish_reason: finished.finish_reason,
-    }))
+    Ok(finished)
 }
 
 /// Emits final usage followed by exactly one terminal serving event.
@@ -210,17 +102,15 @@ async fn emit_terminal(
     context: &EmitContext<'_>,
     accounting: TerminalAccounting,
     finish_detail: Option<String>,
-    done: ChatDone,
-    y: &mut TryYielder<ServeEvent, ServeError>,
+    done: crate::serving::text::Finished,
+    y: &mut TryYielder<RequestOutput, ServeError>,
 ) {
-    debug_assert_eq!(
-        done.output_token_count,
-        done.visible_output_token_count
-            .saturating_add(done.internal_token_count)
-    );
-    y.yield_ok(ServeEvent::Usage {
+    let visible_output_token_count = done
+        .output_token_count
+        .saturating_sub(done.internal_token_count);
+    y.yield_ok(RequestOutput::Usage {
         prompt_tokens: done.prompt_token_count.min(u32::MAX as usize) as u32,
-        visible_output_tokens: done.visible_output_token_count.min(u32::MAX as usize) as u32,
+        visible_output_tokens: visible_output_token_count.min(u32::MAX as usize) as u32,
         internal_tokens: done.internal_token_count.min(u32::MAX as usize) as u32,
         image_count: accounting.image_count,
         image_steps: accounting.image_steps,
@@ -236,27 +126,26 @@ async fn emit_terminal(
     .await;
     match done.finish_reason.reason() {
         uniserve_core::FinishReason::Cancelled => {
-            y.yield_ok(ServeEvent::Cancelled {
+            y.yield_ok(RequestOutput::Cancelled {
                 request_id: context.request_id.clone(),
             })
             .await;
         }
         uniserve_core::FinishReason::Aborted => {
-            y.yield_ok(ServeEvent::Aborted {
+            y.yield_ok(RequestOutput::Aborted {
                 request_id: context.request_id.clone(),
             })
             .await;
         }
         uniserve_core::FinishReason::Error => {
-            y.yield_ok(ServeEvent::Failed {
+            y.yield_ok(RequestOutput::Failed {
                 request_id: context.request_id.clone(),
                 message: finish_detail.unwrap_or_else(|| "engine execution failed".to_string()),
             })
             .await;
         }
         _ => {
-            y.yield_ok(ServeEvent::Finished {
-                candidate_id: CandidateId::PRIMARY,
+            y.yield_ok(RequestOutput::Finished {
                 reason: FinishStatus::from(&done.finish_reason),
                 finish_detail,
             })
@@ -270,7 +159,7 @@ async fn emit_terminal(
 pub(super) async fn assemble_chat_event_stream(
     assembly: StreamInput,
     processor: Qwen3ChatOutputProcessor,
-    mut y: TryYielder<ServeEvent, ServeError>,
+    mut y: TryYielder<RequestOutput, ServeError>,
 ) -> Result<()> {
     let StreamInput {
         request_id,
@@ -302,12 +191,8 @@ pub(super) async fn assemble_chat_event_stream(
         decode_options,
         true,
     );
-    let output = processor
-        .process(decoded)
-        .map_err(|error| ServeError::OutputProcessing {
-            request_id: request_id.clone(),
-            source: OutputProcessingError::Chat(error),
-        })?;
+    let output = processor.parse(decoded);
+    let mut blocks = OutputProcessor::new();
     futures::pin_mut!(output);
 
     // A start event establishes prompt metadata and must precede every output
@@ -320,8 +205,8 @@ pub(super) async fn assemble_chat_event_stream(
             request_id: request_id.clone(),
             source: OutputProcessingError::Chat(error),
         })?;
-        let mut event = match event {
-            ChatEvent::Start {
+        let event = match event {
+            AssistantEvent::Start {
                 prompt_token_ids,
                 prompt_logprobs,
                 queued_at,
@@ -335,7 +220,7 @@ pub(super) async fn assemble_chat_event_stream(
                         ),
                     });
                 }
-                y.yield_ok(ServeEvent::Accepted {
+                y.yield_ok(RequestOutput::Accepted {
                     request_id: request_id.clone(),
                     served_name: event_context.served_name.clone(),
                     description: event_context.description.clone(),
@@ -347,7 +232,7 @@ pub(super) async fn assemble_chat_event_stream(
                 .await;
                 if let (Some(queued_at), Some(scheduled_at)) = (queued_at, scheduled_at) {
                     queue_us = Some(((scheduled_at - queued_at).max(0.0) * 1_000_000.0) as u64);
-                    y.yield_ok(ServeEvent::Scheduled {
+                    y.yield_ok(RequestOutput::Scheduled {
                         request_id: request_id.clone(),
                         queued_at: Some(queued_at),
                         scheduled_at: Some(scheduled_at),
@@ -375,31 +260,36 @@ pub(super) async fn assemble_chat_event_stream(
             });
         }
 
-        // Token identifiers are removed at the final public boundary while the
-        // processor retains their internal accounting.
-        if let ChatEvent::LogprobsDelta { token_ids, .. } = &mut event
-            && !emit_token_ids
-        {
-            token_ids.clear();
-        }
-
-        match map_chat_event(event) {
-            MappedChatEvent::Ignore => {}
-            MappedChatEvent::Event(event) => {
-                let visible = matches!(&event, ServeEvent::TextDelta { text, .. } if !text.is_empty())
-                    || matches!(&event, ServeEvent::ReasoningDelta { text, .. } if !text.is_empty())
-                    || matches!(&event, ServeEvent::ToolCallStart { .. });
-                if visible {
-                    first_visible_output_us
-                        .get_or_insert_with(|| started.elapsed().as_micros() as u64);
+        let events = match event {
+            AssistantEvent::Start { .. } => unreachable!("start metadata handled above"),
+            AssistantEvent::TextDelta { kind, delta } => Ok(blocks.process_text_delta(kind, delta)),
+            AssistantEvent::SampleDelta {
+                logprobs,
+                mut token_ids,
+            } => {
+                if !emit_token_ids {
+                    token_ids.clear();
                 }
-                y.yield_ok(event).await;
+                Ok(vec![RequestOutput::TextDelta {
+                    text: String::new(),
+                    token_ids,
+                    logprobs,
+                }])
             }
-            MappedChatEvent::Done(done) => {
-                // The first processor terminal owns final metrics and is the
-                // only successful exit from the assembled stream.
-                let finish_detail =
-                    generation_finish_detail(done.finish_reason.reason()).to_string();
+            AssistantEvent::ToolCallStart { id, name } => Ok(blocks.start_tool_call(id, name)),
+            AssistantEvent::ToolCallArgumentsDelta { delta } => {
+                blocks.push_tool_call_arguments(delta)
+            }
+            AssistantEvent::Done {
+                prompt_token_count,
+                output_token_count,
+                internal_token_count,
+                finish_reason,
+            } => {
+                for event in blocks.finish() {
+                    y.yield_ok(event).await;
+                }
+                let finish_detail = generation_finish_detail(finish_reason.reason()).to_string();
                 emit_terminal(
                     &emit_context,
                     TerminalAccounting {
@@ -409,12 +299,30 @@ pub(super) async fn assemble_chat_event_stream(
                         image_steps: 0,
                     },
                     Some(finish_detail),
-                    done,
+                    crate::serving::text::Finished {
+                        prompt_token_count,
+                        output_token_count,
+                        internal_token_count,
+                        finish_reason,
+                    },
                     &mut y,
                 )
                 .await;
                 return Ok(());
             }
+        }
+        .map_err(|error| ServeError::OutputProcessing {
+            request_id: request_id.clone(),
+            source: OutputProcessingError::Chat(error),
+        })?;
+        for event in events {
+            let visible = matches!(&event, RequestOutput::TextDelta { text, .. } if !text.is_empty())
+                || matches!(&event, RequestOutput::ReasoningDelta { text, .. } if !text.is_empty())
+                || matches!(&event, RequestOutput::ToolCallStart { .. });
+            if visible {
+                first_visible_output_us.get_or_insert_with(|| started.elapsed().as_micros() as u64);
+            }
+            y.yield_ok(event).await;
         }
     }
 
@@ -436,7 +344,7 @@ struct RawAssemblerState {
     accepted: bool,
     pending_scheduled: Option<(f64, f64)>,
     pending_token: Option<u32>,
-    pending_image_events: Vec<ServeEvent>,
+    pending_image_events: Vec<RequestOutput>,
     sink: OutputSink,
 }
 
@@ -447,7 +355,7 @@ struct RawTokenEmitContext<'a, 'tokenizer> {
     decode_options: &'a mut TextDecodeOptions,
     decoder: &'a mut crate::profile::tokenizer::IncrementalDecoder<'tokenizer>,
     stream: &'a mut EventRx,
-    y: &'a mut TryYielder<ServeEvent, ServeError>,
+    y: &'a mut TryYielder<RequestOutput, ServeError>,
 }
 
 impl RawAssemblerState {
@@ -458,9 +366,9 @@ impl RawAssemblerState {
         event_context: &EventContext,
         prompt_token_ids: &[u32],
         prompt_logprobs: Option<DecodedPromptLogprobs>,
-        y: &mut TryYielder<ServeEvent, ServeError>,
+        y: &mut TryYielder<RequestOutput, ServeError>,
     ) {
-        y.yield_ok(ServeEvent::Accepted {
+        y.yield_ok(RequestOutput::Accepted {
             request_id: request_id.clone(),
             served_name: event_context.served_name.clone(),
             description: event_context.description.clone(),
@@ -472,7 +380,7 @@ impl RawAssemblerState {
         .await;
         self.accepted = true;
         if let Some((queued_at, scheduled_at)) = self.pending_scheduled.take() {
-            y.yield_ok(ServeEvent::Scheduled {
+            y.yield_ok(RequestOutput::Scheduled {
                 request_id: request_id.clone(),
                 queued_at: Some(queued_at),
                 scheduled_at: Some(scheduled_at),
@@ -484,7 +392,7 @@ impl RawAssemblerState {
     }
 
     /// Flushes the pending images.
-    async fn flush_pending_images(&mut self, y: &mut TryYielder<ServeEvent, ServeError>) {
+    async fn flush_pending_images(&mut self, y: &mut TryYielder<RequestOutput, ServeError>) {
         for event in self.pending_image_events.drain(..) {
             y.yield_ok(event).await;
         }
@@ -651,7 +559,7 @@ impl RawAssemblerState {
 pub(super) async fn assemble_event_stream(
     assembly: StreamInput,
     output_processor: OutputProcessorPolicy,
-    mut y: TryYielder<ServeEvent, ServeError>,
+    mut y: TryYielder<RequestOutput, ServeError>,
 ) -> Result<()> {
     let StreamInput {
         request_id,
@@ -705,7 +613,7 @@ pub(super) async fn assemble_event_stream(
                 )
             })?;
             let first_token = tokenizer
-                .decode(&[first_token_id], event_context.skip_special_tokens)
+                .decode(&[first_token_id], decode_options.skip_special_tokens)
                 .map_err(|error| ServeError::OutputProcessing {
                     request_id: request_id.clone(),
                     source: OutputProcessingError::Tokenizer(error),
@@ -731,13 +639,13 @@ pub(super) async fn assemble_event_stream(
 
     while let Some(event) = stream.next().await {
         match event {
-            Event::Scheduled {
+            EngineCoreOutput::Scheduled {
                 queued_at,
                 scheduled_at,
             } => {
                 state.queue_us = Some(((scheduled_at - queued_at).max(0.0) * 1_000_000.0) as u64);
                 if state.accepted {
-                    y.yield_ok(ServeEvent::Scheduled {
+                    y.yield_ok(RequestOutput::Scheduled {
                         request_id: request_id.clone(),
                         queued_at: Some(queued_at),
                         scheduled_at: Some(scheduled_at),
@@ -754,7 +662,7 @@ pub(super) async fn assemble_event_stream(
                     .scheduled
                     .fetch_add(1, Ordering::Relaxed);
             }
-            Event::PromptLogprobs { positions } => {
+            EngineCoreOutput::PromptLogprobs { positions } => {
                 state.prompt_positions.extend(positions);
                 if state.prompt_positions.len() > expected_prompt_positions {
                     return Err(malformed_output(
@@ -770,7 +678,7 @@ pub(super) async fn assemble_event_stream(
                         tokenizer.as_ref(),
                         &prompt_token_ids,
                         &positions,
-                        event_context.skip_special_tokens,
+                        decode_options.skip_special_tokens,
                     )
                     .map_err(|error| ServeError::OutputProcessing {
                         request_id: request_id.clone(),
@@ -787,7 +695,7 @@ pub(super) async fn assemble_event_stream(
                         .await;
                 }
             }
-            Event::TextToken { id, .. } => {
+            EngineCoreOutput::TextToken { id, .. } => {
                 if !state.accepted {
                     return Err(malformed_output(
                         request_id.clone(),
@@ -820,7 +728,7 @@ pub(super) async fn assemble_event_stream(
                     }
                 }
             }
-            Event::TokenLogprobs { id, candidates } => {
+            EngineCoreOutput::TokenLogprobs { id, candidates } => {
                 let pending = state.pending_token.take().ok_or_else(|| {
                     malformed_output(
                         request_id.clone(),
@@ -838,7 +746,7 @@ pub(super) async fn assemble_event_stream(
                     &[uniserve_core::PositionLogprobs {
                         entries: candidates,
                     }],
-                    event_context.skip_special_tokens,
+                    decode_options.skip_special_tokens,
                 )
                 .map_err(|error| ServeError::OutputProcessing {
                     request_id: request_id.clone(),
@@ -861,7 +769,7 @@ pub(super) async fn assemble_event_stream(
                     return Ok(());
                 }
             }
-            Event::ImageBegin {
+            EngineCoreOutput::ImageBegin {
                 image_id,
                 height,
                 width,
@@ -871,8 +779,7 @@ pub(super) async fn assemble_event_stream(
                 state
                     .first_visible_output_us
                     .get_or_insert_with(|| started.elapsed().as_micros() as u64);
-                y.yield_ok(ServeEvent::ImageBegin {
-                    candidate_id: CandidateId::PRIMARY,
+                y.yield_ok(RequestOutput::ImageBegin {
                     image_id: image_id.to_string(),
                     width: Some(width),
                     height: Some(height),
@@ -881,29 +788,27 @@ pub(super) async fn assemble_event_stream(
                 })
                 .await;
             }
-            Event::ImageStep { image_id, step } => {
+            EngineCoreOutput::ImageStep { image_id, step } => {
                 state.ensure_output_ready(&request_id, "image-step event")?;
                 state.image_steps = state.image_steps.saturating_add(1);
-                y.yield_ok(ServeEvent::ImageStep {
-                    candidate_id: CandidateId::PRIMARY,
+                y.yield_ok(RequestOutput::ImageStep {
                     image_id: image_id.to_string(),
                     step: step as u32,
                     elapsed_us: started.elapsed().as_micros() as u64,
                 })
                 .await;
             }
-            Event::ImageCommit { image_id } => {
+            EngineCoreOutput::ImageCommit { image_id } => {
                 state.ensure_output_ready(&request_id, "image-commit event")?;
 
                 // Commit and payload publication remain adjacent even when text
                 // decoding interleaves with the engine's image lifecycle.
-                state.pending_image_events.push(ServeEvent::ImageCommit {
-                    candidate_id: CandidateId::PRIMARY,
+                state.pending_image_events.push(RequestOutput::ImageCommit {
                     image_id: image_id.to_string(),
                     elapsed_us: started.elapsed().as_micros() as u64,
                 });
             }
-            Event::ImageDone {
+            EngineCoreOutput::ImageDone {
                 image_id,
                 height,
                 width,
@@ -914,8 +819,7 @@ pub(super) async fn assemble_event_stream(
                 state.ensure_output_ready(&request_id, "image-done event")?;
                 state.image_count = state.image_count.saturating_add(1);
 
-                state.pending_image_events.push(ServeEvent::ImageDone {
-                    candidate_id: CandidateId::PRIMARY,
+                state.pending_image_events.push(RequestOutput::ImageDone {
                     image_id: image_id.to_string(),
                     width: Some(width),
                     height: Some(height),
@@ -925,7 +829,7 @@ pub(super) async fn assemble_event_stream(
                     elapsed_us: started.elapsed().as_micros() as u64,
                 });
             }
-            Event::Finished {
+            EngineCoreOutput::Finished {
                 reason,
                 stop_reason,
                 prompt_tokens,
@@ -986,25 +890,26 @@ pub(super) async fn assemble_event_stream(
                 .await;
                 return Ok(());
             }
-            Event::Rejected { message } => {
+            EngineCoreOutput::Rejected { message } => {
                 state.flush_pending_images(&mut y).await;
-                y.yield_ok(ServeEvent::Rejected {
+                y.yield_ok(RequestOutput::Rejected {
                     request_id: request_id.clone(),
                     message,
                 })
                 .await;
                 return Ok(());
             }
-            Event::Error { message } => {
+            EngineCoreOutput::Error { message }
+            | EngineCoreOutput::ArtifactUnavailable { message } => {
                 state.flush_pending_images(&mut y).await;
-                y.yield_ok(ServeEvent::Failed {
+                y.yield_ok(RequestOutput::Failed {
                     request_id: request_id.clone(),
                     message,
                 })
                 .await;
                 return Ok(());
             }
-            Event::Artifact(_) | Event::MediaProgress { .. } => {
+            EngineCoreOutput::Artifact(_) | EngineCoreOutput::MediaProgress { .. } => {
                 return Err(malformed_output(
                     request_id,
                     "generation request received a media lifecycle event",

@@ -4,25 +4,26 @@
 //! a transport-independent [`EngineHandle`] to request producers.
 
 use std::collections::{BTreeMap, BTreeSet};
+use uniserve_worker_ipc::ForwardMode;
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::executor::{Executor, TransportMap, WorkerId};
+use crate::executor::{Executor, TransferConfig, WorkerId};
 use crate::handle::{EngineHandle, EventRx, SubmitError};
-use crate::runtime::{ControlTokens, EngineLoop, RuntimeProfile};
 use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedStats, SchedulerConfig,
+    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulerConfig, SchedulerStats,
     SchedulingPolicy,
 };
-use crate::worker::{Worker, WorkerExecutor, WorkerProcessArgs};
+use crate::scheduler::{Scheduler, SpecialTokenIds};
+use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
 use anyhow::Context as _;
 use uniserve_core::{
-    CommandWaker, ComponentDistribution, EntryConfig, GenerationLimits, ModelDtype, ParallelConfig,
-    Request, RequestId, RuntimeFamily, SequenceParallel,
+    CommandWaker, ComponentConfig, ComponentDistribution, GenerationLimits, ModelDtype,
+    ParallelConfig, Request, RequestId, RuntimeFamily, SequenceParallel,
 };
 use uniserve_worker_ipc::WorkerInfo;
 
@@ -40,7 +41,7 @@ pub struct WorkerRank {
 pub struct WorkerConfig {
     pub id: WorkerId,
     pub ranks: Vec<WorkerRank>,
-    pub entries: BTreeMap<String, EntryConfig>,
+    pub entries: BTreeMap<String, ComponentConfig>,
     pub queue_depth: usize,
 }
 
@@ -58,7 +59,7 @@ impl WorkerConfig {
 
     pub fn validate_members(
         ranks: &[WorkerRank],
-        entries: &BTreeMap<String, EntryConfig>,
+        entries: &BTreeMap<String, ComponentConfig>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(!ranks.is_empty(), "worker requires rank members");
         let mut devices = BTreeSet::new();
@@ -104,18 +105,18 @@ impl WorkerConfig {
         Ok(())
     }
 
-    /// Validates unique Worker identities and one static owner for each entry.
+    /// Validates unique WorkerGroup identities and one static owner for each entry.
     pub fn validate_all(workers: &[Self]) -> anyhow::Result<()> {
         anyhow::ensure!(!workers.is_empty(), "engine requires workers");
         let mut ids = BTreeSet::new();
         let mut entries = BTreeSet::new();
         for worker in workers {
             worker.validate()?;
-            anyhow::ensure!(ids.insert(&worker.id), "Worker identity is repeated");
+            anyhow::ensure!(ids.insert(&worker.id), "WorkerGroup identity is repeated");
             for entry in worker.entries.keys() {
                 anyhow::ensure!(
                     entries.insert(entry),
-                    "entry {entry} has multiple Worker owners"
+                    "entry {entry} has multiple WorkerGroup owners"
                 );
             }
         }
@@ -139,7 +140,7 @@ impl WorkerConfig {
             ranks,
             entries: BTreeMap::from([(
                 "model".into(),
-                EntryConfig::parallel(
+                ComponentConfig::parallel(
                     (0..rank_count).collect(),
                     ParallelConfig {
                         tensor_parallel_size: rank_count,
@@ -168,15 +169,15 @@ impl WorkerConfig {
         worker.entries = BTreeMap::from([
             (
                 "denoiser".into(),
-                EntryConfig::parallel(ranks.clone(), denoiser),
+                ComponentConfig::parallel(ranks.clone(), denoiser),
             ),
             (
                 "text_encoder".into(),
-                EntryConfig::parallel(ranks.clone(), encoder),
+                ComponentConfig::parallel(ranks.clone(), encoder),
             ),
             (
                 "video_decoder".into(),
-                EntryConfig {
+                ComponentConfig {
                     ranks,
                     parallel_config: ParallelConfig::default(),
                     distribution: Some(ComponentDistribution::TemporalUnits),
@@ -185,11 +186,11 @@ impl WorkerConfig {
             ),
             (
                 "audio_decoder".into(),
-                EntryConfig::parallel(vec![0], ParallelConfig::default()),
+                ComponentConfig::parallel(vec![0], ParallelConfig::default()),
             ),
             (
                 "output".into(),
-                EntryConfig::parallel(vec![0], ParallelConfig::default()),
+                ComponentConfig::parallel(vec![0], ParallelConfig::default()),
             ),
         ]);
         worker
@@ -201,8 +202,8 @@ impl WorkerConfig {
 pub struct EngineConfig {
     /// Request runtime selected for this configuration.
     pub runtime_family: RuntimeFamily,
-    /// Model-family semantics resolved by the serving profile.
-    pub runtime_profile: RuntimeProfile,
+    /// Model generation requirements, intersected with loaded worker capacities.
+    pub generation_limits: GenerationLimits,
     /// Maximum number of ops assembled into a single forward batch.
     pub max_batch: usize,
     /// Maximum number of tokens scheduled in one engine step.
@@ -222,10 +223,10 @@ pub struct EngineConfig {
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_ipc`. Participating worker
-    /// ranks receive the selected transport. Intra-Worker defaults are resolved
+    /// ranks receive the selected transport. Intra-WorkerGroup defaults are resolved
     /// once from rank node/device coordinates before process launch.
-    pub transfer: TransportMap,
-    /// Rank launch defaults refined by each Worker configuration.
+    pub transfer: TransferConfig,
+    /// Rank launch defaults refined by each WorkerGroup configuration.
     pub worker_process: WorkerProcessArgs,
     /// Beginning-of-sequence token identifier.
     pub bos: u32,
@@ -252,10 +253,7 @@ impl EngineConfig {
         };
         Self {
             runtime_family: RuntimeFamily::Umm,
-            runtime_profile: RuntimeProfile::umm(
-                ModelDtype::BFloat16,
-                crate::runtime::sim_umm_generation_limits(),
-            ),
+            generation_limits: crate::scheduler::sim_umm_generation_limits(),
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
@@ -264,7 +262,7 @@ impl EngineConfig {
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: 8192,
             workers: vec![WorkerConfig::model("cpu", 1, 2)],
-            transfer: TransportMap::default(),
+            transfer: TransferConfig::default(),
             worker_process,
             // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
             // scheduler must recognize it to finish a sim request.
@@ -275,8 +273,8 @@ impl EngineConfig {
     }
 
     /// Returns the control tokens for a scheduler request.
-    fn control_tokens(&self) -> ControlTokens {
-        ControlTokens {
+    fn control_tokens(&self) -> SpecialTokenIds {
+        SpecialTokenIds {
             bos: self.bos,
             eos: self.eos.clone(),
             end_of_image: self.end_of_image,
@@ -289,7 +287,7 @@ impl EngineConfig {
 pub struct EngineCore {
     handle: EngineHandle,
     info: WorkerInfo,
-    stats: Arc<SchedStats>,
+    stats: Arc<SchedulerStats>,
     model_name: String,
     model_dtype: ModelDtype,
     generation_limits: GenerationLimits,
@@ -337,7 +335,7 @@ impl EngineCore {
         }
         let workers = bindings
             .into_iter()
-            .zip(Worker::spawn_all(arguments)?)
+            .zip(WorkerGroup::spawn_all(arguments)?)
             .collect();
         let executor = WorkerExecutor::try_new(workers, config.transfer.clone())?;
         let waker = executor.command_waker();
@@ -368,7 +366,7 @@ impl EngineCore {
         waker: CommandWaker,
     ) -> anyhow::Result<Self> {
         let ctrl = config.control_tokens();
-        let sched = EngineLoop::with_runtime_profile(
+        let sched = Scheduler::with_model_limits(
             executor,
             ctrl,
             SchedulerConfig {
@@ -381,11 +379,12 @@ impl EngineCore {
                 ..Default::default()
             },
             config.runtime_family,
-            config.runtime_profile,
+            config.worker_process.model_dtype,
+            config.generation_limits,
         );
         let info = sched.info().clone();
-        let model_dtype = sched.runtime_profile().model_dtype;
-        let generation_limits = sched.runtime_profile().generation_limits.clone();
+        let model_dtype = config.worker_process.model_dtype;
+        let generation_limits = sched.generation_limits().clone();
         let stats = sched.stats_handle();
 
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
@@ -439,13 +438,14 @@ impl EngineCore {
         self.info.supported_ops.iter().any(|mode| {
             matches!(
                 mode,
-                uniserve_worker_ipc::OpCode::ArDecode | uniserve_worker_ipc::OpCode::ArVerify
+                uniserve_worker_ipc::Computation::Forward(ForwardMode::Decode)
+                    | uniserve_worker_ipc::Computation::Forward(ForwardMode::Verify)
             )
         })
     }
 
     /// Returns live scheduler statistics shared with the scheduler thread.
-    pub fn stats(&self) -> &Arc<SchedStats> {
+    pub fn stats(&self) -> &Arc<SchedulerStats> {
         &self.stats
     }
 

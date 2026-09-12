@@ -15,9 +15,7 @@ pub mod logprobs;
 mod types;
 /// Shared request conversion helpers.
 pub mod utils;
-/// Video-generation request and response schemas.
-pub mod videos;
 
 pub use error::{ApiError, Result, serve_error_to_api};
 pub use types::*;
-pub use utils::{ResolvedRequestContext, convert_logit_bias};
+pub use utils::convert_logit_bias;

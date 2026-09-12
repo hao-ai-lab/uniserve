@@ -8,7 +8,7 @@ use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::http::media::SharedMedia;
+use uniserve_core::SharedMedia;
 
 pub(crate) const MAX_VIDEO_JOBS: usize = 128;
 pub(crate) const MAX_VIDEO_BYTES: usize = 1024 * 1024 * 1024;
@@ -66,6 +66,12 @@ impl std::ops::Deref for RetainedMedia {
     type Target = SharedMedia;
     fn deref(&self) -> &Self::Target {
         &self.media
+    }
+}
+
+impl AsRef<[u8]> for RetainedMedia {
+    fn as_ref(&self) -> &[u8] {
+        self.media.as_bytes()
     }
 }
 
@@ -153,7 +159,7 @@ impl VideoJobs {
     ) {
         let mut entries = self.entries.lock().expect("video job lock poisoned");
         let result = result.and_then(|media| {
-            let bytes = u32::try_from(media.bytes)
+            let bytes = u32::try_from(media.len())
                 .ok()
                 .and_then(|bytes| Arc::clone(&self.bytes).try_acquire_many_owned(bytes).ok());
             match bytes {

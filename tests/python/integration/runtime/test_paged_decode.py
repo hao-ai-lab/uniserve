@@ -25,7 +25,7 @@ def test_tensor_core_decode_replans_and_replays_changed_pages():
     context = SimpleNamespace(
         binding=619,
         block_table=torch.empty((batch, 2), dtype=torch.int32, device=device),
-        kv_lens=torch.empty(batch, dtype=torch.int32, device=device),
+        seq_lens=torch.empty(batch, dtype=torch.int32, device=device),
     )
     backend = FlashInferAttentionBackend(
         tuning=FlashInferTuningConfig(
@@ -41,8 +41,8 @@ def test_tensor_core_decode_replans_and_replays_changed_pages():
     )
 
     def stage(lengths, pages):
-        context.kv_lens_cpu = lengths
-        context.kv_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+        context.seq_lens_cpu = lengths
+        context.seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
         context.block_table.copy_(torch.tensor(pages, dtype=torch.int32, device=device))
         backend.prepare_paged_decode_cuda_graph(
             context.binding,
@@ -64,7 +64,7 @@ def test_tensor_core_decode_replans_and_replays_changed_pages():
             keys,
             values,
             block_table=context.block_table,
-            cache_seqlens=context.kv_lens,
+            cache_seqlens=context.seq_lens,
             causal=False,
             scale=width**-0.5,
             context=context,

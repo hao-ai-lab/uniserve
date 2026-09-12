@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import math
 import os
-import struct
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import lru_cache
-from typing import Any, ClassVar, Protocol, TypeAlias, TypeVar, cast
+from typing import Any, Protocol, TypeAlias, TypeVar, cast
 
 from ..foundation.errors import invalid_descriptor
 
@@ -24,7 +23,7 @@ class CompletionState(Protocol):
     def request_key(self) -> RequestKey: ...
 
     @property
-    def op_id(self) -> int: ...
+    def op_id(self) -> ComputationId: ...
 
     @property
     def status(self) -> OpStatus: ...
@@ -63,15 +62,6 @@ class LanePublication(Protocol):
         """Return whether the request-state transition is visible to successor operations."""
 
         ...
-
-
-class TransferKind(StrEnum):
-    """Identifies encoder, device-product, KV, and latent transfer payloads on the wire."""
-
-    ENCODER = "encoder"
-    DEVICE_PRODUCT = "device_product"
-    KV = "kv"
-    LATENT = "latent"
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,9 +399,8 @@ class TensorTransfer:
 
 @dataclass(frozen=True, slots=True)
 class EncoderTransferValue:
-    """Describes the generation, media geometry, payload encoding, and location of transferred encoder features."""
+    """Describes the media geometry, payload encoding, and location of transferred encoder features."""
 
-    generation: int
     height: int
     width: int
     payload_kind: str
@@ -420,9 +409,8 @@ class EncoderTransferValue:
 
 @dataclass(frozen=True, slots=True)
 class DeviceProductTransferValue:
-    """Describes the generation, media geometry, numeric range, and location of a transferred device product."""
+    """Describes the media geometry, numeric range, and location of a transferred device product."""
 
-    generation: int
     height: int
     width: int
     value_range: str
@@ -430,14 +418,13 @@ class DeviceProductTransferValue:
 
 
 @dataclass(frozen=True, slots=True)
-class KvTransferValue:
-    """Describes a versioned KV extent, its page locators, and source-to-destination checkpoint relation."""
+class KvTransfer:
+    """Describes a versioned KV extent, its page locators, and source-to-destination buffer relation."""
 
-    generation: int
     tensors: tuple[TensorTransfer, ...]
-    source: Checkpoint
+    source: BufferId
     destination: str
-    base: Checkpoint | None
+    base: BufferId | None
     base_extent: int
     published_extent: int
     group_id: int
@@ -447,14 +434,10 @@ class KvTransferValue:
     def __post_init__(self) -> None:
         """Validate the exact KV source, installed base and represented extent."""
 
-        if self.generation < 1 or not isinstance(self.source.point, FixedCheckpoint):
-            raise invalid_descriptor("KV publication source identity is not exact")
         if not self.destination or self.base_extent < 0 or self.published_extent < self.base_extent:
             raise invalid_descriptor("KV publication extent or destination is invalid")
         if self.base is None and self.base_extent != 0:
             raise invalid_descriptor("KV publication base identity disagrees with its extent")
-        if self.base is not None and not isinstance(self.base.point, FixedCheckpoint):
-            raise invalid_descriptor("KV publication base identity is not exact")
         if (
             self.group_id < 0
             or self.page_size < 1
@@ -504,12 +487,62 @@ class KvTransferValue:
 
         return self.tensors[0].shape[2] // self.tensors[2].shape[3] if len(self.tensors) == 3 else 0
 
+    @classmethod
+    def from_mapping(cls, value: object, where: str = "kv_transfer") -> KvTransfer:
+        """Decode source identity and physical cache representation."""
+
+        data = _map(value, where)
+        raw_base = data.get("base")
+        return cls(
+            tensors=tuple(
+                TensorTransfer.from_mapping(item, f"{where}.tensors[{index}]")
+                for index, item in enumerate(_seq(data.get("tensors"), f"{where}.tensors"))
+            ),
+            source=BufferId.from_mapping(data.get("source"), f"{where}.source"),
+            destination=_str(data.get("destination"), f"{where}.destination"),
+            base=(None if raw_base is None else BufferId.from_mapping(raw_base, f"{where}.base")),
+            base_extent=_uint(data.get("base_extent", 0), f"{where}.base_extent"),
+            published_extent=_uint(
+                data.get("published_extent", 0),
+                f"{where}.published_extent",
+            ),
+            group_id=_uint(data.get("group_id", 0), f"{where}.group_id"),
+            compute_dtype=_str(data.get("compute_dtype"), f"{where}.compute_dtype"),
+            page_size=_uint(data.get("page_size"), f"{where}.page_size"),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        """Encode the cache publication without a generic product envelope."""
+
+        return {
+            "tensors": [tensor.to_mapping() for tensor in self.tensors],
+            "source": self.source.to_mapping(),
+            "destination": self.destination,
+            "base": None if self.base is None else self.base.to_mapping(),
+            "base_extent": self.base_extent,
+            "published_extent": self.published_extent,
+            "group_id": self.group_id,
+            "compute_dtype": self.compute_dtype,
+            "page_size": self.page_size,
+        }
+
+    def encoded_size_bound(self) -> int:
+        """Bound all page and scale locators and publication metadata."""
+
+        size = (
+            _tensor_transfers_size(self.tensors)
+            + len(self.destination.encode())
+            + len(self.compute_dtype.encode())
+        )
+        if size > MAX_TRANSFER_HANDLE_BYTES:
+            raise invalid_descriptor("KV transfer exceeds its descriptor byte bound")
+        return size
+
 
 @dataclass(frozen=True, slots=True)
 class LatentTransferValue:
-    """Describes a generation step and media geometry for transferred latent storage."""
+    """Describes a denoising step and media geometry for transferred latent storage."""
 
-    generation: int
     height: int
     width: int
     latent_units: int
@@ -517,356 +550,107 @@ class LatentTransferValue:
     tensor: TensorTransfer
 
 
-TransferValue: TypeAlias = (
-    EncoderTransferValue | DeviceProductTransferValue | KvTransferValue | LatentTransferValue
-)
+TransferValue: TypeAlias = EncoderTransferValue | DeviceProductTransferValue | LatentTransferValue
 
 
-@dataclass(frozen=True, slots=True)
-class TransferHandle:
-    """Wraps one typed transfer descriptor for bounded wire encoding and decoding."""
-
-    value: TransferValue
-
-    @property
-    def kind(self) -> TransferKind:
-        """Return the semantic transfer kind selected by the wrapped descriptor."""
-
-        if isinstance(self.value, EncoderTransferValue):
-            return TransferKind.ENCODER
-        if isinstance(self.value, DeviceProductTransferValue):
-            return TransferKind.DEVICE_PRODUCT
-        if isinstance(self.value, KvTransferValue):
-            return TransferKind.KV
-        return TransferKind.LATENT
-
-    @property
-    def tensors(self) -> tuple[TensorTransfer, ...]:
-        return (
-            self.value.tensors if isinstance(self.value, KvTransferValue) else (self.value.tensor,)
+def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
+    locators = tuple(location for tensor in tensors for location in tensor.locations)
+    size = 512 + sum(64 + 8 * len(tensor.shape) for tensor in tensors)
+    for locator in locators:
+        size += (
+            256
+            + len(locator.dtype.encode())
+            + len(locator.device.encode())
+            + 16 * len(locator.shape)
+            + len(locator.source.worker_id.encode())
+            + len(locator.source.node.encode())
+            + len(locator.source.address_space.encode())
+            + len(locator.source.incarnation.encode())
         )
-
-    def encoded_size_bound(self) -> int:
-        """Calculate a conservative wire-size bound for the nested transport handles."""
-
-        locators = tuple(location for tensor in self.tensors for location in tensor.locations)
-        size = 512 + sum(64 + 8 * len(tensor.shape) for tensor in self.tensors)
-        if isinstance(self.value, KvTransferValue):
-            size += len(self.value.destination.encode()) + len(self.value.compute_dtype.encode())
-        for locator in locators:
+        transport = locator.transport
+        if isinstance(transport, LocalTransfer):
+            size += len(transport.endpoint.encode()) + 16
+        elif isinstance(transport, PosixShmTransfer):
+            size += len(transport.endpoint.encode()) + len(transport.name.encode()) + 16
+        else:
             size += (
-                256
-                + len(locator.dtype.encode())
-                + len(locator.device.encode())
-                + 16 * len(locator.shape)
-                + len(locator.source.worker_id.encode())
-                + len(locator.source.node.encode())
-                + len(locator.source.address_space.encode())
-                + len(locator.source.incarnation.encode())
+                len(transport.endpoint.encode())
+                + len(transport.publication_id.encode())
+                + len(transport.storage_handle)
+                + len(transport.ready_event_handle)
+                + 8 * len(transport.tensor_stride)
+                + 8 * len(transport.storage_offsets_bytes)
+                + 12 * len(transport.span_lengths)
+                + 64
             )
-            transport = locator.transport
-            if isinstance(transport, LocalTransfer):
-                size += len(transport.endpoint.encode()) + 16
-            elif isinstance(transport, PosixShmTransfer):
-                size += len(transport.endpoint.encode()) + len(transport.name.encode()) + 16
-            else:
-                size += (
-                    len(transport.endpoint.encode())
-                    + len(transport.publication_id.encode())
-                    + len(transport.storage_handle)
-                    + len(transport.ready_event_handle)
-                    + 8 * len(transport.tensor_stride)
-                    + 8 * len(transport.storage_offsets_bytes)
-                    + 12 * len(transport.span_lengths)
-                    + 64
-                )
-        if size > MAX_TRANSFER_HANDLE_BYTES:
-            raise invalid_descriptor("transfer handle exceeds its byte bound")
-        return size
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str = "transfer handle") -> TransferHandle:
-        """Parse and validate the kind-specific encoder, product, KV, or latent transfer descriptor."""
-
-        data = _map(value, where)
-        kind = _enum(TransferKind, data.get("kind"), f"{where}.kind")
-        payload = _map(data.get("value"), f"{where}.value")
-        generation = _uint(payload.get("generation"), f"{where}.value.generation")
-        if kind is TransferKind.ENCODER:
-            typed: TransferValue = EncoderTransferValue(
-                generation=generation,
-                height=_uint(payload.get("height"), f"{where}.value.height"),
-                width=_uint(payload.get("width"), f"{where}.value.width"),
-                payload_kind=_str(payload.get("payload_kind"), f"{where}.value.payload_kind"),
-                tensor=TensorTransfer.from_mapping(payload.get("tensor"), f"{where}.value.tensor"),
-            )
-        elif kind is TransferKind.DEVICE_PRODUCT:
-            typed = DeviceProductTransferValue(
-                generation=generation,
-                height=_uint(payload.get("height", 0), f"{where}.value.height"),
-                width=_uint(payload.get("width", 0), f"{where}.value.width"),
-                value_range=_str(payload.get("value_range", ""), f"{where}.value.value_range"),
-                tensor=TensorTransfer.from_mapping(payload.get("tensor"), f"{where}.value.tensor"),
-            )
-        elif kind is TransferKind.KV:
-            raw_base = payload.get("base")
-            typed = KvTransferValue(
-                generation=generation,
-                tensors=tuple(
-                    TensorTransfer.from_mapping(item, f"{where}.value.tensors[{index}]")
-                    for index, item in enumerate(
-                        _seq(payload.get("tensors"), f"{where}.value.tensors")
-                    )
-                ),
-                source=Checkpoint.from_mapping(payload.get("source"), f"{where}.value.source"),
-                destination=_str(payload.get("destination"), f"{where}.value.destination"),
-                base=(
-                    None
-                    if raw_base is None
-                    else Checkpoint.from_mapping(raw_base, f"{where}.value.base")
-                ),
-                base_extent=_uint(payload.get("base_extent", 0), f"{where}.value.base_extent"),
-                published_extent=_uint(
-                    payload.get("published_extent", 0),
-                    f"{where}.value.published_extent",
-                ),
-                group_id=_uint(payload.get("group_id", 0), f"{where}.value.group_id"),
-                compute_dtype=_str(payload.get("compute_dtype"), f"{where}.value.compute_dtype"),
-                page_size=_uint(payload.get("page_size"), f"{where}.value.page_size"),
-            )
-        else:
-            typed = LatentTransferValue(
-                generation=generation,
-                height=_uint(payload.get("height"), f"{where}.value.height"),
-                width=_uint(payload.get("width"), f"{where}.value.width"),
-                latent_units=_uint(payload.get("latent_units"), f"{where}.value.latent_units"),
-                step=_uint(payload.get("step", 0), f"{where}.value.step"),
-                tensor=TensorTransfer.from_mapping(payload.get("tensor"), f"{where}.value.tensor"),
-            )
-        return cls(value=typed)
-
-    def to_mapping(self) -> dict[str, object]:
-        """Encode the wrapped kind-specific transfer descriptor for IPC."""
-
-        typed = self.value
-        if isinstance(typed, EncoderTransferValue):
-            value: dict[str, object] = {
-                "generation": typed.generation,
-                "height": typed.height,
-                "width": typed.width,
-                "payload_kind": typed.payload_kind,
-                "tensor": typed.tensor.to_mapping(),
-            }
-        elif isinstance(typed, DeviceProductTransferValue):
-            value = {
-                "generation": typed.generation,
-                "height": typed.height,
-                "width": typed.width,
-                "value_range": typed.value_range,
-                "tensor": typed.tensor.to_mapping(),
-            }
-        elif isinstance(typed, KvTransferValue):
-            value = {
-                "generation": typed.generation,
-                "tensors": [tensor.to_mapping() for tensor in typed.tensors],
-                "source": typed.source.to_mapping(),
-                "destination": typed.destination,
-                "base": None if typed.base is None else typed.base.to_mapping(),
-                "base_extent": typed.base_extent,
-                "published_extent": typed.published_extent,
-                "group_id": typed.group_id,
-                "compute_dtype": typed.compute_dtype,
-                "page_size": typed.page_size,
-            }
-        else:
-            value = {
-                "generation": typed.generation,
-                "height": typed.height,
-                "width": typed.width,
-                "latent_units": typed.latent_units,
-                "step": typed.step,
-                "tensor": typed.tensor.to_mapping(),
-            }
-        return {"kind": self.kind.value, "value": value}
+    return size
 
 
-class TokenMode(StrEnum):
-    """Selects prompt extension, single-token decode, or speculative verification."""
+class ForwardMode(StrEnum):
+    """The numerical mode of an autoregressive or mixed model forward."""
 
-    EXTEND = "extend"
+    PREFILL = "prefill"
     DECODE = "decode"
     VERIFY = "verify"
+    MIXED = "mixed"
 
 
-class EncodeMode(StrEnum):
-    """Selects vision-feature or latent-feature encoding."""
+class PipelineStage(StrEnum):
+    """A concrete encoder, diffusion, decoder, or media-output computation."""
 
-    VISION = "vision"
-    LATENT = "latent"
+    VISION_ENCODING = "vision_encoding"
+    LATENT_ENCODING = "latent_encoding"
+    TEXT_ENCODING = "text_encoding"
+    LATENT_PREPARATION = "latent_preparation"
+    DENOISING = "denoising"
+    IMAGE_DECODING = "image_decoding"
+    VIDEO_DECODING = "video_decoding"
+    AUDIO_DECODING = "audio_decoding"
+    VIDEO_ENCODING = "video_encoding"
+    AUDIO_ENCODING = "audio_encoding"
+    MUXING = "muxing"
 
 
 class TransferMode(StrEnum):
-    """Selects product movement, KV publication, or KV installation."""
+    """The storage action between a concrete producer and consumer."""
 
-    PRODUCT = "product"
+    TENSOR = "tensor"
     KV_PUBLISH = "kv_publish"
     KV_INSTALL = "kv_install"
 
 
-class MediaMode(StrEnum):
-    """Selects diffusion preparation, denoising, or reconstruction."""
+Computation: TypeAlias = ForwardMode | PipelineStage | TransferMode
 
-    PREPARE = "prepare"
-    DENOISE = "denoise"
-    RECONSTRUCT = "reconstruct"
+VIDEO_STAGES = (
+    PipelineStage.TEXT_ENCODING,
+    PipelineStage.LATENT_PREPARATION,
+    PipelineStage.DENOISING,
+    PipelineStage.VIDEO_DECODING,
+    PipelineStage.AUDIO_DECODING,
+    PipelineStage.VIDEO_ENCODING,
+    PipelineStage.AUDIO_ENCODING,
+    PipelineStage.MUXING,
+)
 
-
-class OpCode(StrEnum):
-    """Defines every executable scheduler operation and its canonical model or transfer route."""
-
-    AR_EXTEND = "ar_extend"
-    AR_DECODE = "ar_decode"
-    AR_VERIFY = "ar_verify"
-    ENCODER_VISION = "encoder_vision"
-    ENCODER_TEXT = "encoder_text"
-    ENCODER_LATENT = "encoder_latent"
-    TRANSFER_PRODUCT = "transfer_product"
-    TRANSFER_KV_PUBLISH = "transfer_kv_publish"
-    TRANSFER_KV_INSTALL = "transfer_kv_install"
-    DIFFUSION_PREPARE = "diffusion_prepare"
-    DIFFUSION_STEP = "diffusion_step"
-    DIFFUSION_FINALIZE = "diffusion_finalize"
-    DIFFUSION_DECODE = "diffusion_decode"
-    MEDIA_APPEND = "media_append"
-
-    @property
-    def advances_state(self) -> bool:
-        """Indicate whether successful execution creates a new request checkpoint."""
-
-        return self in _STATE_ADVANCING_WORK
-
-    @property
-    def requires_fixed_parent(self) -> bool:
-        """Indicate whether host-resolved parent state is required before execution."""
-
-        return self is OpCode.TRANSFER_KV_PUBLISH
-
-    @property
-    def token_mode(self) -> TokenMode | None:
-        """Resolve the autoregressive token mode for token routes."""
-
-        if self is OpCode.AR_EXTEND:
-            return TokenMode.EXTEND
-        if self is OpCode.AR_DECODE:
-            return TokenMode.DECODE
-        if self is OpCode.AR_VERIFY:
-            return TokenMode.VERIFY
-        return None
-
-    @property
-    def encode_mode(self) -> EncodeMode | None:
-        """Resolve the encoder modality for encoder routes."""
-
-        if self is OpCode.ENCODER_VISION:
-            return EncodeMode.VISION
-        if self is OpCode.ENCODER_LATENT:
-            return EncodeMode.LATENT
-        return None
-
-    @property
-    def transfer_mode(self) -> TransferMode | None:
-        """Resolve the data-movement mode for transfer routes."""
-
-        if self is OpCode.TRANSFER_PRODUCT:
-            return TransferMode.PRODUCT
-        if self is OpCode.TRANSFER_KV_PUBLISH:
-            return TransferMode.KV_PUBLISH
-        if self is OpCode.TRANSFER_KV_INSTALL:
-            return TransferMode.KV_INSTALL
-        return None
-
-    @property
-    def media_mode(self) -> MediaMode | None:
-        """Resolve the diffusion media phase for trajectory routes."""
-
-        if self is OpCode.DIFFUSION_PREPARE:
-            return MediaMode.PREPARE
-        if self is OpCode.DIFFUSION_STEP:
-            return MediaMode.DENOISE
-        if self is OpCode.DIFFUSION_DECODE:
-            return MediaMode.RECONSTRUCT
-        return None
-
-    @classmethod
-    def token(cls, mode: TokenMode) -> OpCode:
-        """Select the executable autoregressive route for a token mode."""
-
-        return {
-            TokenMode.EXTEND: cls.AR_EXTEND,
-            TokenMode.DECODE: cls.AR_DECODE,
-            TokenMode.VERIFY: cls.AR_VERIFY,
-        }[mode]
-
-    @classmethod
-    def encoder(cls, mode: EncodeMode) -> OpCode:
-        """Select the executable encoder route for a modality."""
-
-        return {
-            EncodeMode.VISION: cls.ENCODER_VISION,
-            EncodeMode.LATENT: cls.ENCODER_LATENT,
-        }[mode]
-
-    @classmethod
-    def transfer(cls, mode: TransferMode) -> OpCode:
-        """Select the executable data-movement route for a transfer mode."""
-
-        return {
-            TransferMode.PRODUCT: cls.TRANSFER_PRODUCT,
-            TransferMode.KV_PUBLISH: cls.TRANSFER_KV_PUBLISH,
-            TransferMode.KV_INSTALL: cls.TRANSFER_KV_INSTALL,
-        }[mode]
-
-    @classmethod
-    def media(cls, mode: MediaMode) -> OpCode:
-        """Select the executable diffusion route for a media phase."""
-
-        return {
-            MediaMode.PREPARE: cls.DIFFUSION_PREPARE,
-            MediaMode.DENOISE: cls.DIFFUSION_STEP,
-            MediaMode.RECONSTRUCT: cls.DIFFUSION_DECODE,
-        }[mode]
+COMPUTATIONS: tuple[Computation, ...] = (
+    ForwardMode.PREFILL,
+    ForwardMode.DECODE,
+    ForwardMode.VERIFY,
+    *PipelineStage,
+    *TransferMode,
+)
 
 
-class Domain(StrEnum):
-    """Separates prefill, autoregressive decode, and diffusion-flow execution domains."""
+def computation(value: object, where: str) -> Computation:
+    """Decode one concrete computation, excluding mixed model-batch metadata."""
 
-    PREFILL = "prefill"
-    DECODE = "decode"
-    FLOW = "flow"
-
-
-_DOMAIN_BY_WORK_VARIANT = {
-    OpCode.AR_EXTEND: Domain.PREFILL,
-    OpCode.AR_DECODE: Domain.DECODE,
-    OpCode.AR_VERIFY: Domain.DECODE,
-    OpCode.ENCODER_VISION: Domain.PREFILL,
-    OpCode.ENCODER_TEXT: Domain.PREFILL,
-    OpCode.ENCODER_LATENT: Domain.PREFILL,
-    OpCode.TRANSFER_PRODUCT: Domain.PREFILL,
-    OpCode.TRANSFER_KV_PUBLISH: Domain.PREFILL,
-    OpCode.TRANSFER_KV_INSTALL: Domain.PREFILL,
-    OpCode.DIFFUSION_PREPARE: Domain.FLOW,
-    OpCode.DIFFUSION_STEP: Domain.FLOW,
-    OpCode.DIFFUSION_FINALIZE: Domain.FLOW,
-    OpCode.DIFFUSION_DECODE: Domain.FLOW,
-    OpCode.MEDIA_APPEND: Domain.FLOW,
-}
-
-
-def execution_domain(kind: OpCode) -> Domain:
-    """Map an executable operation kind to its prefill, decode, or flow scheduling domain."""
-
-    return _DOMAIN_BY_WORK_VARIANT[kind]
+    if isinstance(value, (ForwardMode, PipelineStage, TransferMode)) and value in COMPUTATIONS:
+        return value
+    if type(value) is str:
+        member = _COMPUTATION_BY_VALUE.get(value)
+        if member is not None:
+            return member
+    raise invalid_descriptor(f"{where} is not a supported computation")
 
 
 class AttentionRegime(StrEnum):
@@ -878,39 +662,10 @@ class AttentionRegime(StrEnum):
     HYBRID = "hybrid"
 
 
-class ProductKind(StrEnum):
-    """Identifies the semantic value carried by an operation input or output edge."""
-
-    TOKEN = "token"
-    LOGPROB = "logprob"
-    VISION_FEATURE = "vision_feature"
-    LATENT_FEATURE = "latent_feature"
-    KV = "kv"
-    LATENT = "latent"
-    ARTIFACT = "artifact"
-    COMPLETION = "completion"
-    SAMPLING_STATE = "sampling_state"
-    SELECTED_POINT = "selected_point"
-    TENSOR = "tensor"
-
-
-class StorageClass(StrEnum):
-    """Identifies the physical storage owner used for an execution product."""
-
-    DEVICE_TENSOR = "device_tensor"
-    REQUEST_RELAY = "request_relay"
-    PAGED_KV = "paged_kv"
-    LATENT_ARENA = "latent_arena"
-    HOST_STAGING = "host_staging"
-    PINNED_OUTPUT = "pinned_output"
-
-
 class DType(StrEnum):
     """Defines wire-stable scalar dtypes supported by scheduler descriptors."""
 
     U8 = "u8"
-    U16 = "u16"
-    U32 = "u32"
     I32 = "i32"
     I16 = "i16"
     I64 = "i64"
@@ -924,8 +679,6 @@ class DType(StrEnum):
 
         return {
             DType.U8: 1,
-            DType.U16: 2,
-            DType.U32: 4,
             DType.I32: 4,
             DType.I16: 2,
             DType.I64: 8,
@@ -933,12 +686,6 @@ class DType(StrEnum):
             DType.BF16: 2,
             DType.F32: 4,
         }[self]
-
-    @property
-    def tensor_element_bytes(self) -> int:
-        """Device Tensor width, including widened unsigned integer storage."""
-
-        return self.element_bytes * (2 if self in {DType.U16, DType.U32} else 1)
 
 
 class OpStatus(StrEnum):
@@ -967,49 +714,35 @@ class DrawLayout(StrEnum):
     FLOW_NOISE = "flow_noise"
 
 
-class Disposition(StrEnum):
-    """Controls whether a committed product is published, retained privately, or discarded."""
-
-    PUBLISH = "publish"
-    RETAIN = "retain"
-    DISCARD = "discard"
-
-
-class CloseReason(StrEnum):
-    """Records why a request reached its terminal lifecycle state."""
-
-    COMPLETED = "completed"
-    CANCELLED = "cancelled"
-    ERROR = "error"
-    PREEMPTED = "preempted"
-
-
 _STATE_ADVANCING_WORK = frozenset(
     {
-        OpCode.AR_EXTEND,
-        OpCode.AR_DECODE,
-        OpCode.AR_VERIFY,
-        OpCode.DIFFUSION_PREPARE,
-        OpCode.DIFFUSION_STEP,
+        ForwardMode.PREFILL,
+        ForwardMode.DECODE,
+        ForwardMode.VERIFY,
+        PipelineStage.LATENT_PREPARATION,
+        PipelineStage.DENOISING,
     }
 )
 
-_FORWARD_MODE_BY_VALUE = {member.value: member for member in OpCode}
+_COMPUTATION_BY_VALUE = {member.value: member for member in COMPUTATIONS}
 
 
 def native_run(
     batch_id: int,
     run_id: int,
     collective_seq: int,
-    operations: tuple[Operation, ...],
+    operations: tuple[ScheduledRequest, ...],
     block_tables: tuple[BlockTable, ...],
     new_cache_pages: tuple[CachePageAllocation, ...],
-    forward_rows: tuple[RowGeometry, ...],
+    forward_inputs: tuple[
+        tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[bool, ...]
+    ],
     latent_params: Sequence[object],
     decode_ranges: Sequence[object],
     buffer_allocations: Sequence[object],
     commands: tuple[BatchCommand, ...],
     input_products: Sequence[object],
+    kv_inputs: Sequence[object],
 ) -> Run:
     """Assemble a physical run from transport-constructed members."""
 
@@ -1021,7 +754,11 @@ def native_run(
     set_field(run, "operations", operations)
     set_field(run, "block_tables", block_tables)
     set_field(run, "new_cache_pages", new_cache_pages)
-    set_field(run, "forward_rows", forward_rows)
+    set_field(run, "forward_operation_indices", forward_inputs[0])
+    set_field(run, "request_pool_indices", forward_inputs[1])
+    set_field(run, "seq_lens", forward_inputs[2])
+    set_field(run, "query_lens", forward_inputs[3])
+    set_field(run, "write_kv", forward_inputs[4])
     set_field(
         run,
         "latent_params",
@@ -1051,10 +788,11 @@ def native_run(
         run,
         "input_products",
         tuple(
-            ProductPayload.from_mapping(item, f"run.input_products[{index}]")
+            TensorPublication.from_mapping(item, f"run.input_products[{index}]")
             for index, item in enumerate(input_products)
         ),
     )
+    set_field(run, "kv_inputs", tuple(KvTransfer.from_mapping(value) for value in kv_inputs))
     set_field(run, "lanes", ())
     return run
 
@@ -1303,42 +1041,71 @@ class ImageParams:
         }
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class ComputationId:
+    """Logical batch and selection ordinal, independent of physical worker packing."""
+
+    batch_id: int
+    request_index: int
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.batch_id <= 0xFFFFFFFFFFFFFFFF:
+            raise invalid_descriptor("computation batch id is outside uint64")
+        if not 0 <= self.request_index <= 0xFFFFFFFF:
+            raise invalid_descriptor("computation request index is outside uint32")
+        if self.batch_id == 0 and self.request_index != 0:
+            raise invalid_descriptor("admission identity requires request index zero")
+
+    @classmethod
+    def from_mapping(cls, value: object, where: str = "computation_id") -> ComputationId:
+        if isinstance(value, cls):
+            return value
+        data = _map(value, where)
+        return cls(
+            batch_id=_uint(data.get("batch_id"), f"{where}.batch_id"),
+            request_index=_uint(data.get("request_index"), f"{where}.request_index"),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {"batch_id": self.batch_id, "request_index": self.request_index}
+
+
 @dataclass(frozen=True, slots=True)
 class RequestKey:
-    """Identifies one request epoch within a scheduler authority."""
+    """Identifies one request epoch within an engine instance."""
 
-    authority_id: int
+    engine_id: int
     request_id: int
-    epoch: int
+    request_epoch: int
 
     def __post_init__(self) -> None:
         """Validate the non-negative request identifier and epoch."""
 
-        _nonnegative(self.authority_id, "request_key.authority_id")
+        _nonnegative(self.engine_id, "request_key.engine_id")
         _nonnegative(self.request_id, "request_key.request_id")
-        _nonnegative(self.epoch, "request_key.epoch")
+        _nonnegative(self.request_epoch, "request_key.request_epoch")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "request_key") -> RequestKey:
-        """Parse and validate a scheduler authority, request id, and admission epoch."""
+        """Parse and validate an engine instance, request id, and admission epoch."""
 
         key = _fast_request_key(value)
         if key is not None:
             return key
         data = _map(value, where)
         return cls(
-            authority_id=_uint(data.get("authority_id"), f"{where}.authority_id"),
+            engine_id=_uint(data.get("engine_id"), f"{where}.engine_id"),
             request_id=_uint(data.get("request_id"), f"{where}.request_id"),
-            epoch=_uint(data.get("epoch"), f"{where}.epoch"),
+            request_epoch=_uint(data.get("request_epoch"), f"{where}.request_epoch"),
         )
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize the complete request-generation identity for IPC."""
 
         return {
-            "authority_id": self.authority_id,
+            "engine_id": self.engine_id,
             "request_id": self.request_id,
-            "epoch": self.epoch,
+            "request_epoch": self.request_epoch,
         }
 
 
@@ -1382,6 +1149,21 @@ class ShapeBound:
         for dim in self.dims:
             elements *= dim.extent if isinstance(dim, StaticDim) else dim.bound
         return elements
+
+    def contains_shape(self, shape: tuple[int, ...]) -> bool:
+        """Check tensor geometry; a single dynamic dimension denotes flat capacity."""
+
+        if any(extent < 1 for extent in shape):
+            return False
+        elements = math.prod(shape)
+        if not self.dims:
+            return elements == 1
+        if len(self.dims) == 1 and isinstance(self.dims[0], DeviceDim):
+            return elements <= self.dims[0].bound
+        return len(shape) == len(self.dims) and all(
+            extent == bound.extent if isinstance(bound, StaticDim) else extent <= bound.bound
+            for extent, bound in zip(shape, self.dims, strict=True)
+        )
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "shape_bound") -> ShapeBound:
@@ -1430,7 +1212,7 @@ class TensorSpec:
     def max_bytes(self) -> int:
         """Maximum physical storage required by this Tensor result."""
 
-        return self.shape_bound.max_elements * self.dtype.tensor_element_bytes
+        return self.shape_bound.max_elements * self.dtype.element_bytes
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "tensor_spec") -> TensorSpec:
@@ -1450,52 +1232,21 @@ class TensorSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class PointRange:
-    """Defines a half-open range of speculative or diffusion checkpoint points."""
-
-    base_point: int = 0
-    max_points: int = 0
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str = "point_range") -> PointRange:
-        """Parse a half-open checkpoint-point capacity range."""
-
-        point_range = _fast_point_range(value)
-        if point_range is not None:
-            return point_range
-        data = _map(value, where)
-        return cls(
-            base_point=_uint(data.get("base_point"), f"{where}.base_point"),
-            max_points=_uint(data.get("max_points"), f"{where}.max_points"),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize checkpoint base and maximum point count for IPC."""
-
-        return {"base_point": self.base_point, "max_points": self.max_points}
-
-
-@dataclass(frozen=True, slots=True)
-class ProductRef:
-    """Identifies a typed, versioned operation output and its bounded physical storage contract."""
+class TensorRef:
+    """Identifies tensor storage independently of its role in a computation."""
 
     request_key: RequestKey
-    producer_op_id: int
+    producer_op_id: ComputationId
     output_index: int
     generation: int
-    kind: ProductKind
-    storage_class: StorageClass
     dtype: DType
     shape_bound: ShapeBound
-    point_range: PointRange
 
     def __post_init__(self) -> None:
-        """Validate product identity, version, kind, and bounded tensor contract."""
+        """Validate allocation generation and bounded tensor capacity."""
 
         if self.generation < 1:
             raise invalid_descriptor("product reference has no logical generation")
-        if self.kind is ProductKind.TENSOR and self.storage_class is not StorageClass.DEVICE_TENSOR:
-            raise invalid_descriptor("tensor product must use persistent device storage")
         self.shape_bound.__post_init__()
 
     @property
@@ -1513,45 +1264,25 @@ class ProductRef:
     def max_bytes(self) -> int:
         """Return the maximum physical bytes allowed by this product’s shape and dtype."""
 
-        element_bytes = (
-            self.dtype.tensor_element_bytes
-            if self.kind is ProductKind.TENSOR
-            else self.dtype.element_bytes
-        )
-        return self.shape_bound.max_elements * element_bytes
-
-    def uses_persistent_buffer(self) -> bool:
-        """Return whether the product is assigned to scheduler-managed persistent storage."""
-
-        if self.kind in {
-            ProductKind.VISION_FEATURE,
-            ProductKind.LATENT_FEATURE,
-            ProductKind.TENSOR,
-        }:
-            return True
-        return self.kind is ProductKind.ARTIFACT and self.storage_class in {
-            StorageClass.DEVICE_TENSOR,
-            StorageClass.LATENT_ARENA,
-        }
+        return self.shape_bound.max_elements * self.dtype.element_bytes
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "product_ref") -> ProductRef:
+    def from_mapping(cls, value: object, where: str = "tensor_ref") -> TensorRef:
         """Parse and validate a typed logical product and its storage bounds."""
 
-        reference = _fast_product_ref(value)
+        reference = _fast_tensor_ref(value)
         if reference is not None:
             return reference
         data = _map(value, where)
         return cls(
             request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
-            producer_op_id=_uint(data.get("producer_op_id"), f"{where}.producer_op_id"),
+            producer_op_id=ComputationId.from_mapping(
+                data.get("producer_op_id"), f"{where}.producer_op_id"
+            ),
             output_index=_uint(data.get("output_index"), f"{where}.output_index"),
             generation=_uint(data.get("generation"), f"{where}.generation"),
-            kind=_enum(ProductKind, data.get("kind"), f"{where}.kind"),
-            storage_class=_enum(StorageClass, data.get("storage_class"), f"{where}.storage_class"),
             dtype=_enum(DType, data.get("dtype"), f"{where}.dtype"),
             shape_bound=ShapeBound.from_mapping(data.get("shape_bound"), f"{where}.shape_bound"),
-            point_range=PointRange.from_mapping(data.get("point_range"), f"{where}.point_range"),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -1559,14 +1290,11 @@ class ProductRef:
 
         return {
             "request_key": self.request_key.to_mapping(),
-            "producer_op_id": self.producer_op_id,
+            "producer_op_id": self.producer_op_id.to_mapping(),
             "output_index": self.output_index,
             "generation": self.generation,
-            "kind": self.kind.value,
-            "storage_class": self.storage_class.value,
             "dtype": self.dtype.value,
             "shape_bound": self.shape_bound.to_mapping(),
-            "point_range": self.point_range.to_mapping(),
         }
 
 
@@ -1575,7 +1303,7 @@ class BufferId:
     """Identifies a versioned operation output buffer and its owning request."""
 
     owner: RequestKey
-    producer_op_id: int
+    producer_op_id: ComputationId
     output_index: int
     generation: int
 
@@ -1592,7 +1320,9 @@ class BufferId:
         data = _map(value, where)
         return cls(
             owner=RequestKey.from_mapping(data.get("owner"), f"{where}.owner"),
-            producer_op_id=_uint(data.get("producer_op_id"), f"{where}.producer_op_id"),
+            producer_op_id=ComputationId.from_mapping(
+                data.get("producer_op_id"), f"{where}.producer_op_id"
+            ),
             output_index=_uint(data.get("output_index"), f"{where}.output_index"),
             generation=_uint(data.get("generation"), f"{where}.generation"),
         )
@@ -1602,80 +1332,16 @@ class BufferId:
 
         return {
             "owner": self.owner.to_mapping(),
-            "producer_op_id": self.producer_op_id,
+            "producer_op_id": self.producer_op_id.to_mapping(),
             "output_index": self.output_index,
             "generation": self.generation,
         }
 
 
 @dataclass(frozen=True, slots=True)
-class FixedCheckpoint:
-    """Selects a fixed speculative checkpoint by point index."""
-
-    point: int
-
-    @property
-    def point_index(self) -> int:
-        """Expose the fixed checkpoint point selected by the scheduler."""
-
-        return self.point
-
-
-@dataclass(frozen=True, slots=True)
-class DeviceSelected:
-    """Marks a checkpoint whose committed point is selected by device execution."""
-
-    pass
-
-
-CheckpointPoint: TypeAlias = FixedCheckpoint | DeviceSelected
-
-
-@dataclass(frozen=True, slots=True)
-class Checkpoint:
-    """Identifies an operation checkpoint using either a fixed or device-selected point."""
-
-    op_id: int
-    point: CheckpointPoint
-
-    def is_fixed(self) -> bool:
-        """Indicate whether the checkpoint point is already host-resolved."""
-
-        return isinstance(self.point, FixedCheckpoint)
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str = "checkpoint") -> Checkpoint:
-        """Parse an operation checkpoint with fixed or device-selected point semantics."""
-
-        reference = _fast_version_ref(value)
-        if reference is not None:
-            return reference
-        data = _map(value, where)
-        kind, payload = _tagged(data.get("point"), f"{where}.point")
-        if kind == "fixed":
-            point: CheckpointPoint = FixedCheckpoint(_uint(payload, f"{where}.point.value"))
-        elif kind == "device_selected":
-            point = DeviceSelected()
-        else:
-            raise invalid_descriptor(f"{where}.point has unknown variant {kind!r}")
-        return cls(op_id=_uint(data.get("op_id"), f"{where}.op_id"), point=point)
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize the checkpoint point as its tagged wire variant."""
-
-        point = (
-            {"kind": "fixed", "value": self.point.point}
-            if isinstance(self.point, FixedCheckpoint)
-            else {"kind": "device_selected", "value": None}
-        )
-        return {"op_id": self.op_id, "point": point}
-
-
-@dataclass(frozen=True, slots=True)
 class Bounds:
     """Caps tokens, pages, latent bytes, completion bytes, and transfer bytes for one operation."""
 
-    max_points: int = 0
     max_tokens: int = 0
     max_kv_pages: int = 0
     max_latent_bytes: int = 0
@@ -1691,7 +1357,6 @@ class Bounds:
             return bounds
         data = _map(value, where)
         return cls(
-            max_points=_uint(data.get("max_points"), f"{where}.max_points"),
             max_tokens=_uint(data.get("max_tokens"), f"{where}.max_tokens"),
             max_kv_pages=_uint(data.get("max_kv_pages"), f"{where}.max_kv_pages"),
             max_latent_bytes=_uint(data.get("max_latent_bytes"), f"{where}.max_latent_bytes"),
@@ -1705,7 +1370,6 @@ class Bounds:
         """Serialize all operation resource ceilings for IPC."""
 
         return {
-            "max_points": self.max_points,
             "max_tokens": self.max_tokens,
             "max_kv_pages": self.max_kv_pages,
             "max_latent_bytes": self.max_latent_bytes,
@@ -1749,207 +1413,213 @@ class Rng:
 
 
 @dataclass(frozen=True, slots=True)
-class OpPayload:
-    """Closed computation tag, data dependencies, RNG coordinates and resource bounds."""
-
-    code: OpCode
-    bounds: Bounds
-    inputs: tuple[ProductRef, ...]
-    outputs: tuple[ProductRef, ...]
-    predicate: ProductRef | None
-    rng: Rng | None
-    control_seq: int
-
-    def to_mapping(self) -> dict[str, object]:
-        return {
-            "code": self.code.value,
-            "bounds": self.bounds.to_mapping(),
-            "inputs": [product.to_mapping() for product in self.inputs],
-            "outputs": [product.to_mapping() for product in self.outputs],
-            "predicate": None if self.predicate is None else self.predicate.to_mapping(),
-            "rng": None if self.rng is None else self.rng.to_mapping(),
-            "control_seq": self.control_seq,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class Operation:
-    """Binds one typed operation payload to its request identity, parent checkpoint, and executable kind."""
+class ScheduledRequest:
+    """One computation with its request identity, dependencies, and output limits."""
 
     request_key: RequestKey
-    op_id: int
-    parent: Checkpoint | None
-    entry: str
-    payload: OpPayload
+    op_id: ComputationId
+    predecessor: ComputationId | None
+    kind: Computation
+    bounds: Bounds
+    entry: str = "model"
+    inputs: tuple[TensorRef, ...] = ()
+    outputs: tuple[TensorRef, ...] = ()
+    token_input: TensorRef | None = None
+    token_output: TensorRef | None = None
+    vision_input: TensorRef | None = None
+    latent_feature_input: TensorRef | None = None
+    encoder_output: TensorRef | None = None
+    latent_input: TensorRef | None = None
+    latent_output: TensorRef | None = None
+    image_input: TensorRef | None = None
+    image_output: TensorRef | None = None
+    completion_output: TensorRef | None = None
+    transition_output: TensorRef | None = None
+    predicate: TensorRef | None = None
+    rng: Rng | None = None
+    sampling_state: SamplingState | None = None
+    input_token_ids: tuple[int, ...] = ()
+    input_image: str | None = None
+    kv_input: BufferId | None = None
+    kv_output: BufferId | None = None
 
-    @property
-    def kind(self) -> OpCode:
-        return self.payload.code
+    def tensor_inputs(self) -> tuple[TensorRef, ...]:
+        """Return tensor inputs from the computation signature, excluding its predicate."""
 
-    @classmethod
-    def registered(
-        cls,
-        *,
-        request_key: RequestKey,
-        op_id: int,
-        parent: Checkpoint | None,
-        kind: OpCode,
-        entry: str = "model",
-        bounds: Bounds,
-        inputs: tuple[ProductRef, ...] = (),
-        outputs: tuple[ProductRef, ...] = (),
-        predicate: ProductRef | None = None,
-        rng: Rng | None = None,
-        control_seq: int = 0,
-    ) -> Operation:
-        """Construct an operation from already typed scheduler fields and the payload matching its family."""
+        return (
+            *self.inputs,
+            *(
+                value
+                for value in (
+                    self.token_input,
+                    self.vision_input,
+                    self.latent_feature_input,
+                    self.latent_input,
+                    self.image_input,
+                )
+                if value is not None
+            ),
+        )
 
-        return cls(
-            request_key=request_key,
-            op_id=op_id,
-            parent=parent,
-            entry=entry,
-            payload=OpPayload(kind, bounds, inputs, outputs, predicate, rng, control_seq),
+    def tensor_outputs(self) -> tuple[TensorRef, ...]:
+        """Return every tensor declaration owned by this computation."""
+
+        return (
+            *self.outputs,
+            *(
+                value
+                for value in (
+                    self.token_output,
+                    self.completion_output,
+                    self.transition_output,
+                    self.encoder_output,
+                    self.latent_output,
+                    self.image_output,
+                )
+                if value is not None
+            ),
+        )
+
+    def buffer_inputs(self) -> tuple[TensorRef, ...]:
+        """Return inputs that require persistent destination storage."""
+
+        return (
+            *self.inputs,
+            *(
+                value
+                for value in (self.vision_input, self.latent_feature_input, self.image_input)
+                if value is not None
+            ),
+        )
+
+    def buffer_outputs(self) -> tuple[TensorRef, ...]:
+        """Return outputs backed by scheduler-allocated persistent buffers."""
+
+        return (
+            *self.outputs,
+            *(
+                value
+                for value in (
+                    self.encoder_output,
+                    self.image_output,
+                )
+                if value is not None
+            ),
         )
 
     @property
-    def state_parent(self) -> Checkpoint:
-        """Require the exact predecessor before accessing mutable request state."""
-
-        if self.parent is None:
-            raise invalid_descriptor("operation has no state predecessor")
-        return self.parent
-
-    @property
-    def domain(self) -> Domain:
-        """Select the execution lane domain implied by this operation's route."""
-
-        return execution_domain(self.kind)
-
-    @property
     def advances_state(self) -> bool:
-        """Indicate whether this operation publishes a new request checkpoint."""
+        """Indicate whether this operation advances accepted request progress."""
 
-        return self.kind.advances_state
-
-    @property
-    def bounds(self) -> Bounds:
-        """Expose scheduler-enforced resource ceilings from the typed payload."""
-
-        return self.payload.bounds
-
-    @property
-    def inputs(self) -> tuple[ProductRef, ...]:
-        """Expose logical products consumed in descriptor order."""
-
-        return self.payload.inputs
-
-    @property
-    def outputs(self) -> tuple[ProductRef, ...]:
-        """Expose logical products produced in descriptor order."""
-
-        return self.payload.outputs
-
-    @property
-    def predicate(self) -> ProductRef | None:
-        """Expose the device decision that conditionally enables this operation."""
-
-        return self.payload.predicate
-
-    @property
-    def rng(self) -> Rng | None:
-        """Expose deterministic draw coordinates required by this operation."""
-
-        return self.payload.rng
-
-    @property
-    def control_seq(self) -> int:
-        """Expose the scheduler control sequence used for ordering checks."""
-
-        return self.payload.control_seq
+        return self.kind in _STATE_ADVANCING_WORK
 
     def validate(self) -> None:
-        """Enforce operation-family, parent, bound, dataflow, predicate, RNG, and control-sequence invariants."""
+        """Enforce operation-family, predecessor, bound, dataflow, predicate, and RNG invariants."""
 
-        if self.op_id < 1:
+        if self.op_id.batch_id < 1:
             raise invalid_descriptor("operation id must be positive")
         if not isinstance(self.entry, str) or not self.entry:
             raise invalid_descriptor("operation entry must not be empty")
-        if not isinstance(self.payload, OpPayload) or not isinstance(self.payload.code, OpCode):
-            raise invalid_descriptor("operation payload requires a valid computation tag")
-        if self.parent is None:
+        if self.kind not in COMPUTATIONS:
+            raise invalid_descriptor("operation requires a valid computation tag")
+        if self.predecessor is None:
             if (
                 self.advances_state
-                or self.kind is OpCode.TRANSFER_KV_INSTALL
-                or any(value.kind is ProductKind.LATENT for value in self.inputs)
+                or self.kind is TransferMode.KV_INSTALL
+                or self.latent_input is not None
             ):
                 raise invalid_descriptor("state-changing operation requires a predecessor")
-            if self.control_seq != 0:
-                raise invalid_descriptor(
-                    "computation without a predecessor has no state control sequence"
-                )
-        if self.kind.requires_fixed_parent and (
-            self.parent is None or not isinstance(self.parent.point, FixedCheckpoint)
+        if self.predecessor is not None and not self.predecessor < self.op_id:
+            raise invalid_descriptor("predecessor must precede operation")
+        if len(self.input_token_ids) > self.bounds.max_tokens:
+            raise invalid_descriptor("input token count exceeds the computation token bound")
+        if any(token < 0 or token > 0xFFFFFFFF for token in self.input_token_ids):
+            raise invalid_descriptor("input token id is outside uint32")
+        if self.sampling_state is not None:
+            self.sampling_state.validate()
+        if self.input_image is not None and (
+            not isinstance(self.input_image, str)
+            or not self.input_image
+            or self.kind not in {PipelineStage.VISION_ENCODING, PipelineStage.LATENT_ENCODING}
+            or self.image_input is not None
         ):
-            raise invalid_descriptor("operation requires a fixed semantic parent")
+            raise invalid_descriptor(
+                "encoded image requires an image encoder without another image source"
+            )
         output_indices: set[int] = set()
-        for product in self.outputs:
+        publishes_kv = self.kind in {TransferMode.KV_PUBLISH, TransferMode.KV_INSTALL}
+        if (self.kv_output is not None) != publishes_kv:
+            raise invalid_descriptor(
+                "KV publication or installation requires one cache output identity"
+            )
+        if self.kv_output is not None:
+            if (
+                self.kv_output.owner != self.request_key
+                or self.kv_output.producer_op_id != self.op_id
+            ):
+                raise invalid_descriptor("KV output is not owned by its producing computation")
+            output_indices.add(self.kv_output.output_index)
+        if self.kv_input is not None and (
+            self.kv_input.owner != self.request_key
+            or self.kind
+            not in {
+                TransferMode.KV_INSTALL,
+                PipelineStage.LATENT_PREPARATION,
+                PipelineStage.DENOISING,
+            }
+        ):
+            raise invalid_descriptor("KV input is incompatible with its computation or request")
+        if self.kind is TransferMode.KV_INSTALL and self.kv_input is None:
+            raise invalid_descriptor("KV installation requires a source publication")
+
+        for product in self.tensor_outputs():
             if product.request_key != self.request_key or product.producer_op_id != self.op_id:
                 raise invalid_descriptor(
                     "an output product is not owned by its producing operation"
                 )
             if product.generation < 1:
                 raise invalid_descriptor("an output product has no logical generation")
-            if product.point_range.max_points > max(1, self.bounds.max_points):
-                raise invalid_descriptor("an output product exceeds the operation point bound")
-            if (
-                product.storage_class is StorageClass.LATENT_ARENA
-                and product.max_bytes > self.bounds.max_latent_bytes
-            ):
-                raise invalid_descriptor(
-                    "a latent-arena output exceeds the operation latent-byte bound"
-                )
-            if (
-                product.storage_class in (StorageClass.HOST_STAGING, StorageClass.PINNED_OUTPUT)
-                and product.max_bytes > self.bounds.max_completion_bytes
-            ):
-                raise invalid_descriptor(
-                    "a host-visible output exceeds the operation completion-byte bound"
-                )
-            if (
-                product.storage_class is StorageClass.PAGED_KV
-                and product.max_bytes > self.bounds.max_transfer_bytes
-            ):
-                raise invalid_descriptor(
-                    "a paged-KV output exceeds the operation transfer-byte bound"
-                )
             if product.output_index in output_indices:
                 raise invalid_descriptor("operation repeats an output index")
             output_indices.add(product.output_index)
-        if any(
-            product.request_key != self.request_key
-            and product.kind not in (ProductKind.VISION_FEATURE, ProductKind.LATENT_FEATURE)
-            for product in self.inputs
+        for tensor in (self.encoder_output, self.latent_output, self.image_output):
+            if tensor is not None and tensor.max_bytes > self.bounds.max_latent_bytes:
+                raise invalid_descriptor(
+                    "image or trajectory output exceeds its declared byte capacity"
+                )
+        if self.token_input is not None and (
+            self.kind is not TransferMode.TENSOR
+            or self.token_input.dtype is not DType.I64
+            or self.token_input.shape_bound.max_elements != 1
         ):
             raise invalid_descriptor(
-                "a request-local input product belongs to another request lineage"
+                "token transfer input requires a tensor transfer of one int64 element"
             )
+        for tensor in (self.token_output,):
+            if tensor is not None and (
+                tensor.dtype is not DType.I64 or tensor.shape_bound.max_elements != 1
+            ):
+                raise invalid_descriptor("device token relay requires one int64 element")
+        for tensor in (self.completion_output, self.transition_output):
+            if tensor is not None and (
+                tensor.dtype is not DType.U8 or tensor.shape_bound.max_elements != 1
+            ):
+                raise invalid_descriptor("device completion requires one uint8 element")
+        for product in self.tensor_inputs():
+            if product.request_key != self.request_key and product not in (
+                self.vision_input,
+                self.latent_feature_input,
+            ):
+                raise invalid_descriptor("request-local tensor belongs to another request lineage")
         if self.predicate is not None:
             if self.predicate.request_key != self.request_key:
-                raise invalid_descriptor("operation predicate belongs to another request lineage")
-            continuation_token = (
-                self.predicate.kind is ProductKind.TOKEN
-                and self.predicate.dtype is DType.U32
-                and self.predicate.shape_bound.max_elements == 1
-            )
+                raise invalid_descriptor("computation predicate belongs to another request lineage")
             if (
-                self.predicate.generation < 1
-                or self.predicate.storage_class
-                not in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
-                or not (self.predicate.kind is ProductKind.COMPLETION or continuation_token)
+                self.predicate.dtype not in {DType.U8, DType.I64}
+                or self.predicate.shape_bound.max_elements != 1
             ):
                 raise invalid_descriptor(
-                    "operation predicate is not a generation-tagged device decision product"
+                    "device predicate requires a boolean or packed continuation scalar"
                 )
 
     @classmethod
@@ -1957,8 +1627,8 @@ class Operation:
         cls,
         value: object,
         where: str = "operation",
-    ) -> Operation:
-        """Parse a typed operation and validate its identity, parent checkpoint, and family payload."""
+    ) -> ScheduledRequest:
+        """Parse and validate a computation, its identity, and its execution dependencies."""
 
         # Field decoding follows declaration order with a no-allocation fast
         # path per field. Irregular values use the validating field decoders so
@@ -1968,127 +1638,152 @@ class Operation:
         request_key = _fast_request_key(get("request_key"))
         if request_key is None:
             request_key = RequestKey.from_mapping(get("request_key"), f"{where}.request_key")
-        op_id = get("op_id")
-        if not (type(op_id) is int and op_id >= 0):
-            op_id = _uint(op_id, f"{where}.op_id")
-        parent = _fast_version_ref(get("parent"))
-        if parent is None and get("parent") is not None:
-            parent = Checkpoint.from_mapping(get("parent"), f"{where}.parent")
+        op_id = ComputationId.from_mapping(get("op_id"), f"{where}.op_id")
+        predecessor_value = get("predecessor")
+        predecessor = (
+            None
+            if predecessor_value is None
+            else ComputationId.from_mapping(predecessor_value, f"{where}.predecessor")
+        )
         entry = _str(get("entry"), f"{where}.entry")
-        payload_data = _map(get("payload"), f"{where}.payload")
-        work = _enum(OpCode, payload_data.get("code"), f"{where}.payload.code")
-        payload_get = payload_data.get
-        bounds = _fast_bounds(payload_get("bounds"))
+        work = computation(get("code"), f"{where}.code")
+        bounds = _fast_bounds(get("bounds"))
         if bounds is None:
-            bounds = Bounds.from_mapping(payload_get("bounds"), f"{where}.payload.bounds")
-        inputs = _fast_product_refs(payload_get("inputs", ()))
+            bounds = Bounds.from_mapping(get("bounds"), f"{where}.bounds")
+        inputs = _fast_tensor_refs(get("inputs", ()))
         if inputs is None:
             inputs = tuple(
-                ProductRef.from_mapping(item, f"{where}.payload.inputs[{index}]")
-                for index, item in enumerate(
-                    _seq(payload_get("inputs", ()), f"{where}.payload.inputs")
-                )
+                TensorRef.from_mapping(item, f"{where}.inputs[{index}]")
+                for index, item in enumerate(_seq(get("inputs", ()), f"{where}.inputs"))
             )
-        outputs = _fast_product_refs(payload_get("outputs", ()))
+        outputs = _fast_tensor_refs(get("outputs", ()))
         if outputs is None:
             outputs = tuple(
-                ProductRef.from_mapping(item, f"{where}.payload.outputs[{index}]")
-                for index, item in enumerate(
-                    _seq(payload_get("outputs", ()), f"{where}.payload.outputs")
-                )
+                TensorRef.from_mapping(item, f"{where}.outputs[{index}]")
+                for index, item in enumerate(_seq(get("outputs", ()), f"{where}.outputs"))
             )
-        predicate_raw = payload_get("predicate")
+        predicate_raw = get("predicate")
         if predicate_raw is None:
             predicate = None
         else:
-            predicate = _fast_product_ref(predicate_raw)
+            predicate = _fast_tensor_ref(predicate_raw)
             if predicate is None:
-                predicate = ProductRef.from_mapping(predicate_raw, f"{where}.payload.predicate")
-        rng_raw = payload_get("rng")
+                predicate = TensorRef.from_mapping(predicate_raw, f"{where}.predicate")
+        rng_raw = get("rng")
         if rng_raw is None:
             rng = None
         else:
             rng = _fast_rng(rng_raw)
             if rng is None:
-                rng = Rng.from_mapping(rng_raw, f"{where}.payload.rng")
-        control_seq = payload_get("control_seq")
-        if not (type(control_seq) is int and control_seq >= 0):
-            control_seq = _uint(control_seq, f"{where}.payload.control_seq")
+                rng = Rng.from_mapping(rng_raw, f"{where}.rng")
         operation = cls(
             request_key=request_key,
             op_id=op_id,
-            parent=parent,
+            predecessor=predecessor,
             entry=entry,
-            payload=OpPayload(work, bounds, inputs, outputs, predicate, rng, control_seq),
+            kind=work,
+            bounds=bounds,
+            inputs=inputs,
+            outputs=outputs,
+            token_input=None
+            if get("token_input") is None
+            else TensorRef.from_mapping(get("token_input"), f"{where}.token_input"),
+            token_output=None
+            if get("token_output") is None
+            else TensorRef.from_mapping(get("token_output"), f"{where}.token_output"),
+            vision_input=None
+            if get("vision_input") is None
+            else TensorRef.from_mapping(get("vision_input"), f"{where}.vision_input"),
+            latent_feature_input=None
+            if get("latent_feature_input") is None
+            else TensorRef.from_mapping(
+                get("latent_feature_input"), f"{where}.latent_feature_input"
+            ),
+            encoder_output=None
+            if get("encoder_output") is None
+            else TensorRef.from_mapping(get("encoder_output"), f"{where}.encoder_output"),
+            latent_input=None
+            if get("latent_input") is None
+            else TensorRef.from_mapping(get("latent_input"), f"{where}.latent_input"),
+            latent_output=None
+            if get("latent_output") is None
+            else TensorRef.from_mapping(get("latent_output"), f"{where}.latent_output"),
+            image_input=None
+            if get("image_input") is None
+            else TensorRef.from_mapping(get("image_input"), f"{where}.image_input"),
+            image_output=None
+            if get("image_output") is None
+            else TensorRef.from_mapping(get("image_output"), f"{where}.image_output"),
+            completion_output=None
+            if get("completion_output") is None
+            else TensorRef.from_mapping(get("completion_output"), f"{where}.completion_output"),
+            transition_output=None
+            if get("transition_output") is None
+            else TensorRef.from_mapping(get("transition_output"), f"{where}.transition_output"),
+            predicate=predicate,
+            rng=rng,
+            input_token_ids=tuple(_ints(get("input_token_ids"), "input_token_ids")),
+            kv_input=None
+            if get("kv_input") is None
+            else BufferId.from_mapping(get("kv_input"), f"{where}.kv_input"),
+            kv_output=None
+            if get("kv_output") is None
+            else BufferId.from_mapping(get("kv_output"), f"{where}.kv_output"),
+            input_image=(
+                None if get("input_image") is None else _str(get("input_image"), "input_image")
+            ),
+            sampling_state=(
+                None
+                if get("sampling_state") is None
+                else SamplingState.from_mapping(get("sampling_state"))
+            ),
         )
         operation.validate()
         return operation
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode operation identity, parent checkpoint, kind, and family-specific payload."""
+        """Encode computation fields and their request and predecessor identities."""
 
         return {
             "request_key": self.request_key.to_mapping(),
-            "op_id": self.op_id,
-            "parent": None if self.parent is None else self.parent.to_mapping(),
+            "op_id": self.op_id.to_mapping(),
+            "predecessor": None if self.predecessor is None else self.predecessor.to_mapping(),
             "entry": self.entry,
-            "payload": self.payload.to_mapping(),
+            "code": self.kind.value,
+            "bounds": self.bounds.to_mapping(),
+            "inputs": [product.to_mapping() for product in self.inputs],
+            "outputs": [product.to_mapping() for product in self.outputs],
+            "token_input": None if self.token_input is None else self.token_input.to_mapping(),
+            "token_output": None if self.token_output is None else self.token_output.to_mapping(),
+            "vision_input": None if self.vision_input is None else self.vision_input.to_mapping(),
+            "latent_feature_input": None
+            if self.latent_feature_input is None
+            else self.latent_feature_input.to_mapping(),
+            "encoder_output": None
+            if self.encoder_output is None
+            else self.encoder_output.to_mapping(),
+            "latent_input": None if self.latent_input is None else self.latent_input.to_mapping(),
+            "latent_output": None
+            if self.latent_output is None
+            else self.latent_output.to_mapping(),
+            "image_input": None if self.image_input is None else self.image_input.to_mapping(),
+            "image_output": None if self.image_output is None else self.image_output.to_mapping(),
+            "completion_output": None
+            if self.completion_output is None
+            else self.completion_output.to_mapping(),
+            "transition_output": None
+            if self.transition_output is None
+            else self.transition_output.to_mapping(),
+            "predicate": None if self.predicate is None else self.predicate.to_mapping(),
+            "rng": None if self.rng is None else self.rng.to_mapping(),
+            "input_token_ids": list(self.input_token_ids),
+            "input_image": self.input_image,
+            "kv_input": None if self.kv_input is None else self.kv_input.to_mapping(),
+            "kv_output": None if self.kv_output is None else self.kv_output.to_mapping(),
+            "sampling_state": (
+                None if self.sampling_state is None else self.sampling_state.to_mapping()
+            ),
         }
-
-
-@dataclass(frozen=True, slots=True)
-class LogicalLengths:
-    """Tracks semantic token, visible-KV, computed-KV, and latent extents after an operation."""
-
-    token_len: int = 0
-    kv_visible_len: int = 0
-    kv_computed_len: int = 0
-    latent_len: int = 0
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str = "logical_lengths") -> LogicalLengths:
-        """Parse semantic token, KV, and latent extents from a result payload."""
-
-        data = _map(value, where)
-        return cls(
-            token_len=_uint(data.get("token_len"), f"{where}.token_len"),
-            kv_visible_len=_uint(data.get("kv_visible_len"), f"{where}.kv_visible_len"),
-            kv_computed_len=_uint(data.get("kv_computed_len"), f"{where}.kv_computed_len"),
-            latent_len=_uint(data.get("latent_len"), f"{where}.latent_len"),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize semantic token, KV, and latent extents for IPC."""
-
-        return {
-            "token_len": self.token_len,
-            "kv_visible_len": self.kv_visible_len,
-            "kv_computed_len": self.kv_computed_len,
-            "latent_len": self.latent_len,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class TokenSpan:
-    """Identifies a contiguous token interval in a model result."""
-
-    base: int = 0
-    len: int = 0
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str = "token_span") -> TokenSpan:
-        """Parse a contiguous token base and length from a result payload."""
-
-        data = _map(value, where)
-        return cls(
-            base=_uint(data.get("base"), f"{where}.base"),
-            len=_uint(data.get("len"), f"{where}.len"),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize the contiguous token interval for IPC."""
-
-        return {"base": self.base, "len": self.len}
 
 
 @dataclass(frozen=True, slots=True)
@@ -2206,151 +1901,58 @@ class MediaOutput:
 
 
 @dataclass(frozen=True, slots=True)
-class _ResultData:
-    """Holds fields shared by autoregressive, encoder, diffusion, and transfer results."""
-
-    family: ClassVar[str]
-    logical_lengths: LogicalLengths
-    token_span: TokenSpan
-    committed_tokens: tuple[int, ...]
-    finish_flags: FinishFlags
-    media_output: MediaOutput | None = None
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize fields shared by every result family and diffusion cursor extensions."""
-
-        lengths = self.logical_lengths
-        span = self.token_span
-        flags = self.finish_flags
-        value: dict[str, object] = {
-            "family": self.family,
-            "logical_lengths": {
-                "token_len": lengths.token_len,
-                "kv_visible_len": lengths.kv_visible_len,
-                "kv_computed_len": lengths.kv_computed_len,
-                "latent_len": lengths.latent_len,
-            },
-            "token_span": {"base": span.base, "len": span.len},
-            "committed_tokens": list(self.committed_tokens),
-            "finish_flags": {"eos": flags.eos, "length": flags.length, "stop": flags.stop},
-            "media_output": None if self.media_output is None else self.media_output.to_mapping(),
-        }
-        if isinstance(self, DiffusionResult):
-            value.update(next_cursor=self.next_cursor, done=self.done)
-        return value
-
-
-class ArResult(_ResultData):
-    """Carries autoregressive lengths, committed tokens, finish state, and optional media output."""
-
-    family = "ar"
-
-
-class EncoderResult(_ResultData):
-    """Carries encoder logical lengths and any produced feature payload metadata."""
-
-    family = "encoder"
-
-
-@dataclass(frozen=True, slots=True)
-class DiffusionResult(_ResultData):
-    """Carries diffusion logical lengths, committed points, and optional media output."""
-
-    family = "diffusion"
-    next_cursor: int = 0
-    done: bool = False
-
-
-class TransferResult(_ResultData):
-    """Carries logical lengths and publication metadata from a transfer operation."""
-
-    family = "transfer"
-
-
-ResultPayload: TypeAlias = ArResult | EncoderResult | DiffusionResult | TransferResult
-
-
-@dataclass(frozen=True, slots=True)
 class ModelOutput:
-    """Associates a typed operation result with status, error metadata, timing, and output products."""
+    """An operation completion with accepted progress, tokens, products, and timing."""
 
     request_key: RequestKey
-    op_id: int
-    completion_slot_generation: int
+    op_id: ComputationId
     status: OpStatus
-    selected_point: int
     product_generations: tuple[int, ...]
     error_code: ErrorCode | None
     timing_counters: TimingCounters
-    payload: ResultPayload
-
-    @property
-    def logical_lengths(self) -> LogicalLengths:
-        """Expose semantic extents carried by the typed result payload."""
-
-        return self.payload.logical_lengths
-
-    @property
-    def token_span(self) -> TokenSpan:
-        """Expose the contiguous token interval produced by the operation."""
-
-        return self.payload.token_span
-
-    @property
-    def committed_tokens(self) -> tuple[int, ...]:
-        """Expose host-visible tokens accepted into request state."""
-
-        return self.payload.committed_tokens
-
-    @property
-    def finish_flags(self) -> FinishFlags:
-        """Expose generation termination conditions from the typed payload."""
-
-        return self.payload.finish_flags
-
-    @property
-    def media_output(self) -> MediaOutput | None:
-        """Expose the completed media artifact attached to this result, if any."""
-
-        return self.payload.media_output
-
-    @property
-    def result_family(self) -> str:
-        """Expose the wire discriminator for the typed result payload."""
-
-        return self.payload.family
-
-    @property
-    def next_cursor(self) -> int:
-        """Expose the next diffusion reconstruction cursor, or zero for other families."""
-
-        return self.payload.next_cursor if isinstance(self.payload, DiffusionResult) else 0
-
-    @property
-    def done(self) -> bool:
-        """Indicate whether diffusion reconstruction is complete."""
-
-        return self.payload.done if isinstance(self.payload, DiffusionResult) else False
+    kind: Computation
+    position: int
+    kv_visible_len: int
+    kv_computed_len: int
+    num_completed_steps: int
+    committed_tokens: tuple[int, ...]
+    finish_flags: FinishFlags
+    media_output: MediaOutput | None = None
+    kv_output: KvTransfer | None = None
+    sampled_logprob: float | None = None
+    top_logprobs: tuple[tuple[int, float, int], ...] = ()
+    prompt_logprobs: tuple[tuple[tuple[int, float, int], ...], ...] = ()
 
     def validate(self) -> None:
-        """Verify that status, result family, products, errors, and timing form a coherent completion."""
+        """Verify that status, products, errors, and timing form a coherent completion."""
 
-        if self.op_id < 1:
+        if self.op_id.batch_id < 1:
             raise invalid_descriptor("completion op id must be positive")
-        if self.logical_lengths.kv_visible_len > self.logical_lengths.kv_computed_len:
+        if self.kv_output is not None and (
+            self.status is not OpStatus.OK
+            or self.kind is not TransferMode.KV_PUBLISH
+            or self.kv_output.source.owner != self.request_key
+            or self.kv_output.source.producer_op_id != self.op_id
+        ):
+            raise invalid_descriptor("KV publication does not belong to its successful completion")
+
+        if self.kv_visible_len > self.kv_computed_len:
             raise invalid_descriptor("completion selected KV length exceeds computed length")
-        if self.completion_slot_generation < 1:
-            raise invalid_descriptor("completion slot generation must be positive")
-        if self.next_cursor < 0:
-            raise invalid_descriptor("completion next cursor must not be negative")
+        if (
+            min(self.position, self.kv_visible_len, self.kv_computed_len, self.num_completed_steps)
+            < 0
+        ):
+            raise invalid_descriptor("completion execution coordinates must be non-negative")
         if self.status is OpStatus.ERROR:
             if self.error_code is None:
                 raise invalid_descriptor("an error completion must carry an error code")
         elif self.error_code is not None:
             raise invalid_descriptor("a non-error completion must not carry an error code")
         if self.status is OpStatus.PREDICATED and (
-            self.token_span.len != 0
-            or self.committed_tokens
+            self.committed_tokens
+            or self.sampled_logprob is not None
+            or self.top_logprobs
+            or self.prompt_logprobs
             or self.product_generations
             or self.finish_flags.eos
             or self.finish_flags.length
@@ -2365,47 +1967,10 @@ class ModelOutput:
         """Parse a completion and enforce its status-specific result and error contract."""
 
         data = _map(value, where)
-        payload = _map(data.get("payload"), f"{where}.payload")
-        result_family = _str(payload.get("family"), f"{where}.payload.family")
-        result_type: type[_ResultData]
-        if result_family == "ar":
-            result_type = ArResult
-        elif result_family == "encoder":
-            result_type = EncoderResult
-        elif result_family == "diffusion":
-            result_type = DiffusionResult
-        elif result_family == "transfer":
-            result_type = TransferResult
-        else:
-            raise invalid_descriptor(f"{where}.payload family is invalid")
-        result_args = (
-            LogicalLengths.from_mapping(
-                payload.get("logical_lengths"), f"{where}.payload.logical_lengths"
-            ),
-            TokenSpan.from_mapping(payload.get("token_span"), f"{where}.payload.token_span"),
-            _uints(payload.get("committed_tokens", ()), f"{where}.payload.committed_tokens"),
-            FinishFlags.from_mapping(payload.get("finish_flags"), f"{where}.payload.finish_flags"),
-            None
-            if payload.get("media_output") is None
-            else MediaOutput.from_mapping(payload["media_output"], f"{where}.payload.media_output"),
-        )
-        result_payload = (
-            DiffusionResult(
-                *result_args,
-                next_cursor=_uint(payload.get("next_cursor", 0), f"{where}.payload.next_cursor"),
-                done=_bool(payload.get("done", False), f"{where}.payload.done"),
-            )
-            if result_type is DiffusionResult
-            else result_type(*result_args)
-        )
         record = cls(
             request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
-            op_id=_uint(data.get("op_id"), f"{where}.op_id"),
-            completion_slot_generation=_uint(
-                data.get("completion_slot_generation"), f"{where}.completion_slot_generation"
-            ),
+            op_id=ComputationId.from_mapping(data.get("op_id"), f"{where}.op_id"),
             status=_enum(OpStatus, data.get("status"), f"{where}.status"),
-            selected_point=_uint(data.get("selected_point"), f"{where}.selected_point"),
             product_generations=_uints(
                 data.get("product_generations", ()), f"{where}.product_generations"
             ),
@@ -2417,28 +1982,73 @@ class ModelOutput:
             timing_counters=TimingCounters.from_mapping(
                 data.get("timing_counters"), f"{where}.timing_counters"
             ),
-            payload=result_payload,
+            kind=computation(data.get("code"), f"{where}.code"),
+            position=_uint(data.get("position"), f"{where}.position"),
+            kv_visible_len=_uint(data.get("kv_visible_len"), f"{where}.kv_visible_len"),
+            kv_computed_len=_uint(data.get("kv_computed_len"), f"{where}.kv_computed_len"),
+            num_completed_steps=_uint(
+                data.get("num_completed_steps"), f"{where}.num_completed_steps"
+            ),
+            sampled_logprob=(
+                None
+                if data.get("sampled_logprob") is None
+                else _logprob_value(data["sampled_logprob"])
+            ),
+            top_logprobs=_logprob_entries(data.get("top_logprobs", ())),
+            prompt_logprobs=tuple(
+                _logprob_entries(entries)
+                for entries in _seq(data.get("prompt_logprobs", ()), "prompt_logprobs")
+            ),
+            committed_tokens=_uints(data.get("committed_tokens", ()), f"{where}.committed_tokens"),
+            finish_flags=FinishFlags.from_mapping(
+                data.get("finish_flags"), f"{where}.finish_flags"
+            ),
+            kv_output=None
+            if data.get("kv_output") is None
+            else KvTransfer.from_mapping(data["kv_output"], f"{where}.kv_output"),
+            media_output=None
+            if data.get("media_output") is None
+            else MediaOutput.from_mapping(data["media_output"], f"{where}.media_output"),
         )
         record.validate()
         return record
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode one operation completion with typed result, products, timing, and error metadata."""
+        """Encode one operation completion with accepted progress, products, timing, and error metadata."""
 
+        flags = self.finish_flags
         key = self.request_key
         timing = self.timing_counters
         error_code = self.error_code
         return {
             "request_key": {
-                "authority_id": key.authority_id,
+                "engine_id": key.engine_id,
                 "request_id": key.request_id,
-                "epoch": key.epoch,
+                "request_epoch": key.request_epoch,
             },
-            "op_id": self.op_id,
-            "completion_slot_generation": self.completion_slot_generation,
+            "op_id": self.op_id.to_mapping(),
             "status": self.status.value,
-            "selected_point": self.selected_point,
-            "payload": self.payload.to_mapping(),
+            "code": self.kind.value,
+            "position": self.position,
+            "kv_visible_len": self.kv_visible_len,
+            "kv_computed_len": self.kv_computed_len,
+            "num_completed_steps": self.num_completed_steps,
+            "committed_tokens": list(self.committed_tokens),
+            "sampled_logprob": self.sampled_logprob,
+            "top_logprobs": [
+                {"token_id": token, "logprob": value, "rank": rank}
+                for token, value, rank in self.top_logprobs
+            ],
+            "prompt_logprobs": [
+                [
+                    {"token_id": token, "logprob": value, "rank": rank}
+                    for token, value, rank in entries
+                ]
+                for entries in self.prompt_logprobs
+            ],
+            "finish_flags": {"eos": flags.eos, "length": flags.length, "stop": flags.stop},
+            "media_output": None if self.media_output is None else self.media_output.to_mapping(),
+            "kv_output": None if self.kv_output is None else self.kv_output.to_mapping(),
             "product_generations": list(self.product_generations),
             "error_code": None if error_code is None else error_code.value,
             "timing_counters": {
@@ -2471,41 +2081,11 @@ class Start:
 
 
 @dataclass(frozen=True, slots=True)
-class Commit:
-    """Atomically selects a checkpoint, publishes bounded results, and advances request state."""
-
-    request_key: RequestKey
-    control_seq: int
-    expected_parent: Checkpoint
-    selected: Checkpoint
-    public_event_limit: int
-    disposition: Disposition
-
-
-@dataclass(frozen=True, slots=True)
 class Finish:
     """Close a lineage while preserving explicitly retained persistent allocations.
 
     Retained buffers are owned outside the request and remain readable until Free;
-    request slots, KV state, and unretained products still retire at this cutoff.
-    """
-
-    request_key: RequestKey
-    control_seq: int
-    cutoff: Checkpoint
-    reason: CloseReason
-    retained_buffers: tuple[BufferId, ...] = ()
-
-    def __post_init__(self) -> None:
-        _validate_retained_buffers(self.request_key, self.retained_buffers)
-
-
-@dataclass(frozen=True, slots=True)
-class Retire:
-    """Retire physical request storage without selecting a semantic checkpoint.
-
-    The Runtime has terminated the request or another Worker owns its cutoff.
-    Accepted computation and readers still drain before acknowledgement.
+    request slots, KV state, and unretained products retire after readers finish.
     """
 
     request_key: RequestKey
@@ -2535,7 +2115,7 @@ class Free:
         return self.buffer.owner
 
 
-BatchCommand: TypeAlias = Start | Commit | Finish | Free | Retire
+BatchCommand: TypeAlias = Start | Finish | Free
 
 
 def _command_variant_index(command: BatchCommand) -> int:
@@ -2543,20 +2123,16 @@ def _command_variant_index(command: BatchCommand) -> int:
 
     if isinstance(command, Start):
         return 0
-    if isinstance(command, Commit):
-        return 1
     if isinstance(command, Finish):
-        return 2
-    if isinstance(command, Retire):
-        return 4
-    return 3
+        return 1
+    return 2
 
 
 def command_from_mapping(
     value: object,
     where: str = "batch command",
 ) -> BatchCommand:
-    """Parse a tagged start, commit, finish, or free lifecycle command."""
+    """Parse a tagged start, finish, or free lifecycle command."""
 
     kind, payload = _tagged(value, where)
     data = _map(payload, f"{where}.value")
@@ -2565,51 +2141,9 @@ def command_from_mapping(
     request_key = _fast_request_key(data.get("request_key"))
     if kind != "free" and request_key is None:
         request_key = RequestKey.from_mapping(data.get("request_key"), f"{where}.value.request_key")
-    if kind == "commit":
+    if kind == "finish":
         assert request_key is not None
-        expected_parent = _fast_version_ref(data.get("expected_parent"))
-        if expected_parent is None:
-            expected_parent = Checkpoint.from_mapping(
-                data.get("expected_parent"), f"{where}.value.expected_parent"
-            )
-        selected = _fast_version_ref(data.get("selected"))
-        if selected is None:
-            selected = Checkpoint.from_mapping(data.get("selected"), f"{where}.value.selected")
-        commit = Commit(
-            request_key=request_key,
-            control_seq=_uint(data.get("control_seq"), f"{where}.value.control_seq"),
-            expected_parent=expected_parent,
-            selected=selected,
-            public_event_limit=_uint(
-                data.get("public_event_limit"), f"{where}.value.public_event_limit"
-            ),
-            disposition=_enum(Disposition, data.get("disposition"), f"{where}.value.disposition"),
-        )
-        if not commit.selected.is_fixed():
-            raise invalid_descriptor("a commit command must select a fixed version")
-        command: BatchCommand = commit
-    elif kind == "finish":
-        assert request_key is not None
-        cutoff = _fast_version_ref(data.get("cutoff"))
-        if cutoff is None:
-            cutoff = Checkpoint.from_mapping(data.get("cutoff"), f"{where}.value.cutoff")
-        command = Finish(
-            request_key=request_key,
-            control_seq=_uint(data.get("control_seq"), f"{where}.value.control_seq"),
-            cutoff=cutoff,
-            reason=_enum(CloseReason, data.get("reason"), f"{where}.value.reason"),
-            retained_buffers=tuple(
-                BufferId.from_mapping(buffer, f"{where}.value.retained_buffers[{index}]")
-                for index, buffer in enumerate(
-                    _seq(data.get("retained_buffers"), f"{where}.value.retained_buffers")
-                )
-            ),
-        )
-        if not command.cutoff.is_fixed():
-            raise invalid_descriptor("a finish command must name a fixed cutoff version")
-    elif kind == "retire":
-        assert request_key is not None
-        command = Retire(
+        command: BatchCommand = Finish(
             request_key=request_key,
             retained_buffers=tuple(
                 BufferId.from_mapping(buffer, f"{where}.value.retained_buffers[{index}]")
@@ -2633,32 +2167,9 @@ def command_to_mapping(command: BatchCommand) -> dict[str, object]:
             "kind": "start",
             "value": {"request": command.request.to_mapping()},
         }
-    if isinstance(command, Commit):
-        return {
-            "kind": "commit",
-            "value": {
-                "request_key": command.request_key.to_mapping(),
-                "control_seq": command.control_seq,
-                "expected_parent": command.expected_parent.to_mapping(),
-                "selected": command.selected.to_mapping(),
-                "public_event_limit": command.public_event_limit,
-                "disposition": command.disposition.value,
-            },
-        }
     if isinstance(command, Finish):
         return {
             "kind": "finish",
-            "value": {
-                "request_key": command.request_key.to_mapping(),
-                "control_seq": command.control_seq,
-                "cutoff": command.cutoff.to_mapping(),
-                "reason": command.reason.value,
-                "retained_buffers": [buffer.to_mapping() for buffer in command.retained_buffers],
-            },
-        }
-    if isinstance(command, Retire):
-        return {
-            "kind": "retire",
             "value": {
                 "request_key": command.request_key.to_mapping(),
                 "retained_buffers": [buffer.to_mapping() for buffer in command.retained_buffers],
@@ -2742,92 +2253,46 @@ class UmmRequestParams:
 
 
 @dataclass(frozen=True, slots=True)
-class MediaGeometry:
-    """Fixes frame rate, frame count, and raster dimensions for bounded media generation."""
+class DiffusionSamplingParams:
+    """Effective diffusion bounds and seed resolved by model preprocessing."""
 
-    frame_count: int
-    video_units: int
-    prompt_tokens: int
-    denoise_steps: int
-
-    def __post_init__(self) -> None:
-        """Validate positive frame rate, frame count, and raster dimensions."""
-
-        for name in (
-            "frame_count",
-            "video_units",
-            "prompt_tokens",
-            "denoise_steps",
-        ):
-            _nonnegative(getattr(self, name), f"media geometry {name}")
-        if (
-            self.frame_count == 0
-            or self.video_units == 0
-            or self.prompt_tokens == 0
-            or self.denoise_steps == 0
-        ):
-            raise invalid_descriptor("media geometry is invalid")
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str = "media geometry") -> MediaGeometry:
-        """Parse exact frame, prompt, denoising, and reconstruction-unit geometry."""
-
-        data = _map(value, where)
-        return cls(
-            frame_count=_uint(data.get("frame_count"), f"{where}.frame_count"),
-            video_units=_uint(data.get("video_units"), f"{where}.video_units"),
-            prompt_tokens=_uint(data.get("prompt_tokens"), f"{where}.prompt_tokens"),
-            denoise_steps=_uint(data.get("denoise_steps"), f"{where}.denoise_steps"),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize bounded media execution geometry for admission."""
-
-        return {
-            "frame_count": self.frame_count,
-            "video_units": self.video_units,
-            "prompt_tokens": self.prompt_tokens,
-            "denoise_steps": self.denoise_steps,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class DiffusionRequestParams:
-    """Defines latent geometry, integration steps, guidance scales, and deterministic noise coordinates."""
-
-    prompt_token_ids: tuple[int, ...]
+    num_frames: int
+    num_decode_chunks: int
+    num_inference_steps: int
     seed: int
-    geometry: MediaGeometry
 
     def __post_init__(self) -> None:
-        """Validate latent geometry, integration steps, guidance, and noise coordinates."""
+        """Require positive work bounds and a nonnegative deterministic seed."""
 
-        if not self.prompt_token_ids:
-            raise invalid_descriptor("diffusion prompt tokens must not be empty")
+        for name in ("num_frames", "num_decode_chunks", "num_inference_steps"):
+            if getattr(self, name) < 1:
+                raise invalid_descriptor(f"diffusion {name} must be positive")
         _nonnegative(self.seed, "diffusion seed")
-        if len(self.prompt_token_ids) != self.geometry.prompt_tokens:
-            raise invalid_descriptor("diffusion prompt tokens disagree with its geometry")
 
     @classmethod
     def from_mapping(
-        cls, value: object, where: str = "diffusion parameters"
-    ) -> DiffusionRequestParams:
-        """Parse prompt tokens, deterministic seed, and media geometry for diffusion work."""
+        cls, value: object, where: str = "diffusion sampling"
+    ) -> DiffusionSamplingParams:
+        """Parse the core's effective diffusion parameters."""
 
         data = _map(value, where)
         return cls(
-            prompt_token_ids=_uints(data.get("prompt_token_ids", ()), f"{where}.prompt_token_ids"),
+            num_frames=_uint(data.get("num_frames"), f"{where}.num_frames"),
+            num_decode_chunks=_uint(data.get("num_decode_chunks"), f"{where}.num_decode_chunks"),
+            num_inference_steps=_uint(
+                data.get("num_inference_steps"), f"{where}.num_inference_steps"
+            ),
             seed=_uint(data.get("seed"), f"{where}.seed"),
-            geometry=MediaGeometry.from_mapping(data.get("geometry"), f"{where}.geometry"),
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize diffusion admission parameters for IPC."""
+        """Serialize the shared diffusion parameter definition."""
 
         return {
-            "prompt_token_ids": list(self.prompt_token_ids),
+            "num_frames": self.num_frames,
+            "num_decode_chunks": self.num_decode_chunks,
+            "num_inference_steps": self.num_inference_steps,
             "seed": self.seed,
-            "geometry": self.geometry.to_mapping(),
         }
 
 
@@ -2839,11 +2304,14 @@ class NewRequest:
     request_pool_idx: int
     ar: ArRequestParams | None
     umm: UmmRequestParams | None
-    diffusion: DiffusionRequestParams | None = None
+    diffusion: DiffusionSamplingParams | None = None
+    prompt_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         """Require exactly one parameter family compatible with the request kind."""
 
+        if self.diffusion is not None and not self.prompt_token_ids:
+            raise invalid_descriptor("diffusion prompt tokens must not be empty")
         if self.request_pool_idx < 1:
             raise invalid_descriptor("request-pool index must be positive")
         if self.ar is None and self.umm is None and self.diffusion is None:
@@ -2857,11 +2325,12 @@ class NewRequest:
         request_pool_idx: int,
         ar: ArRequestParams | None = None,
         umm: UmmRequestParams | None = None,
-        diffusion: DiffusionRequestParams | None = None,
+        diffusion: DiffusionSamplingParams | None = None,
+        prompt_token_ids: tuple[int, ...] = (),
     ) -> NewRequest:
         """Construct a new request while requiring exactly one parameter family."""
 
-        return cls(request_key, request_pool_idx, ar, umm, diffusion)
+        return cls(request_key, request_pool_idx, ar, umm, diffusion, prompt_token_ids)
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "admission") -> NewRequest:
@@ -2871,6 +2340,7 @@ class NewRequest:
         admission = cls(
             request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
             request_pool_idx=_uint(data.get("request_pool_idx"), f"{where}.request_pool_idx"),
+            prompt_token_ids=_uints(data.get("prompt_token_ids", ()), f"{where}.prompt_token_ids"),
             ar=(
                 None
                 if data.get("ar") is None
@@ -2884,7 +2354,7 @@ class NewRequest:
             diffusion=(
                 None
                 if data.get("diffusion") is None
-                else DiffusionRequestParams.from_mapping(data["diffusion"], f"{where}.diffusion")
+                else DiffusionSamplingParams.from_mapping(data["diffusion"], f"{where}.diffusion")
             ),
         )
         return admission
@@ -2895,6 +2365,7 @@ class NewRequest:
         return {
             "request_key": self.request_key.to_mapping(),
             "request_pool_idx": self.request_pool_idx,
+            "prompt_token_ids": list(self.prompt_token_ids),
             "ar": None if self.ar is None else self.ar.to_mapping(),
             "umm": None if self.umm is None else self.umm.to_mapping(),
             "diffusion": None if self.diffusion is None else self.diffusion.to_mapping(),
@@ -3017,54 +2488,29 @@ class CachePageAllocation:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class RowGeometry:
-    """Describe a forward row and whether its queries persist in the KV cache."""
+def _validate_forward_inputs(
+    operation_count: int,
+    operation_indices: tuple[int, ...],
+    request_pool_indices: tuple[int, ...],
+    seq_lens: tuple[int, ...],
+    query_lens: tuple[int, ...],
+    write_kv: tuple[bool, ...],
+) -> None:
+    """Validate aligned model inputs before lane preparation indexes their columns."""
 
-    operation_index: int
-    request_pool_index: int
-    seq_len: int
-    query_len: int
-    write_kv: bool
-
-    def __post_init__(self) -> None:
-        """Validate logical rows fit their positive physical row capacity."""
-
-        if (
-            self.operation_index < 0
-            or self.request_pool_index < 1
-            or self.seq_len < 0
-            or self.query_len < 1
-        ):
-            raise invalid_descriptor("forward row is invalid")
-
-    @classmethod
-    def from_mapping(
-        cls,
-        value: object,
-        where: str = "forward row",
-    ) -> RowGeometry:
-        """Parse one packed forward row's operation, slot, and sequence geometry."""
-
-        data = _map(value, where)
-        return cls(
-            operation_index=_uint(data.get("operation_index"), f"{where}.operation_index"),
-            request_pool_index=_uint(data.get("request_pool_index"), f"{where}.request_pool_index"),
-            seq_len=_uint(data.get("seq_len"), f"{where}.seq_len"),
-            query_len=_uint(data.get("query_len"), f"{where}.query_len"),
-            write_kv=_bool(data.get("write_kv"), f"{where}.write_kv"),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize row-to-operation params and token lengths."""
-
-        return {
-            "operation_index": self.operation_index,
-            "request_pool_index": self.request_pool_index,
-            "seq_len": self.seq_len,
-            "query_len": self.query_len,
-            "write_kv": self.write_kv,
-        }
+    rows = len(operation_indices)
+    if any(
+        len(column) != rows for column in (request_pool_indices, seq_lens, query_lens, write_kv)
+    ):
+        raise invalid_descriptor("forward input columns have different lengths")
+    if any(index < 0 or index >= operation_count for index in operation_indices):
+        raise invalid_descriptor("forward operation index is outside its batch")
+    if any(slot < 1 for slot in request_pool_indices):
+        raise invalid_descriptor("forward input carries the reserved request slot")
+    if any(total < query for total, query in zip(seq_lens, query_lens, strict=True)) or any(
+        length < 1 for length in query_lens
+    ):
+        raise invalid_descriptor("forward input has invalid token lengths")
 
 
 @dataclass(frozen=True, slots=True)
@@ -3072,7 +2518,7 @@ class LatentParams:
     """Solver-step range and optional paged storage for one request trajectory."""
 
     request_key: RequestKey
-    op_id: int
+    op_id: ComputationId
     page_table: tuple[int, ...]
     latent_units: int
     height: int
@@ -3083,7 +2529,7 @@ class LatentParams:
     def __post_init__(self) -> None:
         """Validate latent page ownership, bank, units, width, and raster geometry."""
 
-        if self.op_id < 1:
+        if self.op_id.batch_id < 1:
             raise invalid_descriptor("latent params operation id must be positive")
         if min(self.height, self.width) < 1 or self.latent_units < 0:
             raise invalid_descriptor("latent params geometry must be positive")
@@ -3103,7 +2549,7 @@ class LatentParams:
         data = _map(value, where)
         return cls(
             request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
-            op_id=_uint(data.get("op_id"), f"{where}.op_id"),
+            op_id=ComputationId.from_mapping(data.get("op_id"), f"{where}.op_id"),
             page_table=_uints(data.get("page_table", ()), f"{where}.page_table"),
             latent_units=_uint(data.get("latent_units"), f"{where}.latent_units"),
             height=_uint(data.get("height"), f"{where}.height"),
@@ -3117,7 +2563,7 @@ class LatentParams:
 
         return {
             "request_key": self.request_key.to_mapping(),
-            "op_id": self.op_id,
+            "op_id": self.op_id.to_mapping(),
             "page_table": list(self.page_table),
             "latent_units": self.latent_units,
             "height": self.height,
@@ -3136,24 +2582,19 @@ class MediaTrack(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class DecodeRange:
-    """Selects an independent media track and its bounded temporal range."""
+    """Selects a bounded temporal range for a concrete media computation."""
 
     request_key: RequestKey
-    op_id: int
-    track: MediaTrack
+    op_id: ComputationId
     cursor: int
     max_units: int
 
     def __post_init__(self) -> None:
         """Validate latent slice bounds and destination output-ring slot."""
 
-        if self.op_id < 1 or self.max_units < 1:
+        if self.op_id.batch_id < 1 or self.max_units < 1:
             raise invalid_descriptor("decode params identity and unit bound must be positive")
         _nonnegative(self.cursor, "decode params cursor")
-        if not isinstance(self.track, MediaTrack):
-            raise invalid_descriptor("decode params requires a media track")
-        if self.track is MediaTrack.AUDIO and (self.cursor != 0 or self.max_units != 1):
-            raise invalid_descriptor("audio decode range must address its single sample stream")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "decode params") -> DecodeRange:
@@ -3162,8 +2603,7 @@ class DecodeRange:
         data = _map(value, where)
         return cls(
             request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
-            op_id=_uint(data.get("op_id"), f"{where}.op_id"),
-            track=MediaTrack(_str(data.get("track"), f"{where}.track")),
+            op_id=ComputationId.from_mapping(data.get("op_id"), f"{where}.op_id"),
             cursor=_uint(data.get("cursor"), f"{where}.cursor"),
             max_units=_uint(data.get("max_units"), f"{where}.max_units"),
         )
@@ -3173,8 +2613,7 @@ class DecodeRange:
 
         return {
             "request_key": self.request_key.to_mapping(),
-            "op_id": self.op_id,
-            "track": self.track.value,
+            "op_id": self.op_id.to_mapping(),
             "cursor": self.cursor,
             "max_units": self.max_units,
         }
@@ -3218,7 +2657,7 @@ class BufferAllocation:
 
 
 def _validate_buffer_allocations(
-    operations: Sequence[Operation],
+    operations: Sequence[ScheduledRequest],
     parameters: Sequence[BufferAllocation],
     where: str,
 ) -> None:
@@ -3235,9 +2674,7 @@ def _validate_buffer_allocations(
     if any(left[1] > right[0] for left, right in zip(spans, spans[1:])):
         raise invalid_descriptor(f"{where} buffer parameters overlap")
     for operation in operations:
-        for output in operation.outputs:
-            if not output.uses_persistent_buffer():
-                continue
+        for output in operation.buffer_outputs():
             output_allocation = by_id.get(output.buffer_id)
             if output_allocation is None:
                 raise invalid_descriptor("persistent operation output has no buffer params")
@@ -3252,14 +2689,17 @@ class RunLane:
     lane_id: int
     launch_id: int
     collective_seq: int
-    domain: Domain
     route: int
     attention: AttentionRegime
     shape_class: int
-    operations: tuple[Operation, ...]
+    operations: tuple[ScheduledRequest, ...]
     block_tables: tuple[BlockTable, ...] = ()
     new_cache_pages: tuple[CachePageAllocation, ...] = ()
-    forward_rows: tuple[RowGeometry, ...] = ()
+    forward_operation_indices: tuple[int, ...] = ()
+    request_pool_indices: tuple[int, ...] = ()
+    seq_lens: tuple[int, ...] = ()
+    query_lens: tuple[int, ...] = ()
+    write_kv: tuple[bool, ...] = ()
     latent_params: tuple[LatentParams, ...] = ()
     decode_ranges: tuple[DecodeRange, ...] = ()
     buffer_allocations: tuple[BufferAllocation, ...] = ()
@@ -3280,8 +2720,8 @@ class RunLane:
             raise invalid_descriptor("batch lane route and shape class must be unsigned")
         if not self.operations:
             raise invalid_descriptor("batch lane must carry at least one operation")
-        if any(operation.domain is not self.domain for operation in self.operations):
-            raise invalid_descriptor("batch lane operation disagrees with its domain")
+        if any(operation.kind is not self.operations[0].kind for operation in self.operations):
+            raise invalid_descriptor("batch lane must contain one computation kind")
         operations = {
             (operation.request_key, operation.op_id): operation for operation in self.operations
         }
@@ -3297,19 +2737,28 @@ class RunLane:
             table = tables.get(identity)
             if table is None or not set(allocation.page_ids).issubset(table.page_ids):
                 raise invalid_descriptor("cache-page allocation has no matching block table")
-        for row in self.forward_rows:
-            if row.operation_index >= len(self.operations):
-                raise invalid_descriptor("forward row operation index is outside its lane")
-        latent_ids: set[tuple[RequestKey, int]] = set()
+        _validate_forward_inputs(
+            len(self.operations),
+            self.forward_operation_indices,
+            self.request_pool_indices,
+            self.seq_lens,
+            self.query_lens,
+            self.write_kv,
+        )
+        latent_ids: set[tuple[RequestKey, ComputationId]] = set()
         latent_pages: set[int] = set()
 
-        def addresses_trajectory(operation: Operation) -> bool:
+        def addresses_trajectory(operation: ScheduledRequest) -> bool:
             """Identify operations that require an explicit physical latent params."""
 
-            return operation.kind in {
-                OpCode.DIFFUSION_PREPARE,
-                OpCode.DIFFUSION_STEP,
-            } or any(reference.kind is ProductKind.LATENT for reference in operation.inputs)
+            return (
+                operation.kind
+                in {
+                    PipelineStage.LATENT_PREPARATION,
+                    PipelineStage.DENOISING,
+                }
+                or operation.latent_input is not None
+            )
 
         for latent_params in self.latent_params:
             latent_identity = (latent_params.request_key, latent_params.op_id)
@@ -3332,7 +2781,7 @@ class RunLane:
             for operation in self.operations
         ):
             raise invalid_descriptor("operation that addresses a trajectory has no latent params")
-        decode_ids: set[tuple[RequestKey, int]] = set()
+        decode_ids: set[tuple[RequestKey, ComputationId]] = set()
         for params in self.decode_ranges:
             decode_identity = (params.request_key, params.op_id)
             if decode_identity in decode_ids:
@@ -3340,12 +2789,24 @@ class RunLane:
             decode_ids.add(decode_identity)
             operation = operations.get(decode_identity)
             if operation is None or operation.kind not in {
-                OpCode.DIFFUSION_DECODE,
-                OpCode.MEDIA_APPEND,
+                PipelineStage.VIDEO_DECODING,
+                PipelineStage.VIDEO_ENCODING,
+                PipelineStage.AUDIO_DECODING,
+                PipelineStage.AUDIO_ENCODING,
             }:
                 raise invalid_descriptor("decode params does not name a media decode operation")
+            if operation.kind in {PipelineStage.AUDIO_DECODING, PipelineStage.AUDIO_ENCODING} and (
+                params.cursor != 0 or params.max_units != 1
+            ):
+                raise invalid_descriptor("audio decode range must address its single sample stream")
         if any(
-            operation.kind in {OpCode.DIFFUSION_DECODE, OpCode.MEDIA_APPEND}
+            operation.kind
+            in {
+                PipelineStage.VIDEO_DECODING,
+                PipelineStage.AUDIO_DECODING,
+                PipelineStage.VIDEO_ENCODING,
+                PipelineStage.AUDIO_ENCODING,
+            }
             and (operation.request_key, operation.op_id) not in decode_ids
             for operation in self.operations
         ):
@@ -3365,12 +2826,11 @@ class RunLane:
             lane_id=_uint(data.get("lane_id"), f"{where}.lane_id"),
             launch_id=_uint(data.get("launch_id"), f"{where}.launch_id"),
             collective_seq=_uint(data.get("collective_seq"), f"{where}.collective_seq"),
-            domain=Domain(_str(data.get("domain"), f"{where}.domain")),
             route=_uint(data.get("route"), f"{where}.route"),
             attention=AttentionRegime(_str(data.get("attention"), f"{where}.attention")),
             shape_class=_uint(data.get("shape_class"), f"{where}.shape_class"),
             operations=tuple(
-                Operation.from_mapping(
+                ScheduledRequest.from_mapping(
                     item,
                     f"{where}.operations[{index}]",
                 )
@@ -3396,11 +2856,18 @@ class RunLane:
                     _seq(data.get("new_cache_pages", ()), f"{where}.new_cache_pages")
                 )
             ),
-            forward_rows=tuple(
-                RowGeometry.from_mapping(item, f"{where}.forward_rows[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("forward_rows", ()), f"{where}.forward_rows")
-                )
+            forward_operation_indices=_uints(
+                data.get("forward_operation_indices", ()),
+                "forward inputs.forward_operation_indices",
+            ),
+            request_pool_indices=_uints(
+                data.get("request_pool_indices", ()), "forward inputs.request_pool_indices"
+            ),
+            seq_lens=_uints(data.get("seq_lens", ()), "forward inputs.seq_lens"),
+            query_lens=_uints(data.get("query_lens", ()), "forward inputs.query_lens"),
+            write_kv=tuple(
+                _bool(value, "forward inputs.write_kv")
+                for value in _seq(data.get("write_kv", ()), "forward inputs.write_kv")
             ),
             latent_params=tuple(
                 LatentParams.from_mapping(item, f"{where}.latent_params[{index}]")
@@ -3436,14 +2903,17 @@ class RunLane:
             "lane_id": self.lane_id,
             "launch_id": self.launch_id,
             "collective_seq": self.collective_seq,
-            "domain": self.domain.value,
             "route": self.route,
             "attention": self.attention.value,
             "shape_class": self.shape_class,
             "operations": [operation.to_mapping() for operation in self.operations],
             "block_tables": [table.to_mapping() for table in self.block_tables],
             "new_cache_pages": [allocation.to_mapping() for allocation in self.new_cache_pages],
-            "forward_rows": [row.to_mapping() for row in self.forward_rows],
+            "forward_operation_indices": list(self.forward_operation_indices),
+            "request_pool_indices": list(self.request_pool_indices),
+            "seq_lens": list(self.seq_lens),
+            "query_lens": list(self.query_lens),
+            "write_kv": list(self.write_kv),
             "latent_params": [params.to_mapping() for params in self.latent_params],
             "decode_ranges": [params.to_mapping() for params in self.decode_ranges],
             "buffer_allocations": [params.to_mapping() for params in self.buffer_allocations],
@@ -3457,15 +2927,20 @@ class Run:
     batch_id: int
     run_id: int
     collective_seq: int = 1
-    operations: tuple[Operation, ...] = ()
+    operations: tuple[ScheduledRequest, ...] = ()
     block_tables: tuple[BlockTable, ...] = ()
     new_cache_pages: tuple[CachePageAllocation, ...] = ()
-    forward_rows: tuple[RowGeometry, ...] = ()
+    forward_operation_indices: tuple[int, ...] = ()
+    request_pool_indices: tuple[int, ...] = ()
+    seq_lens: tuple[int, ...] = ()
+    query_lens: tuple[int, ...] = ()
+    write_kv: tuple[bool, ...] = ()
     latent_params: tuple[LatentParams, ...] = ()
     decode_ranges: tuple[DecodeRange, ...] = ()
     buffer_allocations: tuple[BufferAllocation, ...] = ()
     commands: tuple[BatchCommand, ...] = ()
-    input_products: tuple[ProductPayload, ...] = ()
+    input_products: tuple[TensorPublication, ...] = ()
+    kv_inputs: tuple[KvTransfer, ...] = ()
     lanes: tuple[RunLane, ...] = field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -3489,10 +2964,27 @@ class Run:
                 "new_cache_pages",
                 tuple(value for lane in self.lanes for value in lane.new_cache_pages),
             )
+            operation_offset = 0
+            operation_indices: list[int] = []
+            for lane in self.lanes:
+                operation_indices.extend(
+                    index + operation_offset for index in lane.forward_operation_indices
+                )
+                operation_offset += len(lane.operations)
+            set_field(self, "forward_operation_indices", tuple(operation_indices))
             set_field(
                 self,
-                "forward_rows",
-                tuple(value for lane in self.lanes for value in lane.forward_rows),
+                "request_pool_indices",
+                tuple(value for lane in self.lanes for value in lane.request_pool_indices),
+            )
+            set_field(
+                self, "seq_lens", tuple(value for lane in self.lanes for value in lane.seq_lens)
+            )
+            set_field(
+                self, "query_lens", tuple(value for lane in self.lanes for value in lane.query_lens)
+            )
+            set_field(
+                self, "write_kv", tuple(value for lane in self.lanes for value in lane.write_kv)
             )
             set_field(
                 self,
@@ -3526,8 +3018,19 @@ class Run:
             )
         if self.collective_seq < 1:
             raise invalid_descriptor("run collective sequence must be positive")
-        if any(row.operation_index >= len(self.operations) for row in self.forward_rows):
-            raise invalid_descriptor("forward row operation index is outside its run")
+        _validate_forward_inputs(
+            len(self.operations),
+            self.forward_operation_indices,
+            self.request_pool_indices,
+            self.seq_lens,
+            self.query_lens,
+            self.write_kv,
+        )
+        computation_ids = [operation.op_id for operation in self.operations]
+        if any(identity.batch_id != self.batch_id for identity in computation_ids):
+            raise invalid_descriptor("computation identity belongs to another logical batch")
+        if len(set(computation_ids)) != len(computation_ids):
+            raise invalid_descriptor("a submission batch repeats a computation identity")
         request_keys = [operation.request_key for operation in self.operations]
         if len(set(request_keys)) != len(request_keys):
             raise invalid_descriptor(
@@ -3536,15 +3039,13 @@ class Run:
         admitted = [admission.request_key for admission in self.admissions]
         if len(set(admitted)) != len(admitted):
             raise invalid_descriptor("a submission batch carries a duplicate admission")
-        identities: dict[tuple[RequestKey, int | None, int, int | None], BatchCommand] = {}
+        identities: dict[tuple[RequestKey, int, BufferId | None], BatchCommand] = {}
         for command in self.commands:
-            seq = command.control_seq if isinstance(command, (Commit, Finish)) else None
-            generation = command.buffer.generation if isinstance(command, Free) else None
+            buffer = command.buffer if isinstance(command, Free) else None
             identity = (
                 command.request_key,
-                seq,
                 _command_variant_index(command),
-                generation,
+                buffer,
             )
             existing = identities.get(identity)
             if existing is not None and existing != command:
@@ -3555,52 +3056,37 @@ class Run:
         declared_inputs = {
             product
             for operation in self.operations
-            for product in (*operation.inputs, operation.predicate)
+            for product in (*operation.tensor_inputs(), operation.predicate)
             if product is not None
         }
-        for operation in self.operations:
-            for product in operation.inputs:
-                if product.storage_class is StorageClass.HOST_STAGING and (
-                    product.request_key != operation.request_key
-                    or product.producer_op_id != operation.op_id
-                ):
-                    raise invalid_descriptor(
-                        "a host-staging input is not owned by its consuming operation"
-                    )
-        supplied_inputs: set[ProductRef] = set()
+        supplied_inputs: set[TensorRef] = set()
         for payload in self.input_products:
             product = payload.product
             if product not in declared_inputs:
                 raise invalid_descriptor(
                     "an input product payload is not declared by any operation"
                 )
-            transferred = isinstance(payload.payload, TransferHandle)
-            if product.storage_class is StorageClass.HOST_STAGING and transferred:
-                raise invalid_descriptor(
-                    "host-staging input cannot carry a cross-stage transfer handle"
-                )
-            if product.storage_class is not StorageClass.HOST_STAGING:
-                if not transferred:
-                    raise invalid_descriptor("cross-stage product input has no transfer handle")
             if product in supplied_inputs:
                 raise invalid_descriptor("a submission batch repeats an input product payload")
             supplied_inputs.add(product)
-            if product.kind is ProductKind.TOKEN and isinstance(payload.payload, bytes):
-                if (
-                    len(decode_token_product_bytes(payload.payload))
-                    > product.shape_bound.max_elements
-                ):
-                    raise invalid_descriptor(
-                        "token input product exceeds its registered element bound"
-                    )
-            elif isinstance(payload.payload, bytes) and len(payload.payload) > product.max_bytes:
-                raise invalid_descriptor("input product payload exceeds its registered byte bound")
-        for product in declared_inputs:
+        sources: set[BufferId] = set()
+        for publication in self.kv_inputs:
+            publication.encoded_size_bound()
+            if publication.source in sources:
+                raise invalid_descriptor("run repeats a KV input")
+            sources.add(publication.source)
+            consumers = tuple(
+                operation
+                for operation in self.operations
+                if operation.kv_input == publication.source
+            )
+            if len(consumers) != 1 or consumers[0].kind is not TransferMode.KV_INSTALL:
+                raise invalid_descriptor("KV transfer requires one installation consumer")
             if (
-                product.storage_class is StorageClass.HOST_STAGING
-                and product not in supplied_inputs
+                sum(tensor.nbytes for tensor in publication.tensors)
+                > consumers[0].bounds.max_transfer_bytes
             ):
-                raise invalid_descriptor("a host-staging operation input has no product payload")
+                raise invalid_descriptor("KV input exceeds its installation transfer-byte bound")
         _validate_buffer_allocations(self.operations, self.buffer_allocations, "run")
 
     @classmethod
@@ -3611,7 +3097,7 @@ class Run:
         batch_id = _uint(data.get("batch_id"), "execute run.batch_id")
         run_id = _uint(data.get("run_id"), "execute run.run_id")
         operations = tuple(
-            Operation.from_mapping(item, f"execute run.operations[{index}]")
+            ScheduledRequest.from_mapping(item, f"execute run.operations[{index}]")
             for index, item in enumerate(_seq(data.get("operations", ()), "execute run.operations"))
         )
         commands = tuple(
@@ -3622,7 +3108,7 @@ class Run:
             for index, item in enumerate(_seq(data.get("commands", ()), "execute run.commands"))
         )
         input_products = tuple(
-            ProductPayload.from_mapping(item, f"execute run.input_products[{index}]")
+            TensorPublication.from_mapping(item, f"execute run.input_products[{index}]")
             for index, item in enumerate(
                 _seq(data.get("input_products", ()), "execute run.input_products")
             )
@@ -3644,11 +3130,18 @@ class Run:
                     _seq(data.get("new_cache_pages", ()), "execute run.new_cache_pages")
                 )
             ),
-            forward_rows=tuple(
-                RowGeometry.from_mapping(item, f"execute run.forward_rows[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("forward_rows", ()), "execute run.forward_rows")
-                )
+            forward_operation_indices=_uints(
+                data.get("forward_operation_indices", ()),
+                "forward inputs.forward_operation_indices",
+            ),
+            request_pool_indices=_uints(
+                data.get("request_pool_indices", ()), "forward inputs.request_pool_indices"
+            ),
+            seq_lens=_uints(data.get("seq_lens", ()), "forward inputs.seq_lens"),
+            query_lens=_uints(data.get("query_lens", ()), "forward inputs.query_lens"),
+            write_kv=tuple(
+                _bool(value, "forward inputs.write_kv")
+                for value in _seq(data.get("write_kv", ()), "forward inputs.write_kv")
             ),
             latent_params=tuple(
                 LatentParams.from_mapping(item, f"execute run.latent_params[{index}]")
@@ -3670,6 +3163,10 @@ class Run:
             ),
             commands=commands,
             input_products=input_products,
+            kv_inputs=tuple(
+                KvTransfer.from_mapping(value)
+                for value in _seq(data.get("kv_inputs", ()), "run.kv_inputs")
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -3682,18 +3179,23 @@ class Run:
             "operations": [value.to_mapping() for value in self.operations],
             "block_tables": [value.to_mapping() for value in self.block_tables],
             "new_cache_pages": [value.to_mapping() for value in self.new_cache_pages],
-            "forward_rows": [value.to_mapping() for value in self.forward_rows],
+            "forward_operation_indices": list(self.forward_operation_indices),
+            "request_pool_indices": list(self.request_pool_indices),
+            "seq_lens": list(self.seq_lens),
+            "query_lens": list(self.query_lens),
+            "write_kv": list(self.write_kv),
             "latent_params": [value.to_mapping() for value in self.latent_params],
             "decode_ranges": [value.to_mapping() for value in self.decode_ranges],
             "buffer_allocations": [value.to_mapping() for value in self.buffer_allocations],
             "commands": [command_to_mapping(value) for value in self.commands],
             "input_products": [value.to_mapping() for value in self.input_products],
+            "kv_inputs": [value.to_mapping() for value in self.kv_inputs],
         }
 
 
 @dataclass(frozen=True, slots=True)
 class RegistrationAck:
-    """Returns the request versions made visible by a registration batch."""
+    """Reports whether a lane publication is visible to consumers."""
 
     visible: bool = False
 
@@ -3711,75 +3213,87 @@ class RegistrationAck:
 
 
 @dataclass(frozen=True, slots=True)
-class ProductPayload:
-    """Associates one semantic product reference with its encoded payload."""
+class TensorPublication:
+    """A tensor identity and the physical metadata needed by its consumer."""
 
-    product: ProductRef
-    payload: bytes | TransferHandle
+    product: TensorRef
+    value: TransferValue
+
+    def encoded_size_bound(self) -> int:
+        """Bound the transfer metadata bytes, including every tensor location."""
+
+        size = _tensor_transfers_size((self.value.tensor,))
+        if size > MAX_TRANSFER_HANDLE_BYTES:
+            raise invalid_descriptor("transfer metadata exceeds its byte bound")
+        return size
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "product payload") -> ProductPayload:
-        """Parse inline bytes or a transfer handle for one declared product reference."""
+    def from_mapping(cls, value: object, where: str = "tensor publication") -> TensorPublication:
+        """Parse the single generation owner and its typed transfer metadata."""
 
         data = _map(value, where)
-        raw_value = _map(data.get("value"), f"{where}.value")
-        value_kind = _str(raw_value.get("kind"), f"{where}.value.kind")
-        raw = raw_value.get("value")
-        if value_kind == "bytes":
-            payload: bytes | TransferHandle = (
-                raw
-                if type(raw) is bytes
-                else bytes(raw)
-                if isinstance(raw, (bytearray, memoryview))
-                else bytes(_uints(raw, f"{where}.value.value"))
+        product = TensorRef.from_mapping(data.get("product"), f"{where}.product")
+        transfer = _map(data.get("value"), f"{where}.value")
+        kind = _str(transfer.get("kind"), f"{where}.value.kind")
+        payload = _map(transfer.get("value"), f"{where}.value.value")
+        height = _uint(
+            payload.get("height", 0) if kind == "device_product" else payload.get("height"),
+            f"{where}.value.height",
+        )
+        width = _uint(
+            payload.get("width", 0) if kind == "device_product" else payload.get("width"),
+            f"{where}.value.width",
+        )
+        tensor = TensorTransfer.from_mapping(payload.get("tensor"), f"{where}.value.tensor")
+        if kind == "encoder":
+            typed: TransferValue = EncoderTransferValue(
+                height=height,
+                width=width,
+                payload_kind=_str(payload.get("payload_kind"), f"{where}.value.payload_kind"),
+                tensor=tensor,
             )
-        elif value_kind == "transfer":
-            payload = TransferHandle.from_mapping(raw, f"{where}.value.value")
+        elif kind == "device_product":
+            typed = DeviceProductTransferValue(
+                height=height,
+                width=width,
+                value_range=_str(payload.get("value_range", ""), f"{where}.value.value_range"),
+                tensor=tensor,
+            )
+        elif kind == "latent":
+            typed = LatentTransferValue(
+                height=height,
+                width=width,
+                latent_units=_uint(payload.get("latent_units"), f"{where}.value.latent_units"),
+                step=_uint(payload.get("step", 0), f"{where}.value.step"),
+                tensor=tensor,
+            )
         else:
             raise invalid_descriptor(f"{where}.value.kind is invalid")
-        return cls(
-            product=ProductRef.from_mapping(data.get("product"), f"{where}.product"),
-            payload=payload,
-        )
+        return cls(product=product, value=typed)
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize a product reference with its tagged inline or transfer payload."""
+        """Encode tensor identity once alongside the concrete transfer variant."""
 
-        value: dict[str, object]
-        if isinstance(self.payload, TransferHandle):
-            value = {"kind": "transfer", "value": self.payload.to_mapping()}
+        typed = self.value
+        value: dict[str, object] = {
+            "height": typed.height,
+            "width": typed.width,
+            "tensor": typed.tensor.to_mapping(),
+        }
+        if isinstance(typed, EncoderTransferValue):
+            kind = "encoder"
+            value["payload_kind"] = typed.payload_kind
+        elif isinstance(typed, DeviceProductTransferValue):
+            kind = "device_product"
+            value["value_range"] = typed.value_range
         else:
-            value = {"kind": "bytes", "value": self.payload}
-        return {"product": self.product.to_mapping(), "value": value}
-
-
-def encode_token_product_bytes(tokens: Sequence[int]) -> bytes:
-    """Encode a ``ProductKind.TOKEN`` product value.
-
-    The layout is a little-endian ``u32`` count followed by that many
-    little-endian ``u32`` token ids, matching the Rust ``uniserve-worker-ipc`` codec so
-    the scheduler and worker share one exact format.
-    """
-
-    out = bytearray(struct.pack("<I", len(tokens)))
-    for token in tokens:
-        out += struct.pack("<I", token)
-    return bytes(out)
-
-
-def decode_token_product_bytes(data: bytes) -> tuple[int, ...]:
-    """Decode a ``ProductKind.TOKEN`` product value produced by
-    :func:`encode_token_product_bytes`."""
-
-    if len(data) < 4:
-        raise invalid_descriptor("token product bytes are too short to carry a count")
-    (count,) = struct.unpack_from("<I", data, 0)
-    expected = 4 + count * 4
-    if len(data) != expected:
-        raise invalid_descriptor(
-            f"token product byte length {len(data)} does not match declared count {count}"
-        )
-    return tuple(struct.unpack_from("<I", data, 4 + index * 4)[0] for index in range(count))
+            kind = "latent"
+            value["latent_units"] = typed.latent_units
+            value["step"] = typed.step
+        return {
+            "product": self.product.to_mapping(),
+            "value": {"kind": kind, "value": value},
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -3787,7 +3301,7 @@ class SamplingState:
     """Canonical branch-local token processor inputs for one operation.
 
     Penalty token counts are not carried here: they are a device-resident
-    committed base plus bounded per-operation deltas the worker folds on commit,
+    accepted base plus bounded deltas folded when sampling accepts tokens,
     so no host token history participates in a successor's sampling input.
     """
 
@@ -3797,83 +3311,54 @@ class SamplingState:
     transition_token_ids: tuple[int, ...] = ()
     force_finish: bool = False
 
+    def validate(self) -> None:
+        """Require canonical token sets and preserve an explicitly empty whitelist."""
 
-def encode_sampling_state_bytes(state: SamplingState) -> bytes:
-    """Encode generated-token counts as a bounded little-endian sampling-state payload."""
+        for ids in (
+            self.allowed_token_ids,
+            self.suppressed_token_ids,
+            self.finish_token_ids,
+            self.transition_token_ids,
+        ):
+            if ids is None:
+                continue
+            if any(token < 0 or token > 0xFFFFFFFF for token in ids):
+                raise invalid_descriptor("sampling-state token id is outside uint32")
+            if any(left >= right for left, right in zip(ids, ids[1:], strict=False)):
+                raise invalid_descriptor("sampling-state token ids are not canonical")
 
-    allowed = (
-        None
-        if state.allowed_token_ids is None
-        else tuple(sorted(set(int(token) for token in state.allowed_token_ids)))
-    )
-    suppressed = tuple(sorted(set(int(token) for token in state.suppressed_token_ids)))
-    finish = tuple(sorted(set(int(token) for token in state.finish_token_ids)))
-    transition = tuple(sorted(set(int(token) for token in state.transition_token_ids)))
-    out = bytearray()
-    if allowed is None:
-        out += b"\x00"
-    else:
-        out += b"\x01" + struct.pack("<I", len(allowed))
-        for token in allowed:
-            out += struct.pack("<I", token)
-    out += struct.pack("<I", len(suppressed))
-    for token in suppressed:
-        out += struct.pack("<I", token)
-    out += struct.pack("<I", len(finish))
-    for token in finish:
-        out += struct.pack("<I", token)
-    out += struct.pack("<I", len(transition))
-    for token in transition:
-        out += struct.pack("<I", token)
-    out += bytes((int(state.force_finish),))
-    return bytes(out)
+    @classmethod
+    def from_mapping(cls, value: object) -> SamplingState:
+        """Read direct sampler inputs from a computation mapping."""
 
+        data = _map(value, "sampling_state")
+        allowed = data.get("allowed_token_ids")
+        return cls(
+            allowed_token_ids=(
+                None if allowed is None else tuple(_ints(allowed, "allowed_token_ids"))
+            ),
+            suppressed_token_ids=tuple(
+                _ints(data.get("suppressed_token_ids"), "suppressed_token_ids")
+            ),
+            finish_token_ids=tuple(_ints(data.get("finish_token_ids"), "finish_token_ids")),
+            transition_token_ids=tuple(
+                _ints(data.get("transition_token_ids"), "transition_token_ids")
+            ),
+            force_finish=_bool(data.get("force_finish", False), "force_finish"),
+        )
 
-def decode_sampling_state_bytes(data: bytes) -> SamplingState:
-    """Decode and validate a little-endian sampling-state payload."""
+    def to_mapping(self) -> dict[str, object]:
+        """Serialize sampler constraints without assigning a storage identity."""
 
-    offset = 0
-
-    def take_u32() -> int:
-        """Consume one little-endian unsigned integer from the sampling payload."""
-
-        nonlocal offset
-        if offset + 4 > len(data):
-            raise invalid_descriptor("sampling-state bytes are truncated")
-        value = struct.unpack_from("<I", data, offset)[0]
-        offset += 4
-        return value
-
-    def take_ids(count: int) -> tuple[int, ...]:
-        """Consume a canonical strictly increasing token-id vector."""
-
-        values = tuple(take_u32() for _ in range(count))
-        if any(left >= right for left, right in zip(values, values[1:], strict=False)):
-            raise invalid_descriptor("sampling-state token ids are not canonical")
-        return values
-
-    if offset >= len(data):
-        raise invalid_descriptor("sampling-state bytes omit allowed presence")
-    presence = data[offset]
-    offset += 1
-    if presence == 0:
-        allowed = None
-    elif presence == 1:
-        allowed = take_ids(take_u32())
-    else:
-        raise invalid_descriptor(f"sampling-state allowed presence {presence} is invalid")
-    suppressed = take_ids(take_u32())
-    finish = take_ids(take_u32())
-    transition = take_ids(take_u32())
-    if offset >= len(data):
-        raise invalid_descriptor("sampling-state bytes omit force-finish")
-    force_finish = data[offset]
-    offset += 1
-    if force_finish not in (0, 1):
-        raise invalid_descriptor(f"sampling-state force-finish {force_finish} is invalid")
-    if offset != len(data):
-        raise invalid_descriptor("sampling-state bytes contain trailing data")
-    return SamplingState(allowed, suppressed, finish, transition, bool(force_finish))
+        return {
+            "allowed_token_ids": None
+            if self.allowed_token_ids is None
+            else list(self.allowed_token_ids),
+            "suppressed_token_ids": list(self.suppressed_token_ids),
+            "finish_token_ids": list(self.finish_token_ids),
+            "transition_token_ids": list(self.transition_token_ids),
+            "force_finish": self.force_finish,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -4016,7 +3501,7 @@ class LaneResult:
 
     lane_id: int
     completions: tuple[ModelOutput | CompletionState, ...]
-    products: tuple[ProductPayload, ...] = ()
+    products: tuple[TensorPublication, ...] = ()
     registration: RegistrationAck = field(default_factory=RegistrationAck)
     worker_exec_us: int | None = None
     forward_stats: WorkerForwardStats | None = None
@@ -4044,7 +3529,7 @@ class LaneResult:
                 )
             ),
             products=tuple(
-                ProductPayload.from_mapping(item, f"{where}.products[{index}]")
+                TensorPublication.from_mapping(item, f"{where}.products[{index}]")
                 for index, item in enumerate(_seq(data.get("products", ()), f"{where}.products"))
             ),
             registration=RegistrationAck.from_mapping(
@@ -4093,7 +3578,7 @@ class RunResult:
         return tuple(completion for lane in self.lanes for completion in lane.completions)
 
     @property
-    def products(self) -> tuple[ProductPayload, ...]:
+    def products(self) -> tuple[TensorPublication, ...]:
         """Flatten lane product payloads in physical lane order."""
 
         return tuple(product for lane in self.lanes for product in lane.products)
@@ -4147,7 +3632,7 @@ class RunResult:
             for index, item in enumerate(_seq(data.get("completions", ()), f"{where}.completions"))
         )
         products = tuple(
-            ProductPayload.from_mapping(item, f"{where}.products[{index}]")
+            TensorPublication.from_mapping(item, f"{where}.products[{index}]")
             for index, item in enumerate(_seq(data.get("products", ()), f"{where}.products"))
         )
         registration = RegistrationAck.from_mapping(
@@ -4209,9 +3694,6 @@ class RunResult:
 
 _E = TypeVar("_E", bound=StrEnum)
 
-_DOMAIN_BY_VALUE: Mapping[str, Domain] = Domain._value2member_map_  # type: ignore[assignment]
-_PRODUCT_KIND_BY_VALUE: Mapping[str, ProductKind] = ProductKind._value2member_map_  # type: ignore[assignment]
-_STORAGE_CLASS_BY_VALUE: Mapping[str, StorageClass] = StorageClass._value2member_map_  # type: ignore[assignment]
 _DTYPE_BY_VALUE: Mapping[str, DType] = DType._value2member_map_  # type: ignore[assignment]
 _DRAW_LAYOUT_BY_VALUE: Mapping[str, DrawLayout] = DrawLayout._value2member_map_  # type: ignore[assignment]
 
@@ -4357,13 +3839,13 @@ def _nonnegative(value: int, where: str) -> None:
 
 
 @lru_cache(maxsize=8192)
-def _interned_request_key(authority_id: int, request_id: int, epoch: int) -> RequestKey:
-    """Reuse an immutable request key for identical authority, request, and epoch values."""
+def _interned_request_key(engine_id: int, request_id: int, request_epoch: int) -> RequestKey:
+    """Reuse an immutable request key for identical engine, request, and epoch values."""
 
     key = object.__new__(RequestKey)
-    object.__setattr__(key, "authority_id", authority_id)
+    object.__setattr__(key, "engine_id", engine_id)
     object.__setattr__(key, "request_id", request_id)
-    object.__setattr__(key, "epoch", epoch)
+    object.__setattr__(key, "request_epoch", request_epoch)
     return key
 
 
@@ -4372,40 +3854,18 @@ def _fast_request_key(value: object) -> RequestKey | None:
 
     if type(value) is not dict:
         return None
-    authority_id = value.get("authority_id")
+    engine_id = value.get("engine_id")
     request_id = value.get("request_id")
-    epoch = value.get("epoch")
+    request_epoch = value.get("request_epoch")
     if (
-        type(authority_id) is int
-        and authority_id >= 0
+        type(engine_id) is int
+        and engine_id >= 0
         and type(request_id) is int
         and request_id >= 0
-        and type(epoch) is int
-        and epoch >= 0
+        and type(request_epoch) is int
+        and request_epoch >= 0
     ):
-        return _interned_request_key(authority_id, request_id, epoch)
-    return None
-
-
-@lru_cache(maxsize=1024)
-def _interned_point_range(base_point: int, max_points: int) -> PointRange:
-    """Reuse an immutable point range for identical base and extent values."""
-
-    point_range = object.__new__(PointRange)
-    object.__setattr__(point_range, "base_point", base_point)
-    object.__setattr__(point_range, "max_points", max_points)
-    return point_range
-
-
-def _fast_point_range(value: object) -> PointRange | None:
-    """Decode a trusted compact point-range mapping."""
-
-    if type(value) is not dict:
-        return None
-    base_point = value.get("base_point")
-    max_points = value.get("max_points")
-    if type(base_point) is int and base_point >= 0 and type(max_points) is int and max_points >= 0:
-        return _interned_point_range(base_point, max_points)
+        return _interned_request_key(engine_id, request_id, request_epoch)
     return None
 
 
@@ -4463,7 +3923,7 @@ def _fast_shape_bound(value: object) -> ShapeBound | None:
     return _interned_shape_bound(tuple(dims))
 
 
-def _fast_product_ref(value: object) -> ProductRef | None:
+def _fast_tensor_ref(value: object) -> TensorRef | None:
     """Decode a trusted compact product reference and its optional tensor bound."""
 
     if type(value) is not dict:
@@ -4475,103 +3935,64 @@ def _fast_product_ref(value: object) -> ProductRef | None:
     output_index = value.get("output_index")
     generation = value.get("generation")
     if not (
-        type(producer_op_id) is int
-        and producer_op_id >= 0
+        isinstance(producer_op_id, ComputationId)
         and type(output_index) is int
         and output_index >= 0
         and type(generation) is int
         and generation > 0
     ):
         return None
-    raw_kind = value.get("kind")
-    raw_storage = value.get("storage_class")
     raw_dtype = value.get("dtype")
-    if type(raw_kind) is not str or type(raw_storage) is not str or type(raw_dtype) is not str:
+    if type(raw_dtype) is not str:
         return None
-    kind = _PRODUCT_KIND_BY_VALUE.get(raw_kind)
-    storage_class = _STORAGE_CLASS_BY_VALUE.get(raw_storage)
     dtype = _DTYPE_BY_VALUE.get(raw_dtype)
-    if kind is None or storage_class is None or dtype is None:
+    if dtype is None:
         return None
     shape_bound = _fast_shape_bound(value.get("shape_bound"))
     if shape_bound is None:
         return None
-    point_range = _fast_point_range(value.get("point_range"))
-    if point_range is None:
-        return None
-    reference = object.__new__(ProductRef)
+    reference = object.__new__(TensorRef)
     set_field = object.__setattr__
     set_field(reference, "request_key", request_key)
     set_field(reference, "producer_op_id", producer_op_id)
     set_field(reference, "output_index", output_index)
     set_field(reference, "generation", generation)
-    set_field(reference, "kind", kind)
-    set_field(reference, "storage_class", storage_class)
     set_field(reference, "dtype", dtype)
     set_field(reference, "shape_bound", shape_bound)
-    set_field(reference, "point_range", point_range)
     return reference
 
 
-def _fast_product_refs(value: object) -> tuple[ProductRef, ...] | None:
+def _fast_tensor_refs(value: object) -> tuple[TensorRef, ...] | None:
     """Decode a trusted sequence of compact product references."""
 
     kind = type(value)
     if kind is not list and kind is not tuple:
         return None
     items = cast(list[object] | tuple[object, ...], value)
-    references: list[ProductRef] = []
+    references: list[TensorRef] = []
     for item in items:
-        reference = _fast_product_ref(item)
+        reference = _fast_tensor_ref(item)
         if reference is None:
             return None
         references.append(reference)
     return tuple(references)
 
 
-def _fast_version_ref(value: object) -> Checkpoint | None:
-    """Decode a trusted compact version reference from its wire mapping."""
-
-    if type(value) is not dict:
-        return None
-    op_id = value.get("op_id")
-    if not (type(op_id) is int and op_id >= 0):
-        return None
-    raw_point = value.get("point")
-    if type(raw_point) is not dict:
-        return None
-    tag = raw_point.get("kind")
-    payload = raw_point.get("value")
-    if type(tag) is not str:
-        return None
-    point: CheckpointPoint
-    if tag == "fixed":
-        if not (type(payload) is int and payload >= 0):
-            return None
-        point = FixedCheckpoint(payload)
-    elif tag == "device_selected" and payload is None:
-        point = DeviceSelected()
-    else:
-        return None
-    reference = object.__new__(Checkpoint)
-    object.__setattr__(reference, "op_id", op_id)
-    object.__setattr__(reference, "point", point)
-    return reference
-
-
-def _fast_work(value: object) -> OpCode | None:
+def _fast_work(value: object) -> Computation | None:
     """Decode a trusted compact work descriptor and its kind-specific payload."""
 
-    if type(value) is OpCode:
+    if (
+        isinstance(value, (ForwardMode, PipelineStage, TransferMode))
+        and value is not ForwardMode.MIXED
+    ):
         return value
     if type(value) is str:
-        return _FORWARD_MODE_BY_VALUE.get(value)
+        return _COMPUTATION_BY_VALUE.get(value)
     return None
 
 
 @lru_cache(maxsize=256)
 def _interned_bounds(
-    max_points: int,
     max_tokens: int,
     max_kv_pages: int,
     max_latent_bytes: int,
@@ -4582,7 +4003,6 @@ def _interned_bounds(
 
     bounds = object.__new__(Bounds)
     set_field = object.__setattr__
-    set_field(bounds, "max_points", max_points)
     set_field(bounds, "max_tokens", max_tokens)
     set_field(bounds, "max_kv_pages", max_kv_pages)
     set_field(bounds, "max_latent_bytes", max_latent_bytes)
@@ -4596,16 +4016,13 @@ def _fast_bounds(value: object) -> Bounds | None:
 
     if type(value) is not dict:
         return None
-    max_points = value.get("max_points")
     max_tokens = value.get("max_tokens")
     max_kv_pages = value.get("max_kv_pages")
     max_latent_bytes = value.get("max_latent_bytes")
     max_completion_bytes = value.get("max_completion_bytes")
     max_transfer_bytes = value.get("max_transfer_bytes")
     if (
-        type(max_points) is int
-        and max_points >= 0
-        and type(max_tokens) is int
+        type(max_tokens) is int
         and max_tokens >= 0
         and type(max_kv_pages) is int
         and max_kv_pages >= 0
@@ -4617,7 +4034,6 @@ def _fast_bounds(value: object) -> Bounds | None:
         and max_transfer_bytes >= 0
     ):
         return _interned_bounds(
-            max_points,
             max_tokens,
             max_kv_pages,
             max_latent_bytes,
@@ -4667,3 +4083,27 @@ def _fast_uints(value: object) -> tuple[int, ...] | None:
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]
+
+
+def _logprob_entries(value: object) -> tuple[tuple[int, float, int], ...]:
+    """Read ranked scores carried directly by the result record."""
+
+    entries = []
+    for item in _seq(value, "logprob entries"):
+        data = _map(item, "logprob entry")
+        entries.append(
+            (
+                _uint(data.get("token_id"), "logprob.token_id"),
+                _logprob_value(data.get("logprob")),
+                _uint(data.get("rank"), "logprob.rank"),
+            )
+        )
+    return tuple(entries)
+
+
+def _logprob_value(value: object) -> float:
+    """Read a score, including negative infinity for zero-probability tokens."""
+
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise invalid_descriptor("logprob value must be numeric")
+    return float(value)

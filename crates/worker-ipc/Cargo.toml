@@ -12,7 +12,7 @@ flatbuffers.workspace = true
 iceoryx2.workspace = true
 iceoryx2-bb-elementary-traits.workspace = true
 libc.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_bytes.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

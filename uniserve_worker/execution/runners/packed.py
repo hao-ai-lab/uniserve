@@ -12,6 +12,7 @@ from typing import Any, cast
 
 import torch
 
+from uniserve_worker.execution.batch import ForwardMode, PipelineStage
 from uniserve_worker.execution.forward_batch import (
     AttentionMode,
     AttentionSelection,
@@ -329,24 +330,24 @@ class PackedRunner:
         rows = batch.row_count
         if not eligible or not self.enabled or not _cuda_batch(batch):
             return None
-        if batch.forward_mode is AttentionMode.PAGED_VARLEN and (
+        if batch.attention_mode is AttentionMode.PAGED_VARLEN and (
             not self.prefill_enabled
             or any(
                 selection is not TokenSelection.LAST_LOGITS for selection in batch.token_selections
             )
         ):
             return None
-        if batch.forward_mode is AttentionMode.PACKED and not self.prefill_enabled:
+        if batch.attention_mode is AttentionMode.PACKED and not self.prefill_enabled:
             return None
-        if batch.forward_mode is AttentionMode.PACKED and _quantized_kv(self):
+        if batch.attention_mode is AttentionMode.PACKED and _quantized_kv(self):
             return None
         try:
             _graph_provider(
                 self.attention,
-                batch.forward_mode,
+                batch.attention_mode,
                 head_dim=self.cache.head_dim,
                 block_size=self.block_size,
-                device=batch.req_pool_indices.device,
+                device=batch.request_pool_indices.device,
             )
         except _GraphMiss:
             return None
@@ -387,7 +388,7 @@ class PackedRunner:
                 block_size=self.block_size,
             )
             signature = _exact_signature(execution)
-            state_key = ("exact", batch.phase.value, signature)
+            state_key = ("exact", signature)
             padded_rows = rows
             startup_resident = False
 
@@ -666,17 +667,17 @@ class PackedRunner:
         # modes first copy live table views into the static graph batch.
         static = static_batch
         live = live_batch
-        if static.forward_mode is not live.forward_mode:
+        if static.attention_mode is not live.attention_mode:
             raise _GraphMiss("attention form changed for a graph bucket")
-        if static.forward_mode in {AttentionMode.DENSE, AttentionMode.PACKED}:
+        if static.attention_mode in {AttentionMode.DENSE, AttentionMode.PACKED}:
             return ()
-        if static.forward_mode not in {AttentionMode.PAGED_DECODE, AttentionMode.PAGED_VARLEN}:
+        if static.attention_mode not in {AttentionMode.PAGED_DECODE, AttentionMode.PAGED_VARLEN}:
             return ()
         prepared = _live_attention(static, live)
         key_cache, _value_cache = self.cache_pool.layer_cache(0, static.group_id)
         backend = _graph_provider(
             self.attention,
-            static.forward_mode,
+            static.attention_mode,
             head_dim=self.cache.head_dim,
             block_size=self.block_size,
             device=key_cache.device,
@@ -688,7 +689,7 @@ class PackedRunner:
         if capture:
             release_name = (
                 "release_paged_decode_graph_binding"
-                if static.forward_mode is AttentionMode.PAGED_DECODE
+                if static.attention_mode is AttentionMode.PAGED_DECODE
                 else "release_paged_prefill_graph_wrapper"
             )
             release = getattr(backend, release_name, None)
@@ -697,7 +698,7 @@ class PackedRunner:
         try:
             # Decode wrappers are keyed by graph binding and can be replanned for
             # each live table while retaining fixed tensor addresses.
-            if static.forward_mode is AttentionMode.PAGED_DECODE:
+            if static.attention_mode is AttentionMode.PAGED_DECODE:
                 prepare = getattr(backend, "prepare_paged_decode_cuda_graph", None)
                 if callable(prepare):
                     prepare(
@@ -716,7 +717,7 @@ class PackedRunner:
 
             # Prefill capture owns a graph-bound wrapper until graph eviction;
             # replay updates only its caller-owned metadata buffers.
-            if static.forward_mode is not AttentionMode.PAGED_VARLEN:
+            if static.attention_mode is not AttentionMode.PAGED_VARLEN:
                 return ()
             bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
             prepare = getattr(backend, "prepare_paged_prefill_cuda_graph", None)
@@ -756,7 +757,7 @@ def _decode_geometry(
 ) -> _DecodeGeometry | None:
     """Select a graph decode bucket and derive padded rows, blocks, and token counts."""
 
-    if batch.forward_mode is not AttentionMode.PAGED_DECODE or not batch_sizes:
+    if batch.attention_mode is not AttentionMode.PAGED_DECODE or not batch_sizes:
         return None
     rows = batch.row_count
     bucket = next((value for value in batch_sizes if value >= rows), None)
@@ -792,7 +793,7 @@ def _prefill_geometry(
 ) -> _PrefillGeometry | None:
     """Select a graph prefill bucket and derive padded query and cache geometry."""
 
-    if batch.forward_mode is not AttentionMode.PAGED_VARLEN or not token_sizes:
+    if batch.attention_mode is not AttentionMode.PAGED_VARLEN or not token_sizes:
         return None
     rows = batch.row_count
     row_bucket = next((value for value in row_sizes if value > rows), None)
@@ -854,19 +855,19 @@ def _pad_decode_batch(
     embedding_mask = (
         None if batch.embedding_mask is None else _fixed_view(batch.embedding_mask, (bucket,))
     )
-    if batch.block_table is None or batch.kv_lens is None:
+    if batch.block_table is None or batch.seq_lens is None:
         raise _GraphMiss("paged decode has incomplete tensors")
     return replace(
         batch,
         row_count=bucket,
-        req_pool_indices=_fixed_view(batch.req_pool_indices, (bucket,)),
-        seq_lens=_fixed_view(batch.seq_lens, (bucket,)),
+        request_pool_indices=_fixed_view(batch.request_pool_indices, (bucket,)),
+        prefix_lens=_fixed_view(batch.prefix_lens, (bucket,)),
         query_lens=_fixed_view(batch.query_lens, (bucket,)),
         out_cache_loc=_fixed_view(batch.out_cache_loc, (bucket,)),
         block_table=_fixed_view(batch.block_table, (bucket, geometry.width)),
-        kv_lens=_fixed_view(batch.kv_lens, (bucket,)),
-        seq_lens_cpu=(*batch.seq_lens_cpu, *(0 for _ in range(geometry.padding))),
-        kv_lens_cpu=(*batch.kv_lens_cpu, *(1 for _ in range(geometry.padding))),
+        seq_lens=_fixed_view(batch.seq_lens, (bucket,)),
+        prefix_lens_cpu=(*batch.prefix_lens_cpu, *(0 for _ in range(geometry.padding))),
+        seq_lens_cpu=(*batch.seq_lens_cpu, *(1 for _ in range(geometry.padding))),
         query_lens_cpu=(*batch.query_lens_cpu, *(1 for _ in range(geometry.padding))),
         max_seqlen_k=geometry.width * int(block_size),
         decode_force_finish=(
@@ -908,7 +909,7 @@ def _pad_prefill_batch(batch: ForwardBatch, geometry: _PrefillGeometry) -> Forwa
     )
     if (
         batch.block_table is None
-        or batch.kv_lens is None
+        or batch.seq_lens is None
         or batch.cu_seqlens_q is None
         or batch.cu_seqlens_k is None
         or batch.output_indices is None
@@ -918,9 +919,9 @@ def _pad_prefill_batch(batch: ForwardBatch, geometry: _PrefillGeometry) -> Forwa
         batch.block_table,
         (geometry.row_bucket, geometry.width),
     )
-    cache_seqlens = _fixed_view(batch.seq_lens, (geometry.row_bucket,))
+    cache_seqlens = _fixed_view(batch.prefix_lens, (geometry.row_bucket,))
     query_lens = _fixed_view(batch.query_lens, (geometry.row_bucket,))
-    kv_seqlens = _fixed_view(batch.kv_lens, (geometry.row_bucket,))
+    kv_seqlens = _fixed_view(batch.seq_lens, (geometry.row_bucket,))
     cu_seqlens_q = _fixed_view(batch.cu_seqlens_q, (geometry.row_bucket + 1,))
     cu_seqlens_k = _fixed_view(batch.cu_seqlens_k, (geometry.row_bucket + 1,))
     output_indices = _fixed_view(batch.output_indices, (geometry.row_bucket,))
@@ -935,7 +936,7 @@ def _pad_prefill_batch(batch: ForwardBatch, geometry: _PrefillGeometry) -> Forwa
         query_lens[live_rows : live_rows + 1].fill_(geometry.padding)
         kv_seqlens[live_rows : live_rows + 1].fill_(geometry.padding)
     cu_seqlens_q[live_rows + 1 :].fill_(geometry.token_bucket)
-    padded_kv_tokens = sum(int(value) for value in batch.kv_lens_cpu) + geometry.padding
+    padded_kv_tokens = sum(int(value) for value in batch.seq_lens_cpu) + geometry.padding
     cu_seqlens_k[live_rows + 1 :].fill_(padded_kv_tokens)
     output_indices[live_rows:].zero_()
     if geometry.padding:
@@ -947,21 +948,21 @@ def _pad_prefill_batch(batch: ForwardBatch, geometry: _PrefillGeometry) -> Forwa
     return replace(
         batch,
         row_count=geometry.row_bucket,
-        req_pool_indices=_fixed_view(
-            batch.req_pool_indices,
+        request_pool_indices=_fixed_view(
+            batch.request_pool_indices,
             (geometry.row_bucket,),
         ),
-        seq_lens=cache_seqlens,
+        prefix_lens=cache_seqlens,
         query_lens=query_lens,
         out_cache_loc=_fixed_view(batch.out_cache_loc, (geometry.token_bucket,)),
         block_table=block_table,
-        kv_lens=kv_seqlens,
+        seq_lens=kv_seqlens,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         output_indices=output_indices,
-        seq_lens_cpu=(*batch.seq_lens_cpu, *(0 for _ in range(dummy_rows))),
+        prefix_lens_cpu=(*batch.prefix_lens_cpu, *(0 for _ in range(dummy_rows))),
         query_lens_cpu=(*batch.query_lens_cpu, *dummy_query_lens),
-        kv_lens_cpu=(*batch.kv_lens_cpu, *dummy_query_lens),
+        seq_lens_cpu=(*batch.seq_lens_cpu, *dummy_query_lens),
         max_seqlen_q=geometry.max_query_len,
         max_seqlen_k=geometry.max_key_len,
         token_row_indices=tuple(range(geometry.row_bucket)),
@@ -978,7 +979,6 @@ def _decode_signature(batch: ForwardBatch, geometry: _DecodeGeometry) -> tuple[o
 
     return (
         "paged_decode_bucket",
-        batch.phase.value,
         geometry.bucket,
         geometry.width,
         batch.token_selections[0].value,
@@ -993,7 +993,6 @@ def _prefill_signature(batch: ForwardBatch, geometry: _PrefillGeometry) -> tuple
 
     return (
         "paged_prefill_bucket",
-        batch.phase.value,
         geometry.row_bucket,
         geometry.token_bucket,
         geometry.width,
@@ -1024,12 +1023,21 @@ def _batch_tensor_signature(batch: ForwardBatch) -> tuple[object, ...]:
 def _exact_signature(batch: ForwardBatch) -> tuple[object, ...]:
     """Build a hashable signature for all graph-observable batch geometry."""
 
+    # AR and denoising invoke the same model.forward entry. Row geometry and
+    # selections below distinguish their executed math; encoders and the VAE
+    # decoder use separate neural entry points even when tensor shapes match.
+    entry = (
+        "forward"
+        if isinstance(batch.forward_mode, ForwardMode)
+        or batch.forward_mode is PipelineStage.DENOISING
+        else batch.forward_mode.value
+    )
     return (
-        batch.phase.value,
+        entry,
         batch.row_count,
         batch.token_row_indices,
         batch.flow_row_indices,
-        batch.forward_mode.value,
+        batch.attention_mode.value,
         batch.query_lens_cpu,
         tuple(value.value for value in batch.token_selections),
         batch.flow_image_tokens,
@@ -1061,7 +1069,7 @@ def _normalize_exact_batch(
     staged tensors carry the live lengths on every replay.
     """
 
-    if batch.forward_mode is not AttentionMode.PACKED or context_blocks <= 0:
+    if batch.attention_mode is not AttentionMode.PACKED or context_blocks <= 0:
         return batch
     if batch.block_table is None:
         raise _GraphMiss("packed attention has no block table")
@@ -1099,7 +1107,7 @@ def _graph_batch(
     graph_batch = _clone_value(batch) if own_inputs else batch
     if not isinstance(graph_batch, ForwardBatch):
         raise TypeError("graph input cloning did not preserve ForwardBatch")
-    if graph_batch.forward_mode is AttentionMode.REQUEST_INDEXED_DECODE:
+    if graph_batch.attention_mode is AttentionMode.REQUEST_INDEXED_DECODE:
         raise _GraphMiss("request-indexed decode metadata was not staged")
     return replace(
         graph_batch,
@@ -1290,12 +1298,12 @@ def _attention_tensor_leaves(batch: ForwardBatch) -> Iterator[torch.Tensor]:
     """Collect every tensor whose address participates in attention graph capture."""
 
     for name in (
-        "req_pool_indices",
-        "seq_lens",
+        "request_pool_indices",
+        "prefix_lens",
         "query_lens",
         "out_cache_loc",
         "block_table",
-        "kv_lens",
+        "seq_lens",
         "cu_seqlens_q",
         "cu_seqlens_k",
         "output_indices",
@@ -1362,7 +1370,7 @@ def _greedy_decode_values(
     """Derive graph-capturable greedy tokens and continuation state from model logits."""
 
     if (
-        batch.forward_mode is not AttentionMode.PAGED_DECODE
+        batch.attention_mode is not AttentionMode.PAGED_DECODE
         or predicate_state is None
         or force_finish is None
         or len(output.values) != batch.row_count

@@ -1,11 +1,9 @@
-//! Bagel model profile, prompt layout, and generation policy.
+//! Bagel model parameters, prompt layout, and image configuration.
 
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
-    FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor, GeneratedImageFeedbackRecipe,
-    GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationPolicyDescriptor,
-    ImageIngestRecipe, ImageIngestStep, ImageKvEffect, Modality, ModelDtype,
-    TriggerPolicyDescriptor,
+    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationFeatures, GenerationLimits,
+    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageTrigger, ModelDtype,
 };
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
@@ -31,10 +29,12 @@ pub struct BagelProfile {
     pub resolution_policy: ResolutionPolicy,
     /// Filters applied to decoded assistant output.
     pub output_filter: OutputFilterPolicy,
-    /// Runtime recipe for encoding input images.
-    pub image_ingest: ImageIngestRecipe,
-    /// Runtime state-machine policy for generated image segments.
-    pub generation_policy: GenerationPolicyDescriptor,
+    /// Ordered encoders and their loaded KV requirements for input images.
+    pub image_encoders: Vec<ImageEncoderInput>,
+    /// Logical positions contributed by one input image, independently of KV tokens.
+    pub image_num_positions: u32,
+    /// Image trigger and feedback encoder requirements.
+    pub image_generation: ImageGenerationConfig,
 }
 
 impl BagelProfile {
@@ -79,31 +79,35 @@ impl BagelProfile {
             start_of_image_text,
             end_of_image_text,
         };
-        let image_ingest = ImageIngestRecipe {
-            steps: vec![ImageIngestStep::VaeEncode, ImageIngestStep::VitEncode],
-            logical_positions: 1,
-            step_kv_tokens: vec![ImageKvEffect::WorkerDefined, ImageKvEffect::WorkerDefined],
-            modality: Modality::Und,
-        };
-        let generation_policy = GenerationPolicyDescriptor {
-            trigger: TriggerPolicyDescriptor::Token {
+        let image_encoders = vec![
+            ImageEncoderInput {
+                encoder: ImageIngestStep::VaeEncode,
+                num_kv_tokens: None,
+                max_kv_tokens: None,
+            },
+            ImageEncoderInput {
+                encoder: ImageIngestStep::VitEncode,
+                num_kv_tokens: None,
+                max_kv_tokens: None,
+            },
+        ];
+        let image_num_positions = 1;
+        let image_generation = ImageGenerationConfig {
+            trigger: ImageTrigger::Token {
                 token_id: controls.start_of_image,
             },
-            gen_only_start: GenOnlyStartPolicyDescriptor::Immediate,
-            feedback: Some(GeneratedImageFeedbackRecipe {
-                source: FeedbackSource::DeviceProduct,
-                next_und_token: FeedbackNextToken::Token {
-                    token_id: controls.end_of_image,
-                },
-                ingest: ImageIngestRecipe {
-                    steps: vec![ImageIngestStep::VaeEncode],
-                    logical_positions: 2,
-                    step_kv_tokens: vec![ImageKvEffect::WorkerDefined],
-                    modality: Modality::Und,
-                },
-                sample_continuation: false,
-            }),
-            ..GenerationPolicyDescriptor::default()
+            requires_text_for_image: false,
+            feedback_source: Some(FeedbackSource::DeviceProduct),
+            feedback_next_token: FeedbackNextToken::Token {
+                token_id: controls.end_of_image,
+            },
+            num_feedback_positions: 2,
+            feedback_encoders: vec![ImageEncoderInput {
+                encoder: ImageIngestStep::VaeEncode,
+                num_kv_tokens: None,
+                max_kv_tokens: None,
+            }],
+            sample_feedback_continuation: false,
         };
         let default_resolution = ResolutionBucket {
             name: ResolutionName::Square,
@@ -134,8 +138,9 @@ impl BagelProfile {
                 reasoning: None,
                 visible_wrappers: Vec::new(),
             },
-            image_ingest,
-            generation_policy,
+            image_encoders,
+            image_num_positions,
+            image_generation,
         })
     }
 
@@ -201,13 +206,13 @@ impl BagelProfile {
         Ok(ids)
     }
 
-    /// Builds the encoder recipe for an input image of the given dimensions.
-    pub fn image_ingest_for_dimensions(
+    /// Builds the encoder inputs for an input image of the given dimensions.
+    pub fn image_encoders_for_dimensions(
         &self,
         width: u32,
         height: u32,
         _image_count: usize,
-    ) -> assets::Result<ImageIngestRecipe> {
+    ) -> assets::Result<Vec<ImageEncoderInput>> {
         let vae_tokens = stride_resize_tokens(width, height, &[(1024, 512, 16, 1_806_336)], 16, 2)?;
         let vit_tokens = stride_resize_tokens(
             width,
@@ -216,34 +221,38 @@ impl BagelProfile {
             14,
             2,
         )?;
-        let mut ingest = self.image_ingest.clone();
-        ingest.step_kv_tokens = vec![
-            ImageKvEffect::Exact { tokens: vae_tokens },
-            ImageKvEffect::Exact { tokens: vit_tokens },
-        ];
-        Ok(ingest)
+        Ok(vec![
+            ImageEncoderInput {
+                encoder: ImageIngestStep::VaeEncode,
+                num_kv_tokens: Some(vae_tokens),
+                max_kv_tokens: None,
+            },
+            ImageEncoderInput {
+                encoder: ImageIngestStep::VitEncode,
+                num_kv_tokens: Some(vit_tokens),
+                max_kv_tokens: None,
+            },
+        ])
     }
 
-    /// Builds generation and feedback policy for the requested canvas.
-    pub fn generation_policy_for_dimensions(
+    /// Resolves the generated-image feedback KV contribution for the requested canvas.
+    pub fn image_generation_for_dimensions(
         &self,
         width: u32,
         height: u32,
-    ) -> assets::Result<GenerationPolicyDescriptor> {
+    ) -> assets::Result<ImageGenerationConfig> {
         let tokens = stride_resize_tokens(width, height, &[(1024, 512, 16, 1_806_336)], 16, 2)?;
-        let mut policy = self.generation_policy.clone();
-        let feedback = policy
-            .feedback
-            .as_mut()
-            .ok_or_else(|| assets::Error::invalid("Bagel generation policy has no feedback"))?;
-        if feedback.ingest.steps.as_slice() != [ImageIngestStep::VaeEncode]
-            || feedback.ingest.step_kv_tokens.len() != 1
+        let mut policy = self.image_generation.clone();
+        if policy.feedback_source.is_none()
+            || policy.feedback_encoders.len() != 1
+            || policy.feedback_encoders[0].encoder != ImageIngestStep::VaeEncode
         {
             return Err(assets::Error::invalid(
-                "Bagel feedback recipe does not match its image processor",
+                "image feedback encoders do not match the model processor",
             ));
         }
-        feedback.ingest.step_kv_tokens[0] = ImageKvEffect::Exact { tokens };
+        policy.feedback_encoders[0].num_kv_tokens = Some(tokens);
+        policy.feedback_encoders[0].max_kv_tokens = None;
         Ok(policy)
     }
 }

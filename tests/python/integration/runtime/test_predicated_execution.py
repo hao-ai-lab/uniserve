@@ -5,99 +5,67 @@ from dataclasses import replace
 
 from tests.python.fixtures.depth_one import (
     ar_params,
-    commit_for_completion,
     diffusion_prepare_operation,
     execution_run,
     kv_publication_operation,
+    record_completion,
     root_parent,
     token_operation,
     umm_params,
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.execution.batch import (
-    Checkpoint,
-    CloseReason,
-    Commit,
-    DeviceSelected,
-    Disposition,
+    ComputationId,
     DType,
     Finish,
-    FixedCheckpoint,
+    ForwardMode,
     Free,
     ImageParams,
     NewRequest,
-    Operation,
     OpStatus,
-    PointRange,
-    ProductKind,
-    ProductPayload,
-    ProductRef,
     SamplingState,
+    ScheduledRequest,
     ShapeBound,
-    StaticDim,
-    StorageClass,
-    TokenMode,
-    encode_sampling_state_bytes,
+    TensorRef,
 )
 from uniserve_worker.execution.output import finalize_run_result
 from uniserve_worker.models.stub import _next_token
 
 
 def _with_transition_predicate(
-    operation: Operation,
+    operation: ScheduledRequest,
     token_id: int,
-) -> tuple[Operation, ProductPayload]:
+) -> ScheduledRequest:
     selected = operation
-    payload = encode_sampling_state_bytes(SamplingState(transition_token_ids=(token_id,)))
-    state = ProductRef(
-        request_key=selected.request_key,
-        producer_op_id=selected.op_id,
-        output_index=(1 << 16) - 2,
-        generation=selected.op_id * 8 + 7,
-        kind=ProductKind.SAMPLING_STATE,
-        storage_class=StorageClass.HOST_STAGING,
-        dtype=DType.U8,
-        shape_bound=ShapeBound((StaticDim(len(payload)),)),
-        point_range=PointRange(),
-    )
-    transition = ProductRef(
+    transition = TensorRef(
         request_key=selected.request_key,
         producer_op_id=selected.op_id,
         output_index=3,
-        generation=selected.op_id * 8 + 8,
-        kind=ProductKind.COMPLETION,
-        storage_class=StorageClass.DEVICE_TENSOR,
+        generation=selected.op_id.batch_id * 8 + 8,
         dtype=DType.U8,
         shape_bound=ShapeBound(),
-        point_range=PointRange(),
     )
-    return (
-        Operation.registered(
-            request_key=selected.request_key,
-            op_id=selected.op_id,
-            parent=selected.parent,
-            kind=selected.kind,
-            bounds=selected.bounds,
-            inputs=(*selected.inputs, state),
-            outputs=(*selected.outputs, transition),
-            predicate=selected.predicate,
-            rng=selected.rng,
-            control_seq=selected.control_seq,
-        ),
-        ProductPayload(product=state, payload=payload),
+    return replace(
+        selected,
+        transition_output=transition,
+        sampling_state=SamplingState(transition_token_ids=(token_id,)),
     )
 
 
-def _release_relay_outputs(worker, *operations: Operation) -> None:
+def _release_relay_outputs(worker, *operations: ScheduledRequest) -> None:
     finalize_run_result(
         worker.execute(
             execution_run(
-                run_id=max(operation.op_id for operation in operations) + 1,
+                run_id=max(operation.op_id.batch_id for operation in operations) + 1,
                 commands=tuple(
                     Free(output.buffer_id)
                     for operation in operations
-                    for output in operation.outputs
-                    if output.storage_class is StorageClass.REQUEST_RELAY
+                    for output in (
+                        operation.token_output,
+                        operation.completion_output,
+                        operation.transition_output,
+                    )
+                    if output is not None
                 ),
             )
         )
@@ -107,44 +75,32 @@ def _release_relay_outputs(worker, *operations: Operation) -> None:
 def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> None:
     worker = execution_worker(device="cpu", pipeline_depth=2)
     admission = ar_params(50, block_ids=(0,))
-    base, token_input = token_operation(
+    base = token_operation(
         admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(1, 0),
+        predecessor=root_parent(admission),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    with_transition, sampling_input = _with_transition_predicate(base, _next_token(4))
+    with_transition = _with_transition_predicate(base, _next_token(4))
     token = replace(
-        next(output for output in with_transition.outputs if output.kind is ProductKind.TOKEN),
+        with_transition.token_output,
         output_index=1,
     )
-    transition = replace(
-        next(output for output in with_transition.outputs if output.kind is ProductKind.COMPLETION),
-        storage_class=StorageClass.REQUEST_RELAY,
-    )
-    completion = ProductRef(
+    transition = with_transition.transition_output
+    completion = TensorRef(
         request_key=base.request_key,
         producer_op_id=base.op_id,
         output_index=0,
-        generation=base.op_id * 8 + 6,
-        kind=ProductKind.COMPLETION,
-        storage_class=StorageClass.REQUEST_RELAY,
+        generation=base.op_id.batch_id * 8 + 6,
         dtype=DType.U8,
         shape_bound=ShapeBound(),
-        point_range=PointRange(),
     )
-    operation = Operation.registered(
-        request_key=base.request_key,
-        op_id=base.op_id,
-        parent=base.parent,
-        kind=base.kind,
-        bounds=base.bounds,
-        inputs=with_transition.inputs,
-        outputs=(completion, token, transition),
-        predicate=base.predicate,
-        rng=base.rng,
-        control_seq=base.control_seq,
+    operation = replace(
+        with_transition,
+        completion_output=completion,
+        token_output=token,
+        transition_output=transition,
     )
 
     report = finalize_run_result(
@@ -153,7 +109,6 @@ def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> Non
                 run_id=1,
                 admissions=(admission,),
                 operations=(operation,),
-                input_products=(token_input, sampling_input),
             )
         )
     )
@@ -175,30 +130,26 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         request_pool_idx=base.request_pool_idx,
         ar=replace(base.ar, finish_token_ids=(_next_token(4),)),
     )
-    parent, parent_input = token_operation(
+    predecessor = token_operation(
         admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(1, 0),
+        predecessor=root_parent(admission),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
     parent_report = worker.execute(
         execution_run(
             run_id=1,
             admissions=(admission,),
-            operations=(parent,),
-            input_products=(parent_input,),
+            operations=(predecessor,),
         )
     )
-    continuation = next(output for output in parent.outputs if output.kind is ProductKind.TOKEN)
-    successor, successor_input = token_operation(
+    continuation = predecessor.token_output
+    successor = token_operation(
         admission.request_key,
-        op_id=2,
-        parent=Checkpoint(
-            parent.op_id,
-            DeviceSelected(),
-        ),
-        mode=TokenMode.DECODE,
+        op_id=ComputationId(2, 0),
+        predecessor=predecessor.op_id,
+        mode=ForwardMode.DECODE,
         tokens=(0,),
         predicate=continuation,
     )
@@ -207,21 +158,15 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
             run_id=2,
             admissions=(),
             operations=(successor,),
-            input_products=(successor_input,),
         )
     )
     successor_report = finalize_run_result(successor_report)
-    successor_continuation = next(
-        output for output in successor.outputs if output.kind is ProductKind.TOKEN
-    )
-    descendant, descendant_input = token_operation(
+    successor_continuation = successor.token_output
+    descendant = token_operation(
         admission.request_key,
-        op_id=3,
-        parent=Checkpoint(
-            successor.op_id,
-            DeviceSelected(),
-        ),
-        mode=TokenMode.DECODE,
+        op_id=ComputationId(3, 0),
+        predecessor=successor.op_id,
+        mode=ForwardMode.DECODE,
         tokens=(0,),
         predicate=successor_continuation,
     )
@@ -231,50 +176,34 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
                 run_id=3,
                 admissions=(),
                 operations=(descendant,),
-                input_products=(descendant_input,),
             )
         )
     )
     completion = successor_report.completions[0]
     completion.validate()
     assert completion.status is OpStatus.PREDICATED
-    assert completion.selected_point == 1
     descendant_completion = descendant_report.completions[0]
     descendant_completion.validate()
     assert descendant_completion.status is OpStatus.PREDICATED
-    assert descendant_completion.selected_point == 1
     parent_completion = finalize_run_result(parent_report).completions[0]
-    assert completion.logical_lengths == parent_completion.logical_lengths
-    assert descendant_completion.logical_lengths == completion.logical_lengths
+    assert completion.position == parent_completion.position
+    assert completion.kv_visible_len == parent_completion.kv_visible_len
+    assert completion.kv_computed_len == parent_completion.kv_computed_len
+    assert completion.num_completed_steps == parent_completion.num_completed_steps
+    assert descendant_completion.position == completion.position
+    assert descendant_completion.kv_visible_len == completion.kv_visible_len
+    assert descendant_completion.kv_computed_len == completion.kv_computed_len
+    assert descendant_completion.num_completed_steps == completion.num_completed_steps
 
-    selected = Checkpoint(
-        parent.op_id,
-        FixedCheckpoint(parent_completion.selected_point),
-    )
-    commit = Commit(
-        request_key=admission.request_key,
-        control_seq=1,
-        expected_parent=root_parent(admission),
-        selected=selected,
-        public_event_limit=2,
-        disposition=Disposition.PUBLISH,
-    )
-    worker.execute(
-        execution_run(
-            run_id=4,
-            admissions=(),
-            operations=(),
-            commands=(commit,),
-        )
-    )
-    _release_relay_outputs(worker, parent, successor, descendant)
-    later, later_input = token_operation(
+    selected = predecessor.op_id
+
+    _release_relay_outputs(worker, predecessor, successor, descendant)
+    later = token_operation(
         admission.request_key,
-        op_id=4,
-        parent=commit.selected,
-        mode=TokenMode.DECODE,
+        op_id=ComputationId(4, 0),
+        predecessor=selected,
+        mode=ForwardMode.DECODE,
         tokens=(7,),
-        control_seq=commit.control_seq,
     )
     later_completion = finalize_run_result(
         worker.execute(
@@ -282,30 +211,12 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
                 run_id=5,
                 admissions=(),
                 operations=(later,),
-                input_products=(later_input,),
             )
         )
     ).completions[0]
-    later_selected = Checkpoint(
-        later.op_id,
-        FixedCheckpoint(later_completion.selected_point),
-    )
-    later_commit = Commit(
-        request_key=admission.request_key,
-        control_seq=commit.control_seq + 1,
-        expected_parent=commit.selected,
-        selected=later_selected,
-        public_event_limit=3,
-        disposition=Disposition.PUBLISH,
-    )
-    worker.execute(
-        execution_run(
-            run_id=6,
-            admissions=(),
-            operations=(),
-            commands=(later_commit,),
-        )
-    )
+    assert later_completion.status is OpStatus.OK
+    assert later_completion.position == parent_completion.position + 1
+
     close_report = worker.execute(
         execution_run(
             run_id=7,
@@ -314,9 +225,6 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
             commands=(
                 Finish(
                     request_key=admission.request_key,
-                    control_seq=later_commit.control_seq + 1,
-                    cutoff=commit.selected,
-                    reason=CloseReason.COMPLETED,
                 ),
             ),
         )
@@ -334,11 +242,11 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         ar=understanding.ar,
         umm=generation.umm,
     )
-    initial, initial_input = token_operation(
+    initial = token_operation(
         admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(1, 0),
+        predecessor=root_parent(admission),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
     initial_report = worker.execute(
@@ -346,64 +254,44 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
             run_id=1,
             admissions=(admission,),
             operations=(initial,),
-            input_products=(initial_input,),
         )
     )
-    initial_commit = commit_for_completion(initial, initial_report)
+    initial_observation = record_completion(initial, initial_report)
     publication, conditioning = kv_publication_operation(
         admission.request_key,
-        op_id=2,
-        parent=initial_commit.selected,
-        control_seq=initial_commit.control_seq,
+        op_id=ComputationId(2, 0),
+        predecessor=initial_observation.op_id,
     )
     worker.execute(
         execution_run(
             run_id=2,
             operations=(publication,),
-            commands=(initial_commit,),
+            commands=(),
         )
     )
-    parent, parent_input = token_operation(
+    predecessor = token_operation(
         admission.request_key,
-        op_id=3,
-        parent=initial_commit.selected,
-        mode=TokenMode.DECODE,
+        op_id=ComputationId(3, 0),
+        predecessor=initial_observation.op_id,
+        mode=ForwardMode.DECODE,
         tokens=(_next_token(4),),
-        control_seq=initial_commit.control_seq,
     )
-    parent, sampling_input = _with_transition_predicate(parent, 4_242)
+    predecessor = _with_transition_predicate(predecessor, 4_242)
     parent_report = worker.execute(
         execution_run(
             run_id=3,
-            operations=(parent,),
-            input_products=(parent_input, sampling_input),
+            operations=(predecessor,),
         )
     )
-    transition_predicate = next(
-        output for output in parent.outputs if output.kind is ProductKind.COMPLETION
-    )
+    transition_predicate = predecessor.transition_output
     candidate, _latent = diffusion_prepare_operation(
         admission.request_key,
-        op_id=4,
-        parent=Checkpoint(
-            parent.op_id,
-            DeviceSelected(),
-        ),
+        op_id=ComputationId(4, 0),
+        predecessor=predecessor.op_id,
         conditioning=conditioning,
-        control_seq=initial_commit.control_seq,
     )
-    candidate = Operation.registered(
-        request_key=candidate.request_key,
-        op_id=candidate.op_id,
-        parent=candidate.parent,
-        kind=candidate.kind,
-        bounds=candidate.bounds,
-        inputs=candidate.inputs,
-        outputs=candidate.outputs,
-        predicate=transition_predicate,
-        rng=candidate.rng,
-        control_seq=candidate.control_seq,
-    )
+    candidate = replace(candidate, predicate=transition_predicate)
+
     candidate_batch = execution_run(run_id=4, operations=(candidate,))
     prepared = worker.prepare_execute(candidate_batch)
     assert prepared is not None
@@ -415,24 +303,26 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     parent_completion = finalize_run_result(parent_report).completions[0]
     candidate_completion = candidate_report.completions[0]
     assert candidate_completion.status is OpStatus.PREDICATED
-    assert candidate_completion.logical_lengths == parent_completion.logical_lengths
+    assert candidate_completion.position == parent_completion.position
+    assert candidate_completion.kv_visible_len == parent_completion.kv_visible_len
+    assert candidate_completion.kv_computed_len == parent_completion.kv_computed_len
+    assert candidate_completion.num_completed_steps == parent_completion.num_completed_steps
     assert candidate_completion.product_generations == ()
 
-    parent_commit = commit_for_completion(parent, parent_report)
-    _release_relay_outputs(worker, initial, parent, candidate)
+    parent_observation = record_completion(predecessor, parent_report)
+    _release_relay_outputs(worker, initial, predecessor, candidate)
     selected, _selected_latent = diffusion_prepare_operation(
         admission.request_key,
-        op_id=5,
-        parent=parent_commit.selected,
+        op_id=ComputationId(5, 0),
+        predecessor=parent_observation.op_id,
         conditioning=conditioning,
-        control_seq=parent_commit.control_seq,
     )
     selected_report = finalize_run_result(
         worker.execute(
             execution_run(
                 run_id=5,
                 operations=(selected,),
-                commands=(parent_commit,),
+                commands=(),
             )
         )
     )

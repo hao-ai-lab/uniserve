@@ -6,9 +6,8 @@ import argparse
 import json
 from collections.abc import Sequence
 
-from ..execution.batch import OpCode
 from .capacity import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
-from .config import WorkerProcessArgs
+from .config import SUPPORTED_OP_GROUPS, WorkerProcessArgs
 
 
 def _json_object(value: str) -> dict[str, object]:
@@ -35,8 +34,8 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default="")
     parser.add_argument(
         "--supported-ops",
-        default=",".join(value.value for value in OpCode),
-        help="comma-separated operation kinds assigned to this pool",
+        default=",".join(SUPPORTED_OP_GROUPS),
+        help="comma-separated computation capability groups assigned to this pool",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(

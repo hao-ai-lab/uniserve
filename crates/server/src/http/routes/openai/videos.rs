@@ -1,23 +1,21 @@
 //! HTTP handler for synchronous OpenAI-compatible video generation.
 //!
-//! Completed video bytes are streamed from POSIX shared memory and unlinked
-//! after the response acquires its own open descriptor.
+//! Completed video bytes retain the engine-owned immutable mapping for each
+//! active response and retained video job.
 
 use std::sync::Arc;
 
-use crate::http::media::SharedMedia;
 use crate::openai::VideoGenerationRequest;
 use crate::openai::serve_error_to_api;
-use crate::openai::videos::lower_video_generation_request;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use uniserve_core::{Event, FinishReason};
+use uniserve_core::{EngineCoreOutput, FinishReason};
 
 use crate::AppState;
 
-use crate::http::utils::resolve_request_context;
+use crate::http::utils::resolve_request_id;
 use crate::openai::ApiError;
 
 /// Validates and streams one completed video artifact synchronously.
@@ -28,15 +26,25 @@ pub(crate) async fn videos_sync(
 ) -> Response {
     let started_at = std::time::Instant::now();
 
-    // Lower and admit the request before constructing any streaming response.
-    let context = resolve_request_context(&headers);
-    let input = match lower_video_generation_request(body, state.served_model_name(), context) {
-        Ok(input) => input,
-        Err(error) => return ApiError::from(error).into_response(),
+    let base_id = resolve_request_id(&headers);
+    let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
+    let submission = match state
+        .runtime()
+        .model()
+        .preprocess_video_request(&request_id, body)
+    {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
     };
-    let mut stream = match state.runtime().generate_video(input).await {
+    let mut stream = match state
+        .engine()
+        .submit_media(request_id.into_inner(), submission)
+        .await
+    {
         Ok(stream) => stream,
-        Err(error) => return ApiError::from(serve_error_to_api(error)).into_response(),
+        Err(error) => {
+            return serve_error_to_api(crate::serving::ServeError::Engine(error)).into_response();
+        }
     };
 
     // The synchronous endpoint consumes lifecycle events until the runtime
@@ -44,27 +52,27 @@ pub(crate) async fn videos_sync(
     let mut artifact = None;
     loop {
         match stream.next().await {
-            Some(Event::Artifact(value)) => match SharedMedia::open(&value) {
-                Ok(media) => artifact = Some((value, Arc::new(media))),
-                Err(message) => return ApiError::server_error(message).into_response(),
-            },
-            Some(Event::Finished {
+            Some(EngineCoreOutput::Artifact(value)) => artifact = Some(value),
+            Some(EngineCoreOutput::Finished {
                 reason: FinishReason::Completed,
                 ..
             }) => break,
-            Some(Event::Finished { reason, .. }) => {
+            Some(EngineCoreOutput::Finished { reason, .. }) => {
                 return ApiError::server_error(format!(
                     "video generation ended without an artifact: {reason:?}"
                 ))
                 .into_response();
             }
-            Some(Event::Rejected { message }) => {
+            Some(EngineCoreOutput::Rejected { message }) => {
                 return ApiError::invalid_request(message, None).into_response();
             }
-            Some(Event::Error { message }) => {
+            Some(
+                EngineCoreOutput::Error { message }
+                | EngineCoreOutput::ArtifactUnavailable { message },
+            ) => {
                 return ApiError::server_error(message).into_response();
             }
-            Some(Event::Scheduled { .. } | Event::MediaProgress { .. }) => {}
+            Some(EngineCoreOutput::Scheduled { .. } | EngineCoreOutput::MediaProgress { .. }) => {}
             Some(_) => {
                 return ApiError::server_error(
                     "video runtime emitted an incompatible event".to_string(),
@@ -78,23 +86,13 @@ pub(crate) async fn videos_sync(
         }
     }
 
-    let Some((artifact, media)) = artifact else {
+    let Some(artifact) = artifact else {
         return ApiError::server_error("video generation produced no artifact".to_string())
             .into_response();
     };
 
-    let length = artifact.bytes;
-
-    // Copy bounded chunks from the mapping so the HTTP body owns each yielded buffer.
-    let body_stream = futures::stream::try_unfold((media, 0_usize), |(media, offset)| async move {
-        if offset == media.bytes {
-            Ok::<_, std::convert::Infallible>(None)
-        } else {
-            let count = (media.bytes - offset).min(64 * 1024);
-            let chunk = media.chunk(offset, count);
-            Ok(Some((chunk, (media, offset + count))))
-        }
-    });
+    let media = artifact.media;
+    let length = media.len();
 
     let generation_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
     Response::builder()
@@ -105,7 +103,7 @@ pub(crate) async fn videos_sync(
             "server-timing",
             format!("generation;dur={generation_ms:.1}"),
         )
-        .body(Body::from_stream(body_stream))
+        .body(media_body(media))
         .unwrap_or_else(|error| {
             ApiError::server_error(format!("failed to construct media response: {error}"))
                 .into_response()
@@ -205,24 +203,18 @@ pub(crate) async fn videos_create(
 ) -> Response {
     use crate::video_jobs::{VideoFailure, VideoJob, timestamp};
     let requested_seconds = body.seconds;
-    let input = match lower_video_generation_request(
-        body,
-        state.served_model_name(),
-        resolve_request_context(&headers),
-    ) {
-        Ok(input) => input,
+    let base_id = resolve_request_id(&headers);
+    let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
+    let submission = match state
+        .runtime()
+        .model()
+        .preprocess_video_request(&request_id, body)
+    {
+        Ok(request) => request,
         Err(error) => return error.into_response(),
-    };
-    let submission = match state.runtime().prepare_video(input) {
-        Ok(submission) => submission,
-        Err(error) => return ApiError::from(serve_error_to_api(error)).into_response(),
     };
     // Public IDs are server-generated; caller request-ID headers cannot collide with retained jobs.
     let id = format!("video_{}", uuid::Uuid::new_v4().simple());
-    let submission = crate::engine_client::MediaSubmission {
-        external_request_id: id.clone(),
-        ..submission
-    };
     let record = VideoJob {
         id: id.clone(),
         object: "video",
@@ -236,11 +228,11 @@ pub(crate) async fn videos_create(
         completed_at: None,
         expires_at: None,
         seconds: requested_seconds,
-        actual_seconds: f64::from(submission.geometry.frame_count) / 24.0,
+        actual_seconds: f64::from(submission.sampling.num_frames) / 24.0,
         status: "queued",
         phase: "queued".to_owned(),
         completed_steps: 0,
-        total_steps: submission.geometry.denoise_steps,
+        total_steps: submission.sampling.num_inference_steps,
         error: None,
     };
     let cancellation = match state.videos.insert(record.clone()) {
@@ -260,7 +252,7 @@ pub(crate) async fn videos_create(
         let result = async {
             let mut stream = state
                 .engine()
-                .submit_media(submission)
+                .submit_media(id.clone(), submission)
                 .await
                 .map_err(|error| VideoFailure {
                     code: "submission_failed",
@@ -278,21 +270,17 @@ pub(crate) async fn videos_create(
                     }
                 };
                 match event {
-                    Some(Event::Scheduled { .. }) => state.videos.progress(&id, "encoding", 0),
-                    Some(Event::MediaProgress {
+                    Some(EngineCoreOutput::Scheduled { .. }) => {
+                        state.videos.progress(&id, "encoding", 0)
+                    }
+                    Some(EngineCoreOutput::MediaProgress {
                         phase,
                         completed_steps,
                     }) => state.videos.progress(&id, &phase, completed_steps),
-                    Some(Event::Artifact(value)) => {
-                        artifact =
-                            Some(Arc::new(SharedMedia::open(&value).map_err(|message| {
-                                VideoFailure {
-                                    code: "artifact_unavailable",
-                                    message,
-                                }
-                            })?));
+                    Some(EngineCoreOutput::Artifact(value)) => {
+                        artifact = Some(value.media);
                     }
-                    Some(Event::Finished {
+                    Some(EngineCoreOutput::Finished {
                         reason: FinishReason::Completed,
                         ..
                     }) => {
@@ -301,13 +289,22 @@ pub(crate) async fn videos_create(
                             message: "generation completed without an artifact".to_owned(),
                         });
                     }
-                    Some(Event::Finished { reason, .. }) => {
+                    Some(EngineCoreOutput::Finished { reason, .. }) => {
                         return Err(VideoFailure {
                             code: "generation_terminated",
                             message: format!("generation ended: {reason:?}"),
                         });
                     }
-                    Some(Event::Rejected { message } | Event::Error { message }) => {
+                    Some(EngineCoreOutput::ArtifactUnavailable { message }) => {
+                        return Err(VideoFailure {
+                            code: "artifact_unavailable",
+                            message,
+                        });
+                    }
+                    Some(
+                        EngineCoreOutput::Rejected { message }
+                        | EngineCoreOutput::Error { message },
+                    ) => {
                         return Err(VideoFailure {
                             code: "generation_failed",
                             message,
@@ -385,23 +382,30 @@ pub(crate) async fn videos_content(
             missing_video()
         };
     };
-    let length = media.bytes;
-    let chunks = futures::stream::try_unfold((media, 0), |(media, offset)| async move {
-        if offset == media.bytes {
-            Ok::<_, std::convert::Infallible>(None)
-        } else {
-            let count = (media.bytes - offset).min(64 * 1024);
-            Ok(Some((media.chunk(offset, count), (media, offset + count))))
-        }
-    });
+    let length = media.len();
     (
         [
             (header::CONTENT_TYPE, "video/mp4".to_owned()),
             (header::CONTENT_LENGTH, length.to_string()),
         ],
-        Body::from_stream(chunks),
+        media_body(media),
     )
         .into_response()
+}
+
+/// Retains the immutable mapping while yielding bounded, independently owned body chunks.
+fn media_body<M: AsRef<[u8]> + Send + Sync + 'static>(media: Arc<M>) -> Body {
+    let chunks = futures::stream::try_unfold((media, 0_usize), |(media, offset)| async move {
+        let bytes = media.as_ref().as_ref();
+        if offset == bytes.len() {
+            Ok::<_, std::convert::Infallible>(None)
+        } else {
+            let count = (bytes.len() - offset).min(64 * 1024);
+            let chunk = axum::body::Bytes::copy_from_slice(&bytes[offset..offset + count]);
+            Ok(Some((chunk, (media, offset + count))))
+        }
+    });
+    Body::from_stream(chunks)
 }
 
 pub(crate) async fn capabilities(State(state): State<Arc<AppState>>) -> Response {

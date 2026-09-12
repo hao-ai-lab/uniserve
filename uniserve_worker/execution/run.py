@@ -5,17 +5,16 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from uniserve_worker.execution.batch import (
+    ComputationId,
     Finish,
     Free,
     LaneResult,
     ModelOutput,
-    Retire,
+    RequestKey,
     Run,
     RunResult,
-    TransferHandle,
 )
 from uniserve_worker.execution.output import (
-    _completion_payload_ready,
     _record_ready,
     finalize_run_result,
 )
@@ -23,7 +22,7 @@ from uniserve_worker.execution.rows import PreparedExecution
 from uniserve_worker.foundation.errors import WorkerError, classify, invalid_descriptor
 from uniserve_worker.foundation.resources import close_resources
 
-_OperationKey = tuple[int, int, int]
+_OperationKey = tuple[RequestKey, ComputationId]
 
 __all__ = ["LaneRun", "WorkerRun"]
 
@@ -32,7 +31,7 @@ def _operation_key(operation: object) -> _OperationKey:
     """Extract a stable request-and-operation identity from an operation-like value."""
 
     request = getattr(operation, "request_key")
-    return (int(request.request_id), int(request.epoch), int(getattr(operation, "op_id")))
+    return (request, getattr(operation, "op_id"))
 
 
 def _request_ids(batch: Run) -> frozenset[int]:
@@ -58,9 +57,8 @@ def _validate_report(run: WorkerRun, report: RunResult) -> None:
     for lane, expected_keys in zip(report.lanes, run.lane_operation_keys, strict=True):
         actual_keys = tuple(
             (
-                int(record.request_key.request_id),
-                int(record.request_key.epoch),
-                int(record.op_id),
+                record.request_key,
+                record.op_id,
             )
             for record in lane.completions
         )
@@ -70,9 +68,8 @@ def _validate_report(run: WorkerRun, report: RunResult) -> None:
         for product in lane.products:
             reference = product.product
             key = (
-                int(reference.request_key.request_id),
-                int(reference.request_key.epoch),
-                int(reference.producer_op_id),
+                reference.request_key,
+                reference.producer_op_id,
             )
             if key not in expected:
                 raise invalid_descriptor("terminal product does not belong to its completion lane")
@@ -87,7 +84,6 @@ class LaneRun:
         "result",
         "_raw",
         "_record_cursor",
-        "_product_cursor",
     )
 
     def __init__(self, lane_id: int) -> None:
@@ -96,7 +92,6 @@ class LaneRun:
         self.result: LaneResult | None = None
         self._raw: LaneResult | None = None
         self._record_cursor = 0
-        self._product_cursor = 0
 
     def launch(self, lane: LaneResult) -> None:
         """Attach the lane’s pending result and reject duplicate execution."""
@@ -120,13 +115,7 @@ class LaneRun:
             raw.completions[self._record_cursor]
         ):
             self._record_cursor += 1
-        while self._product_cursor < len(raw.products) and _completion_payload_ready(
-            raw.products[self._product_cursor].payload
-        ):
-            self._product_cursor += 1
-        return self._record_cursor == len(raw.completions) and self._product_cursor == len(
-            raw.products
-        )
+        return self._record_cursor == len(raw.completions)
 
     @property
     def successors_ready(self) -> bool:
@@ -157,10 +146,6 @@ class LaneRun:
                 raise RuntimeError("materialized completion still has a pending output")
             if any(type(token) is not int for token in record.committed_tokens):
                 raise RuntimeError("materialized completion carries an unresolved committed token")
-        if any(
-            not isinstance(product.payload, (bytes, TransferHandle)) for product in result.products
-        ):
-            raise RuntimeError("materialized completion contains an unresolved product payload")
         self.result = result
         self._raw = None
         self.state = "FINISHED"
@@ -233,7 +218,7 @@ class WorkerRun:
         self.error: WorkerError | None = None
         self.report: RunResult | None = None
         self.requires_command_ack = any(
-            isinstance(command, (Free, Finish, Retire)) for command in run.commands
+            isinstance(command, (Free, Finish)) for command in run.commands
         )
         self._retirement: Callable[[], bool] | None = None
         self._source: RunResult | PreparedExecution | None = None
@@ -350,7 +335,7 @@ class WorkerRun:
             if any(lane.result is None for lane in self.lanes):
                 return
 
-            # Free/Finish/Retire acknowledge only after outstanding readers release storage.
+            # Free/Finish acknowledge only after outstanding readers release storage.
             if self._retirement is not None:
                 if not self._retirement():
                     return

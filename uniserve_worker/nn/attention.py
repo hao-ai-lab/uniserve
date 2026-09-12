@@ -152,7 +152,7 @@ class RadixAttention(nn.Module):
         group = self.exchange.ulysses_group
         if group.world_size == 1:
             return self._forward(q, k, v, context, causal=causal, scale=scale, attn_mask=attn_mask)
-        if context is None or context.forward_mode is AttentionMode.DENSE or q.ndim != 3:
+        if context is None or context.attention_mode is AttentionMode.DENSE or q.ndim != 3:
             raise ValueError("sequence-owned paged attention requires packed Q/K/V rows")
         if partition is None or partition.group != group:
             raise ValueError("sequence attention requires its caller-owned row partition")
@@ -236,7 +236,7 @@ class RadixAttention(nn.Module):
         effective_scale = self.scale if scale is None else float(scale)
         if self._selection is None:
             raise RuntimeError("attention module has not been bound to a startup backend")
-        if context is None or context.forward_mode is AttentionMode.DENSE:
+        if context is None or context.attention_mode is AttentionMode.DENSE:
             request = ops.DenseAttention(
                 q=q,
                 k=k,
@@ -259,11 +259,11 @@ class RadixAttention(nn.Module):
         pool = self._cache_pool
         if pool is None or context.block_table is None:
             raise RuntimeError("paged attention has no bound physical cache")
-        if context.forward_mode is AttentionMode.PAGED_DECODE:
+        if context.attention_mode is AttentionMode.PAGED_DECODE:
             return self._decode(q, k, v, context, causal, effective_scale, pool)
-        if context.forward_mode is AttentionMode.PAGED_VARLEN:
+        if context.attention_mode is AttentionMode.PAGED_VARLEN:
             return self._varlen(q, k, v, context, causal, effective_scale, pool)
-        if context.forward_mode is AttentionMode.REQUEST_INDEXED_DECODE:
+        if context.attention_mode is AttentionMode.REQUEST_INDEXED_DECODE:
             raise ValueError("request-indexed decode metadata was not staged")
         return self._packed(q, k, v, context, effective_scale, pool)
 
@@ -282,7 +282,7 @@ class RadixAttention(nn.Module):
         assert context.block_table is not None
         if q.ndim != 3 or int(q.shape[0]) != int(context.block_table.shape[0]):
             raise ValueError("paged decode query rows do not match its page table")
-        if context.kv_lens is None:
+        if context.seq_lens is None:
             raise ValueError("paged decode requires resulting KV lengths")
         if context.has_cache_writes:
             pool.write_locations(self.layer_id, context.out_cache_loc, k, v)
@@ -293,7 +293,7 @@ class RadixAttention(nn.Module):
                 k=k_cache,
                 v=v_cache,
                 block_table=context.block_table,
-                cache_seqlens=context.kv_lens,
+                cache_seqlens=context.seq_lens,
                 causal=causal,
                 scale=scale,
                 ctx=context,
@@ -377,7 +377,7 @@ class RadixAttention(nn.Module):
                 fully_visible=context.fully_visible,
                 prefix_k=k_cache,
                 prefix_v=v_cache,
-                prefix_lens=context.seq_lens,
+                prefix_lens=context.prefix_lens,
                 ctx=context,
             ),
             provider=self.provider(AttentionMode.PACKED),

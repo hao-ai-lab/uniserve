@@ -508,7 +508,6 @@ def sample_device_greedy_group(
             valid=valid,
             active=active,
             continuation=continuation_values,
-            selected_points=None,
             penalty_bases=tuple(task.penalty_base for task in tasks),
         )
         if all(task.request_pool_index is not None for task in tasks)
@@ -713,7 +712,7 @@ def _sample_task_group(
     # Speculative tasks accept the longest matching draft prefix. A terminal
     # prefix selects its final draft token without adding a continuation point.
     accepted_counts: list[torch.Tensor] = []
-    selected_points: list[torch.Tensor] = []
+    accepted_token_counts: list[torch.Tensor] = []
     terminal_finishes: list[torch.Tensor] = []
     output_rows: list[torch.Tensor] = []
     terminal_tokens: list[torch.Tensor] = []
@@ -735,14 +734,14 @@ def _sample_task_group(
             terminal = raw_accepted >= terminal_prefix
             terminal_token = draft[terminal_prefix - 1]
         accepted_counts.append(accepted)
-        selected_points.append(accepted + (~terminal).to(dtype=torch.long))
+        accepted_token_counts.append(accepted + (~terminal).to(dtype=torch.long))
         terminal_finishes.append(terminal)
         output_rows.append(accepted + row_offset)
         terminal_tokens.append(terminal_token)
     output_indexes = torch.stack(output_rows)
     task_tokens = row_tokens.index_select(0, output_indexes)
     counts = torch.stack(accepted_counts)
-    points = torch.stack(selected_points)
+    points = torch.stack(accepted_token_counts)
     terminal_finish = torch.stack(terminal_finishes)
     task_tokens = torch.where(terminal_finish, torch.stack(terminal_tokens), task_tokens)
 
@@ -812,8 +811,8 @@ def _sample_task_group(
             completion=SamplingOutputRow(span, index),
             device_token=task_tokens[index : index + 1],
             logprobs=details.get(index),
-            device_accepted_tokens=counts[index : index + 1],
-            device_selected_point=points[index : index + 1],
+            device_accepted_draft_count=counts[index : index + 1],
+            device_accepted_token_count=points[index : index + 1],
             device_valid=task_valid[index : index + 1],
             device_active=active[index : index + 1],
             device_finish=(None if device_finish is None else device_finish[index : index + 1]),
@@ -1022,26 +1021,6 @@ def sample_result_vector(
         tuple(cast(torch.Tensor | None, getattr(sample, field_name)) for sample in samples),
         f"sample batch lost device field {field_name}",
     )
-
-
-def runtime_selected_points(
-    selected_values: Sequence[torch.Tensor | None],
-    accepted_values: Sequence[torch.Tensor | None],
-) -> torch.Tensor:
-    """Resolve selected speculative points from explicit indices or acceptance counts."""
-
-    if len(selected_values) != len(accepted_values):
-        raise RuntimeError("runtime selected-point columns are not aligned")
-    points: list[torch.Tensor] = []
-    for selected, accepted in zip(selected_values, accepted_values, strict=True):
-        if selected is not None:
-            points.append(selected.reshape(-1).to(dtype=torch.int32))
-        elif accepted is not None:
-            points.append(accepted.reshape(-1).to(dtype=torch.int32) + 1)
-        else:
-            raise RuntimeError("runtime selected-point publication lost device state")
-    packed = packed_tensor_views(points)
-    return torch.cat(points, dim=0) if packed is None else packed
 
 
 def _publish_sampled_device_values(

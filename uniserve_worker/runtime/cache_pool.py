@@ -11,7 +11,7 @@ from threading import RLock
 import torch
 
 from ..backends.paged_kv_math import paged_kv_write
-from ..execution.batch import BufferId, ProductRef, RequestKey
+from ..execution.batch import BufferId, RequestKey
 from ..foundation.errors import compute_error, invalid_descriptor, resource_error, unsupported_setup
 from ..nn.quant.kv_cache import (
     dequantize_fp8_block,
@@ -251,7 +251,7 @@ class CachePool:
 
     def reserve_publication(
         self,
-        product: ProductRef,
+        buffer: BufferId,
         page_ids: Sequence[int],
         *,
         group: int,
@@ -269,9 +269,9 @@ class CachePool:
         ranges = {
             page: (offset, count) for page, offset, count in self._spans(pages, start, length)
         }
-        if not ranges or product.buffer_id in self._sources:
+        if not ranges or buffer in self._sources:
             raise invalid_descriptor("KV publication has an empty or already registered interval")
-        source = CacheSource(product.buffer_id, ranges)
+        source = CacheSource(buffer, ranges)
         self._sources[source.buffer] = source
         return source
 

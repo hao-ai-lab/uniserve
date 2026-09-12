@@ -10,8 +10,10 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use uniserve_core::{BlockId, ImageParams, KvCacheDtype, KvCacheGroup, RequestId, SamplingParams};
-pub use uniserve_core::{OpId, WorkerForwardStats};
+use uniserve_core::{
+    BlockId, ImageParams, KvCacheDtype, KvCacheGroup, RequestId, SamplingParams, TokenLogprob,
+};
+pub use uniserve_core::{ComputationId, WorkerForwardStats};
 
 /// Result type for semantic worker-message validation.
 pub type ValidationResult<T> = std::result::Result<T, ValidationError>;
@@ -81,12 +83,12 @@ pub use iceoryx::{
 
 mod info;
 mod operation;
-mod product;
 mod request;
+mod tensor;
 
 pub use info::*;
 pub use operation::*;
-pub use product::*;
 pub use request::*;
+pub use tensor::*;
 #[cfg(test)]
 mod tests;

@@ -14,25 +14,19 @@ import torch
 
 from uniserve_worker.execution import operations as operation_geometry
 from uniserve_worker.execution.batch import (
-    ArResult,
-    DiffusionResult,
-    EncoderResult,
+    DType,
     ErrorCode,
     FinishFlags,
-    FixedCheckpoint,
+    ForwardMode,
     LaneResult,
-    LogicalLengths,
     ModelOutput,
-    OpCode,
     OpStatus,
-    ProductKind,
+    PipelineStage,
     RegistrationAck,
     Run,
     RunLane,
     RunResult,
     TimingCounters,
-    TokenSpan,
-    TransferResult,
     WorkerForwardStats,
 )
 from uniserve_worker.execution.commit import _commit_lane, _discard_lane
@@ -59,6 +53,7 @@ from uniserve_worker.foundation.errors import (
     should_capture_trace,
 )
 from uniserve_worker.profiling import _forward_stats
+from uniserve_worker.runtime.request import RequestRuntime
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -88,15 +83,6 @@ logger = logging.getLogger(__name__)
 SAMPLING_COMPLETION_FIELDS = 4
 TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
-_GENERATION_WORK_VARIANTS = frozenset(
-    {
-        OpCode.DIFFUSION_PREPARE,
-        OpCode.DIFFUSION_STEP,
-        OpCode.DIFFUSION_DECODE,
-        OpCode.MEDIA_APPEND,
-        OpCode.DIFFUSION_FINALIZE,
-    }
-)
 
 
 def _completion_error_code(code: WorkerErrorCode) -> ErrorCode:
@@ -171,7 +157,7 @@ def execute_batch(
     required_predicates = {
         operation_geometry.operation_identity(operation)
         for operation in batch.operations
-        if operation.predicate is not None and operation.predicate.kind is ProductKind.COMPLETION
+        if operation.predicate is not None and operation.predicate.dtype is DType.U8
     }
     if required_predicates != set(predicate_values):
         raise invalid_descriptor(
@@ -405,10 +391,10 @@ def _classify_lane_failure(
 
     operations = tuple(
         (
-            int(operation.request_key.authority_id),
+            int(operation.request_key.engine_id),
             int(operation.request_key.request_id),
-            int(operation.request_key.epoch),
-            int(operation.op_id),
+            int(operation.request_key.request_epoch),
+            operation.op_id,
         )
         for operation in lane.operations
     )
@@ -419,7 +405,7 @@ def _classify_lane_failure(
         phase=phase,
         operations=operations,
         req_id=None if sole is None else int(sole.request_key.request_id),
-        op_id=None if sole is None else int(sole.op_id),
+        op_id=None if sole is None else sole.op_id,
         op_kind=None if sole is None else sole.kind.value,
         route=str(lane.route),
     )
@@ -435,10 +421,10 @@ def _published_lane_failure(
 
     operations = tuple(
         (
-            int(operation.request_key.authority_id),
+            int(operation.request_key.engine_id),
             int(operation.request_key.request_id),
-            int(operation.request_key.epoch),
-            int(operation.op_id),
+            int(operation.request_key.request_epoch),
+            operation.op_id,
         )
         for operation in lane.operations
     )
@@ -525,7 +511,7 @@ def _execute_lane_group(
         if operation_geometry.operation_identity(operation) not in scope.predicated_operations
     )
     homogeneous_decode = bool(group_active) and all(
-        operation.kind is OpCode.AR_DECODE for operation in group_active
+        operation.kind is ForwardMode.DECODE for operation in group_active
     )
     states: list[OperationState] = []
     locations: dict[int, tuple[int, int]] = {}
@@ -629,7 +615,14 @@ def _run_ready_set(
 
     # Products define the in-lane dependency graph; failures suppress only the
     # affected lane while independent lanes continue through the ready set.
-    producers = {output: state for state in states for output in state.operation.outputs}
+    producers = {
+        buffer: state
+        for state in states
+        for buffer in (
+            *(output.buffer_id for output in state.operation.tensor_outputs()),
+            *((state.operation.kv_output,) if state.operation.kv_output is not None else ()),
+        )
+    }
     errors: dict[int, BaseException] = {}
 
     def live(state: OperationState) -> bool:
@@ -645,7 +638,7 @@ def _run_ready_set(
             state for state in states if live(state) and dependencies_ready(state, producers)
         )
         flow_ready = tuple(
-            state for state in ready if state.operation.kind is OpCode.DIFFUSION_STEP
+            state for state in ready if state.operation.kind is PipelineStage.DENOISING
         )
         flow_ready_ids = {id(state) for state in flow_ready}
         for state in flow_ready:
@@ -856,7 +849,7 @@ def _pack_state_forward(
     from . import encode, flow, token
 
     operation = state.operation
-    if operation.kind.token_mode is not None:
+    if isinstance(operation.kind, ForwardMode):
         return token.pack_forward(
             state,
             encoder_cache=encoder_cache,
@@ -865,7 +858,7 @@ def _pack_state_forward(
             runtime_states=runtime_states,
             tokenizer=tokenizer,
         )
-    if operation.kind is OpCode.DIFFUSION_STEP and latent_pool is not None:
+    if operation.kind is PipelineStage.DENOISING and latent_pool is not None:
         return flow.pack_forward(
             state,
             cache_registry=cache_registry,
@@ -874,8 +867,8 @@ def _pack_state_forward(
             model_runner=model_runner,
             tokenizer=tokenizer,
         )
-    if operation.kind.encode_mode is not None or (
-        operation.kind is OpCode.DIFFUSION_FINALIZE and latent_pool is not None
+    if operation.kind in {PipelineStage.VISION_ENCODING, PipelineStage.LATENT_ENCODING} or (
+        operation.kind is PipelineStage.IMAGE_DECODING and latent_pool is not None
     ):
         return encode.pack_forward(
             state,
@@ -906,7 +899,7 @@ def _consume_state_forward(
     from . import encode, flow, token
 
     operation = state.operation
-    if operation.kind.token_mode is not None:
+    if isinstance(operation.kind, ForwardMode):
         token.consume_forward(
             state,
             outputs,
@@ -915,12 +908,12 @@ def _consume_state_forward(
             request_tables=request_tables,
             runtime_states=runtime_states,
         )
-    elif operation.kind is OpCode.DIFFUSION_STEP and latent_pool is not None:
+    elif operation.kind is PipelineStage.DENOISING and latent_pool is not None:
         flow.consume_forward(
             state, outputs, request_tables=request_tables, runtime_states=runtime_states
         )
-    elif operation.kind.encode_mode is not None or (
-        operation.kind is OpCode.DIFFUSION_FINALIZE and latent_pool is not None
+    elif operation.kind in {PipelineStage.VISION_ENCODING, PipelineStage.LATENT_ENCODING} or (
+        operation.kind is PipelineStage.IMAGE_DECODING and latent_pool is not None
     ):
         encode.consume_forward(
             state,
@@ -940,9 +933,8 @@ def _registration_error_lane(
 ) -> LaneResult:
     """Build aligned error outputs without committing candidate request state."""
 
-    generation = 1
     report = _build_error_lane(
-        lane, generation, False, error, started, WorkerForwardStats(), request_pool=request_pool
+        lane, False, error, started, WorkerForwardStats(), request_pool=request_pool
     )
     return report
 
@@ -954,7 +946,6 @@ def _error_lane(
 
     report = _build_error_lane(
         scope.lane,
-        scope.completion.generation,
         scope.registration_visible,
         error,
         scope.started_ns,
@@ -966,7 +957,6 @@ def _error_lane(
 
 def _build_error_lane(
     lane: RunLane,
-    generation: int,
     registration_visible: bool,
     error: WorkerError,
     started: int,
@@ -979,69 +969,31 @@ def _build_error_lane(
     completion_code = _completion_error_code(error.code)
     records: list[ModelOutput] = []
     for operation in lane.operations:
-        # Resolve only enough parent state to preserve the scheduler-visible
-        # checkpoint and logical lengths in the failed completion.
+        # Report execution coordinates only for the matching admitted epoch;
+        # a stale descriptor cannot observe a replacement request slot.
         request = request_pool.peek(operation.request_key.request_id)
-        selected_parent = (
-            operation.parent
-            if operation.parent is not None and operation.parent.is_fixed()
-            else None
-            if request is None
-            else request.resolve_version(operation.parent)
-        )
-        point = None if selected_parent is None else selected_parent.point
-        selected_point = point.point_index if isinstance(point, FixedCheckpoint) else 0
-        if request is None or operation.parent is None:
-            lengths = LogicalLengths()
+        if (
+            request is None
+            or request.request_key != operation.request_key
+            or operation.predecessor is None
+        ):
+            runtime = RequestRuntime()
         else:
-            parent = request.parent_runtime(operation.parent)
-            lengths = LogicalLengths(
-                token_len=request.logical_position,
-                kv_visible_len=parent.kv_visible_len,
-                kv_computed_len=parent.kv_computed_len,
-                latent_len=request.flow_step,
-            )
-        payload_type = (
-            ArResult
-            if operation.kind in {OpCode.AR_EXTEND, OpCode.AR_DECODE, OpCode.AR_VERIFY}
-            else EncoderResult
-            if operation.kind in {OpCode.ENCODER_VISION, OpCode.ENCODER_LATENT, OpCode.ENCODER_TEXT}
-            else DiffusionResult
-            if operation.kind
-            in {
-                OpCode.DIFFUSION_PREPARE,
-                OpCode.DIFFUSION_STEP,
-                OpCode.DIFFUSION_DECODE,
-                OpCode.MEDIA_APPEND,
-                OpCode.DIFFUSION_FINALIZE,
-            }
-            else TransferResult
-        )
-
-        # All result families share an empty token span. Diffusion additionally
-        # carries its cursor fields so the wire payload remains schema-complete.
-        payload_args = (
-            lengths,
-            TokenSpan(base=lengths.token_len, len=0),
-            (),
-            FinishFlags(),
-            None,
-        )
-        payload = (
-            DiffusionResult(*payload_args, next_cursor=0, done=False)
-            if payload_type is DiffusionResult
-            else payload_type(*payload_args)
-        )
+            runtime = request.current.runtime
         placeholder = ModelOutput(
             request_key=operation.request_key,
             op_id=operation.op_id,
-            completion_slot_generation=max(1, generation),
             status=OpStatus.ERROR,
-            selected_point=selected_point,
             product_generations=(),
             error_code=completion_code,
             timing_counters=TimingCounters(),
-            payload=payload,
+            kind=operation.kind,
+            position=int(runtime.logical_position),
+            kv_visible_len=int(runtime.kv_visible_len),
+            kv_computed_len=int(runtime.kv_computed_len),
+            num_completed_steps=int(runtime.flow_step),
+            committed_tokens=(),
+            finish_flags=FinishFlags(),
         )
         records.append(placeholder)
     return LaneResult(

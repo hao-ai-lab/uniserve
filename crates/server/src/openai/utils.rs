@@ -53,15 +53,6 @@ pub fn check_prompt_logprobs_bound(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-/// Request metadata resolved from HTTP headers before schema lowering.
-pub struct ResolvedRequestContext {
-    /// Canonical request identifier selected from HTTP metadata.
-    pub request_id: String,
-    /// Distributed trace headers accepted from the request.
-    pub trace_context: HashMap<String, String>,
-}
-
 /// Converts OpenAI-style `logit_bias` with string token-ID keys into the
 /// internal token-ID map.
 pub fn convert_logit_bias(

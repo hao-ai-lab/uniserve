@@ -6,30 +6,20 @@ import logging
 import time
 from collections.abc import Mapping
 from dataclasses import replace
-from functools import partial
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 
 from uniserve_worker.execution import operations as operation_geometry
 from uniserve_worker.execution.batch import (
-    Checkpoint,
     CompletionState,
-    DeviceSelected,
-    FixedCheckpoint,
     LaneResult,
-    OpCode,
-    Operation,
-    OpStatus,
-    ProductKind,
-    ProductPayload,
+    PipelineStage,
     RegistrationAck,
-    StorageClass,
-    TransferHandle,
+    ScheduledRequest,
+    TensorPublication,
 )
 from uniserve_worker.execution.output import (
-    ImagePayload,
-    LogprobPayload,
     OutputRecord,
     PendingOutput,
 )
@@ -39,7 +29,7 @@ from uniserve_worker.execution.transfer import _release_locators
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.profiling import _forward_stats, record_component
 from uniserve_worker.runtime.device_products import DeviceProductWrite
-from uniserve_worker.runtime.request import RequestRuntime, SpeculativeCommit
+from uniserve_worker.runtime.request import RequestRuntime, SpeculativeSelection
 
 if TYPE_CHECKING:
     from uniserve_worker.bootstrap.worker_info import WorkerInfo
@@ -61,15 +51,6 @@ logger = logging.getLogger(__name__)
 SAMPLING_COMPLETION_FIELDS = 4
 TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
-_GENERATION_WORK_VARIANTS = frozenset(
-    {
-        OpCode.DIFFUSION_PREPARE,
-        OpCode.DIFFUSION_STEP,
-        OpCode.DIFFUSION_DECODE,
-        OpCode.MEDIA_APPEND,
-        OpCode.DIFFUSION_FINALIZE,
-    }
-)
 
 
 def _commit_lane(
@@ -88,7 +69,7 @@ def _commit_lane(
     transfer_publications: TransferPublications,
     config: WorkerConfig,
 ) -> LaneResult:
-    """Atomically publish validated lane resources, request versions, and output records."""
+    """Atomically publish validated lane resources, execution progress, and output records."""
 
     commit_started = time.perf_counter_ns()
     lane = scope.lane
@@ -109,12 +90,11 @@ def _commit_lane(
             scope.latent_releases,
         )
     scope.completion.seal()
-    # Build the complete next-version description without mutating resident state.
+    # Prepare the execution result without mutating resident state.
     records: list[PendingOutput] = []
-    selected_versions: dict[int, Checkpoint] = {}
     pending_completions: dict[int, CompletionState] = {}
-    speculative_commits: dict[int, SpeculativeCommit] = {}
-    report_products: list[ProductPayload] = []
+    speculative_selections: dict[int, SpeculativeSelection] = {}
+    report_products: list[TensorPublication] = []
     resolved_runtime: dict[int, RequestRuntime] = {}
     layout = scope.layout
     if layout is None or layout.operations != operations:
@@ -128,30 +108,39 @@ def _commit_lane(
         )
     ):
         _validate_completion_products(operation, outcome.products)
-        report_products.extend(
-            product
-            for product in outcome.products
-            if config.rank == worker_info.output_rank(operation.entry)
-            or isinstance(product.payload, TransferHandle)
-        )
+        if outcome.kv_output is not None:
+            if outcome.kv_output.source != operation.kv_output:
+                raise invalid_descriptor("KV publication differs from its declared output")
+            if (
+                sum(tensor.nbytes for tensor in outcome.kv_output.tensors)
+                > operation.bounds.max_transfer_bytes
+            ):
+                raise invalid_descriptor("KV publication exceeds its transfer-byte bound")
+            outcome.kv_output.encoded_size_bound()
+        # The bound covers score values and prompt-position counts; framing is
+        # owned by the single IPC result message, not by stored products.
+        logprob_bytes = (
+            0 if outcome.logprobs is None else 4 + 12 * outcome.logprobs.max_entries()
+        ) + sum(4 + 12 * position.max_entries() for position in outcome.prompt_logprobs)
+        if logprob_bytes > operation.bounds.max_completion_bytes:
+            raise invalid_descriptor("logprob result exceeds its registered completion capacity")
+        reports_output = config.rank == worker_info.output_rank(operation.entry)
+        report_products.extend(outcome.products)
         pending = PendingOutput(
-            (
-                request.request.pending_operations.get(int(operation.parent.op_id))
-                if operation.parent is not None
-                and isinstance(operation.parent.point, DeviceSelected)
-                else None
-            ),
+            request.predecessor.completion,
             scope.completion,
             row,
-            partial(_finalize_predicated_runtime, operation, request_pool=request_pool),
+            request.predecessor.accepted_runtime,
             status=outcome.status,
-            selected_point=outcome.selected_point,
+            reports_output=reports_output,
             completion_tasks=(
                 *outcome.completion_tasks,
+                # Non-output ranks still retire captures after their copy events.
                 *(
-                    cast(LogprobPayload, product.payload)
-                    for product in outcome.products
-                    if isinstance(product.payload, LogprobPayload)
+                    (() if outcome.logprobs is None else (outcome.logprobs,))
+                    + outcome.prompt_logprobs
+                    if not reports_output
+                    else ()
                 ),
             ),
         )
@@ -162,47 +151,23 @@ def _commit_lane(
                 kind=operation.kind,
                 completion_slot_generation=scope.completion.generation,
                 status=outcome.status,
-                selected_point=outcome.selected_point,
-                logical_lengths=outcome.logical_lengths,
-                token_span=outcome.token_span,
+                runtime=outcome.runtime,
                 committed_tokens=outcome.committed_tokens,
                 sampling=outcome.sampling,
+                logprobs=outcome.logprobs if reports_output else None,
+                prompt_logprobs=outcome.prompt_logprobs if reports_output else (),
                 finish_flags=outcome.finish_flags,
                 product_generations=outcome.product_generations,
                 error_code=None,
-                next_cursor=outcome.next_cursor,
-                done=outcome.done,
+                kv_output=outcome.kv_output,
             )
         )
         records.append(record)
-        if operation.advances_state:
-            pending_completions[operation.request_key.request_id] = pending
-            if outcome.status is OpStatus.PREDICATED:
-                selected = request.request.resolve_version(operation.parent)
-                if selected is None:
-                    raise RuntimeError("predicated operation lost its selected parent")
-                selected_versions[operation.request_key.request_id] = selected
-            else:
-                selected_versions[operation.request_key.request_id] = Checkpoint(
-                    op_id=operation.op_id,
-                    point=FixedCheckpoint(outcome.selected_point),
-                )
-        elif operation.parent is not None:
-            selected = request.request.resolve_version(operation.parent)
-            if selected is None:
-                raise RuntimeError("non-state operation lost its resolved parent")
-            selected_versions[operation.request_key.request_id] = selected
-        resolved_runtime[operation.request_key.request_id] = RequestRuntime(
-            logical_position=request.logical_position,
-            rng_counter=request.rng_counter,
-            latent_product=request.latent_product,
-            flow_step=request.flow_step,
-            kv_visible_len=outcome.logical_lengths.kv_visible_len,
-            kv_computed_len=outcome.logical_lengths.kv_computed_len,
-        )
+        pending_completions[operation.request_key.request_id] = pending
+        resolved_runtime[operation.request_key.request_id] = outcome.runtime
         selection = outcome.selection
         if selection is not None:
-            speculative_commits[operation.request_key.request_id] = SpeculativeCommit(
+            speculative_selections[operation.request_key.request_id] = SpeculativeSelection(
                 draft_tokens=selection.draft_tokens,
                 terminal_prefix=selection.terminal_prefix,
                 base_logical_position=selection.base_logical_position,
@@ -236,10 +201,9 @@ def _commit_lane(
         run_id=run_id,
         operations=operations,
         candidates=scope.request_candidates,
-        selected_versions=selected_versions,
         runtimes=resolved_runtime,
         completions=pending_completions,
-        speculative=speculative_commits,
+        speculative=speculative_selections,
     )
     transfer_publications.validate(scope.stage_publications)
     # From this point the lane cannot be discarded: apply resource commits, then
@@ -287,7 +251,6 @@ def _commit_runtime_states(scope: LaneState, *, runtime_states: RuntimeStates | 
                 device_indices=publication.device_slots,
                 tokens=publication.tokens,
                 predicates=publication.predicates,
-                selected_points=publication.selected_points,
             )
             for index, penalty_base in enumerate(publication.penalty_bases):
                 if penalty_base is None:
@@ -310,9 +273,6 @@ def _commit_runtime_states(scope: LaneState, *, runtime_states: RuntimeStates | 
         future_token.bitwise_and_(TOKEN_VALUE_MASK)
         states.predicates[slot : slot + 1].copy_(
             publication.predicate.reshape(-1)[:1].to(dtype=torch.bool)
-        )
-        states.selected_points[slot : slot + 1].copy_(
-            publication.selected_point.reshape(-1)[:1].to(dtype=torch.int32)
         )
         _copy_runtime_scalar(
             states.logical_lengths[slot : slot + 1],
@@ -365,16 +325,16 @@ def _discard_lane(
         raise RuntimeError("published lane state cannot be discarded")
     if media_mux is not None:
         for operation in scope.lane.operations:
-            if operation.kind is OpCode.DIFFUSION_PREPARE:
+            if operation.kind is PipelineStage.LATENT_PREPARATION:
                 media_mux.drop(int(operation.request_key.request_id))
     scope.completion.abandon()
     device_products.abandon_writes(tuple(scope.device_writes))
     encoder_cache.abandon_writes(tuple(scope.encoder_writes))
     if cache_pool is not None:
         cache_pool.release_buffers(
-            product.buffer_id
+            operation.kv_output
             for operation in scope.lane.operations
-            for product in operation.outputs
+            if operation.kv_output is not None
         )
     if latent_pool is not None and scope.latent_import_slots:
         latent_pool.release_slots(tuple(scope.latent_import_slots))
@@ -383,64 +343,24 @@ def _discard_lane(
             tuple(
                 product.buffer_id
                 for operation in scope.lane.operations
-                for product in operation.outputs
+                for product in operation.tensor_outputs()
             )
         )
     _release_locators(scope.published, transfer_backends=transfer_backends)
 
 
-def _finalize_predicated_runtime(
-    operation: Operation, *, request_pool: RequestPool
-) -> tuple[Checkpoint | None, RequestRuntime]:
-    """Resolve state-dependent skips; independent computation has no selected state."""
-
-    if operation.parent is None:
-        return None, RequestRuntime()
-    selected, resolved = request_pool.resolve_predicated(
-        operation.request_key.request_id,
-        operation.op_id,
-        operation.parent,
-    )
-    return selected, resolved
-
-
 def _validate_completion_products(
-    operation: Operation,
-    products: tuple[ProductPayload, ...],
+    operation: ScheduledRequest,
+    products: tuple[TensorPublication, ...],
 ) -> None:
     """Validate completion payloads against every product declared by the operation."""
 
-    declared = {output: output for output in operation.outputs}
+    declared = {output: output for output in operation.tensor_outputs()}
     for product in products:
         reference = declared.get(product.product)
         if reference is None:
             raise invalid_descriptor("completion carries a product not declared by its operation")
-        payload_bound = (
-            product.payload.encoded_size_bound()
-            if isinstance(product.payload, TransferHandle)
-            else product.payload.max_encoded_bytes()
-            if isinstance(
-                product.payload,
-                (
-                    ImagePayload,
-                    LogprobPayload,
-                ),
-            )
-            else len(product.payload)
-        )
-        transferred = isinstance(product.payload, TransferHandle)
-        if transferred and reference.storage_class in {
-            StorageClass.HOST_STAGING,
-            StorageClass.PINNED_OUTPUT,
-        }:
-            raise invalid_descriptor("host-visible output cannot carry a transfer entry")
-        if not transferred and payload_bound > int(reference.max_bytes):
-            raise invalid_descriptor("completion product exceeds its registered product byte bound")
-        if reference.storage_class in (
-            StorageClass.HOST_STAGING,
-            StorageClass.PINNED_OUTPUT,
-        ) and payload_bound > int(operation.bounds.max_completion_bytes):
-            raise invalid_descriptor("completion product exceeds its registered byte bound")
+        product.encoded_size_bound()
 
 
 def _publish_predicates(scope: LaneState, *, device_products: DeviceProducts) -> None:
@@ -453,10 +373,15 @@ def _publish_predicates(scope: LaneState, *, device_products: DeviceProducts) ->
     propagated = {
         id(write) for writes in scope.propagated_predicate_writes.values() for write in writes
     }
+    completions = {
+        operation.completion_output
+        for operation in scope.lane.operations
+        if operation.completion_output is not None
+    }
     writes = tuple(
         write
         for write in scope.device_writes
-        if write.reference.kind is ProductKind.COMPLETION
+        if write.reference in completions
         and not write.producer_recorded
         and operation_geometry.product_identity(write.reference) in producers
         and id(write) not in transitions
@@ -490,9 +415,7 @@ def _finish_device_reads(
     if reads:
         after_writes: list[DeviceProductWrite] = []
         for read in reads:
-            write = scope.operation_writes.get(
-                (read.reference.request_key, int(read.consumer_op_id))
-            )
+            write = scope.operation_writes.get((read.reference.request_key, read.consumer_op_id))
             if write is None:
                 after_writes.clear()
                 break

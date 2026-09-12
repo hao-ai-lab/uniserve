@@ -10,32 +10,31 @@ mod handle;
 mod kv;
 /// Scheduler-owned allocation and worker-params primitives.
 pub mod memory;
-mod runtime;
 mod scheduler;
 mod sim;
 mod worker;
 
 pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank};
 pub use crate::executor::{
-    Batch, BatchResult, CommandOutcome, ComponentDistribution, EntryConfig, Executor,
-    ExecutorError, ExecutorInfo, ExecutorSubmitError, Op, ParallelConfig, SequenceParallel,
-    TransferBackend, TransferEdge, TransportMap, TransportMapError, WorkerExecError, WorkerFailure,
-    WorkerId,
+    BatchResult, CommandOutcome, ComponentConfig, ComponentDistribution, Executor, ExecutorError,
+    ExecutorInfo, ExecutorSubmitError, OpResult, ParallelConfig, RequestPlacement, ScheduleBatch,
+    SequenceParallel, TransferBackend, TransferConfig, TransferConfigError, TransferEdge,
+    WorkerExecError, WorkerFailure, WorkerId, WorkerResult,
 };
 pub use crate::handle::{
     Command, EVENT_BUFFER_CAPACITY, EngineHandle, EventRx, EventSendError, EventTx,
     StreamCancelCause, SubmitError,
 };
-pub use crate::runtime::{ControlTokens, EngineLoop, RuntimeProfile};
+pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, DomainStats, EncoderStats,
-    ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats, SchedStats, SchedStatsReporter,
-    Scheduler, SchedulerConfig, SchedulingPolicy, TimingStats, WorkerStats,
+    ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats, Scheduler, SchedulerConfig,
+    SchedulerStats, SchedulerStatsReporter, SchedulingPolicy, TimingStats, WorkerStats,
 };
 pub use crate::sim::{SimEngine, SimExecutor};
 pub use crate::worker::{
-    FlashInferBackend, FlashInferBackendParseError, LaneConfig, RunSubmitError, Worker,
-    WorkerExecutor, WorkerProcessArgs,
+    FlashInferBackend, FlashInferBackendParseError, LaneConfig, RunSubmitError, WorkerExecutor,
+    WorkerGroup, WorkerProcessArgs,
 };
 pub use uniserve_worker_ipc::AttentionBackend;

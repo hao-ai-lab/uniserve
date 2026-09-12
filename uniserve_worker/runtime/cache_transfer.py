@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ..execution.batch import BufferId, KvTransferValue, ProductRef, RequestKey, TensorTransfer
+from ..execution.batch import BufferId, KvTransfer, RequestKey, TensorTransfer
 from ..foundation.errors import invalid_descriptor, resource_error
 from ..nn.quant.kv_cache import FP8_MAX, SCALE_EPS
 from ..transfer.layout import TensorRegion, fetch_tensor
@@ -45,12 +45,12 @@ def cache_transfer_workspace_bytes(
 class CacheWrite:
     """A scheduler-owned KV destination retained through physical input access."""
 
-    product: ProductRef
+    buffer: BufferId
     request_pool_idx: int
     group_id: int
     pages: tuple[int, ...]
     initialized_pages: tuple[int, ...]
-    publication: KvTransferValue
+    publication: KvTransfer
     ranges: dict[int, tuple[int, int]]
     completion: Future[None] = field(default_factory=Future)
     retirement: Future[None] = field(default_factory=Future)
@@ -124,8 +124,8 @@ class CacheTransfers:
 
     def reserve(
         self,
-        product: ProductRef,
-        publication: KvTransferValue,
+        buffer: BufferId,
+        publication: KvTransfer,
         *,
         request_pool_idx: int,
         group: int,
@@ -145,13 +145,13 @@ class CacheTransfers:
             self.pool.require_reusable((page,), group=group, start=offset, length=count)
         reservation = self._tasks.reserve() if publication.tensors or initialized_pages else None
         write = CacheWrite(
-            product, request_pool_idx, group, pages, initialized_pages, publication, ranges
+            buffer, request_pool_idx, group, pages, initialized_pages, publication, ranges
         )
         try:
             with self._condition:
-                if self._closed or product.buffer_id in self._writes:
+                if self._closed or buffer in self._writes:
                     raise invalid_descriptor("KV import destination is closed or already reserved")
-                self._writes[product.buffer_id] = write
+                self._writes[buffer] = write
             if reservation is None:
                 write._work_finished = True
                 write._stream_finished = True
@@ -162,13 +162,13 @@ class CacheTransfers:
             if reservation is not None:
                 reservation.abandon()
             with self._condition:
-                self._writes.pop(product.buffer_id, None)
+                self._writes.pop(buffer, None)
             raise
         return write
 
     def owns(self, write: CacheWrite) -> bool:
         with self._condition:
-            return self._writes.get(write.product.buffer_id) is write
+            return self._writes.get(write.buffer) is write
 
     def adopt(self, write: CacheWrite) -> None:
         """Hand a completed import to resident cache ownership."""
@@ -207,10 +207,7 @@ class CacheTransfers:
     ) -> None:
         with self._condition:
             for write in tuple(self._writes.values()):
-                if (
-                    write.product.request_key in requests
-                    and write.product.buffer_id not in retained
-                ):
+                if write.buffer.owner in requests and write.buffer not in retained:
                     self.abandon(write)
 
     def retirement_ready(
@@ -273,7 +270,7 @@ class CacheTransfers:
             write._workspace = None
             self._condition.notify_all()
         if write.released and not write.retirement.done():
-            self._writes.pop(write.product.buffer_id, None)
+            self._writes.pop(write.buffer, None)
             write.retirement.set_result(None)
             if self._wake is not None:
                 self._wake()

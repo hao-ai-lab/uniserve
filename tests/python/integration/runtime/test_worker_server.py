@@ -15,13 +15,13 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from uniserve_worker.execution.batch import (
+    ComputationId,
+    Finish,
+    ForwardMode,
     NewRequest,
-    Operation,
-    ProductPayload,
     RequestKey,
-    Retire,
     Run,
-    TokenMode,
+    ScheduledRequest,
 )
 
 pytestmark = pytest.mark.integration
@@ -34,27 +34,25 @@ def _request(call_id: int, run: Run) -> dict[str, object]:
 def _token_run(
     *,
     request_id: int,
-    op_id: int,
+    op_id: ComputationId,
     run_id: int,
     tokens: tuple[int, ...],
-) -> tuple[NewRequest, Operation, ProductPayload, Run]:
+) -> tuple[NewRequest, ScheduledRequest, Run]:
     admission = ar_params(request_id, block_ids=(request_id,))
-    operation, payload = token_operation(
+    operation = token_operation(
         admission.request_key,
         op_id=op_id,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
+        predecessor=root_parent(admission),
+        mode=ForwardMode.PREFILL,
         tokens=tokens,
     )
     return (
         admission,
         operation,
-        payload,
         execution_run(
             run_id=run_id,
             admissions=(admission,),
             operations=(operation,),
-            input_products=(payload,),
         ),
     )
 
@@ -87,9 +85,9 @@ def test_info_request_is_served_before_close() -> None:
 
 @pytest.mark.parametrize("pipeline_depth", (1, 3))
 def test_duplicate_submissions_are_rejected_while_the_original_completes(pipeline_depth) -> None:
-    _admission, _operation, _payload, run = _token_run(
+    _admission, _operation, run = _token_run(
         request_id=11,
-        op_id=21,
+        op_id=ComputationId(21, 0),
         run_id=7,
         tokens=(8, 9),
     )
@@ -134,27 +132,26 @@ def test_failed_submissions_cannot_be_reused_and_allow_shutdown() -> None:
 
 
 def test_conflicting_run_identity_fails_before_new_admission() -> None:
-    admission, operation, payload, run = _token_run(
+    admission, operation, run = _token_run(
         request_id=12,
-        op_id=31,
+        op_id=ComputationId(2, 0),
         run_id=8,
         tokens=(4, 5),
     )
-    conflicting, conflicting_payload = token_operation(
+    conflicting = token_operation(
         admission.request_key,
-        op_id=31,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(2, 0),
+        predecessor=root_parent(admission),
+        mode=ForwardMode.PREFILL,
         tokens=(4, 5, 6),
     )
     conflicting_run = execution_run(
         run_id=8,
         operations=(conflicting,),
-        input_products=(conflicting_payload,),
     )
-    next_admission, next_operation, next_payload, next_run = _token_run(
+    next_admission, next_operation, next_run = _token_run(
         request_id=13,
-        op_id=32,
+        op_id=ComputationId(2, 1),
         run_id=8,
         tokens=(7,),
     )
@@ -162,7 +159,6 @@ def test_conflicting_run_identity_fails_before_new_admission() -> None:
         run_id=8,
         admissions=(next_admission,),
         operations=(operation, next_operation),
-        input_products=(payload, next_payload),
     )
     endpoint = QueuedWorkerIpc(
         (
@@ -183,12 +179,12 @@ def test_conflicting_run_identity_fails_before_new_admission() -> None:
     assert responses[2]["code"] == "InvalidDescriptor"
     assert responses[3]["kind"] == "error"
     assert responses[3]["code"] == "InvalidDescriptor"
-    # Rejected work must not admit its request. Logical batch IDs need not
-    # increase when the scheduler dispatches independent work around dependencies.
+    # Rejected work must not admit its request; the independent computation
+    # can still execute in another physical run of the same logical batch.
     result = responses[4]["result"]
     assert result["batch_id"] == 2
     assert result["run_id"] == 9
-    assert result["completions"][0]["op_id"] == 32
+    assert result["completions"][0]["op_id"] == {"batch_id": 2, "request_index": 1}
     assert result["completions"][0]["status"] == "ok"
     assert responses[5]["kind"] == "ok"
 
@@ -219,7 +215,7 @@ def test_unbound_run_failure_closes_worker_at_scope_exit() -> None:
     with pytest.raises(RuntimeError, match="closed"):
         worker.bind(QueuedWorkerIpc())
     with pytest.raises(RuntimeError, match="closed"):
-        worker.execute(execution_run(run_id=1, commands=(Retire(RequestKey(1, 1, 1)),)))
+        worker.execute(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
     worker.close()
 
 
@@ -245,7 +241,7 @@ def test_service_is_single_use_and_scope_exit_prevents_reuse() -> None:
         with pytest.raises(RuntimeError, match="closed"):
             action()
     with pytest.raises(RuntimeError, match="closed"):
-        worker.execute(execution_run(run_id=1, commands=(Retire(RequestKey(1, 1, 1)),)))
+        worker.execute(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
     worker.close()
 
 
@@ -320,7 +316,7 @@ def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
     assert endpoint.responses == []
     assert not endpoint.closed
     with pytest.raises(RuntimeError, match="closed"):
-        worker.execute(execution_run(run_id=1, commands=(Retire(RequestKey(1, 1, 1)),)))
+        worker.execute(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
     if cleanup_failure:
         assert any("executor shutdown failed" in note for note in failure.__notes__)
 
@@ -347,7 +343,7 @@ def test_transport_failure_releases_worker_and_restores_gc(gc_enabled: bool) -> 
         assert gc.isenabled() == gc_enabled
         assert not endpoint.closed
         with pytest.raises(RuntimeError, match="closed"):
-            worker.execute(execution_run(run_id=1, commands=(Retire(RequestKey(1, 1, 1)),)))
+            worker.execute(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
     finally:
         (gc.enable if was_enabled else gc.disable)()
         worker.close()

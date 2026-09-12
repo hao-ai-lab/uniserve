@@ -1,20 +1,17 @@
 //! Typed serving inputs before and after model-owned tokenization.
 //!
-//! [`GenerateReqInput`] carries transport-independent user intent.
-//! [`TokenizedGenerateReqInput`] carries the fully resolved engine request and
+//! [`TextPromptRequest`] accepts programmatic text prompts and optional input images.
+//! [`ResponseOptions`] retains the frontend output requirements and
 //! output policy.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
-use uniserve_core::GenerationRequest;
-
-use crate::serving::chat::{ChatMessage, ChatToolChoice, ReasoningEffort, Tool};
 use crate::serving::text::TextDecodeOptions;
 use crate::serving::text::tokenizer::DynTokenizer;
 use crate::serving::{CacheAccounting, ResourceAccounting, ServeRequestId};
 
 /// One supported public input image. Model-specific params is resolved by
-/// [`crate::serving::model::ResolvedModel::tokenize`].
+/// [`crate::serving::model::InputProcessor::preprocess_text_request`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInput {
     /// Base64-encoded image payload.
@@ -22,22 +19,13 @@ pub struct ImageInput {
 }
 
 /// The public prompt: raw text or a chat conversation. Input images live in
-/// [`GenerateReqInput::images`] (and inside chat parts for the chat variant).
+/// programmatic image inputs (and inside chat parts for the chat variant).
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptInput {
     /// Plain text prompt.
     Text(String),
-    /// Structured conversation prompt with optional function tools.
-    Chat {
-        /// Ordered conversation history.
-        messages: Vec<ChatMessage>,
-        /// Functions available for the next assistant turn.
-        tools: Vec<Tool>,
-        /// Tool-selection policy for the next assistant turn.
-        tool_choice: ChatToolChoice,
-        /// Optional model reasoning budget.
-        reasoning_effort: Option<ReasoningEffort>,
-    },
+    /// Conversation, rendering options, and tools consumed by the chat renderer.
+    Chat(crate::serving::chat::ChatRequest),
 }
 
 /// Closed output-modality selection. The input side is inferred from the prompt
@@ -155,28 +143,6 @@ pub struct ImageGenControls {
     pub retain_images: Option<bool>,
 }
 
-/// Cache bounds required for admission.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CacheBounds {
-    /// Optional cache namespace isolating otherwise identical requests.
-    pub namespace: Option<String>,
-    /// Optional caller-provided value mixed into the cache key.
-    pub salt: Option<String>,
-    /// Whether existing cache entries are ignored.
-    pub bypass_read: bool,
-    /// Whether products from this request are excluded from cache storage.
-    pub no_store: bool,
-}
-
-/// Scheduling bounds required for admission (no deadline).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SchedulingBounds {
-    /// Request scheduling priority; larger values receive preference.
-    pub priority: i32,
-    /// Distributed trace context propagated into engine execution.
-    pub trace_context: BTreeMap<String, String>,
-}
-
 /// Per-token detail included in the public output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputDetail {
@@ -208,15 +174,14 @@ impl Default for DecodeControls {
     }
 }
 
-/// The sole internal generate-class admission value.
+/// A programmatic text prompt with optional context images. HTTP endpoints use
+/// their own request schemas and do not construct this value.
 #[derive(Debug, Clone, PartialEq)]
-pub struct GenerateReqInput {
+pub struct TextPromptRequest {
     /// Caller-visible request identifier.
     pub request_id: ServeRequestId,
-    /// Whether transport output should be streamed incrementally.
-    pub stream: bool,
-    /// Text or structured chat prompt.
-    pub prompt: PromptInput,
+    /// Plain text passed through the model's text-prompt preprocessing.
+    pub prompt: String,
     /// Top-level input images associated with the prompt.
     pub images: Vec<ImageInput>,
     /// Requested output modalities.
@@ -229,95 +194,47 @@ pub struct GenerateReqInput {
     pub negative_text: Option<String>,
     /// Image-generation controls when image output is requested.
     pub image_gen: Option<ImageGenControls>,
-    /// Prefix and product cache controls.
-    pub cache: CacheBounds,
-    /// Admission and scheduling controls.
-    pub scheduling: SchedulingBounds,
+    /// Optional cache namespace isolating otherwise identical requests.
+    pub cache_namespace: Option<String>,
+    /// Optional caller-provided value mixed into the cache key.
+    pub cache_salt: Option<String>,
+    /// Whether existing prefix and encoder cache entries are ignored.
+    pub bypass_cache_read: bool,
+    /// Whether this request is excluded from cache storage.
+    pub no_cache_store: bool,
+    /// Scheduler priority for this request.
+    pub priority: i32,
     /// Requested response detail.
     pub output: OutputDetail,
     /// Incremental text decoding controls.
     pub decode: DecodeControls,
 }
 
-impl GenerateReqInput {
-    /// Builds a minimal text-prompt request with default controls.
-    pub fn text(request_id: impl Into<ServeRequestId>, prompt: impl Into<String>) -> Self {
-        Self::from_prompt(request_id.into(), PromptInput::Text(prompt.into()))
-    }
-
-    /// Builds a minimal chat request with default controls.
-    pub fn chat(request_id: impl Into<ServeRequestId>, messages: Vec<ChatMessage>) -> Self {
-        Self::from_prompt(
-            request_id.into(),
-            PromptInput::Chat {
-                messages,
-                tools: Vec::new(),
-                tool_choice: ChatToolChoice::None,
-                reasoning_effort: None,
-            },
-        )
-    }
-
-    /// Builds serving input from a text prompt.
-    fn from_prompt(request_id: ServeRequestId, prompt: PromptInput) -> Self {
+impl TextPromptRequest {
+    /// Creates a programmatic text-prompt request with model-default controls.
+    pub fn new(request_id: impl Into<ServeRequestId>, prompt: impl Into<String>) -> Self {
         Self {
-            request_id,
-            stream: true,
-            prompt,
+            request_id: request_id.into(),
+            prompt: prompt.into(),
             images: Vec::new(),
-            modalities: ModalitySelection::default(),
+            modalities: ModalitySelection::Text,
             sampling: SamplingConfig::default(),
             stop: StopConfig::default(),
             negative_text: None,
             image_gen: None,
-            cache: CacheBounds::default(),
-            scheduling: SchedulingBounds::default(),
-            output: OutputDetail::default(),
+            cache_namespace: None,
+            cache_salt: None,
+            bypass_cache_read: false,
+            no_cache_store: false,
+            priority: 0,
+            output: OutputDetail::VisibleText,
             decode: DecodeControls::default(),
         }
-    }
-
-    /// Returns whether the request declares any input image.
-    pub fn has_input_image(&self) -> bool {
-        !self.images.is_empty()
-            || matches!(&self.prompt, PromptInput::Chat { messages, .. } if messages.iter().any(ChatMessage::has_multimodal))
-    }
-
-    /// Returns whether the request uses function-tool syntax in either the
-    /// current turn or its chat history.
-    pub fn uses_tools(&self) -> bool {
-        let PromptInput::Chat {
-            messages, tools, ..
-        } = &self.prompt
-        else {
-            return false;
-        };
-        !tools.is_empty()
-            || messages.iter().any(|message| match message {
-                ChatMessage::Developer { tools, .. } => {
-                    tools.as_ref().is_some_and(|tools| !tools.is_empty())
-                }
-                ChatMessage::Assistant { content } => content.has_tool_calls(),
-                ChatMessage::ToolResponse { .. } => true,
-                ChatMessage::System { .. } | ChatMessage::User { .. } => false,
-            })
-    }
-
-    /// Returns whether the request asks the model's chat template to select a
-    /// reasoning effort.
-    pub fn requests_reasoning(&self) -> bool {
-        matches!(
-            &self.prompt,
-            PromptInput::Chat {
-                reasoning_effort: Some(_),
-                ..
-            }
-        )
     }
 }
 
 /// Model-supplied committed-event processor selection, built inside
-/// [`crate::serving::model::ResolvedModel::tokenize`].
+/// [`crate::serving::model::InputProcessor::preprocess_text_request`].
 pub enum OutputProcessorPolicy {
     /// Raw visible text.
     None,
@@ -327,8 +244,6 @@ pub enum OutputProcessorPolicy {
     Qwen3(crate::serving::chat::Qwen3ChatOutputProcessor),
     /// SenseNova reasoning and visible-answer filtering over committed text.
     SenseNova(crate::profile::omni::OutputFilterPolicy),
-    /// Bagel committed-event output policy.
-    Bagel,
 }
 
 /// Model identity stamped onto `Accepted` events.
@@ -340,13 +255,11 @@ pub struct ModelEventIdentity {
     pub description: String,
 }
 
-/// The sole value submitted to the engine client, produced by
-/// [`crate::serving::model::ResolvedModel::tokenize`].
-pub struct TokenizedGenerateReqInput {
+/// Tokenization resources and output requirements retained by the frontend.
+/// The corresponding generation request moves directly into the engine.
+pub struct ResponseOptions {
     /// Caller-visible request identifier.
     pub request_id: ServeRequestId,
-    /// Canonical engine request from the public funnel.
-    pub request: GenerationRequest,
     /// The model-bound tokenizer that owns decoding for this request.
     pub tokenizer: DynTokenizer,
     /// Prompt token identifiers submitted to the engine.
@@ -359,8 +272,6 @@ pub struct TokenizedGenerateReqInput {
     pub prompt_logprobs_requested: bool,
     /// Whether generated-token log probabilities are requested.
     pub generated_logprobs_requested: bool,
-    /// Whether special tokens are omitted from decoded response text.
-    pub skip_special_tokens: bool,
     /// Model-selected semantic output processor.
     pub output_processor: OutputProcessorPolicy,
     /// Model identity stamped onto accepted events.

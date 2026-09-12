@@ -11,7 +11,7 @@ use crate::openai::types::{
 };
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, AssistantMessage};
 use crate::serving::text::DecodedLogprobs;
-use crate::serving::{CandidateId, FinishStatus, ServeEvent};
+use crate::serving::{FinishStatus, RequestOutput};
 use asynk_strim_attr::{TryYielder, try_stream};
 use axum::response::sse::Event;
 use futures::{Stream, StreamExt as _, pin_mut};
@@ -24,13 +24,14 @@ use crate::openai::logprobs::{decoded_logprobs_to_openai_chat, decoded_prompt_lo
 use crate::openai::utils::completion_token_count;
 
 /// Converts a terminal serving event into its OpenAI representation.
-fn openai_terminal_event(event: ServeEvent) -> ServeEvent {
+fn openai_terminal_event(event: RequestOutput) -> RequestOutput {
     match event {
-        ServeEvent::Cancelled { .. } | ServeEvent::Aborted { .. } => ServeEvent::Finished {
-            candidate_id: CandidateId::PRIMARY,
-            reason: FinishStatus::Abort,
-            finish_detail: None,
-        },
+        RequestOutput::Cancelled { .. } | RequestOutput::Aborted { .. } => {
+            RequestOutput::Finished {
+                reason: FinishStatus::Abort,
+                finish_detail: None,
+            }
+        }
         event => event,
     }
 }
@@ -49,7 +50,7 @@ macro_rules! bail_server_error {
 
 /// Collects a chat event stream into one non-streaming response.
 pub async fn collect_chat_completion(
-    stream: impl Stream<Item = crate::serving::Result<ServeEvent>> + Send,
+    stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
     request_id: String,
     response_model: String,
     created: u64,
@@ -167,7 +168,7 @@ struct CollectedChatOutput {
 
 /// Collects semantic serving events into one non-streaming chat response payload.
 async fn collect_chat_events(
-    stream: impl Stream<Item = crate::serving::Result<ServeEvent>> + Send,
+    stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
 ) -> Result<CollectedChatOutput, ApiError> {
     pin_mut!(stream);
     let mut message = AssistantMessage::default();
@@ -193,7 +194,7 @@ async fn collect_chat_events(
 
     while let Some(next) = stream.next().await {
         match next.map(openai_terminal_event) {
-            Ok(ServeEvent::Accepted {
+            Ok(RequestOutput::Accepted {
                 prompt_token_count: accepted_prompt_token_count,
                 prompt_token_ids: accepted_prompt_token_ids,
                 prompt_logprobs: accepted_prompt_logprobs,
@@ -203,7 +204,7 @@ async fn collect_chat_events(
                 prompt_token_ids = accepted_prompt_token_ids;
                 prompt_logprobs = accepted_prompt_logprobs;
             }
-            Ok(ServeEvent::TextDelta {
+            Ok(RequestOutput::TextDelta {
                 text,
                 token_ids: delta_token_ids,
                 logprobs: delta_logprobs,
@@ -220,8 +221,8 @@ async fn collect_chat_events(
                         .append(&mut delta_logprobs.positions);
                 }
             }
-            Ok(ServeEvent::ReasoningDelta { text, .. }) => loose_reasoning.push_str(&text),
-            Ok(ServeEvent::OutputBlockEnd { block, .. }) => {
+            Ok(RequestOutput::ReasoningDelta { text, .. }) => loose_reasoning.push_str(&text),
+            Ok(RequestOutput::OutputBlockEnd { block, .. }) => {
                 match block.kind() {
                     AssistantBlockKind::Text => saw_text_block = true,
                     AssistantBlockKind::Reasoning => saw_reasoning_block = true,
@@ -229,13 +230,13 @@ async fn collect_chat_events(
                 }
                 message.push_block(block);
             }
-            Ok(ServeEvent::ImageBegin { image_id, .. }) => {
+            Ok(RequestOutput::ImageBegin { image_id, .. }) => {
                 image_step_counts.entry(image_id).or_default();
             }
-            Ok(ServeEvent::ImageStep { image_id, .. }) => {
+            Ok(RequestOutput::ImageStep { image_id, .. }) => {
                 *image_step_counts.entry(image_id).or_default() += 1;
             }
-            Ok(ServeEvent::ImageDone {
+            Ok(RequestOutput::ImageDone {
                 image_id,
                 pixels_png_b64,
                 ..
@@ -247,7 +248,7 @@ async fn collect_chat_events(
                 image_step_counts.entry(image_id.clone()).or_default();
                 completed_image_ids.push(image_id);
             }
-            Ok(ServeEvent::ToolCallEnd {
+            Ok(RequestOutput::ToolCallEnd {
                 id,
                 name,
                 arguments,
@@ -261,7 +262,7 @@ async fn collect_chat_events(
                     },
                 ));
             }
-            Ok(ServeEvent::Usage {
+            Ok(RequestOutput::Usage {
                 prompt_tokens,
                 visible_output_tokens,
                 internal_tokens,
@@ -275,14 +276,14 @@ async fn collect_chat_events(
                 image_count = generated_images;
                 image_steps = generated_steps;
             }
-            Ok(ServeEvent::Finished { reason, .. }) => {
+            Ok(RequestOutput::Finished { reason, .. }) => {
                 finish_status = Some(reason);
                 break;
             }
-            Ok(ServeEvent::Rejected { message, .. }) => {
+            Ok(RequestOutput::Rejected { message, .. }) => {
                 return Err(ApiError::invalid_request(message, None));
             }
-            Ok(ServeEvent::Failed {
+            Ok(RequestOutput::Failed {
                 request_id,
                 message,
             }) => {
@@ -336,7 +337,7 @@ async fn collect_chat_events(
 /// Converts one serving event stream into OpenAI chat-completion chunks.
 #[try_stream]
 pub async fn chat_completion_chunk_stream(
-    stream: impl Stream<Item = crate::serving::Result<ServeEvent>> + Send,
+    stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
     request_id: String,
     response_model: String,
     created: u64,
@@ -370,7 +371,7 @@ pub async fn chat_completion_chunk_stream(
 
     while let Some(next) = stream.next().await {
         match next.map(openai_terminal_event) {
-            Ok(ServeEvent::Accepted {
+            Ok(RequestOutput::Accepted {
                 prompt_token_count: accepted_prompt_token_count,
                 prompt_token_ids,
                 ..
@@ -382,7 +383,7 @@ pub async fn chat_completion_chunk_stream(
                 }
                 y.yield_ok(chunk).await;
             }
-            Ok(ServeEvent::TextDelta {
+            Ok(RequestOutput::TextDelta {
                 text,
                 token_ids,
                 logprobs,
@@ -435,7 +436,7 @@ pub async fn chat_completion_chunk_stream(
                     }
                 }
             }
-            Ok(ServeEvent::ReasoningDelta { text: delta, .. }) => {
+            Ok(RequestOutput::ReasoningDelta { text: delta, .. }) => {
                 let kind = AssistantBlockKind::Reasoning;
                 let include_delta =
                     include_reasoning || !matches!(kind, AssistantBlockKind::Reasoning);
@@ -451,14 +452,14 @@ pub async fn chat_completion_chunk_stream(
                     suppress_current_update_metadata = true;
                 }
             }
-            Ok(ServeEvent::OutputBlockStart { kind, .. }) => {
+            Ok(RequestOutput::OutputBlockStart { kind, .. }) => {
                 debug!(?kind, "starting new block");
                 if !include_reasoning && matches!(kind, AssistantBlockKind::Reasoning) {
                     inside_hidden_reasoning = true;
                     suppress_current_update_metadata = true;
                 }
             }
-            Ok(ServeEvent::OutputBlockEnd { block, .. }) => {
+            Ok(RequestOutput::OutputBlockEnd { block, .. }) => {
                 debug!("ending current block");
                 if inside_hidden_reasoning || matches!(block.kind(), AssistantBlockKind::Reasoning)
                 {
@@ -466,7 +467,7 @@ pub async fn chat_completion_chunk_stream(
                     suppress_current_update_metadata = true;
                 }
             }
-            Ok(ServeEvent::ToolCallStart {
+            Ok(RequestOutput::ToolCallStart {
                 index, id, name, ..
             }) => {
                 let tool_index = index as u32;
@@ -490,7 +491,7 @@ pub async fn chat_completion_chunk_stream(
                     .await;
                 }
             }
-            Ok(ServeEvent::ToolCallArgumentsDelta { index, delta, .. }) => {
+            Ok(RequestOutput::ToolCallArgumentsDelta { index, delta, .. }) => {
                 let tool_index = index as u32;
                 if let Some(pending_chunk) = pending_chunk.as_mut() {
                     pending_chunk.push_tool_call_arguments(tool_index, delta);
@@ -505,16 +506,16 @@ pub async fn chat_completion_chunk_stream(
                     .await;
                 }
             }
-            Ok(ServeEvent::ToolCallEnd { .. }) => {
+            Ok(RequestOutput::ToolCallEnd { .. }) => {
                 debug!("ending current tool call");
             }
-            Ok(ServeEvent::ImageBegin { image_id, .. }) => {
+            Ok(RequestOutput::ImageBegin { image_id, .. }) => {
                 image_step_counts.entry(image_id).or_default();
             }
-            Ok(ServeEvent::ImageStep { image_id, .. }) => {
+            Ok(RequestOutput::ImageStep { image_id, .. }) => {
                 *image_step_counts.entry(image_id).or_default() += 1;
             }
-            Ok(ServeEvent::ImageDone {
+            Ok(RequestOutput::ImageDone {
                 image_id,
                 pixels_png_b64,
                 ..
@@ -533,7 +534,7 @@ pub async fn chat_completion_chunk_stream(
                 image_step_counts.entry(image_id.clone()).or_default();
                 completed_image_ids.push(image_id);
             }
-            Ok(ServeEvent::Usage {
+            Ok(RequestOutput::Usage {
                 prompt_tokens,
                 visible_output_tokens,
                 internal_tokens,
@@ -547,7 +548,7 @@ pub async fn chat_completion_chunk_stream(
                 image_count = generated_images;
                 image_steps = generated_steps;
             }
-            Ok(ServeEvent::Finished { reason, .. }) => {
+            Ok(RequestOutput::Finished { reason, .. }) => {
                 if log_request {
                     info!(
                         stream = true,
@@ -608,10 +609,10 @@ pub async fn chat_completion_chunk_stream(
 
                 return Ok(());
             }
-            Ok(ServeEvent::Rejected { message, .. }) => {
+            Ok(RequestOutput::Rejected { message, .. }) => {
                 return Err(ApiError::invalid_request(message, None));
             }
-            Ok(ServeEvent::Failed { .. }) => {
+            Ok(RequestOutput::Failed { .. }) => {
                 bail_server_error!("Internal server error");
             }
             Ok(_) => {}

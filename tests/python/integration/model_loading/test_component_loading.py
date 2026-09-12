@@ -184,11 +184,11 @@ def test_missing_serialized_buffer_rejects_incomplete_component(component_checkp
 def test_component_resolution_requires_only_resident_sources(component_checkpoint):
     from uniserve_worker.loader.source import resolve_weight_sources
     from uniserve_worker.nn.mesh import DeviceMesh, EntryBindings
-    from uniserve_worker.nn.parallel import EntryConfig, ParallelConfig
+    from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig
 
     entry, request, root = component_checkpoint
     bindings = EntryBindings(
-        {"encode": EntryConfig((0,)), "decode": EntryConfig((1,))},
+        {"encode": ComponentConfig((0,)), "decode": ComponentConfig((1,))},
         {"encode": DeviceMesh((0,), 0, ParallelConfig(), torch.device("cpu"))},
         Communicator(ranks=(0, 1), rank=0),
     )

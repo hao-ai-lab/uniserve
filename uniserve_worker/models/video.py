@@ -5,12 +5,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Hashable
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Generic, TypeVar
 
 import torch
 
-from ..execution.batch import MediaGeometry, MediaTrack, OpCode
+from ..execution.batch import DiffusionSamplingParams, MediaTrack
 from ..execution.bounded_storage import BoundedTensorStorage
 from ..execution.denoising import DenoisingStep
 from ..nn.diffusion.schedule import DiffusionSchedule
@@ -30,86 +29,6 @@ class VideoOutputGeometry:
     audio_rate: int
 
 
-class MediaPlanRepeat(StrEnum):
-    """Select how a generation-plan stage expands for one request."""
-
-    ONCE = "once"
-    FIXED = "fixed"
-    VIDEO_UNITS = "video_units"
-
-
-@dataclass(frozen=True, slots=True)
-class MediaPlanStage:
-    """Declare one schedulable media stage and its model-level dependencies."""
-
-    name: str
-    operation: OpCode
-    entry: str
-    dependencies: tuple[str, ...] = ()
-    input_from: str | None = None
-    repeat: MediaPlanRepeat = MediaPlanRepeat.ONCE
-    count: int = 1
-
-    def __post_init__(self) -> None:
-        if not self.name or not self.entry:
-            raise ValueError("media plan stages require names and component entries")
-        if self.repeat is MediaPlanRepeat.FIXED and self.count < 1:
-            raise ValueError("a fixed media stage requires a positive repetition count")
-        if self.repeat is not MediaPlanRepeat.FIXED and self.count != 1:
-            raise ValueError("only fixed media stages declare a repetition count")
-
-    def to_mapping(self) -> dict[str, object]:
-        """Encode this model declaration for worker discovery."""
-
-        return {
-            "name": self.name,
-            "operation": self.operation.value,
-            "entry": self.entry,
-            "dependencies": list(self.dependencies),
-            "input_from": self.input_from,
-            "repeat": self.repeat.value,
-            "count": self.count,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class MediaExecutionPlan:
-    """Finite component graph consumed by the shared media scheduler."""
-
-    stages: tuple[MediaPlanStage, ...]
-
-    def __post_init__(self) -> None:
-        names = tuple(stage.name for stage in self.stages)
-        if not names or len(set(names)) != len(names):
-            raise ValueError("a media plan requires unique ordered stage names")
-        declared: set[str] = set()
-        for stage in self.stages:
-            references = stage.dependencies + ((stage.input_from,) if stage.input_from else ())
-            if any(reference not in declared for reference in references):
-                raise ValueError(f"media stage {stage.name!r} references a later or missing stage")
-            declared.add(stage.name)
-
-    @property
-    def denoise_steps(self) -> int:
-        """Return the fixed learned-prediction count declared by this plan."""
-
-        stages = [stage for stage in self.stages if stage.operation is OpCode.DIFFUSION_STEP]
-        if len(stages) != 1 or stages[0].repeat is not MediaPlanRepeat.FIXED:
-            return 0
-        return stages[0].count
-
-    @property
-    def operations(self) -> frozenset[OpCode]:
-        """Return the worker operation families required by the declared stages."""
-
-        return frozenset(stage.operation for stage in self.stages)
-
-    def to_mapping(self) -> dict[str, object]:
-        """Encode the complete finite graph for worker discovery."""
-
-        return {"stages": [stage.to_mapping() for stage in self.stages]}
-
-
 MetadataT = TypeVar("MetadataT")
 TensorViewsT = TypeVar("TensorViewsT")
 
@@ -123,13 +42,6 @@ class VideoModel(ExecutionModel, Generic[MetadataT, TensorViewsT], ABC):
     text_encoder: torch.nn.Module | None
     denoiser: torch.nn.Module | None
     conditioner: torch.nn.Sequential | None
-    media_plan: MediaExecutionPlan
-
-    @property
-    def denoise_steps(self) -> int:
-        """Expose the scheduler repetition count from the declared media plan."""
-
-        return self.media_plan.denoise_steps
 
     @abstractmethod
     def denoising_signature(self, tensors: TensorViewsT, metadata: MetadataT) -> Hashable:
@@ -146,7 +58,7 @@ class VideoModel(ExecutionModel, Generic[MetadataT, TensorViewsT], ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def execution_key(self, geometry: MediaGeometry) -> Hashable:
+    def execution_key(self, geometry: DiffusionSamplingParams, num_prompt_tokens: int) -> Hashable:
         """Validate geometry and identify reusable mathematical metadata."""
 
         raise NotImplementedError
@@ -154,7 +66,8 @@ class VideoModel(ExecutionModel, Generic[MetadataT, TensorViewsT], ABC):
     @abstractmethod
     def build_execution(
         self,
-        geometry: MediaGeometry,
+        geometry: DiffusionSamplingParams,
+        num_prompt_tokens: int,
         storage: BoundedTensorStorage,
         context: AttentionContextWorkspace | None,
     ) -> MetadataT:
@@ -163,9 +76,7 @@ class VideoModel(ExecutionModel, Generic[MetadataT, TensorViewsT], ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def request_tensors(
-        self, storage: BoundedTensorStorage, geometry: MediaGeometry, metadata: MetadataT
-    ) -> TensorViewsT:
+    def request_tensors(self, storage: BoundedTensorStorage, metadata: MetadataT) -> TensorViewsT:
         """Borrow immutable views for the declared geometry from public storage."""
 
         raise NotImplementedError
@@ -230,16 +141,13 @@ class VideoModel(ExecutionModel, Generic[MetadataT, TensorViewsT], ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def output_geometry(self, geometry: MediaGeometry) -> VideoOutputGeometry:
+    def output_geometry(self, geometry: DiffusionSamplingParams) -> VideoOutputGeometry:
         """Describe the raster, timing, and unit boundaries used by output muxing."""
 
         raise NotImplementedError
 
 
 __all__ = [
-    "MediaExecutionPlan",
-    "MediaPlanRepeat",
-    "MediaPlanStage",
     "VideoOutputGeometry",
     "VideoModel",
 ]

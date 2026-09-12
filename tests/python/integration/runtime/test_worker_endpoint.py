@@ -1,3 +1,5 @@
+from uniserve_worker.execution.batch import ComputationId, ForwardMode
+
 """Endpoint ownership across real native IPC and worker launch failures."""
 
 import json
@@ -211,14 +213,22 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
     )
     from tests.python.fixtures.execution_worker import execution_worker
     from uniserve_worker.config import LaneConfig, WorkerConfig
-    from uniserve_worker.execution.batch import Domain, OpStatus, TokenMode
+    from uniserve_worker.execution.batch import COMPUTATIONS, OpStatus
 
     policy = WorkerConfig(
         prefill_cuda_graph=False,
         graph_policy="off",
         lanes=(
-            LaneConfig("decode", 64, (Domain.DECODE,)),
-            LaneConfig("compute", 88, (Domain.PREFILL, Domain.FLOW)),
+            LaneConfig("decode", 64, (ForwardMode.DECODE, ForwardMode.VERIFY)),
+            LaneConfig(
+                "compute",
+                88,
+                tuple(
+                    kind
+                    for kind in COMPUTATIONS
+                    if kind not in {ForwardMode.DECODE, ForwardMode.VERIFY}
+                ),
+            ),
         ),
     )
     create_stream = driver.cuGreenCtxStreamCreate
@@ -255,11 +265,11 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
 
     with execution_worker(device="cuda:0", execution=policy) as worker:
         admission = ar_params(1, block_ids=(0,))
-        operation, payload = token_operation(
+        operation = token_operation(
             admission.request_key,
-            op_id=1,
-            parent=root_parent(admission),
-            mode=TokenMode.EXTEND,
+            op_id=ComputationId(1, 0),
+            predecessor=root_parent(admission),
+            mode=ForwardMode.PREFILL,
             tokens=(3, 4),
         )
         result = finalized_report(
@@ -268,7 +278,6 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
                     run_id=1,
                     admissions=(admission,),
                     operations=(operation,),
-                    input_products=(payload,),
                 )
             )
         )

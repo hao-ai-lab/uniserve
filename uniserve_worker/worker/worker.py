@@ -16,8 +16,9 @@ from typing import TYPE_CHECKING, Any, Self, cast
 
 import torch
 
+from uniserve_worker.execution.batch import Computation, PipelineStage
 from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
-from uniserve_worker.nn.parallel import EntryConfig
+from uniserve_worker.nn.parallel import ComponentConfig
 
 from ..bootstrap.capacity import (
     check_startup_memory,
@@ -33,17 +34,7 @@ from ..config import (
     graph_memory_budget_bytes,
 )
 from ..execution.attention import supports_flow_attention
-from ..execution.batch import (
-    BufferId,
-    Finish,
-    Free,
-    OpCode,
-    RequestKey,
-    Retire,
-    Run,
-    RunResult,
-    WorkerEndpoint,
-)
+from ..execution.batch import BufferId, Finish, Free, RequestKey, Run, RunResult, WorkerEndpoint
 from ..execution.forward_batch import AttentionSelection
 from ..execution.model_runner import ModelRunner
 from ..execution.output import OutputPool
@@ -188,7 +179,7 @@ class Worker:
         worker_config: WorkerConfig,
         sampling_group: Communicator | None,
         tokenizer: Any | None,
-        allowed_work_variants: frozenset[OpCode],
+        allowed_work_variants: frozenset[Computation],
         pipeline_depth: int,
         completion_payload_bytes: int,
         attention: AttentionSelection | None = None,
@@ -196,7 +187,7 @@ class Worker:
         publication_backends: tuple[str, ...] = ("local",),
         worker_id: str = "worker",
         schedule: DiffusionSchedule | None = None,
-        components: tuple[tuple[str, EntryConfig], ...] = (),
+        components: tuple[tuple[str, ComponentConfig], ...] = (),
         distributed_environment: DistributedEnvironment | None = None,
     ) -> None:
         """Allocate execution resources for an already-loaded model.
@@ -367,7 +358,7 @@ class Worker:
                 startup.callback(self.cache_pool.close)
 
                 assert attention is not None
-                if OpCode.DIFFUSION_STEP in info.supported_ops and not supports_flow_attention(
+                if PipelineStage.DENOISING in info.supported_ops and not supports_flow_attention(
                     attention,
                     cache,
                     self.cache_pool,
@@ -1188,7 +1179,7 @@ class Worker:
                     )
         return plan_run(batch, worker_info=self.info, model_runner=self.runner)
 
-    def supports_run_kind(self, kind: OpCode) -> bool:
+    def supports_run_kind(self, kind: Computation) -> bool:
         """Return whether this worker can execute one physical run variant."""
 
         return kind in self.info.supported_ops
@@ -1234,9 +1225,7 @@ class Worker:
         """Delay command acknowledgement until physical readers and request storage retire."""
 
         closed = frozenset(
-            command.request_key
-            for command in batch.commands
-            if isinstance(command, (Finish, Retire))
+            command.request_key for command in batch.commands if isinstance(command, Finish)
         )
         local_closed = frozenset(
             key
@@ -1250,7 +1239,7 @@ class Worker:
             frozenset(
                 buffer
                 for command in batch.commands
-                if isinstance(command, (Finish, Retire))
+                if isinstance(command, Finish)
                 for buffer in command.retained_buffers
             )
             - freed

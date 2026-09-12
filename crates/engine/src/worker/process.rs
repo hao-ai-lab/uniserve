@@ -3,6 +3,7 @@
 //! The host exchanges FlatBuffers descriptors and bounded result values while
 //! tensors, KV pages, and latent storage remain worker-resident.
 
+use crate::executor::WorkerResult;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -13,17 +14,11 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use uniserve_worker_ipc::{ClientEndpoint, Frame, Pending, service_name};
 use uniserve_worker_ipc::{
-    Domain, OpId, RequestKey, Run as PhysicalRun, RunResult, WorkerInfo, WorkerRequest,
-    WorkerResponse,
+    ComputationId, RequestKey, Run as PhysicalRun, WorkerInfo, WorkerRequest, WorkerResponse,
 };
 
 use crate::worker::WorkerProcessArgs;
 use crate::worker::death_watch::DeathWatcher;
-
-/// Enqueues a completed worker result for delivery.
-fn enqueue_ready(ready: &mut VecDeque<RunResult>, report: RunResult) {
-    ready.push_back(report);
-}
 
 /// Deadline for the initial worker connect / info handshake, where the worker may still
 /// be loading a large model and the IPC server may not yet be connected.
@@ -47,8 +42,8 @@ pub struct LaneConfig {
     pub lane_id: String,
     /// Streaming-multiprocessor budget assigned to the lane.
     pub sm_budget: u32,
-    /// Execution domains routed to the lane.
-    pub domains: Vec<Domain>,
+    /// Public JSON capability selectors resolved to computations by worker startup.
+    pub domains: Vec<String>,
     /// Optional lane-local KV capacity in tokens.
     pub kv_capacity_tokens: Option<u64>,
     /// Optional lane-local latent capacity in allocation units.
@@ -71,7 +66,11 @@ impl std::str::FromStr for LaneConfig {
         if lane.lane_id.is_empty()
             || lane.sm_budget == 0
             || lane.domains.is_empty()
-            || lane.domains.iter().copied().collect::<HashSet<_>>().len() != lane.domains.len()
+            || lane
+                .domains
+                .iter()
+                .any(|name| !matches!(name.as_str(), "prefill" | "decode" | "flow"))
+            || lane.domains.iter().collect::<HashSet<_>>().len() != lane.domains.len()
         {
             return Err("execution lane identity, SM budget, and domains must be valid".into());
         }
@@ -156,7 +155,7 @@ impl Default for WorkerProcessArgs {
             max_batch_operations: 128,
             max_batch_tokens: 16_384,
             attention_backend: uniserve_worker_ipc::AttentionBackend::Auto,
-            supported_ops: uniserve_worker_ipc::OpCode::ALL.to_vec(),
+            capability_groups: Vec::new(),
             transfer: Default::default(),
             stub: false,
             load_format: "auto".to_string(),
@@ -282,9 +281,9 @@ pub(super) struct RankProcess {
     depth: usize,
     rank: u32,
     world_size: u32,
-    expected_components: std::collections::BTreeMap<String, uniserve_core::EntryConfig>,
+    expected_components: std::collections::BTreeMap<String, uniserve_core::ComponentConfig>,
     pending: HashMap<u64, PendingRecord>,
-    ready: VecDeque<RunResult>,
+    ready: VecDeque<WorkerResult>,
     next_call_id: u64,
     command_wake_pending: bool,
     shutdown_sent: bool,
@@ -309,7 +308,7 @@ fn release_consumed_request(record: PendingRecord) -> OutstandingKind {
 enum OutstandingKind {
     Batch {
         run_id: u64,
-        remaining_operations: HashSet<(RequestKey, OpId)>,
+        remaining_operations: HashSet<(RequestKey, ComputationId)>,
     },
 }
 
@@ -321,7 +320,7 @@ impl RankProcess {
         rank: u32,
         world_size: u32,
         rendezvous: Option<std::sync::Arc<tempfile::TempDir>>,
-        components: &std::collections::BTreeMap<String, crate::executor::EntryConfig>,
+        components: &std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<Self> {
         let depth = args.pipeline_depth.max(1);
@@ -360,16 +359,9 @@ impl RankProcess {
             .arg(rank.to_string())
             .arg("--entries")
             .arg(serde_json::to_string(&components)?);
-        if args.supported_ops != uniserve_worker_ipc::OpCode::ALL {
-            cmd.arg("--supported-ops").arg(
-                args.supported_ops
-                    .iter()
-                    .map(|operation| operation.as_str())
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
+        if !args.capability_groups.is_empty() {
+            cmd.arg("--supported-ops")
+                .arg(args.capability_groups.join(","));
         }
         // Resolve mechanism ownership from the physical rank's incident edges.
         let (backends, publications) = args.transfer.rank_backends(&args.worker_id, rank);
@@ -451,6 +443,10 @@ impl RankProcess {
             WorkerResponse::Info { info, .. } => info,
             WorkerResponse::Error { error, .. } => {
                 bail!("Worker startup failed: {}", error.message)
+            }
+            WorkerResponse::Result { result, .. } => {
+                drop(WorkerResult::receive(result));
+                bail!("unexpected startup result response");
             }
             other => bail!("unexpected startup response: {:?}", other.kind()),
         };
@@ -611,74 +607,16 @@ impl RankProcess {
         Ok((drained, wakes))
     }
 
-    /// Validates response correlation and routes one decoded worker response.
+    /// Acquires output storage before validating response correlation.
     fn route(&mut self, call_id: u64, kind: OutstandingKind, frame: Frame) -> anyhow::Result<()> {
-        if frame.header.call_id != 0 && frame.header.call_id != call_id {
-            bail!(
-                "worker response call id mismatch: expected {call_id}, got {}",
-                frame.header.call_id
-            );
-        }
-        let wr = frame.decode_response()?;
-        if let Some(echoed) = wr.call_id()
-            && echoed != call_id
-        {
-            bail!("worker response echoed call id {echoed}, expected {call_id}");
-        }
-        match kind {
-            OutstandingKind::Batch {
-                run_id,
-                remaining_operations,
-            } => self.route_batch(run_id, remaining_operations, wr),
-        }
-    }
-
-    /// Accumulates a partial run response or schedules polling for remaining operations.
-    fn route_batch(
-        &mut self,
-        run_id: u64,
-        mut remaining_operations: HashSet<(RequestKey, OpId)>,
-        wr: WorkerResponse,
-    ) -> anyhow::Result<()> {
-        match wr {
-            WorkerResponse::Result { result: r, .. } => {
-                for product in &r.products {
-                    if let uniserve_worker_ipc::InlineValue::Transfer(handle) = &product.value {
-                        anyhow::ensure!(
-                            handle
-                                .locators()
-                                .all(|locator| locator.source == self.info.endpoint),
-                            "worker published a product from an unbound rank incarnation"
-                        );
-                    }
-                }
-                if r.run_id != run_id {
-                    bail!(
-                        "worker result step id mismatch: expected {run_id}, got {}",
-                        r.run_id
-                    );
-                }
-                for output in &r.completions {
-                    anyhow::ensure!(
-                        remaining_operations.remove(&(output.request_key, output.op_id)),
-                        "worker returned a duplicate or unknown operation for step {run_id}"
-                    );
-                }
-                anyhow::ensure!(
-                    !r.done || remaining_operations.is_empty(),
-                    "worker run completion flag disagrees with remaining physical work"
-                );
-                anyhow::ensure!(
-                    !r.completions.is_empty() || r.done,
-                    "worker returned an empty partial completion for step {run_id}"
-                );
-                let done = r.done;
-                enqueue_ready(&mut self.ready, r);
-                if !done {
-                    self.submit_completion_poll(run_id, remaining_operations)?;
-                }
-                Ok(())
-            }
+        let OutstandingKind::Batch {
+            run_id,
+            remaining_operations,
+        } = kind;
+        let response = frame.decode_response()?;
+        let echoed = response.call_id();
+        let report = match response {
+            WorkerResponse::Result { result, .. } => Ok(WorkerResult::receive(result)),
             WorkerResponse::Error { error, .. } => Err(WorkerExecError {
                 run_id: Some(run_id),
                 fatal: error.fatal,
@@ -690,15 +628,74 @@ impl RankProcess {
                 operations: error.operations,
             }
             .into()),
-            other => bail!("unexpected execute response kind: {:?}", other.kind()),
+            other => Err(anyhow::anyhow!(
+                "unexpected execute response kind: {:?}",
+                other.kind()
+            )),
+        };
+        if frame.header.call_id != 0 && frame.header.call_id != call_id {
+            bail!(
+                "worker response call id mismatch: expected {call_id}, got {}",
+                frame.header.call_id
+            );
         }
+        if let Some(echoed) = echoed
+            && echoed != call_id
+        {
+            bail!("worker response echoed call id {echoed}, expected {call_id}");
+        }
+        self.route_batch(run_id, remaining_operations, report?)
+    }
+
+    /// Accumulates a partial run response or schedules polling for remaining operations.
+    fn route_batch(
+        &mut self,
+        run_id: u64,
+        mut remaining_operations: HashSet<(RequestKey, ComputationId)>,
+        r: WorkerResult,
+    ) -> anyhow::Result<()> {
+        for product in &r.products {
+            anyhow::ensure!(
+                product
+                    .value
+                    .locators()
+                    .all(|locator| locator.source == self.info.endpoint),
+                "worker published a product from an unbound rank incarnation"
+            );
+        }
+        if r.run_id != run_id {
+            bail!(
+                "worker result step id mismatch: expected {run_id}, got {}",
+                r.run_id
+            );
+        }
+        for output in &r.results {
+            anyhow::ensure!(
+                remaining_operations.remove(&(output.output.request_key, output.output.op_id)),
+                "worker returned a duplicate or unknown operation for step {run_id}"
+            );
+        }
+        anyhow::ensure!(
+            !r.done || remaining_operations.is_empty(),
+            "worker run completion flag disagrees with remaining physical work"
+        );
+        anyhow::ensure!(
+            !r.results.is_empty() || r.done,
+            "worker returned an empty partial completion for step {run_id}"
+        );
+        let done = r.done;
+        self.ready.push_back(r);
+        if !done {
+            self.submit_completion_poll(run_id, remaining_operations)?;
+        }
+        Ok(())
     }
 
     /// Submits a continuation poll for the unresolved operations of one run.
     fn submit_completion_poll(
         &mut self,
         run_id: u64,
-        remaining_operations: HashSet<(RequestKey, OpId)>,
+        remaining_operations: HashSet<(RequestKey, ComputationId)>,
     ) -> anyhow::Result<()> {
         let call_id = self.alloc_call_id();
         let mut request = WorkerRequest::poll(run_id);
@@ -761,7 +758,7 @@ impl RankProcess {
     }
 
     /// Drives IPC progress until a result, command wake, worker death, or timeout.
-    pub(super) fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<RunResult>> {
+    pub(super) fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
         if self.command_wake_pending {
             return Ok(None);
         }

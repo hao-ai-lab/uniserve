@@ -10,13 +10,13 @@ from __future__ import annotations
 import torch
 
 from uniserve_worker.config import WorkerConfig
+from uniserve_worker.execution.batch import COMPUTATIONS
 
 from ..bootstrap.capacity import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
     DEFAULT_MAX_REQUEST_POOL_SIZE,
 )
-from ..execution.batch import OpCode
 from ..execution.forward_batch import (
     AttentionSelection,
     ForwardBatch,
@@ -157,7 +157,7 @@ class StubModel(ExecutionModel):
             latent_downsample=STUB_LATENT_DOWNSAMPLE,
         )
         self.max_vit_grid_tokens = STUB_MAX_LATENT_SIZE
-        self.supported_work = frozenset(OpCode)
+        self.supported_work = frozenset(COMPUTATIONS)
         self.vocab_size = _STUB_VOCAB_SIZE
         self.hidden_size = _STUB_HIDDEN_SIZE
         self.text_max_tokens = STUB_MAX_LATENT_SIZE

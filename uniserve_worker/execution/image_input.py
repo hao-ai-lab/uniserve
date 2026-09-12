@@ -14,7 +14,7 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as vision
 
-from uniserve_worker.execution.batch import EncodeMode
+from uniserve_worker.execution.batch import PipelineStage
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.models.inputs import (
     ImageProcessor,
@@ -39,7 +39,7 @@ class PreparedImage:
 
 def prepare_image(
     processor: ImageProcessor,
-    kind: EncodeMode,
+    kind: PipelineStage,
     encoded: str,
     *,
     device: torch.device,
@@ -47,7 +47,7 @@ def prepare_image(
     """Decode, resize, normalize, and stage one encoded image for the selected model tower."""
 
     image = _decode_rgb(encoded)
-    transform = processor.vit if kind is EncodeMode.VISION else processor.vae
+    transform = processor.vit if kind is PipelineStage.VISION_ENCODING else processor.vae
     if transform is None:
         raise invalid_descriptor(f"model declares no {kind.value} image transform")
 
@@ -84,7 +84,7 @@ def prepare_image(
 
 def prepare_tensor_image(
     processor: ImageProcessor,
-    kind: EncodeMode,
+    kind: PipelineStage,
     image: torch.Tensor,
     *,
     device: torch.device,
@@ -103,7 +103,7 @@ def prepare_tensor_image(
         value = (value + 1.0) * 0.5
     value = value.clamp(0.0, 1.0)
     source_height, source_width = int(value.shape[1]), int(value.shape[2])
-    transform = processor.vit if kind is EncodeMode.VISION else processor.vae
+    transform = processor.vit if kind is PipelineStage.VISION_ENCODING else processor.vae
     if transform is None:
         raise invalid_descriptor(f"model declares no {kind.value} image transform")
 

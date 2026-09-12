@@ -8,7 +8,7 @@ from threading import RLock
 
 import torch
 
-from ..execution.batch import BufferAllocation, BufferId, ProductRef
+from ..execution.batch import BufferAllocation, BufferId, TensorRef
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor
 from .device import canonical_device
 
@@ -96,7 +96,7 @@ class PersistentBuffers:
 
     def bind(
         self,
-        reference: ProductRef,
+        reference: TensorRef,
         allocation: BufferAllocation,
         *,
         device: torch.device | str,

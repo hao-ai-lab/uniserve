@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from uniserve_worker.bootstrap.cli import parse_worker_args
-from uniserve_worker.execution.batch import Domain
+from uniserve_worker.execution.batch import ForwardMode, PipelineStage
 
 pytestmark = pytest.mark.unit
 
@@ -187,7 +187,7 @@ def test_execution_lanes_are_typed_and_domain_disjoint() -> None:
         ("decode", 64),
         ("compute", 88),
     )
-    assert config.execution.lanes[0].domains == (Domain.DECODE,)
+    assert config.execution.lanes[0].computations == (ForwardMode.DECODE, ForwardMode.VERIFY)
 
 
 def test_execution_lanes_reject_duplicate_domain_bindings() -> None:
@@ -208,3 +208,30 @@ def test_execution_lanes_reject_duplicate_domain_bindings() -> None:
                 '{"lane_id":"b","sm_budget":64,"domains":["decode"]}',
             ]
         )
+
+
+@pytest.mark.parametrize(
+    ("selector", "expected"),
+    [
+        ("ar_decode", {ForwardMode.DECODE}),
+        ("diffusion_decode", {PipelineStage.VIDEO_DECODING, PipelineStage.AUDIO_DECODING}),
+        ("media_append", {PipelineStage.VIDEO_ENCODING, PipelineStage.AUDIO_ENCODING}),
+        ("diffusion_finalize", {PipelineStage.IMAGE_DECODING, PipelineStage.MUXING}),
+    ],
+)
+def test_launch_capabilities_select_concrete_computations(selector, expected):
+    config = parse_worker_args(
+        [
+            "--service-name",
+            "capabilities",
+            "--ipc-payload-cap",
+            "65536",
+            "--max-batch-tokens",
+            "8192",
+            "--model",
+            "model",
+            "--supported-ops",
+            selector,
+        ]
+    )
+    assert config.supported_ops == expected

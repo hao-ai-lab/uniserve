@@ -6,7 +6,7 @@
 //!
 //! Layout:
 //!
-//! - key = a `splitmix` fold of `(session_seed, authority_id, request_id,
+//! - key = a `splitmix` fold of `(session_seed, engine_id, request_id,
 //!   epoch, draw_layout)`, split into two 32-bit words;
 //! - counter = `[semantic_token_index low, semantic_token_index high,
 //!   processor_stage, draw_index]`;
@@ -73,14 +73,14 @@ pub fn philox4x32_10(mut counter: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
 /// Derives the 64-bit Philox key for one request lineage and draw space.
 pub fn sampling_key(
     session_seed: u64,
-    authority_id: u64,
+    engine_id: u64,
     request_id: u64,
-    epoch: u64,
+    request_epoch: u64,
     draw_layout: u64,
 ) -> u64 {
     // Fold coordinates in protocol order so the same tuple addresses the same
     // random stream in every runtime.
-    [authority_id, request_id, epoch, draw_layout]
+    [engine_id, request_id, request_epoch, draw_layout]
         .into_iter()
         .fold(session_seed, splitmix_coordinate)
 }

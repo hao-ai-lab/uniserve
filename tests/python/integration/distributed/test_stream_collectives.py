@@ -7,7 +7,7 @@ import torch
 import torch.multiprocessing as mp
 
 from uniserve_worker.config import LaneConfig
-from uniserve_worker.execution.batch import Domain
+from uniserve_worker.execution.batch import COMPUTATIONS, ForwardMode
 from uniserve_worker.execution.graph.full import FullCudaGraphBackend
 from uniserve_worker.execution.lane import create_green_contexts
 from uniserve_worker.nn.collective import stream_collective_scope
@@ -36,8 +36,16 @@ def _run_collectives(rank: int, rendezvous: str):
         group = mesh.get_group("tp")
         greens = create_green_contexts(
             (
-                LaneConfig("decode", 64, (Domain.DECODE,)),
-                LaneConfig("compute", 88, (Domain.PREFILL, Domain.FLOW)),
+                LaneConfig("decode", 64, (ForwardMode.DECODE, ForwardMode.VERIFY)),
+                LaneConfig(
+                    "compute",
+                    88,
+                    tuple(
+                        kind
+                        for kind in COMPUTATIONS
+                        if kind not in {ForwardMode.DECODE, ForwardMode.VERIFY}
+                    ),
+                ),
             ),
             device,
         )

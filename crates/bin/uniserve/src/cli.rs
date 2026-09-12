@@ -15,7 +15,7 @@ use uniserve_core::{KvCacheDtype, ModelDtype};
 use uniserve_engine::{
     AttentionBackend, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
-    FlashInferBackend, LaneConfig, TransportMap, WorkerConfig, WorkerProcessArgs,
+    FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
@@ -178,7 +178,7 @@ pub(crate) struct SharedRuntimeArgs {
     pub workers: Option<Box<[WorkerConfig]>>,
     /// Directed product bindings: source[:rank]->destination[:rank]=backend.
     #[arg(long)]
-    pub transfer: Option<TransportMap>,
+    pub transfer: Option<TransferConfig>,
     /// KV block size in tokens (the page size).
     #[arg(long = "page-size", default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     pub block_size: u32,

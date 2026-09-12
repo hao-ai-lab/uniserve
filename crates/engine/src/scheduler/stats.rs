@@ -122,13 +122,35 @@ pub struct ExecutionDomainStats {
 }
 
 impl ExecutionDomainStats {
-    /// Returns counters for one physical execution domain.
-    pub fn get(&self, domain: uniserve_worker_ipc::Domain) -> &DomainStats {
-        match domain {
-            uniserve_worker_ipc::Domain::Prefill => &self.prefill,
-            uniserve_worker_ipc::Domain::Decode => &self.decode,
-            uniserve_worker_ipc::Domain::Flow => &self.flow,
+    /// Public metrics aggregate concrete computations into three stable labels.
+    /// This index is used only for counters, never for execution or lane routing.
+    pub(super) const fn index(computation: uniserve_worker_ipc::Computation) -> usize {
+        use uniserve_worker_ipc::{Computation, ForwardMode, PipelineStage};
+        match computation {
+            Computation::Forward(ForwardMode::Decode | ForwardMode::Verify) => 1,
+            Computation::Forward(_)
+            | Computation::Transfer(_)
+            | Computation::Pipeline(
+                PipelineStage::TextEncoding
+                | PipelineStage::VisionEncoding
+                | PipelineStage::LatentEncoding,
+            ) => 0,
+            Computation::Pipeline(_) => 2,
         }
+    }
+
+    /// Stable public metric labels and their accumulated counters.
+    pub(super) fn groups(&self) -> [(&'static str, &DomainStats); 3] {
+        [
+            ("prefill", &self.prefill),
+            ("decode", &self.decode),
+            ("flow", &self.flow),
+        ]
+    }
+
+    /// Returns the public metrics counters for an actual computation.
+    pub fn get(&self, computation: uniserve_worker_ipc::Computation) -> &DomainStats {
+        self.groups()[Self::index(computation)].1
     }
 }
 
@@ -200,7 +222,7 @@ pub struct WorkerStats {
 
 /// Live scheduler stats, shared with the frontend for `/stats` observability.
 #[derive(Default)]
-pub struct SchedStats {
+pub struct SchedulerStats {
     /// General scheduler loop and queue counters.
     pub general: GeneralStats,
     /// Paged KV allocation and prefix-cache counters.

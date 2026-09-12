@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
-from uniserve_worker.execution.batch import BufferId, Finish, Free, Retire, Run
+from uniserve_worker.execution.batch import BufferId, Finish, Free, Run
 
 if TYPE_CHECKING:
     from uniserve_worker.runtime.cache_pool import CachePool
@@ -59,22 +59,24 @@ def _apply_release_controls(
     """Apply lifecycle releases in the phase required by their ownership contract."""
 
     consumed = {
-        (reference.request_key, int(reference.producer_op_id))
+        (reference.request_key, reference.producer_op_id)
         for operation in batch.operations
         for reference in (
-            *operation.inputs,
+            *operation.tensor_inputs(),
             *(() if operation.predicate is None else (operation.predicate,)),
         )
     }
-    releases = tuple(
-        (operation.request_key, operation.parent.op_id)
+    consumed.update(
+        (operation.kv_input.owner, operation.kv_input.producer_op_id)
         for operation in batch.operations
-        if operation.parent is not None
-        and operation.parent.op_id > 0
-        and (
-            ((operation.request_key, int(operation.parent.op_id)) not in consumed)
-            == before_execution
-        )
+        if operation.kv_input is not None
+    )
+    releases = tuple(
+        (operation.request_key, operation.predecessor)
+        for operation in batch.operations
+        if operation.predecessor is not None
+        and operation.predecessor.batch_id > 0
+        and (((operation.request_key, operation.predecessor) not in consumed) == before_execution)
     )
     device_products.release_operations(releases)
     encoder_cache.release_operations(releases)
@@ -91,7 +93,7 @@ def _apply_release_controls(
         closed = {
             command.request_key: frozenset(command.retained_buffers) - freed
             for command in batch.commands
-            if isinstance(command, (Finish, Retire))
+            if isinstance(command, Finish)
         }
         closing_publications = tuple(
             buffer
@@ -118,7 +120,7 @@ def _apply_release_controls(
             predicate.buffer_id
             for operation in batch.operations
             if (predicate := operation.predicate) is not None
-            and (operation.parent is None or predicate.producer_op_id != operation.parent.op_id)
+            and (operation.predecessor is None or predicate.producer_op_id != operation.predecessor)
         )
         device_products.release_buffers(consumed_predicates)
 

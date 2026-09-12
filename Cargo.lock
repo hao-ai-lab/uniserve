@@ -4079,8 +4079,10 @@ name = "uniserve-core"
 version = "0.2.0"
 dependencies = [
  "bitflags",
+ "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

@@ -1,28 +1,24 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
 from tests.python.fixtures.depth_one import (
     ar_params,
-    commit_for_completion,
     execution_run,
+    record_completion,
     root_parent,
     token_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.execution.batch import (
-    Checkpoint,
-    Commit,
-    DeviceSelected,
-    Disposition,
+    ComputationId,
     DrawLayout,
-    FixedCheckpoint,
-    Operation,
-    ProductKind,
+    ForwardMode,
     Rng,
     SamplingParams,
-    TokenMode,
 )
 from uniserve_worker.execution.output import finalize_run_result
 from uniserve_worker.models.stub import _next_token
@@ -37,11 +33,11 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
     device = "cuda:0"
     worker = execution_worker(device=device, pipeline_depth=2)
     warm_admission = ar_params(30, block_ids=(1,))
-    warm_operation, warm_input = token_operation(
+    warm_operation = token_operation(
         warm_admission.request_key,
-        op_id=100,
-        parent=root_parent(warm_admission),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(100, 0),
+        predecessor=root_parent(warm_admission),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
     worker.execute(
@@ -49,18 +45,17 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
             run_id=0,
             admissions=(warm_admission,),
             operations=(warm_operation,),
-            input_products=(warm_input,),
         )
     )
     torch.cuda.synchronize()
     worker.drop_request(30)
 
     admission = ar_params(31, block_ids=(0,))
-    parent, parent_input = token_operation(
+    predecessor = token_operation(
         admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(1, 0),
+        predecessor=root_parent(admission),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
 
@@ -68,32 +63,20 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
         execution_run(
             run_id=1,
             admissions=(admission,),
-            operations=(parent,),
-            input_products=(parent_input,),
+            operations=(predecessor,),
         )
     )
-    device_parent = Checkpoint(
-        parent.op_id,
-        DeviceSelected(),
-    )
-    successor_template, _ = token_operation(
+    device_parent = predecessor.op_id
+    successor_template = token_operation(
         admission.request_key,
-        op_id=2,
-        parent=device_parent,
-        mode=TokenMode.DECODE,
+        op_id=ComputationId(2, 0),
+        predecessor=device_parent,
+        mode=ForwardMode.DECODE,
         tokens=(0,),
-        predicate=next(output for output in parent.outputs if output.kind is ProductKind.TOKEN),
+        predicate=predecessor.token_output,
     )
-    successor = Operation.registered(
-        request_key=successor_template.request_key,
-        op_id=successor_template.op_id,
-        parent=device_parent,
-        kind=successor_template.kind,
-        bounds=successor_template.bounds,
-        outputs=successor_template.outputs,
-        predicate=successor_template.predicate,
-        rng=successor_template.rng,
-    )
+    successor = replace(successor_template, input_token_ids=())
+
     successor_report = worker.execute(
         execution_run(
             run_id=2,
@@ -109,38 +92,16 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
     first = _next_token(4)
     assert parent_report.completions[0].committed_tokens == (first,)
     assert successor_report.completions[0].committed_tokens == (_next_token(first),)
-    parent_record = parent_report.completions[0]
-    parent_selected = Checkpoint(
-        parent.op_id,
-        FixedCheckpoint(parent_record.selected_point),
-    )
-    worker.execute(
-        execution_run(
-            run_id=3,
-            admissions=(),
-            operations=(),
-            commands=(
-                Commit(
-                    request_key=admission.request_key,
-                    control_seq=1,
-                    expected_parent=root_parent(admission),
-                    selected=parent_selected,
-                    public_event_limit=1,
-                    disposition=Disposition.PUBLISH,
-                ),
-            ),
-        )
-    )
 
 
 def test_device_continuation_chain_matches_serial_token_sequence() -> None:
     worker = execution_worker(device="cuda:0", pipeline_depth=4)
     admission = ar_params(32, block_ids=(0,))
-    operation, token_input = token_operation(
+    operation = token_operation(
         admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(1, 0),
+        predecessor=root_parent(admission),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
     reports = [
@@ -149,24 +110,20 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
                 run_id=1,
                 admissions=(admission,),
                 operations=(operation,),
-                input_products=(token_input,),
             )
         )
     ]
     operations = [operation]
 
     for run_id in range(2, 5):
-        parent = operations[-1]
-        operation, token_input = token_operation(
+        predecessor = operations[-1]
+        operation = token_operation(
             admission.request_key,
-            op_id=run_id,
-            parent=Checkpoint(
-                parent.op_id,
-                DeviceSelected(),
-            ),
-            mode=TokenMode.DECODE,
+            op_id=ComputationId(run_id, 0),
+            predecessor=predecessor.op_id,
+            mode=ForwardMode.DECODE,
             tokens=(0,),
-            predicate=next(output for output in parent.outputs if output.kind is ProductKind.TOKEN),
+            predicate=predecessor.token_output,
         )
         reports.append(
             worker.execute(
@@ -174,7 +131,6 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
                     run_id=run_id,
                     admissions=(),
                     operations=(operation,),
-                    input_products=(token_input,),
                 )
             )
         )
@@ -195,11 +151,11 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
 def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
     worker = execution_worker(device="cuda:0", pipeline_depth=3)
     admission = ar_params(33, block_ids=(0,))
-    operation, token_input = token_operation(
+    operation = token_operation(
         admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(1, 0),
+        predecessor=root_parent(admission),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
     reports = [
@@ -208,30 +164,25 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
                 run_id=1,
                 admissions=(admission,),
                 operations=(operation,),
-                input_products=(token_input,),
             )
         )
     ]
     operations = [operation]
     for run_id in range(2, 5):
-        parent = operations[-1]
-        operation, token_input = token_operation(
+        predecessor = operations[-1]
+        operation = token_operation(
             admission.request_key,
-            op_id=run_id,
-            parent=Checkpoint(
-                parent.op_id,
-                DeviceSelected(),
-            ),
-            mode=TokenMode.DECODE,
+            op_id=ComputationId(run_id, 0),
+            predecessor=predecessor.op_id,
+            mode=ForwardMode.DECODE,
             tokens=(0,),
-            predicate=next(output for output in parent.outputs if output.kind is ProductKind.TOKEN),
+            predicate=predecessor.token_output,
         )
         reports.append(
             worker.execute(
                 execution_run(
                     run_id=run_id,
                     operations=(operation,),
-                    input_products=(token_input,),
                 )
             )
         )
@@ -239,8 +190,7 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
 
     torch.cuda.synchronize()
     tokens = tuple(
-        finalize_run_result(report).completions[0].committed_tokens[0]
-        for report in reports
+        finalize_run_result(report).completions[0].committed_tokens[0] for report in reports
     )
     expected = []
     current = 4
@@ -254,11 +204,11 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
     worker = execution_worker(device="cuda:0", pipeline_depth=2)
     sampling = SamplingParams(temperature=0.8, top_k=32, top_p=0.93, seed=917)
     pipelined = ar_params(41, block_ids=(2,), sampling=sampling)
-    parent, parent_input = token_operation(
+    predecessor = token_operation(
         pipelined.request_key,
-        op_id=1,
-        parent=root_parent(pipelined),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(1, 0),
+        predecessor=root_parent(pipelined),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
         rng=Rng(seed=917, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
@@ -266,20 +216,16 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         execution_run(
             run_id=1,
             admissions=(pipelined,),
-            operations=(parent,),
-            input_products=(parent_input,),
+            operations=(predecessor,),
         )
     )
-    successor, successor_input = token_operation(
+    successor = token_operation(
         pipelined.request_key,
-        op_id=2,
-        parent=Checkpoint(
-            parent.op_id,
-            DeviceSelected(),
-        ),
-        mode=TokenMode.DECODE,
+        op_id=ComputationId(2, 0),
+        predecessor=predecessor.op_id,
+        mode=ForwardMode.DECODE,
         tokens=(0,),
-        predicate=next(output for output in parent.outputs if output.kind is ProductKind.TOKEN),
+        predicate=predecessor.token_output,
         rng=Rng(seed=917, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
     successor_report = worker.execute(
@@ -287,7 +233,6 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
             run_id=2,
             admissions=(),
             operations=(successor,),
-            input_products=(successor_input,),
         )
     )
 
@@ -297,11 +242,11 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
 
     serial_worker = execution_worker(device="cuda:0", pipeline_depth=1)
     serial = ar_params(41, block_ids=(2,), sampling=sampling)
-    serial_parent, serial_parent_input = token_operation(
+    serial_parent = token_operation(
         serial.request_key,
-        op_id=11,
-        parent=root_parent(serial),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(11, 0),
+        predecessor=root_parent(serial),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
         rng=Rng(seed=917, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
@@ -310,29 +255,26 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
             run_id=11,
             admissions=(serial,),
             operations=(serial_parent,),
-            input_products=(serial_parent_input,),
         )
     )
     torch.cuda.synchronize()
     serial_parent_report = finalize_run_result(serial_parent_report)
     serial_first = serial_parent_report.completions[0].committed_tokens[0]
-    commit = commit_for_completion(serial_parent, serial_parent_report)
-    serial_successor, serial_successor_input = token_operation(
+    observation = record_completion(serial_parent, serial_parent_report)
+    serial_successor = token_operation(
         serial.request_key,
-        op_id=12,
-        parent=commit.selected,
-        mode=TokenMode.DECODE,
+        op_id=ComputationId(12, 0),
+        predecessor=observation.op_id,
+        mode=ForwardMode.DECODE,
         tokens=(serial_first,),
         rng=Rng(seed=917, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
-        control_seq=commit.control_seq,
     )
     serial_successor_report = serial_worker.execute(
         execution_run(
             run_id=12,
             admissions=(),
             operations=(serial_successor,),
-            commands=(commit,),
-            input_products=(serial_successor_input,),
+            commands=(),
         )
     )
     torch.cuda.synchronize()
@@ -354,11 +296,11 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
     )
     worker = execution_worker(device="cuda:0", pipeline_depth=2)
     pipelined = ar_params(57, block_ids=(3,), sampling=sampling)
-    parent, parent_input = token_operation(
+    predecessor = token_operation(
         pipelined.request_key,
-        op_id=1,
-        parent=root_parent(pipelined),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(1, 0),
+        predecessor=root_parent(pipelined),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
         rng=Rng(seed=613, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
@@ -366,20 +308,16 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         execution_run(
             run_id=1,
             admissions=(pipelined,),
-            operations=(parent,),
-            input_products=(parent_input,),
+            operations=(predecessor,),
         )
     )
-    successor, successor_input = token_operation(
+    successor = token_operation(
         pipelined.request_key,
-        op_id=2,
-        parent=Checkpoint(
-            parent.op_id,
-            DeviceSelected(),
-        ),
-        mode=TokenMode.DECODE,
+        op_id=ComputationId(2, 0),
+        predecessor=predecessor.op_id,
+        mode=ForwardMode.DECODE,
         tokens=(0,),
-        predicate=next(output for output in parent.outputs if output.kind is ProductKind.TOKEN),
+        predicate=predecessor.token_output,
         rng=Rng(seed=613, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
     successor_report = worker.execute(
@@ -387,7 +325,6 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
             run_id=2,
             admissions=(),
             operations=(successor,),
-            input_products=(successor_input,),
         )
     )
 
@@ -397,11 +334,11 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
 
     serial_worker = execution_worker(device="cuda:0", pipeline_depth=1)
     serial = ar_params(57, block_ids=(3,), sampling=sampling)
-    serial_parent, serial_parent_input = token_operation(
+    serial_parent = token_operation(
         serial.request_key,
-        op_id=11,
-        parent=root_parent(serial),
-        mode=TokenMode.EXTEND,
+        op_id=ComputationId(11, 0),
+        predecessor=root_parent(serial),
+        mode=ForwardMode.PREFILL,
         tokens=(3, 4),
         rng=Rng(seed=613, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
@@ -410,29 +347,26 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
             run_id=11,
             admissions=(serial,),
             operations=(serial_parent,),
-            input_products=(serial_parent_input,),
         )
     )
     torch.cuda.synchronize()
     serial_parent_report = finalize_run_result(serial_parent_report)
     serial_first = serial_parent_report.completions[0].committed_tokens[0]
-    commit = commit_for_completion(serial_parent, serial_parent_report)
-    serial_successor, serial_successor_input = token_operation(
+    observation = record_completion(serial_parent, serial_parent_report)
+    serial_successor = token_operation(
         serial.request_key,
-        op_id=12,
-        parent=commit.selected,
-        mode=TokenMode.DECODE,
+        op_id=ComputationId(12, 0),
+        predecessor=observation.op_id,
+        mode=ForwardMode.DECODE,
         tokens=(serial_first,),
         rng=Rng(seed=613, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
-        control_seq=commit.control_seq,
     )
     serial_successor_report = serial_worker.execute(
         execution_run(
             run_id=12,
             admissions=(),
             operations=(serial_successor,),
-            commands=(commit,),
-            input_products=(serial_successor_input,),
+            commands=(),
         )
     )
     torch.cuda.synchronize()

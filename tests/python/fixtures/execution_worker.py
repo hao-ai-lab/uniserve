@@ -12,7 +12,7 @@ from uniserve_worker.models.generation import LatentLayout
 from uniserve_worker.models.runtime import ExecutionModel
 from uniserve_worker.models.stub import StubModel, stub_worker_config
 from uniserve_worker.nn.mesh import Communicator
-from uniserve_worker.nn.parallel import EntryConfig
+from uniserve_worker.nn.parallel import ComponentConfig
 from uniserve_worker.worker import Worker
 
 
@@ -28,7 +28,7 @@ def execution_worker(
     max_batch_tokens: int = 8192,
     max_request_pool_size: int = 128,
     max_batch_operations: int | None = None,
-    components: tuple[tuple[str, EntryConfig], ...] = (),
+    components: tuple[tuple[str, ComponentConfig], ...] = (),
 ) -> Worker:
     ready = StubModel() if model is None else model
     worker_config = replace(

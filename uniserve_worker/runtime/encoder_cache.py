@@ -11,15 +11,15 @@ from typing import Final
 
 import torch
 
+from uniserve_worker.execution.batch import ComputationId
+
 from ..execution.batch import (
     BufferAllocation,
     BufferId,
     DType,
-    ProductKind,
-    ProductRef,
     RequestKey,
     StaticDim,
-    StorageClass,
+    TensorRef,
 )
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
 from ..transfer.tickets import TransferTicket
@@ -33,8 +33,8 @@ _DTYPES: Final[dict[DType, torch.dtype]] = {
     DType.BF16: torch.bfloat16,
     DType.F32: torch.float32,
 }
-_ReferenceKey = tuple[int, int, int, int, int]
-_OperationKey = tuple[RequestKey, int]
+_ReferenceKey = tuple[int, int, int, ComputationId, int]
+_OperationKey = tuple[RequestKey, ComputationId]
 
 
 def _invariant(message: str) -> WorkerError:
@@ -43,20 +43,20 @@ def _invariant(message: str) -> WorkerError:
     return WorkerError(code=WorkerErrorCode.INVARIANT_VIOLATION, message=message, fatal=True)
 
 
-def _reference_key(reference: ProductRef) -> _ReferenceKey:
+def _reference_key(reference: TensorRef) -> _ReferenceKey:
     """Build the generation-tagged lookup key for an encoder feature."""
 
     key = reference.request_key
     return (
-        int(key.authority_id),
+        int(key.engine_id),
         int(key.request_id),
-        int(key.epoch),
-        int(reference.producer_op_id),
+        int(key.request_epoch),
+        reference.producer_op_id,
         int(reference.output_index),
     )
 
 
-def _shape(reference: ProductRef) -> tuple[int, ...]:
+def _shape(reference: TensorRef) -> tuple[int, ...]:
     """Resolve an encoder feature's bounded dimensions to a concrete shape."""
 
     dims = tuple(
@@ -94,7 +94,7 @@ class _EncoderSlot:
 class EncoderWrite:
     """Owns a writable encoder-cache slot and its producer/reader synchronization events."""
 
-    reference: ProductRef
+    reference: TensorRef
     slot: _EncoderSlot
     physical_generation: int
     binding_id: int
@@ -117,12 +117,12 @@ class EncoderRead:
 
     tensor: torch.Tensor
     metadata: EncoderMetadata
-    consumer_op_id: int
+    consumer_op_id: ComputationId
     _write: EncoderWrite = field(repr=False, compare=False)
     _recorded: bool = field(default=False, repr=False, compare=False)
 
     @property
-    def reference(self) -> ProductRef:
+    def reference(self) -> TensorRef:
         """Expose the immutable logical encoder-product identity guarded by this read lease."""
 
         return self._write.reference
@@ -191,7 +191,7 @@ class EncoderCache:
 
     def bind_outputs(
         self,
-        bindings: tuple[tuple[ProductRef, torch.device | str], ...],
+        bindings: tuple[tuple[TensorRef, torch.device | str], ...],
         *,
         buffer_allocations: Mapping[BufferId, BufferAllocation],
     ) -> tuple[EncoderWrite, ...]:
@@ -206,16 +206,9 @@ class EncoderCache:
             keys = tuple(_reference_key(reference) for reference, _device in bindings)
             if len(set(keys)) != len(keys):
                 raise invalid_descriptor("encoder cache registration repeats a product identity")
-            validated: list[tuple[ProductRef, torch.device, BufferAllocation]] = []
+            validated: list[tuple[TensorRef, torch.device, BufferAllocation]] = []
             requested_by_device: dict[str, int] = {}
             for (reference, raw_device), key in zip(bindings, keys, strict=True):
-                if reference.kind not in {
-                    ProductKind.VISION_FEATURE,
-                    ProductKind.LATENT_FEATURE,
-                }:
-                    raise invalid_descriptor("encoder cache received a non-feature product")
-                if reference.storage_class is not StorageClass.LATENT_ARENA:
-                    raise invalid_descriptor("encoder feature has an incompatible storage class")
                 dtype = _DTYPES.get(reference.dtype)
                 if dtype is None:
                     raise invalid_descriptor("encoder feature dtype is unsupported")
@@ -242,7 +235,7 @@ class EncoderCache:
                 if requested_by_device[str(device)] > len(free):
                     raise resource_error("encoder cache has no query-ready device slot")
                 validated.append((reference, device, allocation))
-            prepared: list[tuple[ProductRef, torch.device, BufferAllocation, _EncoderSlot]] = []
+            prepared: list[tuple[TensorRef, torch.device, BufferAllocation, _EncoderSlot]] = []
             try:
                 for reference, device, allocation in validated:
                     slot = self._slots[str(device)][self._free[str(device)].popleft()]
@@ -324,9 +317,9 @@ class EncoderCache:
 
     def consume(
         self,
-        reference: ProductRef,
+        reference: TensorRef,
         *,
-        consumer_op_id: int,
+        consumer_op_id: ComputationId,
         device: torch.device | str | None = None,
     ) -> EncoderRead:
         """Acquire a generation-safe encoder feature read on the consumer device."""
@@ -351,7 +344,7 @@ class EncoderCache:
             return EncoderRead(
                 tensor=entry.tensor,
                 metadata=entry.metadata,
-                consumer_op_id=int(consumer_op_id),
+                consumer_op_id=consumer_op_id,
                 _write=entry,
             )
 
@@ -412,7 +405,7 @@ class EncoderCache:
             for key, entry in zip(keys, entries, strict=True):
                 self._entries[key] = entry
                 self._operations.setdefault(
-                    (entry.reference.request_key, int(entry.reference.producer_op_id)), []
+                    (entry.reference.request_key, entry.reference.producer_op_id), []
                 ).append(entry)
                 self._candidates.pop(entry.binding_id)
 
@@ -475,12 +468,12 @@ class EncoderCache:
                 for entry in (*self._entries.values(), *self._candidates.values())
             )
 
-    def release_operations(self, releases: Iterable[tuple[RequestKey, int]]) -> None:
+    def release_operations(self, releases: Iterable[tuple[RequestKey, ComputationId]]) -> None:
         """Release encoder products associated with completed operation identities."""
 
         with self._lock:
             for request_key, raw_op_id in releases:
-                for entry in self._operations.pop((request_key, int(raw_op_id)), ()):
+                for entry in self._operations.pop((request_key, raw_op_id), ()):
                     entry.released = True
             self._reclaim_ready_locked()
 
@@ -547,7 +540,7 @@ class EncoderCache:
             self._free.clear()
             self._slots.clear()
 
-    def _require_locked(self, reference: ProductRef) -> EncoderWrite:
+    def _require_locked(self, reference: TensorRef) -> EncoderWrite:
         """Resolve a live generation-tagged encoder entry."""
 
         entry = self._entries.get(_reference_key(reference))
@@ -577,7 +570,7 @@ class EncoderCache:
     def _detach_locked(self, entry: EncoderWrite) -> None:
         """Remove one encoder entry and release its physical storage and events."""
 
-        key = (entry.reference.request_key, int(entry.reference.producer_op_id))
+        key = (entry.reference.request_key, entry.reference.producer_op_id)
         entries = self._operations.get(key)
         if entries is None:
             return

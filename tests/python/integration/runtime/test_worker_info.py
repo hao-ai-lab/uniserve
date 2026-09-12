@@ -9,7 +9,7 @@ import pytest
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
 from uniserve_worker.config import LaneConfig, WorkerConfig
-from uniserve_worker.execution.batch import Domain, OpCode
+from uniserve_worker.execution.batch import COMPUTATIONS, ForwardMode, PipelineStage
 from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry
 from uniserve_worker.models.stub import StubModel, stub_worker_config
 from uniserve_worker.worker import Worker
@@ -41,7 +41,7 @@ def test_action_model_reports_zero_kv_geometry() -> None:
     class ActionModel(ExecutionModel):
         architecture = "ActionModel"
         resource_geometry = ResourceGeometry(kv=False)
-        supported_work = frozenset({OpCode.DIFFUSION_DECODE})
+        supported_work = frozenset({PipelineStage.VIDEO_DECODING})
         generation = None
 
     worker_config = WorkerConfig(
@@ -101,8 +101,19 @@ def test_worker_info_reports_limits_safe_for_all_bound_lanes(with_lane_limits) -
         stub_worker_config(16, max_batch_tokens=256),
         max_batch_operations=4,
         lanes=(
-            LaneConfig("decode", 64, (Domain.DECODE,), max_batch_operations=2),
-            LaneConfig("compute", 64, (Domain.PREFILL, Domain.FLOW), max_batch_tokens=128),
+            LaneConfig(
+                "decode", 64, (ForwardMode.DECODE, ForwardMode.VERIFY), max_batch_operations=2
+            ),
+            LaneConfig(
+                "compute",
+                64,
+                tuple(
+                    kind
+                    for kind in COMPUTATIONS
+                    if kind not in {ForwardMode.DECODE, ForwardMode.VERIFY}
+                ),
+                max_batch_tokens=128,
+            ),
         )
         if with_lane_limits
         else (),
@@ -120,8 +131,8 @@ def test_worker_identity_and_capabilities_reflect_enabled_operations() -> None:
     identities = []
     config = replace(stub_worker_config(16, max_batch_tokens=256), graph_policy="off")
     for allowed in (
-        frozenset({OpCode.AR_EXTEND}),
-        frozenset({OpCode.AR_EXTEND, OpCode.AR_DECODE}),
+        frozenset({ForwardMode.PREFILL}),
+        frozenset({ForwardMode.PREFILL, ForwardMode.DECODE}),
     ):
         with Worker(
             StubModel(),
@@ -134,8 +145,8 @@ def test_worker_identity_and_capabilities_reflect_enabled_operations() -> None:
         ) as worker:
             info = worker.info.to_mapping()
             assert set(info["supported_ops"]) == {code.value for code in allowed}
-            assert worker.supports_run_kind(OpCode.AR_EXTEND)
-            assert worker.supports_run_kind(OpCode.AR_DECODE) == (OpCode.AR_DECODE in allowed)
+            assert worker.supports_run_kind(ForwardMode.PREFILL)
+            assert worker.supports_run_kind(ForwardMode.DECODE) == (ForwardMode.DECODE in allowed)
             identities.append(info["configuration_id"])
 
     # Same model and geometry, but different executable work: callers must not

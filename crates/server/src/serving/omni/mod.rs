@@ -10,25 +10,15 @@ use crate::profile::omni::resolution::{ResolutionPolicy, resolve_resolution};
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use base64::Engine as _;
 use uniserve_core::{
-    ContextSegment as CoreContextSegment, GenerationBehaviorDescriptor,
-    GenerationCachePolicyDescriptor, GenerationConstraint, GenerationLimits,
-    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageIngestRecipe,
-    ImageParams, ImageSegment as CoreImageSegment, RequestId, SamplingParams, SegmentPosition,
-    UndVisibility,
+    GenerationConstraint, GenerationRequest, ImageEncoderInput, ImageInput, ImageParams,
+    MultimodalInputs, SamplingParams,
 };
 
 use crate::serving::chat::{
     ChatContent, ChatContentPart, ChatMessage, ChatRequest, GenerationPromptMode, HfChatRenderer,
 };
-use crate::serving::input::{
-    GenerateReqInput, ModalitySelection, ModelEventIdentity, OutputProcessorPolicy, PromptInput,
-    TokenizedGenerateReqInput,
-};
-use crate::serving::text::TextDecodeOptions;
+use crate::serving::input::{ModalitySelection, OutputProcessorPolicy, PromptInput};
 use crate::serving::text::tokenizer::DynTokenizer;
-use crate::serving::{
-    CacheAccounting, ResourceAccounting, Result, ServeError, cache_isolation_key,
-};
 
 pub(crate) use output::{SenseNovaOutputProcessor, SenseNovaTextDelta};
 
@@ -78,32 +68,6 @@ mod context_image_defaults {
     pub(super) const RESOLUTION: u32 = 512;
 }
 
-/// Profile and request values shared by multimodal tokenizers.
-pub(super) struct RuntimeBinding<'a> {
-    pub(super) tokenizer: DynTokenizer,
-    pub(super) renderer: &'a HfChatRenderer,
-    pub(super) limits: &'a GenerationLimits,
-    pub(super) default_max_output_tokens: Option<u32>,
-    pub(super) max_model_tokens: u32,
-    pub(super) identity: ModelEventIdentity,
-}
-
-#[derive(Debug, Clone)]
-struct LoweredInput {
-    prompt_ids: Vec<u32>,
-    negative_prompt_ids: Vec<u32>,
-    sampling: SamplingParams,
-    image: ImageParams,
-    constraint: GenerationConstraint,
-    images: Vec<RenderedImage>,
-    stop_token_ids: Vec<u32>,
-}
-
-#[derive(Debug, Clone)]
-struct PositionedImageInput {
-    b64: String,
-}
-
 #[derive(Debug, Clone)]
 struct RenderedImage {
     hash: u64,
@@ -111,128 +75,135 @@ struct RenderedImage {
     b64: String,
 }
 
-/// Tokenizes and lowers a request using the SenseNova profile.
-pub(super) fn tokenize_sensenova(
+/// Fills the SenseNova prompt, image inputs, and image-generation parameters.
+pub(super) fn preprocess_sensenova(
     profile: &SenseNovaProfile,
-    binding: RuntimeBinding<'_>,
-    request: GenerateReqInput,
-) -> Result<TokenizedGenerateReqInput> {
-    let request_id = request.request_id.clone();
-    let result = (|| {
-        let lowered = lower_sensenova(profile, &binding.tokenizer, binding.renderer, &request)?;
-        let context = build_sensenova_context(profile, &lowered)?;
-        let policy = profile
-            .generation_policy_for_dimensions(lowered.image.width, lowered.image.height)
-            .map_err(|error| error.to_string())?;
-        finish_tokenized(
-            &binding,
-            &policy,
-            request,
-            lowered,
-            context,
-            OutputProcessorPolicy::SenseNova(profile.output_filter.clone()),
-        )
-    })();
-    result.map_err(|source| ServeError::Tokenize {
+    processor: &crate::serving::InputProcessor,
+    request_id: &crate::serving::ServeRequestId,
+    prompt: PromptInput,
+    images: Vec<crate::serving::ImageInput>,
+    negative_text: Option<String>,
+    image_gen: Option<crate::serving::ImageGenControls>,
+    generation: &mut GenerationRequest,
+) -> OmniResult<OutputProcessorPolicy> {
+    let (prompt_token_ids, images) = sensenova_prompt(
+        profile,
+        &processor.tokenizer,
+        processor
+            .renderer
+            .as_ref()
+            .expect("text models require a chat renderer"),
         request_id,
-        source: crate::serving::TokenizeError::Omni(source),
-    })
-}
-
-/// Tokenizes and lowers a request using the Bagel profile.
-pub(super) fn tokenize_bagel(
-    profile: &BagelProfile,
-    binding: RuntimeBinding<'_>,
-    request: GenerateReqInput,
-) -> Result<TokenizedGenerateReqInput> {
-    let request_id = request.request_id.clone();
-    let result = (|| {
-        let lowered = lower_bagel(profile, &binding.tokenizer, binding.renderer, &request)?;
-        let context = build_bagel_context(profile, &lowered)?;
-        let policy = profile
-            .generation_policy_for_dimensions(lowered.image.width, lowered.image.height)
-            .map_err(|error| error.to_string())?;
-        finish_tokenized(
-            &binding,
-            &policy,
-            request,
-            lowered,
-            context,
-            OutputProcessorPolicy::Bagel,
-        )
-    })();
-    result.map_err(|source| ServeError::Tokenize {
-        request_id,
-        source: crate::serving::TokenizeError::Omni(source),
-    })
-}
-
-/// Lowers a SenseNova request into token, image, sampling, and termination inputs.
-fn lower_sensenova(
-    profile: &SenseNovaProfile,
-    tokenizer: &DynTokenizer,
-    renderer: &HfChatRenderer,
-    request: &GenerateReqInput,
-) -> OmniResult<LoweredInput> {
-    let constraint = generation_constraint(request);
-    let (prompt_ids, images) = sensenova_prompt(profile, tokenizer, renderer, request, constraint)?;
-    validate_prompt(&prompt_ids)?;
-    let negative_prompt_ids = profile
-        .render_negative_prompt_ids(tokenizer, request.negative_text.as_deref().unwrap_or(""))
+        prompt,
+        images.into_iter().map(|image| image.b64).collect(),
+        generation.constraint,
+    )?;
+    validate_prompt(&prompt_token_ids)?;
+    let negative_prompt_token_ids = profile
+        .render_negative_prompt_ids(&processor.tokenizer, negative_text.as_deref().unwrap_or(""))
         .map_err(|error| error.to_string())?;
-    Ok(LoweredInput {
-        prompt_ids,
-        negative_prompt_ids,
-        sampling: resolve_sampling(request)?,
-        image: resolve_image_params(
-            &profile.image_defaults,
-            &profile.resolution_policy,
-            request,
-            constraint,
-        )?,
-        constraint,
+    let image = resolve_image_params(
+        &profile.image_defaults,
+        &profile.resolution_policy,
+        image_gen.unwrap_or_default(),
+        generation.sampling.seed,
+        negative_text.unwrap_or_default(),
+        generation.constraint,
+    )?;
+    let multimodal_inputs = prepare_image_inputs(
+        prompt_token_ids.len(),
         images,
-        stop_token_ids: request.stop.stop_token_ids.clone(),
-    })
+        profile.image_num_positions,
+        |width, height, count| {
+            profile
+                .image_encoders_for_dimensions(width, height, count)
+                .map_err(OmniError::from)
+        },
+    )?;
+    let policy = profile
+        .image_generation_for_dimensions(image.width, image.height)
+        .map_err(|error| error.to_string())?;
+    generation.prompt_token_ids = prompt_token_ids;
+    generation.negative_prompt_token_ids = negative_prompt_token_ids;
+    generation.multimodal_inputs = multimodal_inputs;
+    generation.image = image;
+
+    generation.image_generation = policy;
+    Ok(OutputProcessorPolicy::SenseNova(
+        profile.output_filter.clone(),
+    ))
 }
 
-/// Lowers a Bagel request into token, image, sampling, and termination inputs.
-fn lower_bagel(
+/// Renders Bagel input with the model's context-image conditioning rules.
+pub(super) fn preprocess_bagel(
     profile: &BagelProfile,
-    tokenizer: &DynTokenizer,
-    renderer: &HfChatRenderer,
-    request: &GenerateReqInput,
-) -> OmniResult<LoweredInput> {
-    let constraint = generation_constraint(request);
-    let (prompt_ids, images, context_image_mode) =
-        bagel_prompt(profile, tokenizer, renderer, request, constraint)?;
-    validate_prompt(&prompt_ids)?;
-    let negative_prompt_ids = if context_image_mode {
-        prompt_ids.clone()
+    processor: &crate::serving::InputProcessor,
+    request_id: &crate::serving::ServeRequestId,
+    prompt: PromptInput,
+    images: Vec<crate::serving::ImageInput>,
+    negative_text: Option<String>,
+    image_gen: Option<crate::serving::ImageGenControls>,
+    generation: &mut GenerationRequest,
+) -> OmniResult<OutputProcessorPolicy> {
+    let (prompt_token_ids, images, context_image_mode) = bagel_prompt(
+        profile,
+        &processor.tokenizer,
+        processor
+            .renderer
+            .as_ref()
+            .expect("text models require a chat renderer"),
+        request_id,
+        prompt,
+        images.into_iter().map(|image| image.b64).collect(),
+        generation.constraint,
+    )?;
+    validate_prompt(&prompt_token_ids)?;
+    let negative_prompt_token_ids = if context_image_mode {
+        prompt_token_ids.clone()
     } else {
         profile
-            .render_negative_prompt_ids(tokenizer, request.negative_text.as_deref().unwrap_or(""))
+            .render_negative_prompt_ids(
+                &processor.tokenizer,
+                negative_text.as_deref().unwrap_or(""),
+            )
             .map_err(|error| error.to_string())?
     };
     let image = if context_image_mode {
-        bagel_context_image_params(profile, request)?
+        bagel_context_image_params(
+            profile,
+            image_gen.unwrap_or_default(),
+            generation.sampling.seed,
+        )?
     } else {
         resolve_image_params(
             &profile.image_defaults,
             &profile.resolution_policy,
-            request,
-            constraint,
+            image_gen.unwrap_or_default(),
+            generation.sampling.seed,
+            negative_text.unwrap_or_default(),
+            generation.constraint,
         )?
     };
-    Ok(LoweredInput {
-        prompt_ids,
-        negative_prompt_ids,
-        sampling: resolve_sampling(request)?,
-        image,
-        constraint,
+    let multimodal_inputs = prepare_image_inputs(
+        prompt_token_ids.len(),
         images,
-        stop_token_ids: request.stop.stop_token_ids.clone(),
-    })
+        profile.image_num_positions,
+        |width, height, count| {
+            profile
+                .image_encoders_for_dimensions(width, height, count)
+                .map_err(OmniError::from)
+        },
+    )?;
+    let policy = profile
+        .image_generation_for_dimensions(image.width, image.height)
+        .map_err(|error| error.to_string())?;
+    generation.prompt_token_ids = prompt_token_ids;
+    generation.negative_prompt_token_ids = negative_prompt_token_ids;
+    generation.multimodal_inputs = multimodal_inputs;
+    generation.image = image;
+
+    generation.image_generation = policy;
+    Ok(OutputProcessorPolicy::None)
 }
 
 /// Renders a SenseNova text or chat prompt and resolves positioned input images.
@@ -240,26 +211,33 @@ fn sensenova_prompt(
     profile: &SenseNovaProfile,
     tokenizer: &DynTokenizer,
     renderer: &HfChatRenderer,
-    request: &GenerateReqInput,
+    request_id: &str,
+    prompt: PromptInput,
+    images: Vec<String>,
     constraint: GenerationConstraint,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
-    match &request.prompt {
+    match prompt {
         PromptInput::Text(prompt) => {
-            let images = top_level_images(request);
             if images.is_empty() {
                 let prompt_ids = profile
-                    .render_prompt_ids(tokenizer, constraint, prompt, None, None)
+                    .render_prompt_ids(tokenizer, constraint, &prompt, None, None)
                     .map_err(|error| error.to_string())?;
                 Ok((prompt_ids, Vec::new()))
             } else {
-                let placeholders = image_placeholders(request.request_id.as_ref(), images.len());
-                let prompt = prompt_with_image_slots(prompt, &placeholders);
+                let placeholders = image_placeholders(request_id, images.len());
+                let prompt = prompt_with_image_slots(&prompt, &placeholders);
                 let rendered = profile.render_prompt_text(constraint, &prompt, None, None);
-                tokenize_sensenova_with_slots(tokenizer, &rendered, &placeholders, images, profile)
+                preprocess_sensenova_with_slots(
+                    tokenizer,
+                    &rendered,
+                    &placeholders,
+                    images,
+                    profile,
+                )
             }
         }
-        PromptInput::Chat { .. } => {
-            render_sensenova_chat(profile, tokenizer, renderer, request, constraint)
+        PromptInput::Chat(chat) => {
+            render_sensenova_chat(profile, tokenizer, renderer, request_id, chat, constraint)
         }
     }
 }
@@ -269,16 +247,19 @@ fn bagel_prompt(
     profile: &BagelProfile,
     tokenizer: &DynTokenizer,
     renderer: &HfChatRenderer,
-    request: &GenerateReqInput,
+    request_id: &str,
+    prompt: PromptInput,
+    images: Vec<String>,
     constraint: GenerationConstraint,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>, bool)> {
-    match &request.prompt {
-        PromptInput::Chat { .. } => {
-            let (prompt_ids, images) = render_bagel_chat(tokenizer, renderer, request, constraint)?;
+    match prompt {
+        PromptInput::Chat(chat) => {
+            let (prompt_ids, images) =
+                render_bagel_chat(tokenizer, renderer, request_id, chat, constraint)?;
             Ok((prompt_ids, images, false))
         }
         PromptInput::Text(prompt)
-            if constraint == GenerationConstraint::UndOnly && !request.images.is_empty() =>
+            if constraint == GenerationConstraint::UndOnly && !images.is_empty() =>
         {
             let mut prompt_ids = profile
                 .wrap_context_text(tokenizer, CONTEXT_SYSTEM_PROMPT)
@@ -286,23 +267,22 @@ fn bagel_prompt(
             let image_position = prompt_ids.len() as u32;
             prompt_ids.extend(
                 profile
-                    .wrap_context_text(tokenizer, prompt)
+                    .wrap_context_text(tokenizer, &prompt)
                     .map_err(|error| error.to_string())?,
             );
-            let images = top_level_images(request)
+            let images = images
                 .into_iter()
-                .map(|image| rendered_image(&image, image_position))
+                .map(|image| rendered_image(image, image_position))
                 .collect();
             Ok((prompt_ids, images, true))
         }
         PromptInput::Text(prompt) => {
-            let images = top_level_images(request);
             let prompt_ids = profile
                 .render_prompt_ids(
                     tokenizer,
                     constraint,
                     !images.is_empty(),
-                    prompt,
+                    &prompt,
                     None,
                     None,
                 )
@@ -310,7 +290,7 @@ fn bagel_prompt(
             let position = prompt_ids.len() as u32;
             let images = images
                 .into_iter()
-                .map(|image| rendered_image(&image, position))
+                .map(|image| rendered_image(image, position))
                 .collect();
             Ok((prompt_ids, images, false))
         }
@@ -322,54 +302,37 @@ fn render_sensenova_chat(
     profile: &SenseNovaProfile,
     tokenizer: &DynTokenizer,
     renderer: &HfChatRenderer,
-    request: &GenerateReqInput,
+    request_id: &str,
+    mut chat: ChatRequest,
     constraint: GenerationConstraint,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
-    let PromptInput::Chat {
-        messages,
-        tools,
-        tool_choice,
-        reasoning_effort,
-    } = &request.prompt
-    else {
-        unreachable!("caller matched chat prompt")
-    };
-    let mut messages = messages.clone();
-    if !messages
+    if !chat
+        .messages
         .iter()
         .any(|message| matches!(message, ChatMessage::System { .. }))
         && let Some(system) = SenseNovaProfile::default_system_prompt(constraint)
     {
-        messages.insert(0, ChatMessage::system(system));
+        chat.messages.insert(0, ChatMessage::system(system));
     }
     let mut generation_prompt_mode = GenerationPromptMode::StartNewAssistant;
     let assistant_prefix = SenseNovaProfile::assistant_prefix(constraint);
     if !assistant_prefix.is_empty() {
-        messages.push(ChatMessage::assistant_text(assistant_prefix));
+        chat.messages
+            .push(ChatMessage::assistant_text(assistant_prefix));
         generation_prompt_mode = GenerationPromptMode::ContinueFinalAssistant;
     }
-    let (images, placeholders) = replace_chat_images(request.request_id.as_ref(), &mut messages)?;
-    let rendered = renderer
-        .render(&ChatRequest {
-            messages,
-            chat_options: crate::serving::chat::ChatOptions {
-                generation_prompt_mode,
-                reasoning_effort: *reasoning_effort,
-            },
-            tools: tools.clone(),
-            tool_choice: *tool_choice,
-            decode_options: TextDecodeOptions::default(),
-        })
-        .map_err(|error| error.to_string())?;
-    tokenize_sensenova_with_slots(tokenizer, &rendered, &placeholders, images, profile)
+    let (images, placeholders) = replace_chat_images(request_id, &mut chat.messages)?;
+    chat.chat_options.generation_prompt_mode = generation_prompt_mode;
+    let rendered = renderer.render(&chat).map_err(|error| error.to_string())?;
+    preprocess_sensenova_with_slots(tokenizer, &rendered, &placeholders, images, profile)
 }
 
 /// Replaces SenseNova image slots and computes their positions in token space.
-fn tokenize_sensenova_with_slots(
+fn preprocess_sensenova_with_slots(
     tokenizer: &DynTokenizer,
     rendered: &str,
     placeholders: &[String],
-    images: Vec<PositionedImageInput>,
+    images: Vec<String>,
     profile: &SenseNovaProfile,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     let marker = format!(
@@ -399,7 +362,7 @@ fn tokenize_sensenova_with_slots(
             let position = position
                 .try_into()
                 .map_err(|_| "SenseNova image params exceeds the token range".to_string())?;
-            Ok(rendered_image(&image, position))
+            Ok(rendered_image(image, position))
         })
         .collect::<OmniResult<Vec<_>>>()?;
     Ok((prompt_ids, images))
@@ -409,39 +372,21 @@ fn tokenize_sensenova_with_slots(
 fn render_bagel_chat(
     tokenizer: &DynTokenizer,
     renderer: &HfChatRenderer,
-    request: &GenerateReqInput,
+    request_id: &str,
+    mut chat: ChatRequest,
     constraint: GenerationConstraint,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
-    let PromptInput::Chat {
-        messages,
-        tools,
-        tool_choice,
-        reasoning_effort,
-    } = &request.prompt
-    else {
-        unreachable!("caller matched chat prompt")
-    };
-    let mut messages = messages.clone();
-    if !messages
+    if !chat
+        .messages
         .iter()
         .any(|message| matches!(message, ChatMessage::System { .. }))
         && let Some(system) = BagelProfile::default_system_prompt(constraint)
     {
-        messages.insert(0, ChatMessage::system(system));
+        chat.messages.insert(0, ChatMessage::system(system));
     }
-    let (images, placeholders) = replace_chat_images(request.request_id.as_ref(), &mut messages)?;
-    let rendered = renderer
-        .render(&ChatRequest {
-            messages,
-            chat_options: crate::serving::chat::ChatOptions {
-                generation_prompt_mode: GenerationPromptMode::StartNewAssistant,
-                reasoning_effort: *reasoning_effort,
-            },
-            tools: tools.clone(),
-            tool_choice: *tool_choice,
-            decode_options: TextDecodeOptions::default(),
-        })
-        .map_err(|error| error.to_string())?;
+    let (images, placeholders) = replace_chat_images(request_id, &mut chat.messages)?;
+    chat.chat_options.generation_prompt_mode = GenerationPromptMode::StartNewAssistant;
+    let rendered = renderer.render(&chat).map_err(|error| error.to_string())?;
     tokenize_bagel_with_slots(tokenizer, &rendered, &placeholders, images)
 }
 
@@ -450,7 +395,7 @@ fn tokenize_bagel_with_slots(
     tokenizer: &DynTokenizer,
     rendered: &str,
     placeholders: &[String],
-    images: Vec<PositionedImageInput>,
+    images: Vec<String>,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     let (clean, byte_offsets) = replace_rendered_slots(rendered, placeholders, "")?;
     let prompt_ids = tokenizer
@@ -466,31 +411,29 @@ fn tokenize_bagel_with_slots(
                 .len()
                 .try_into()
                 .map_err(|_| "Bagel image params exceeds the token range".to_string())?;
-            Ok(rendered_image(&image, position))
+            Ok(rendered_image(image, position))
         })
         .collect::<OmniResult<Vec<_>>>()?;
     Ok((prompt_ids, images))
 }
 
-/// Validates resolved multimodal state and assembles the canonical engine request.
-fn finish_tokenized(
-    binding: &RuntimeBinding<'_>,
-    policy: &GenerationPolicyDescriptor,
-    request: GenerateReqInput,
-    mut lowered: LoweredInput,
-    mut context: Vec<CoreContextSegment>,
-    output_processor: OutputProcessorPolicy,
-) -> OmniResult<TokenizedGenerateReqInput> {
+/// Resolves sampling and checks multimodal requirements against loaded model limits.
+pub(super) fn prepare_generation_resources(
+    processor: &crate::serving::InputProcessor,
+    controls: &crate::serving::SamplingConfig,
+    stop: &crate::serving::StopConfig,
+    generation: &mut GenerationRequest,
+) -> OmniResult<()> {
+    generation.sampling = resolve_sampling(controls, generation.sampling.seed)?;
     // Resolve the autoregressive budget only for requests whose behavior can
     // enter text decoding.
-    let prompt_tokens = u32::try_from(lowered.prompt_ids.len())
+    let prompt_tokens = u32::try_from(generation.prompt_token_ids.len())
         .map_err(|_| "generation prompt exceeds the supported token count".to_string())?;
-    let behavior = GenerationBehaviorDescriptor::resolve(lowered.constraint, policy);
-    let mut max_tokens = if behavior.und_decode {
+    generation.max_und_tokens = if generation.decodes_text() {
         crate::serving::text::resolve_max_tokens(
-            request.sampling.max_tokens,
-            binding.default_max_output_tokens,
-            Some(binding.max_model_tokens),
+            controls.max_tokens,
+            processor.config.sampling_defaults.max_output_tokens,
+            Some(processor.config.max_model_tokens()),
             prompt_tokens,
         )
         .map_err(|error| error.to_string())? as usize
@@ -500,154 +443,70 @@ fn finish_tokenized(
 
     // Sampling choices determine logprob delivery and whether prefix-cache
     // reads remain semantically valid for this request.
-    apply_request_sampling(&binding.tokenizer, &request, &mut lowered.sampling)?;
-    let prompt_logprobs_requested = lowered.sampling.prompt_logprobs_requested();
-    let generated_logprobs_requested = lowered.sampling.generated_logprobs_requested();
-    let cache = GenerationCachePolicyDescriptor {
-        read: !request.cache.bypass_read && !prompt_logprobs_requested,
-        write: !request.cache.no_store,
-        isolation_key: cache_isolation_key(
-            request.cache.namespace.as_deref(),
-            request.cache.salt.as_deref(),
-        ),
-    };
-    for segment in &mut context {
-        if let CoreContextSegment::Image { image, .. } = segment {
-            image.hash = isolated_cache_key(image.hash, cache.isolation_key);
-        }
+    apply_request_sampling(
+        &processor.tokenizer,
+        controls,
+        stop,
+        &mut generation.sampling,
+    )?;
+    let prompt_logprobs_requested = generation.sampling.prompt_logprobs_requested();
+    generation.cache.read &= !prompt_logprobs_requested;
+    for image in &mut generation.multimodal_inputs.images {
+        image.hash = isolated_cache_key(image.hash, generation.cache.isolation_key);
     }
 
-    // Negative conditioning is internal context and contributes to resource
-    // bounds only when the selected generation behavior consumes it.
-    let negative_context = (!lowered.negative_prompt_ids.is_empty())
-        .then(|| CoreContextSegment::UndTokens {
-            token_ids: lowered.negative_prompt_ids.clone(),
-            visibility: UndVisibility::Internal,
-        })
-        .into_iter()
-        .collect::<Vec<_>>();
-
-    // Compile conservative capacity before admission. Text output may shrink to
+    // Resolve conservative capacity before admission. Text output may shrink to
     // fit the model context, but non-text resource requirements remain fixed.
-    let mut resources =
-        GenerationResourceBounds::conservative(uniserve_core::GenerationResources {
-            context: &context,
-            negative_context: &negative_context,
-            behavior: &behavior,
-            policy,
-            image: &lowered.image,
-            max_und_tokens: max_tokens,
-            cache: &cache,
-            limits: binding.limits,
-        })
+    generation
+        .validate_resources(&processor.limits)
         .map_err(|error| error.to_string())?;
-    if resources.max_kv_tokens > binding.max_model_tokens as usize && behavior.und_decode {
-        let excess = resources.max_kv_tokens - binding.max_model_tokens as usize;
-        max_tokens = max_tokens
+    let mut max_kv_tokens = generation
+        .max_kv_tokens(&processor.limits)
+        .map_err(|error| error.to_string())?;
+    if max_kv_tokens > processor.config.max_model_tokens() as usize && generation.decodes_text() {
+        let excess = max_kv_tokens - processor.config.max_model_tokens() as usize;
+        generation.max_und_tokens = generation.max_und_tokens
             .checked_sub(excess)
             .filter(|value| *value > 0)
             .ok_or_else(|| {
                 format!(
                     "generation context requires at least {} KV tokens, exceeding the {}-token runtime limit",
-                    resources.max_kv_tokens.saturating_sub(max_tokens),
-                    binding.max_model_tokens
+                    max_kv_tokens.saturating_sub(generation.max_und_tokens),
+                    processor.config.max_model_tokens()
                 )
             })?;
-        resources = GenerationResourceBounds::conservative(uniserve_core::GenerationResources {
-            context: &context,
-            negative_context: &negative_context,
-            behavior: &behavior,
-            policy,
-            image: &lowered.image,
-            max_und_tokens: max_tokens,
-            cache: &cache,
-            limits: binding.limits,
-        })
-        .map_err(|error| error.to_string())?;
+        max_kv_tokens = generation
+            .max_kv_tokens(&processor.limits)
+            .map_err(|error| error.to_string())?;
     }
 
-    if resources.max_kv_tokens > binding.max_model_tokens as usize {
+    if max_kv_tokens > processor.config.max_model_tokens() as usize {
         return Err(format!(
             "generation requires {} KV tokens, exceeding the {}-token runtime limit",
-            resources.max_kv_tokens, binding.max_model_tokens
+            max_kv_tokens,
+            processor.config.max_model_tokens()
         )
         .into());
     }
 
-    // Public accounting captures the admitted cache and resource contract before
-    // ownership moves into the core generation request.
-    let cache_accounting = CacheAccounting {
-        read_enabled: cache.read,
-        write_enabled: cache.write,
-        encoder_pin_count: resources.encoder_cache_keys.len(),
-    };
-    let resource_accounting = ResourceAccounting {
-        expected_kv_tokens: resources.max_kv_tokens as u64,
-        image_latent_units: resources.max_image_latent_units,
-        encoder_cache_pins: resources.encoder_cache_keys.len(),
-        replayable: !resources.generated_feedback_makes_non_replayable,
-    };
-
-    let generation = GenerationRequest {
-        request_id: RequestId(fnv1a(request.request_id.as_bytes())),
-        context,
-        negative_context,
-        constraint: lowered.constraint,
-        behavior,
-        sampling: lowered.sampling,
-        image: lowered.image,
-        max_und_tokens: max_tokens,
-        stop_strings: request.stop.stop_strings.clone(),
-        stop_token_ids: lowered.stop_token_ids,
-        priority: request.scheduling.priority,
-        cache,
-        policy: policy.clone(),
-        resources,
-    };
     generation.validate().map_err(|error| error.to_string())?;
-
-    // Derive the flattened prompt only from the validated canonical context.
-    let prompt_token_ids = generation.prompt_token_ids();
-    Ok(TokenizedGenerateReqInput {
-        request_id: request.request_id,
-        request: generation,
-        tokenizer: std::sync::Arc::clone(&binding.tokenizer),
-        prompt_token_ids,
-        decode: TextDecodeOptions {
-            skip_special_tokens: request.decode.skip_special_tokens,
-            include_stop_str_in_output: request.decode.include_stop_string_in_output,
-            stop_strings: (!request.stop.stop_strings.is_empty())
-                .then(|| request.stop.stop_strings.clone()),
-            min_tokens: request.sampling.min_tokens.unwrap_or(0),
-        },
-        emit_token_ids: matches!(
-            request.output,
-            crate::serving::input::OutputDetail::Tokens
-                | crate::serving::input::OutputDetail::Logprobs
-        ),
-        prompt_logprobs_requested,
-        generated_logprobs_requested,
-        skip_special_tokens: request.decode.skip_special_tokens,
-        output_processor,
-        identity: binding.identity.clone(),
-        cache: cache_accounting,
-        resources: resource_accounting,
-    })
+    Ok(())
 }
 
 /// Applies request-specific penalties, masks, and bad-word tokens to profile sampling.
 fn apply_request_sampling(
     tokenizer: &DynTokenizer,
-    request: &GenerateReqInput,
+    controls: &crate::serving::SamplingConfig,
+    stop: &crate::serving::StopConfig,
     sampling: &mut SamplingParams,
 ) -> OmniResult<()> {
-    sampling.ignore_eos = request.sampling.ignore_eos;
-    sampling.min_tokens = request.sampling.min_tokens.unwrap_or(0) as usize;
-    sampling.min_p = request.sampling.min_p.unwrap_or(0.0);
-    sampling.frequency_penalty = request.sampling.frequency_penalty.unwrap_or(0.0);
-    sampling.presence_penalty = request.sampling.presence_penalty.unwrap_or(0.0);
-    sampling.repetition_penalty = request.sampling.repetition_penalty.unwrap_or(1.0);
-    if let Some(request_bias) = &request.stop.logit_bias {
+    sampling.ignore_eos = controls.ignore_eos;
+    sampling.min_tokens = controls.min_tokens.unwrap_or(0) as usize;
+    sampling.min_p = controls.min_p.unwrap_or(0.0);
+    sampling.frequency_penalty = controls.frequency_penalty.unwrap_or(0.0);
+    sampling.presence_penalty = controls.presence_penalty.unwrap_or(0.0);
+    sampling.repetition_penalty = controls.repetition_penalty.unwrap_or(1.0);
+    if let Some(request_bias) = &stop.logit_bias {
         let mut merged = std::collections::BTreeMap::new();
         for (token_id, bias) in sampling.logit_bias.drain(..) {
             merged.insert(token_id, bias);
@@ -657,21 +516,17 @@ fn apply_request_sampling(
         }
         sampling.logit_bias = merged.into_iter().collect();
     }
-    sampling.return_logprobs =
-        request.stop.logprobs.is_some() || request.stop.logprob_token_ids.is_some();
-    sampling.n_logprobs = request
-        .stop
+    sampling.return_logprobs = stop.logprobs.is_some() || stop.logprob_token_ids.is_some();
+    sampling.n_logprobs = stop
         .logprobs
         .map_or(0, |count| if count < 0 { u32::MAX } else { count as u32 });
-    sampling.return_prompt_logprobs = request.stop.prompt_logprobs.is_some();
-    sampling.n_prompt_logprobs = request
-        .stop
+    sampling.return_prompt_logprobs = stop.prompt_logprobs.is_some();
+    sampling.n_prompt_logprobs = stop
         .prompt_logprobs
         .map_or(0, |count| if count < 0 { u32::MAX } else { count as u32 });
-    sampling.logprob_token_ids = request.stop.logprob_token_ids.clone().unwrap_or_default();
-    sampling.allowed_token_ids = request.stop.allowed_token_ids.clone();
-    sampling.bad_words_ids = request
-        .stop
+    sampling.logprob_token_ids = stop.logprob_token_ids.clone().unwrap_or_default();
+    sampling.allowed_token_ids = stop.allowed_token_ids.clone();
+    sampling.bad_words_ids = stop
         .bad_words
         .iter()
         .map(|word| tokenizer.encode(word, false).map_err(OmniError::from))
@@ -680,9 +535,12 @@ fn apply_request_sampling(
 }
 
 /// Resolves and validates baseline multimodal sampling parameters.
-fn resolve_sampling(request: &GenerateReqInput) -> OmniResult<SamplingParams> {
+fn resolve_sampling(
+    controls: &crate::serving::SamplingConfig,
+    seed: Option<u64>,
+) -> OmniResult<SamplingParams> {
     let temperature = finite(
-        request.sampling.temperature.unwrap_or(DEFAULT_TEMPERATURE),
+        controls.temperature.unwrap_or(DEFAULT_TEMPERATURE),
         "temperature",
     )?;
     if temperature < 0.0 {
@@ -690,24 +548,15 @@ fn resolve_sampling(request: &GenerateReqInput) -> OmniResult<SamplingParams> {
             "temperature must be non-negative".to_string(),
         ));
     }
-    let top_p = finite(request.sampling.top_p.unwrap_or(DEFAULT_TOP_P), "top_p")?;
+    let top_p = finite(controls.top_p.unwrap_or(DEFAULT_TOP_P), "top_p")?;
     if !(0.0..=1.0).contains(&top_p) || top_p == 0.0 {
         return Err(OmniError::Invalid("top_p must be in (0, 1]".to_string()));
     }
     Ok(SamplingParams {
         temperature,
         top_p,
-        top_k: request.sampling.top_k.unwrap_or(DEFAULT_TOP_K),
-        seed: request
-            .image_gen
-            .as_ref()
-            .and_then(|image| image.seed)
-            .or_else(|| {
-                request
-                    .sampling
-                    .seed
-                    .and_then(|value| value.try_into().ok())
-            }),
+        top_k: controls.top_k.unwrap_or(DEFAULT_TOP_K),
+        seed,
         ..SamplingParams::default()
     })
 }
@@ -716,10 +565,11 @@ fn resolve_sampling(request: &GenerateReqInput) -> OmniResult<SamplingParams> {
 fn resolve_image_params(
     defaults: &crate::profile::omni::ImageGenerationDefaults,
     resolution_policy: &ResolutionPolicy,
-    request: &GenerateReqInput,
+    image: crate::serving::ImageGenControls,
+    sampling_seed: Option<u64>,
+    negative_prompt: String,
     constraint: GenerationConstraint,
 ) -> OmniResult<ImageParams> {
-    let image = request.image_gen.clone().unwrap_or_default();
     let resolution = resolve_resolution(
         resolution_policy,
         image.resolution.or(Some(defaults.resolution)),
@@ -764,16 +614,8 @@ fn resolve_image_params(
         )?,
         height: resolution.height,
         width: resolution.width,
-        seed: image
-            .seed
-            .or_else(|| {
-                request
-                    .sampling
-                    .seed
-                    .and_then(|value| value.try_into().ok())
-            })
-            .or(defaults.seed),
-        negative_prompt: request.negative_text.clone().unwrap_or_default(),
+        seed: sampling_seed.or(defaults.seed),
+        negative_prompt,
         max_images,
         image_prompts: image.prompts,
         retain_images: image
@@ -785,9 +627,9 @@ fn resolve_image_params(
 /// Resolves Bagel image parameters for understanding requests with context images.
 fn bagel_context_image_params(
     profile: &BagelProfile,
-    request: &GenerateReqInput,
+    image: crate::serving::ImageGenControls,
+    sampling_seed: Option<u64>,
 ) -> OmniResult<ImageParams> {
-    let image = request.image_gen.clone().unwrap_or_default();
     let steps = image.steps.unwrap_or(DEFAULT_STEPS);
     if steps == 0 {
         return Err(OmniError::Invalid(
@@ -808,15 +650,7 @@ fn bagel_context_image_params(
             .unwrap_or(profile.image_defaults.timestep_shift),
         height: context_image_defaults::RESOLUTION,
         width: context_image_defaults::RESOLUTION,
-        seed: image
-            .seed
-            .or_else(|| {
-                request
-                    .sampling
-                    .seed
-                    .and_then(|value| value.try_into().ok())
-            })
-            .or(Some(0)),
+        seed: sampling_seed.or(Some(0)),
         negative_prompt: String::new(),
         max_images,
         image_prompts: image.prompts,
@@ -824,119 +658,51 @@ fn bagel_context_image_params(
     })
 }
 
-/// Builds the sensenova context.
-fn build_sensenova_context(
-    profile: &SenseNovaProfile,
-    lowered: &LoweredInput,
-) -> OmniResult<Vec<CoreContextSegment>> {
-    let image_count = lowered.images.len();
-    let ingests = lowered
-        .images
-        .iter()
-        .map(|image| -> OmniResult<ImageIngestRecipe> {
+/// Resolves each image's encoder inputs at its final prompt position.
+fn prepare_image_inputs(
+    num_prompt_tokens: usize,
+    images: Vec<RenderedImage>,
+    num_positions: u32,
+    mut encoders_for_dimensions: impl FnMut(u32, u32, usize) -> OmniResult<Vec<ImageEncoderInput>>,
+) -> OmniResult<MultimodalInputs> {
+    let image_count = images.len();
+    let mut images = images
+        .into_iter()
+        .map(|image| {
+            if image.position as usize > num_prompt_tokens {
+                return Err(OmniError::Invalid(
+                    "image position exceeds the tokenized prompt".into(),
+                ));
+            }
             let (width, height) = image_dimensions(&image.b64)?;
-            profile
-                .image_ingest_for_dimensions(width, height, image_count)
-                .map_err(OmniError::from)
-        })
-        .collect::<OmniResult<Vec<_>>>()?;
-    assemble_context(&lowered.prompt_ids, &lowered.images, ingests)
-}
-
-/// Builds the bagel context.
-fn build_bagel_context(
-    profile: &BagelProfile,
-    lowered: &LoweredInput,
-) -> OmniResult<Vec<CoreContextSegment>> {
-    let image_count = lowered.images.len();
-    let ingests = lowered
-        .images
-        .iter()
-        .map(|image| -> OmniResult<ImageIngestRecipe> {
-            let (width, height) = image_dimensions(&image.b64)?;
-            profile
-                .image_ingest_for_dimensions(width, height, image_count)
-                .map_err(OmniError::from)
-        })
-        .collect::<OmniResult<Vec<_>>>()?;
-    assemble_context(&lowered.prompt_ids, &lowered.images, ingests)
-}
-
-/// Interleaves token spans and positioned image segments into canonical context order.
-fn assemble_context(
-    prompt_ids: &[u32],
-    images: &[RenderedImage],
-    ingests: Vec<ImageIngestRecipe>,
-) -> OmniResult<Vec<CoreContextSegment>> {
-    if images.len() != ingests.len() {
-        return Err(OmniError::Invalid(
-            "image ingest declarations do not match input images".to_string(),
-        ));
-    }
-    let mut indexed = images.iter().cloned().zip(ingests).collect::<Vec<_>>();
-    indexed.sort_by_key(|(image, _)| image.position);
-    let mut segments = Vec::with_capacity(indexed.len().saturating_mul(2).saturating_add(1));
-    let mut token_cursor = 0usize;
-    for (image, ingest) in indexed {
-        let position = (image.position as usize).min(prompt_ids.len());
-        if position > token_cursor {
-            segments.push(CoreContextSegment::UndTokens {
-                token_ids: prompt_ids[token_cursor..position].to_vec(),
-                visibility: UndVisibility::Internal,
-            });
-        }
-        segments.push(CoreContextSegment::Image {
-            image: CoreImageSegment {
+            let encoders = encoders_for_dimensions(width, height, image_count)?;
+            Ok(ImageInput {
                 hash: image.hash,
                 b64: image.b64,
-                position: SegmentPosition::AtToken {
-                    position: image.position,
-                },
-            },
-            ingest,
-        });
-        token_cursor = position;
-    }
-    if token_cursor < prompt_ids.len() {
-        segments.push(CoreContextSegment::UndTokens {
-            token_ids: prompt_ids[token_cursor..].to_vec(),
-            visibility: UndVisibility::Internal,
-        });
-    }
-    if segments.is_empty() {
-        segments.push(CoreContextSegment::UndTokens {
-            token_ids: prompt_ids.to_vec(),
-            visibility: UndVisibility::Internal,
-        });
-    }
-    Ok(segments)
+                position: image.position,
+                num_positions,
+                encoders,
+            })
+        })
+        .collect::<OmniResult<Vec<_>>>()?;
+    images.sort_by_key(|image| image.position);
+    Ok(MultimodalInputs { images })
 }
 
 /// Resolves the generation constraint implied by requested modalities.
-pub(crate) fn generation_constraint(request: &GenerateReqInput) -> GenerationConstraint {
-    match request.modalities {
+pub(crate) fn generation_constraint(modalities: ModalitySelection) -> GenerationConstraint {
+    match modalities {
         ModalitySelection::Text => GenerationConstraint::UndOnly,
         ModalitySelection::Image => GenerationConstraint::GenOnly,
         ModalitySelection::TextAndImage => GenerationConstraint::Default,
     }
 }
 
-/// Returns the images attached at the top request level.
-fn top_level_images(request: &GenerateReqInput) -> Vec<PositionedImageInput> {
-    request
-        .images
-        .iter()
-        .map(|image| PositionedImageInput {
-            b64: image.b64.clone(),
-        })
-        .collect()
-}
-
 /// Replaces chat image parts with unique template placeholders and retains their payloads.
 fn replace_chat_images(
     request_id: &str,
     messages: &mut [ChatMessage],
-) -> OmniResult<(Vec<PositionedImageInput>, Vec<String>)> {
+) -> OmniResult<(Vec<String>, Vec<String>)> {
     let mut images = Vec::new();
     let mut placeholders = Vec::new();
     for message in messages {
@@ -955,9 +721,7 @@ fn replace_chat_images(
                 continue;
             };
             let placeholder = image_placeholder(request_id, images.len());
-            images.push(PositionedImageInput {
-                b64: data_image_payload(image_url)?,
-            });
+            images.push(data_image_payload(image_url)?);
             placeholders.push(placeholder.clone());
             *part = ChatContentPart::Text { text: placeholder };
         }
@@ -1023,11 +787,11 @@ fn data_image_payload(url: &str) -> OmniResult<String> {
 }
 
 /// Renders an image input for the model prompt.
-fn rendered_image(image: &PositionedImageInput, position: u32) -> RenderedImage {
+fn rendered_image(b64: String, position: u32) -> RenderedImage {
     RenderedImage {
-        hash: fnv1a(image.b64.as_bytes()),
+        hash: fnv1a(b64.as_bytes()),
         position,
-        b64: image.b64.clone(),
+        b64,
     }
 }
 

@@ -7,11 +7,30 @@ import math
 import os
 from dataclasses import dataclass
 
-from uniserve_worker.nn.parallel import EntryConfig, parse_entries
+from uniserve_worker.execution.batch import Computation, ForwardMode, PipelineStage, TransferMode
+from uniserve_worker.nn.parallel import ComponentConfig, parse_entries
 
 from ..config import WorkerConfig, worker_config_from_namespace
-from ..execution.batch import OpCode
 from ..loader.config import LoadConfig
+
+# These launch selectors assign capabilities to a worker pool. A media selector
+# includes both tracks; submitted computations still identify the concrete stage.
+SUPPORTED_OP_GROUPS: dict[str, tuple[Computation, ...]] = {
+    "ar_extend": (ForwardMode.PREFILL,),
+    "ar_decode": (ForwardMode.DECODE,),
+    "ar_verify": (ForwardMode.VERIFY,),
+    "encoder_vision": (PipelineStage.VISION_ENCODING,),
+    "encoder_latent": (PipelineStage.LATENT_ENCODING,),
+    "encoder_text": (PipelineStage.TEXT_ENCODING,),
+    "transfer_product": (TransferMode.TENSOR,),
+    "transfer_kv_publish": (TransferMode.KV_PUBLISH,),
+    "transfer_kv_install": (TransferMode.KV_INSTALL,),
+    "diffusion_prepare": (PipelineStage.LATENT_PREPARATION,),
+    "diffusion_step": (PipelineStage.DENOISING,),
+    "diffusion_finalize": (PipelineStage.IMAGE_DECODING, PipelineStage.MUXING),
+    "diffusion_decode": (PipelineStage.VIDEO_DECODING, PipelineStage.AUDIO_DECODING),
+    "media_append": (PipelineStage.VIDEO_ENCODING, PipelineStage.AUDIO_ENCODING),
+}
 
 
 @dataclass(frozen=True)
@@ -47,7 +66,7 @@ class WorkerProcessArgs:
     """Aggregates the validated launch configuration for one worker rank."""
 
     worker_id: str
-    supported_ops: frozenset[OpCode]
+    supported_ops: frozenset[Computation]
     ipc: WorkerIpcConfig
     local_rank: int
     distributed_backend: str | None
@@ -57,7 +76,7 @@ class WorkerProcessArgs:
     execution: WorkerConfig
     load: LoadConfig
     use_stub_model: bool
-    components: tuple[tuple[str, EntryConfig], ...] = ()
+    components: tuple[tuple[str, ComponentConfig], ...] = ()
 
     @classmethod
     def from_namespace(cls, namespace: argparse.Namespace) -> "WorkerProcessArgs":
@@ -177,15 +196,15 @@ def _load_config(namespace: argparse.Namespace) -> LoadConfig:
     )
 
 
-def _parse_supported_ops(value: object) -> frozenset[OpCode]:
-    """Parse unique supported operation kinds from text or an iterable."""
+def _parse_supported_ops(value: object) -> frozenset[Computation]:
+    """Resolve unique launch capability selectors to concrete computations."""
 
     names = tuple(part.strip() for part in str(value).split(",") if part.strip())
     if not names:
         raise ValueError("--supported-ops must list at least one operation")
     try:
-        operations = tuple(OpCode(name) for name in names)
-    except ValueError as error:
+        operations = tuple(operation for name in names for operation in SUPPORTED_OP_GROUPS[name])
+    except KeyError as error:
         raise ValueError(f"unknown operation in --supported-ops {value!r}") from error
     if len(set(operations)) != len(operations):
         raise ValueError("--supported-ops contains duplicate operations")

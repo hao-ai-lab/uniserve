@@ -9,33 +9,8 @@ use crate::serving::chat::output::FinishReason;
 use crate::serving::text::output::{DecodedLogprobs, DecodedPromptLogprobs};
 
 #[derive(Debug, Clone, PartialEq)]
-/// Incremental reasoning-parser event consumed by chat assembly.
-pub(crate) enum ReasoningEvent {
-    Start {
-        prompt_token_ids: Arc<[u32]>,
-        prompt_logprobs: Option<DecodedPromptLogprobs>,
-        queued_at: Option<f64>,
-        scheduled_at: Option<f64>,
-    },
-    TextDelta {
-        kind: AssistantBlockKind,
-        delta: String,
-    },
-    SampleDelta {
-        logprobs: Option<DecodedLogprobs>,
-        token_ids: Vec<u32>,
-    },
-    Done {
-        prompt_token_count: usize,
-        output_token_count: usize,
-        internal_token_count: usize,
-        finish_reason: FinishReason,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq)]
 /// Incremental assistant event after reasoning and tool parsing.
-pub(crate) enum AssistantEvent {
+pub enum AssistantEvent {
     Start {
         prompt_token_ids: Arc<[u32]>,
         prompt_logprobs: Option<DecodedPromptLogprobs>,
@@ -63,44 +38,6 @@ pub(crate) enum AssistantEvent {
         internal_token_count: usize,
         finish_reason: FinishReason,
     },
-}
-
-impl From<ReasoningEvent> for AssistantEvent {
-    /// Converts a reasoning-parser event without changing ordering or terminal accounting.
-    fn from(event: ReasoningEvent) -> Self {
-        match event {
-            ReasoningEvent::Start {
-                prompt_token_ids,
-                prompt_logprobs,
-                queued_at,
-                scheduled_at,
-            } => Self::Start {
-                prompt_token_ids,
-                prompt_logprobs,
-                queued_at,
-                scheduled_at,
-            },
-            ReasoningEvent::TextDelta { kind, delta } => Self::TextDelta { kind, delta },
-            ReasoningEvent::SampleDelta {
-                logprobs,
-                token_ids,
-            } => Self::SampleDelta {
-                logprobs,
-                token_ids,
-            },
-            ReasoningEvent::Done {
-                prompt_token_count,
-                output_token_count,
-                internal_token_count,
-                finish_reason,
-            } => Self::Done {
-                prompt_token_count,
-                output_token_count,
-                internal_token_count,
-                finish_reason,
-            },
-        }
-    }
 }
 
 /// Generates an OpenAI-compatible tool-call identifier.

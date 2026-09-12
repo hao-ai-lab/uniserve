@@ -9,6 +9,38 @@ from uniserve_worker.backends.attention.torch_sdpa import TorchSDPAAttentionBack
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
 
 
+@pytest.mark.parametrize("write_current", [False, True])
+def test_paged_decode_includes_current_token(write_current: bool) -> None:
+    generator = torch.Generator().manual_seed(31)
+    prefix, heads, width, page_size = 3, 2, 8, 4
+    query = torch.randn((1, heads, 1, width), generator=generator)
+    keys = torch.randn((prefix + 1, heads, width), generator=generator)
+    values = torch.randn(keys.shape, generator=generator)
+    key_cache = torch.zeros((2, page_size, heads, width))
+    value_cache = torch.zeros_like(key_cache)
+    resident = prefix if write_current else prefix + 1
+    key_cache[1, :resident].copy_(keys[:resident])
+    value_cache[1, :resident].copy_(values[:resident])
+    context = SimpleNamespace(prefix_lens_cpu=(prefix,), seq_lens_cpu=(prefix + 1,))
+
+    actual = TorchSDPAAttentionBackend().forward_paged(
+        query,
+        key_cache,
+        value_cache,
+        block_table=torch.tensor([[1]], dtype=torch.int32),
+        cache_seqlens=torch.tensor([prefix + 1], dtype=torch.int32),
+        k=keys[-1:] if write_current else None,
+        v=values[-1:] if write_current else None,
+        causal=False,
+        scale=width**-0.5,
+        context=context,
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query, keys.transpose(0, 1).unsqueeze(0), values.transpose(0, 1).unsqueeze(0)
+    )
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_attention_state_merge_matches_reference_during_cuda_graph_replay() -> None:
     device = torch.device("cuda")
@@ -91,7 +123,7 @@ def test_paged_prefix_dense_current_matches_concatenated_attention(causal: bool)
         visible[:] = torch.arange(1, query_len + 1, dtype=torch.int32)
     context = SimpleNamespace(
         query_lens_cpu=(query_len,) * rows,
-        seq_lens_cpu=prefix_lens,
+        prefix_lens_cpu=prefix_lens,
     )
     backend = TorchSDPAAttentionBackend()
     actual = backend.forward_segmented(
@@ -156,9 +188,9 @@ def test_flashinfer_segmented_attention_matches_concatenated_attention(prefix_le
     context = SimpleNamespace(
         query_lens_cpu=query_lens,
         query_lens=torch.tensor(query_lens, device=device, dtype=torch.int32),
-        seq_lens_cpu=prefix_lens,
-        kv_lens_cpu=tuple(prefix + current for prefix, current in zip(prefix_lens, query_lens)),
-        kv_lens=torch.tensor(
+        prefix_lens_cpu=prefix_lens,
+        seq_lens_cpu=tuple(prefix + current for prefix, current in zip(prefix_lens, query_lens)),
+        seq_lens=torch.tensor(
             [prefix + current for prefix, current in zip(prefix_lens, query_lens)],
             device=device,
             dtype=torch.int32,

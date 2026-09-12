@@ -17,26 +17,24 @@ import torch
 from uniserve_worker.execution import operations as operation_geometry
 from uniserve_worker.execution.batch import (
     AttentionRegime,
+    Computation,
+    ComputationId,
     DeviceProductTransferValue,
-    Domain,
     DType,
     EncoderTransferValue,
-    KvTransferValue,
+    ForwardMode,
+    KvTransfer,
     LatentParams,
     LatentTransferValue,
-    OpCode,
-    Operation,
-    ProductKind,
-    ProductPayload,
-    ProductRef,
+    PipelineStage,
     Run,
     RunLane,
+    ScheduledRequest,
     ShapeBound,
-    StorageClass,
+    TensorPublication,
+    TensorRef,
     TensorTransfer,
-    TransferHandle,
-    decode_sampling_state_bytes,
-    decode_token_product_bytes,
+    TransferMode,
 )
 from uniserve_worker.execution.commit import _discard_lane
 from uniserve_worker.execution.operations import _completion_devices, _operation_device
@@ -97,15 +95,6 @@ logger = logging.getLogger(__name__)
 SAMPLING_COMPLETION_FIELDS = 4
 TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
-_GENERATION_WORK_VARIANTS = frozenset(
-    {
-        OpCode.DIFFUSION_PREPARE,
-        OpCode.DIFFUSION_STEP,
-        OpCode.DIFFUSION_DECODE,
-        OpCode.MEDIA_APPEND,
-        OpCode.DIFFUSION_FINALIZE,
-    }
-)
 
 
 def plan_run(
@@ -123,33 +112,31 @@ def plan_run(
         for params in batch.buffer_allocations
     ):
         raise invalid_descriptor("run buffer params exceeds the worker buffer pool")
-    grouped: dict[tuple[Domain, str], list[tuple[int, Operation]]] = {}
+    grouped: dict[tuple[Computation, str], list[tuple[int, ScheduledRequest]]] = {}
     for index, operation in enumerate(batch.operations):
-        grouped.setdefault((operation.domain, operation.entry), []).append((index, operation))
+        grouped.setdefault((operation.kind, operation.entry), []).append((index, operation))
     lanes: list[RunLane] = []
-    for lane_id, ((domain, _entry), members) in enumerate(grouped.items(), start=1):
+    for lane_id, ((_kind, _entry), members) in enumerate(grouped.items(), start=1):
         global_to_local = {
             global_index: local_index
             for local_index, (global_index, _operation) in enumerate(members)
         }
         member_operations = tuple(operation for _index, operation in members)
-        identities = {
-            (operation.request_key, int(operation.op_id)) for operation in member_operations
-        }
+        identities = {(operation.request_key, operation.op_id) for operation in member_operations}
         rows = tuple(
-            replace(row, operation_index=global_to_local[int(row.operation_index)])
-            for row in batch.forward_rows
-            if int(row.operation_index) in global_to_local
+            index
+            for index, operation in enumerate(batch.forward_operation_indices)
+            if operation in global_to_local
         )
-        request_slots = {int(row.request_pool_index) for row in rows}
+        request_slots = {batch.request_pool_indices[index] for index in rows}
         attention = (
             AttentionRegime.CAUSAL
             if all(
-                operation.kind in {OpCode.AR_EXTEND, OpCode.AR_DECODE, OpCode.AR_VERIFY}
+                operation.kind in {ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY}
                 for operation in member_operations
             )
             else AttentionRegime.HYBRID
-            if any(operation.kind is OpCode.DIFFUSION_STEP for operation in member_operations)
+            if any(operation.kind is PipelineStage.DENOISING for operation in member_operations)
             else AttentionRegime.NONE
         )
         lanes.append(
@@ -157,7 +144,6 @@ def plan_run(
                 lane_id=lane_id,
                 launch_id=lane_id,
                 collective_seq=batch.collective_seq,
-                domain=domain,
                 route=0,
                 attention=attention,
                 shape_class=0,
@@ -172,16 +158,22 @@ def plan_run(
                     for allocation in batch.new_cache_pages
                     if int(allocation.request_pool_idx) in request_slots
                 ),
-                forward_rows=rows,
+                forward_operation_indices=tuple(
+                    global_to_local[batch.forward_operation_indices[index]] for index in rows
+                ),
+                request_pool_indices=tuple(batch.request_pool_indices[index] for index in rows),
+                seq_lens=tuple(batch.seq_lens[index] for index in rows),
+                query_lens=tuple(batch.query_lens[index] for index in rows),
+                write_kv=tuple(batch.write_kv[index] for index in rows),
                 latent_params=tuple(
                     params
                     for params in batch.latent_params
-                    if (params.request_key, int(params.op_id)) in identities
+                    if (params.request_key, params.op_id) in identities
                 ),
                 decode_ranges=tuple(
                     params
                     for params in batch.decode_ranges
-                    if (params.request_key, int(params.op_id)) in identities
+                    if (params.request_key, params.op_id) in identities
                 ),
                 buffer_allocations=tuple(
                     params
@@ -190,8 +182,8 @@ def plan_run(
                         product.buffer_id == params.buffer
                         for operation in member_operations
                         for product in (
-                            *operation.inputs,
-                            *operation.outputs,
+                            *operation.tensor_inputs(),
+                            *operation.tensor_outputs(),
                             *((operation.predicate,) if operation.predicate is not None else ()),
                         )
                     )
@@ -248,7 +240,7 @@ def prepare_batch(
         }
         for latent_params in batch.latent_params:
             operation = operations[(latent_params.request_key, latent_params.op_id)]
-            if operation.kind not in {OpCode.DIFFUSION_PREPARE, OpCode.DIFFUSION_STEP}:
+            if operation.kind not in {PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING}:
                 continue
             request = request_pool.peek(latent_params.request_key.request_id)
             request_slot = (
@@ -262,33 +254,27 @@ def prepare_batch(
                 pool.write_dependencies(request_slot, latent_params.page_table)
             )
 
-    entries = [
-        payload for payload in batch.input_products if isinstance(payload.payload, TransferHandle)
-    ]
-    supplied = {entry.product for entry in entries}
+    entries = list(batch.input_products)
+    kv_entries = list(batch.kv_inputs)
+    supplied = {publication.source for publication in kv_entries}
     for operation in batch.operations:
-        if operation.kind is not OpCode.TRANSFER_KV_INSTALL:
+        if operation.kind is not TransferMode.KV_INSTALL:
             continue
-        for product in operation.inputs:
-            if product.kind is ProductKind.KV and product not in supplied:
-                publications = cache_registry
-                if publications is None:
-                    raise invalid_descriptor("KV installation requires cache publication storage")
-                publication = publications.publication(product)
-                entries.append(ProductPayload(product, TransferHandle(publication)))
-                supplied.add(product)
+        source = operation.kv_input
+        if source is None:
+            raise invalid_descriptor("KV installation requires a source publication")
+        if source not in supplied:
+            if cache_registry is None:
+                raise invalid_descriptor("KV installation requires cache publication storage")
+            kv_entries.append(cache_registry.publication(source))
+            supplied.add(source)
     cache = cache_pool
     tables = request_tables
     if cache is not None and tables is not None and cache.has_pending_accesses:
         request_slots = {
             admission.request_key: admission.request_pool_idx for admission in batch.admissions
         }
-        kv_inputs = {
-            entry.product: entry.payload.value
-            for entry in entries
-            if isinstance(entry.payload, TransferHandle)
-            and isinstance(entry.payload.value, KvTransferValue)
-        }
+        kv_inputs = {publication.source: publication for publication in kv_entries}
         for lane in batch.lanes:
             assigned = {
                 (table.request_pool_idx, table.group_id): table.page_ids
@@ -308,19 +294,19 @@ def prepare_batch(
                         length=len(allocation.page_ids) * cache.block_size,
                     )
                 )
-            for row in lane.forward_rows:
-                if not row.write_kv:
+            for row, write_kv in enumerate(lane.write_kv):
+                if not write_kv:
                     continue
                 storage_dependencies.extend(
                     cache.write_dependencies(
-                        pages_for(row.request_pool_index, 0),
+                        pages_for(lane.request_pool_indices[row], 0),
                         group=0,
-                        start=row.seq_len,
-                        length=row.query_len,
+                        start=lane.seq_lens[row] - lane.query_lens[row],
+                        length=lane.query_lens[row],
                     )
                 )
             for operation in lane.operations:
-                if operation.kind is not OpCode.TRANSFER_KV_INSTALL:
+                if operation.kind is not TransferMode.KV_INSTALL:
                     continue
                 request = request_pool.peek(operation.request_key.request_id)
                 slot = (
@@ -330,29 +316,32 @@ def prepare_batch(
                 )
                 if slot is None:
                     raise invalid_descriptor("KV installation has no admitted request slot")
-                for reference in operation.inputs:
-                    kv_publication = kv_inputs.get(reference)
-                    if kv_publication is not None:
-                        storage_dependencies.extend(
-                            cache.write_dependencies(
-                                pages_for(slot, kv_publication.group_id),
-                                group=kv_publication.group_id,
-                                start=kv_publication.base_extent,
-                                length=kv_publication.published_extent - kv_publication.base_extent,
-                            )
+                source = operation.kv_input
+                if source is None:
+                    raise invalid_descriptor("KV installation requires a source publication")
+                kv_publication = kv_inputs.get(source)
+                if kv_publication is not None:
+                    storage_dependencies.extend(
+                        cache.write_dependencies(
+                            pages_for(slot, kv_publication.group_id),
+                            group=kv_publication.group_id,
+                            start=kv_publication.base_extent,
+                            length=kv_publication.published_extent - kv_publication.base_extent,
                         )
+                    )
     prepared = PreparedExecution(
         batch=batch,
         transfers=(),
         storage_dependencies=tuple(storage_dependencies),
     )
-    if entries:
+    if entries or kv_entries:
         # Destination addresses may still belong to an earlier physical reader.
         # Its retirement wakes the execution thread, which submits these reads.
         prepared._prepare_inputs = partial(
             _prepare_inputs,
             batch,
             tuple(entries),
+            tuple(kv_entries),
             cache_pool=cache_pool,
             cache_registry=cache_registry,
             device_products=device_products,
@@ -370,6 +359,7 @@ def prepare_batch(
         prepared.transfers, prepared.predicates = _prepare_inputs(
             batch,
             tuple(entries),
+            tuple(kv_entries),
             cache_pool=cache_pool,
             cache_registry=cache_registry,
             device_products=device_products,
@@ -387,7 +377,8 @@ def prepare_batch(
 
 def _prepare_inputs(
     batch: Run,
-    entries: tuple[ProductPayload, ...],
+    entries: tuple[TensorPublication, ...],
+    kv_entries: tuple[KvTransfer, ...],
     *,
     cache_pool: CachePool | None,
     cache_registry: CachePublications | None,
@@ -406,38 +397,41 @@ def _prepare_inputs(
     from . import transfer
 
     transports = transfer_backends
-    if entries and not transports:
+    if (entries or kv_entries) and not transports:
         raise unsupported_setup("cross-stage input requires a configured transport")
     transfers: list[PreparedTransferInput] = []
     try:
         for entry in entries:
             assert transports
-            assert isinstance(entry.payload, TransferHandle)
             devices = {
                 model_runner.operation_device(operation)
                 for operation in batch.operations
-                if entry.product in operation.inputs or entry.product == operation.predicate
+                if entry.product in operation.tensor_inputs()
+                or entry.product == operation.predicate
             }
             if len(devices) != 1:
                 raise invalid_descriptor("transferred product requires one consumer device per run")
             device = next(iter(devices))
-            value = entry.payload.value
+            value = entry.value
             tensors: tuple[TensorTransfer, ...]
             if isinstance(value, EncoderTransferValue):
                 main = value.tensor
                 tensors = (main,)
                 if (
                     not isinstance(value.payload_kind, str)
-                    or value.payload_kind
-                    not in {ProductKind.VISION_FEATURE.value, ProductKind.LATENT_FEATURE.value}
-                    or min(value.height, value.width, value.generation) < 1
-                    or value.generation != entry.product.generation
+                    or value.payload_kind not in {"vision_feature", "latent_feature"}
+                    or min(value.height, value.width) < 1
                     or not transfer.tensor_matches_product(main, entry.product)
                 ):
                     raise invalid_descriptor("encoder transfer metadata exceeds its product bounds")
-                if (
-                    entry.product.kind.value != value.payload_kind
-                    or entry.product.storage_class is not StorageClass.LATENT_ARENA
+                if not any(
+                    entry.product
+                    == (
+                        operation.vision_input
+                        if value.payload_kind == "vision_feature"
+                        else operation.latent_feature_input
+                    )
+                    for operation in batch.operations
                 ):
                     raise invalid_descriptor(
                         "encoder transfer entry disagrees with its product identity"
@@ -453,11 +447,16 @@ def _prepare_inputs(
                     raise invalid_descriptor("device-product value range is invalid")
                 if value.height == 0 and value.value_range:
                     raise invalid_descriptor("non-image device product carries an image range")
-                if (
-                    value.generation != entry.product.generation
-                    or not transfer.requires_device_product_binding(entry.product)
-                    or not transfer.tensor_matches_product(main, entry.product)
-                ):
+                if not any(
+                    entry.product
+                    in (
+                        *operation.inputs,
+                        operation.token_input,
+                        operation.image_input,
+                        operation.predicate,
+                    )
+                    for operation in batch.operations
+                ) or not transfer.tensor_matches_product(main, entry.product):
                     raise invalid_descriptor(
                         "device-product transfer metadata exceeds its product bounds"
                     )
@@ -474,11 +473,11 @@ def _prepare_inputs(
                     * int(pool.storage.element_size())
                 )
                 if (
-                    entry.product.kind is not ProductKind.LATENT
-                    or entry.product.storage_class is not StorageClass.LATENT_ARENA
+                    not any(
+                        entry.product == operation.latent_input for operation in batch.operations
+                    )
                     or pool is None
-                    or min(value.height, value.width, value.latent_units, value.generation) < 1
-                    or value.generation != entry.product.generation
+                    or min(value.height, value.width, value.latent_units) < 1
                     or tuple(main.shape) != (value.latent_units, int(pool.latent_width))
                     or main.dtype != expected_dtype
                     or main.nbytes != expected_nbytes
@@ -486,79 +485,6 @@ def _prepare_inputs(
                     or math.prod(main.shape) > entry.product.shape_bound.max_elements
                 ):
                     raise invalid_descriptor("latent transfer metadata exceeds its product bounds")
-            elif isinstance(value, KvTransferValue):
-                if (
-                    entry.product.kind is not ProductKind.KV
-                    or entry.product.storage_class is not StorageClass.PAGED_KV
-                    or value.generation != entry.product.generation
-                ):
-                    raise invalid_descriptor("KV transfer entry names a non-KV product")
-                consumers = tuple(
-                    operation for operation in batch.operations if entry.product in operation.inputs
-                )
-                if len(consumers) != 1 or consumers[0].kind is not OpCode.TRANSFER_KV_INSTALL:
-                    raise invalid_descriptor("KV input requires one installation consumer")
-                publications = cache_registry
-                cache = cache_pool
-                tables = request_tables
-                if publications is None or cache is None or tables is None:
-                    raise invalid_descriptor("KV input requires physical cache storage")
-                resident = request_pool.peek(entry.product.request_key.request_id)
-                admission = next(
-                    (
-                        row
-                        for row in batch.admissions
-                        if row.request_key == entry.product.request_key
-                    ),
-                    None,
-                )
-                if resident is not None and resident.request_key == entry.product.request_key:
-                    slot = int(resident.request_pool_idx)
-                elif admission is not None:
-                    slot = int(admission.request_pool_idx)
-                else:
-                    raise invalid_descriptor("KV transfer has no admitted request slot")
-                table = next(
-                    (
-                        table
-                        for lane in batch.lanes
-                        for table in lane.block_tables
-                        if (table.request_pool_idx, table.group_id) == (slot, value.group_id)
-                    ),
-                    None,
-                )
-                pages = tables.pages(slot, value.group_id) if table is None else table.page_ids
-                allocated = (
-                    tables.allocated_length(slot) if table is None else table.allocated_tokens
-                )
-                initialized = tuple(
-                    page
-                    for lane in batch.lanes
-                    for allocation in lane.new_cache_pages
-                    if (allocation.request_pool_idx, allocation.group_id) == (slot, value.group_id)
-                    for page in allocation.page_ids
-                )
-                write = publications.prepare_install(
-                    entry.product,
-                    value,
-                    request_pool_idx=slot,
-                    group_id=value.group_id,
-                    page_ids=pages,
-                    allocated_length=allocated,
-                    initialized_pages=initialized,
-                    transports=transports,
-                )
-                transfers.append(
-                    PreparedTransferInput(
-                        product=entry.product,
-                        value=value,
-                        tickets=(),
-                        buffers=(),
-                        destination=write,
-                        _discard_destination=partial(cache.imports.abandon, write),
-                    )
-                )
-                continue
             else:
                 raise invalid_descriptor("cross-stage transfer entry has an unknown kind")
             binding: DeviceProductWrite | EncoderWrite | LatentWrite | None = None
@@ -605,7 +531,7 @@ def _prepare_inputs(
                 )
                 transfers.append(
                     PreparedTransferInput(
-                        product=entry.product,
+                        buffer=entry.product.buffer_id,
                         value=value,
                         tickets=imported.tickets,
                         buffers=(imported.tensor,),
@@ -616,7 +542,9 @@ def _prepare_inputs(
                 continue
             elif isinstance(value, LatentTransferValue):
                 consumers = tuple(
-                    operation for operation in batch.operations if entry.product in operation.inputs
+                    operation
+                    for operation in batch.operations
+                    if entry.product in operation.tensor_inputs()
                 )
                 if len(consumers) != 1:
                     raise invalid_descriptor("latent transfer must have one consumer")
@@ -704,7 +632,7 @@ def _prepare_inputs(
                     )
                 transfers.append(
                     PreparedTransferInput(
-                        product=entry.product,
+                        buffer=entry.product.buffer_id,
                         value=value,
                         tickets=tuple(tickets),
                         buffers=tuple(buffers),
@@ -718,6 +646,69 @@ def _prepare_inputs(
                 if discard is not None:
                     discard()
                 raise
+        for kv_transfer in kv_entries:
+            consumers = tuple(
+                operation
+                for operation in batch.operations
+                if operation.kv_input == kv_transfer.source
+            )
+            if len(consumers) != 1 or consumers[0].kind is not TransferMode.KV_INSTALL:
+                raise invalid_descriptor("KV input requires one installation consumer")
+            publications = cache_registry
+            cache = cache_pool
+            tables = request_tables
+            if publications is None or cache is None or tables is None:
+                raise invalid_descriptor("KV input requires physical cache storage")
+            resident = request_pool.peek(kv_transfer.source.owner.request_id)
+            admission = next(
+                (row for row in batch.admissions if row.request_key == kv_transfer.source.owner),
+                None,
+            )
+            if resident is not None and resident.request_key == kv_transfer.source.owner:
+                slot = int(resident.request_pool_idx)
+            elif admission is not None:
+                slot = int(admission.request_pool_idx)
+            else:
+                raise invalid_descriptor("KV transfer has no admitted request slot")
+            table = next(
+                (
+                    table
+                    for lane in batch.lanes
+                    for table in lane.block_tables
+                    if (table.request_pool_idx, table.group_id) == (slot, kv_transfer.group_id)
+                ),
+                None,
+            )
+            pages = tables.pages(slot, kv_transfer.group_id) if table is None else table.page_ids
+            allocated = tables.allocated_length(slot) if table is None else table.allocated_tokens
+            initialized = tuple(
+                page
+                for lane in batch.lanes
+                for allocation in lane.new_cache_pages
+                if (allocation.request_pool_idx, allocation.group_id)
+                == (slot, kv_transfer.group_id)
+                for page in allocation.page_ids
+            )
+            write = publications.prepare_install(
+                kv_transfer.source,
+                kv_transfer,
+                request_pool_idx=slot,
+                group_id=kv_transfer.group_id,
+                page_ids=pages,
+                allocated_length=allocated,
+                initialized_pages=initialized,
+                transports=transports,
+            )
+            transfers.append(
+                PreparedTransferInput(
+                    buffer=kv_transfer.source,
+                    value=kv_transfer,
+                    tickets=(),
+                    buffers=(),
+                    destination=write,
+                    _discard_destination=partial(cache.imports.abandon, write),
+                )
+            )
         predicates = _prepare_predicates(
             batch,
             transfers=tuple(transfers),
@@ -747,11 +738,11 @@ def _prepare_predicates(
     operations = tuple(
         operation
         for operation in batch.operations
-        if operation.predicate is not None and operation.predicate.kind is ProductKind.COMPLETION
+        if operation.predicate is not None and operation.predicate.dtype is DType.U8
     )
     if not operations:
         return None
-    transferred = {transfer.product: transfer for transfer in transfers}
+    transferred = {transfer.buffer: transfer for transfer in transfers}
     buffer = output_pool.acquire(
         len(operations),
         token_capacity=len(operations),
@@ -763,13 +754,13 @@ def _prepare_predicates(
     try:
         # Local sources are consumed in device batches and captured directly;
         # transferred sources retain their target row for later completion.
-        grouped: dict[torch.device, list[Operation]] = defaultdict(list)
+        grouped: dict[torch.device, list[ScheduledRequest]] = defaultdict(list)
         rows = {
             operation_geometry.operation_identity(operation): row
             for row, operation in enumerate(operations)
         }
         for operation in operations:
-            transfer = transferred.get(cast(ProductRef, operation.predicate))
+            transfer = transferred.get(cast(TensorRef, operation.predicate).buffer_id)
             if transfer is None:
                 grouped[_operation_device(operation, config=config)].append(operation)
             else:
@@ -784,8 +775,8 @@ def _prepare_predicates(
             reads = device_products.consume_batch(
                 tuple(
                     (
-                        cast(ProductRef, operation.predicate),
-                        int(operation.op_id),
+                        cast(TensorRef, operation.predicate),
+                        operation.op_id,
                         device,
                     )
                     for operation in device_operations
@@ -910,12 +901,17 @@ def _open_lane(
     )
     # Restrict input payloads to identities declared by this lane.
     started = time.perf_counter_ns()
-    declared_inputs = {reference for operation in operations for reference in operation.inputs}
+    declared_inputs = {
+        reference.buffer_id for operation in operations for reference in operation.tensor_inputs()
+    }
     declared_inputs.update(
-        operation.predicate for operation in operations if operation.predicate is not None
+        operation.kv_input for operation in operations if operation.kv_input is not None
+    )
+    declared_inputs.update(
+        operation.predicate.buffer_id for operation in operations if operation.predicate is not None
     )
     input_products = tuple(
-        payload for payload in batch.input_products if payload.product in declared_inputs
+        payload for payload in batch.input_products if payload.product.buffer_id in declared_inputs
     )
     completion: OutputBuffer | None = None
     try:
@@ -927,7 +923,7 @@ def _open_lane(
         )
         candidates = request_pool.stage_lane(operations, request_pool_indices)
         for operation, request in zip(operations, candidates, strict=True):
-            request.install_runtime(request.request.parent_runtime(operation.parent))
+            request.install_runtime(request.predecessor.runtime)
         completion = output_pool.acquire(
             len(operations),
             token_capacity=_lane_completion_words(operations),
@@ -946,9 +942,7 @@ def _open_lane(
         request_rows={request.request.request_id: request for request in candidates},
         completion=completion,
         prepared_transfers={
-            transfer.product: transfer
-            for transfer in prepared
-            if transfer.product in declared_inputs
+            transfer.buffer: transfer for transfer in prepared if transfer.buffer in declared_inputs
         },
         predicated_operations=predicated,
     )
@@ -969,7 +963,7 @@ def _open_lane(
                 if (
                     active_lane.block_tables
                     or active_lane.new_cache_pages
-                    or active_lane.forward_rows
+                    or active_lane.forward_operation_indices
                 ):
                     raise unsupported_setup(
                         "KV-free execution received cache tables or packed forward rows"
@@ -982,9 +976,10 @@ def _open_lane(
         scope.layout = LaneLayout(
             operations=operations,
             requests=candidates,
+            # Physical row columns bound queued work. A verifier can publish a
+            # shorter accepted prefix before this lane becomes executable.
             seq_lens=tuple(
-                int(request.request.parent_runtime(operation.parent).kv_visible_len)
-                for operation, request in zip(operations, candidates, strict=True)
+                int(request.predecessor.runtime.kv_visible_len) for request in candidates
             ),
             identities=tuple(
                 operation_geometry.operation_identity(operation) for operation in operations
@@ -1006,7 +1001,7 @@ def _open_lane(
         # Only live operations consume inputs; predicated outputs are published
         # directly into their aligned completion rows.
         active_inputs = {
-            reference for operation in active_operations for reference in operation.inputs
+            reference for operation in active_operations for reference in operation.tensor_inputs()
         }
         active_inputs.update(
             operation.predicate
@@ -1043,7 +1038,7 @@ def _open_lane(
 
 def _active_lane(
     lane: RunLane,
-    operations: tuple[Operation, ...],
+    operations: tuple[ScheduledRequest, ...],
 ) -> RunLane | None:
     """Rebuild lane-indexed rows and parameters after predicated operations are removed."""
 
@@ -1065,20 +1060,40 @@ def _active_lane(
     return replace(
         lane,
         operations=operations,
-        forward_rows=tuple(
-            replace(row, operation_index=old_to_new[row.operation_index])
-            for row in lane.forward_rows
-            if row.operation_index in old_to_new
+        forward_operation_indices=tuple(
+            old_to_new[operation]
+            for row, operation in enumerate(lane.forward_operation_indices)
+            if operation in old_to_new
+        ),
+        request_pool_indices=tuple(
+            lane.request_pool_indices[row]
+            for row, operation in enumerate(lane.forward_operation_indices)
+            if operation in old_to_new
+        ),
+        seq_lens=tuple(
+            lane.seq_lens[row]
+            for row, operation in enumerate(lane.forward_operation_indices)
+            if operation in old_to_new
+        ),
+        query_lens=tuple(
+            lane.query_lens[row]
+            for row, operation in enumerate(lane.forward_operation_indices)
+            if operation in old_to_new
+        ),
+        write_kv=tuple(
+            lane.write_kv[row]
+            for row, operation in enumerate(lane.forward_operation_indices)
+            if operation in old_to_new
         ),
         latent_params=tuple(
             params
             for params in lane.latent_params
-            if (params.request_key, int(params.op_id)) in identities
+            if (params.request_key, params.op_id) in identities
         ),
     )
 
 
-def _lane_completion_words(operations: tuple[Operation, ...]) -> int:
+def _lane_completion_words(operations: tuple[ScheduledRequest, ...]) -> int:
     """Compute fixed completion-word capacity for all operations in a lane."""
 
     return max(
@@ -1089,7 +1104,7 @@ def _lane_completion_words(operations: tuple[Operation, ...]) -> int:
 
 
 def _reserve_cpu_tasks(
-    operations: tuple[Operation, ...],
+    operations: tuple[ScheduledRequest, ...],
     scope: LaneState,
     *,
     cpu_tasks: CpuPool,
@@ -1102,9 +1117,12 @@ def _reserve_cpu_tasks(
 
     video_model = isinstance(execution_model, VideoModel)
     for operation in operations:
-        if operation.kind is not OpCode.DIFFUSION_FINALIZE and not (
-            video_model and operation.kind is OpCode.MEDIA_APPEND
-        ):
+        if operation.kind not in {
+            PipelineStage.IMAGE_DECODING,
+            PipelineStage.VIDEO_ENCODING,
+            PipelineStage.AUDIO_ENCODING,
+            PipelineStage.MUXING,
+        }:
             continue
         if video_model and config.rank != worker_info.output_rank(operation.entry):
             continue
@@ -1113,21 +1131,10 @@ def _reserve_cpu_tasks(
             raise invalid_descriptor("materialization repeats its CPU task identity")
         reservation = cpu_tasks.reserve()
         try:
-            if video_model and operation.kind is OpCode.MEDIA_APPEND:
-                params = next(
-                    (
-                        params
-                        for params in scope.lane.decode_ranges
-                        if params.request_key == operation.request_key
-                        and int(params.op_id) == int(operation.op_id)
-                    ),
-                    None,
-                )
-                if params is None:
-                    raise invalid_descriptor("video decode operation has no exact decode params")
+            if operation.kind in {PipelineStage.VIDEO_ENCODING, PipelineStage.AUDIO_ENCODING}:
                 scope.media_output_leases[identity] = require_media_output_ring(
                     media_output_ring
-                ).reserve(params.track.value)
+                ).reserve("video" if operation.kind is PipelineStage.VIDEO_ENCODING else "audio")
         except BaseException:
             reservation.abandon()
             raise
@@ -1155,7 +1162,7 @@ def _validate_batch(
         for lane in batch.lanes
         for index in (
             *(table.request_pool_idx for table in lane.block_tables),
-            *(row.request_pool_index for row in lane.forward_rows),
+            *lane.request_pool_indices,
         )
     ):
         raise invalid_descriptor("execution batch exceeds request-slot capacity")
@@ -1164,7 +1171,7 @@ def _validate_batch(
 
 
 def _reserve_outputs(
-    operations: tuple[Operation, ...],
+    operations: tuple[ScheduledRequest, ...],
     scope: LaneState,
     *,
     device_products: DeviceProducts,
@@ -1174,41 +1181,37 @@ def _reserve_outputs(
 ) -> None:
     """Bind each declared device value to its concrete bounded owner."""
 
-    from . import transfer
-
     regions = {}
     shapes = {}
     scalar_groups: dict[
-        tuple[torch.device, ProductKind, DType, ShapeBound],
-        list[tuple[ProductRef, torch.device | str]],
+        tuple[torch.device, DType, ShapeBound], list[tuple[TensorRef, torch.device | str]]
     ] = {}
-    general_bindings: list[tuple[ProductRef, torch.device | str]] = []
-    persistent_bindings: list[tuple[ProductRef, torch.device | str]] = []
-    encoder_bindings: list[tuple[ProductRef, torch.device | str]] = []
+    persistent_bindings: list[tuple[TensorRef, torch.device | str]] = []
+    encoder_bindings: list[tuple[TensorRef, torch.device | str]] = []
+    by_identity = {
+        operation_geometry.operation_identity(operation): operation for operation in operations
+    }
     for operation in operations:
         device = _operation_device(operation, config=config)
         request = operation_geometry.request_row(scope, operation.request_key.request_id)
-        media = request.request.admission.diffusion
-        decode = next(
-            (
-                params
-                for params in scope.lane.decode_ranges
-                if params.op_id == operation.op_id and params.request_key == operation.request_key
-            ),
-            None,
-        )
-        for output in operation.outputs:
-            if (
-                operation_geometry.operation_identity(operation) in scope.predicated_operations
-                and output.kind is not ProductKind.COMPLETION
-            ):
-                continue
-            if output.kind is ProductKind.TENSOR:
+        predicated = operation_geometry.operation_identity(operation) in scope.predicated_operations
+        if not predicated:
+            decode = next(
+                (
+                    params
+                    for params in scope.lane.decode_ranges
+                    if params.op_id == operation.op_id
+                    and params.request_key == operation.request_key
+                ),
+                None,
+            )
+            for output in operation.outputs:
                 layout = execution_model.output_layout(
                     operation.entry,
                     output.output_index,
-                    None if media is None else media.geometry,
+                    request.request.admission.diffusion,
                     decode,
+                    len(request.request.admission.prompt_token_ids),
                 )
                 if layout is None:
                     continue
@@ -1216,84 +1219,67 @@ def _reserve_outputs(
                     shapes[output] = layout.shape
                 if layout.region is not None:
                     regions[output] = layout.region
-            if output.kind in {
-                ProductKind.VISION_FEATURE,
-                ProductKind.LATENT_FEATURE,
-            }:
-                encoder_bindings.append((output, device))
+                persistent_bindings.append((output, device))
+            if operation.image_output is not None:
+                persistent_bindings.append((operation.image_output, device))
+            if operation.encoder_output is not None:
+                encoder_bindings.append((operation.encoder_output, device))
+        # A skipped computation propagates false predicates but publishes no
+        # sampled token, feature, image, or latent state.
+        for scalar in (
+            operation.token_output,
+            operation.completion_output,
+            operation.transition_output,
+        ):
+            if scalar is None or (predicated and scalar == operation.token_output):
                 continue
-            if transfer.requires_device_product_binding(output):
-                binding = (output, device)
-                if output.uses_persistent_buffer():
-                    persistent_bindings.append(binding)
-                elif output.shape_bound.max_elements == 1:
-                    scalar_groups.setdefault(
-                        (device, output.kind, output.dtype, output.shape_bound),
-                        [],
-                    ).append(binding)
-                else:
-                    general_bindings.append(binding)
+            scalar_groups.setdefault((device, scalar.dtype, scalar.shape_bound), []).append(
+                (scalar, device)
+            )
     groups = tuple(tuple(group) for group in scalar_groups.values())
-    if general_bindings:
-        groups = (*groups, tuple(general_bindings))
     if persistent_bindings:
         groups = (*groups, tuple(persistent_bindings))
     request_slots = {
         request.request.request_key: int(request.request.request_pool_idx)
         for request in scope.request_candidates
     }
+    allocations = {params.buffer: params for params in scope.lane.buffer_allocations}
     bound_groups = device_products.bind_output_groups(
         groups,
         regions=regions,
         shapes=shapes,
         request_slots=request_slots,
-        buffer_allocations={params.buffer: params for params in scope.lane.buffer_allocations},
+        buffer_allocations=allocations,
     )
     scope.device_writes.extend(write for binding in bound_groups for write in binding.writes)
     scope.encoder_writes.extend(
-        encoder_cache.bind_outputs(
-            tuple(encoder_bindings),
-            buffer_allocations={params.buffer: params for params in scope.lane.buffer_allocations},
-        )
+        encoder_cache.bind_outputs(tuple(encoder_bindings), buffer_allocations=allocations)
     )
-    operation_identities = {
-        operation_geometry.operation_identity(operation) for operation in operations
-    }
-    token_operation_identities = {
-        operation_geometry.operation_identity(operation)
-        for operation in operations
-        if operation.kind.token_mode is not None
-    }
     for write in scope.device_writes:
-        operation_identity = operation_geometry.product_identity(write.reference)
-        if operation_identity not in operation_identities:
-            raise RuntimeError("device output binding has no operation in the execution batch")
-        if write.reference.kind is ProductKind.TOKEN:
-            scope.token_writes[operation_identity] = write
-            scope.operation_writes.setdefault(operation_identity, write)
-        elif write.reference.kind is ProductKind.SELECTED_POINT:
-            scope.selected_point_writes[operation_identity] = write
-        elif (
-            write.reference.kind is ProductKind.COMPLETION
-            and operation_identity in token_operation_identities
-            and int(write.reference.output_index) == 3
-        ):
-            scope.transition_writes[operation_identity] = write
+        identity = operation_geometry.product_identity(write.reference)
+        producer = by_identity.get(identity)
+        if producer is None:
+            raise RuntimeError("device output binding has no computation in the execution batch")
+        if write.reference == producer.token_output:
+            scope.token_writes[identity] = write
+            scope.operation_writes.setdefault(identity, write)
+        elif write.reference == producer.transition_output:
+            scope.transition_writes[identity] = write
         else:
-            scope.operation_writes.setdefault(operation_identity, write)
-        if (
-            operation_identity in scope.predicated_operations
-            and write.reference.kind is ProductKind.COMPLETION
+            scope.operation_writes.setdefault(identity, write)
+        if identity in scope.predicated_operations and write.reference in (
+            producer.completion_output,
+            producer.transition_output,
         ):
-            scope.propagated_predicate_writes.setdefault(operation_identity, ())
-            scope.propagated_predicate_writes[operation_identity] = (
-                *scope.propagated_predicate_writes[operation_identity],
+            scope.propagated_predicate_writes.setdefault(identity, ())
+            scope.propagated_predicate_writes[identity] = (
+                *scope.propagated_predicate_writes[identity],
                 write,
             )
 
 
 def _consume_predicates(
-    operations: tuple[Operation, ...],
+    operations: tuple[ScheduledRequest, ...],
     scope: LaneState,
     *,
     device_products: DeviceProducts,
@@ -1305,8 +1291,8 @@ def _consume_predicates(
         torch.device,
         list[
             tuple[
-                Operation,
-                tuple[ProductRef, int, torch.device | str | None],
+                ScheduledRequest,
+                tuple[TensorRef, ComputationId, torch.device | str | None],
             ]
         ],
     ] = {}
@@ -1320,7 +1306,7 @@ def _consume_predicates(
                 operation,
                 (
                     predicate,
-                    int(operation.op_id),
+                    operation.op_id,
                     device,
                 ),
             )
@@ -1332,8 +1318,8 @@ def _consume_predicates(
         )
         scope.device_reads.extend(reads)
         for (operation, _request), read in zip(entries, reads, strict=True):
-            predicate = cast(ProductRef, operation.predicate)
-            tagged = predicate.kind is ProductKind.TOKEN and predicate.dtype is DType.U32
+            predicate = cast(TensorRef, operation.predicate)
+            tagged = predicate.dtype is DType.I64
             scope.predicate_values[operation_geometry.operation_identity(operation)] = (
                 read.tensor,
                 tagged,
@@ -1341,7 +1327,7 @@ def _consume_predicates(
 
 
 def _publish_predicated_outputs(
-    operations: tuple[Operation, ...], scope: LaneState, *, device_products: DeviceProducts
+    operations: tuple[ScheduledRequest, ...], scope: LaneState, *, device_products: DeviceProducts
 ) -> None:
     """Publish inactive sentinel values for products of predicated operations."""
 
@@ -1372,16 +1358,16 @@ def _bind_latent_rows(
         # Fixed request tensors own the trajectory directly. Solver progress
         # remains explicit, without a second paged-storage reservation.
         for params in lane.latent_params:
-            identity = params.request_key, int(params.op_id)
+            identity = params.request_key, params.op_id
             selected = operations.get(identity)
             if selected is None:
                 raise invalid_descriptor("latent params names an operation outside its lane")
             operation, request = selected
             if params.page_table or params.latent_units:
                 raise invalid_descriptor("paged latent params require a resident latent pool")
-            if operation.kind is OpCode.DIFFUSION_PREPARE:
+            if operation.kind is PipelineStage.LATENT_PREPARATION:
                 valid = int(params.start_step) == 0 and int(params.step_count) == 0
-            elif operation.kind is OpCode.DIFFUSION_STEP:
+            elif operation.kind is PipelineStage.DENOISING:
                 valid = (
                     int(params.start_step) == int(request.flow_step) and int(params.step_count) == 1
                 )
@@ -1397,7 +1383,7 @@ def _bind_latent_rows(
     # Pooled models bind each operation to validated image geometry and page ownership.
     rows: list[tuple[OperationIdentity, LatentParams, int]] = []
     for params in lane.latent_params:
-        identity = (params.request_key, int(params.op_id))
+        identity = (params.request_key, params.op_id)
         selected = operations.get(identity)
         if selected is None:
             raise invalid_descriptor("latent params names an operation outside its lane")
@@ -1417,17 +1403,17 @@ def _bind_latent_rows(
         transferred = next(
             (
                 prepared.value
-                for reference in operation.inputs
-                if (prepared := scope.prepared_transfers.get(reference)) is not None
+                for reference in operation.tensor_inputs()
+                if (prepared := scope.prepared_transfers.get(reference.buffer_id)) is not None
                 and isinstance(prepared.value, LatentTransferValue)
             ),
             None,
         )
         committed_step = int(request.flow_step) if transferred is None else transferred.step
-        if operation.kind is OpCode.DIFFUSION_PREPARE:
+        if operation.kind is PipelineStage.LATENT_PREPARATION:
             if int(params.start_step) != 0 or int(params.step_count) != 0:
                 raise invalid_descriptor("media preparation params carries denoise steps")
-        elif operation.kind is OpCode.DIFFUSION_STEP:
+        elif operation.kind is PipelineStage.DENOISING:
             if (
                 int(params.start_step) != committed_step
                 or int(params.step_count) < 1
@@ -1505,28 +1491,43 @@ def _bind_cache_tables(
             allocation.group_id, tuple(page for page in pages if page not in initialized)
         )
 
-    rows_by_operation: dict[int, list] = defaultdict(list)
-    for row in lane.forward_rows:
-        rows_by_operation[int(row.operation_index)].append(row)
+    # Indices refer to the original lane columns, including when inactive
+    # computations were filtered from the cache-registration view.
+    inputs = scope.lane
+    rows_by_operation: dict[OperationIdentity, list[int]] = defaultdict(list)
+    for row, index in enumerate(inputs.forward_operation_indices):
+        identity = operation_geometry.operation_identity(inputs.operations[index])
+        rows_by_operation[identity].append(row)
 
-    for operation_index, operation in enumerate(lane.operations):
+    for operation in lane.operations:
         request = operation_geometry.request_row(scope, operation.request_key.request_id)
         main_slot = int(request.request.request_pool_idx)
-        parent_runtime = request.request.parent_runtime(operation.parent)
-        operation_rows = rows_by_operation.get(operation_index, [])
-        scope.forward_rows[operation_geometry.operation_identity(operation)] = tuple(operation_rows)
+        parent_runtime = request.predecessor.runtime
+        operation_rows = rows_by_operation.get(operation_geometry.operation_identity(operation), [])
+        scope.forward_indices[operation_geometry.operation_identity(operation)] = tuple(
+            operation_rows
+        )
         main_descriptor = next(
-            (row for row in operation_rows if int(row.request_pool_index) == main_slot),
+            (row for row in operation_rows if inputs.request_pool_indices[row] == main_slot),
             None,
         )
-        if main_descriptor is not None and int(main_descriptor.seq_len) != int(
-            parent_runtime.kv_visible_len
-        ):
-            raise invalid_descriptor("forward row sequence length disagrees with its parent")
+        if main_descriptor is not None:
+            visible = int(parent_runtime.kv_visible_len)
+            declared = inputs.seq_lens[main_descriptor] - inputs.query_lens[main_descriptor]
+            relayed = operation.predicate is not None and operation.predicate.dtype is DType.I64
+            # A queued relay carries a capacity bound computed before its
+            # predecessor's predicate was known. Actual KV length and validity
+            # come from the device row; an inactive descendant must still drain.
+            if declared < visible or (not relayed and declared != visible):
+                raise invalid_descriptor(
+                    "forward row sequence length disagrees with execution state"
+                )
         for descriptor in operation_rows:
-            slot = int(descriptor.request_pool_index)
+            slot = inputs.request_pool_indices[descriptor]
             pages = page_tables.pages(slot, 0)
-            if slot != main_slot and int(descriptor.seq_len) > page_tables.allocated_length(slot):
+            if slot != main_slot and (
+                inputs.seq_lens[descriptor] - inputs.query_lens[descriptor]
+            ) > page_tables.allocated_length(slot):
                 raise invalid_descriptor("forward row exceeds alternative-prefix capacity")
             if slot != main_slot:
                 page_tables.retain_prefix(operation.request_key, slot)
@@ -1534,15 +1535,15 @@ def _bind_cache_tables(
                 operation.request_key,
                 pages,
                 group=0,
-                length=int(descriptor.seq_len)
-                + (int(descriptor.query_len) if descriptor.write_kv else 0),
+                length=inputs.seq_lens[descriptor]
+                - (0 if inputs.write_kv[descriptor] else inputs.query_lens[descriptor]),
                 completion=scope.completion.completion_future(),
             )
     record_component(scope, "bc_tables", started)
 
 
 def _stage_input_products(
-    input_products: Sequence[ProductPayload],
+    input_products: Sequence[TensorPublication],
     scope: LaneState,
     *,
     cache_registry: CachePublications | None,
@@ -1550,120 +1551,98 @@ def _stage_input_products(
     latent_pool: LatentPool | None,
     config: WorkerConfig,
 ) -> None:
-    """Decode ephemeral host inputs and publish transferred physical values."""
+    """Publish query-ready transferred values into their owning runtime stores."""
 
+    for buffer, prepared_kv in scope.prepared_transfers.items():
+        if not isinstance(prepared_kv.value, KvTransfer):
+            continue
+        if not prepared_kv.ready():
+            raise invalid_descriptor("KV input has no query-ready physical import")
+        if cache_registry is None:
+            raise invalid_descriptor("KV input requires cache publication storage")
+        existing = cache_registry.resident(buffer)
+        if existing is not None and existing != prepared_kv.value:
+            raise invalid_descriptor("staged KV publication conflicts with its buffer identity")
+        scope.cache_publication_inputs[buffer] = prepared_kv.value
     for entry in input_products:
         product = entry.product
-        if isinstance(entry.payload, TransferHandle):
-            # Transfer metadata determines which runtime owns the imported value;
-            # each branch validates identity and geometry before publication.
-            transfer = scope.prepared_transfers.get(product)
-            if transfer is None or not transfer.ready():
-                raise invalid_descriptor("cross-stage input has no query-ready prepared transfer")
-            value = transfer.value
-            if isinstance(value, KvTransferValue):
-                snapshot = value
-                publications = cache_registry
-                if publications is None:
-                    raise invalid_descriptor("KV input requires cache publication storage")
-                existing = publications.resident(product)
-                if existing is not None and existing != snapshot:
-                    raise invalid_descriptor(
-                        "staged KV publication conflicts with its product identity"
-                    )
-                staged = scope.cache_publication_inputs.get(product)
-                if staged is not None and staged != snapshot:
-                    raise invalid_descriptor(
-                        "batch repeats a KV product with conflicting publication data"
-                    )
-                scope.cache_publication_inputs[product] = snapshot
-                continue
-            if isinstance(value, LatentTransferValue):
-                consumers = tuple(
-                    operation for operation in scope.lane.operations if product in operation.inputs
-                )
-                if len(consumers) != 1:
-                    raise invalid_descriptor("latent transfer must have one lane consumer")
-                row = operation_geometry.latent_row(consumers[0], scope)
-                if (
-                    value.latent_units != int(row.params.latent_units)
-                    or value.height != int(row.params.height)
-                    or value.width != int(row.params.width)
-                    or value.step != int(row.params.start_step)
-                    or value.generation != int(product.generation)
-                ):
-                    raise invalid_descriptor("latent transfer disagrees with its scheduler params")
-                request = operation_geometry.request_row(scope, product.request_key.request_id)
-                if request.latent_product is not None or int(request.flow_step) != 0:
-                    raise invalid_descriptor(
-                        "latent transfer destination already owns a trajectory"
-                    )
-                binding = transfer.destination
-                if not isinstance(binding, LatentWrite):
-                    raise RuntimeError("latent transfer lost its reserved destination")
-                if (binding.request_pool_idx, binding.page_table) != (
-                    row.request_pool_idx,
-                    tuple(row.params.page_table),
-                ):
-                    raise invalid_descriptor("latent import reservation changed before execution")
-                require_latent_pool(latent_pool).adopt_import(
-                    binding,
-                    generation=value.generation,
-                    step=value.step,
-                    height=value.height,
-                    width=value.width,
-                )
-                transfer.adopt_destination()
-                scope.latent_import_slots.append(row.request_pool_idx)
-                request.latent_product = product
-                request.flow_step = value.step
-                continue
-            tensors = transfer.tensors()
-            if len(tensors) != 1:
-                raise invalid_descriptor("product transfer produced an invalid tensor set")
+        # Transfer metadata determines which runtime owns the imported value;
+        # each branch validates identity and geometry before publication.
+        transfer = scope.prepared_transfers.get(product.buffer_id)
+        if transfer is None or not transfer.ready():
+            raise invalid_descriptor("cross-stage input has no query-ready prepared transfer")
+        value = transfer.value
+        if isinstance(value, LatentTransferValue):
             consumers = tuple(
                 operation
                 for operation in scope.lane.operations
-                if product in operation.inputs or operation.predicate == product
+                if product in operation.tensor_inputs()
             )
-            if not consumers:
-                raise invalid_descriptor("transferred product has no lane consumer")
-            devices = {_operation_device(operation, config=config) for operation in consumers}
-            if len(devices) != 1:
-                raise invalid_descriptor("transferred product spans multiple consumer devices")
-            if isinstance(value, DeviceProductTransferValue):
-                binding = transfer.destination
-                if not isinstance(binding, DeviceProductImport):
-                    raise RuntimeError("device-product transfer lost its reserved destination")
-                if not transfer.destination_adopted:
-                    binding.commit()
-                    transfer.adopt_destination()
-                continue
-            if not isinstance(value, EncoderTransferValue):
-                raise RuntimeError("prepared transfer has an unknown descriptor")
-            encoder_binding = transfer.destination
-            if not isinstance(encoder_binding, EncoderWrite):
-                raise RuntimeError("encoder transfer lost its reserved destination")
+            if len(consumers) != 1:
+                raise invalid_descriptor("latent transfer must have one lane consumer")
+            row = operation_geometry.latent_row(consumers[0], scope)
+            if (
+                value.latent_units != int(row.params.latent_units)
+                or value.height != int(row.params.height)
+                or value.width != int(row.params.width)
+                or value.step != int(row.params.start_step)
+            ):
+                raise invalid_descriptor("latent transfer disagrees with its scheduler params")
+            request = operation_geometry.request_row(scope, product.request_key.request_id)
+            if request.latent_product is not None or int(request.flow_step) != 0:
+                raise invalid_descriptor("latent transfer destination already owns a trajectory")
+            binding = transfer.destination
+            if not isinstance(binding, LatentWrite):
+                raise RuntimeError("latent transfer lost its reserved destination")
+            if (binding.request_pool_idx, binding.page_table) != (
+                row.request_pool_idx,
+                tuple(row.params.page_table),
+            ):
+                raise invalid_descriptor("latent import reservation changed before execution")
+            require_latent_pool(latent_pool).adopt_import(
+                binding,
+                generation=product.generation,
+                step=value.step,
+                height=value.height,
+                width=value.width,
+            )
+            transfer.adopt_destination()
+            scope.latent_import_slots.append(row.request_pool_idx)
+            request.latent_product = product
+            request.flow_step = value.step
+            continue
+        tensors = transfer.tensors()
+        if len(tensors) != 1:
+            raise invalid_descriptor("product transfer produced an invalid tensor set")
+        consumers = tuple(
+            operation
+            for operation in scope.lane.operations
+            if product in operation.tensor_inputs() or operation.predicate == product
+        )
+        if not consumers:
+            raise invalid_descriptor("transferred product has no lane consumer")
+        devices = {_operation_device(operation, config=config) for operation in consumers}
+        if len(devices) != 1:
+            raise invalid_descriptor("transferred product spans multiple consumer devices")
+        if isinstance(value, DeviceProductTransferValue):
+            binding = transfer.destination
+            if not isinstance(binding, DeviceProductImport):
+                raise RuntimeError("device-product transfer lost its reserved destination")
             if not transfer.destination_adopted:
-                encoder_cache.publish(
-                    encoder_binding,
-                    tensors[0],
-                    EncoderMetadata(height=value.height, width=value.width),
-                )
-                encoder_cache.commit_writes((encoder_binding,))
+                binding.commit()
                 transfer.adopt_destination()
             continue
-        # Inline payloads remain host-owned until their consuming operation stages them.
-        if product.kind is ProductKind.SAMPLING_STATE:
-            scope.sampling_states[operation_geometry.product_identity(product)] = (
-                decode_sampling_state_bytes(entry.payload)
+        if not isinstance(value, EncoderTransferValue):
+            raise RuntimeError("prepared transfer has an unknown descriptor")
+        encoder_binding = transfer.destination
+        if not isinstance(encoder_binding, EncoderWrite):
+            raise RuntimeError("encoder transfer lost its reserved destination")
+        if not transfer.destination_adopted:
+            encoder_cache.publish(
+                encoder_binding,
+                tensors[0],
+                EncoderMetadata(height=value.height, width=value.width),
             )
-            continue
-        if product.kind is ProductKind.TOKEN:
-            scope.input_tokens[product] = decode_token_product_bytes(entry.payload)
-            continue
-        if product.kind is not ProductKind.ARTIFACT:
-            raise invalid_descriptor("host-staging payload has no concrete product owner")
-        if product.storage_class is not StorageClass.HOST_STAGING or not entry.payload:
-            raise invalid_descriptor("source image payload has invalid storage metadata")
-        scope.input_images[product] = entry.payload.decode("utf-8")
+            encoder_cache.commit_writes((encoder_binding,))
+            transfer.adopt_destination()
+        continue

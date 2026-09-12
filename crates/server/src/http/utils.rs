@@ -1,6 +1,5 @@
 //! Transport-level request metadata and timestamp helpers.
 
-pub(crate) use crate::openai::ResolvedRequestContext;
 use axum::http::HeaderMap;
 use uuid::Uuid;
 
@@ -9,27 +8,12 @@ pub(crate) fn unix_timestamp() -> u64 {
     uniserve_core::now_unix_secs_u64()
 }
 
-/// Extracts the external request ID and tracing metadata from HTTP headers.
-pub(crate) fn resolve_request_context(headers: &HeaderMap) -> ResolvedRequestContext {
-    // Extract request id from header.
+/// Resolves the caller's request ID from HTTP headers, generating one when absent or invalid.
+pub(crate) fn resolve_request_id(headers: &HeaderMap) -> String {
     let request_id_header = headers
         .get("X-Request-Id")
         .and_then(|value| value.to_str().ok());
-    let request_id = resolve_base_request_id(request_id_header);
-    let trace_context = ["traceparent", "tracestate", "baggage"]
-        .into_iter()
-        .filter_map(|name| {
-            headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(|value| (name.to_string(), value.to_string()))
-        })
-        .collect();
-
-    ResolvedRequestContext {
-        request_id,
-        trace_context,
-    }
+    resolve_base_request_id(request_id_header)
 }
 
 /// Maximum accepted length (in bytes) of a client-supplied request ID. IDs

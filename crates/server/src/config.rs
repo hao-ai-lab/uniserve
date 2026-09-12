@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 use uniserve_engine::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulingPolicy, TransportMap,
+    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulingPolicy, TransferConfig,
     WorkerConfig, WorkerProcessArgs,
 };
 
@@ -77,7 +77,7 @@ pub struct EngineSettings {
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
-    pub transfer: TransportMap,
+    pub transfer: TransferConfig,
     /// Worker process arguments completed with resolved model assets before spawn.
     pub worker_process: WorkerProcessArgs,
 }
@@ -96,7 +96,7 @@ impl Default for EngineSettings {
             max_model_len: None,
             max_video_seconds: 15.0,
             workers: vec![WorkerConfig::model("cuda", 1, 2)],
-            transfer: TransportMap::default(),
+            transfer: TransferConfig::default(),
             worker_process: WorkerProcessArgs {
                 resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
                 ..WorkerProcessArgs::default()

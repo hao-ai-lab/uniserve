@@ -11,7 +11,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+if TYPE_CHECKING:
+    from uniserve_worker.execution.batch import ComputationId
 
 __all__ = [
     "WorkerErrorCode",
@@ -100,11 +103,11 @@ class WorkerError(Exception):
     retryable: bool = False
     fatal: bool = False
     req_id: int | None = None
-    op_id: int | None = None
+    op_id: ComputationId | None = None
     op_kind: str | None = None
     phase: str | None = None
     route: str | None = None
-    operations: tuple[tuple[int, int, int, int], ...] = ()
+    operations: tuple[tuple[int, int, int, ComputationId], ...] = ()
     details: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -129,13 +132,13 @@ class WorkerError(Exception):
             "operations": [
                 {
                     "request_key": {
-                        "authority_id": authority_id,
+                        "engine_id": engine_id,
                         "request_id": request_id,
-                        "epoch": epoch,
+                        "request_epoch": request_epoch,
                     },
-                    "op_id": op_id,
+                    "op_id": op_id.to_mapping(),
                 }
-                for authority_id, request_id, epoch, op_id in self.operations
+                for engine_id, request_id, request_epoch, op_id in self.operations
             ],
         }
 

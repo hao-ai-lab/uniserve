@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
-
 from uniserve_kernel import flash_attn_jagged
+
 from uniserve_worker.backends.attention.fa4_cute import Fa4CuteAttentionBackend
 
 
@@ -120,12 +120,17 @@ def test_prefix_tiles_preserve_live_visibility_and_sequence_boundaries(variable_
         q_begin = k_begin = 0
         for index, (q_len, k_len) in enumerate(zip(query_lengths, key_lengths, strict=True)):
             mask = torch.arange(k_len, device=device)[None] < visible[index, :q_len, None]
-            values.append(F.scaled_dot_product_attention(
-                query[q_begin:q_begin + q_len].double().transpose(0, 1),
-                key[k_begin:k_begin + k_len].double().transpose(0, 1),
-                value[k_begin:k_begin + k_len].double().transpose(0, 1),
-                attn_mask=mask, enable_gqa=True,
-            ).transpose(0, 1).to(query.dtype))
+            values.append(
+                F.scaled_dot_product_attention(
+                    query[q_begin : q_begin + q_len].double().transpose(0, 1),
+                    key[k_begin : k_begin + k_len].double().transpose(0, 1),
+                    value[k_begin : k_begin + k_len].double().transpose(0, 1),
+                    attn_mask=mask,
+                    enable_gqa=True,
+                )
+                .transpose(0, 1)
+                .to(query.dtype)
+            )
             q_begin += q_len
             k_begin += k_len
         return torch.cat(values)

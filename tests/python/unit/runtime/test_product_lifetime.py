@@ -10,14 +10,12 @@ import torch
 from uniserve_worker.execution.batch import (
     BufferAllocation,
     BufferId,
+    ComputationId,
     DType,
-    PointRange,
-    ProductKind,
-    ProductRef,
     RequestKey,
     ShapeBound,
     StaticDim,
-    StorageClass,
+    TensorRef,
 )
 from uniserve_worker.execution.output import CpuJob, OutputPool
 from uniserve_worker.foundation.errors import WorkerError
@@ -55,19 +53,16 @@ def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() 
 
 
 def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
-    reference = ProductRef(
+    reference = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=1,
+        producer_op_id=ComputationId(1, 0),
         output_index=0,
         generation=1,
-        kind=ProductKind.TENSOR,
-        storage_class=StorageClass.DEVICE_TENSOR,
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(32),)),
-        point_range=PointRange(),
     )
-    second = replace(reference, producer_op_id=2)
-    third = replace(reference, producer_op_id=3)
+    second = replace(reference, producer_op_id=ComputationId(2, 0))
+    third = replace(reference, producer_op_id=ComputationId(3, 0))
     buffers = PersistentBuffers(byte_capacity=512, devices=("cpu",), compact=True)
     first_binding = buffers.bind(
         reference,
@@ -156,7 +151,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
         assert not cache.retirement_ready(requests=(request,))
         # Releasing another product of this request does not retire its KV
         # computation. The execution fence still protects page reuse above.
-        assert cache.retirement_ready(buffers=(BufferId(request, 2, 0, 2),))
+        assert cache.retirement_ready(buffers=(BufferId(request, ComputationId(2, 0), 0, 2),))
 
         source = cache.transfer_views((1,), group=0, start=0, length=3)[0][0]
         if stream is not None:
@@ -265,16 +260,11 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         dtype=torch.float32,
         device="cpu",
     )
-    product = ProductRef(
-        request_key=RequestKey(1, 1, 1),
-        producer_op_id=1,
+    buffer = BufferId(
+        owner=RequestKey(1, 1, 1),
+        producer_op_id=ComputationId(1, 0),
         output_index=0,
         generation=1,
-        kind=ProductKind.KV,
-        storage_class=StorageClass.PAGED_KV,
-        dtype=DType.U8,
-        shape_bound=ShapeBound((StaticDim(4096),)),
-        point_range=PointRange(),
     )
     pages = (3, 1, 4)
     prefix = torch.arange(12, dtype=torch.float32).view(3, 1, 4)
@@ -282,7 +272,7 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
     readers = []
     try:
         pool.write(0, pages, start=0, k=prefix, v=-prefix)
-        source = pool.reserve_publication(product, pages, group=0, start=0, length=3)
+        source = pool.reserve_publication(buffer, pages, group=0, start=0, length=3)
         for tensor in pool.read(0, pages, start=0, length=3):
             assert tensor is not None
             location = transport.publish(tensor)
@@ -300,18 +290,18 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         with pytest.raises(WorkerError, match="published version"):
             pool.write(0, pages, start=2, k=suffix[:1], v=-suffix[:1])
 
-        pool.release_buffers((product.buffer_id,))
+        pool.release_buffers((buffer,))
         for location in locations:
             transport.release(location)
         readers[0].close()
-        assert not pool.retirement_ready(buffers=(product.buffer_id,))
+        assert not pool.retirement_ready(buffers=(buffer,))
         with pytest.raises(WorkerError, match="published version"):
             pool.zero_pages(0, (3,))
         torch.testing.assert_close(readers[1].result(), -prefix, rtol=0, atol=0)
         dependencies = pool.write_dependencies(pages, group=0, start=0, length=3)
         output = outputs.acquire(1, token_capacity=8, devices=("cpu",))
         pool.retain_execution(
-            product.request_key,
+            buffer.owner,
             pages,
             group=0,
             length=3,
@@ -320,8 +310,8 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         readers[1].close()
         for future in dependencies:
             future.result(timeout=5)
-        assert pool.retirement_ready(buffers=(product.buffer_id,))
-        assert not pool.retirement_ready(requests=(product.request_key,))
+        assert pool.retirement_ready(buffers=(buffer,))
+        assert not pool.retirement_ready(requests=(buffer.owner,))
         with pytest.raises(WorkerError, match="executing producer or consumer"):
             pool.zero_pages(0, (3,))
         output.seal()
@@ -341,10 +331,8 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         events.close()
 
 
-@pytest.mark.parametrize(
-    "kind", (ProductKind.VISION_FEATURE, ProductKind.ARTIFACT, ProductKind.TENSOR)
-)
-def test_free_retains_an_acquired_consumer_until_it_records_completion(kind: ProductKind) -> None:
+@pytest.mark.parametrize("storage", ("encoder", "tensor"))
+def test_free_retains_an_acquired_consumer_until_it_records_completion(storage: str) -> None:
     events = DeviceEventPool()
     buffers = PersistentBuffers(byte_capacity=16, devices=("cpu",))
     store = (
@@ -355,23 +343,18 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(kind: Pro
             persistent_buffers=buffers,
             event_pool=events,
         )
-        if kind is ProductKind.VISION_FEATURE
+        if storage == "encoder"
         else DeviceProducts(
             capacity=1, byte_capacity=1, persistent_buffers=buffers, event_pool=events
         )
     )
-    product = ProductRef(
+    product = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=1,
+        producer_op_id=ComputationId(1, 0),
         output_index=0,
         generation=1,
-        kind=kind,
-        storage_class=(
-            StorageClass.DEVICE_TENSOR if kind is ProductKind.TENSOR else StorageClass.LATENT_ARENA
-        ),
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(4),)),
-        point_range=PointRange(),
     )
     replacement = replace(product, generation=2)
     value = torch.arange(4, dtype=torch.float32)
@@ -386,7 +369,7 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(kind: Pro
             store.publish_write(write, value)
         store.commit_writes((write,))
         store.release_requests((product.request_key,), retained=frozenset((product.buffer_id,)))
-        read = store.consume(product, consumer_op_id=2)
+        read = store.consume(product, consumer_op_id=ComputationId(2, 0))
         store.release_buffers((product.buffer_id,))
         with pytest.raises(WorkerError):
             store.bind_outputs(
@@ -419,16 +402,13 @@ def test_tensor_publication_enforces_its_logical_region_and_representation() -> 
     store = DeviceProducts(
         capacity=1, byte_capacity=16, persistent_buffers=buffers, event_pool=events
     )
-    reference = ProductRef(
+    reference = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=1,
+        producer_op_id=ComputationId(1, 0),
         output_index=0,
         generation=1,
-        kind=ProductKind.TENSOR,
-        storage_class=StorageClass.DEVICE_TENSOR,
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(4), StaticDim(4))),
-        point_range=PointRange(),
     )
     allocation = {reference.buffer_id: BufferAllocation(reference.buffer_id, 0, 24)}
     region = TensorRegion(offset=(2, 1), shape=(2, 3))
@@ -449,7 +429,7 @@ def test_tensor_publication_enforces_its_logical_region_and_representation() -> 
             store.publish_write(write, expected.reshape(3, 2))
         store.publish_write(write, expected)
         store.commit_writes((write,))
-        read = store.consume(reference, consumer_op_id=2)
+        read = store.consume(reference, consumer_op_id=ComputationId(2, 0))
         assert read.region == region
         torch.testing.assert_close(read.tensor, expected, rtol=0, atol=0)
         store.record_readers((read,))
@@ -470,16 +450,13 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
         dtype=torch.float32,
         device="cpu",
     )
-    product = ProductRef(
+    product = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=2,
+        producer_op_id=ComputationId(2, 0),
         output_index=0,
         generation=3,
-        kind=ProductKind.LATENT,
-        storage_class=StorageClass.LATENT_ARENA,
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(11), StaticDim(4))),
-        point_range=PointRange(),
     )
     expected = torch.arange(44, dtype=torch.float32).reshape(11, 4)
     locator = transport.publish(expected)
@@ -533,16 +510,13 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(committed: bo
         dtype=torch.float32,
         device="cpu",
     )
-    product = ProductRef(
+    product = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=1,
+        producer_op_id=ComputationId(1, 0),
         output_index=0,
         generation=1,
-        kind=ProductKind.LATENT,
-        storage_class=StorageClass.LATENT_ARENA,
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(11), StaticDim(4))),
-        point_range=PointRange(),
     )
     pages = (3, 1, 4)
     staging = pool.stage((pages,), (11,))[0]
@@ -673,16 +647,13 @@ def test_failed_latent_publication_retains_its_pages_without_poisoning_other_req
         dtype=torch.float32,
         device="cpu",
     )
-    product = ProductRef(
+    product = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=1,
+        producer_op_id=ComputationId(1, 0),
         output_index=0,
         generation=1,
-        kind=ProductKind.LATENT,
-        storage_class=StorageClass.LATENT_ARENA,
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(4), StaticDim(4))),
-        point_range=PointRange(),
     )
     staging = pool.stage(((1,),), (4,))[0]
     staging.value.fill_(1)

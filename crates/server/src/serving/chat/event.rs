@@ -1,12 +1,8 @@
 //! Structured assistant messages and incremental chat events.
 
 use std::ops::Deref;
-use std::sync::Arc;
 
-use crate::serving::text::{DecodedLogprobs, DecodedPromptLogprobs};
 use serde::{Deserialize, Serialize};
-
-use crate::serving::text::FinishReason;
 
 /// One finalized assistant tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,92 +160,4 @@ impl AssistantMessage {
             .collect();
         self
     }
-}
-
-/// Streamed chat event emitted by the chat facade.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ChatEvent {
-    /// The request was accepted, streaming has started, and prompt metadata is
-    /// ready.
-    Start {
-        /// The actual prompt token IDs for this request.
-        prompt_token_ids: Arc<[u32]>,
-        /// Once-only prompt logprobs metadata, when requested.
-        prompt_logprobs: Option<DecodedPromptLogprobs>,
-        /// Monotonic timestamp at which the request entered the serving queue.
-        queued_at: Option<f64>,
-        /// Monotonic timestamp at which engine execution began.
-        scheduled_at: Option<f64>,
-    },
-    /// A new assistant output block has started.
-    BlockStart {
-        /// Zero-based content-block index.
-        index: usize,
-        /// Semantic kind of the opened block.
-        kind: AssistantBlockKind,
-    },
-    /// A newly observed delta for one open assistant output block.
-    BlockDelta {
-        /// Zero-based content-block index.
-        index: usize,
-        /// Semantic kind of the open block.
-        kind: AssistantBlockKind,
-        /// Newly decoded block text.
-        delta: String,
-    },
-    /// Per-decoded-update sample metadata: logprobs and/or output token IDs.
-    LogprobsDelta {
-        /// Per-position candidate log probabilities, when requested.
-        logprobs: Option<DecodedLogprobs>,
-        /// Token identifiers represented by this update.
-        token_ids: Vec<u32>,
-    },
-    /// One assistant output block has ended.
-    BlockEnd {
-        /// Zero-based content-block index.
-        index: usize,
-        /// Complete normalized block content.
-        block: AssistantContentBlock,
-    },
-    /// One tool call has started.
-    ToolCallStart {
-        /// Zero-based tool-call index.
-        index: usize,
-        /// Request-local tool-call identifier.
-        id: String,
-        /// Selected function name.
-        name: String,
-    },
-    /// One incremental tool-call arguments delta for the currently open tool
-    /// call.
-    ToolCallArgumentsDelta {
-        /// Zero-based tool-call index.
-        index: usize,
-        /// Newly decoded serialized argument text.
-        delta: String,
-    },
-    /// One tool call has ended.
-    ToolCallEnd {
-        /// Zero-based tool-call index.
-        index: usize,
-        /// Complete normalized tool call.
-        call: AssistantToolCall,
-    },
-    /// Terminal event carrying the final assembled assistant message and finish
-    /// metadata.
-    Done {
-        /// Final assembled assistant message.
-        message: AssistantMessage,
-        /// Number of prompt tokens actually sent to the engine after chat
-        /// template rendering and tokenization.
-        prompt_token_count: usize,
-        /// Number of output tokens generated.
-        output_token_count: usize,
-        /// Number of generated tokens included in user-visible output.
-        visible_output_token_count: usize,
-        /// Number of generated tokens consumed by internal protocol sections.
-        internal_token_count: usize,
-        /// Terminal condition reported by the engine or output assembler.
-        finish_reason: FinishReason,
-    },
 }

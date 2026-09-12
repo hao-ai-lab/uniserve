@@ -8,7 +8,7 @@ use tracing::warn;
 
 use crate::profile::reasoning::{Qwen3ReasoningParser, ReasoningDelta};
 use crate::serving::chat::AssistantBlockKind;
-use crate::serving::chat::output::processor::ReasoningEvent;
+use crate::serving::chat::output::processor::AssistantEvent;
 use crate::serving::chat::{Error, Result};
 
 struct ReasoningState {
@@ -26,9 +26,9 @@ impl ReasoningState {
     }
 
     /// Processes one text delta through the reasoning parser.
-    fn process_delta(&mut self, delta: String) -> Vec<ReasoningEvent> {
+    fn process_delta(&mut self, delta: String) -> Vec<AssistantEvent> {
         let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
-            return vec![ReasoningEvent::TextDelta {
+            return vec![AssistantEvent::TextDelta {
                 kind: AssistantBlockKind::Text,
                 delta,
             }];
@@ -58,7 +58,7 @@ impl ReasoningState {
     }
 
     /// Finishes incremental output processing.
-    fn finish(&mut self) -> Vec<ReasoningEvent> {
+    fn finish(&mut self) -> Vec<AssistantEvent> {
         let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
             return Vec::new();
         };
@@ -77,14 +77,14 @@ impl ReasoningState {
 }
 
 /// Appends a nonempty semantic text delta.
-fn push_text_delta(events: &mut Vec<ReasoningEvent>, kind: AssistantBlockKind, delta: String) {
+fn push_text_delta(events: &mut Vec<AssistantEvent>, kind: AssistantBlockKind, delta: String) {
     if !delta.is_empty() {
-        events.push(ReasoningEvent::TextDelta { kind, delta });
+        events.push(AssistantEvent::TextDelta { kind, delta });
     }
 }
 
 /// Pushes the reasoning delta.
-fn push_reasoning_delta(events: &mut Vec<ReasoningEvent>, delta: ReasoningDelta) {
+fn push_reasoning_delta(events: &mut Vec<AssistantEvent>, delta: ReasoningDelta) {
     if let Some(reasoning) = delta.reasoning {
         push_text_delta(events, AssistantBlockKind::Reasoning, reasoning);
     }
@@ -98,7 +98,7 @@ fn push_reasoning_delta(events: &mut Vec<ReasoningEvent>, delta: ReasoningDelta)
 pub async fn reasoning_event_stream(
     decoded_stream: impl futures::Stream<Item = crate::serving::text::Result<DecodedTextEvent>> + Send,
     parser: Option<Qwen3ReasoningParser>,
-    mut y: TryYielder<ReasoningEvent, Error>,
+    mut y: TryYielder<AssistantEvent, Error>,
 ) -> Result<()> {
     pin_mut!(decoded_stream);
     let mut state = ReasoningState::new(parser);
@@ -112,7 +112,7 @@ pub async fn reasoning_event_stream(
                 scheduled_at,
             } => {
                 state.initialize(&prompt_token_ids);
-                y.yield_ok(ReasoningEvent::Start {
+                y.yield_ok(AssistantEvent::Start {
                     prompt_token_ids,
                     prompt_logprobs,
                     queued_at,
@@ -130,7 +130,7 @@ pub async fn reasoning_event_stream(
                     y.yield_ok(next).await;
                 }
                 if logprobs.is_some() || !token_ids.is_empty() {
-                    y.yield_ok(ReasoningEvent::SampleDelta {
+                    y.yield_ok(AssistantEvent::SampleDelta {
                         logprobs,
                         token_ids,
                     })
@@ -140,7 +140,7 @@ pub async fn reasoning_event_stream(
                     for next in state.finish() {
                         y.yield_ok(next).await;
                     }
-                    y.yield_ok(ReasoningEvent::Done {
+                    y.yield_ok(AssistantEvent::Done {
                         prompt_token_count: finished.prompt_token_count,
                         output_token_count: finished.output_token_count,
                         internal_token_count: finished.internal_token_count,

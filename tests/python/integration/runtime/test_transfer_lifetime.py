@@ -12,15 +12,13 @@ import torch
 from tests.python.fixtures.shm_publication import serve_pending_publication
 from uniserve_worker.execution.batch import (
     BufferAllocation,
+    ComputationId,
     DType,
     Locator,
-    PointRange,
-    ProductKind,
-    ProductRef,
     RequestKey,
     ShapeBound,
     StaticDim,
-    StorageClass,
+    TensorRef,
     WorkerEndpoint,
 )
 from uniserve_worker.foundation.errors import WorkerError
@@ -703,20 +701,13 @@ def test_cancelled_shard_reads_retain_destination_and_capacity_until_physical_re
             dtype=torch.float32,
             device="cpu",
         )
-    product = ProductRef(
+    product = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=1,
+        producer_op_id=ComputationId(1, 0),
         output_index=0,
         generation=1,
-        kind={
-            "encoder": ProductKind.VISION_FEATURE,
-            "device": ProductKind.ARTIFACT,
-            "latent": ProductKind.LATENT,
-        }[owner],
-        storage_class=StorageClass.LATENT_ARENA,
         dtype=DType.F32,
         shape_bound=ShapeBound(tuple(StaticDim(dimension) for dimension in shape)),
-        point_range=PointRange(),
     )
     replacement = replace(product, generation=2)
     allocation = BufferAllocation(product.buffer_id, 0, 4096)

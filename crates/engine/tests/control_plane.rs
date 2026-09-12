@@ -6,136 +6,141 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
+use uniserve_worker_ipc::{ForwardMode, PipelineStage};
 
+use uniserve_core::{EngineCoreOutput, FinishReason};
 use uniserve_core::{
-    ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
-    GenerationBehaviorDescriptor, GenerationConstraint, GenerationLimits,
-    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageIngestRecipe,
-    ImageKvEffect, ImageParams, ImageSegment, RequestId, SamplingParams, SegmentPosition,
-    TriggerPolicyDescriptor, UndVisibility,
+    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
+    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageInput, ImageParams,
+    ImageTrigger, MultimodalInputs, RequestId, SamplingParams,
 };
-use uniserve_core::{Event, FinishReason};
 use uniserve_engine::{
-    ControlTokens, EngineHandle, EngineLoop, SchedulingPolicy, SimEngine, SimExecutor,
+    EngineHandle, Scheduler, SchedulingPolicy, SimEngine, SimExecutor, SpecialTokenIds,
 };
 
-fn ctrl() -> ControlTokens {
-    ControlTokens::default()
+fn ctrl() -> SpecialTokenIds {
+    SpecialTokenIds::default()
 }
 
 #[test]
 fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
     use uniserve_core::GenerationFeatures;
-    use uniserve_worker_ipc::OpCode;
+    use uniserve_worker_ipc::Computation;
 
     let image_path = vec![
-        OpCode::DiffusionPrepare,
-        OpCode::DiffusionStep,
-        OpCode::DiffusionFinalize,
+        Computation::Pipeline(PipelineStage::LatentPreparation),
+        Computation::Pipeline(PipelineStage::Denoising),
+        Computation::Pipeline(PipelineStage::ImageDecoding),
     ];
     let cases = [
         (
-            vec![OpCode::EncoderVision],
+            vec![Computation::Pipeline(PipelineStage::VisionEncoding)],
             GenerationFeatures::VISION_ENCODE,
         ),
         (
-            vec![OpCode::EncoderLatent],
+            vec![Computation::Pipeline(PipelineStage::LatentEncoding)],
             GenerationFeatures::LATENT_ENCODE,
         ),
         (
-            vec![OpCode::EncoderVision, OpCode::EncoderLatent],
+            vec![
+                Computation::Pipeline(PipelineStage::VisionEncoding),
+                Computation::Pipeline(PipelineStage::LatentEncoding),
+            ],
             GenerationFeatures::VISION_ENCODE | GenerationFeatures::LATENT_ENCODE,
         ),
         (image_path, GenerationFeatures::IMAGE_GENERATION),
         (
-            vec![OpCode::DiffusionStep, OpCode::DiffusionFinalize],
-            GenerationFeatures::empty(),
-        ),
-        (
-            vec![OpCode::DiffusionPrepare, OpCode::DiffusionFinalize],
+            vec![
+                Computation::Pipeline(PipelineStage::Denoising),
+                Computation::Pipeline(PipelineStage::ImageDecoding),
+            ],
             GenerationFeatures::empty(),
         ),
         (
             vec![
-                OpCode::DiffusionPrepare,
-                OpCode::DiffusionStep,
-                OpCode::DiffusionDecode,
+                Computation::Pipeline(PipelineStage::LatentPreparation),
+                Computation::Pipeline(PipelineStage::ImageDecoding),
+            ],
+            GenerationFeatures::empty(),
+        ),
+        (
+            vec![
+                Computation::Pipeline(PipelineStage::LatentPreparation),
+                Computation::Pipeline(PipelineStage::Denoising),
+                Computation::Pipeline(PipelineStage::VideoDecoding),
             ],
             GenerationFeatures::empty(),
         ),
     ];
     for (operations, expected) in cases {
         let mut sim = SimEngine::new();
-        sim.mut_info_for_test().supported_ops = vec![OpCode::ArExtend, OpCode::ArDecode];
+        sim.mut_info_for_test().supported_ops = vec![
+            Computation::Forward(ForwardMode::Prefill),
+            Computation::Forward(ForwardMode::Decode),
+        ];
         sim.mut_info_for_test().supported_ops.extend(operations);
-        let scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+        let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
         assert_eq!(
-            scheduler.runtime_profile().generation_limits.features,
+            scheduler.generation_limits().features,
             GenerationFeatures::UNDERSTANDING | expected,
         );
     }
 }
 
-fn text_context(token_ids: Vec<u32>) -> Vec<ContextSegment> {
-    vec![ContextSegment::UndTokens {
-        token_ids,
-        visibility: UndVisibility::Internal,
-    }]
+fn text_input(token_ids: Vec<u32>) -> (Vec<u32>, MultimodalInputs) {
+    (token_ids, MultimodalInputs::default())
 }
 
-fn context_with_image(
-    before: Vec<u32>,
+fn image_input(
+    mut before: Vec<u32>,
     after: Vec<u32>,
     hash: u64,
     logical_positions: u32,
     physical_tokens: u32,
-) -> Vec<ContextSegment> {
+) -> (Vec<u32>, MultimodalInputs) {
     let position = before.len() as u32;
-    vec![
-        ContextSegment::UndTokens {
-            token_ids: before,
-            visibility: UndVisibility::Internal,
-        },
-        ContextSegment::Image {
-            image: ImageSegment {
+    before.extend(after);
+    (
+        before,
+        MultimodalInputs {
+            images: vec![ImageInput {
                 hash,
                 b64: "aW1hZ2U=".to_string(),
-                position: SegmentPosition::AtToken { position },
-            },
-            ingest: ImageIngestRecipe::vit_only(
-                logical_positions,
-                ImageKvEffect::Exact {
-                    tokens: physical_tokens,
-                },
-            ),
+                position,
+                num_positions: logical_positions,
+                encoders: vec![ImageEncoderInput {
+                    encoder: ImageIngestStep::VitEncode,
+                    num_kv_tokens: Some(physical_tokens),
+                    max_kv_tokens: None,
+                }],
+            }],
         },
-        ContextSegment::UndTokens {
-            token_ids: after,
-            visibility: UndVisibility::Internal,
-        },
-    ]
+    )
 }
 
 fn generation_request(
     request_id: RequestId,
-    context: Vec<ContextSegment>,
+    (prompt_token_ids, multimodal_inputs): (Vec<u32>, MultimodalInputs),
     sampling: SamplingParams,
     image: ImageParams,
     constraint: GenerationConstraint,
     max_und_tokens: usize,
 ) -> GenerationRequest {
-    let policy = GenerationPolicyDescriptor {
-        trigger: TriggerPolicyDescriptor::Token { token_id: 1000 },
-        gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
-        feedback: Some(GeneratedImageFeedbackRecipe {
-            source: FeedbackSource::DeviceProduct,
-            next_und_token: FeedbackNextToken::EndOfImage,
-            ingest: ImageIngestRecipe::vit_only(2, ImageKvEffect::WorkerDefined),
-            sample_continuation: true,
-        }),
-        ..GenerationPolicyDescriptor::default()
+    let policy = ImageGenerationConfig {
+        trigger: ImageTrigger::Token { token_id: 1000 },
+        requires_text_for_image: false,
+        feedback_source: Some(FeedbackSource::DeviceProduct),
+        feedback_next_token: FeedbackNextToken::EndOfImage,
+        num_feedback_positions: 2,
+        feedback_encoders: vec![ImageEncoderInput {
+            encoder: ImageIngestStep::VitEncode,
+            num_kv_tokens: None,
+            max_kv_tokens: None,
+        }],
+        sample_feedback_continuation: true,
+        ..ImageGenerationConfig::default()
     };
-    let behavior = GenerationBehaviorDescriptor::resolve(constraint, &policy);
+
     let cache = Default::default();
     let limits = GenerationLimits {
         features: uniserve_core::GenerationFeatures::UNDERSTANDING
@@ -151,43 +156,31 @@ fn generation_request(
         max_cfg_branches: 3,
         encoder_cache_entries: 256,
     };
-    let resources = GenerationResourceBounds::conservative(uniserve_core::GenerationResources {
-        context: &context,
-        negative_context: &[],
-        behavior: &behavior,
-        policy: &policy,
-        image: &image,
-        max_und_tokens,
-        cache: &cache,
-        limits: &limits,
-    })
-    .expect("bounded simulation request");
-    GenerationRequest {
+    let request = GenerationRequest {
         request_id,
-        context,
-        negative_context: Vec::new(),
+        prompt_token_ids,
+        multimodal_inputs,
+        negative_prompt_token_ids: Vec::new(),
         constraint,
-        behavior,
         sampling,
         image,
         max_und_tokens,
+        include_stop_token: false,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache,
-        policy,
-        resources,
-    }
+        image_generation: policy,
+    };
+    request
+        .validate_resources(&limits)
+        .expect("bounded simulation request");
+    request
 }
 
-fn with_trigger(
-    mut request: GenerationRequest,
-    trigger: TriggerPolicyDescriptor,
-) -> GenerationRequest {
-    request.policy.trigger = trigger;
-    request.behavior = GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
-    request.resources.generated_feedback_makes_non_replayable =
-        request.behavior.generated_image_feedback;
+fn with_trigger(mut request: GenerationRequest, trigger: ImageTrigger) -> GenerationRequest {
+    request.image_generation.trigger = trigger;
+
     request
 }
 
@@ -208,7 +201,7 @@ fn run_requests(
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(depth);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = EngineLoop::with_policy(executor, ctrl(), 32, policy);
+    let sched = Scheduler::with_policy(executor, ctrl(), 32, policy);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -219,7 +212,7 @@ fn run_requests(
         for _ in 0..*n {
             let req = generation_request(
                 RequestId(id),
-                text_context(vec![1, 2, 3, 4, 5]),
+                text_input(vec![1, 2, 3, 4, 5]),
                 SamplingParams::default(),
                 ImageParams {
                     steps: 4,
@@ -248,9 +241,9 @@ fn run_requests(
                     reason: None,
                 });
                 match ev {
-                    Event::TextToken { .. } => c.text += 1,
-                    Event::ImageDone { .. } => c.images += 1,
-                    Event::Finished { reason, .. } if !c.finished => {
+                    EngineCoreOutput::TextToken { .. } => c.text += 1,
+                    EngineCoreOutput::ImageDone { .. } => c.images += 1,
+                    EngineCoreOutput::Finished { reason, .. } if !c.finished => {
                         c.finished = true;
                         c.reason = Some(reason);
                         done += 1;
@@ -295,7 +288,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     sim.mut_info_for_test().latent_pages = 65;
     sim.mut_info_for_test().buffer_pool_bytes = 16 << 20;
     sim.mut_info_for_test().max_batch_ops = 1024;
-    let scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let thread = thread::spawn(move || scheduler.run(rx));
@@ -303,7 +296,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     let mut first = handle
         .submit(generation_request(
             RequestId(1),
-            text_context(vec![4, 5, 6]),
+            text_input(vec![4, 5, 6]),
             SamplingParams::default(),
             ImageParams {
                 steps: ImageParams::MAX_STEPS,
@@ -317,7 +310,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     let mut began = false;
     while !began && Instant::now() < begin_deadline {
         match first.try_recv() {
-            Ok(Event::ImageBegin { .. }) => began = true,
+            Ok(EngineCoreOutput::ImageBegin { .. }) => began = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -327,7 +320,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     let mut second = handle
         .submit(generation_request(
             RequestId(2),
-            text_context(vec![4, 5, 6]),
+            text_input(vec![4, 5, 6]),
             SamplingParams::default(),
             ImageParams {
                 steps: 2,
@@ -346,8 +339,8 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
         for (id, receiver) in [(RequestId(1), &mut first), (RequestId(2), &mut second)] {
             while let Ok(event) = receiver.try_recv() {
                 match event {
-                    Event::ImageDone { .. } if id == RequestId(2) => second_images += 1,
-                    Event::Finished { reason, .. } => {
+                    EngineCoreOutput::ImageDone { .. } if id == RequestId(2) => second_images += 1,
+                    EngineCoreOutput::Finished { reason, .. } => {
                         reasons.insert(id, reason);
                     }
                     _ => {}
@@ -368,7 +361,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
 #[test]
 fn image_events_cover_declared_denoise_steps() {
     const STEPS: u16 = 3;
-    let scheduler = EngineLoop::new(Box::new(SimExecutor::new(SimEngine::new())), ctrl(), 32);
+    let scheduler = Scheduler::new(Box::new(SimExecutor::new(SimEngine::new())), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let scheduler_thread = thread::spawn(move || scheduler.run(rx));
@@ -376,7 +369,7 @@ fn image_events_cover_declared_denoise_steps() {
     let mut events = handle
         .submit(generation_request(
             RequestId(1),
-            text_context(vec![4, 5, 6]),
+            text_input(vec![4, 5, 6]),
             SamplingParams::default(),
             ImageParams {
                 steps: STEPS,
@@ -395,24 +388,26 @@ fn image_events_cover_declared_denoise_steps() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while finished.is_none() && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(Event::ImageBegin {
+            Ok(EngineCoreOutput::ImageBegin {
                 image_id,
                 height,
                 width,
                 steps,
             }) => begin = Some((image_id, height, width, steps)),
-            Ok(Event::ImageStep { image_id, step }) => steps.push((image_id, step)),
-            Ok(Event::ImageCommit { image_id }) => {
+            Ok(EngineCoreOutput::ImageStep { image_id, step }) => steps.push((image_id, step)),
+            Ok(EngineCoreOutput::ImageCommit { image_id }) => {
                 assert_eq!(image_id, 1);
                 commits += 1;
             }
-            Ok(Event::ImageDone {
+            Ok(EngineCoreOutput::ImageDone {
                 image_id,
                 height,
                 width,
                 ..
             }) => image_done = Some((image_id, height, width)),
-            Ok(Event::Finished { reason, images, .. }) => finished = Some((reason, images)),
+            Ok(EngineCoreOutput::Finished { reason, images, .. }) => {
+                finished = Some((reason, images))
+            }
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -432,7 +427,7 @@ fn image_events_cover_declared_denoise_steps() {
 fn scheduler_clamps_max_batch_to_worker_info() {
     let mut sim = SimEngine::new();
     sim.mut_info_for_test().max_batch_ops = 3;
-    let sched = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
 
     assert_eq!(sched.config().max_batch, 3);
 }
@@ -465,10 +460,10 @@ fn operation_window_metrics_record_the_full_lifecycle() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     sim.set_text_len(6);
-    let mut scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let request = generation_request(
         RequestId(1),
-        text_context(vec![1, 2, 3, 4, 5]),
+        text_input(vec![1, 2, 3, 4, 5]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
@@ -479,7 +474,7 @@ fn operation_window_metrics_record_the_full_lifecycle() {
     for _ in 0..512 {
         scheduler.step();
         while let Ok(event) = events.try_recv() {
-            if matches!(event, Event::Finished { .. }) {
+            if matches!(event, EngineCoreOutput::Finished { .. }) {
                 finished = true;
             }
         }
@@ -513,7 +508,7 @@ fn operation_window_metrics_record_the_full_lifecycle() {
         );
         assert!(domain.completed_runs.load(Ordering::Relaxed) > 0);
     }
-    let mut reporter = uniserve_engine::SchedStatsReporter::default();
+    let mut reporter = uniserve_engine::SchedulerStatsReporter::default();
     let snapshot = reporter.snapshot(&scheduler.stats, 16);
     let decoded_active = snapshot
         .domain_stats
@@ -538,10 +533,10 @@ fn relay_run(
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(depth);
     sim.set_text_len(text_len);
-    let mut scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let mut request = generation_request(
         RequestId(1),
-        text_context(vec![1, 2, 3, 4, 5]),
+        text_input(vec![1, 2, 3, 4, 5]),
         sampling,
         ImageParams::default(),
         GenerationConstraint::UndOnly,
@@ -555,8 +550,8 @@ fn relay_run(
         scheduler.step();
         while let Ok(event) = events.try_recv() {
             match event {
-                Event::TextToken { id, .. } => tokens.push(id),
-                Event::Finished { .. } => finished = true,
+                EngineCoreOutput::TextToken { id, .. } => tokens.push(id),
+                EngineCoreOutput::Finished { .. } => finished = true,
                 _ => {}
             }
         }
@@ -646,10 +641,10 @@ fn image_context_decode_is_depth_invariant() {
         let mut sim = SimEngine::new();
         sim.set_pipeline_depth(pipeline_depth);
         sim.set_text_len(8);
-        let mut scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+        let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
         let request = generation_request(
             RequestId(1),
-            context_with_image(vec![1, 2], vec![3, 4], 0xD3C0DE, 4, 1),
+            image_input(vec![1, 2], vec![3, 4], 0xD3C0DE, 4, 1),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
@@ -662,8 +657,8 @@ fn image_context_decode_is_depth_invariant() {
             scheduler.step();
             while let Ok(event) = events.try_recv() {
                 match event {
-                    Event::TextToken { id, .. } => tokens.push(id),
-                    Event::Finished { reason, .. } => finish_reason = Some(reason),
+                    EngineCoreOutput::TextToken { id, .. } => tokens.push(id),
+                    EngineCoreOutput::Finished { reason, .. } => finish_reason = Some(reason),
                     _ => {}
                 }
             }
@@ -684,14 +679,14 @@ fn stop_token_terminates_with_stop() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = EngineLoop::new(executor, ctrl(), 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
     let mut req = generation_request(
         RequestId(1),
-        text_context(vec![1, 2, 3]),
+        text_input(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
@@ -706,8 +701,8 @@ fn stop_token_terminates_with_stop() {
     while reason.is_none() && Instant::now() < deadline {
         if let Ok(ev) = erx.try_recv() {
             match ev {
-                Event::TextToken { .. } => text += 1,
-                Event::Finished { reason: r, .. } => reason = Some(r),
+                EngineCoreOutput::TextToken { .. } => text += 1,
+                EngineCoreOutput::Finished { reason: r, .. } => reason = Some(r),
                 _ => {}
             }
         } else {
@@ -728,14 +723,14 @@ fn run_until_control(abort: bool) -> FinishReason {
     sim.set_text_len(1024);
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = EngineLoop::new(executor, ctrl(), 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
     let req = generation_request(
         RequestId(1),
-        text_context(vec![1, 2, 3]),
+        text_input(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
@@ -747,7 +742,7 @@ fn run_until_control(abort: bool) -> FinishReason {
     let mut saw_token = false;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !saw_token && Instant::now() < deadline {
-        if let Ok(Event::TextToken { .. }) = erx.try_recv() {
+        if let Ok(EngineCoreOutput::TextToken { .. }) = erx.try_recv() {
             saw_token = true;
         } else {
             thread::sleep(Duration::from_millis(1));
@@ -763,7 +758,7 @@ fn run_until_control(abort: bool) -> FinishReason {
     let deadline = Instant::now() + Duration::from_secs(10);
     while reason.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(Event::Finished { reason: r, .. }) => reason = Some(r),
+            Ok(EngineCoreOutput::Finished { reason: r, .. }) => reason = Some(r),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -784,7 +779,7 @@ fn stop_string_cutoff_is_request_local() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1024);
     sim.set_pipeline_depth(2);
-    let scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let scheduler_thread = thread::spawn(move || scheduler.run(rx));
@@ -792,7 +787,7 @@ fn stop_string_cutoff_is_request_local() {
     let mut unrelated_events = handle
         .submit(generation_request(
             RequestId(1),
-            text_context(vec![1, 2, 3]),
+            text_input(vec![1, 2, 3]),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
@@ -802,7 +797,7 @@ fn stop_string_cutoff_is_request_local() {
 
     let mut stopping = generation_request(
         RequestId(2),
-        text_context(vec![1, 2, 3]),
+        text_input(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
@@ -815,7 +810,7 @@ fn stop_string_cutoff_is_request_local() {
     let mut consumed_tokens = 0;
     while consumed_tokens < 2 && Instant::now() < deadline {
         match stopping_events.try_recv() {
-            Ok(Event::TextToken { .. }) => {
+            Ok(EngineCoreOutput::TextToken { .. }) => {
                 consumed_tokens += 1;
                 if consumed_tokens == 1 {
                     handle.acknowledge_at(RequestId(2), 1);
@@ -833,12 +828,12 @@ fn stop_string_cutoff_is_request_local() {
     let mut unrelated_reason = None;
     while Instant::now() < deadline {
         while let Ok(event) = stopping_events.try_recv() {
-            if let Event::Finished { reason, .. } = event {
+            if let EngineCoreOutput::Finished { reason, .. } = event {
                 stop_reason = Some(reason);
             }
         }
         while let Ok(event) = unrelated_events.try_recv() {
-            if let Event::Finished { reason, .. } = event {
+            if let EngineCoreOutput::Finished { reason, .. } = event {
                 unrelated_reason = Some(reason);
             }
         }
@@ -877,7 +872,7 @@ fn hybrid_groups_handshake_runs() {
         },
     ]);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = EngineLoop::new(executor, ctrl(), 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -885,7 +880,7 @@ fn hybrid_groups_handshake_runs() {
     let mut erx = handle
         .submit(generation_request(
             RequestId(1),
-            text_context(vec![1, 2, 3]),
+            text_input(vec![1, 2, 3]),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
@@ -897,7 +892,7 @@ fn hybrid_groups_handshake_runs() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(Event::Finished { .. }) => finished = true,
+            Ok(EngineCoreOutput::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -918,7 +913,7 @@ fn prefix_cache_reuses_shared_prompt() {
     let mut sim = SimEngine::new();
     sim.set_text_len(4);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = EngineLoop::new(executor, ctrl(), 32); // block_size 256
+    let sched = Scheduler::new(executor, ctrl(), 32); // block_size 256
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -932,7 +927,7 @@ fn prefix_cache_reuses_shared_prompt() {
         let mut erx = handle
             .submit(generation_request(
                 RequestId(rid),
-                text_context(prompt.clone()),
+                text_input(prompt.clone()),
                 SamplingParams::default(),
                 ImageParams::default(),
                 GenerationConstraint::UndOnly,
@@ -943,7 +938,7 @@ fn prefix_cache_reuses_shared_prompt() {
         let mut done = false;
         while !done && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(Event::Finished { .. }) => done = true,
+                Ok(EngineCoreOutput::Finished { .. }) => done = true,
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -978,7 +973,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
 
     let mut sim = SimEngine::new();
     sim.set_text_len(2);
-    let sched = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -988,13 +983,13 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
     let run = |id: u64, read: bool, write: bool, isolation_key: u64| {
         let mut request = generation_request(
             RequestId(id),
-            text_context(prompt.clone()),
+            text_input(prompt.clone()),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
             8,
         );
-        request.cache = uniserve_core::GenerationCachePolicyDescriptor {
+        request.cache = uniserve_core::CachePolicy {
             read,
             write,
             isolation_key: Some(isolation_key),
@@ -1003,7 +998,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             match events.try_recv() {
-                Ok(Event::Finished { .. }) => return,
+                Ok(EngineCoreOutput::Finished { .. }) => return,
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1055,7 +1050,7 @@ fn chunked_prefill_progresses_with_decode() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
-    let mut sched = EngineLoop::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
+    let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
     sched.set_long_prefill_threshold(64); // cap a prefill chunk at 64 tokens
     sched.set_token_budget(256); // leaves room for other decodes per step
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -1067,7 +1062,7 @@ fn chunked_prefill_progresses_with_decode() {
     let mut erx1 = handle
         .submit(generation_request(
             RequestId(1),
-            text_context(long_prompt),
+            text_input(long_prompt),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
@@ -1077,7 +1072,7 @@ fn chunked_prefill_progresses_with_decode() {
     let mut erx2 = handle
         .submit(generation_request(
             RequestId(2),
-            text_context(vec![1, 2, 3]),
+            text_input(vec![1, 2, 3]),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
@@ -1091,8 +1086,8 @@ fn chunked_prefill_progresses_with_decode() {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !done && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(Event::TextToken { .. }) => text += 1,
-                Ok(Event::Finished { .. }) => done = true,
+                Ok(EngineCoreOutput::TextToken { .. }) => text += 1,
+                Ok(EngineCoreOutput::Finished { .. }) => done = true,
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1117,14 +1112,14 @@ fn run_sampling(
     let mut sim = SimEngine::new();
     sim.set_text_len(text_len);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = EngineLoop::new(executor, ctrl(), 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
     let req = generation_request(
         RequestId(1),
-        text_context(vec![1, 2, 3]),
+        text_input(vec![1, 2, 3]),
         sampling,
         ImageParams::default(),
         GenerationConstraint::UndOnly,
@@ -1138,13 +1133,13 @@ fn run_sampling(
     let deadline = Instant::now() + Duration::from_secs(10);
     while finished.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(Event::TextToken { id, logprob, .. }) => {
+            Ok(EngineCoreOutput::TextToken { id, logprob, .. }) => {
                 toks.push(id);
                 if logprob.is_some() {
                     any_logprob = true;
                 }
             }
-            Ok(Event::Finished { reason, .. }) => finished = Some(reason),
+            Ok(EngineCoreOutput::Finished { reason, .. }) => finished = Some(reason),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1182,6 +1177,22 @@ fn allowed_tokens_restricts_output() {
         toks.iter().all(|&t| t == 1234),
         "every token must be the single allowed id, got {toks:?}"
     );
+}
+
+#[test]
+fn bad_word_suffix_overrides_bias_without_suppressing_its_prefix() {
+    let sampling = SamplingParams {
+        allowed_token_ids: Some(vec![1234, 4321]),
+        logit_bias: vec![(4321, 1000.0)],
+        bad_words_ids: vec![vec![4321, 4321]],
+        ..Default::default()
+    };
+    let (tokens, _, finished) = run_sampling(sampling, 8, 6);
+    assert!(finished.is_some());
+    assert_eq!(tokens.len(), 6, "{tokens:?}, {finished:?}");
+    assert_eq!(tokens[0], 4321);
+    assert!(tokens.iter().all(|token| [1234, 4321].contains(token)));
+    assert!(tokens.windows(2).all(|pair| pair != [4321, 4321]));
 }
 
 #[test]
@@ -1245,7 +1256,7 @@ fn multimodal_encode_then_cache_hit() {
     sim.set_pipeline_depth(2);
     let executor = SimExecutor::new(sim);
     let wake = executor.command_waker();
-    let sched = EngineLoop::new(Box::new(executor), ctrl(), 32);
+    let sched = Scheduler::new(Box::new(executor), ctrl(), 32);
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::with_waker(tx, wake);
@@ -1254,7 +1265,7 @@ fn multimodal_encode_then_cache_hit() {
     let run_img = |rid: u64, handle: &EngineHandle| -> (bool, Vec<String>) {
         let req = generation_request(
             RequestId(rid),
-            context_with_image(vec![1, 2, 3], vec![9], 0xCAFE, 4, 1),
+            image_input(vec![1, 2, 3], vec![9], 0xCAFE, 4, 1),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::GenOnly,
@@ -1267,11 +1278,11 @@ fn multimodal_encode_then_cache_hit() {
         let mut seen = Vec::new();
         while !done && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(Event::ImageDone { .. }) => {
+                Ok(EngineCoreOutput::ImageDone { .. }) => {
                     seen.push("image_done".to_string());
                     images += 1;
                 }
-                Ok(Event::Finished { reason, .. }) => {
+                Ok(EngineCoreOutput::Finished { reason, .. }) => {
                     seen.push(format!("finished:{reason:?}"));
                     done = true;
                 }
@@ -1321,11 +1332,11 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
     let mut sim = SimEngine::new();
     sim.set_text_len(6);
     sim.set_pipeline_depth(2);
-    let mut scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let request = |request_id| {
         generation_request(
             RequestId(request_id),
-            context_with_image(vec![1, 2, 3], vec![9], 0xCAFE, 4, 1),
+            image_input(vec![1, 2, 3], vec![9], 0xCAFE, 4, 1),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
@@ -1345,8 +1356,8 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
             while let Ok(event) = events.try_recv() {
                 seen[index].push(format!("{event:?}"));
                 match event {
-                    Event::TextToken { .. } => text_tokens[index] += 1,
-                    Event::Finished { reason, .. } => reasons[index] = Some(reason),
+                    EngineCoreOutput::TextToken { .. } => text_tokens[index] += 1,
+                    EngineCoreOutput::Finished { reason, .. } => reasons[index] = Some(reason),
                     _ => {}
                 }
             }
@@ -1378,7 +1389,7 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
 
     let mut sim = SimEngine::new();
     sim.set_text_len(20);
-    let sched = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -1386,7 +1397,7 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
 
     let request = generation_request(
         RequestId(81),
-        context_with_image(vec![1, 2], vec![3, 4], 0x81, 4, 17),
+        image_input(vec![1, 2], vec![3, 4], 0x81, 4, 17),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
@@ -1399,9 +1410,9 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
     let mut finished = false;
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(Event::TextToken { .. }) => text_tokens += 1,
-            Ok(Event::ImageDone { .. }) => images += 1,
-            Ok(Event::Finished { .. }) => finished = true,
+            Ok(EngineCoreOutput::TextToken { .. }) => text_tokens += 1,
+            Ok(EngineCoreOutput::ImageDone { .. }) => images += 1,
+            Ok(EngineCoreOutput::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1426,7 +1437,7 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         sim.set_text_len(1_000_000);
         sim.set_pipeline_depth(pipeline_depth);
         let executor = Box::new(SimExecutor::new(sim));
-        let sched = EngineLoop::new(executor, ctrl(), 32);
+        let sched = Scheduler::new(executor, ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
@@ -1434,7 +1445,7 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         let req = with_trigger(
             generation_request(
                 RequestId(1),
-                text_context(vec![1, 2, 3]),
+                text_input(vec![1, 2, 3]),
                 SamplingParams::default(),
                 ImageParams {
                     steps: 3,
@@ -1444,7 +1455,7 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
                 GenerationConstraint::Default,
                 200,
             ),
-            TriggerPolicyDescriptor::Token { token_id: 1008 },
+            ImageTrigger::Token { token_id: 1008 },
         );
         let mut erx = handle.submit(req).unwrap();
 
@@ -1456,12 +1467,12 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         let deadline = Instant::now() + Duration::from_secs(15);
         while finish_reason.is_none() && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(Event::TextToken { id, .. }) => signature.push(('T', id)),
-                Ok(Event::ImageBegin { .. }) => image_begins += 1,
-                Ok(Event::ImageStep { .. }) => image_steps += 1,
-                Ok(Event::ImageCommit { .. }) => image_commits += 1,
-                Ok(Event::ImageDone { image_id, .. }) => signature.push(('I', image_id)),
-                Ok(Event::Finished { reason, .. }) => finish_reason = Some(reason),
+                Ok(EngineCoreOutput::TextToken { id, .. }) => signature.push(('T', id)),
+                Ok(EngineCoreOutput::ImageBegin { .. }) => image_begins += 1,
+                Ok(EngineCoreOutput::ImageStep { .. }) => image_steps += 1,
+                Ok(EngineCoreOutput::ImageCommit { .. }) => image_commits += 1,
+                Ok(EngineCoreOutput::ImageDone { image_id, .. }) => signature.push(('I', image_id)),
+                Ok(EngineCoreOutput::Finished { reason, .. }) => finish_reason = Some(reason),
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1503,7 +1514,7 @@ fn interleave_c4_generated_images_complete() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     sim.set_text_len(1_000_000);
-    let mut scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let mut events = HashMap::new();
     let mut results = HashMap::new();
 
@@ -1513,7 +1524,7 @@ fn interleave_c4_generated_images_complete() {
         let request = with_trigger(
             generation_request(
                 request_id,
-                text_context(vec![1, 2, 3]),
+                text_input(vec![1, 2, 3]),
                 SamplingParams::default(),
                 ImageParams {
                     steps: 2,
@@ -1523,7 +1534,7 @@ fn interleave_c4_generated_images_complete() {
                 GenerationConstraint::Default,
                 24,
             ),
-            TriggerPolicyDescriptor::Token { token_id: trigger },
+            ImageTrigger::Token { token_id: trigger },
         );
         events.insert(request_id, scheduler.submit_for_test(request));
         results.insert(
@@ -1544,9 +1555,9 @@ fn interleave_c4_generated_images_complete() {
             while let Ok(event) = event_rx.try_recv() {
                 let result = results.get_mut(id).expect("request result exists");
                 match event {
-                    Event::TextToken { .. } => result.text += 1,
-                    Event::ImageDone { .. } => result.images += 1,
-                    Event::Finished { reason, .. } if !result.finished => {
+                    EngineCoreOutput::TextToken { .. } => result.text += 1,
+                    EngineCoreOutput::ImageDone { .. } => result.images += 1,
+                    EngineCoreOutput::Finished { reason, .. } if !result.finished => {
                         result.finished = true;
                         result.reason = Some(reason);
                     }
@@ -1576,7 +1587,7 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = EngineLoop::new(executor, ctrl(), 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1584,7 +1595,7 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     let mut request = with_trigger(
         generation_request(
             RequestId(1),
-            text_context(vec![1, 2, 3]),
+            text_input(vec![1, 2, 3]),
             SamplingParams {
                 logit_bias: vec![(2222, 1000.0)],
                 ..Default::default()
@@ -1598,15 +1609,18 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
             GenerationConstraint::Default,
             12,
         ),
-        TriggerPolicyDescriptor::Token { token_id: 2222 },
+        ImageTrigger::Token { token_id: 2222 },
     );
-    request.policy.feedback = Some(GeneratedImageFeedbackRecipe {
-        source: FeedbackSource::ArtifactProduct,
-        next_und_token: FeedbackNextToken::Bos,
-        ingest: ImageIngestRecipe::vit_only(1, ImageKvEffect::Exact { tokens: 1 }),
-        sample_continuation: false,
-    });
-    request.behavior = GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
+    request.image_generation.feedback_source = Some(FeedbackSource::ArtifactProduct);
+    request.image_generation.feedback_next_token = FeedbackNextToken::Bos;
+    request.image_generation.num_feedback_positions = 1;
+    request.image_generation.feedback_encoders = vec![ImageEncoderInput {
+        encoder: ImageIngestStep::VitEncode,
+        num_kv_tokens: Some(1),
+        max_kv_tokens: None,
+    }];
+    request.image_generation.sample_feedback_continuation = false;
+
     let mut events = handle.submit(request).unwrap();
 
     let mut sequence = Vec::new();
@@ -1614,9 +1628,9 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(Event::TextToken { .. }) => sequence.push('T'),
-            Ok(Event::ImageDone { .. }) => sequence.push('I'),
-            Ok(Event::Finished { .. }) => finished = true,
+            Ok(EngineCoreOutput::TextToken { .. }) => sequence.push('T'),
+            Ok(EngineCoreOutput::ImageDone { .. }) => sequence.push('I'),
+            Ok(EngineCoreOutput::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1642,14 +1656,14 @@ fn gen_branch_waits_for_model_image_starts() {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000);
         sim.set_pipeline_depth(depth);
-        let sched = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+        let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
         let request = with_trigger(
             generation_request(
                 RequestId(1),
-                text_context(vec![1, 2, 3]),
+                text_input(vec![1, 2, 3]),
                 SamplingParams::default(),
                 ImageParams {
                     steps: 3,
@@ -1659,7 +1673,7 @@ fn gen_branch_waits_for_model_image_starts() {
                 GenerationConstraint::Default,
                 40,
             ),
-            TriggerPolicyDescriptor::Token { token_id: 2222 },
+            ImageTrigger::Token { token_id: 2222 },
         );
         let mut events = handle.submit(request).unwrap();
         let mut tokens = Vec::new();
@@ -1668,9 +1682,9 @@ fn gen_branch_waits_for_model_image_starts() {
         let deadline = Instant::now() + Duration::from_secs(15);
         while finish_reason.is_none() && Instant::now() < deadline {
             match events.try_recv() {
-                Ok(Event::TextToken { id, .. }) => tokens.push(id),
-                Ok(Event::ImageDone { .. }) => images += 1,
-                Ok(Event::Finished { reason, .. }) => finish_reason = Some(reason),
+                Ok(EngineCoreOutput::TextToken { id, .. }) => tokens.push(id),
+                Ok(EngineCoreOutput::ImageDone { .. }) => images += 1,
+                Ok(EngineCoreOutput::Finished { reason, .. }) => finish_reason = Some(reason),
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1692,14 +1706,14 @@ fn gen_branch_waits_for_model_image_starts() {
 fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
-    let sched = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
     let mut request = generation_request(
         RequestId(61),
-        text_context(vec![1, 2, 3]),
+        text_input(vec![1, 2, 3]),
         SamplingParams {
             logit_bias: vec![(2222, 1000.0)],
             ..SamplingParams::default()
@@ -1712,11 +1726,8 @@ fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
         GenerationConstraint::GenOnly,
         8,
     );
-    request.policy.trigger = TriggerPolicyDescriptor::Token { token_id: 2222 };
-    request.policy.gen_only_start = uniserve_core::GenOnlyStartPolicyDescriptor::DiscoverTrigger;
-    request.behavior = GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
-    assert!(request.behavior.und_decode);
-    assert!(!request.behavior.start_gen_after_context);
+    request.image_generation.trigger = ImageTrigger::Token { token_id: 2222 };
+    request.image_generation.requires_text_for_image = true;
 
     let mut events = handle.submit(request).expect("submit request");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1725,9 +1736,9 @@ fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
     let mut finished = false;
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(Event::TextToken { .. }) => visible_text += 1,
-            Ok(Event::ImageDone { .. }) => images += 1,
-            Ok(Event::Finished { .. }) => finished = true,
+            Ok(EngineCoreOutput::TextToken { .. }) => visible_text += 1,
+            Ok(EngineCoreOutput::ImageDone { .. }) => images += 1,
+            Ok(EngineCoreOutput::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1746,7 +1757,7 @@ fn und_only_round_close_trigger_cannot_open_gen() {
     sim.set_text_len(2);
     let control = ctrl();
     let close_token_ids = control.eos.clone();
-    let sched = EngineLoop::new(Box::new(SimExecutor::new(sim)), control, 32);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), control, 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1754,7 +1765,7 @@ fn und_only_round_close_trigger_cannot_open_gen() {
     let request = with_trigger(
         generation_request(
             RequestId(62),
-            text_context(vec![1, 2, 3]),
+            text_input(vec![1, 2, 3]),
             SamplingParams::default(),
             ImageParams {
                 steps: 2,
@@ -1764,7 +1775,7 @@ fn und_only_round_close_trigger_cannot_open_gen() {
             GenerationConstraint::UndOnly,
             16,
         ),
-        TriggerPolicyDescriptor::RoundCloseThenSuffix {
+        ImageTrigger::RoundCloseThenSuffix {
             close_token_ids,
             trigger_token_ids: vec![1008],
         },
@@ -1776,9 +1787,9 @@ fn und_only_round_close_trigger_cannot_open_gen() {
     let mut finished = false;
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(Event::TextToken { .. }) => text += 1,
-            Ok(Event::ImageDone { .. }) => images += 1,
-            Ok(Event::Finished { .. }) => finished = true,
+            Ok(EngineCoreOutput::TextToken { .. }) => text += 1,
+            Ok(EngineCoreOutput::ImageDone { .. }) => images += 1,
+            Ok(EngineCoreOutput::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1796,10 +1807,10 @@ fn gen_branch_model_image_starts_spend_budget() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let trig = ControlTokens {
-        ..ControlTokens::default()
+    let trig = SpecialTokenIds {
+        ..SpecialTokenIds::default()
     };
-    let sched = EngineLoop::new(executor, trig, 32);
+    let sched = Scheduler::new(executor, trig, 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1807,7 +1818,7 @@ fn gen_branch_model_image_starts_spend_budget() {
     let req = with_trigger(
         generation_request(
             RequestId(1),
-            text_context(vec![1, 2, 3]),
+            text_input(vec![1, 2, 3]),
             SamplingParams {
                 logit_bias: vec![(2222, 1000.0)],
                 ..Default::default()
@@ -1820,7 +1831,7 @@ fn gen_branch_model_image_starts_spend_budget() {
             GenerationConstraint::Default,
             64,
         ),
-        TriggerPolicyDescriptor::Token { token_id: 2222 },
+        ImageTrigger::Token { token_id: 2222 },
     );
     let mut erx = handle.submit(req).unwrap();
 
@@ -1829,9 +1840,9 @@ fn gen_branch_model_image_starts_spend_budget() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(Event::TextToken { .. }) => seq.push('T'),
-            Ok(Event::ImageDone { .. }) => seq.push('I'),
-            Ok(Event::Finished { .. }) => finished = true,
+            Ok(EngineCoreOutput::TextToken { .. }) => seq.push('T'),
+            Ok(EngineCoreOutput::ImageDone { .. }) => seq.push('I'),
+            Ok(EngineCoreOutput::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1867,14 +1878,14 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
     sim.set_num_blocks(128);
     sim.set_block_size(256);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = EngineLoop::new(executor, ctrl(), 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
     let req = generation_request(
         RequestId(1),
-        text_context(vec![1, 2, 3]),
+        text_input(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams {
             steps: 3,
@@ -1892,8 +1903,8 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while finished.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(Event::Rejected { .. }) => rejected = true,
-            Ok(Event::Finished { reason, .. }) => finished = Some(reason),
+            Ok(EngineCoreOutput::Rejected { .. }) => rejected = true,
+            Ok(EngineCoreOutput::Finished { reason, .. }) => finished = Some(reason),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1918,7 +1929,7 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = EngineLoop::new(executor, ctrl(), 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1926,7 +1937,7 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
     let mut req = with_trigger(
         generation_request(
             RequestId(1),
-            text_context(vec![1, 2, 3]),
+            text_input(vec![1, 2, 3]),
             SamplingParams {
                 logit_bias: vec![(2222, 1000.0)],
                 ..Default::default()
@@ -1939,11 +1950,10 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
             GenerationConstraint::GenOnly,
             40,
         ),
-        TriggerPolicyDescriptor::Token { token_id: 2222 },
+        ImageTrigger::Token { token_id: 2222 },
     );
-    req.policy.gen_only_start = uniserve_core::GenOnlyStartPolicyDescriptor::DiscoverTrigger;
-    req.behavior = GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
-    assert!(req.behavior.finish_after_gen_commit);
+    req.image_generation.requires_text_for_image = true;
+
     let mut erx = handle.submit(req).unwrap();
 
     let mut text = 0usize;
@@ -1952,9 +1962,9 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while finished.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(Event::TextToken { .. }) => text += 1,
-            Ok(Event::ImageDone { .. }) => images += 1,
-            Ok(Event::Finished { reason, .. }) => finished = Some(reason),
+            Ok(EngineCoreOutput::TextToken { .. }) => text += 1,
+            Ok(EngineCoreOutput::ImageDone { .. }) => images += 1,
+            Ok(EngineCoreOutput::Finished { reason, .. }) => finished = Some(reason),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1995,7 +2005,7 @@ fn gen_branch_literal_trigger_starts_images() {
     let executor = Box::new(SimExecutor::new(sim));
     // Sim emits 1000 + ((id*7 + n) % 5000) for request id=1: 1007, 1008, 1009…
     // After an image commits, the sim resets and the round repeats from 1007.
-    let sched = EngineLoop::new(executor, ctrl(), 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2003,7 +2013,7 @@ fn gen_branch_literal_trigger_starts_images() {
     let req = with_trigger(
         generation_request(
             RequestId(1),
-            text_context(vec![1, 2, 3]),
+            text_input(vec![1, 2, 3]),
             SamplingParams::default(),
             ImageParams {
                 steps: 3,
@@ -2013,7 +2023,7 @@ fn gen_branch_literal_trigger_starts_images() {
             GenerationConstraint::Default,
             40,
         ),
-        TriggerPolicyDescriptor::Suffix {
+        ImageTrigger::Suffix {
             token_ids: vec![1008, 1009],
         },
     );
@@ -2024,9 +2034,9 @@ fn gen_branch_literal_trigger_starts_images() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(Event::TextToken { .. }) => seq.push('T'),
-            Ok(Event::ImageDone { .. }) => seq.push('I'),
-            Ok(Event::Finished { .. }) => finished = true,
+            Ok(EngineCoreOutput::TextToken { .. }) => seq.push('T'),
+            Ok(EngineCoreOutput::ImageDone { .. }) => seq.push('I'),
+            Ok(EngineCoreOutput::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2060,7 +2070,7 @@ fn image_start_logit_bias_steers_gen_branch() {
         sim.set_text_len(1_000_000); // never EOS on its own
         let executor = Box::new(SimExecutor::new(sim));
         // an image-start token inside the sim's vocab
-        let sched = EngineLoop::new(executor, ctrl(), 32);
+        let sched = Scheduler::new(executor, ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
@@ -2068,7 +2078,7 @@ fn image_start_logit_bias_steers_gen_branch() {
         let mut req = with_trigger(
             generation_request(
                 RequestId(1),
-                text_context(vec![1, 2, 3]),
+                text_input(vec![1, 2, 3]),
                 SamplingParams {
                     logit_bias: vec![(2222, bias)],
                     ..Default::default()
@@ -2081,7 +2091,7 @@ fn image_start_logit_bias_steers_gen_branch() {
                 GenerationConstraint::Default,
                 12,
             ),
-            TriggerPolicyDescriptor::Token { token_id: 2222 },
+            ImageTrigger::Token { token_id: 2222 },
         );
         req.sampling.seed = None;
         let mut erx = handle.submit(req).unwrap();
@@ -2092,9 +2102,11 @@ fn image_start_logit_bias_steers_gen_branch() {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !finished && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(Event::TextToken { .. }) if images == 0 => text_before_first_image += 1,
-                Ok(Event::ImageDone { .. }) => images += 1,
-                Ok(Event::Finished { .. }) => finished = true,
+                Ok(EngineCoreOutput::TextToken { .. }) if images == 0 => {
+                    text_before_first_image += 1
+                }
+                Ok(EngineCoreOutput::ImageDone { .. }) => images += 1,
+                Ok(EngineCoreOutput::Finished { .. }) => finished = true,
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -2124,7 +2136,7 @@ fn gen_branch_prefilled_image_start_begins_without_text() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = EngineLoop::new(executor, ctrl(), 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2132,7 +2144,7 @@ fn gen_branch_prefilled_image_start_begins_without_text() {
     let req = with_trigger(
         generation_request(
             RequestId(1),
-            text_context(vec![10, 11, 2222]),
+            text_input(vec![10, 11, 2222]),
             SamplingParams::default(),
             ImageParams {
                 steps: 3,
@@ -2142,7 +2154,7 @@ fn gen_branch_prefilled_image_start_begins_without_text() {
             GenerationConstraint::Default,
             8,
         ),
-        TriggerPolicyDescriptor::Token { token_id: 2222 },
+        ImageTrigger::Token { token_id: 2222 },
     );
     let mut erx = handle.submit(req).unwrap();
 
@@ -2152,9 +2164,9 @@ fn gen_branch_prefilled_image_start_begins_without_text() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(Event::TextToken { .. }) if images == 0 => text_before_first_image += 1,
-            Ok(Event::ImageDone { .. }) => images += 1,
-            Ok(Event::Finished { .. }) => finished = true,
+            Ok(EngineCoreOutput::TextToken { .. }) if images == 0 => text_before_first_image += 1,
+            Ok(EngineCoreOutput::ImageDone { .. }) => images += 1,
+            Ok(EngineCoreOutput::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2177,7 +2189,7 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
     let executor = Box::new(SimExecutor::new(sim));
     let control = ctrl();
     let close_token_ids = control.eos.clone();
-    let sched = EngineLoop::new(executor, control, 32);
+    let sched = Scheduler::new(executor, control, 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2185,7 +2197,7 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
     let req = with_trigger(
         generation_request(
             RequestId(1),
-            context_with_image(Vec::new(), vec![1, 2, 3], 7, 1, 1),
+            image_input(Vec::new(), vec![1, 2, 3], 7, 1, 1),
             SamplingParams::default(),
             ImageParams {
                 steps: 2,
@@ -2195,7 +2207,7 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
             GenerationConstraint::Default,
             40,
         ),
-        TriggerPolicyDescriptor::RoundCloseThenSuffix {
+        ImageTrigger::RoundCloseThenSuffix {
             close_token_ids,
             trigger_token_ids: vec![1008],
         },
@@ -2207,9 +2219,9 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(Event::TextToken { .. }) => seq.push('T'),
-            Ok(Event::ImageDone { .. }) => seq.push('I'),
-            Ok(Event::Finished { .. }) => finished = true,
+            Ok(EngineCoreOutput::TextToken { .. }) => seq.push('T'),
+            Ok(EngineCoreOutput::ImageDone { .. }) => seq.push('I'),
+            Ok(EngineCoreOutput::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2238,7 +2250,7 @@ fn image_budget_suppresses_biased_image_start() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000); // never EOS on its own
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = EngineLoop::new(executor, ctrl(), 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2246,7 +2258,7 @@ fn image_budget_suppresses_biased_image_start() {
     let req = with_trigger(
         generation_request(
             RequestId(1),
-            text_context(vec![1, 2, 3]),
+            text_input(vec![1, 2, 3]),
             SamplingParams {
                 logit_bias: vec![(2222, 1000.0)],
                 ..Default::default()
@@ -2259,7 +2271,7 @@ fn image_budget_suppresses_biased_image_start() {
             GenerationConstraint::Default,
             24,
         ),
-        TriggerPolicyDescriptor::Token { token_id: 2222 },
+        ImageTrigger::Token { token_id: 2222 },
     );
     let mut erx = handle.submit(req).unwrap();
 
@@ -2270,7 +2282,7 @@ fn image_budget_suppresses_biased_image_start() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(Event::TextToken { id, .. }) => {
+            Ok(EngineCoreOutput::TextToken { id, .. }) => {
                 if images >= 2 {
                     if id == 2222 {
                         post_budget_triggers += 1;
@@ -2279,8 +2291,8 @@ fn image_budget_suppresses_biased_image_start() {
                     }
                 }
             }
-            Ok(Event::ImageDone { .. }) => images += 1,
-            Ok(Event::Finished { .. }) => finished = true,
+            Ok(EngineCoreOutput::ImageDone { .. }) => images += 1,
+            Ok(EngineCoreOutput::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2304,7 +2316,7 @@ fn image_budget_suppresses_biased_image_start() {
 #[test]
 fn kv_resources_return_after_completion() {
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let mut sched = EngineLoop::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
+    let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
 
     // Keep receivers alive — a dropped receiver is treated as a cancellation.
     let mut keep_alive = Vec::new();
@@ -2317,7 +2329,7 @@ fn kv_resources_return_after_completion() {
     for (i, mode) in cases.iter().enumerate() {
         let req = generation_request(
             RequestId(i as u64 + 1),
-            text_context(vec![1, 2, 3, 4, 5]),
+            text_input(vec![1, 2, 3, 4, 5]),
             SamplingParams::default(),
             ImageParams {
                 steps: 4,
@@ -2351,12 +2363,12 @@ fn kv_resources_return_after_completion() {
 #[test]
 fn cancellation_storm_retires_every_request() {
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let mut scheduler = EngineLoop::new(executor, ctrl(), 32);
+    let mut scheduler = Scheduler::new(executor, ctrl(), 32);
     let receivers = (1..=128)
         .map(|request_id| {
             scheduler.submit_for_test(generation_request(
                 RequestId(request_id),
-                text_context(vec![1, 2, 3]),
+                text_input(vec![1, 2, 3]),
                 SamplingParams::default(),
                 ImageParams::default(),
                 GenerationConstraint::UndOnly,
@@ -2387,10 +2399,10 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let mut scheduler = EngineLoop::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
+    let mut scheduler = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
     let slow_events = scheduler.submit_for_test(generation_request(
         RequestId(1),
-        text_context(vec![1, 2, 3]),
+        text_input(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
@@ -2398,7 +2410,7 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     ));
     let mut fast_events = scheduler.submit_for_test(generation_request(
         RequestId(2),
-        text_context(vec![1, 2, 3]),
+        text_input(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
@@ -2410,7 +2422,7 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     while Instant::now() < deadline && !fast_finished {
         scheduler.step();
         while let Ok(event) = fast_events.try_recv() {
-            fast_finished |= matches!(event, Event::Finished { .. });
+            fast_finished |= matches!(event, EngineCoreOutput::Finished { .. });
         }
     }
     assert!(

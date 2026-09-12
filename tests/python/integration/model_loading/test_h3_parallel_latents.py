@@ -15,7 +15,7 @@ from uniserve_eval.config import load_config
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.batch import (
-    MediaGeometry,
+    DiffusionSamplingParams,
     TensorTransfer,
     WorkerEndpoint,
 )
@@ -34,7 +34,7 @@ from uniserve_worker.models.minimax_h3.packing import (
     video_latent_frames,
 )
 from uniserve_worker.nn.mesh import EntryBindings
-from uniserve_worker.nn.parallel import EntryConfig, ParallelConfig, SequenceParallel
+from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig, SequenceParallel
 from uniserve_worker.nn.quant.config import resolve_component_precisions
 from uniserve_worker.runtime.device_events import DeviceEventPool
 from uniserve_worker.runtime.distributed import (
@@ -91,13 +91,13 @@ def _generate(
     )
     ranks, parallel = _LAYOUTS[kind]
     components = {
-        "denoiser": EntryConfig(ranks, parallel),
-        "text_encoder": EntryConfig(
+        "denoiser": ComponentConfig(ranks, parallel),
+        "text_encoder": ComponentConfig(
             (0, 2, 1, 3)[:encoder_tp], ParallelConfig(tensor_parallel_size=encoder_tp)
         ),
-        "video_decoder": EntryConfig((2, 0), distribution="temporal_units"),
-        "audio_decoder": EntryConfig((1,)),
-        "output": EntryConfig((2,)),
+        "video_decoder": ComponentConfig((2, 0), distribution="temporal_units"),
+        "audio_decoder": ComponentConfig((1,)),
+        "output": ComponentConfig((2,)),
     }
     meshes = initialize_model_parallel(
         environment,
@@ -153,14 +153,14 @@ def _generate(
     with torch.inference_mode():
         for index, (frames, token_ids) in enumerate(requests):
             print(f"{kind} rank {rank} case {index}: encoding", flush=True)
-            media = MediaGeometry(
-                frame_count=frames,
-                video_units=(frames - 5) // 17,
-                prompt_tokens=len(token_ids),
-                denoise_steps=4,
+            media = DiffusionSamplingParams(
+                num_frames=frames,
+                num_decode_chunks=(frames - 5) // 17,
+                seed=0,
+                num_inference_steps=4,
             )
-            metadata = runner.build_execution(media, scratch, context_workspace)
-            slot = runner.request_tensors(storage, media, metadata)
+            metadata = runner.build_execution(media, len(token_ids), scratch, context_workspace)
+            slot = runner.request_tensors(storage, metadata)
             encoded = None
             if runner.text_encoder is not None:
                 tokens = execution.stage_text_tokens(token_ids)
@@ -215,7 +215,7 @@ def _generate(
                         1,
                         schedule,
                         slot=1,
-                        geometry=runner.execution_key(media),
+                        geometry=runner.execution_key(media, len(token_ids)),
                     )
                     for observed, expected in zip(samples, eager, strict=True):
                         torch.testing.assert_close(observed, expected, rtol=2e-2, atol=2e-2)

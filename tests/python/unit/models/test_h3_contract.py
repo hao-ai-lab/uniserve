@@ -55,11 +55,11 @@ def test_parallel_placement_preserves_global_modality_rows_with_eight_sequence_o
     from uniserve_worker.models.minimax_h3.layout import H3Layout
     from uniserve_worker.models.minimax_h3.weights import validate_h3_entries
     from uniserve_worker.nn.mesh import Communicator, DeviceMesh, EntryBindings
-    from uniserve_worker.nn.parallel import EntryConfig, ParallelConfig, SequenceParallel
+    from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig, SequenceParallel
 
     ranks = tuple(range(7, -1, -1))
     config = ParallelConfig(sequence_parallel=SequenceParallel("ulysses", (8,)))
-    entry = EntryConfig(ranks, config)
+    entry = ComponentConfig(ranks, config)
     layouts = []
     for rank in ranks:
         bindings = EntryBindings(

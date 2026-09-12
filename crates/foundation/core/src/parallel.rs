@@ -117,7 +117,7 @@ pub enum ComponentDistribution {
 /// Computation entry members index the ordered ranks of a Worker instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EntryConfig {
+pub struct ComponentConfig {
     pub ranks: Vec<usize>,
     #[serde(default)]
     pub parallel_config: ParallelConfig,
@@ -127,7 +127,7 @@ pub struct EntryConfig {
     pub units_per_rank: usize,
 }
 
-impl EntryConfig {
+impl ComponentConfig {
     pub fn parallel(ranks: Vec<usize>, parallel_config: ParallelConfig) -> Self {
         Self {
             ranks,
