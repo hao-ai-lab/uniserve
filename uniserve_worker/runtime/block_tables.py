@@ -83,7 +83,7 @@ class BlockTables:
             device=self.page_tables.device,
         )
         self._slot_host = StagingBuffers(
-            self._table_capacity,
+            (2, self._table_capacity),
             dtype=torch.int64,
             depth=staging_depth,
             device=self.page_tables.device,
@@ -117,7 +117,7 @@ class BlockTables:
             "verified_lengths": TensorSchema((rows,), torch.int32, fill=0),
             "alloced_lens": TensorSchema((rows,), torch.int32, fill=0),
             "_page_staging": TensorSchema((tables, max_blocks_per_request), torch.int32),
-            "_slot_staging": TensorSchema((tables,), torch.int64),
+            "_slot_staging": TensorSchema((2, tables), torch.int64),
             "_group_staging": TensorSchema((tables,), torch.int64),
             "_allocated_staging": TensorSchema((tables,), torch.int32),
         }
@@ -169,52 +169,50 @@ class BlockTables:
                 allocated_by_slot[slot] = allocated_tokens
 
         changed_count = len(rows)
+        allocated_slots = tuple(allocated_by_slot)
+        allocated = tuple(allocated_by_slot.values())
+        allocated_count = len(allocated_slots)
+        non_blocking = self.page_tables.device.type == "cuda"
+        if changed_count or allocated_count:
+            # Page rows and allocated lengths have independent index sets, but
+            # belong to one installation. Submit both from one pinned generation
+            # so a batch does not consume two slots of the staging ring.
+            slot_slot, slot_host = self._slot_host.acquire()
+            slot_host.zero_()
+            fill_cpu_ints(slot_host[0, :changed_count], slots)
+            fill_cpu_ints(slot_host[1, :allocated_count], allocated_slots)
+            self._slot_staging.copy_(slot_host, non_blocking=non_blocking)
+            self._slot_host.record_copy(slot_slot)
+
         if changed_count:
             page_slot, page_host = self._page_host.acquire()
-            slot_slot, slot_host = self._slot_host.acquire()
             group_slot, group_host = self._group_host.acquire()
             pages_host = page_host[:changed_count]
             pages_host.zero_()
-            fill_cpu_ints(slot_host[:changed_count], slots)
             fill_cpu_ints(group_host[:changed_count], groups)
             for row, pages in enumerate(rows):
                 fill_cpu_ints(pages_host[row, : len(pages)], pages)
-            non_blocking = self.page_tables.device.type == "cuda"
             self._page_staging[:changed_count].copy_(pages_host, non_blocking=non_blocking)
-            self._slot_staging[:changed_count].copy_(
-                slot_host[:changed_count], non_blocking=non_blocking
-            )
             self._group_staging[:changed_count].copy_(
                 group_host[:changed_count], non_blocking=non_blocking
             )
             self._page_host.record_copy(page_slot)
-            self._slot_host.record_copy(slot_slot)
             self._group_host.record_copy(group_slot)
             self.page_tables[
                 self._group_staging[:changed_count],
-                self._slot_staging[:changed_count],
+                self._slot_staging[0, :changed_count],
             ] = self._page_staging[:changed_count]
 
-        allocated_slots = tuple(allocated_by_slot)
-        allocated = tuple(allocated_by_slot.values())
-        allocated_count = len(allocated_slots)
         if allocated_count:
-            slot_slot, slot_host = self._slot_host.acquire()
             allocated_slot, allocated_host = self._allocated_host.acquire()
-            fill_cpu_ints(slot_host[:allocated_count], allocated_slots)
             fill_cpu_ints(allocated_host[:allocated_count], allocated)
-            non_blocking = self.page_tables.device.type == "cuda"
-            self._slot_staging[:allocated_count].copy_(
-                slot_host[:allocated_count], non_blocking=non_blocking
-            )
             self._allocated_staging[:allocated_count].copy_(
                 allocated_host[:allocated_count], non_blocking=non_blocking
             )
-            self._slot_host.record_copy(slot_slot)
             self._allocated_host.record_copy(allocated_slot)
             self.alloced_lens.index_copy_(
                 0,
-                self._slot_staging[:allocated_count],
+                self._slot_staging[1, :allocated_count],
                 self._allocated_staging[:allocated_count],
             )
 
@@ -296,9 +294,9 @@ class BlockTables:
             raise invalid_descriptor("released request slot is outside capacity")
         count = len(values)
         slot, host = self._slot_host.acquire()
-        fill_cpu_ints(host[:count], values)
-        indices = self._slot_staging[:count]
-        indices.copy_(host[:count], non_blocking=self.page_tables.device.type == "cuda")
+        fill_cpu_ints(host[0, :count], values)
+        indices = self._slot_staging[0, :count]
+        indices.copy_(host[0, :count], non_blocking=self.page_tables.device.type == "cuda")
         self._slot_host.record_copy(slot)
         self.page_tables.index_fill_(1, indices, 0)
         self.verified_lengths.index_fill_(0, indices, 0)
