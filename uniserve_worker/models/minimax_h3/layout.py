@@ -664,6 +664,7 @@ def bind_compute_tensors(
 
 if TYPE_CHECKING:
     from .transformer import H3TransformerMetadata, MiniMaxH3Transformer
+    from .video_vae import MiniMaxH3VideoVAE
 
 
 @dataclass(frozen=True, slots=True)
@@ -768,7 +769,7 @@ class H3ComputeInputs:
         *,
         presentation_tags: torch.Tensor | None = None,
         reference_image: torch.Tensor | None = None,
-        video_vae=None,
+        video_vae: MiniMaxH3VideoVAE | None = None,
     ) -> None:
         """Install presentation states and one fixed image into resident inputs.
 
@@ -829,18 +830,23 @@ class H3ComputeInputs:
     ) -> tuple[H3Tensors, ...]:
         """Bind and initialize every resident slot for one warmup geometry."""
 
-        page_rows = int(self.layout.packed.text_indices.numel())
+        packed = self.layout.packed
+        text_rows = int(
+            packed.text_indices.numel()
+            if packed.presentation_tags is None
+            else packed.presentation_tags.numel()
+        )
         views = tuple(bind_request_tensors(tensors, self.layout) for tensors in storage)
         for slot in views:
+            # Warmup needs valid geometry and finite inputs, not an image encode
+            # or request conditioning. Reference rows are fixed just like text.
             slot.text_condition.zero_()
+            slot.reference_rows.zero_()
             slot.video_rows.zero_()
             slot.audio_rows.zero_()
-            self.prepare_tensors(
-                slot,
-                slot.text_condition if transformer.pipeline.first else None,
-                page_rows,
-                transformer,
-            )
+            slot.video_overlap.zero_()
+            self._prepare_tile_metadata(slot, text_rows)
+            self._prepare_rotary(slot, text_rows, transformer)
         return views
 
     @staticmethod

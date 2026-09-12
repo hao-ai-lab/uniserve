@@ -321,10 +321,21 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         execution: H3ComputeInputs,
         encoded: torch.Tensor | None,
         text_rows: int,
+        *,
+        presentation_tags: torch.Tensor | None = None,
+        reference_image: torch.Tensor | None = None,
     ) -> None:
-        """Install refined conditioning and shape metadata into the explicit request tensors."""
+        """Install refined presentation and optional decoded image in a bound layout."""
 
-        execution.prepare_tensors(slot, encoded, text_rows, self.denoiser)
+        execution.prepare_tensors(
+            slot,
+            encoded,
+            text_rows,
+            self.denoiser,
+            presentation_tags=presentation_tags,
+            reference_image=reference_image,
+            video_vae=self.video_decoder,
+        )
 
     @torch.inference_mode()
     def initialize_tensors(

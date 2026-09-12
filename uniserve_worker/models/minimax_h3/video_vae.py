@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""UniServe-owned MiniMax H3 video VAE decoder."""
+"""UniServe-owned H3 causal image encoding and temporal video reconstruction."""
 
 from __future__ import annotations
 
@@ -246,7 +246,7 @@ class _VideoTransformer(nn.Module):
 
 
 class MiniMaxH3VideoDecoder(nn.Module):
-    """Checkpoint-defined 36-layer ViT decoder and latent-channel projection."""
+    """Checkpoint VAE weights: causal image encoder and 36-layer ViT decoder."""
 
     spatial_compression_ratio = 16
     temporal_compression_ratio = 4
@@ -449,7 +449,7 @@ class MiniMaxH3VideoDecoder(nn.Module):
 
 
 class MiniMaxH3VideoVAE(nn.Module):
-    """Own one resident checkpoint VAE and decode temporal segments."""
+    """Own normalized single-image encoding and temporal-segment decoding."""
 
     latents_mean: torch.Tensor
     latents_std: torch.Tensor
