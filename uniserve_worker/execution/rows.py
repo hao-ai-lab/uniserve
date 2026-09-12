@@ -20,7 +20,11 @@ OperationIdentity: TypeAlias = tuple[RequestKey, ComputationId]
 
 @dataclass(frozen=True, slots=True)
 class ForwardRow:
-    """Immutable numerical input views and cache coordinates for one model row."""
+    """Immutable input views or a request-slot continuation for one model row.
+
+    An indexed decode borrows token and position columns from DecodeState at
+    staging time; it carries no redundant per-row tensor views.
+    """
 
     forward_mode: ForwardMode | PipelineStage
     token_ids: torch.Tensor | None = None
@@ -53,6 +57,8 @@ class ForwardRow:
     def query_tokens(self) -> int:
         """Return the live token or image-patch count represented by this row."""
 
+        if self.request_indexed_decode:
+            return 1
         if self.token_ids is not None:
             return int(self.token_ids.numel())
         if self.latent is not None and self.image_tokens > 0:

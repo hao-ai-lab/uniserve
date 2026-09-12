@@ -112,21 +112,13 @@ def prepare_forward(
             and request.predicate is not None
             and request.predicate[1]
         )
-        positions: tuple[int, ...] | torch.Tensor = (start,)
-        if indexed:
-            assert decode_state is not None
-            slot = int(request.request.request_pool_idx)
-            # These real views also work in a mixed forward; a pure decode
-            # batch gathers the same rows through InputBuffers' fused path.
-            current = decode_state.future_input_tokens[slot, :1]
-            positions = decode_state.logical_lengths[slot : slot + 1]
-        else:
-            current = resolve_decode_token(operation, request, decode_state=decode_state)
         task = token_task(
             operation,
             request,
-            (current,),
-            positions,
+            None
+            if indexed
+            else (resolve_decode_token(operation, request, decode_state=decode_state),),
+            None if indexed else (start,),
             TokenSelection.LAST_LOGITS,
             completion_group,
             request_tables=request_tables,
@@ -718,8 +710,8 @@ def token_outcome(
 def token_task(
     operation: ScheduledRequest,
     request: PendingOutput,
-    token_ids: tuple[int | torch.Tensor, ...],
-    positions: tuple[int, ...] | torch.Tensor,
+    token_ids: tuple[int | torch.Tensor, ...] | None,
+    positions: tuple[int, ...] | torch.Tensor | None,
     selection: TokenSelection,
     completion_group: int,
     *,
@@ -730,14 +722,34 @@ def token_task(
 ) -> ForwardRow:
     """Build one staged autoregressive forward row from request runtime and token coordinates."""
 
-    if len(token_ids) != len(positions) or not token_ids:
-        raise invalid_descriptor("token task ids and positions must align")
-    if len(token_ids) == 1 and isinstance(token_ids[0], torch.Tensor):
-        token_values = token_ids[0].reshape(1)
+    if request_indexed_decode:
+        if (
+            operation.kind is not ForwardMode.DECODE
+            or token_ids is not None
+            or positions is not None
+        ):
+            raise invalid_descriptor(
+                "indexed decode borrows its token and position from request state"
+            )
+        token_values = None
+        position_values = None
     else:
-        token_values = torch.tensor(
-            tuple(int(value) for value in token_ids),
-            dtype=torch.long,
+        if (
+            token_ids is None
+            or positions is None
+            or len(token_ids) != len(positions)
+            or not token_ids
+        ):
+            raise invalid_descriptor("token task ids and positions must align")
+        token_values = (
+            token_ids[0].reshape(1)
+            if len(token_ids) == 1 and isinstance(token_ids[0], torch.Tensor)
+            else torch.tensor(tuple(int(value) for value in token_ids), dtype=torch.long)
+        )
+        position_values = (
+            positions.reshape(-1)
+            if isinstance(positions, torch.Tensor)
+            else torch.tensor(positions, dtype=torch.long)
         )
     predicate_value = request.predicate
     sampling_state = operation.sampling_state or SamplingState()
@@ -750,14 +762,7 @@ def token_task(
     return ForwardRow(
         forward_mode=cast(ForwardMode, operation.kind),
         token_ids=token_values,
-        # InputBuffers owns the model's integer dtype. Borrow device positions
-        # here: indexed decode gathers them in bulk, and mixed staging converts
-        # them while copying into its fixed destination, without per-row casts.
-        positions=(
-            positions.reshape(-1)
-            if isinstance(positions, torch.Tensor)
-            else torch.tensor(positions, dtype=torch.long)
-        ),
+        positions=position_values,
         selection=selection,
         request_pool_idx=cache[0],
         seq_len=visible,

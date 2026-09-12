@@ -159,6 +159,23 @@ class InputBuffers:
         row_count = len(tasks)
         if not 0 < row_count <= self.max_rows:
             raise ValueError("forward row count exceeds input-buffer capacity")
+        indexed = tuple(task for task in tasks if task.request_indexed_decode)
+        if indexed:
+            if states is None:
+                raise ValueError("indexed decode requires resident request state")
+            if any(
+                task.forward_mode is not ForwardMode.DECODE
+                or task.token_ids is not None
+                or task.positions is not None
+                or task.token_embeddings is not None
+                or task.token_embedding_mask is not None
+                or task.selection is None
+                or not 0 < task.request_pool_idx <= states.request_pool_size
+                for task in indexed
+            ):
+                raise ValueError(
+                    "indexed decode requires a valid request slot and no explicit inputs"
+                )
         if attention is None:
             textual = all(
                 isinstance(task.forward_mode, ForwardMode)
@@ -187,6 +204,25 @@ class InputBuffers:
                     table_width=width,
                     binding=binding,
                 )
+        if indexed:
+            assert states is not None
+            # Mixed forwards consume ordinary numerical views. Resolve only
+            # these rows here; pure decode already gathered the shared columns
+            # directly into fixed addresses without constructing row views.
+            tasks = tuple(
+                replace(
+                    task,
+                    token_ids=states.future_input_tokens[task.request_pool_idx, :1],
+                    positions=states.logical_lengths[
+                        task.request_pool_idx : task.request_pool_idx + 1
+                    ],
+                    request_indexed_decode=False,
+                )
+                if task.request_indexed_decode
+                else task
+                for task in tasks
+            )
+        if attention is None:
             attention = (
                 columns(tasks, cache=cache, tables=tables, packed=packed, binding=binding)
                 if textual
@@ -410,17 +446,6 @@ class InputBuffers:
         """Snapshot mutable request columns directly into graph-stable input addresses."""
 
         row_count = len(tasks)
-        if row_count > self.max_rows or any(
-            task.token_ids is None
-            or task.token_ids.numel() != 1
-            or task.positions is None
-            or task.positions.numel() != 1
-            or task.token_embeddings is not None
-            or task.token_embedding_mask is not None
-            or task.selection is None
-            for task in tasks
-        ):
-            raise ValueError("request-indexed decode requires one plain token per row")
         request_pool_indices = tuple(task.request_pool_idx for task in tasks)
         decode_force_finish = (
             tuple(task.decode_force_finish for task in tasks)

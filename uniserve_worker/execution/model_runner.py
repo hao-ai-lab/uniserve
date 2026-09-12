@@ -1860,8 +1860,8 @@ class ModelRunner:
                     invoke,
                     eligible=graph_eligible,
                     borrow_output=all(
-                        task.token_ids is not None
-                        and int(task.token_ids.numel()) == 1
+                        (task.request_indexed_decode or task.token_ids is not None)
+                        and task.query_tokens == 1
                         and task.selection is TokenSelection.LAST_LOGITS
                         for task in tasks
                     ),
@@ -1908,7 +1908,11 @@ def _validate_outputs(
             raise ValueError(f"model output is on {value.device}, expected {device}")
         if not value.is_floating_point():
             raise ValueError("raw neural outputs must use a floating dtype")
-        if (task.token_ids is not None or task.token_embeddings is not None) and value.ndim < 2:
+        if (
+            task.request_indexed_decode
+            or task.token_ids is not None
+            or task.token_embeddings is not None
+        ) and value.ndim < 2:
             raise ValueError("token output must retain token and feature dimensions")
         if task.latent is not None and task.image_tokens > 0 and value.shape != task.latent.shape:
             raise ValueError("flow prediction shape does not match its latent")
