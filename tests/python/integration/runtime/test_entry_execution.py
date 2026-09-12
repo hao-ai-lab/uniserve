@@ -11,6 +11,7 @@ from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.batch import (
     Bounds,
     BufferAllocation,
+    DecodedReference,
     DeviceDim,
     DiffusionRequestParams,
     DType,
@@ -44,9 +45,21 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize("separate_start", (False, True))
-def test_text_encoder_operation_publishes_consumable_conditioning(separate_start):
+@pytest.mark.parametrize("with_image", (False, True))
+def test_text_encoder_operation_publishes_consumable_conditioning(separate_start, with_image):
+    class Conditioner(torch.nn.Embedding):
+        """Small numerical entry standing in for externally loaded model weights."""
+
+        def forward(self, tokens, pixels=None):
+            text = super().forward(tokens)
+            if pixels is None:
+                return text
+            assert pixels.dtype is torch.uint8
+            assert tuple(pixels.shape) == (1, 2, 2, 3)
+            return text + pixels[..., 0].sum().float()
+
     model = StubModel()
-    model.text_encoder = torch.nn.Embedding(32, 4)
+    model.text_encoder = Conditioner(32, 4)
     model.text_max_tokens = 16
     model.entry_outputs = {
         "text_encoder": (
@@ -76,6 +89,18 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
         ShapeBound((StaticDim(1), StaticDim(3), StaticDim(4))),
         PointRange(),
     )
+    pixels = ProductRef(
+        key,
+        1,
+        65535,
+        1,
+        ProductKind.TENSOR,
+        StorageClass.HOST_STAGING,
+        DType.U8,
+        ShapeBound((StaticDim(1), StaticDim(2), StaticDim(2), StaticDim(3))),
+        PointRange(),
+    )
+    image = DecodedReference("image", "first_frame", "first_frame", False, pixels, None, 0, 1)
     operation = Operation.registered(
         request_key=key,
         op_id=1,
@@ -83,6 +108,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
         kind=OpCode.ENCODER_TEXT,
         entry="text_encoder",
         bounds=Bounds(),
+        inputs=(pixels,) if with_image else (),
         outputs=(reference,),
     )
     run = Run(
@@ -94,10 +120,16 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
                 NewRequest.create(
                     key,
                     request_pool_idx=1,
-                    diffusion=DiffusionRequestParams(prompt, 1000, MediaGeometry(22, 3, 3, 4)),
+                    diffusion=DiffusionRequestParams(
+                        prompt,
+                        1000,
+                        MediaGeometry(22, 3, 3, 4),
+                        references=(image,) if with_image else (),
+                    ),
                 )
             ),
         ),
+        input_products=(ProductPayload(pixels, bytes(range(12))),) if with_image else (),
         buffer_allocations=(BufferAllocation(reference.buffer_id, 0, reference.max_bytes),),
     )
     try:
@@ -133,6 +165,8 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
             ticket.result()
             ticket.close()
         expected = torch.tensor(prompt).reshape(1, 3, 1) * 4 + torch.arange(4)
+        if with_image:
+            expected = expected + 18  # Red-channel values 0 + 3 + 6 + 9.
         torch.testing.assert_close(destination, expected.float(), atol=0, rtol=0)
         from dataclasses import replace
 

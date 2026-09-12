@@ -230,6 +230,7 @@ impl EngineClient {
             seed,
             priority,
             geometry,
+            image_reference,
             ..
         } = submission;
         let rid = self.core.next_request_id();
@@ -249,6 +250,7 @@ impl EngineClient {
             });
         }
         let request = uniserve_core::DiffusionRequest {
+            image_reference,
             request_id: rid,
             prompt_token_ids,
             seed,

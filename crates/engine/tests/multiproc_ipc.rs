@@ -763,6 +763,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
             let prompt_token_ids = vec![100_000 + index as u32];
             let prompt_tokens = u32::try_from(prompt_token_ids.len())?;
             let events = engine.submit(Request::Diffusion(DiffusionRequest {
+                image_reference: None,
                 request_id,
                 prompt_token_ids,
                 seed: index as u64,

@@ -886,7 +886,11 @@ fn product_ref_from_table(reference: fbs::ValueRef<'_>) -> CodecResult<ProductRe
                 output_index,
                 generation,
                 kind: ProductKind::Tensor,
-                storage_class: StorageClass::DeviceTensor,
+                storage_class: match value.delivery() {
+                    fbs::TensorDelivery::Device => StorageClass::DeviceTensor,
+                    fbs::TensorDelivery::Inline => StorageClass::HostStaging,
+                    _ => codec_bail!("tensor has an unknown delivery"),
+                },
                 dtype: dtype_from_fb(value.dtype())?,
                 shape_bound: shape_bound_from_parts(value.extents(), value.dynamic_axis())?,
                 point_range: PointRange {
@@ -2131,6 +2135,11 @@ fn product_ref_to_fb(product: &ProductRef) -> CodecResult<fbs::ValueRefT> {
             }))
         }
         ProductKind::Tensor => fbs::ValueReferenceT::TensorBuffer(Box::new(fbs::TensorBufferT {
+            delivery: match product.storage_class {
+                StorageClass::DeviceTensor => fbs::TensorDelivery::Device,
+                StorageClass::HostStaging => fbs::TensorDelivery::Inline,
+                _ => codec_bail!("tensor value has an invalid delivery"),
+            },
             buffer: Some(Box::new(buffer_descriptor_to_fb(product))),
             dtype: dtype_to_fb(product.dtype),
             extents: Some(extents),

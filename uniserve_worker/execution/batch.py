@@ -1494,8 +1494,11 @@ class ProductRef:
 
         if self.generation < 1:
             raise invalid_descriptor("product reference has no logical generation")
-        if self.kind is ProductKind.TENSOR and self.storage_class is not StorageClass.DEVICE_TENSOR:
-            raise invalid_descriptor("tensor product must use persistent device storage")
+        if self.kind is ProductKind.TENSOR and self.storage_class not in {
+            StorageClass.DEVICE_TENSOR,
+            StorageClass.HOST_STAGING,
+        }:
+            raise invalid_descriptor("tensor product must use device storage or host staging")
         self.shape_bound.__post_init__()
 
     @property
@@ -1523,6 +1526,8 @@ class ProductRef:
     def uses_persistent_buffer(self) -> bool:
         """Return whether the product is assigned to scheduler-managed persistent storage."""
 
+        if self.storage_class is StorageClass.HOST_STAGING:
+            return False
         if self.kind in {
             ProductKind.VISION_FEATURE,
             ProductKind.LATENT_FEATURE,
@@ -3708,7 +3713,13 @@ class Run:
             if product in supplied_inputs:
                 raise invalid_descriptor("a submission batch repeats an input product payload")
             supplied_inputs.add(product)
-            if product.kind is ProductKind.TOKEN and isinstance(payload.payload, bytes):
+            if product.kind is ProductKind.TENSOR and isinstance(payload.payload, bytes):
+                if (
+                    not all(isinstance(dim, StaticDim) for dim in product.shape_bound.dims)
+                    or len(payload.payload) != product.max_bytes
+                ):
+                    raise invalid_descriptor("host tensor input must exactly fill its static shape")
+            elif product.kind is ProductKind.TOKEN and isinstance(payload.payload, bytes):
                 if (
                     len(decode_token_product_bytes(payload.payload))
                     > product.shape_bound.max_elements

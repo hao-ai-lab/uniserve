@@ -209,8 +209,12 @@ impl ProductRef {
             "product reference has no logical generation"
         );
         ensure_valid!(
-            self.kind != ProductKind::Tensor || self.storage_class == StorageClass::DeviceTensor,
-            "tensor product must use persistent device storage"
+            self.kind != ProductKind::Tensor
+                || matches!(
+                    self.storage_class,
+                    StorageClass::DeviceTensor | StorageClass::HostStaging
+                ),
+            "tensor product must use device storage or host staging"
         );
         self.shape_bound.validate()
     }
@@ -232,6 +236,9 @@ impl ProductRef {
     /// KV and diffusion trajectories use dedicated page allocations;
     /// request-relay scalars and host results do not consume this pool.
     pub const fn uses_persistent_buffer(&self) -> bool {
+        if matches!(self.storage_class, StorageClass::HostStaging) {
+            return false;
+        }
         matches!(
             self.kind,
             ProductKind::VisionFeature | ProductKind::LatentFeature | ProductKind::Tensor
@@ -781,6 +788,17 @@ impl ProductPayload {
         }
         let bytes = self.value.bytes().expect("inline bytes");
         match self.product.kind {
+            ProductKind::Tensor => {
+                ensure_valid!(
+                    self.product
+                        .shape_bound
+                        .dims
+                        .iter()
+                        .all(|dim| matches!(dim, DimBound::Static(_)))
+                        && bytes.len() as u64 == self.product.max_bytes(),
+                    "host tensor input must exactly fill its static shape"
+                );
+            }
             ProductKind::Token => {
                 let tokens = decode_token_product_bytes(bytes)?;
                 ensure_valid!(

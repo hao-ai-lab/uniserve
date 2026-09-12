@@ -228,6 +228,17 @@ pub struct MediaGeometry {
     pub denoise_steps: u32,
 }
 
+/// One request-owned decoded RGB image used as first-frame conditioning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageReference {
+    /// Raster width in pixels.
+    pub width: u32,
+    /// Raster height in pixels.
+    pub height: u32,
+    /// Contiguous RGB u8 pixels in HWC order, with no row padding.
+    pub pixels: Vec<u8>,
+}
+
 /// Media request. Final media bytes are returned through shared memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffusionRequest {
@@ -241,6 +252,9 @@ pub struct DiffusionRequest {
     pub priority: i32,
     /// Fully resolved media geometry.
     pub geometry: MediaGeometry,
+    /// Decoded first-frame conditioning, owned until request retirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_reference: Option<ImageReference>,
 }
 
 impl DiffusionRequest {
@@ -248,6 +262,18 @@ impl DiffusionRequest {
     pub fn validate(&self) -> Result<(), DiffusionRequestError> {
         if self.prompt_token_ids.is_empty() {
             return Err(DiffusionRequestError::EmptyPromptTokens);
+        }
+
+        if let Some(image) = &self.image_reference {
+            let pixels = u64::from(image.width) * u64::from(image.height);
+            if image.width == 0
+                || image.height == 0
+                || image.width > 4096
+                || image.height > 4096
+                || pixels * 3 != image.pixels.len() as u64
+            {
+                return Err(DiffusionRequestError::InvalidImageReference);
+            }
         }
 
         // Geometry must describe positive work and carry the same logical
@@ -269,6 +295,9 @@ impl DiffusionRequest {
 /// Validation failures for a media generation request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DiffusionRequestError {
+    /// The decoded image is not a complete supported RGB raster.
+    #[error("image reference must be contiguous RGB within 4096x4096")]
+    InvalidImageReference,
     /// The tokenized prompt contains no tokens.
     #[error("media prompt tokens must not be empty")]
     EmptyPromptTokens,

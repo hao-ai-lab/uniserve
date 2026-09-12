@@ -16,6 +16,8 @@ pub struct MediaSubmission {
     pub priority: i32,
     /// Fixed frame and decode-work geometry.
     pub geometry: MediaGeometry,
+    /// Decoded first-frame pixels whose lifetime follows this submission.
+    pub image_reference: Option<uniserve_core::ImageReference>,
     /// Caller-supplied arrival timestamp, when available.
     pub arrival_time: Option<f64>,
     /// Explicit data-parallel rank assignment, when requested.
@@ -38,6 +40,7 @@ impl MediaSubmission {
             seed,
             priority: 0,
             geometry,
+            image_reference: None,
             arrival_time: None,
             data_parallel_rank: None,
             trace_headers: None,

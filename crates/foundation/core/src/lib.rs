@@ -28,7 +28,8 @@ pub mod sampling;
 pub use codec::stats::WorkerForwardStats;
 pub use events::{
     ArtifactEvent, ArtifactHandle, DiffusionRequest, DiffusionRequestError, Event, FinishReason,
-    MediaGeometry, MediaKind, PositionLogprobs, Request, RuntimeFamily, StopReason, TokenLogprob,
+    ImageReference, MediaGeometry, MediaKind, PositionLogprobs, Request, RuntimeFamily, StopReason,
+    TokenLogprob,
 };
 pub use generation::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor,

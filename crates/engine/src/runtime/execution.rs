@@ -453,6 +453,7 @@ impl EngineLoop {
         });
         let mut admissions = Vec::new();
         let mut logical_ops = Vec::with_capacity(candidates.len());
+        let mut inline = Vec::new();
         for (_, _, id, quantum) in candidates {
             let op_id = if quantum == MediaQuantum::Encode {
                 self.media_state(id)
@@ -525,9 +526,26 @@ impl EngineLoop {
                 ) => {
                     vec![state.audio.as_ref().expect("audio is ready").clone()]
                 }
+                (None, MediaQuantum::Encode) => state
+                    .admission
+                    .diffusion
+                    .as_ref()
+                    .expect("media request parameters")
+                    .references
+                    .iter()
+                    .filter_map(|reference| reference.pixels.clone())
+                    .collect(),
                 (None, _) => Vec::new(),
                 _ => unreachable!("validated media plan input disagrees with its stage role"),
             };
+            if quantum == MediaQuantum::Encode {
+                if let Some(image) = &state.request.image_reference {
+                    inline.push(ProductPayload {
+                        product: inputs[0].clone(),
+                        value: uniserve_worker_ipc::InlineValue::Bytes(image.pixels.clone()),
+                    });
+                }
+            }
             let mut buffers = Vec::new();
             let mut outputs = Vec::new();
             if quantum == MediaQuantum::Encode
@@ -685,7 +703,7 @@ impl EngineLoop {
             .map(|request| BatchCommand::Start { request })
             .collect::<Vec<_>>();
         batch_commands.extend(commands.clone());
-        let batch = Batch::new(batch_id, logical_ops, batch_commands, Vec::new());
+        let batch = Batch::new(batch_id, logical_ops, batch_commands, inline);
         if !commands.is_empty() {
             self.inflight.command_batches.insert(batch_id, commands);
         }

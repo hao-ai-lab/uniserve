@@ -344,7 +344,40 @@ impl EngineLoop {
                 request_key,
                 request_pool_idx,
                 DiffusionRequestParams {
-                    references: Vec::new(),
+                    references: submission
+                        .request
+                        .image_reference
+                        .as_ref()
+                        .map(|image| {
+                            vec![uniserve_worker_ipc::DecodedReference {
+                                kind: "image".into(),
+                                task: "first_frame".into(),
+                                role: "first_frame".into(),
+                                include_audio: false,
+                                pixels: Some(ProductRef {
+                                    request_key,
+                                    // The reserved host-input index cannot alias the
+                                    // encoder's output conditioning tensor.
+                                    producer_op_id: encoder_op,
+                                    output_index: u16::MAX,
+                                    generation: 1,
+                                    kind: ProductKind::Tensor,
+                                    storage_class: StorageClass::HostStaging,
+                                    dtype: DType::U8,
+                                    shape_bound: ShapeBound {
+                                        dims: [1, image.height, image.width, 3]
+                                            .into_iter()
+                                            .map(DimBound::Static)
+                                            .collect(),
+                                    },
+                                    point_range: PointRange::default(),
+                                }),
+                                audio: None,
+                                fps_num: 0,
+                                fps_den: 1,
+                            }]
+                        })
+                        .unwrap_or_default(),
                     prompt_token_ids: submission.request.prompt_token_ids.clone(),
                     seed: submission.request.seed,
                     geometry: MediaGeometry {

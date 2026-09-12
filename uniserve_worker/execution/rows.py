@@ -587,6 +587,8 @@ class LaneState:
     completion: OutputBuffer
     input_tokens: dict[ProductRef, tuple[int, ...]] = field(default_factory=dict)
     input_images: dict[ProductRef, str] = field(default_factory=dict)
+    # Admission-owned tensors live through the consuming lane, not in the device arena.
+    input_tensors: dict[ProductRef, torch.Tensor] = field(default_factory=dict)
     forward_rows: dict[OperationIdentity, tuple[RowGeometry, ...]] = field(default_factory=dict)
     layout: LaneLayout | None = None
     prepared_transfers: dict[ProductRef, PreparedTransferInput] = field(default_factory=dict)

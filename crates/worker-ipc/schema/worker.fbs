@@ -294,6 +294,8 @@ table SelectedPointValue {
   max_points:uint;
 }
 
+enum TensorDelivery:ubyte { Device, Inline }
+
 table TensorBuffer {
   buffer:BufferDescriptor;
   dtype:DType;
@@ -301,6 +303,7 @@ table TensorBuffer {
   dynamic_axis:int = -1;
   base_point:uint;
   max_points:uint;
+  delivery:TensorDelivery = Device;
 }
 
 union ValueReference {

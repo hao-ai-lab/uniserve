@@ -1035,6 +1035,65 @@ fn batch_carries_host_supplied_input_product_values() {
 }
 
 #[test]
+fn admitted_image_pixels_reach_encoder_inputs() {
+    let pixels = ProductRef {
+        request_key: request_key(),
+        producer_op_id: OpId(11),
+        output_index: u16::MAX,
+        generation: 1,
+        kind: ProductKind::Tensor,
+        storage_class: StorageClass::HostStaging,
+        dtype: DType::U8,
+        shape_bound: ShapeBound {
+            dims: [1, 2, 2, 3].map(DimBound::Static).to_vec(),
+        },
+        point_range: PointRange::default(),
+    };
+    let mut admission = media_admission(vec![7, 8, 9]);
+    admission.diffusion.as_mut().unwrap().references = vec![DecodedReference {
+        kind: "image".into(),
+        task: "first_frame".into(),
+        role: "first_frame".into(),
+        include_audio: false,
+        pixels: Some(pixels.clone()),
+        audio: None,
+        fps_num: 0,
+        fps_den: 1,
+    }];
+    let operation = Operation {
+        request_key: request_key(),
+        op_id: OpId(11),
+        parent: None,
+        entry: "text_encoder".into(),
+        payload: OpPayload::new(
+            OpCode::EncoderText,
+            Bounds::default(),
+            vec![pixels.clone()],
+            Vec::new(),
+            None,
+            None,
+            0,
+        ),
+    }
+    .sealed();
+    let run = batch_with_operations(1, vec![admission], vec![operation]).with_input_products(vec![
+        ProductPayload {
+            product: pixels,
+            value: InlineValue::Bytes((0..12).collect()),
+        },
+    ]);
+    assert_eq!(execute_round_trip(run.clone()), run);
+    for length in [11, 13] {
+        let mut invalid = run.clone();
+        invalid.input_products[0].value = InlineValue::Bytes(vec![0; length]);
+        assert!(
+            invalid.validate().is_err(),
+            "partial or oversized raster accepted"
+        );
+    }
+}
+
+#[test]
 fn batch_rejects_a_conflicting_command_identity() {
     let commit = |limit| BatchCommand::Commit {
         request_key: request_key(),

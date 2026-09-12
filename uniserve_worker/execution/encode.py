@@ -181,9 +181,28 @@ def _encode_text(
     ):
         raise invalid_descriptor("text encoder outputs must declare conditioning tensors")
     tokens = model_runner.stage_text_tokens(media.prompt_token_ids)
+    reference_inputs: tuple[torch.Tensor, ...] = ()
+    if media.references:
+        if len(media.references) != 1:
+            raise invalid_descriptor("text conditioning supports one image reference")
+        reference = media.references[0]
+        if (
+            reference.kind != "image"
+            or reference.task != "first_frame"
+            or reference.pixels is None
+            or tuple(operation.inputs) != (reference.pixels,)
+        ):
+            raise invalid_descriptor("text conditioning requires a declared first-frame image")
+        pixels = scope.input_tensors.get(reference.pixels)
+        if pixels is None:
+            raise invalid_descriptor("image conditioning has no admitted pixel product")
+        reference_inputs = (pixels.to(device=tokens.device),)
+    elif operation.inputs:
+        raise invalid_descriptor("text-only conditioning must not consume reference products")
     result = model_runner.run_entry(
         operation.entry,
         tokens,
+        *reference_inputs,
     )
     if len(result.values) != len(operation.outputs):
         raise invalid_descriptor("text encoder output declarations disagree with the loaded entry")

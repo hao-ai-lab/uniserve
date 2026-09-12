@@ -32,6 +32,7 @@ from uniserve_worker.execution.batch import (
     Run,
     RunLane,
     ShapeBound,
+    StaticDim,
     StorageClass,
     TensorTransfer,
     TransferHandle,
@@ -67,6 +68,7 @@ from uniserve_worker.runtime.device_products import (
     DeviceProductRead,
     DeviceProductWrite,
     ImageRange,
+    device_product_storage,
 )
 from uniserve_worker.runtime.encoder_cache import EncoderMetadata, EncoderWrite
 from uniserve_worker.runtime.latent_pool import LatentWrite, require_latent_pool
@@ -1654,6 +1656,20 @@ def _stage_input_products(
                 transfer.adopt_destination()
             continue
         # Inline payloads remain host-owned until their consuming operation stages them.
+        if product.kind is ProductKind.TENSOR:
+            if (
+                product.storage_class is not StorageClass.HOST_STAGING
+                or not all(isinstance(dim, StaticDim) for dim in product.shape_bound.dims)
+                or len(entry.payload) != product.max_bytes
+                or not entry.payload
+            ):
+                raise invalid_descriptor("host tensor must exactly fill a positive static shape")
+            dtype_name, _ = device_product_storage(product.dtype)
+            # Own writable host memory; frombuffer must not alias immutable IPC bytes.
+            scope.input_tensors[product] = torch.frombuffer(
+                bytearray(entry.payload), dtype=getattr(torch, dtype_name)
+            ).reshape(tuple(dim.extent for dim in product.shape_bound.dims))
+            continue
         if product.kind is ProductKind.SAMPLING_STATE:
             scope.sampling_states[operation_geometry.product_identity(product)] = (
                 decode_sampling_state_bytes(entry.payload)
