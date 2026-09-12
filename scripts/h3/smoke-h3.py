@@ -35,7 +35,7 @@ def main():
         if route == "/v1/models" and [item["id"] for item in json.loads(body)["data"]] != [model]:
             raise ValueError("Server does not expose the requested single-model contract")
 
-    # H3 rounds 5 seconds at 24 FPS to its 6n+4 frame lattice: 124 frames.
+    # H3 rounds 5 seconds at 24 FPS up to its 17n+5 frame lattice: 124 frames.
     payload = {
         "model": model,
         "prompt": "A calm sea at sunrise, with gentle waves and natural ocean sound.",

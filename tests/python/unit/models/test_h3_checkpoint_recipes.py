@@ -40,6 +40,13 @@ def test_catalog_release_schedule(release, forwards, shifts):
     assert all(s[-1] == 0 for s in schedule.sigmas)
 
 
+@pytest.mark.parametrize("variant", ["base", "ref"])
+def test_distilled_contract_rejects_base_variant_override(eight_step, monkeypatch, variant):
+    monkeypatch.setenv("UNISERVE_H3_VARIANT", variant)
+    with pytest.raises(ValueError, match="cannot override a distilled contract"):
+        resolve_h3_contract(eight_step)
+
+
 def test_eight_step_schedule_matches_upstream_scheduler(eight_step):
     # FastVideo's scheduler accepts already shifted explicit sigmas. Compute
     # those with its FP32 tensor arithmetic, independently of UniServe's

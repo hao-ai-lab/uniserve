@@ -4,7 +4,6 @@
 import json
 import os
 from pathlib import Path
-import socket
 import sys
 import time
 import urllib.error
@@ -25,6 +24,13 @@ def main():
         actual = (contract["variant"], contract["denoise_steps"], contract["attention"])
         if actual != expected:
             raise ValueError(f"ENTRY {entry} requires {expected}, checkpoint resolves {actual}")
+        if entry == "8step" and (
+            contract["attention_backend"] != "VIDEO_SPARSE_ATTN_H3"
+            or contract["ladder"] != [999, 874, 749, 624, 500, 375, 250, 125]
+            or contract["sigma_shifts"] != [10.0, 3.0]
+            or contract["sparsity"] != 0.8
+        ):
+            raise ValueError("8step requires the VSA-H3 sparsity-0.8 shift-10 release recipe")
         print(json.dumps(contract, sort_keys=True))
         return
     if action == "remove":
@@ -59,7 +65,7 @@ def main():
         "id": path.stem,
         "kind": "uniserve",
         "name": f"UniServe H3 {entry} rack 3",
-        "base_url": f"http://{socket.getfqdn()}:{port}",
+        "base_url": f"http://{os.environ['ADVERTISE_HOST']}:{port}",
         "health_path": "/health",
         "metrics_path": "/metrics",
         "api_key_file": os.environ["KEY_FILE"],

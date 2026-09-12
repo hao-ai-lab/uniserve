@@ -53,6 +53,10 @@ if [[ ${1:-} != --inside ]]; then
 fi
 
 cd "$R"
+printf 'UniServe source commit: '
+git rev-parse HEAD
+git status --short
+sha256sum uv.lock Cargo.lock "$D/serve-h3.sbatch"
 export HOME="$D/container-home" XDG_CACHE_HOME="$D/cache" TMPDIR="$D/tmp"
 export CARGO_HOME="$D/toolchain/cargo" RUSTUP_HOME="$D/toolchain/rustup"
 export CUDA_HOME=/usr/local/cuda UV_CACHE_DIR="$D/cache"
@@ -80,6 +84,9 @@ if [[ -n $RUN_ID ]]; then
     "$AGENTS_HOME/bin/runctl" runtime "$RUN_ID" --job-id "$SLURM_JOB_ID" \
         --python "$UV_PROJECT_ENVIRONMENT/bin/python" --observed graph_policy=off || true
 fi
+ADVERTISE_HOST=$(hostname -I | awk '{print $1}')
+[[ -n $ADVERTISE_HOST ]]
+export ADVERTISE_HOST
 key=$(< "$KEY_FILE")
 [[ -n $key ]]
 server_pid=
