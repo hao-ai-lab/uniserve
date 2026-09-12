@@ -229,6 +229,22 @@ def test_reference_checkpoint_validates_selected_transformer_dimensions(base_roo
         require_h3_checkpoint(base_root)
 
 
+@pytest.mark.parametrize("base_root", [True], indirect=True)
+@pytest.mark.parametrize("variant,width", [("base", 1344), ("ref", 832)])
+def test_explicit_variant_selects_one_recipe_from_full_root(base_root, monkeypatch, variant, width):
+    monkeypatch.setenv("UNISERVE_H3_VARIANT", variant)
+    contract = inspect_model(str(base_root))["contract"]
+    assert contract["variant"] == variant
+    assert contract["width"] == width
+    assert contract["denoise_steps"] == 49
+
+
+def test_explicit_variant_rejects_unknown_recipe(base_root, monkeypatch):
+    monkeypatch.setenv("UNISERVE_H3_VARIANT", "typo")
+    with pytest.raises(ValueError, match="UNISERVE_H3_VARIANT"):
+        resolve_h3_contract(base_root)
+
+
 def test_explicit_missing_contract_does_not_select_base_recipe(base_root, monkeypatch):
     missing = base_root / "operator-contract.json"
     with pytest.raises(ValueError, match="sidecar does not exist"):

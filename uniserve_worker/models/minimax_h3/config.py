@@ -122,11 +122,16 @@ def resolve_h3_contract(root: Path, contract_path: Path | None = None) -> H3Cont
 
     An explicit sidecar (argument or UNISERVE_H3_CONTRACT) must name its local
     checkpoint_root when no embedded manifest exists. Published manifests may
-    not be overridden. Hashes are exporter declarations, not rehashed weights.
+    not be overridden. UNISERVE_H3_VARIANT selects base or ref from a pinned
+    repository containing both denoisers; it cannot override a distilled recipe.
+    Hashes are exporter declarations, not rehashed weights.
     Only the pinned four-step release uses its historical uniform grid rather
     than the explicit DMD-index protocol selected by custom checkpoints.
     """
 
+    variant = os.environ.get("UNISERVE_H3_VARIANT")
+    if variant not in (None, "base", "ref"):
+        raise ValueError("UNISERVE_H3_VARIANT must be base or ref")
     selected = contract_path or os.environ.get("UNISERVE_H3_CONTRACT")
     path = Path(selected) if selected else root / "fastvideo_inference.json"
     if not path.is_file():
@@ -139,9 +144,12 @@ def resolve_h3_contract(root: Path, contract_path: Path | None = None) -> H3Cont
                 "MiniMax H3 requires a pinned base H3 root or an explicit "
                 "UNISERVE_H3_CONTRACT sidecar for a full local export"
             )
-        # A top-level reference denoiser selects the image recipe. Explicit
-        # distilled manifests and sidecars retain precedence over root discovery.
-        return resolve_base_h3_contract(root, reference=(root / "transformer_ref").exists())
+        # Full base repositories contain both denoisers. A process may select
+        # one explicitly; otherwise retain checkpoint-based reference discovery.
+        reference = variant == "ref" if variant else (root / "transformer_ref").exists()
+        return resolve_base_h3_contract(root, reference=reference)
+    if variant is not None:
+        raise ValueError("UNISERVE_H3_VARIANT cannot override a distilled contract")
     manifest = json.loads(path.read_text(encoding="utf-8"))
     expected = {
         "schema_version": "fasth3-inference-contract-v1",
