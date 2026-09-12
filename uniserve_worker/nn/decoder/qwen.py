@@ -435,8 +435,30 @@ class Qwen3Model(nn.Module):
         context: ForwardBatch | None = None,
         *,
         input_embeds: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        visual_mask: torch.Tensor | None = None,
+        deepstack_features: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Decode token or supplied embedding rows and return final normalized hidden states."""
+        """Decode rows, optionally injecting full-width visual features after early layers.
+
+        Multimodal factors use compact [rows, head_dim/2] rotary layout. DeepStack
+        requires an unpartitioned, context-free forward and a boolean token mask.
+        """
+
+        if deepstack_features is not None:
+            if (
+                context is not None
+                or self.sequence.world_size > 1
+                or not (self.pipeline.first and self.pipeline.last)
+            ):
+                raise ValueError("DeepStack requires an unpartitioned conditioning forward")
+            if visual_mask is None or visual_mask.dtype != torch.bool:
+                raise ValueError("DeepStack requires a boolean visual mask")
+            expected = (int(visual_mask.sum()), self.hidden_size)
+            if visual_mask.shape != input_ids.shape or any(
+                tuple(feature.shape) != expected for feature in deepstack_features
+            ):
+                raise ValueError("DeepStack features do not match visual rows")
 
         partition = None
         if self.sequence.world_size > 1:
@@ -460,7 +482,11 @@ class Qwen3Model(nn.Module):
             )
             residual = torch.empty_like(hidden_states)
             self.pipeline.receive_activation(hidden_states, residual)
-        cos, sin = self.rotary.cos_sin_1d(positions.reshape(-1))
+        cos, sin = (
+            self.rotary.cos_sin_1d(positions.reshape(-1))
+            if position_embeddings is None
+            else position_embeddings
+        )
         if context is not None and hidden_states.ndim == 2:
             values: RowTensors = (hidden_states,) if residual is None else (hidden_states, residual)
             hidden_states, residual = run_row_pipeline(
@@ -471,7 +497,7 @@ class Qwen3Model(nn.Module):
                 ),
             ).materialize()
         else:
-            for layer_module in self.layers.values():
+            for layer_index, layer_module in enumerate(self.layers.values()):
                 layer = cast(Qwen3DecoderLayer, layer_module)
                 hidden_states, residual = layer(
                     hidden_states,
@@ -482,6 +508,12 @@ class Qwen3Model(nn.Module):
                     positions=positions,
                     partition=partition,
                 )
+                if deepstack_features is not None and layer_index < len(deepstack_features):
+                    # Materialize the layer output before adding visual features;
+                    # changing this addition order changes BF16 rounding.
+                    hidden_states = hidden_states + residual
+                    hidden_states[visual_mask] += deepstack_features[layer_index].to(hidden_states)
+                    residual = torch.zeros_like(hidden_states)
         assert residual is not None
         self.pipeline.send_activation(hidden_states, residual)
         if not self.pipeline.last:

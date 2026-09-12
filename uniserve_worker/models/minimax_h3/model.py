@@ -432,7 +432,9 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
                 inputs=(torch.zeros((1, 24, 7, 48, 84), dtype=torch.float32, device=self.device),),
             )
         if self.text_encoder is not None:
-            runner.bind_module("text_encoder", self.text_encoder, groups=groups("text_encoder"))
+            runner.bind_module(
+                "text_encoder", self.text_encoder.numerical_entry, groups=groups("text_encoder")
+            )
         if self.conditioner is not None:
             runner.bind_module(
                 "conditioner", self.conditioner, groups=groups("denoiser", ("tp", "sp"))

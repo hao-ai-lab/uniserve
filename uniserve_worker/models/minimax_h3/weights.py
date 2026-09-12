@@ -343,6 +343,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
             max_text_rows=text_capacity,
             parameter_device="meta",
             linear_precision=precisions["text_encoder"],
+            checkpoint_path=context.root / "text_encoder",
         )
         components.append(
             CheckpointComponent(
