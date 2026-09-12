@@ -128,10 +128,12 @@ def build_packed_layout(
     reference_shape: tuple[int, int] | None = None,
     presentation_tags: torch.Tensor | None = None,
 ) -> H3PackedLayout:
-    """Build the fixed-profile `[text | audio | tiled video | padding]` row layout."""
+    """Build `[text | audio | tiled video | padding]` for a target raster."""
 
-    if text_rows < 1 or height != 768 or width != 1344:
-        raise ValueError("the FastH3 profile requires 1344x768 output and nonempty text")
+    # VAE compression (16) followed by a 2×2 transformer patch must be exact;
+    # truncating either dimension would silently discard target pixels.
+    if text_rows < 1 or min(height, width) < 32 or height % 32 or width % 32:
+        raise ValueError("H3 output dimensions must be positive multiples of 32 with nonempty text")
     patch_t, patch_h, patch_w = patch_size
     latent_height, latent_width = height // 16, width // 16
     video_frames = video_latent_frames(num_frames)

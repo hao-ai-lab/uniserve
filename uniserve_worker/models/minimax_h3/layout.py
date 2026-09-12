@@ -40,8 +40,6 @@ __all__ = [
     "MIN_H3_FRAMES",
 ]
 
-PROFILE_HEIGHT = 768
-PROFILE_WIDTH = 1344
 PROFILE_FPS = 24
 PROFILE_AUDIO_RATE = 32_000
 MIN_H3_FRAMES = 22
@@ -86,8 +84,8 @@ def entry_output_schema(layout: H3Layout) -> dict[str, tuple[TensorSpec, ...]]:
                         StaticDim(1),
                         StaticDim(3),
                         StaticDim(25),
-                        StaticDim(PROFILE_HEIGHT),
-                        StaticDim(PROFILE_WIDTH),
+                        StaticDim(layout.height),
+                        StaticDim(layout.width),
                     )
                 ),
             ),
@@ -163,6 +161,8 @@ class H3Layout:
         frames: int,
         text_rows: int,
         audio_frames: int,
+        height: int = 768,
+        width: int = 1344,
         sparsity: float = 0.9,
         attention_backend: str = "VIDEO_SPARSE_ATTN",
         attention: str = "vsa",
@@ -182,6 +182,8 @@ class H3Layout:
         packed = build_packed_layout(
             text_rows=text_rows,
             num_frames=frames,
+            height=height,
+            width=width,
             audio_frames=audio_frames,
             reference_shape=reference_shape,
             presentation_tags=presentation_tags,
@@ -211,6 +213,24 @@ class H3Layout:
         )
 
     @property
+    def height(self) -> int:
+        """Target raster height; the video VAE compresses space by sixteen."""
+
+        return self.packed.latent_height * 16
+
+    @property
+    def width(self) -> int:
+        """Target raster width in pixels."""
+
+        return self.packed.latent_width * 16
+
+    @property
+    def video_rows_per_frame(self) -> int:
+        """Transformer rows per latent frame, using the 2×2 spatial patch."""
+
+        return (self.packed.latent_height // 2) * (self.packed.latent_width // 2)
+
+    @property
     def attention_rows(self) -> int:
         """Rows owned by one context coordinate after Ulysses head exchange."""
 
@@ -229,12 +249,14 @@ class H3Layout:
 
     @property
     def shape_key(self) -> tuple:
-        """Identify layouts by video frames, padded text rows, and audio frames."""
+        """Identify target geometry, padded text rows, and optional reference spans."""
 
         key = (
             self.frame_count,
             int(self.packed.text_indices.numel()),
             int(self.packed.audio_frames),
+            self.height,
+            self.width,
         )
         if self.packed.reference_shape is None:
             return key
@@ -293,7 +315,9 @@ def request_tensor_schema(layout: H3Layout) -> dict[str, TensorSchema]:
     dense = packed.prefix_tiles + packed.video_tiles if denoiser else 0
     return {
         "video_noise": TensorSchema(
-            (int(denoiser), 24, packed.video_frames, 48, 84), torch.float32, memory="pinned"
+            (int(denoiser), 24, packed.video_frames, packed.latent_height, packed.latent_width),
+            torch.float32,
+            memory="pinned",
         ),
         "audio_noise": TensorSchema(
             (packed.audio_indices.numel() if denoiser else 0, 32), torch.float32, memory="pinned"
@@ -328,7 +352,7 @@ def request_tensor_schema(layout: H3Layout) -> dict[str, TensorSchema]:
         "rotary_cosine": TensorSchema((rows, 96), torch.float32),
         "rotary_sine": TensorSchema((rows, 96), torch.float32),
         "video_overlap": TensorSchema(
-            (int(layout.output_owner), 3, 5, PROFILE_HEIGHT, PROFILE_WIDTH),
+            (int(layout.output_owner), 3, 5, layout.height, layout.width),
             layout.video_dtype,
         ),
     }
@@ -368,7 +392,13 @@ def bind_request_tensors(storage: BoundedTensorStorage, layout: H3Layout) -> H3T
     views = storage.bind(
         layout.shape_key,
         {
-            "video_noise": (int(denoiser), 24, packed.video_frames, 48, 84),
+            "video_noise": (
+                int(denoiser),
+                24,
+                packed.video_frames,
+                packed.latent_height,
+                packed.latent_width,
+            ),
             "audio_noise": (packed.audio_indices.numel() if denoiser else 0, 32),
             "video_source": (layout.local_video_rows if denoiser else 0, 96),
             "audio_source": (layout.local_audio_rows if denoiser else 0, 32),
@@ -384,7 +414,7 @@ def bind_request_tensors(storage: BoundedTensorStorage, layout: H3Layout) -> H3T
             "prefix_count": (),
             "rotary_cosine": (packed.padded_rows if denoiser else 0, 96),
             "rotary_sine": (packed.padded_rows if denoiser else 0, 96),
-            "video_overlap": tuple(storage.capacity["video_overlap"].shape),
+            "video_overlap": (int(layout.output_owner), 3, 5, layout.height, layout.width),
         },
     )
     return H3Tensors(
@@ -549,10 +579,15 @@ def media_tensor_schema(layout: H3Layout, bindings: EntryBindings) -> dict[str, 
     audio = bindings.owns("audio_decoder")
     output = bindings.owns("output")
     return {
-        "video_input": TensorSchema((int(video), 24, 7, 48, 84), torch.float32),
-        "reconstruction_rows": TensorSchema((7 * 24 * 42 if video else 0, 96), torch.float32),
+        "video_input": TensorSchema(
+            (int(video), 24, 7, layout.packed.latent_height, layout.packed.latent_width),
+            torch.float32,
+        ),
+        "reconstruction_rows": TensorSchema(
+            (7 * layout.video_rows_per_frame if video else 0, 96), torch.float32
+        ),
         "rgb_round": TensorSchema(
-            (layout.frame_count if output else 0, PROFILE_HEIGHT, PROFILE_WIDTH, 3), torch.uint8
+            (layout.frame_count if output else 0, layout.height, layout.width, 3), torch.uint8
         ),
         "audio_latents": TensorSchema(
             (2 if audio else 0, 32, layout.packed.audio_frames), torch.float32
@@ -624,11 +659,20 @@ def bind_compute_tensors(
         ):
             if name in shapes:
                 shapes[name] = (0,)
+    video = bool(shapes["video_input"][0])
+    shapes["video_input"] = (
+        int(video),
+        24,
+        7,
+        layout.packed.latent_height,
+        layout.packed.latent_width,
+    )
+    shapes["reconstruction_rows"] = (7 * layout.video_rows_per_frame if video else 0, 96)
     shapes["audio_latents"] = (shapes["audio_latents"][0], 32, layout.packed.audio_frames)
     shapes["rgb_round"] = (
         layout.frame_count if shapes["rgb_round"][0] else 0,
-        PROFILE_HEIGHT,
-        PROFILE_WIDTH,
+        layout.height,
+        layout.width,
         3,
     )
     views = storage.bind(layout.shape_key, shapes)
@@ -895,6 +939,8 @@ def tensor_output_layout(
     text_rows: int,
     prompt_tokens: int,
     audio_frames: int,
+    height: int = 768,
+    width: int = 1344,
 ) -> TensorOutputLayout | None:
     """Describe one entry's logical H3 tensor and this rank's produced region."""
 
@@ -908,6 +954,8 @@ def tensor_output_layout(
             frames=frames,
             text_rows=text_rows,
             audio_frames=audio_frames,
+            height=height,
+            width=width,
         )
         indices = layout.packed.video_indices if output_index == 0 else layout.packed.audio_indices
         count = layout.local_video_rows if output_index == 0 else layout.local_audio_rows
@@ -925,7 +973,7 @@ def tensor_output_layout(
         rank = bindings.entries[entry].ranks.index(bindings.process_group.rank)
         if rank >= decode.max_units:
             return None
-        shape = (decode.max_units, 1, 3, 25, PROFILE_HEIGHT, PROFILE_WIDTH)
+        shape = (decode.max_units, 1, 3, 25, height, width)
         return TensorOutputLayout(
             shape,
             TensorRegion((rank, 0, 0, 0, 0, 0), (1, *shape[1:])),

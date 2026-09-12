@@ -27,7 +27,7 @@ from ...ops.residual import (
 )
 from ...ops.rope import qk_rms_norm_partial_rope_
 from .image_vae import H3ImageEncoder
-from .layout import PROFILE_HEIGHT, PROFILE_WIDTH, H3ComputeInputs, H3Tensors
+from .layout import H3ComputeInputs, H3Layout, H3Tensors
 from .packing import unpatchify_video_into
 
 __all__ = ["H3VideoAssembler", "MiniMaxH3VideoDecoder", "MiniMaxH3VideoVAE"]
@@ -638,8 +638,12 @@ class MiniMaxH3VideoVAE(nn.Module):
     ) -> torch.Tensor:
         """Denormalize one latent segment and decode it through the spatial tiling path."""
 
-        if normalized_latents.shape != (1, 24, 7, 48, 84):
-            raise ValueError("an H3 video decode unit must have shape [1, 24, 7, 48, 84]")
+        if (
+            normalized_latents.ndim != 5
+            or normalized_latents.shape[:3] != (1, 24, 7)
+            or any(size < 2 or size % 2 for size in normalized_latents.shape[-2:])
+        ):
+            raise ValueError("an H3 video decode unit requires [1, 24, 7, H, W] with even H and W")
         latents = normalized_latents.to(device=self.device, dtype=torch.float32)
         latents = latents * self.latents_std + self.latents_mean
         with torch.autocast(
@@ -665,15 +669,17 @@ class MiniMaxH3VideoVAE(nn.Module):
             raise ValueError("video decode exceeds its temporal range")
         if tuple(latents.shape) != (int(layout.packed.video_indices.numel()), 96):
             raise ValueError("video decoder requires complete final latent rows")
-        start = (cursor + rank) * 5 * 24 * 42
-        selected = scratch.video_raster_order[start : start + 7 * 24 * 42]
+        # Consecutive seven-frame latent windows advance by five frames.
+        rows_per_frame = layout.video_rows_per_frame
+        start = (cursor + rank) * 5 * rows_per_frame
+        selected = scratch.video_raster_order[start : start + 7 * rows_per_frame]
         torch.index_select(latents, 0, selected, out=scratch.reconstruction_rows)
         unpatchify_video_into(
             scratch.reconstruction_rows,
             scratch.video_input,
             frames=7,
-            height=48,
-            width=84,
+            height=layout.packed.latent_height,
+            width=layout.packed.latent_width,
         )
         return scratch.video_input
 
@@ -704,7 +710,7 @@ class H3VideoAssembler(nn.Module):
         """Blend ordered decoder windows and convert them into RGB byte frames."""
 
         layout, scratch = execution.layout, execution.media
-        expected = (unit_count, 1, 3, 25, PROFILE_HEIGHT, PROFILE_WIDTH)
+        expected = (unit_count, 1, 3, 25, layout.height, layout.width)
         if tuple(segments.shape) != expected:
             raise ValueError("video assembly requires complete decoded segments")
         if start_unit + unit_count > layout.video_reconstruction_units:
@@ -737,11 +743,11 @@ class H3VideoAssembler(nn.Module):
         return scratch.rgb_round[:frame_start]
 
     @torch.inference_mode()
-    def warmup(self) -> None:
+    def warmup(self, layout: H3Layout) -> None:
         """Compile the output pixel transform without retaining request state."""
 
         segment = torch.zeros(
-            (1, 3, 25, PROFILE_HEIGHT, PROFILE_WIDTH),
+            (1, 3, 25, layout.height, layout.width),
             dtype=torch.float16,
             device=self.pixel_mean.device,
         )

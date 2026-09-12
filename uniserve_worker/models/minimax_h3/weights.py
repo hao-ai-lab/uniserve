@@ -316,11 +316,17 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
     max_frames = int(raw_frames + (5 - raw_frames) % 17)
     if text_capacity < 64 or max_frames < MIN_H3_FRAMES:
         raise ValueError("H3 worker_config capacity is smaller than a legal request")
+    # Fixed-frame recipes must fit the worker's configured temporal capacity.
+    frames = int(contract.get("num_frames", max_frames))
+    if frames > max_frames:
+        raise ValueError("H3 worker_config capacity is smaller than the checkpoint frame count")
     layout = H3Layout.build(
         bindings,
-        frames=max_frames,
+        frames=frames,
+        height=int(contract["height"]),
+        width=int(contract["width"]),
         text_rows=text_capacity,
-        audio_frames=audio_latent_frames(max_frames),
+        audio_frames=audio_latent_frames(frames),
         sparsity=contract["sparsity"],
         attention_backend=contract["attention_backend"],
         attention=str(contract["attention"]),

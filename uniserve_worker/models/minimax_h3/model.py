@@ -33,8 +33,6 @@ from .config import FASTH3_LADDER
 from .layout import (
     PROFILE_AUDIO_RATE,
     PROFILE_FPS,
-    PROFILE_HEIGHT,
-    PROFILE_WIDTH,
     H3ComputeInputs,
     H3Layout,
     H3Tensors,
@@ -242,8 +240,8 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         self.output_capacity = VideoOutputGeometry(
             frame_count=layout.frame_count,
             unit_frames=layout.reconstruction_unit_frames,
-            width=PROFILE_WIDTH,
-            height=PROFILE_HEIGHT,
+            width=layout.width,
+            height=layout.height,
             frame_rate=PROFILE_FPS,
             audio_rate=PROFILE_AUDIO_RATE,
         )
@@ -261,7 +259,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
 
         return build_h3_checkpoint(config, context)
 
-    def execution_key(self, geometry: MediaGeometry) -> tuple[int, int, int]:
+    def execution_key(self, geometry: MediaGeometry) -> tuple[int, int, int, int, int]:
         """Validate admitted bounds and describe equivalent packed metadata."""
 
         page_rows = ((geometry.prompt_tokens + 63) // 64) * 64
@@ -275,7 +273,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         units = reconstruction_unit_frames(geometry.frame_count)
         if geometry.video_units != len(units) or geometry.denoise_steps != self.denoise_steps:
             raise ValueError("the H3 worker received invalid computation bounds")
-        return geometry.frame_count, page_rows, audio_frames
+        return geometry.frame_count, page_rows, audio_frames, self.layout.height, self.layout.width
 
     def build_execution(
         self,
@@ -285,12 +283,14 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
     ) -> H3ComputeInputs:
         """Build immutable packed metadata for a validated public geometry cache key."""
 
-        frames, text_rows, audio_frames = self.execution_key(geometry)
+        frames, text_rows, audio_frames, height, width = self.execution_key(geometry)
         layout = H3Layout.build(
             self.bindings,
             frames=frames,
             text_rows=text_rows,
             audio_frames=audio_frames,
+            height=height,
+            width=width,
             sparsity=self.layout.sparsity,
             attention_backend=self.layout.attention_backend,
             attention=self.layout.attention,
@@ -356,7 +356,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
 
         if media is None:
             raise ValueError("H3 tensor results require media geometry")
-        frames, text_rows, audio_frames = self.execution_key(media)
+        frames, text_rows, audio_frames, height, width = self.execution_key(media)
         return tensor_output_layout(
             self.bindings,
             entry,
@@ -366,6 +366,8 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             text_rows=text_rows,
             prompt_tokens=media.prompt_tokens,
             audio_frames=audio_frames,
+            height=height,
+            width=width,
         )
 
     def decoder_input(
@@ -421,8 +423,8 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         return VideoOutputGeometry(
             frame_count=geometry.frame_count,
             unit_frames=reconstruction_unit_frames(geometry.frame_count),
-            width=PROFILE_WIDTH,
-            height=PROFILE_HEIGHT,
+            width=self.layout.width,
+            height=self.layout.height,
             frame_rate=PROFILE_FPS,
             audio_rate=PROFILE_AUDIO_RATE,
         )
@@ -440,7 +442,19 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             runner.bind_module(
                 "video_decoder",
                 self.video_decoder,
-                inputs=(torch.zeros((1, 24, 7, 48, 84), dtype=torch.float32, device=self.device),),
+                inputs=(
+                    torch.zeros(
+                        (
+                            1,
+                            24,
+                            7,
+                            self.layout.packed.latent_height,
+                            self.layout.packed.latent_width,
+                        ),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                ),
             )
         if self.text_encoder is not None:
             runner.bind_module(
@@ -488,7 +502,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
                 runner.denoise.warmup(views[0], execution, runner.schedule)
         if self.bindings.owns("output"):
             assert self.video_assembler is not None
-            self.video_assembler.warmup()
+            self.video_assembler.warmup(self.layout)
         if self.audio_decoder is not None:
             audio_latents = self.audio_decoder.warmup_input(self.layout.packed.audio_frames)
             runner.modules["audio_decoder"].warmup(audio_latents)

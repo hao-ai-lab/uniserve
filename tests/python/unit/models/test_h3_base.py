@@ -1,6 +1,7 @@
 """Base recipe grids, dense padding semantics, and checkpoint provenance."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -9,14 +10,22 @@ import torch
 from uniserve_worker.backends.attention.torch_sdpa import TorchSDPAAttentionBackend
 from uniserve_worker.bootstrap.catalog import resolve_catalog_entry
 from uniserve_worker.bootstrap.inspect_model import inspect_model
+from uniserve_worker.config import WorkerConfig
+from uniserve_worker.execution.batch import MediaGeometry, StaticDim
+from uniserve_worker.execution.bounded_storage import BoundedTensorStorage
+from uniserve_worker.loader.component import ModelBuildContext
+from uniserve_worker.loader.config import LoadRequest
 from uniserve_worker.models.minimax_h3.base_contract import (
     BASE_H3_REVISION,
     resolve_base_h3_contract,
 )
 from uniserve_worker.models.minimax_h3.config import resolve_h3_contract
+from uniserve_worker.models.minimax_h3.model import MiniMaxH3Model
 from uniserve_worker.models.minimax_h3.packing import build_packed_layout, dense_key_mask
 from uniserve_worker.models.minimax_h3.weights import require_h3_checkpoint
 from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
+from uniserve_worker.nn.mesh import Communicator, DeviceMesh, EntryBindings
+from uniserve_worker.nn.parallel import EntryConfig, ParallelConfig
 
 pytestmark = pytest.mark.unit
 
@@ -243,6 +252,77 @@ def test_explicit_variant_rejects_unknown_recipe(base_root, monkeypatch):
     monkeypatch.setenv("UNISERVE_H3_VARIANT", "typo")
     with pytest.raises(ValueError, match="UNISERVE_H3_VARIANT"):
         resolve_h3_contract(base_root)
+
+
+@pytest.mark.parametrize(
+    "base_root,recipe,height,width,frames,forwards",
+    [
+        (False, "base", 768, 1344, 141, 49),
+        (False, "eight-step", 768, 1344, 141, 8),
+        (True, "ref", 480, 832, 124, 49),
+    ],
+    indirect=["base_root"],
+)
+def test_worker_products_follow_checkpoint_geometry(
+    base_root, recipe, height, width, frames, forwards
+):
+    if recipe == "eight-step":
+        fixture = (
+            Path(__file__).parents[2] / "fixtures/models/fasth3-eight-step/fastvideo_inference.json"
+        )
+        (base_root / "fastvideo_inference.json").write_text(fixture.read_text())
+        (base_root / "scheduler/scheduler_config.json").write_text('{"shift":10.0}')
+    bindings = EntryBindings(
+        {"output": EntryConfig((0,), ParallelConfig())},
+        {"output": DeviceMesh((0,), 0, ParallelConfig())},
+        Communicator(),
+    )
+    entry = resolve_catalog_entry(("MiniMaxH3Transformer3DModel",), root=base_root)
+    context = ModelBuildContext(
+        root=base_root,
+        sources=(),
+        request=LoadRequest(
+            str(base_root), WorkerConfig(), bindings, max_text_rows=64, max_video_seconds=5.5
+        ),
+        quantization=None,
+        component_precisions=entry.component_precisions({}),
+        schedule=entry.create_schedule("cpu"),
+    )
+    # An output-only worker constructs no checkpoint modules; its public media
+    # products must still carry the same contract as the denoiser worker.
+    model = MiniMaxH3Model.build_checkpoint({}, context).assemble()
+    media = MediaGeometry(
+        frame_count=frames, video_units=(frames - 5) // 17, prompt_tokens=1, denoise_steps=forwards
+    )
+    assert (
+        model.output_capacity.height,
+        model.output_capacity.width,
+        model.output_capacity.frame_count,
+    ) == (height, width, frames)
+    assert model.output_geometry(media) == model.output_capacity
+    decoder_schema = model.entry_outputs["video_decoder"][0]
+    assert decoder_schema.shape_bound.dims[-2:] == (StaticDim(height), StaticDim(width))
+    # Meta storage exercises view geometry without allocating full RGB movies.
+    storage = BoundedTensorStorage(
+        {
+            name: torch.empty(spec.shape, dtype=spec.dtype, device="meta")
+            for name, spec in model.scratch_schema.items()
+        }
+    )
+    execution = model.build_execution(media, storage, None)
+    assert execution.media.rgb_round.shape == (frames, height, width, 3)
+    request_storage = BoundedTensorStorage(
+        {
+            name: torch.empty(spec.shape, dtype=spec.dtype, device="meta")
+            for name, spec in model.resource_geometry.request_tensors.items()
+        }
+    )
+    slot = model.request_tensors(request_storage, media, execution)
+    assert slot.video_overlap.shape == (1, 3, 5, height, width)
+    if recipe == "ref":
+        undersized = replace(context, request=replace(context.request, max_video_seconds=1.0))
+        with pytest.raises(ValueError, match="checkpoint frame count"):
+            MiniMaxH3Model.build_checkpoint({}, undersized)
 
 
 def test_explicit_missing_contract_does_not_select_base_recipe(base_root, monkeypatch):
