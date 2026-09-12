@@ -1,4 +1,4 @@
-"""Decoded reference admission preserves media order and bounded tensor contracts."""
+"""Worker admission accepts one bounded image reference and preserves plain requests."""
 
 from dataclasses import replace
 
@@ -41,10 +41,10 @@ def references():
     return (
         DecodedReference(
             "image",
-            "first_last_frame",
-            "last_frame",
+            "reference",
+            "reference",
             False,
-            product(0, (1, 16, 24, 3), DType.U8),
+            product(0, (1, 32, 64, 3), DType.U8),
             None,
             0,
             1,
@@ -66,13 +66,15 @@ def references():
 
 
 def test_ordered_reference_admission_round_trip():
-    params = DiffusionRequestParams((1, 2), 17, MediaGeometry(22, 3, 2, 4), references())
+    params = DiffusionRequestParams((1, 2), 17, MediaGeometry(22, 3, 2, 4), references()[:1])
     admission = NewRequest.create(OWNER, request_pool_idx=1, diffusion=params)
     restored = NewRequest.from_mapping(admission.to_mapping())
     assert restored == admission
-    assert tuple(item.kind for item in restored.diffusion.references) == ("image", "video", "audio")
-    assert restored.diffusion.references[1].fps_num == 24000
-    assert restored.diffusion.references[1].fps_den == 1001
+    assert len(restored.diffusion.references) == 1
+    assert (
+        restored.diffusion.references[0].pixels.shape_bound
+        == product(0, (1, 32, 64, 3), DType.U8).shape_bound
+    )
 
 
 @pytest.mark.parametrize(
@@ -99,6 +101,24 @@ def test_foreign_request_product_rejected():
         NewRequest.create(OWNER, request_pool_idx=1, diffusion=params)
 
 
+@pytest.mark.parametrize(
+    ("bundle", "rule"),
+    [
+        (references()[:1] * 2, "at most 1"),
+        (references()[1:2], "requires image"),
+        (references()[2:], "requires image"),
+        ((replace(references()[0], task="first_frame", role="first_frame"),), "task=reference"),
+        (
+            (replace(references()[0], pixels=product(0, (1, 32, 33, 3), DType.U8)),),
+            "multiples of 32",
+        ),
+    ],
+)
+def test_unsupported_reference_bundles_name_the_admission_rule(bundle, rule):
+    with pytest.raises(WorkerError, match=rule):
+        DiffusionRequestParams((1,), 0, MediaGeometry(1, 1, 1, 1), bundle)
+
+
 def test_empty_and_omitted_bundle_are_equal():
     params = DiffusionRequestParams((1,), 0, MediaGeometry(1, 1, 1, 1))
     mapping = params.to_mapping()
@@ -112,5 +132,5 @@ def test_soundtrack_and_audio_bounds():
         replace(video, include_audio=False)
     with pytest.raises(WorkerError, match="30 seconds"):
         replace(audio, audio=product(3, (2, 960001), DType.F32))
-    with pytest.raises(WorkerError, match="visual"):
+    with pytest.raises(WorkerError, match="requires image"):
         DiffusionRequestParams((1,), 0, MediaGeometry(1, 1, 1, 1), (audio,))

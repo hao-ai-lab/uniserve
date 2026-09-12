@@ -228,7 +228,10 @@ impl EngineLoop {
             });
             return;
         }
-        if self.media_tensor_specs(request.geometry, request.image_reference.is_some()).is_none() {
+        if self
+            .media_tensor_specs(request.geometry, request.image_reference.is_some())
+            .is_none()
+        {
             let _ = submission.event_tx.send(Event::Rejected {
                 message: "loaded media entries cannot represent the requested tensor geometry"
                     .into(),

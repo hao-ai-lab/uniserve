@@ -2918,9 +2918,13 @@ class DiffusionRequestParams:
             raise invalid_descriptor("references permits at most 1 image")
         for reference in self.references:
             if (reference.kind, reference.task, reference.role) != (
-                "image", "reference", "reference"
+                "image",
+                "reference",
+                "reference",
             ):
-                raise invalid_descriptor("references requires image with task=reference and role=reference")
+                raise invalid_descriptor(
+                    "references requires image with task=reference and role=reference"
+                )
             assert reference.pixels is not None
             if any(dim.extent % 32 for dim in reference.pixels.shape_bound.dims[1:3]):
                 raise invalid_descriptor("references image dimensions must be multiples of 32")

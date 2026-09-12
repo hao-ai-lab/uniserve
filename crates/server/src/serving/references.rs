@@ -36,7 +36,12 @@ pub enum ReferenceRole {
 }
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum ReferenceSource {
     Url(String),
     Base64(String),
@@ -69,7 +74,8 @@ pub fn validate_references(references: &[VideoReference]) -> Result<(), &'static
         if reference.kind != ReferenceKind::Image {
             return Err("references supports only image sources");
         }
-        if reference.task != ReferenceTask::Reference || reference.role != ReferenceRole::Reference {
+        if reference.task != ReferenceTask::Reference || reference.role != ReferenceRole::Reference
+        {
             return Err("references requires task=reference and role=reference");
         }
         if reference.include_audio.is_some() {
@@ -81,7 +87,8 @@ pub fn validate_references(references: &[VideoReference]) -> Result<(), &'static
         if encoded.is_empty() || encoded.len() > MAX_REFERENCE_BYTES.div_ceil(3) * 4 {
             return Err("references base64 exceeds the 32 MiB source bound");
         }
-        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
             .map_err(|_| "references requires valid standard base64")?;
         if bytes.len() > MAX_REFERENCE_BYTES {
             return Err("references exceeds the 32 MiB source bound");
@@ -102,17 +109,26 @@ pub fn admit_references(
         return Err("references requires a model contract declaring max=1, kinds=[image]");
     }
     validate_references(references)?;
-    let ReferenceSource::Base64(encoded) = &references[0].source else { unreachable!() };
-    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)
+    let ReferenceSource::Base64(encoded) = &references[0].source else {
+        unreachable!()
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
         .map_err(|_| "references requires valid standard base64")?;
     let format = image::guess_format(&bytes).map_err(|_| "references requires PNG or JPEG")?;
     if !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg) {
         return Err("references requires PNG or JPEG");
     }
     let (width, height) = image::ImageReader::with_format(Cursor::new(&bytes), format)
-        .into_dimensions().map_err(|_| "references image header is invalid")?;
-    if width == 0 || height == 0 || width > 4096 || height > 4096
-        || width % 32 != 0 || height % 32 != 0 {
+        .into_dimensions()
+        .map_err(|_| "references image header is invalid")?;
+    if width == 0
+        || height == 0
+        || width > 4096
+        || height > 4096
+        || width % 32 != 0
+        || height % 32 != 0
+    {
         return Err("references image dimensions must be multiples of 32 in 32..=4096");
     }
     let mut reader = image::ImageReader::with_format(Cursor::new(&bytes), format);
@@ -121,7 +137,14 @@ pub fn admit_references(
     limits.max_image_height = Some(4096);
     limits.max_alloc = Some(256 * 1024 * 1024);
     reader.limits(limits);
-    let pixels = reader.decode().map_err(|_| "references image is invalid or exceeds decode bounds")?
-        .to_rgb8().into_raw();
-    Ok(Some(ImageReference { width, height, pixels }))
+    let pixels = reader
+        .decode()
+        .map_err(|_| "references image is invalid or exceeds decode bounds")?
+        .to_rgb8()
+        .into_raw();
+    Ok(Some(ImageReference {
+        width,
+        height,
+        pixels,
+    }))
 }
