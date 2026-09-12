@@ -266,6 +266,17 @@ def test_explicit_variant_rejects_unknown_recipe(base_root, monkeypatch):
 def test_worker_products_follow_checkpoint_geometry(
     base_root, recipe, height, width, frames, forwards
 ):
+    if recipe == "ref":
+        # Presentation geometry consumes real processor assets even on an
+        # output-only rank; empty JSON sidecars are not a processor fixture.
+        source = Path("/mnt/lustre/vlm-k1kong/models/MiniMax-H3/text_encoder")
+        for name in (
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        ):
+            (base_root / "text_encoder" / name).write_bytes((source / name).read_bytes())
     if recipe == "eight-step":
         fixture = (
             Path(__file__).parents[2] / "fixtures/models/fasth3-eight-step/fastvideo_inference.json"

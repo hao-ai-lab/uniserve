@@ -20,7 +20,11 @@ def main():
         from uniserve_worker.bootstrap.inspect_model import inspect_model
 
         contract = inspect_model(os.environ["CHECKPOINT_ROOT"])["contract"]
-        expected = ("base", 49, "dense") if entry == "base" else ("fasth3", 8, "vsa")
+        expected = {
+            "base": ("base", 49, "dense"),
+            "8step": ("fasth3", 8, "vsa"),
+            "ref": ("ref", 49, "dense"),
+        }[entry]
         actual = (contract["variant"], contract["denoise_steps"], contract["attention"])
         if actual != expected:
             raise ValueError(f"ENTRY {entry} requires {expected}, checkpoint resolves {actual}")

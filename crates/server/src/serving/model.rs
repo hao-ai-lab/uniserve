@@ -294,7 +294,9 @@ impl ResolvedAssets {
                 tokenizer,
                 max_video_seconds: config.engine.max_video_seconds,
                 denoise_steps,
-                image_references: config.model_contract.as_ref()
+                image_references: config
+                    .model_contract
+                    .as_ref()
                     .and_then(|contract| contract.get("references"))
                     == Some(&serde_json::json!({"max": 1, "kinds": ["image"]})),
             });
@@ -643,7 +645,7 @@ impl ResolvedModel {
                 if description.max_video_seconds > default_seconds {
                     suggested_seconds.push(description.max_video_seconds);
                 }
-                serde_json::json!({
+                let mut capabilities = serde_json::json!({
                     "tasks": ["t2va"],
                     "default_seconds": default_seconds,
                     "max_seconds": description.max_video_seconds,
@@ -654,7 +656,23 @@ impl ResolvedModel {
                     "default_steps": description.denoise_steps + 1,
                     "supported_steps": [description.denoise_steps + 1],
                     "guidance_scale": 1.0,
-                })
+                });
+                if description.image_references {
+                    // The reference recipe has a fixed target raster, independent
+                    // of the admitted reference image's bounded source geometry.
+                    capabilities["width"] = serde_json::json!(832);
+                    capabilities["height"] = serde_json::json!(480);
+                    capabilities["references"] = serde_json::json!({"max": 1, "kinds": ["image"]});
+                    capabilities["request_fields"] = serde_json::json!([
+                        "model",
+                        "prompt",
+                        "seconds",
+                        "seed",
+                        "steps",
+                        "references"
+                    ]);
+                }
+                capabilities
             }
             _ => serde_json::Value::Null,
         }
@@ -1299,4 +1317,48 @@ fn stable_hash(value: &str) -> u64 {
         .fold(0xcbf29ce484222325, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_capabilities_follow_reference_contract_not_alias() {
+        for capable in [false, true] {
+            let model = ResolvedModel::Media(MiniMaxH3Desc {
+                identity: ModelIdentity {
+                    served_name: "minimax-h3-ref".into(),
+                    description: ModelDescription::MiniMaxH3,
+                },
+                tokenizer: crate::serving::test_support::configured_tokenizer(),
+                max_prompt_tokens: 1024,
+                max_video_seconds: 5.0,
+                denoise_steps: 49,
+                image_references: capable,
+            });
+            assert_eq!(model.supports_image_references(), capable);
+            let mut expected = serde_json::json!({
+                "tasks": ["t2va"], "default_seconds": 5.0, "max_seconds": 5.0,
+                "suggested_seconds": [5.0], "min_frames": 22, "fps": 24,
+                "width": 1344, "height": 768, "max_prompt_tokens": 1024,
+                "request_fields": ["model", "prompt", "seconds", "seed", "steps"],
+                "default_steps": 50, "supported_steps": [50], "guidance_scale": 1.0,
+            });
+            if capable {
+                expected["width"] = serde_json::json!(832);
+                expected["height"] = serde_json::json!(480);
+                expected["references"] = serde_json::json!({"max": 1, "kinds": ["image"]});
+                expected["request_fields"] = serde_json::json!([
+                    "model",
+                    "prompt",
+                    "seconds",
+                    "seed",
+                    "steps",
+                    "references"
+                ]);
+            }
+            assert_eq!(model.video_capabilities(), expected);
+        }
+    }
 }
