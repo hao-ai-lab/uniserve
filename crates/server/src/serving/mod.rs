@@ -12,6 +12,8 @@ pub mod chat;
 mod input;
 mod model;
 mod omni;
+/// Ordered reference-media descriptors and admission bounds.
+pub mod references;
 #[cfg(test)]
 mod test_support;
 /// Text tokenization, decoding, and sampling utilities.
@@ -354,6 +356,8 @@ pub struct VideoGenerationInput {
     pub seconds: f64,
     /// Optional scheduler grid-point count; the checkpoint owns the default.
     pub steps: Option<u32>,
+    /// Conditioning sources in their original caller order.
+    pub references: Vec<references::VideoReference>,
 }
 
 impl ServingRuntime {
@@ -418,6 +422,15 @@ impl ServingRuntime {
             return Err(ServeError::Tokenize {
                 request_id: request.request_id,
                 source: TokenizeError::Invalid("video prompt must not be empty".to_string()),
+            });
+        }
+        // Never silently discard conditioning on a text-to-video execution plan.
+        // Reference admission must be connected to a reference-capable model before
+        // a nonempty bundle can enter the engine.
+        if !request.references.is_empty() {
+            return Err(ServeError::UnsupportedFeature {
+                request_id: request.request_id,
+                feature: "reference_conditioning",
             });
         }
         let (geometry, prompt_token_ids) = self.model.resolve_video_request_geometry(

@@ -29,6 +29,9 @@ pub struct VideoGenerationRequest {
     #[serde(default)]
     #[validate(range(min = 2, max = 1000))]
     pub steps: Option<u32>,
+    /// Ordered image, video and audio conditioning sources.
+    #[serde(default)]
+    pub references: Vec<crate::serving::references::VideoReference>,
 }
 
 impl Normalizable for VideoGenerationRequest {}

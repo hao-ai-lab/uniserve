@@ -28,11 +28,14 @@ pub fn lower_video_generation_request(
             Some("steps"),
         ));
     }
+    crate::serving::references::validate_references(&request.references)
+        .map_err(|message| ApiError::invalid_request(message.to_string(), Some("references")))?;
     Ok(VideoGenerationInput {
         request_id: ServeRequestId::from(format!("vid-{}", context.request_id)),
         prompt: request.prompt,
         seed: request.seed,
         seconds: request.seconds,
         steps: request.steps,
+        references: request.references,
     })
 }
