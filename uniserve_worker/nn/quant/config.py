@@ -19,7 +19,7 @@ __all__ = [
     "create_linear_method",
 ]
 
-LinearPrecision: TypeAlias = Literal["fp16", "bf16", "fp8", "mxfp8", "nvfp4"]
+LinearPrecision: TypeAlias = Literal["fp32", "fp16", "bf16", "fp8", "mxfp8", "nvfp4"]
 
 
 def resolve_component_precisions(
@@ -92,7 +92,7 @@ def create_linear_method(precision: str, *, tensorwise: bool = False) -> LinearM
     retain the construction dtype. Checkpoint-scale FP8 uses the row domain.
     """
 
-    if precision in {"fp16", "bf16"}:
+    if precision in {"fp32", "fp16", "bf16"}:
         precision = "unquantized"
     if tensorwise and precision == "fp8":
         return DynamicW8A8Fp8LinearMethod(tensorwise=True)

@@ -26,7 +26,9 @@ def inspect_model(model: str, *, download: bool = False, revision: str | None = 
         revision = FASTH3_REVISION
     root, repository = resolve_model_root(model, LoadConfig(revision=revision))
     config = read_model_config(root)
-    entry = resolve_catalog_entry(config["architectures"])
+    entry = resolve_catalog_entry(
+        config["architectures"], root=root if repository is None else None
+    )
     descriptions = {
         "MiniMaxH3Transformer3DModel": "minimax-h3",
         "Qwen3ForCausalLM": "qwen3",
@@ -84,15 +86,16 @@ def doctor(model: dict, ranks: int) -> dict:
         raise RuntimeError(
             f"requested {ranks} GPUs, but only {torch.cuda.device_count()} are visible"
         )
+    dense = (model.get("contract") or {}).get("attention") == "dense"
     devices = []
     for rank in range(ranks):
-        provider = resolve_sparse_provider(torch.device("cuda", rank))
+        provider = None if dense else resolve_sparse_provider(torch.device("cuda", rank))
         free, total = torch.cuda.mem_get_info(rank)
         devices.append(
             {
                 "rank": rank,
                 "name": torch.cuda.get_device_name(rank),
-                "sparse_attention": provider.name,
+                "sparse_attention": None if provider is None else provider.name,
                 "free_bytes": free,
                 "total_bytes": total,
             }
@@ -132,8 +135,12 @@ def doctor(model: dict, ranks: int) -> dict:
         "toolkit": toolkit,
         "devices": devices,
         "codecs": ["libx264", "aac"],
-        "native_sparse_attention": "available",
-        "precision": PRECISION_PRESETS["balanced"],
+        "native_sparse_attention": "not_required" if dense else "available",
+        "precision": (
+            {**PRECISION_PRESETS["quality"], "video_vae": "fp32"}
+            if dense
+            else PRECISION_PRESETS["balanced"]
+        ),
         "capacity_estimate": {
             "checkpoint_component_bytes": component_bytes,
             "unquantized_weight_bytes_per_rank": weight_ceiling,

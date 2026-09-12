@@ -282,9 +282,19 @@ fn minimax_video_geometry_carries_the_admitted_token_sequence() {
     let expected = tokenizer.encode(prompt, false).unwrap();
 
     let (geometry, prompt_token_ids) = model
-        .resolve_video_request_geometry(&ServeRequestId::new("video"), prompt, 1.0)
+        .resolve_video_request_geometry(&ServeRequestId::new("video"), prompt, 1.0, None)
         .unwrap();
 
     assert_eq!(prompt_token_ids, expected);
     assert_eq!(geometry.prompt_tokens as usize, prompt_token_ids.len());
+    assert_eq!(geometry.denoise_steps, 4);
+    let (explicit, _) = model
+        .resolve_video_request_geometry(&ServeRequestId::new("video"), prompt, 1.0, Some(5))
+        .unwrap();
+    assert_eq!(explicit.denoise_steps, geometry.denoise_steps);
+    assert!(
+        model
+            .resolve_video_request_geometry(&ServeRequestId::new("video"), prompt, 1.0, Some(50))
+            .is_err()
+    );
 }

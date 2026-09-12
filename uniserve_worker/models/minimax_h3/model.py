@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Hashable
+from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -167,10 +168,20 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         bindings: EntryBindings,
         components: H3Components,
         layout: H3Layout,
+        *,
+        denoise_steps: int = len(FASTH3_LADDER),
     ) -> None:
         """Bind H3 model components to runtime-owned state, scratch, and device products."""
 
         super().__init__()
+        self.media_plan = MediaExecutionPlan(
+            tuple(
+                replace(stage, count=denoise_steps)
+                if stage.operation is OpCode.DIFFUSION_STEP
+                else stage
+                for stage in type(self).media_plan.stages
+            )
+        )
 
         self.bindings: EntryBindings = bindings
         self.owns_media_output = bindings.owns("output")
@@ -280,6 +291,8 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             frames=frames,
             text_rows=text_rows,
             audio_frames=audio_frames,
+            attention=self.layout.attention,
+            video_dtype=self.layout.video_dtype,
         )
         return H3ComputeInputs.bind(
             self.bindings,

@@ -40,6 +40,33 @@ class DiffusionSchedule:
                 raise ValueError("schedule constants must use FP32")
 
     @classmethod
+    def uniform_grid(
+        cls,
+        points: int,
+        shifts: tuple[float, ...],
+        *,
+        device: torch.device | str,
+    ) -> DiffusionSchedule:
+        """Build a shifted FP32 grid with ``points - 1`` Euler intervals.
+
+        Coordinates are evaluated on CPU before device transfer, matching the
+        MiniMax-H3 scheduler's rounding and clean-time convention.
+        """
+
+        if isinstance(points, bool) or not isinstance(points, int) or points < 2:
+            raise ValueError("a uniform diffusion grid requires at least two points")
+        if not shifts or any(not shift > 0 for shift in shifts):
+            raise ValueError("schedule shifts must be positive")
+        base = torch.linspace(1.0, 0.0, points, dtype=torch.float32)
+        sigmas = tuple(
+            torch.unique_consecutive(shift * base / (1 + (shift - 1) * base)) for shift in shifts
+        )
+        return cls(
+            tuple(value.to(device=device) for value in sigmas),
+            tuple((1.0 - value[:-1]).to(device=device) for value in sigmas),
+        )
+
+    @classmethod
     def build(
         cls,
         ladder: tuple[int, ...],

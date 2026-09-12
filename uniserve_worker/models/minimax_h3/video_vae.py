@@ -77,9 +77,7 @@ class _Attention(nn.Module):
         super().__init__()
         self.heads = heads
         self.head_dim = head_dim
-        self.attention = RadixAttention(
-            heads, heads, head_dim
-        )
+        self.attention = RadixAttention(heads, heads, head_dim)
         self.to_q = LinearBase(width, width, layer_config=layer_config, prefix="to_q")
         self.to_k = LinearBase(width, width, layer_config=layer_config, prefix="to_k")
         self.to_v = LinearBase(width, width, layer_config=layer_config, prefix="to_v")
@@ -596,9 +594,10 @@ class MiniMaxH3VideoVAE(nn.Module):
         with torch.autocast(
             device_type=self.device.type,
             dtype=self.autocast_dtype,
-            enabled=self.device.type == "cuda",
+            enabled=self.device.type == "cuda" and self.linear_precision != "fp32",
         ):
-            return self._decode_segment(latents).to(torch.float16)
+            decoded = self._decode_segment(latents)
+            return decoded if self.linear_precision == "fp32" else decoded.to(torch.float16)
 
     def prepare_input(
         self,

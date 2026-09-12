@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
+from pathlib import Path
 from typing import Callable, Mapping
 
 import torch
@@ -12,6 +13,7 @@ from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..loader.source import WeightSourceConfig
 from ..models.bagel import BagelForConditionalGeneration
 from ..models.minimax_h3 import MiniMaxH3Model
+from ..models.minimax_h3.base_contract import BASE_H3_GRID_POINTS, BASE_H3_SHIFTS
 from ..models.minimax_h3.config import (
     FASTH3_LADDER,
     FASTH3_SHIFTS,
@@ -125,7 +127,30 @@ MINIMAX_H3_ENTRY = CatalogEntry(
 )
 
 
-def resolve_catalog_entry(architectures: list[str] | tuple[str, ...]) -> CatalogEntry:
+BASE_H3_ENTRY = replace(
+    MINIMAX_H3_ENTRY,
+    component_precisions=partial(
+        resolve_component_precisions,
+        supported={**SUPPORTED_PRECISIONS, "video_vae": ("fp32", "fp16", "bf16", "nvfp4")},
+        presets={
+            **PRECISION_PRESETS,
+            "quality": {**PRECISION_PRESETS["quality"], "video_vae": "fp32"},
+        },
+        shorthands=PRECISION_SHORTHANDS,
+        default_mode="quality",
+    ),
+    create_schedule=lambda device: DiffusionSchedule.uniform_grid(
+        BASE_H3_GRID_POINTS, BASE_H3_SHIFTS, device=device
+    ),
+    sidecars=tuple(
+        path for path in MINIMAX_H3_ENTRY.sidecars if path != "fastvideo_inference.json"
+    ),
+)
+
+
+def resolve_catalog_entry(
+    architectures: list[str] | tuple[str, ...], *, root: Path | None = None
+) -> CatalogEntry:
     """Resolve one exact configured checkpoint architecture."""
 
     match tuple(str(architecture) for architecture in architectures):
@@ -136,6 +161,11 @@ def resolve_catalog_entry(architectures: list[str] | tuple[str, ...]) -> Catalog
         case ("NEOChatModel",):
             return SENSENOVA_ENTRY
         case ("MiniMaxH3Transformer3DModel",):
+            if root is not None:
+                from ..models.minimax_h3.config import resolve_h3_contract
+
+                if resolve_h3_contract(root)["attention"] == "dense":
+                    return BASE_H3_ENTRY
             return MINIMAX_H3_ENTRY
     raise unsupported_setup(
         "configured checkpoint must declare exactly one architecture from "

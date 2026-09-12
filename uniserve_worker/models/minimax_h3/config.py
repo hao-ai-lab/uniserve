@@ -82,10 +82,9 @@ def resolve_h3_contract(root: Path) -> dict[str, object]:
 
     path = root / "fastvideo_inference.json"
     if not path.is_file():
-        raise ValueError(
-            "MiniMax H3 requires fastvideo_inference.json from the full FastH3 VSA "
-            "checkpoint; base partitions and adapter-only checkpoints are unsupported"
-        )
+        from .base_contract import resolve_base_h3_contract
+
+        return resolve_base_h3_contract(root)
     manifest = json.loads(path.read_text(encoding="utf-8"))
     expected = {
         "schema_version": "fasth3-inference-contract-v1",

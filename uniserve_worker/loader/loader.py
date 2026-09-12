@@ -184,7 +184,10 @@ def load_model(request: LoadRequest) -> LoadedModel:
 
     root, repository_id = resolve_model_root(request.model_path, request.load)
     config = read_model_config(root)
-    entry = resolve_catalog_entry(tuple(str(value) for value in config.get("architectures") or ()))
+    entry = resolve_catalog_entry(
+        tuple(str(value) for value in config.get("architectures") or ()),
+        root=root if repository_id is None else None,
+    )
     loaded = get_model_loader(request.load.load_format).load(
         entry, config, request, root=root, repository_id=repository_id
     )

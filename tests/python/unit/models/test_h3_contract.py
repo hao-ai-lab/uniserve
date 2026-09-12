@@ -45,7 +45,7 @@ def test_incompatible_checkpoint_is_rejected(checkpoint, field, value):
 
 
 def test_architecture_without_variant_metadata_is_rejected(tmp_path):
-    with pytest.raises(ValueError, match="fastvideo_inference.json"):
+    with pytest.raises(ValueError, match="base H3"):
         resolve_h3_contract(tmp_path)
 
 
