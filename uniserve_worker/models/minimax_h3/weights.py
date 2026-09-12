@@ -96,7 +96,7 @@ def validate_h3_entries(bindings: EntryBindings) -> None:
 def require_h3_checkpoint(root: Path) -> None:
     """Validate checkpoint component files and tensor dimensions against the H3 architecture."""
 
-    resolve_h3_contract(root)
+    contract = resolve_h3_contract(root)
     transformer = json.loads((root / "transformer" / "config.json").read_text(encoding="utf-8"))
     transformer_config = H3TransformerConfig()
     expected_transformer = {
@@ -148,7 +148,9 @@ def require_h3_checkpoint(root: Path) -> None:
                 f"FastH3 text encoder {field} must be {expected!r}, got {encoder.get(field)!r}"
             )
 
-    for component, expected_shift in (("scheduler", 12.0), ("audio_scheduler", 3.0)):
+    for component, expected_shift in zip(
+        ("scheduler", "audio_scheduler"), contract["sigma_shifts"]
+    ):
         scheduler = json.loads(
             (root / component / "scheduler_config.json").read_text(encoding="utf-8")
         )
@@ -278,6 +280,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
         raise ValueError("H3 construction requires its diffusion schedule")
     validate_h3_entries(bindings)
     require_h3_checkpoint(context.root)
+    contract = resolve_h3_contract(context.root)
     device = bindings.process_group.device
     precisions = context.component_precisions
     text_capacity = ((int(request.max_text_rows) + 63) // 64) * 64
@@ -290,6 +293,8 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
         frames=max_frames,
         text_rows=text_capacity,
         audio_frames=audio_latent_frames(max_frames),
+        sparsity=contract["sparsity"],
+        attention_backend=contract["attention_backend"],
     )
     components = []
     transformer = encoder = video_decoder = audio_decoder = None
@@ -405,6 +410,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
                 audio_vae=MiniMaxH3AudioVAE(audio_decoder) if audio_decoder is not None else None,
             ),
             layout,
+            denoise_steps=contract["denoise_steps"],
         )
 
     return ModelConstruction(tuple(components), assemble, config)
