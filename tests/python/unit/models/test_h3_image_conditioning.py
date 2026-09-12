@@ -26,13 +26,14 @@ class VisionTower(nn.Module):
 
     def __init__(self):
         super().__init__()
+        self.deepstack_scale = 1.0
         self.patch_embed = nn.Module()
         self.patch_embed.proj = nn.Linear(1, 1, dtype=torch.bfloat16)
 
     def forward(self, pixels, grid):
         rows = int(grid.prod(dim=1).sum()) // 4
         features = torch.full((rows, 16), float(pixels.float().mean()), dtype=torch.bfloat16)
-        return features, [torch.ones_like(features)]
+        return features, [torch.full_like(features, self.deepstack_scale)]
 
 
 @pytest.fixture
@@ -108,8 +109,45 @@ def test_image_presentation_and_processor_grid(encoder):
     assert torch.equal(states, encoder.numerical_entry(tokens, image))
     changed, _ = encoder.encode_presentation(tokens, [torch.zeros_like(image)])
     assert not torch.equal(states, changed)
+    encoder.visual.deepstack_scale = 0.0
+    without_deepstack, _ = encoder.encode_presentation(tokens, [image])
+    assert not torch.equal(states[:, -3:], without_deepstack[:, -3:])
 
 
 def test_invalid_decoded_raster(encoder):
     with pytest.raises(ValueError, match="HWC uint8"):
         encoder(torch.tensor([[42]]), [torch.zeros(3, 32, 32)])
+
+
+@torch.no_grad()
+def test_vision_tower_matches_qwen_cpu_reference():
+    from transformers import Qwen3VLVisionConfig
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+    from uniserve_worker.models.minimax_h3.vision import H3VisionModel
+
+    torch.manual_seed(11)
+    config = Qwen3VLVisionConfig(
+        depth=2,
+        hidden_size=16,
+        intermediate_size=32,
+        num_heads=2,
+        out_hidden_size=16,
+        patch_size=2,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[0],
+    )
+    reference = Qwen3VLVisionModel(config).eval()
+    tower = H3VisionModel(config).eval()
+    tower.load_state_dict(reference.state_dict(), strict=True)
+    pixels = torch.randn(24, 24)
+    grid = torch.tensor([[1, 4, 6]])
+    expected = reference(pixels, grid)
+    features, deepstack = tower(pixels, grid)
+    # PyTorch's default FP32 tolerances cover equivalent SDPA/interpolation math.
+    torch.testing.assert_close(features, expected.pooler_output)
+    assert len(deepstack) == len(expected.deepstack_features)
+    for actual, wanted in zip(deepstack, expected.deepstack_features, strict=True):
+        torch.testing.assert_close(actual, wanted)

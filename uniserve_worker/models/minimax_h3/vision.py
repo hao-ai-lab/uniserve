@@ -38,13 +38,11 @@ class H3VisionPatchEmbed(nn.Module):
 class H3VisionRotaryEmbedding(nn.Module):
     def __init__(self, dimension: int) -> None:
         super().__init__()
-        # Transformers initializes this non-persistent constant on CPU before
-        # moving the model.  FastVideo constructs native encoders inside a CUDA
-        # device context, where evaluating the power directly differs by a few
-        # fp32 ULPs and is amplified by the 64-layer language model.
-        target_device = torch.empty(0).device
+        # Keep a real CPU constant even under meta parameter construction. The
+        # shared loader moves buffers after loading; CPU evaluation also matches
+        # the reference frequencies without device-dependent power rounding.
         exponents = torch.arange(0, dimension, 2, dtype=torch.float32, device="cpu") / dimension
-        inv_freq = (1.0 / (10000.0**exponents)).to(target_device)
+        inv_freq = 1.0 / (10000.0**exponents)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, sequence_length: int) -> torch.Tensor:

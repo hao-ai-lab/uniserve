@@ -1,4 +1,4 @@
-"""Tensor-parallel Qwen3-VL text conditioner for MiniMax H3."""
+"""Qwen3-VL image/text presentation conditioning through H3 hidden state 50."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ class H3TextEncoderConfig:
 
 
 class MiniMaxH3TextEncoder(nn.Module):
-    """The Qwen3-VL language path through checkpoint hidden state 50."""
+    """Replicated Qwen vision tower with a tensor-parallel, layer-50 language stack."""
 
     architecture = "Qwen3VLForConditionalGeneration"
 
@@ -118,7 +118,12 @@ class MiniMaxH3TextEncoder(nn.Module):
     def forward(
         self, token_ids: torch.Tensor, images: list[torch.Tensor] | None = None
     ) -> torch.Tensor:
-        """Validate a single bounded prompt and produce its text-conditioning states."""
+        """Encode one prompt, optionally preceded by ordered image presentation spans.
+
+        Images are decoded HWC uint8 RGB tensors. The returned rows retain causal
+        presentation order; use encode_presentation when modality tags are needed.
+        No image-VAE latent rows are synthesized by the language conditioner.
+        """
 
         if token_ids.ndim != 2 or token_ids.shape[0] != 1:
             raise ValueError("H3 text conditioning requires one token sequence")

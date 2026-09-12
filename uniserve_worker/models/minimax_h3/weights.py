@@ -229,7 +229,7 @@ def _map_transformer(model: nn.Module, handles: Iterable[WeightHandle]) -> LoadR
 
 
 def _map_encoder(model: MiniMaxH3TextEncoder, handles: Iterable[WeightHandle]) -> LoadReport:
-    """Select retained Qwen text layers and express their packed checkpoint projection names."""
+    """Load the replicated vision tower and retained, tensor-parallel Qwen text layers."""
 
     mapping = (
         ("self_attn.qkv_proj", "self_attn.q_proj", "q"),
@@ -244,8 +244,12 @@ def _map_encoder(model: MiniMaxH3TextEncoder, handles: Iterable[WeightHandle]) -
         name, shard = stacked_weight_name(handle.name.removeprefix("model."), mapping)
         parameter = parameters.get(name)
         if parameter is None:
+            if name.startswith("visual."):
+                raise ValueError(f"unexpected Qwen vision checkpoint parameter {handle.name}")
             report.skipped.append(handle.name)
             continue
+        if name.startswith("visual.") and tuple(handle.shape) != tuple(parameter.shape):
+            raise ValueError(f"Qwen vision checkpoint shape mismatch for {handle.name}")
         load_parameter_weight(parameter, handle, shard)
         report.loaded.add(name)
     return report
