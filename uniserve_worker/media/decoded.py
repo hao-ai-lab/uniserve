@@ -46,8 +46,8 @@ def decode_reference_image(payload: bytes, *, budget: DecodedMemoryBudget) -> np
     follows RGB channel conversion, without target-model resizing or augmentation.
     """
 
-    if not payload:
-        raise ValueError("empty encoded image")
+    if not payload or len(payload) > 32 * 1024 * 1024:
+        raise ValueError("encoded reference image is empty or exceeds 32 MiB")
     reserved = 0
     retained = 0
     try:
@@ -57,8 +57,6 @@ def decode_reference_image(payload: bytes, *, budget: DecodedMemoryBudget) -> np
             width, height = image.size
             if min(width, height) < 1 or max(width, height) > 4096:
                 raise ValueError("reference image dimensions exceed pixel bounds")
-            if getattr(image, "n_frames", 1) != 1:
-                raise ValueError("image reference must contain exactly one frame")
             pixels = width * height
             retained = 3 * pixels
             # Source pixels (up to four bytes/pixel), converted RGB, and the
@@ -66,6 +64,15 @@ def decode_reference_image(payload: bytes, *, budget: DecodedMemoryBudget) -> np
             workspace = 8 * pixels
             budget.reserve(retained + workspace)
             reserved = retained + workspace
+            # Seeking just the second frame detects animation without enumerating
+            # or decoding the entire container. Some plugins load the first frame
+            # while seeking, so this must happen after the memory reservation.
+            try:
+                image.seek(1)
+            except EOFError:
+                image.seek(0)
+            else:
+                raise ValueError("image reference must contain exactly one frame")
             image.load()
             with image.convert("RGB") as rgb:
                 result = np.array(rgb, dtype=np.uint8, copy=True)[None]

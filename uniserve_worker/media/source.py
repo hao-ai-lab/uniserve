@@ -95,7 +95,7 @@ def _destinations(host: str, port: int, policy: SourcePolicy) -> tuple[str, ...]
 def _read_url(value: str, policy: SourcePolicy) -> bytes:
     deadline = time.monotonic() + policy.timeout_seconds
     for redirects in range(policy.max_redirects + 1):
-        if any(ord(char) <= 32 or ord(char) == 127 for char in value):
+        if len(value) > 8192 or any(ord(char) <= 32 or ord(char) == 127 for char in value):
             raise ValueError("invalid media URL")
         try:
             url = urlsplit(value)
