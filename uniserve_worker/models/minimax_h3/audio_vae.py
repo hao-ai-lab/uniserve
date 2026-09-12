@@ -1,4 +1,4 @@
-"""Checkpoint-exact resident MiniMax H3 audio decoder."""
+"""Checkpoint-exact resident MiniMax H3 audio autoencoder."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ __all__ = ["MiniMaxH3AudioVAE"]
 
 
 class MiniMaxH3AudioVAE(nn.Module):
-    """Decodes H3 audio latents into bounded stereo PCM waveforms."""
+    """Encode reference stereo and decode generated H3 audio latents."""
 
     vae: Any
     latents_mean: torch.Tensor
@@ -46,6 +46,27 @@ class MiniMaxH3AudioVAE(nn.Module):
         """Identify the execution device from the resident decoder parameters."""
 
         return next(self.vae.parameters()).device
+
+    @torch.inference_mode()
+    def encode(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Encode prepared 32-kHz stereo `[2, samples]` to `[2, 32, time]`.
+
+        The caller owns resampling and duration limits. Channels are independent
+        mono examples for the checkpoint VAE. Ref2VA uses the posterior mode,
+        not a sample, and normalizes in FP32 without visual noise augmentation.
+        """
+
+        if waveform.ndim != 2 or waveform.shape[0] != 2 or waveform.shape[1] < 1:
+            raise ValueError("H3 reference audio must have shape [2, samples] with samples > 0")
+        if not waveform.is_floating_point():
+            raise ValueError("H3 reference audio must be a floating-point waveform")
+        if not hasattr(self.vae, "encode"):
+            raise TypeError("MiniMax H3 audio VAE does not expose encode")
+        samples = waveform.to(device=self.device, dtype=torch.float32)
+        latents = self.vae.encode(samples[:, None]).latent_dist.mode().float()
+        if latents.ndim != 3 or latents.shape[:2] != (2, 32) or latents.shape[2] < 1:
+            raise RuntimeError("MiniMax H3 audio encoder returned invalid stereo geometry")
+        return (latents - self.latents_mean) / self.latents_std
 
     def _decode(self, normalized_latents: torch.Tensor) -> torch.Tensor:
         """Denormalize audio latents and convert decoder output to interleaved signed-16 stereo."""
