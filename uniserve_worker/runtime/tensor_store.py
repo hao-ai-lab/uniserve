@@ -95,7 +95,7 @@ _SlotStorageKey = tuple[str, tuple[int, ...], torch.dtype]
 
 
 def _reference_key(reference: TensorRef) -> _ReferenceKey:
-    """Build the generation-tagged lookup key for a product reference."""
+    """Build the logical identity whose live record validates the full generation."""
 
     key = reference.request_key
     return (
@@ -193,6 +193,8 @@ class TensorRecord:
     relay_slot: RelaySlot | None = None
     feature: bool = False
     retired: bool = False
+    # Publication exposes the logical product; release may precede retirement.
+    committed: bool = False
     region: TensorRegion | None = None
     logical_shape: tuple[int, ...] | None = None
     transfers: tuple[TransferTicket, ...] = ()
@@ -287,11 +289,12 @@ class TensorStore:
         self._relay_slots: dict[tuple[str, int, int], dict[tuple[torch.dtype, int], RelaySlot]] = {}
         self._relay_operation_lanes: dict[tuple[str, int, RequestKey, ComputationId], int] = {}
 
-        # Logical references point at generation-tagged physical writes. The
-        # shared event pool owns readiness events until every reader releases.
+        # Both reserved and committed products retain their logical identity
+        # until physical retirement. Only committed records are consumable.
+        # Physical handles are validated independently of logical publication.
         self.event_pool = EventPool() if event_pool is None else event_pool
-        self._entries: dict[_ReferenceKey, TensorRecord] = {}
-        self._candidates: dict[int, TensorRecord] = {}
+        self._products: dict[_ReferenceKey, TensorRecord] = {}
+        self._writes: dict[int, TensorRecord] = {}
         self._imports: dict[_ReferenceKey, TensorImport] = {}
         self._operation_writes: dict[
             _OperationKey,
@@ -313,9 +316,7 @@ class TensorStore:
                 if owner == name
             ]
             tensors.extend(
-                entry.tensor
-                for entry in (*self._entries.values(), *self._candidates.values())
-                if entry.device_name == name
+                entry.tensor for entry in self._writes.values() if entry.device_name == name
             )
             storages = {
                 tensor.untyped_storage().data_ptr(): tensor.untyped_storage() for tensor in tensors
@@ -329,8 +330,8 @@ class TensorStore:
             self.exports.clear()
             self.export_releases.clear()
             self._imports.clear()
-            self._entries.clear()
-            self._candidates.clear()
+            self._products.clear()
+            self._writes.clear()
             self._operation_writes.clear()
             self._relay_arenas.clear()
             self._relay_slots.clear()
@@ -425,8 +426,7 @@ class TensorStore:
             raise invalid_descriptor("tensor registration repeats an output identity")
         with self._lock:
             self._reclaim_ready_locked()
-            records = (*self._entries.values(), *self._candidates.values())
-            candidate_keys = {_reference_key(entry.reference) for entry in records}
+            records = self._writes.values()
             counts: dict[str, int] = {}
             for entry in records:
                 if not entry.feature and entry.relay_slot is None:
@@ -438,7 +438,7 @@ class TensorStore:
                 raise resource_error("encoder cache has no query-ready entry capacity")
             for (reference, raw_device), key in zip(bindings, keys, strict=True):
                 device = canonical_device(raw_device)
-                if key in candidate_keys:
+                if key in self._products:
                     raise invalid_descriptor("persistent output is already registered")
                 if reference.buffer_id not in allocations:
                     raise invalid_descriptor("persistent output has no buffer allocation")
@@ -460,7 +460,7 @@ class TensorStore:
                         )
             writes: list[TensorRecord] = []
             try:
-                for reference, raw_device in bindings:
+                for (reference, raw_device), key in zip(bindings, keys, strict=True):
                     device = canonical_device(raw_device)
                     dtype = _device_dtype(reference.dtype)
                     logical_shape = (
@@ -501,11 +501,13 @@ class TensorStore:
                         logical_shape=logical_shape,
                     )
                     self._next_binding_id += 1
-                    self._candidates[write.binding_id] = write
+                    self._writes[write.binding_id] = write
+                    self._products[key] = write
                     writes.append(write)
             except BaseException:
                 for write in reversed(writes):
-                    self._candidates.pop(write.binding_id, None)
+                    self._writes.pop(write.binding_id)
+                    self._products.pop(_reference_key(write.reference))
                     self._release_storage_locked(write)
                 raise
             return tuple(writes)
@@ -548,9 +550,6 @@ class TensorStore:
             raise invalid_descriptor("request-relay registration repeats an output identity")
         with self._lock:
             self._reclaim_ready_locked()
-            candidate_keys = {
-                _reference_key(candidate.reference) for candidate in self._candidates.values()
-            }
             for (reference, _device, _slot, _dtype, _field), key in zip(
                 requested, keys, strict=True
             ):
@@ -558,13 +557,13 @@ class TensorStore:
                     raise invalid_descriptor(
                         "request-relay registration requires a positive logical generation"
                     )
-                existing = self._entries.get(key)
+                existing = self._products.get(key)
                 if existing is not None:
+                    if not existing.committed:
+                        raise invalid_descriptor("request-relay output already has a candidate")
                     if existing.reference != reference:
                         raise invalid_descriptor("stale request-relay logical generation")
                     raise invalid_descriptor("request-relay output is already registered")
-                if key in candidate_keys:
-                    raise invalid_descriptor("request-relay output already has a candidate")
 
             operation_lanes: dict[tuple[str, int, RequestKey, ComputationId], int] = {}
             for reference, device, request_slot, _dtype, _field in requested:
@@ -593,7 +592,9 @@ class TensorStore:
             writes: list[TensorRecord] = []
             installed_operations: set[tuple[str, int, RequestKey, ComputationId]] = set()
             try:
-                for reference, device, request_slot, dtype, field in requested:
+                for (reference, device, request_slot, dtype, field), key in zip(
+                    requested, keys, strict=True
+                ):
                     operation = (
                         str(device),
                         request_slot,
@@ -624,13 +625,15 @@ class TensorStore:
                     )
                     self._next_binding_id += 1
                     slot.owner = write.binding_id
-                    self._candidates[write.binding_id] = write
+                    self._writes[write.binding_id] = write
+                    self._products[key] = write
                     self._relay_operation_lanes[operation] = lane
                     installed_operations.add(operation)
                     writes.append(write)
             except BaseException:
                 for write in reversed(writes):
-                    self._candidates.pop(write.binding_id, None)
+                    self._writes.pop(write.binding_id)
+                    self._products.pop(_reference_key(write.reference))
                     self._release_storage_locked(write)
                 for operation in installed_operations:
                     self._release_relay_operation_locked(operation)
@@ -1310,9 +1313,10 @@ class TensorStore:
                     op_id,
                     0,
                 )
-                direct = self._entries.get(direct_key)
+                direct = self._products.get(direct_key)
                 if (
                     direct is not None
+                    and direct.committed
                     and not direct._indexed
                     and direct.reference.request_key == request_key
                     and all(entry is not direct for entry in entries)
@@ -1332,7 +1336,7 @@ class TensorStore:
         if not selected:
             return
         with self._lock:
-            for entry in (*self._entries.values(), *self._candidates.values()):
+            for entry in tuple(self._writes.values()):
                 if entry.reference.buffer_id in selected:
                     self._release_entry_locked(entry)
             self._reclaim_ready_locked()
@@ -1346,7 +1350,7 @@ class TensorStore:
         if not selected:
             return
         with self._lock:
-            for entry in (*self._entries.values(), *self._candidates.values()):
+            for entry in tuple(self._writes.values()):
                 if entry.reference.request_key in selected:
                     if entry.reference.buffer_id in retained:
                         if entry.buffer_binding is None:
@@ -1365,7 +1369,7 @@ class TensorStore:
         """Confirm selected allocations have returned after every physical reader."""
 
         with self._lock:
-            for entry in (*self._entries.values(), *self._candidates.values()):
+            for entry in tuple(self._writes.values()):
                 if entry.reference.buffer_id in buffers or (
                     entry.reference.request_key in requests
                     and entry.reference.buffer_id not in retained
@@ -1382,7 +1386,7 @@ class TensorStore:
                     entry.reference.request_key in requests
                     and entry.reference.buffer_id not in retained
                 )
-                for entry in (*self._entries.values(), *self._candidates.values())
+                for entry in self._writes.values()
             )
 
     def _release_entry_locked(self, entry: TensorRecord) -> None:
@@ -1483,7 +1487,9 @@ class TensorStore:
                     metadata=pending.metadata,
                     imported=pending,
                 )
-            existing = self._entries.get(key)
+            existing = self._products.get(key)
+            if existing is not None and not existing.committed:
+                existing = None
             missing: tuple[TensorRegion, ...]
             full = TensorRegion((0,) * len(tensor.shape), tensor.shape)
             if existing is not None:
@@ -1638,7 +1644,7 @@ class TensorStore:
         with self._lock:
             for write in writes:
                 entry = self._require_write_locked(write)
-                if self._candidates.get(entry.binding_id) is not entry:
+                if entry.committed:
                     raise _invariant("device-product candidate is not live")
                 if not entry.producer_recorded:
                     raise _invariant("completion packing found an unpublished device product")
@@ -1654,14 +1660,14 @@ class TensorStore:
             if len(set(keys)) != len(keys):
                 raise _invariant("device-product publication repeats a product identity")
             for key, entry in zip(keys, entries, strict=True):
-                if self._candidates.get(entry.binding_id) is not entry:
+                if entry.committed:
                     raise _invariant("device-product candidate is not live")
                 if not entry.producer_recorded:
                     raise _invariant("device-product candidate has no producer readiness")
-                if key in self._entries:
-                    raise _invariant("device-product publication identity is already resident")
-            for key, entry in zip(keys, entries, strict=True):
-                self._entries[key] = entry
+                if self._products.get(key) is not entry:
+                    raise _invariant("device-product publication lost its reserved identity")
+            for entry in entries:
+                entry.committed = True
                 operation_key = (
                     entry.reference.request_key,
                     entry.reference.producer_op_id,
@@ -1674,21 +1680,17 @@ class TensorStore:
                 else:
                     self._operation_writes[operation_key] = [operation_writes, entry]
                 entry._indexed = True
-                self._candidates.pop(entry.binding_id)
 
     def _require_locked(self, reference: TensorRef) -> TensorRecord:
-        entry = self._entries.get(_reference_key(reference))
-        if entry is None:
+        entry = self._products.get(_reference_key(reference))
+        if entry is None or not entry.committed:
             raise invalid_descriptor("unknown device-product reference")
         if entry.reference != reference:
             raise invalid_descriptor("stale device-product logical generation")
         return self._require_write_locked(entry)
 
     def _require_write_locked(self, write: TensorRecord) -> TensorRecord:
-        if write.retired or (
-            self._entries.get(_reference_key(write.reference)) is not write
-            and self._candidates.get(write.binding_id) is not write
-        ):
+        if write.retired or self._writes.get(write.binding_id) is not write:
             raise _invariant("stale device-product physical generation")
         slot = write.relay_slot
         if slot is not None and (
@@ -1826,7 +1828,7 @@ class TensorStore:
                 return all(ready(event) for event in events)
             return ready(events)
 
-        for key, entry in tuple(self._entries.items()):
+        for binding_id, entry in tuple(self._writes.items()):
             if (
                 entry.released
                 and entry.readers == 0
@@ -1838,36 +1840,13 @@ class TensorStore:
                 and ready(entry.producer_event)
                 and readers_ready(entry)
             ):
-                if self._entries.get(key) is not entry:
-                    raise _invariant("device-product reclamation lost its indexed generation")
+                key = _reference_key(entry.reference)
+                if self._products.get(key) is not entry:
+                    raise _invariant("device-product reclamation lost its reserved identity")
                 self._require_write_locked(entry)
-                self._entries.pop(key)
+                self._writes.pop(binding_id)
+                self._products.pop(key)
                 self._detach_write_locked(entry)
-                self._release_storage_locked(entry)
-                if entry.producer_event is not None:
-                    release_event(entry.producer_event)
-                reader_events = entry.reader_events
-                if isinstance(reader_events, list):
-                    for event in reader_events:
-                        release_event(event)
-                elif reader_events is not None:
-                    release_event(reader_events)
-                reclaimed += 1
-        for binding_id, entry in tuple(self._candidates.items()):
-            if (
-                entry.released
-                and entry.readers == 0
-                and all(transfer.retired() for transfer in entry.transfers)
-                and all(
-                    publication.done() and publication.exception() is None
-                    for publication in entry.publications
-                )
-                and ready(entry.producer_event)
-                and readers_ready(entry)
-            ):
-                if self._candidates.get(binding_id) is not entry:
-                    raise _invariant("device-product reclamation lost its candidate generation")
-                self._candidates.pop(binding_id)
                 self._release_storage_locked(entry)
                 if entry.producer_event is not None:
                     release_event(entry.producer_event)

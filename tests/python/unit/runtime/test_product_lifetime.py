@@ -402,6 +402,74 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(storage: 
         events.close()
 
 
+@pytest.mark.parametrize("relay", (False, True))
+def test_tensor_publication_is_atomic_and_preserves_generation_ownership(relay: bool) -> None:
+    buffers = BufferPool(byte_capacity=16, devices=("cpu",))
+    store = TensorStore(
+        capacity=2,
+        request_capacity=1 if relay else 0,
+        relay_depth=2 if relay else 0,
+        buffer_pool=buffers,
+    )
+    first = TensorRef(
+        request_key=RequestKey(1, 1, 1),
+        producer_op_id=ComputationId(1, 0),
+        output_index=0,
+        generation=1,
+        dtype=DType.F32,
+        shape_bound=ShapeBound((StaticDim(1),)),
+    )
+    second = replace(first, output_index=1)
+    consumer = ComputationId(2, 0)
+
+    def reserve(references):
+        return store.bind_outputs(
+            tuple((reference, "cpu") for reference in references),
+            request_slots={first.request_key: 1} if relay else None,
+            buffer_allocations={
+                reference.buffer_id: BufferAllocation(reference.buffer_id, index * 4, 4)
+                for index, reference in enumerate(references)
+            },
+        )
+
+    try:
+        writes = reserve((first, second))
+        store.publish_write(writes[0], torch.tensor([3.0]))
+        with pytest.raises(WorkerError):
+            reserve((first,))
+        with pytest.raises(WorkerError):
+            store.commit_writes(writes)
+        # A batch containing an unfinished producer exposes neither product.
+        for reference in (first, second):
+            with pytest.raises(WorkerError):
+                store.consume(reference, consumer_op_id=consumer)
+        store.publish_write(writes[1], torch.tensor([7.0]))
+        store.commit_writes(writes)
+        for reference, expected in ((first, 3.0), (second, 7.0)):
+            with pytest.raises(WorkerError):
+                store.consume(replace(reference, generation=2), consumer_op_id=consumer)
+            read = store.consume(reference, consumer_op_id=consumer)
+            torch.testing.assert_close(read.tensor, torch.tensor([expected]), rtol=0, atol=0)
+            store.complete_reads((read,))
+
+        store.release_buffers((first.buffer_id, second.buffer_id))
+        replacement = replace(first, generation=2)
+        (write,) = reserve((replacement,))
+        with pytest.raises(WorkerError):
+            store.producer_write_views((writes[0],))
+        store.publish_write(write, torch.tensor([11.0]))
+        store.commit_writes((write,))
+        with pytest.raises(WorkerError):
+            store.consume(first, consumer_op_id=consumer)
+        read = store.consume(replacement, consumer_op_id=consumer)
+        torch.testing.assert_close(read.tensor, torch.tensor([11.0]), rtol=0, atol=0)
+        store.complete_reads((read,))
+    finally:
+        store.close()
+        buffers.close()
+        store.event_pool.close()
+
+
 def test_tensor_publication_enforces_its_logical_region_and_representation() -> None:
     buffers = BufferPool(byte_capacity=24, devices=("cpu",))
     events = EventPool()
