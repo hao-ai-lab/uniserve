@@ -109,6 +109,10 @@ class ModelLoader:
         if quantization is not None:
             quantization.validate_device(request.execution.device, dtype)
             config = {**config, "quantization_config": dict(quantization.raw)}
+        # Sidecars are available after source resolution, including remote snapshots.
+        from ..bootstrap.catalog import resolve_catalog_entry
+
+        entry = resolve_catalog_entry((entry.architecture,), root=root)
         schedule = None if entry.create_schedule is None else entry.create_schedule(device)
         context = ModelBuildContext(
             root=root,

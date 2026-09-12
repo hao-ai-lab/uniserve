@@ -27,13 +27,14 @@ __all__ = [
 ]
 
 TILE = 64
-SPARSITY = 0.9
 
 
-def video_sparse_selected_tiles(video_tiles: int) -> int:
-    """Return the ten-percent sparse tile budget, rounded up and bounded to one tile."""
+def video_sparse_selected_tiles(video_tiles: int, sparsity: float = 0.9) -> int:
+    """Return FastVideo's ceil-rounded video-only top-k budget."""
 
-    return max(1, math.ceil((1.0 - SPARSITY) * int(video_tiles)))
+    if video_tiles < 1 or not math.isfinite(sparsity) or not 0 <= sparsity < 1:
+        raise ValueError("VSA requires positive video tiles and sparsity in [0, 1)")
+    return max(1, math.ceil((1.0 - sparsity) * int(video_tiles)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,11 +46,13 @@ class VideoSparseAttentionMetadata:
     video_tiles: int
     valid_tiles: int
     valid_sizes: torch.Tensor
+    sparsity: float = 0.9
+    attention_backend: str = "VIDEO_SPARSE_ATTN"
 
     def pattern(self, query_tiles: int, query_tile_offset: int = 0) -> SparseAttentionPattern:
         """Declare checkpoint selection cardinalities independently of its provider."""
 
-        selected = video_sparse_selected_tiles(self.video_tiles)
+        selected = video_sparse_selected_tiles(self.video_tiles, self.sparsity)
         counts = tuple(
             self.valid_tiles
             if tile < self.prefix_tiles
@@ -150,9 +153,16 @@ def build_video_sparse_metadata(
     video_tiles: int,
     valid_sizes: torch.Tensor,
     device: torch.device,
+    sparsity: float = 0.9,
+    attention_backend: str = "VIDEO_SPARSE_ATTN",
 ) -> VideoSparseAttentionMetadata:
     """Validate tile geometry and move per-tile valid-row counts onto the execution device."""
 
+    if attention_backend not in {"VIDEO_SPARSE_ATTN", "VIDEO_SPARSE_ATTN_H3"}:
+        raise ValueError("unsupported video sparse attention backend")
+    video_sparse_selected_tiles(video_tiles, sparsity)
+    if prefix_tiles < 0 or bool(((valid_sizes < 0) | (valid_sizes > TILE)).any()):
+        raise ValueError("video sparse attention tile sizes must be in [0, 64]")
     if padded_rows % (TILE * 2):
         raise ValueError("video sparse attention transport requires an even tile-64 count")
     total_tiles = padded_rows // TILE
@@ -177,11 +187,20 @@ def build_video_sparse_metadata(
         video_tiles=video_tiles,
         valid_tiles=prefix_tiles + video_tiles,
         valid_sizes=valid,
+        sparsity=sparsity,
+        attention_backend=attention_backend,
     )
 
 
 class VideoSparseAttentionBackend:
-    """Checkpoint VSA: sparse top-k attention plus trained dense compression."""
+    """Checkpoint VSA: sparse top-k attention plus trained dense compression.
+
+    VIDEO_SPARSE_ATTN_H3 uses FastVideo's tile-64 exempt-prefix policy:
+    segment-pure prefix queries are dense, prefix keys are always visible,
+    and only logical video tiles compete in top-k. Transport partners never
+    enter selection or compression. The pinned four-step VSA path shares
+    these operations, retaining its own sparsity and schedule contract.
+    """
 
     def __init__(self, metadata: VideoSparseAttentionMetadata) -> None:
         """Bind immutable tile metadata and resolve the sparse attention kernel."""
@@ -298,7 +317,7 @@ class VideoSparseAttentionBackend:
             video_sparse_ops.threshold_topk_indices(video_scores, topk_indices_i32)
             selected = topk_indices_i32
         else:
-            keep_video_tiles = video_sparse_selected_tiles(video_tiles)
+            keep_video_tiles = video_sparse_selected_tiles(video_tiles, self.metadata.sparsity)
             selected = torch.topk(
                 video_scores,
                 keep_video_tiles,

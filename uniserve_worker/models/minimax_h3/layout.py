@@ -133,6 +133,8 @@ class H3Layout:
     local_end: int
     frame_count: int
     reconstruction_unit_frames: tuple[int, ...]
+    sparsity: float = 0.9
+    attention_backend: str = "VIDEO_SPARSE_ATTN"
     local_video_rows: int = field(init=False)
     local_audio_rows: int = field(init=False)
 
@@ -159,6 +161,8 @@ class H3Layout:
         frames: int,
         text_rows: int,
         audio_frames: int,
+        sparsity: float = 0.9,
+        attention_backend: str = "VIDEO_SPARSE_ATTN",
     ) -> "H3Layout":
         """Partition one packed request evenly across the mesh sequence ranks."""
 
@@ -178,6 +182,8 @@ class H3Layout:
         shard = packed.padded_rows // size
         return cls(
             packed=packed,
+            sparsity=sparsity,
+            attention_backend=attention_backend,
             sp_rank=rank,
             sp_size=size,
             tp_size=1 if config is None else config.tensor_parallel_size,
@@ -485,7 +491,11 @@ def scratch_tensor_schema(
         "pooled_value": TensorSchema((tiles, heads, 128), torch.float32),
         "compressed_tiles": TensorSchema((heads, query_tiles, 128), torch.float32),
         "topk_indices_i32": TensorSchema(
-            (heads, query_tiles, video_sparse_selected_tiles(layout.packed.video_tiles)),
+            (
+                heads,
+                query_tiles,
+                video_sparse_selected_tiles(layout.packed.video_tiles, layout.sparsity),
+            ),
             torch.int32,
         ),
         "block_adaln_params": TensorSchema(block_params_shape, torch.bfloat16),
@@ -555,7 +565,7 @@ def bind_compute_tensors(
                 "topk_indices_i32": (
                     local_heads,
                     layout.attention_video_tiles,
-                    video_sparse_selected_tiles(layout.packed.video_tiles),
+                    video_sparse_selected_tiles(layout.packed.video_tiles, layout.sparsity),
                 ),
                 "rotary_positions": (global_rows, 3),
                 "rotary_frequencies": (global_rows, 3, 16),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Hashable
+from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -151,7 +152,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         """Compose the learned denoiser with the shared solver and pipeline feedback."""
 
         if not 0 <= step < self.denoise_steps:
-            raise ValueError("H3 denoise step is outside the four-evaluation ladder")
+            raise ValueError("H3 denoise step is outside the checkpoint ladder")
         assert self.denoiser is not None and metadata.scratch is not None
         assert metadata.transformer_metadata is not None
         return DenoisingStep(
@@ -167,10 +168,20 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         bindings: EntryBindings,
         components: H3Components,
         layout: H3Layout,
+        *,
+        denoise_steps: int = len(FASTH3_LADDER),
     ) -> None:
         """Bind H3 model components to runtime-owned state, scratch, and device products."""
 
         super().__init__()
+        self.media_plan = MediaExecutionPlan(
+            tuple(
+                replace(stage, count=denoise_steps)
+                if stage.repeat is MediaPlanRepeat.FIXED
+                else stage
+                for stage in self.media_plan.stages
+            )
+        )
 
         self.bindings: EntryBindings = bindings
         self.owns_media_output = bindings.owns("output")
@@ -280,6 +291,8 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             frames=frames,
             text_rows=text_rows,
             audio_frames=audio_frames,
+            sparsity=self.layout.sparsity,
+            attention_backend=self.layout.attention_backend,
         )
         return H3ComputeInputs.bind(
             self.bindings,

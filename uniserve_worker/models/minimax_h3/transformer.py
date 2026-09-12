@@ -88,6 +88,8 @@ def build_transformer_metadata(layout: H3Layout, device: torch.device) -> H3Tran
         video_tiles=layout.packed.video_tiles,
         valid_sizes=layout.packed.tile_valid_sizes,
         device=device,
+        sparsity=layout.sparsity,
+        attention_backend=layout.attention_backend,
     )
     vsa = VideoSparseAttentionBackend(metadata)
     local_tags = layout.packed.token_tags[layout.local_start : layout.local_end]

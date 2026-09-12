@@ -1,6 +1,6 @@
 # FastH3 cheat sheet
 
-UniServe serves `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree` as text-to-video-and-audio. The output is an H.264/AAC MP4 at 1344×768, 24 fps, with stereo 32-kHz audio.
+UniServe serves full FastVideo-exported FastH3 checkpoints as text-to-video-and-audio, including the pinned four-step VSA release and `FastVideo/FastVideo-FastH3-8-step-Preview-v1-VSA80-DataFree-Shift10`. The output is an H.264/AAC MP4 at 1344×768, 24 fps, with stereo 32-kHz audio.
 
 ## Requirements
 
@@ -42,6 +42,45 @@ hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree \
 ```
 
 Pass the model root containing `modular_model_index.json`, `fastvideo_inference.json`, `transformer/`, `text_encoder/`, `vae/`, `audio_vae/`, `scheduler/`, `audio_scheduler/`, and `tokenizer/`.
+
+## Checkpoint contracts
+
+`H3_MODEL` selects the full checkpoint root. UniServe reads `fastvideo_inference.json` before constructing components. Published four-step and eight-step identities retain strict hash and recipe checks; another export must use its own identity. Hash fields identify exporter receipts, not a claim that UniServe rehashes every weight shard. Scheduler component configurations must agree with the declared shifts.
+
+For the eight-step release:
+
+```bash
+export H3_MODEL=/mnt/lustre/vlm-wlsaidhi/fastvideo/exports/FastVideo-FastH3-8-step-Preview-v1-VSA80-DataFree-Shift10
+unset UNISERVE_H3_CONTRACT H3_CONTRACT
+python -m uniserve_worker.bootstrap.inspect_model --model "$H3_MODEL"
+```
+
+For a manifest-less local export, write an external JSON sidecar and select it explicitly. Do not copy a published manifest or invent its hashes. Obtain the export's content/metadata receipts and source commit, and choose its inference ladder explicitly; a directory name or training grid does not select an inference recipe. The checkpoint remains immutable.
+
+| Field | Contract |
+|---|---|
+| `schema_version` | `fasth3-inference-contract-v1` |
+| `checkpoint_root` | Resolved absolute checkpoint root; required for an external sidecar without an embedded manifest |
+| `model_id` | Nonempty export identity, distinct from published releases |
+| `checkpoint_content_sha256`, `checkpoint_metadata_sha256` | Actual exporter receipt identities, lowercase 64-digit SHA-256 |
+| `fastvideo_commit` | Exact lowercase 40-digit FastVideo source commit |
+| `task` | `t2av` |
+| `transformer_forwards` | Positive integer equal to ladder length |
+| `num_inference_steps` | Forward count plus one terminal grid point |
+| `dmd_denoising_steps` | Strictly descending integer list in `(0, 1000]`; divided by 1000 before shifting, with terminal zero appended |
+| `video_scheduler_shift`, `audio_scheduler_shift` | Positive finite shifts; video precedes audio |
+| `guidance_scale` | `1.0` (CFG is not implemented) |
+| `attention_backend` | `VIDEO_SPARSE_ATTN_H3` or `VIDEO_SPARSE_ATTN` |
+| `vsa_tile_size`, `vsa_sparsity` | Tile size `64`; finite sparsity in `[0, 1)` |
+| `sequence_parallel_size` | Positive integer recording recipe SP size; physical placement remains controlled by workers |
+
+```bash
+export H3_MODEL=/mnt/lustre/vlm-wlsaidhi/fastvideo/exports/minimax_h3_pdd_v23_step1600_fp32_grid32/inference/checkpoint-1600
+export UNISERVE_H3_CONTRACT=/absolute/path/to/operator-contract.json
+python -m uniserve_worker.bootstrap.inspect_model --model "$H3_MODEL"
+```
+
+An explicit sidecar must equal an embedded manifest when both exist; it cannot override a release. For `uniserve-deploy/serve-fasth3.sbatch`, export `H3_MODEL` and optionally `H3_CONTRACT` (the script exports it as `UNISERVE_H3_CONTRACT`). Record both the checkpoint and sidecar in the serving run before submission. Use `UNISERVE_ROOT` to select the installed UniServe checkout. H3 VSA uses segment-pure prefix tiles, dense prefix queries, always-visible prefix keys, video-only top-k selection, and the trained gated pooled-attention branch. Padding tiles are excluded from logical attention and compression.
 
 ## Start the server
 
@@ -153,8 +192,8 @@ Example:
 
 ## Fixed model contract
 
-- Four denoiser forwards with inference grid `[1, 0.75, 0.5, 0.25, 0]` and video/audio sigma shifts `12/3`.
-- VSA sparse attention with tile size 64 and sparsity 0.9. The shared provider selects the installed implementation from the execution device; SM100 uses the native SM100a kernel and supports incremental row production. Dense attention selects a compatible provider from each request’s dtype, head layout and mask. GB200 has end-to-end validation; other hardware requires its own validation before performance claims.
+- The checkpoint contract selects denoiser forward count, schedule and attention settings. The pinned four-step release preserves `[1, 0.75, 0.5, 0.25, 0]` and video/audio sigma shifts `12/3`. The eight-step release uses integer ladder `[999, 874, 749, 624, 500, 375, 250, 125] / 1000`, terminal zero, shifts `10/3`, guidance 1, and eight forwards.
+- VSA sparse attention uses tile size 64 and manifest sparsity (0.9 for the pinned four-step release, 0.8 for the eight-step H3 VSA release). The shared provider selects the installed implementation from the execution device; SM100 uses the native SM100a kernel and supports incremental row production. Dense attention selects a compatible provider from each request’s dtype, head layout and mask. GB200 has end-to-end validation; other hardware requires its own validation before performance claims.
 - Fixed 1344×768 output, 24 fps, and stereo 32-kHz audio.
 - Text-only conditioning. Image/video references, LoRA, variable resolution, guidance changes, and step-count changes are rejected.
 
