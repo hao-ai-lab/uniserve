@@ -10,16 +10,17 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve_worker.execution.batch import ForwardMode, PipelineStage
+from uniserve_worker.protocol.batch import ForwardMode, ForwardStats, PipelineStage
 
 if TYPE_CHECKING:
     from ..backends.attention.base import AttentionBackend
+    from .sampling import SamplerOutput
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,13 +41,12 @@ class AttentionSelection:
 
 
 class AttentionMode(StrEnum):
-    """Selects dense, paged-decode, paged-prefill, packed, or request-indexed attention execution."""
+    """Selects dense, paged decode, paged prefill, or packed attention execution."""
 
     DENSE = "dense"
     PAGED_DECODE = "paged_decode"
     PAGED_VARLEN = "paged_varlen"
     PACKED = "packed"
-    REQUEST_INDEXED_DECODE = "request_indexed_decode"
 
 
 class ExpertRoute(StrEnum):
@@ -128,21 +128,20 @@ class FlowPatches:
 
 
 @dataclass(frozen=True, slots=True)
-class ForwardBatch:
-    """One borrowed columnar view over execution-lane input buffers."""
+class AttentionMetadata:
+    """Borrowed numerical geometry consumed independently by attention backends.
 
-    forward_mode: ForwardMode | PipelineStage
-    row_count: int
+    Prefix lengths exclude the current query. Paged modes materialize total
+    lengths; packed attention reads the prefix and query segments separately.
+    Capture retains stable tensor addresses and a backend binding identity.
+    """
+
     attention_mode: AttentionMode
-    request_pool_indices: torch.Tensor
-    # Cached tokens precede the current query; total lengths include that query.
     prefix_lens: torch.Tensor
     query_lens: torch.Tensor
     out_cache_loc: torch.Tensor
     has_cache_writes: bool = True
     block_table: torch.Tensor | None = None
-    # Packed attention reads prefix/current segments separately, so only paged
-    # decode and varlen need a materialized total-length device column.
     seq_lens: torch.Tensor | None = None
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
@@ -161,6 +160,16 @@ class ForwardBatch:
     fully_visible: bool = False
     binding: int = 0
     cuda_graph_capture: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardBatch:
+    """One borrowed columnar view over execution-lane input buffers."""
+
+    forward_mode: ForwardMode | PipelineStage
+    row_count: int
+    attention: AttentionMetadata
+    request_pool_indices: torch.Tensor
     decode_force_finish: torch.Tensor | None = None
     token_row_indices: tuple[int, ...] = ()
     flow_row_indices: tuple[int, ...] = ()
@@ -191,8 +200,8 @@ class ForwardBatch:
         if int(self.request_pool_indices.numel()) != self.row_count:
             raise ValueError("forward request indices do not align with rows")
         if (
-            int(self.prefix_lens.numel()) != self.row_count
-            or int(self.query_lens.numel()) != self.row_count
+            int(self.attention.prefix_lens.numel()) != self.row_count
+            or int(self.attention.query_lens.numel()) != self.row_count
         ):
             raise ValueError("forward KV lengths do not align with rows")
         if self.decode_force_finish is not None and (
@@ -211,13 +220,20 @@ class ForwardBatch:
             raise ValueError("forward token columns are not aligned")
         if any(
             len(lengths) != self.row_count
-            for lengths in (self.prefix_lens_cpu, self.seq_lens_cpu, self.query_lens_cpu)
+            for lengths in (
+                self.attention.prefix_lens_cpu,
+                self.attention.seq_lens_cpu,
+                self.attention.query_lens_cpu,
+            )
         ):
             raise ValueError("forward host KV lengths do not align with rows")
         if any(
             prefix < 0 or query < 0 or total != prefix + query
             for prefix, query, total in zip(
-                self.prefix_lens_cpu, self.query_lens_cpu, self.seq_lens_cpu, strict=True
+                self.attention.prefix_lens_cpu,
+                self.attention.query_lens_cpu,
+                self.attention.seq_lens_cpu,
+                strict=True,
             )
         ):
             raise ValueError("forward sequence lengths must equal cached prefix plus query")
@@ -284,6 +300,10 @@ class ForwardOutput:
 
     values: tuple[torch.Tensor, ...]
     vocabularies: tuple[VocabularyPartition | None, ...] = ()
+    request_pool_indices: torch.Tensor | None = None
+    output_event: torch.cuda.Event | None = None
+    stats: ForwardStats | None = None
+    greedy: SamplerOutput | None = None
 
     def __post_init__(self) -> None:
         if not self.vocabularies:
@@ -297,6 +317,10 @@ class ForwardOutput:
     def materialize(self) -> ForwardOutput:
         """Gather global vocabulary rows, preserving their caller-visible shapes."""
 
+        if self.output_event is not None:
+            if not self.values:
+                raise RuntimeError("forward output has a fence without a producer tensor")
+            torch.cuda.current_stream(self.values[0].device).wait_event(self.output_event)
         if not any(self.vocabularies):
             return self
         from ..nn.logits import gather_vocabulary
@@ -315,7 +339,7 @@ class ForwardOutput:
             results = gathered.split(tuple(value.shape[0] for value in sources))
             for index, value in zip(indexes, results, strict=True):
                 values[index] = value
-        return ForwardOutput(tuple(values))
+        return replace(self, values=tuple(values), vocabularies=(None,) * len(values))
 
     def clone(self) -> ForwardOutput:
         """Own detached copies that survive reuse of the producer's storage.
@@ -325,6 +349,10 @@ class ForwardOutput:
         storage remains live for as long as any returned tensor is retained.
         """
 
+        if self.output_event is not None:
+            if not self.values:
+                raise RuntimeError("forward output has a fence without a producer tensor")
+            torch.cuda.current_stream(self.values[0].device).wait_event(self.output_event)
         groups: dict[tuple[torch.device, torch.dtype], list[int]] = defaultdict(list)
         for index, value in enumerate(self.values):
             groups[(value.device, value.dtype)].append(index)
@@ -339,7 +367,18 @@ class ForwardOutput:
             views = packed.split(tuple(value.numel() for value in sources))
             for index, view in zip(indexes, views, strict=True):
                 copied[index] = view.reshape(self.values[index].shape)
-        return ForwardOutput(tuple(copied), self.vocabularies)
+        greedy = self.greedy
+        if greedy is not None:
+            greedy = greedy.clone()
+        return replace(
+            self,
+            values=tuple(copied),
+            output_event=None,
+            greedy=greedy,
+            request_pool_indices=None
+            if self.request_pool_indices is None
+            else self.request_pool_indices.clone(),
+        )
 
     def validate_for(self, batch: ForwardBatch) -> None:
         """Require one tensor result for every row in the originating batch."""
@@ -361,3 +400,11 @@ __all__ = [
     "VocabularyPartition",
     "packed_tensor_views",
 ]
+
+
+def concatenate_views(values: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """Borrow adjacent numerical columns, or concatenate disjoint allocations."""
+
+    tensors = tuple(value.reshape(-1) for value in values)
+    packed = packed_tensor_views(tensors)
+    return torch.cat(tensors, dim=0) if packed is None else packed

@@ -30,7 +30,7 @@ from ...nn.mesh import DeviceMesh
 from ...nn.mlp import GatedMLP
 from ...nn.norm import RMSNorm
 from ...nn.parallel_attention import (
-    AttentionContextWorkspace,
+    AttentionBuffers,
     AttentionRowExchange,
     ParallelAttention,
 )
@@ -411,7 +411,7 @@ class _H3Attention(nn.Module):
         projection_sync_output: torch.Tensor,
         attention_workspace: torch.Tensor,
         attention_output: torch.Tensor,
-        context_workspace: AttentionContextWorkspace | None,
+        context_workspace: AttentionBuffers | None,
         tile_scores: torch.Tensor,
         block_counts: torch.Tensor,
         block_indices: torch.Tensor,
@@ -549,7 +549,7 @@ class _TransformerBlock(nn.Module):
         projection_sync_output: torch.Tensor,
         attention_workspace: torch.Tensor,
         attention_output: torch.Tensor,
-        context_workspace: AttentionContextWorkspace | None,
+        context_workspace: AttentionBuffers | None,
         tile_scores: torch.Tensor,
         block_counts: torch.Tensor,
         block_indices: torch.Tensor,

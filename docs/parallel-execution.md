@@ -71,7 +71,7 @@ Mixed-batch startup measures service time to select useful execution geometries.
 
 ## Worker computation resources
 
-A worker's logical domains (`decode`, `prefill`, and `flow`) resolve to physical computation bindings during construction. Without `--lane`, they use the existing full-device execution stream. An explicit Lane reserves a Green Context and SM quota; domains assigned to the same Lane share one PackedRunner, its staging, and its graph backend. Separate Lanes have independent mutable computation storage and NCCL communicators. The explicit-stream NCCL provider keeps communication kernels inside the assigned Green Context during eager execution and capture. ModelRunner owns grouping and synchronization within the scheduler's submitted logical launch constraints.
+A worker's logical domains (`decode`, `prefill`, and `flow`) resolve to ModelEntry bindings during construction. Without `--lane`, they use the full-device execution stream. An explicit lane configuration creates a CudaStream with a Green Context and SM quota. Domains assigned to the same stream share compatible InputBuffers and graph storage; separate streams have independent mutable computation storage and NCCL communicators. The explicit-stream NCCL provider keeps communication kernels inside the assigned Green Context during eager execution and capture. ModelRunner owns numerical grouping and synchronization for each actual forward call while preserving result alignment and completion boundaries.
 
 The following server options configure a shared 152-SM binding or independent 64/88-SM bindings on a device supporting those quotas:
 
@@ -82,6 +82,6 @@ The following server options configure a shared 152-SM binding or independent 64
 --lane '{"lane_id":"compute","sm_budget":88,"domains":["prefill","flow"]}'
 ```
 
-The quotas are explicit configuration, validated against the target device at startup. Unsupported domains, overlapping assignments, or invalid quotas fail construction. Lane resources remain fixed until the worker closes. Warmup, capture, replay, and eager execution all use the configured bindings; graph policy does not change SM allocation. Use `--graph-policy full --prefill-cuda-graph true` for required capture, or `--graph-policy off --prefill-cuda-graph false` for eager execution. A required graph cannot silently fall back to eager execution.
+The quotas are explicit configuration, validated against the target device at startup. Unsupported domains, overlapping assignments, or invalid quotas fail construction. CudaStream resources remain fixed until the worker closes. Warmup, capture, replay, and eager execution all use the configured bindings; graph policy does not change SM allocation. Use `--graph-policy full --prefill-cuda-graph true` for required capture, or `--graph-policy off --prefill-cuda-graph false` for eager execution. A required graph cannot silently fall back to eager execution.
 
-The [Worker lifecycle](worker-lifecycle.md) describes endpoint ownership, optional direct-execution warmup, and the scope that releases graphs and staging before physical Lane resources.
+The [Worker lifecycle](worker-lifecycle.md) describes endpoint ownership, optional direct-execution warmup, and the scope that releases graphs and staging before CudaStream resources.

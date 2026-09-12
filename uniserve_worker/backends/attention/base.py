@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from ...execution.forward_batch import AttentionMode, ForwardBatch
+from ...execution.forward_batch import AttentionMetadata, AttentionMode
 from ..triton import triton_available
 
 try:  # pragma: no cover - availability depends on the serving environment.
@@ -481,7 +481,7 @@ class AttentionBackend:
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute dense attention over rank-three or rank-four Q/K/V tensors."""
 
@@ -499,7 +499,7 @@ class AttentionBackend:
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute decode attention against scheduler-indexed paged KV storage."""
 
@@ -518,7 +518,7 @@ class AttentionBackend:
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute attention over packed sequences delimited by cumulative query and KV offsets."""
 
@@ -540,7 +540,7 @@ class AttentionBackend:
         scale: float | None = None,
         use_prefix_bounds: bool = False,
         fully_visible: bool = False,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute dense attention with an independent visible KV boundary for each query row."""
 
@@ -560,7 +560,7 @@ class AttentionBackend:
         visible_current_end: torch.Tensor,
         scale: float,
         fully_visible_current: bool,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute attention over current and cached KV segments and merge their online-softmax states."""
 

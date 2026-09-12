@@ -25,10 +25,7 @@ class _EmptyStreamHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler method name.
         length = int(self.headers.get("content-length", "0"))
         self.rfile.read(length)
-        payload = (
-            b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
-            b"data: [DONE]\n\n"
-        )
+        payload = b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n'
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("content-length", str(len(payload)))

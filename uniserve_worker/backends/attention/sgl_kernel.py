@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from ...execution.forward_batch import AttentionMode, ForwardBatch
+from ...execution.forward_batch import AttentionMetadata, AttentionMode
 from .base import AttentionBackend
 
 __all__ = [
@@ -61,7 +61,7 @@ class SglKernelAttentionBackend(AttentionBackend):
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute dense attention through the SGL FlashAttention extension."""
 
@@ -130,7 +130,7 @@ class SglKernelAttentionBackend(AttentionBackend):
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Write current K/V and compute paged decode through the SGL extension."""
 
@@ -196,7 +196,7 @@ class SglKernelAttentionBackend(AttentionBackend):
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute packed variable-length attention through the SGL extension."""
 

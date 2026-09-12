@@ -774,7 +774,7 @@ pub struct MediaOutput {
 /// The fixed-layout record a worker emits once for every operation, after its
 /// copy event is query-ready and its pinned fields are validated on the host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModelOutput {
+pub struct RequestOutput {
     /// Request lineage completed by the operation.
     pub request_key: RequestKey,
     /// Request-local operation identifier.
@@ -813,7 +813,7 @@ pub struct ModelOutput {
     pub kv_output: Option<KvTransfer>,
 }
 
-impl ModelOutput {
+impl RequestOutput {
     /// Validates completion identity, status, accepted lengths, and product generations.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(self.op_id.batch_id > 0, "completion op id must be positive");
@@ -1316,7 +1316,7 @@ impl BufferAllocation {
 /// One executor-produced physical worker invocation. Execution domains,
 /// attention selection, and captured buckets are derived by the worker.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Run {
+pub struct ScheduleBatch {
     /// Submission batch identity assigned by the executor.
     pub batch_id: u64,
     /// Physical invocation identity, strictly increasing in each worker's Submit order.
@@ -1347,7 +1347,7 @@ pub struct Run {
     pub kv_inputs: Vec<KvTransfer>,
 }
 
-impl Run {
+impl ScheduleBatch {
     /// Constructs a run with admissions and operations using default metadata.
     pub fn new(
         batch_id: u64,
@@ -1708,13 +1708,13 @@ impl Run {
 
 /// One independently ready subset of a physical run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RunResult {
+pub struct BatchOutput {
     /// Submission batch identity copied from the run.
     pub batch_id: u64,
     /// Physical invocation identity copied from the run.
     pub run_id: u64,
     /// Operation completions contained in this fragment.
-    pub completions: Vec<ModelOutput>,
+    pub completions: Vec<RequestOutput>,
     /// Product values published by completed operations.
     pub products: Vec<TensorPublication>,
     /// Visibility result for atomic product registration.
@@ -1722,16 +1722,16 @@ pub struct RunResult {
     /// Aggregate worker execution time in microseconds, when measured.
     pub worker_exec_us: Option<u64>,
     /// Model-forward statistics, when reported by the worker.
-    pub forward_stats: Option<WorkerForwardStats>,
+    pub forward_stats: Option<ForwardStats>,
     /// Whether all operations and command-owned physical resources have retired.
     /// Free/Finish runs publish a separate empty terminal fragment after any
     /// operation fragments, even when retirement is immediately ready.
     pub done: bool,
 }
 
-impl RunResult {
+impl BatchOutput {
     /// Iterates over operation completions in report order.
-    pub fn completions(&self) -> impl Iterator<Item = &ModelOutput> {
+    pub fn completions(&self) -> impl Iterator<Item = &RequestOutput> {
         self.completions.iter()
     }
 

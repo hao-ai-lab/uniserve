@@ -13,8 +13,8 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Generic, TypeVar
 
-from ..execution.batch import CudaIpcTransfer, Locator, PosixShmTransfer
 from ..foundation.errors import invalid_descriptor, resource_error
+from ..protocol.batch import CudaIpcTransfer, Locator, PosixShmTransfer
 
 Source = TypeVar("Source")
 

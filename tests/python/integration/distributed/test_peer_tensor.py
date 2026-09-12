@@ -6,18 +6,19 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
+from uniserve_worker.bootstrap.distributed import (
     initialize_model_parallel,
+    initialize_process_groups,
 )
+from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
+from uniserve_worker.runtime.peer_memory import allocate_peer_workspace
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 def _run_peer_tensor(rank: int, rendezvous: str, world_size: int) -> None:
     device = torch.device("cuda", rank)
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=world_size,
@@ -36,9 +37,7 @@ def _run_peer_tensor(rank: int, rendezvous: str, world_size: int) -> None:
         },
     )["model"]
     group = mesh.get_group("cp")
-    workspace = environment.peer_tensor(
-        group, (123, 7, 128), dtype=torch.bfloat16, name="rows", row_multiple=64
-    )
+    workspace = allocate_peer_workspace(group, (123, 7, 128), dtype=torch.bfloat16, row_multiple=64)
     assert workspace.local.shape[0] >= 123 and workspace.local.shape[0] % 64 == 0
     sync_input = torch.zeros(1, dtype=torch.int32, device=device)
     sync_output = torch.empty(world_size, dtype=torch.int32, device=device)

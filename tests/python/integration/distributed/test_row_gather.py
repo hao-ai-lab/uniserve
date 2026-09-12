@@ -4,16 +4,16 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve_worker.execution.bounded_storage import BoundedTensorStorage, TensorSchema
+from uniserve_worker.bootstrap.distributed import (
+    initialize_model_parallel,
+    initialize_process_groups,
+)
 from uniserve_worker.nn.layer import LayerConfig
 from uniserve_worker.nn.linear import LinearBase
 from uniserve_worker.nn.mesh import Communicator
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.nn.row_pipeline import ProjectedRows, RowStage, run_row_pipeline
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from uniserve_worker.runtime.tensor_buffers import TensorBuffers, TensorSchema
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -21,7 +21,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 @torch.no_grad()
 def _run_gather(rank: int, rendezvous: str) -> None:
     device = torch.device("cuda", rank)
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=2,
@@ -38,10 +38,9 @@ def _run_gather(rank: int, rendezvous: str) -> None:
         for mesh in meshes.values():
             group = mesh.get_group("sp")
             for dtype in (torch.bfloat16, torch.uint8):
-                storage = BoundedTensorStorage.allocate(
+                storage = TensorBuffers.allocate(
                     {"rows": TensorSchema((8192,), dtype, memory="symmetric", group=group)},
                     device,
-                    environment=environment,
                 )
                 gathered = storage.capacity["rows"]
                 local = (torch.arange(4096, device=device) % 31 + rank * 64).to(dtype)
@@ -63,7 +62,7 @@ def _run_gather(rank: int, rendezvous: str) -> None:
                 graph.reset()
                 del gathered, storage
             for local_rows, width in ((128, 512), (16392, 2048)):
-                storage = BoundedTensorStorage.allocate(
+                storage = TensorBuffers.allocate(
                     {
                         "rows": TensorSchema(
                             (local_rows * width * 4,),
@@ -73,7 +72,6 @@ def _run_gather(rank: int, rendezvous: str) -> None:
                         )
                     },
                     device,
-                    environment=environment,
                 )
                 columns = (torch.arange(width, device=device) % 17).bfloat16() / 16
                 rows = columns.repeat(local_rows, 1).add_(rank)
@@ -215,7 +213,7 @@ def _run_quantized_gather(rank: int, rendezvous: str) -> None:
     from uniserve_worker.nn.quant import DynamicW8A8Fp8LinearMethod, DynamicW8A8MxFp8LinearMethod
 
     device = torch.device("cuda", rank)
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=2,
@@ -235,14 +233,13 @@ def _run_quantized_gather(rank: int, rendezvous: str) -> None:
         magnitudes = torch.tensor([0.03125, 0.25, 2, 16], device=device)
         full.mul_(magnitudes[torch.arange(local_rows * 2, device=device) % 4, None])
         local = full.chunk(2)[group.rank_in_group].clone()
-        storage = BoundedTensorStorage.allocate(
+        storage = TensorBuffers.allocate(
             {
                 "rows": TensorSchema(
                     (4 * 128 * width,), torch.bfloat16, memory="symmetric", group=group
                 )
             },
             device,
-            environment=environment,
         )
         for method in (DynamicW8A8Fp8LinearMethod(), DynamicW8A8MxFp8LinearMethod()):
             layer = LinearBase(
@@ -298,7 +295,7 @@ def _run_routed_scales(rank: int, rendezvous: str) -> None:
     from uniserve_worker.nn.quant.nvfp4 import DynamicW4A4NvFp4LinearMethod
 
     device = torch.device("cuda", rank)
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=2,

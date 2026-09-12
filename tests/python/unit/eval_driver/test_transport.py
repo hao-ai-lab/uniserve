@@ -60,6 +60,7 @@ def test_chat_json_records_visible_text_and_server_usage() -> None:
             )
         assert record.success is True
         assert record.generated_text == "caption"
+        assert record.record_dict()["generated_text"] == "caption"
         assert record.prompt_len_source == "server_usage"
         assert record.output_len_source == "server_usage"
         assert record.token_timing_available is False
@@ -97,6 +98,7 @@ def test_stream_records_reasoning_content_as_public_text() -> None:
         assert record.success is True
         assert record.classifier == "ok"
         assert record.generated_text == "reason"
+        assert record.record_dict()["generated_text"] == "reason"
         assert record.token_timing_available is True
         assert record.prompt_len_source == "server_usage"
         assert record.output_len_source == "server_usage"

@@ -135,7 +135,13 @@ class Qwen3Attention(nn.Module):
             q, k, v, state_shape, batched_decode, batched
         )
         out = self.attn(
-            q_attn, k_attn, v_attn, context, causal=True, scale=self.scale, partition=partition
+            q_attn,
+            k_attn,
+            v_attn,
+            None if context is None else context.attention,
+            causal=True,
+            scale=self.scale,
+            partition=partition,
         )
         return self.o_proj(
             self._restore_attention_output(out, state_shape, batched_decode, batched),
@@ -369,7 +375,7 @@ class Qwen3DecoderLayer(nn.Module):
             project,
             self.self_attn.attn,
             finish,
-            context=context,
+            context=context.attention,
             partition=partition,
             causal=True,
             scale=self.self_attn.scale,

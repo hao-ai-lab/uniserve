@@ -6,9 +6,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .execution.batch import WorkerForwardStats
-    from .execution.model_runner import RunObservation
-    from .execution.rows import LaneState
+    from .protocol.batch import ForwardStats
 
 
 import inspect
@@ -16,7 +14,7 @@ import logging
 import os
 import time
 from contextlib import ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -340,63 +338,26 @@ def _profiler_table(profiler, *, prefer_cuda: bool) -> str:
     return profiler.key_averages().table(row_limit=120)
 
 
-def record_component(scope: LaneState, name: str, started_ns: int) -> None:
-    """Accumulate elapsed microseconds under a lane-scoped execution component."""
+def record_component(component_us: dict[str, int], name: str, started_ns: int) -> None:
+    """Accumulate component time in the owning completion group, in microseconds."""
 
     elapsed_us = max(0, (time.perf_counter_ns() - int(started_ns)) // 1000)
-    scope.component_us[name] = scope.component_us.get(name, 0) + elapsed_us
+    component_us[name] = component_us.get(name, 0) + elapsed_us
 
 
 def _forward_stats(
-    observations: Sequence[RunObservation],
+    values: Sequence[ForwardStats],
     component_us: Mapping[str, int] | None = None,
-) -> WorkerForwardStats:
-    """Aggregate forward observations into stable per-component and total timing statistics."""
+) -> ForwardStats:
+    """Aggregate the original counters and local component times at completion."""
 
-    from .execution.batch import WorkerForwardStats
-    from .execution.model_runner import RunPath
+    from .protocol.batch import ForwardStats
 
-    route_counts: dict[str, int] = {}
-    route_rows: dict[str, int] = {}
-    route_us: dict[str, int] = {}
-    path_counts: dict[str, int] = {}
-    captures = 0
-    replays = 0
-    fallbacks = 0
-    graph_unpadded_tokens = 0
-    graph_padded_tokens = 0
-    for observation in observations:
-        route_counts[observation.route] = route_counts.get(observation.route, 0) + 1
-        route_rows[observation.route] = route_rows.get(observation.route, 0) + int(
-            observation.row_count
-        )
-        route_us[observation.route] = route_us.get(observation.route, 0) + int(
-            observation.duration_us
-        )
-        path_counts[observation.path.value] = path_counts.get(observation.path.value, 0) + 1
-        captures += observation.path is RunPath.GRAPH_CAPTURE
-        replays += observation.path is RunPath.GRAPH_REPLAY
-        fallbacks += observation.path is RunPath.GRAPH_FALLBACK
-        graph_unpadded_tokens += int(observation.graph_unpadded_tokens)
-        graph_padded_tokens += int(observation.graph_padded_tokens)
-    components: dict[str, int] = {}
-    if observations:
-        components["forward"] = sum(route_us.values())
+    stats = ForwardStats.combine(values)
+    components = dict(stats.component_us)
     for name, value in (component_us or {}).items():
         components[str(name)] = components.get(str(name), 0) + max(0, int(value))
-    return WorkerForwardStats(
-        mode_counts=route_counts,
-        mode_tokens=route_rows,
-        mode_us=route_us,
-        component_us=components,
-        cuda_graph_captures=int(captures),
-        cuda_graph_replays=int(replays),
-        cuda_graph_misses=int(fallbacks),
-        cuda_graph_fallbacks=int(fallbacks),
-        cuda_graph_unpadded_tokens=graph_unpadded_tokens,
-        cuda_graph_padded_tokens=graph_padded_tokens,
-        cuda_graph_runtime_mode_counts=path_counts,
-    )
+    return replace(stats, component_us=components)
 
 
 def record_failure(raw_kind: object, error: WorkerError, *, unexpected: bool = False) -> None:

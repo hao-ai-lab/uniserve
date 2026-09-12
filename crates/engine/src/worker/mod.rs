@@ -16,7 +16,7 @@ pub use process::{FlashInferBackend, FlashInferBackendParseError, LaneConfig};
 pub enum RunSubmitError {
     /// Returns the unaccepted physical submission when the instance has no capacity.
     #[error("worker run queue is full")]
-    WouldBlock(uniserve_worker_ipc::Run),
+    WouldBlock(uniserve_worker_ipc::ScheduleBatch),
     /// Reports a terminal transport or execution failure.
     #[error(transparent)]
     Failed(anyhow::Error),

@@ -1,6 +1,6 @@
 """Ownership transfer of immutable media bytes through POSIX shared memory."""
 
-from ..runtime.device import allocate_shared_memory
+from ..foundation.shared_memory import allocate_shared_memory
 
 
 def publish_media_bytes(payload: bytes) -> str:

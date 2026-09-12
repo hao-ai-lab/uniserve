@@ -6,16 +6,14 @@ from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from math import prod
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import torch
 
-from ..nn.mesh import Communicator
+from ..nn.mesh import Communicator, SymmetricMemory
+from .peer_memory import allocate_symmetric_memory
 
-if TYPE_CHECKING:
-    from ..runtime.distributed import DistributedEnvironment
-
-__all__ = ["BoundedTensorStorage", "TensorSchema"]
+__all__ = ["TensorBuffers", "TensorSchema"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +39,7 @@ class TensorSchema:
         return prod(self.shape) * self.dtype.itemsize
 
 
-class BoundedTensorStorage:
+class TensorBuffers:
     """Own fixed-capacity tensors and cache prefix views for legal shape keys."""
 
     def __init__(self, tensors: Mapping[str, torch.Tensor]) -> None:
@@ -56,29 +54,27 @@ class BoundedTensorStorage:
             raise ValueError("bounded tensor storage fields must be contiguous")
         self._views: dict[Hashable, Mapping[str, torch.Tensor]] = {}
         self._peers: dict[str, tuple[torch.Tensor, ...]] = {}
+        self._symmetric: list[SymmetricMemory] = []
 
     @classmethod
     def allocate(
         cls,
         schema: Mapping[str, TensorSchema],
         device: torch.device | str,
-        *,
-        environment: DistributedEnvironment | None = None,
-        layout: tuple[object, ...] = (),
-    ) -> BoundedTensorStorage:
+    ) -> TensorBuffers:
         """Allocate the declared tensor capacities on the publicly assigned device."""
 
         tensors: dict[str, torch.Tensor] = {}
         peers: dict[str, tuple[torch.Tensor, ...]] = {}
+        workspaces: list[SymmetricMemory] = []
         for name, field in schema.items():
             if field.memory == "symmetric":
-                if environment is None or field.group is None:
-                    raise ValueError("shared tensor storage requires its distributed owner")
+                if field.group is None:
+                    raise ValueError("shared tensor storage requires its process group")
                 if field.group.device != torch.device(device):
                     raise ValueError("shared tensor storage must use the group's assigned device")
-                symmetric = environment.symmetric_memory(
-                    field.group, field.shape, dtype=field.dtype, name=name, layout=layout
-                )
+                symmetric = allocate_symmetric_memory(field.group, field.shape, dtype=field.dtype)
+                workspaces.append(symmetric)
                 tensors[name] = symmetric.local
                 peers[name] = symmetric.peers
                 if field.fill is not None:
@@ -94,6 +90,7 @@ class BoundedTensorStorage:
                     tensors[name].fill_(field.fill)
         storage = cls(tensors)
         storage._peers = peers
+        storage._symmetric = workspaces
         return storage
 
     def peers(self, name: str) -> tuple[torch.Tensor, ...]:

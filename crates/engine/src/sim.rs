@@ -12,7 +12,7 @@ use std::time::Duration;
 use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
 
 use crate::executor::{
-    BatchResult, Executor, ExecutorInfo, ExecutorSubmitError, ScheduleBatch, WorkerId,
+    BatchResult, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError, WorkerId,
     logical_result,
 };
 use base64::Engine as _;
@@ -23,8 +23,8 @@ use uniserve_core::{
     try_apply_sampling_counts,
 };
 use uniserve_worker_ipc::{
-    Computation, DrawLayout, ErrorCode, FinishFlags, ModelOutput, NewRequest, OpStatus,
-    RegistrationAck, RunResult, SamplingState, ScheduledRequest, TensorRef, TimingCounters,
+    BatchOutput, Computation, DrawLayout, ErrorCode, FinishFlags, NewRequest, OpStatus,
+    RegistrationAck, RequestOutput, SamplingState, ScheduledRequest, TensorRef, TimingCounters,
     WorkerInfo,
 };
 
@@ -35,7 +35,7 @@ const DEFAULT_DENOISE_STEPS: u16 = 50;
 const DEFAULT_IMAGE_HW: (u32, u32) = (512, 512);
 
 enum Job {
-    Batch(ScheduleBatch),
+    Batch(ExecutionBatch),
     Shutdown,
 }
 
@@ -193,7 +193,7 @@ impl Executor for SimExecutor {
     }
 
     /// Lowers and submits a logical batch while preserving executor backpressure semantics.
-    fn submit(&mut self, batch: ScheduleBatch) -> Result<(), ExecutorSubmitError> {
+    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
         if self.handle.is_none() {
             return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
                 "Executor is closed"
@@ -477,15 +477,15 @@ impl SimEngine {
     }
 
     /// Executes one operation against its request, producing the terminal
-    /// [`ModelOutput`] and any resolved output-product values.
+    /// [`RequestOutput`] and any resolved output-product values.
     fn execute_operation(
         vocab: usize,
         text_len: usize,
         fake_eos: u32,
         operation: &ScheduledRequest,
         request: &mut SimRequestState,
-    ) -> anyhow::Result<ModelOutput> {
-        let mut record = ModelOutput {
+    ) -> anyhow::Result<RequestOutput> {
+        let mut record = RequestOutput {
             sampled_logprob: None,
             top_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
@@ -706,8 +706,8 @@ impl SimEngine {
     fn predicated_completion(
         operation: &ScheduledRequest,
         request: &SimRequestState,
-    ) -> ModelOutput {
-        ModelOutput {
+    ) -> RequestOutput {
+        RequestOutput {
             sampled_logprob: None,
             top_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
@@ -805,7 +805,7 @@ impl SimEngine {
 }
 
 /// Sets every logical KV frontier to the visible token position.
-fn set_kv_lengths(lengths: &mut ModelOutput, visible: u32) {
+fn set_kv_lengths(lengths: &mut RequestOutput, visible: u32) {
     lengths.kv_visible_len = visible;
     lengths.kv_computed_len = visible;
 }
@@ -847,7 +847,7 @@ impl SimEngine {
     }
 
     /// Executes selected computations in order against deterministic model state.
-    fn execute(&mut self, batch: ScheduleBatch) -> anyhow::Result<RunResult> {
+    fn execute(&mut self, batch: ExecutionBatch) -> anyhow::Result<BatchOutput> {
         batch.validate()?;
         let batch_id = batch.id;
         let run_id = batch.id;
@@ -945,7 +945,7 @@ impl SimEngine {
                 Self::execute_operation(vocab, text_len, fake_eos, &operation, request)?;
             completions.push(completion);
         }
-        let report = RunResult {
+        let report = BatchOutput {
             batch_id,
             run_id,
             completions,
@@ -1012,7 +1012,7 @@ mod tests {
         }
     }
 
-    fn batch(run_id: u64, request_index: u32) -> ScheduleBatch {
+    fn batch(run_id: u64, request_index: u32) -> ExecutionBatch {
         let request_key = request_key();
         let admission = admission();
         let parent = ComputationId::new(0, 0);
@@ -1049,7 +1049,7 @@ mod tests {
             predicate: None,
             rng: None,
         };
-        ScheduleBatch::new(
+        ExecutionBatch::new(
             run_id,
             vec![(
                 operation,

@@ -6,7 +6,7 @@ from typing import Any, NamedTuple
 
 import torch
 
-from ...execution.forward_batch import ForwardBatch
+from ...execution.forward_batch import AttentionMetadata
 from .base import AttentionBackend
 from .flashinfer_kernels import _decode_effective_seqlens, _write_decode_token
 from .layout import QKVLayout, normalize_kv, normalize_to
@@ -80,7 +80,7 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute dense attention through the TensorRT-LLM MHA context kernel."""
 
@@ -99,7 +99,7 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Write current K/V and execute TensorRT-LLM paged decode on SM10x."""
 
@@ -156,7 +156,7 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Execute TensorRT-LLM paged context attention for packed variable-length queries."""
 

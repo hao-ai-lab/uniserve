@@ -8,8 +8,8 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve_worker.execution.batch import ForwardMode
 from uniserve_worker.execution.forward_batch import (
+    AttentionMetadata,
     AttentionMode,
     ForwardBatch,
     TokenSelection,
@@ -21,6 +21,7 @@ from uniserve_worker.models.sensenova.model import NEOChatModel
 from uniserve_worker.nn.diffusion.schedule import ScheduleDirection
 from uniserve_worker.nn.layer import LayerConfig
 from uniserve_worker.nn.mesh import Communicator
+from uniserve_worker.protocol.batch import ForwardMode
 
 pytestmark = pytest.mark.unit
 
@@ -115,32 +116,32 @@ def _text_batch(
         dtype=torch.int32,
     )
     return ForwardBatch(
-        forward_mode=ForwardMode.DECODE
-        if attention_mode is AttentionMode.PAGED_DECODE
-        else ForwardMode.PREFILL,
-        row_count=rows,
-        attention_mode=attention_mode,
-        request_pool_indices=torch.arange(1, rows + 1),
-        prefix_lens=torch.zeros(rows, dtype=torch.int32),
-        query_lens=torch.tensor(query_lens, dtype=torch.int32),
-        out_cache_loc=torch.zeros(total, dtype=torch.int64),
-        block_table=torch.zeros((rows, 1), dtype=torch.int32),
-        seq_lens=torch.tensor(query_lens, dtype=torch.int32),
-        cu_seqlens_q=(cumulative if attention_mode is AttentionMode.PAGED_VARLEN else None),
-        cu_seqlens_k=(cumulative if attention_mode is AttentionMode.PAGED_VARLEN else None),
-        output_indices=(
-            torch.tensor(
+        attention=AttentionMetadata(
+            attention_mode=attention_mode,
+            prefix_lens=torch.zeros(rows, dtype=torch.int32),
+            query_lens=torch.tensor(query_lens, dtype=torch.int32),
+            out_cache_loc=torch.zeros(total, dtype=torch.int64),
+            block_table=torch.zeros((rows, 1), dtype=torch.int32),
+            seq_lens=torch.tensor(query_lens, dtype=torch.int32),
+            cu_seqlens_q=cumulative if attention_mode is AttentionMode.PAGED_VARLEN else None,
+            cu_seqlens_k=cumulative if attention_mode is AttentionMode.PAGED_VARLEN else None,
+            output_indices=torch.tensor(
                 [sum(query_lens[: index + 1]) - 1 for index in range(rows)],
                 dtype=torch.int64,
             )
             if attention_mode is AttentionMode.PAGED_VARLEN
-            else None
+            else None,
+            max_seqlen_q=max(query_lens),
+            max_seqlen_k=max(query_lens),
+            prefix_lens_cpu=(0,) * rows,
+            query_lens_cpu=query_lens,
+            seq_lens_cpu=query_lens,
         ),
-        max_seqlen_q=max(query_lens),
-        max_seqlen_k=max(query_lens),
-        prefix_lens_cpu=(0,) * rows,
-        query_lens_cpu=query_lens,
-        seq_lens_cpu=query_lens,
+        forward_mode=ForwardMode.DECODE
+        if attention_mode is AttentionMode.PAGED_DECODE
+        else ForwardMode.PREFILL,
+        row_count=rows,
+        request_pool_indices=torch.arange(1, rows + 1),
         token_row_indices=tuple(range(rows)),
         input_ids=torch.zeros(total, dtype=torch.long),
         positions=torch.arange(total, dtype=torch.long),

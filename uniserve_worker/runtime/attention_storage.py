@@ -6,21 +6,20 @@ from collections.abc import Iterable
 
 import torch
 
-from ..execution.bounded_storage import BoundedTensorStorage, TensorSchema
 from ..nn.attention import RadixAttention
-from ..nn.attention_storage import AttentionExchangeStorage
+from ..nn.attention_storage import ExchangeBuffers
 from ..nn.mesh import Communicator
-from .distributed import DistributedEnvironment
+from ..nn.parallel_attention import AttentionBuffers, AttentionContextGeometry
+from ..runtime.tensor_buffers import TensorBuffers, TensorSchema
+from .peer_memory import allocate_peer_workspace
 
 
 def allocate_attention_exchange_storage(
     modules: Iterable[RadixAttention],
-    environment: DistributedEnvironment,
     *,
     max_tokens: int,
     dtype: torch.dtype,
-    scope: tuple[object, ...],
-) -> dict[Communicator, AttentionExchangeStorage]:
+) -> dict[Communicator, ExchangeBuffers]:
     """Share each group's maximum payload capacity across serialized layers.
 
     Each scope must own an independent stream execution domain. The logical
@@ -42,7 +41,7 @@ def allocate_attention_exchange_storage(
     result = {}
     for group, (query, key) in widths.items():
         rows = (max_tokens + group.world_size - 1) // group.world_size * group.world_size
-        symmetric = environment.backend == "nccl"
+        symmetric = torch.distributed.get_backend(group._require()) == "nccl"
         schema = {
             f"{role}_{direction}": TensorSchema(
                 (rows * width * dtype.itemsize,),
@@ -55,8 +54,44 @@ def allocate_attention_exchange_storage(
                 ("send", "receive") if role == "output" else ("send", "receive", "staging")
             )
         }
-        allocation = BoundedTensorStorage.allocate(
-            schema, group.device, environment=environment, layout=scope
-        )
-        result[group] = AttentionExchangeStorage(allocation.capacity)
+        allocation = TensorBuffers.allocate(schema, group.device)
+        result[group] = ExchangeBuffers(allocation)
     return result
+
+
+def allocate_attention_context(geometry: AttentionContextGeometry) -> AttentionBuffers:
+    """Allocate context K/V and fences using their actual physical row capacity."""
+
+    group, rows = geometry.group, geometry.rows
+    shape = (rows, geometry.heads, geometry.head_dim)
+    if geometry.mapped:
+        keys = allocate_peer_workspace(
+            group,
+            shape,
+            dtype=geometry.dtype,
+            row_multiple=geometry.block_size,
+        )
+        values = allocate_peer_workspace(
+            group,
+            shape,
+            dtype=geometry.dtype,
+            row_multiple=geometry.block_size,
+        )
+        key, value = keys.global_tensor, values.global_tensor
+        local_key, local_value = keys.local, values.local
+    else:
+        key = torch.empty(
+            (rows * group.world_size, *shape[1:]), dtype=geometry.dtype, device=group.device
+        )
+        value = torch.empty_like(key)
+        begin = group.rank_in_group * rows
+        local_key, local_value = key[begin : begin + rows], value[begin : begin + rows]
+    return AttentionBuffers(
+        key,
+        value,
+        local_key,
+        local_value,
+        torch.empty(key.shape[0] // geometry.block_size, dtype=torch.int32, device=group.device),
+        torch.zeros(1, dtype=torch.int32, device=group.device),
+        torch.empty(group.world_size, dtype=torch.int32, device=group.device),
+    )

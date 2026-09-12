@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 import torch
 import torch.nn.functional as F
 
-from ...execution.forward_batch import ForwardBatch
+from ...execution.forward_batch import AttentionMetadata
 from .base import AttentionBackend, merge_attention_states
 
 __all__ = [
@@ -32,7 +32,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute dense attention with PyTorch SDPA after canonicalizing layout and mask shape."""
 
@@ -55,7 +55,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Gather each visible paged KV row, append current K/V, and apply PyTorch SDPA."""
 
@@ -119,7 +119,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         visible_current_end: torch.Tensor,
         scale: float,
         fully_visible_current: bool,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Concatenate current and cached segments per row before applying PyTorch SDPA."""
 
@@ -196,7 +196,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Slice packed variable-length rows and apply PyTorch SDPA independently."""
 
@@ -263,7 +263,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         scale: float | None = None,
         use_prefix_bounds: bool = False,
         fully_visible: bool = False,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Apply PyTorch SDPA to each query row’s bounded visible KV prefix."""
 

@@ -8,8 +8,8 @@ from threading import RLock
 
 import torch
 
-from ..execution.batch import BufferAllocation, BufferId, TensorRef
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor
+from ..protocol.batch import BufferAllocation, BufferId, TensorRef
 from .device import canonical_device
 
 
@@ -24,18 +24,18 @@ def _invariant(message: str) -> WorkerError:
 
 
 @dataclass(frozen=True, slots=True)
-class PersistentBufferBinding:
+class BufferBinding:
     """Binds a logical buffer allocation to its validated tensor view."""
 
     buffer: BufferId
-    offset: int
-    bytes: int
+    physical_offset: int
+    physical_bytes: int
     binding_id: int
     device_name: str
     tensor: torch.Tensor
 
 
-class PersistentBuffers:
+class BufferPool:
     """One fixed byte-addressed arena per worker-owned device."""
 
     def __init__(
@@ -63,7 +63,7 @@ class PersistentBuffers:
             str(device): torch.empty((self.byte_capacity,), dtype=torch.uint8, device=device)
             for device in self.devices
         }
-        self._active: dict[tuple[str, BufferId], PersistentBufferBinding] = {}
+        self._active: dict[tuple[str, BufferId], BufferBinding] = {}
         self._next_binding_id = 1
         self._lock = RLock()
 
@@ -72,21 +72,19 @@ class PersistentBuffers:
 
         cursor = 0
         active_bindings = sorted(
-            (
-                binding
-                for binding in self._active.values()
-                if binding.device_name == device_name
-            ),
-            key=lambda binding: binding.offset,
+            (binding for binding in self._active.values() if binding.device_name == device_name),
+            key=lambda binding: binding.physical_offset,
         )
         for active in active_bindings:
             start = ((cursor + 255) // 256) * 256
-            if start + extent <= active.offset:
+            if start + extent <= active.physical_offset:
                 return start
-            cursor = max(cursor, active.offset + active.bytes)
+            cursor = max(cursor, active.physical_offset + active.physical_bytes)
         start = ((cursor + 255) // 256) * 256
         if start + extent > self.byte_capacity:
-            spans = tuple((binding.offset, binding.bytes) for binding in active_bindings)
+            spans = tuple(
+                (binding.physical_offset, binding.physical_bytes) for binding in active_bindings
+            )
             raise invalid_descriptor(
                 "physical buffer allocation exceeds the worker buffer pool: "
                 f"{extent} bytes requested from {self.byte_capacity} bytes with "
@@ -102,7 +100,7 @@ class PersistentBuffers:
         device: torch.device | str,
         dtype: torch.dtype,
         shape: tuple[int, ...],
-    ) -> PersistentBufferBinding:
+    ) -> BufferBinding:
         """Validate a buffer allocation and return its device tensor view with generation ownership."""
 
         target = canonical_device(device)
@@ -122,11 +120,7 @@ class PersistentBuffers:
         with self._lock:
             if key in self._active:
                 raise invalid_descriptor("buffer allocation is already bound")
-            extent = (
-                ((required + 255) // 256) * 256
-                if self.compact
-                else int(allocation.bytes)
-            )
+            extent = ((required + 255) // 256) * 256 if self.compact else int(allocation.bytes)
             start = (
                 self._compact_offset_locked(device_name, extent)
                 if self.compact
@@ -138,13 +132,16 @@ class PersistentBuffers:
             for active in self._active.values():
                 if active.device_name != device_name:
                     continue
-                if start < active.offset + active.bytes and active.offset < end:
+                if (
+                    start < active.physical_offset + active.physical_bytes
+                    and active.physical_offset < end
+                ):
                     raise invalid_descriptor("buffer allocation overlaps a live worker buffer")
             tensor = arena.narrow(0, start, required).view(dtype).reshape(shape)
-            binding = PersistentBufferBinding(
+            binding = BufferBinding(
                 buffer=allocation.buffer,
-                offset=start,
-                bytes=extent,
+                physical_offset=start,
+                physical_bytes=extent,
                 binding_id=self._next_binding_id,
                 device_name=device_name,
                 tensor=tensor,
@@ -153,7 +150,7 @@ class PersistentBuffers:
             self._active[key] = binding
             return binding
 
-    def release(self, binding: PersistentBufferBinding) -> None:
+    def release(self, binding: BufferBinding) -> None:
         """Release one generation-tagged persistent buffer binding."""
 
         key = (binding.device_name, binding.buffer)

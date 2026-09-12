@@ -83,9 +83,9 @@ def execution_worker(
 
     flow = worker.model.generation
     configure_physical_pool(
-        cache_pages=worker.cache_pool.num_pages,
+        cache_pages=worker.kv_cache.num_pages,
         request_pool_size=worker.info.request_slots,
-        block_size=worker.cache_pool.block_size,
+        block_size=worker.kv_cache.block_size,
         commit_marker_tokens=(
             int(flow.commit_marker_tokens)
             if flow is not None and flow.latent_layout is LatentLayout.PATCH_TOKENS

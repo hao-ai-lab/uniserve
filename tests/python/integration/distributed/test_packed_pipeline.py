@@ -10,8 +10,12 @@ import torch.multiprocessing as mp
 from uniserve_worker.backends.attention.fa4_cute import Fa4CuteAttentionBackend
 from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
-from uniserve_worker.execution.batch import ForwardMode
+from uniserve_worker.bootstrap.distributed import (
+    initialize_model_parallel,
+    initialize_process_groups,
+)
 from uniserve_worker.execution.forward_batch import (
+    AttentionMetadata,
     AttentionMode,
     AttentionSelection,
     ExpertRoute,
@@ -32,19 +36,16 @@ from uniserve_worker.nn.attention_storage import attention_exchange_scope
 from uniserve_worker.nn.layer import LayerConfig
 from uniserve_worker.nn.mesh import Communicator
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
+from uniserve_worker.protocol.batch import ForwardMode
 from uniserve_worker.runtime.attention_storage import allocate_attention_exchange_storage
-from uniserve_worker.runtime.cache_pool import CachePool
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from uniserve_worker.runtime.kv_cache import KVCache
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 def _pool(model, device):
     geometry = model.cache_geometry
-    pool = CachePool(
+    pool = KVCache(
         num_layers=geometry.num_layers,
         total_layers=geometry.total_layers,
         layer_offset=geometry.layer_offset,
@@ -71,23 +72,25 @@ def _pool(model, device):
 
 def _prefill(device):
     return ForwardBatch(
+        attention=AttentionMetadata(
+            attention_mode=AttentionMode.PAGED_VARLEN,
+            prefix_lens=torch.zeros(2, dtype=torch.int32, device=device),
+            query_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
+            out_cache_loc=torch.tensor([64, 65, 66, 128, 129], device=device),
+            block_table=torch.tensor([[1], [2]], dtype=torch.int32, device=device),
+            seq_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
+            cu_seqlens_q=torch.tensor([0, 3, 5], dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.tensor([0, 3, 5], dtype=torch.int32, device=device),
+            max_seqlen_q=3,
+            max_seqlen_k=3,
+            prefix_lens_cpu=(0, 0),
+            query_lens_cpu=(3, 2),
+            causal_rows_cpu=(True, True),
+            seq_lens_cpu=(3, 2),
+        ),
         forward_mode=ForwardMode.PREFILL,
         row_count=2,
-        attention_mode=AttentionMode.PAGED_VARLEN,
         request_pool_indices=torch.tensor([1, 2], device=device),
-        prefix_lens=torch.zeros(2, dtype=torch.int32, device=device),
-        query_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
-        out_cache_loc=torch.tensor([64, 65, 66, 128, 129], device=device),
-        block_table=torch.tensor([[1], [2]], dtype=torch.int32, device=device),
-        seq_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
-        cu_seqlens_q=torch.tensor([0, 3, 5], dtype=torch.int32, device=device),
-        cu_seqlens_k=torch.tensor([0, 3, 5], dtype=torch.int32, device=device),
-        max_seqlen_q=3,
-        max_seqlen_k=3,
-        prefix_lens_cpu=(0, 0),
-        query_lens_cpu=(3, 2),
-        causal_rows_cpu=(True, True),
-        seq_lens_cpu=(3, 2),
         token_row_indices=(0, 1),
         input_ids=torch.tensor([1, 3, 5, 7, 9], device=device),
         positions=torch.tensor([0, 1, 2, 0, 1], device=device),
@@ -260,7 +263,7 @@ def _run_pipeline(
     long_rows: bool = False,
 ) -> None:
     device = torch.device("cuda", rank)
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=pipeline_size * tensor_size * sequence_size,
@@ -434,10 +437,8 @@ def _run_pipeline(
                                 for module in model.modules()
                                 if isinstance(module, RadixAttention)
                             ),
-                            environment,
                             max_tokens=131075,
                             dtype=torch.bfloat16,
-                            scope=("packed_rows", architecture),
                         )
                         with attention_exchange_scope(storage):
                             _compare_long_packed_rows(model, reference, architecture, device)

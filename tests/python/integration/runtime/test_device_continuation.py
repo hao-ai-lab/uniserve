@@ -8,20 +8,20 @@ import torch
 from tests.python.fixtures.depth_one import (
     ar_params,
     execution_run,
+    finalized_report,
     record_completion,
     root_parent,
     token_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.execution.batch import (
+from uniserve_worker.models.stub import _next_token
+from uniserve_worker.protocol.batch import (
     ComputationId,
     DrawLayout,
     ForwardMode,
     Rng,
     SamplingParams,
 )
-from uniserve_worker.execution.output import finalize_run_result
-from uniserve_worker.models.stub import _next_token
 
 pytestmark = [
     pytest.mark.integration,
@@ -40,7 +40,7 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    worker.execute(
+    worker.submit(
         execution_run(
             run_id=0,
             admissions=(warm_admission,),
@@ -59,7 +59,7 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
         tokens=(3, 4),
     )
 
-    parent_report = worker.execute(
+    parent_report = worker.submit(
         execution_run(
             run_id=1,
             admissions=(admission,),
@@ -77,7 +77,7 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
     )
     successor = replace(successor_template, input_token_ids=())
 
-    successor_report = worker.execute(
+    successor_report = worker.submit(
         execution_run(
             run_id=2,
             admissions=(),
@@ -86,8 +86,8 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
     )
 
     torch.cuda.synchronize()
-    parent_report = finalize_run_result(parent_report)
-    successor_report = finalize_run_result(successor_report)
+    parent_report = finalized_report(worker, parent_report)
+    successor_report = finalized_report(worker, successor_report)
 
     first = _next_token(4)
     assert parent_report.completions[0].committed_tokens == (first,)
@@ -105,7 +105,7 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
         tokens=(3, 4),
     )
     reports = [
-        worker.execute(
+        worker.submit(
             execution_run(
                 run_id=1,
                 admissions=(admission,),
@@ -126,7 +126,7 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
             predicate=predecessor.token_output,
         )
         reports.append(
-            worker.execute(
+            worker.submit(
                 execution_run(
                     run_id=run_id,
                     admissions=(),
@@ -138,7 +138,7 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
 
     torch.cuda.synchronize()
     tokens = tuple(
-        finalize_run_result(report).completions[0].committed_tokens[0] for report in reports
+        finalized_report(worker, report).completions[0].committed_tokens[0] for report in reports
     )
     expected = []
     current = 4
@@ -159,7 +159,7 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
         tokens=(3, 4),
     )
     reports = [
-        worker.execute(
+        worker.submit(
             execution_run(
                 run_id=1,
                 admissions=(admission,),
@@ -179,7 +179,7 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
             predicate=predecessor.token_output,
         )
         reports.append(
-            worker.execute(
+            worker.submit(
                 execution_run(
                     run_id=run_id,
                     operations=(operation,),
@@ -190,7 +190,7 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
 
     torch.cuda.synchronize()
     tokens = tuple(
-        finalize_run_result(report).completions[0].committed_tokens[0] for report in reports
+        finalized_report(worker, report).completions[0].committed_tokens[0] for report in reports
     )
     expected = []
     current = 4
@@ -212,7 +212,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         tokens=(3, 4),
         rng=Rng(seed=917, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
-    parent_report = worker.execute(
+    parent_report = worker.submit(
         execution_run(
             run_id=1,
             admissions=(pipelined,),
@@ -228,7 +228,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         predicate=predecessor.token_output,
         rng=Rng(seed=917, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
-    successor_report = worker.execute(
+    successor_report = worker.submit(
         execution_run(
             run_id=2,
             admissions=(),
@@ -237,8 +237,10 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
     )
 
     torch.cuda.synchronize()
-    parent_tokens = finalize_run_result(parent_report).completions[0].committed_tokens
-    successor_tokens = finalize_run_result(successor_report).completions[0].committed_tokens
+    parent_report = finalized_report(worker, parent_report)
+    parent_tokens = parent_report.completions[0].committed_tokens
+    successor_report = finalized_report(worker, successor_report)
+    successor_tokens = successor_report.completions[0].committed_tokens
 
     serial_worker = execution_worker(device="cuda:0", pipeline_depth=1)
     serial = ar_params(41, block_ids=(2,), sampling=sampling)
@@ -250,7 +252,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         tokens=(3, 4),
         rng=Rng(seed=917, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
-    serial_parent_report = serial_worker.execute(
+    serial_parent_report = serial_worker.submit(
         execution_run(
             run_id=11,
             admissions=(serial,),
@@ -258,7 +260,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         )
     )
     torch.cuda.synchronize()
-    serial_parent_report = finalize_run_result(serial_parent_report)
+    serial_parent_report = finalized_report(serial_worker, serial_parent_report)
     serial_first = serial_parent_report.completions[0].committed_tokens[0]
     observation = record_completion(serial_parent, serial_parent_report)
     serial_successor = token_operation(
@@ -269,7 +271,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         tokens=(serial_first,),
         rng=Rng(seed=917, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
-    serial_successor_report = serial_worker.execute(
+    serial_successor_report = serial_worker.submit(
         execution_run(
             run_id=12,
             admissions=(),
@@ -278,7 +280,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         )
     )
     torch.cuda.synchronize()
-    serial_successor_report = finalize_run_result(serial_successor_report)
+    serial_successor_report = finalized_report(serial_worker, serial_successor_report)
 
     assert parent_tokens == serial_parent_report.completions[0].committed_tokens
     assert successor_tokens == serial_successor_report.completions[0].committed_tokens
@@ -304,7 +306,7 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         tokens=(3, 4),
         rng=Rng(seed=613, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
-    parent_report = worker.execute(
+    parent_report = worker.submit(
         execution_run(
             run_id=1,
             admissions=(pipelined,),
@@ -320,7 +322,7 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         predicate=predecessor.token_output,
         rng=Rng(seed=613, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
-    successor_report = worker.execute(
+    successor_report = worker.submit(
         execution_run(
             run_id=2,
             admissions=(),
@@ -329,8 +331,10 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
     )
 
     torch.cuda.synchronize()
-    parent_tokens = finalize_run_result(parent_report).completions[0].committed_tokens
-    successor_tokens = finalize_run_result(successor_report).completions[0].committed_tokens
+    parent_report = finalized_report(worker, parent_report)
+    parent_tokens = parent_report.completions[0].committed_tokens
+    successor_report = finalized_report(worker, successor_report)
+    successor_tokens = successor_report.completions[0].committed_tokens
 
     serial_worker = execution_worker(device="cuda:0", pipeline_depth=1)
     serial = ar_params(57, block_ids=(3,), sampling=sampling)
@@ -342,7 +346,7 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         tokens=(3, 4),
         rng=Rng(seed=613, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
-    serial_parent_report = serial_worker.execute(
+    serial_parent_report = serial_worker.submit(
         execution_run(
             run_id=11,
             admissions=(serial,),
@@ -350,7 +354,7 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         )
     )
     torch.cuda.synchronize()
-    serial_parent_report = finalize_run_result(serial_parent_report)
+    serial_parent_report = finalized_report(serial_worker, serial_parent_report)
     serial_first = serial_parent_report.completions[0].committed_tokens[0]
     observation = record_completion(serial_parent, serial_parent_report)
     serial_successor = token_operation(
@@ -361,7 +365,7 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         tokens=(serial_first,),
         rng=Rng(seed=613, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
-    serial_successor_report = serial_worker.execute(
+    serial_successor_report = serial_worker.submit(
         execution_run(
             run_id=12,
             admissions=(),
@@ -370,7 +374,7 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         )
     )
     torch.cuda.synchronize()
-    serial_successor_report = finalize_run_result(serial_successor_report)
+    serial_successor_report = finalized_report(serial_worker, serial_successor_report)
 
     assert parent_tokens == serial_parent_report.completions[0].committed_tokens
     assert successor_tokens == serial_successor_report.completions[0].committed_tokens

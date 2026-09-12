@@ -1,4 +1,4 @@
-"""Depth-one ``ScheduledRequest``/``Run`` builders for worker forward-behavior tests.
+"""Depth-one ``ScheduledRequest``/``ScheduleBatch`` builders for worker forward-behavior tests.
 
 Each builder produces the records the scheduler supplies at depth one: an
 :class:`NewRequest`, an :class:`ScheduledRequest` whose ``predecessor`` names accepted execution progress,
@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import time
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
-from uniserve_worker.execution.batch import (
-    COMPUTATIONS,
+from uniserve_worker.execution.batch_state import BatchState
+
+if TYPE_CHECKING:
+    from uniserve_worker.worker import Worker
+
+from uniserve_worker.protocol.batch import (
     ArRequestParams,
-    AttentionRegime,
     BatchCommand,
+    BatchOutput,
     BlockTable,
     Bounds,
     BufferAllocation,
@@ -28,16 +33,14 @@ from uniserve_worker.execution.batch import (
     ImageParams,
     KvTransfer,
     LatentParams,
-    ModelOutput,
     NewRequest,
     OpStatus,
     PipelineStage,
     RequestKey,
+    RequestOutput,
     Rng,
-    Run,
-    RunLane,
-    RunResult,
     SamplingParams,
+    ScheduleBatch,
     ScheduledRequest,
     ShapeBound,
     Start,
@@ -45,10 +48,6 @@ from uniserve_worker.execution.batch import (
     TensorRef,
     TransferMode,
     UmmRequestParams,
-)
-from uniserve_worker.execution.output import (
-    finalize_run_result,
-    run_result_ready,
 )
 
 AUTHORITY = 0
@@ -217,8 +216,8 @@ def execution_run(
     commands: Sequence[BatchCommand] = (),
     block_tables: Sequence[BlockTable] = (),
     new_cache_pages: Sequence[CachePageAllocation] = (),
-) -> Run:
-    """Build the explicit physical lanes used by ModelRunner behavior tests."""
+) -> ScheduleBatch:
+    """Build scheduler columns and physical allocations for observable worker behavior."""
 
     for admission in admissions:
         if admission.umm is not None:
@@ -241,8 +240,6 @@ def execution_run(
                 offset,
                 required,
             )
-    by_route: dict[int, list[ScheduledRequest]] = {0: list(operations)} if operations else {}
-    lanes: list[RunLane] = []
     explicit_tables = {
         (int(table.request_pool_idx), int(table.group_id)): table for table in block_tables
     }
@@ -261,138 +258,111 @@ def execution_run(
         pages = tuple(_BLOCK_TABLES.get(operation.request_key, ()))
         return BlockTable(slot, 0, pages, len(pages) * _BLOCK_SIZE)
 
-    lane_id = 1
-    for group_id, (route, routed) in enumerate(sorted(by_route.items()), start=1):
-        kinds = tuple(kind for kind in COMPUTATIONS if any(op.kind is kind for op in routed))
-        variants = {operation.kind for operation in routed}
-        attention = (
-            AttentionRegime.HYBRID
-            if PipelineStage.DENOISING in variants
-            else AttentionRegime.CAUSAL
-            if any(isinstance(variant, ForwardMode) for variant in variants)
-            else AttentionRegime.NONE
-        )
-        for kind in kinds:
-            member_operations = tuple(operation for operation in routed if operation.kind is kind)
-            tables: dict[tuple[int, int], BlockTable] = {}
-            allocations: dict[tuple[int, int], set[int]] = {}
-            forward_operation_indices: list[int] = []
-            request_pool_indices: list[int] = []
-            seq_lens: list[int] = []
-            query_lens: list[int] = []
-            write_kv: list[bool] = []
-            for operation_index, operation in enumerate(member_operations):
-                table = table_for(operation)
-                if table is not None:
-                    identity = (table.request_pool_idx, table.group_id)
-                    tables[identity] = table
-                    pages = _PAGES_TO_ZERO.get((operation.request_key, operation.op_id), ())
-                    if pages:
-                        allocations.setdefault(identity, set()).update(pages)
-                lengths = _OP_KV_LENGTHS.get((operation.request_key, operation.op_id))
-                if lengths is not None and lengths[1] > 0:
-                    forward_operation_indices.append(operation_index)
-                    request_pool_indices.append(_REQUEST_POOL_INDICES[operation.request_key])
-                    seq_lens.append(lengths[2] + lengths[1])
-                    query_lens.append(lengths[1])
-                    write_kv.append(True)
-                if operation.kind is PipelineStage.DENOISING:
-                    image = _IMAGE_PARAMS[operation.request_key]
-                    main_slot = _REQUEST_POOL_INDICES[operation.request_key]
-                    main_len = 0 if lengths is None else lengths[2]
-                    text_off = abs(float(image.cfg_text_scale) - 1.0) <= 1e-6
-                    image_off = abs(float(image.cfg_img_scale) - 1.0) <= 1e-6
-                    branches = 1 if text_off and image_off else 2 if text_off or image_off else 3
-                    branches = min(branches, _MAX_CFG_BRANCHES)
-                    query_len = (
-                        max(1, int(image.height) // _LATENT_DOWNSAMPLE)
-                        * max(1, int(image.width) // _LATENT_DOWNSAMPLE)
-                        + _COMMIT_MARKER_TOKENS
-                    )
-                    alternative: tuple[int, int] | None = None
-                    if branches > 1:
-                        alt_slot = _alternative_slot(operation.request_key)
-                        negative = next(
-                            (
-                                admission.ar.negative_token_ids
-                                for admission in admissions
-                                if admission.request_key == operation.request_key
-                                and admission.ar is not None
-                            ),
-                            (),
-                        )
-                        alt_pages = _alternative_pages(operation.request_key, len(negative))
-                        alt_table = BlockTable(
-                            alt_slot,
-                            0,
-                            alt_pages,
-                            len(alt_pages) * _BLOCK_SIZE,
-                        )
-                        tables[(alt_slot, 0)] = alt_table
-                        if alt_pages:
-                            allocations.setdefault((alt_slot, 0), set()).update(alt_pages)
-                        if negative:
-                            forward_operation_indices.append(operation_index)
-                            request_pool_indices.append(alt_slot)
-                            seq_lens.append(len(negative))
-                            query_lens.append(len(negative))
-                            write_kv.append(True)
-                        alternative = (alt_slot, len(negative))
-                    for branch in range(branches):
-                        slot, seq_len = (
-                            (main_slot, main_len)
-                            if branch == 0 or alternative is None
-                            else alternative
-                        )
-                        forward_operation_indices.append(operation_index)
-                        request_pool_indices.append(slot)
-                        seq_lens.append(seq_len + query_len)
-                        query_lens.append(query_len)
-                        write_kv.append(False)
-            for allocation in new_cache_pages:
-                identity = (allocation.request_pool_idx, allocation.group_id)
-                allocations.setdefault(identity, set()).update(allocation.page_ids)
-            lanes.append(
-                RunLane(
-                    lane_id=lane_id,
-                    launch_id=group_id,
-                    collective_seq=int(run_id) * 1024 + group_id + 1,
-                    route=route,
-                    attention=attention,
-                    shape_class=0,
-                    operations=member_operations,
-                    block_tables=tuple(tables.values()),
-                    new_cache_pages=tuple(
-                        CachePageAllocation(slot, group, tuple(sorted(pages)))
-                        for (slot, group), pages in allocations.items()
-                        if pages
-                    ),
-                    forward_operation_indices=tuple(forward_operation_indices),
-                    request_pool_indices=tuple(request_pool_indices),
-                    seq_lens=tuple(seq_lens),
-                    query_lens=tuple(query_lens),
-                    write_kv=tuple(write_kv),
-                    latent_params=tuple(
-                        _latent_params(operation)
-                        for operation in member_operations
-                        if operation.kind
-                        in {PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING}
-                        or operation.latent_input is not None
-                    ),
-                    buffer_allocations=tuple(
-                        {
-                            product.buffer_id: _BUFFER_ALLOCATIONS[product.buffer_id]
-                            for operation in member_operations
-                            for product in (*operation.buffer_inputs(), *operation.buffer_outputs())
-                        }.values()
-                    ),
-                )
+    tables: dict[tuple[int, int], BlockTable] = {}
+    allocations: dict[tuple[int, int], set[int]] = {}
+    forward_operation_indices: list[int] = []
+    request_pool_indices: list[int] = []
+    seq_lens: list[int] = []
+    query_lens: list[int] = []
+    write_kv: list[bool] = []
+    for operation_index, operation in enumerate(operations):
+        table = table_for(operation)
+        if table is not None:
+            identity = (table.request_pool_idx, table.group_id)
+            tables[identity] = table
+            pages = _PAGES_TO_ZERO.get((operation.request_key, operation.op_id), ())
+            if pages:
+                allocations.setdefault(identity, set()).update(pages)
+        lengths = _OP_KV_LENGTHS.get((operation.request_key, operation.op_id))
+        if lengths is not None and lengths[1] > 0:
+            forward_operation_indices.append(operation_index)
+            request_pool_indices.append(_REQUEST_POOL_INDICES[operation.request_key])
+            seq_lens.append(lengths[2] + lengths[1])
+            query_lens.append(lengths[1])
+            write_kv.append(True)
+        if operation.kind is PipelineStage.DENOISING:
+            image = _IMAGE_PARAMS[operation.request_key]
+            main_slot = _REQUEST_POOL_INDICES[operation.request_key]
+            main_len = 0 if lengths is None else lengths[2]
+            text_off = abs(float(image.cfg_text_scale) - 1.0) <= 1e-6
+            image_off = abs(float(image.cfg_img_scale) - 1.0) <= 1e-6
+            branches = 1 if text_off and image_off else 2 if text_off or image_off else 3
+            branches = min(branches, _MAX_CFG_BRANCHES)
+            query_len = (
+                max(1, int(image.height) // _LATENT_DOWNSAMPLE)
+                * max(1, int(image.width) // _LATENT_DOWNSAMPLE)
+                + _COMMIT_MARKER_TOKENS
             )
-            lane_id += 1
-    return Run(
+            alternative: tuple[int, int] | None = None
+            if branches > 1:
+                alt_slot = _alternative_slot(operation.request_key)
+                negative = next(
+                    (
+                        admission.ar.negative_token_ids
+                        for admission in admissions
+                        if admission.request_key == operation.request_key
+                        and admission.ar is not None
+                    ),
+                    (),
+                )
+                alt_pages = _alternative_pages(operation.request_key, len(negative))
+                alt_table = BlockTable(
+                    alt_slot,
+                    0,
+                    alt_pages,
+                    len(alt_pages) * _BLOCK_SIZE,
+                )
+                tables[(alt_slot, 0)] = alt_table
+                if alt_pages:
+                    allocations.setdefault((alt_slot, 0), set()).update(alt_pages)
+                if negative:
+                    forward_operation_indices.append(operation_index)
+                    request_pool_indices.append(alt_slot)
+                    seq_lens.append(len(negative))
+                    query_lens.append(len(negative))
+                    write_kv.append(True)
+                alternative = (alt_slot, len(negative))
+            for branch in range(branches):
+                slot, seq_len = (
+                    (main_slot, main_len) if branch == 0 or alternative is None else alternative
+                )
+                forward_operation_indices.append(operation_index)
+                request_pool_indices.append(slot)
+                seq_lens.append(seq_len + query_len)
+                query_lens.append(query_len)
+                write_kv.append(False)
+    for allocation in new_cache_pages:
+        identity = (allocation.request_pool_idx, allocation.group_id)
+        allocations.setdefault(identity, set()).update(allocation.page_ids)
+    return ScheduleBatch(
         batch_id=operations[0].op_id.batch_id if operations else int(run_id),
         run_id=int(run_id),
-        lanes=tuple(lanes),
+        collective_seq=int(run_id) * 1024 + 2,
+        operations=tuple(operations),
+        block_tables=tuple(tables.values()),
+        new_cache_pages=tuple(
+            CachePageAllocation(slot, group, tuple(sorted(pages)))
+            for (slot, group), pages in allocations.items()
+            if pages
+        ),
+        forward_operation_indices=tuple(forward_operation_indices),
+        request_pool_indices=tuple(request_pool_indices),
+        seq_lens=tuple(seq_lens),
+        query_lens=tuple(query_lens),
+        write_kv=tuple(write_kv),
+        latent_params=tuple(
+            _latent_params(operation)
+            for operation in operations
+            if operation.kind in {PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING}
+            or operation.latent_input is not None
+        ),
+        buffer_allocations=tuple(
+            {
+                product.buffer_id: _BUFFER_ALLOCATIONS[product.buffer_id]
+                for operation in operations
+                for product in (*operation.buffer_inputs(), *operation.buffer_outputs())
+            }.values()
+        ),
         input_products=tuple(input_products),
         kv_inputs=tuple(kv_inputs),
         commands=tuple(Start(request) for request in admissions) + tuple(commands),
@@ -417,7 +387,7 @@ def ar_params(
     _UNBOUND_PAGES[rk] = list(_BLOCK_TABLES[rk])
     _REQUEST_POOL_INDICES[rk] = request_id + 1
     _OP_KV_RESULTS[(rk, ComputationId(0, 0))] = int(prefix_len)
-    return NewRequest.create(
+    return NewRequest(
         rk,
         request_pool_idx=request_id + 1,
         ar=ArRequestParams(
@@ -436,7 +406,7 @@ def umm_params(request_id: int, image: ImageParams, *, request_epoch: int = 1) -
     _reset_request(rk)
     _IMAGE_PARAMS[rk] = image
     _REQUEST_POOL_INDICES[rk] = request_id + 1
-    return NewRequest.create(
+    return NewRequest(
         rk,
         request_pool_idx=request_id + 1,
         umm=UmmRequestParams(image=image),
@@ -449,19 +419,27 @@ def root_parent(admission: NewRequest) -> ComputationId:
     return ComputationId(0, 0)
 
 
-def finalized_report(report: RunResult) -> RunResult:
+def finalized_report(worker: Worker, state: BatchState) -> BatchOutput:
+    """Drive the public Worker interface until every response fragment is delivered."""
+
     deadline = time.monotonic() + 10.0
-    while not run_result_ready(report):
+    fragments: list[BatchOutput] = []
+    while True:
+        worker.advance()
+        output = worker.poll(state)
+        if output is not None:
+            fragments.append(output)
+            if output.done:
+                return BatchOutput.combine(fragments)
         if time.monotonic() >= deadline:
             raise TimeoutError("worker completion did not become query-ready")
         time.sleep(0.00005)
-    return finalize_run_result(report)
 
 
-def record_completion(operation: ScheduledRequest, report: RunResult) -> ModelOutput:
+def record_completion(operation: ScheduledRequest, report: BatchOutput) -> RequestOutput:
     """Observe accepted output and carry its visible KV extent into the next test input."""
 
-    resolved = finalized_report(report)
+    resolved = report
     matches = tuple(
         record
         for record in resolved.completions

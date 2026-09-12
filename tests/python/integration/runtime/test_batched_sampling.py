@@ -8,7 +8,6 @@ oracle the stub model defines through its deterministic next-token map.
 
 from __future__ import annotations
 
-import time
 from dataclasses import replace
 from typing import cast
 
@@ -18,13 +17,16 @@ import torch
 from tests.python.fixtures.depth_one import (
     ar_params,
     execution_run,
+    finalized_report,
     record_completion,
     root_parent,
     token_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.execution.batch import (
+from uniserve_worker.models.stub import STUB_IMG_START_TOKEN_ID, _next_token
+from uniserve_worker.protocol.batch import (
     ArRequestParams,
+    BatchOutput,
     ComputationId,
     DrawLayout,
     ErrorCode,
@@ -32,26 +34,12 @@ from uniserve_worker.execution.batch import (
     NewRequest,
     OpStatus,
     Rng,
-    RunResult,
     SamplingParams,
     SamplingState,
     ScheduledRequest,
 )
-from uniserve_worker.execution.output import (
-    finalize_run_result,
-    run_result_ready,
-)
-from uniserve_worker.models.stub import STUB_IMG_START_TOKEN_ID, _next_token
 
 pytestmark = pytest.mark.integration
-
-
-def _resolved_report(report: RunResult) -> RunResult:
-    deadline = time.monotonic() + 5.0
-    while not run_result_ready(report) and time.monotonic() < deadline:
-        time.sleep(0.0001)
-    assert run_result_ready(report)
-    return finalize_run_result(report)
 
 
 def test_logprob_reporting_does_not_change_sample_selection() -> None:
@@ -81,14 +69,15 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
         rng=Rng(seed=71, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
 
-    result = _resolved_report(
-        worker.execute(
+    result = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=1,
                 admissions=(first, second),
                 operations=(first_op, second_op),
             )
-        )
+        ),
     )
 
     assert result.completions[0].committed_tokens == result.completions[1].committed_tokens
@@ -97,7 +86,7 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
 def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
     worker = execution_worker()
     admissions = (ar_params(21, block_ids=(0,)), ar_params(22, block_ids=(1,)))
-    primed: list[tuple[ScheduledRequest, RunResult]] = []
+    primed: list[tuple[ScheduledRequest, BatchOutput]] = []
     for index, admission in enumerate(admissions):
         extend = token_operation(
             admission.request_key,
@@ -106,12 +95,15 @@ def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
             mode=ForwardMode.PREFILL,
             tokens=(3, 4),
         )
-        report = worker.execute(
-            execution_run(
-                run_id=1 + index,
-                admissions=(admission,),
-                operations=(extend,),
-            )
+        report = finalized_report(
+            worker,
+            worker.submit(
+                execution_run(
+                    run_id=1 + index,
+                    admissions=(admission,),
+                    operations=(extend,),
+                )
+            ),
         )
         primed.append((extend, report))
 
@@ -129,15 +121,16 @@ def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
         decode_ops.append(operation)
 
         commits.append(observation)
-    result = _resolved_report(
-        worker.execute(
+    result = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=9,
                 admissions=(),
                 operations=tuple(decode_ops),
                 commands=tuple(commits),
             )
-        )
+        ),
     )
 
     expected = _next_token(_next_token(4))
@@ -151,7 +144,7 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> Non
     second_base = ar_params(25, block_ids=(4,))
     expected = _next_token(4)
     assert second_base.ar is not None
-    second = NewRequest.create(
+    second = NewRequest(
         second_base.request_key,
         request_pool_idx=second_base.request_pool_idx,
         ar=replace(second_base.ar, finish_token_ids=(expected,)),
@@ -171,14 +164,15 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> Non
         tokens=(3, 4),
     )
 
-    result = _resolved_report(
-        worker.execute(
+    result = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=1,
                 admissions=(first, second),
                 operations=(first_op, second_op),
             )
-        )
+        ),
     )
 
     assert result.completions[0].committed_tokens == (expected,)
@@ -205,8 +199,13 @@ def test_verify_commits_every_accepted_position() -> None:
         tokens=(3, 4),
         logprobs=True,
     )
-    prime = worker.execute(
-        execution_run(run_id=1, admissions=(admission,), operations=(extend,), input_products=())
+    prime = finalized_report(
+        worker,
+        worker.submit(
+            execution_run(
+                run_id=1, admissions=(admission,), operations=(extend,), input_products=()
+            )
+        ),
     )
     observation = record_completion(extend, prime)
     verify = token_operation(
@@ -217,15 +216,16 @@ def test_verify_commits_every_accepted_position() -> None:
         tokens=(1000, 1001, STUB_IMG_START_TOKEN_ID),
         logprobs=True,
     )
-    result = _resolved_report(
-        worker.execute(
+    result = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=2,
                 admissions=(),
                 operations=(verify,),
                 commands=(),
             )
-        )
+        ),
     )
     committed = result.completions[0].committed_tokens
 
@@ -253,14 +253,15 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(dev
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    prime = _resolved_report(
-        worker.execute(
+    prime = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=1,
                 admissions=(admission,),
                 operations=(extend,),
             )
-        )
+        ),
     )
     observation = record_completion(extend, prime)
     verify = token_operation(
@@ -271,7 +272,7 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(dev
         tokens=(prime.completions[0].committed_tokens[0], 900, 901),
     )
 
-    result = _resolved_report(worker.execute(execution_run(run_id=2, operations=(verify,))))
+    result = finalized_report(worker, worker.submit(execution_run(run_id=2, operations=(verify,))))
     successor = replace(
         token_operation(
             admission.request_key,
@@ -288,10 +289,8 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(dev
     successor_batch = replace(
         execution_run(run_id=3, operations=(successor,)),
         seq_lens=(len(extend.input_token_ids) + len(verify.input_token_ids) + 1,),
-        lanes=(),
     )
-    following = worker.execute(successor_batch)
-    following = _resolved_report(following)
+    following = finalized_report(worker, worker.submit(successor_batch))
 
     completion = result.completions[0]
     assert completion.committed_tokens == (_next_token(prime.completions[0].committed_tokens[0]),)
@@ -308,7 +307,7 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(dev
 def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> None:
     worker = execution_worker()
     base = ar_params(6, block_ids=(5,))
-    admission = NewRequest.create(
+    admission = NewRequest(
         base.request_key,
         request_pool_idx=base.request_pool_idx,
         ar=replace(cast(ArRequestParams, base.ar), finish_token_ids=(1001,)),
@@ -320,12 +319,15 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> Non
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    prime = worker.execute(
-        execution_run(
-            run_id=1,
-            admissions=(admission,),
-            operations=(extend,),
-        )
+    prime = finalized_report(
+        worker,
+        worker.submit(
+            execution_run(
+                run_id=1,
+                admissions=(admission,),
+                operations=(extend,),
+            )
+        ),
     )
     observation = record_completion(extend, prime)
     verify = token_operation(
@@ -336,15 +338,16 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> Non
         tokens=(1000, 1001),
     )
 
-    result = _resolved_report(
-        worker.execute(
+    result = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=2,
                 admissions=(),
                 operations=(verify,),
                 commands=(),
             )
-        )
+        ),
     )
 
     completion = result.completions[0]
@@ -366,14 +369,15 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
         tokens=(3, 4),
         logprobs=True,
     )
-    first_result = _resolved_report(
-        worker.execute(
+    first_result = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=1,
                 admissions=(admission,),
                 operations=(first,),
             )
-        )
+        ),
     )
     observation = record_completion(first, first_result)
     second = token_operation(
@@ -384,15 +388,16 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
         tokens=(5, 6),
         logprobs=True,
     )
-    second_result = _resolved_report(
-        worker.execute(
+    second_result = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=2,
                 admissions=(),
                 operations=(second,),
                 commands=(),
             )
-        )
+        ),
     )
 
     first_positions = first_result.completions[0].prompt_logprobs
@@ -416,14 +421,15 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         tokens=(3, 4),
         logprobs=True,
     )
-    first_result = _resolved_report(
-        worker.execute(
+    first_result = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=1,
                 admissions=(admission,),
                 operations=(first,),
             )
-        )
+        ),
     )
     observation = record_completion(first, first_result)
     invalid = token_operation(
@@ -435,14 +441,15 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         logprobs=True,
     )
     invalid = replace(invalid, bounds=replace(invalid.bounds, max_completion_bytes=1))
-    failed = _resolved_report(
-        worker.execute(
+    failed = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=2,
                 operations=(invalid,),
                 commands=(),
             )
-        )
+        ),
     )
     assert failed.completions[0].status is OpStatus.ERROR
     assert failed.completions[0].error_code is ErrorCode.INVALID_OPERATION
@@ -455,13 +462,14 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         tokens=(7, 8),
         logprobs=True,
     )
-    recovered = _resolved_report(
-        worker.execute(
+    recovered = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=3,
                 operations=(continued,),
             )
-        )
+        ),
     )
 
     oracle = execution_worker()
@@ -473,14 +481,15 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         tokens=(3, 4),
         logprobs=True,
     )
-    oracle_result = _resolved_report(
-        oracle.execute(
+    oracle_result = finalized_report(
+        oracle,
+        oracle.submit(
             execution_run(
                 run_id=1,
                 admissions=(admission,),
                 operations=(oracle_first,),
             )
-        )
+        ),
     )
     oracle_observation = record_completion(oracle_first, oracle_result)
     oracle_continued = token_operation(
@@ -491,14 +500,15 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         tokens=(7, 8),
         logprobs=True,
     )
-    expected = _resolved_report(
-        oracle.execute(
+    expected = finalized_report(
+        oracle,
+        oracle.submit(
             execution_run(
                 run_id=3,
                 operations=(oracle_continued,),
                 commands=(),
             )
-        )
+        ),
     )
 
     recovered_output = recovered.completions[0]
@@ -523,14 +533,15 @@ def test_worker_samples_with_the_operation_branch_state() -> None:
         sampling_state=SamplingState(allowed_token_ids=(7,)),
     )
 
-    result = _resolved_report(
-        worker.execute(
+    result = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=1,
                 admissions=(admission,),
                 operations=(operation,),
             )
-        )
+        ),
     )
 
     assert result.completions[0].committed_tokens == (7,)
@@ -555,14 +566,15 @@ def test_forced_token_schedule_overrides_selection() -> None:
         tokens=(3, 4),
     )
 
-    result = _resolved_report(
-        worker.execute(
+    result = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=1,
                 admissions=(admission,),
                 operations=(operation,),
             )
-        )
+        ),
     )
 
     assert result.completions[0].committed_tokens == (7,)
@@ -583,14 +595,15 @@ def test_all_masked_branch_state_produces_an_error_completion() -> None:
         sampling_state=SamplingState(allowed_token_ids=()),
     )
 
-    result = _resolved_report(
-        worker.execute(
+    result = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=1,
                 admissions=(admission,),
                 operations=(operation,),
             )
-        )
+        ),
     )
 
     completion = result.completions[0]

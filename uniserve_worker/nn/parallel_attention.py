@@ -8,7 +8,7 @@ from math import prod
 
 import torch
 
-from .attention_storage import AttentionExchangeStorage
+from .attention_storage import ExchangeBuffers
 from .mesh import Communicator, DeviceMesh, RowChunkProducer
 from .parallel_sequence import SequencePartition
 
@@ -47,13 +47,13 @@ class AttentionContextGeometry:
 
 
 @dataclass(frozen=True)
-class AttentionContextWorkspace:
+class AttentionBuffers:
     """Fixed-capacity K/V transport storage, separate from sparse compute.
 
     Mapped storage exposes ordered peer allocations in one virtual key domain.
     Each owner has a page-aligned row capacity, which can exceed its active
     logical rows. Gather storage instead holds a compact replicated key domain.
-    The distributed runtime owns mapped allocation lifetime.
+    The attention owner retains mapped tensor storage through its final peer read.
     ``valid_sizes`` stores valid-row counts for the geometry's explicit block
     size; numerical backends populate it when masking aligned owner capacity.
     """
@@ -179,7 +179,7 @@ class HeadRowPreparation:
         self,
         exchange: HeadRowExchange,
         partition: SequencePartition,
-        storage: AttentionExchangeStorage | None = None,
+        storage: ExchangeBuffers | None = None,
     ) -> None:
         if partition.group != exchange.ulysses_group:
             raise ValueError("projected rows require their sequence communicator")
@@ -308,7 +308,7 @@ class HeadRowExchange:
         self,
         tensor: torch.Tensor,
         *,
-        storage: AttentionExchangeStorage | None = None,
+        storage: ExchangeBuffers | None = None,
         role: str = "query",
     ) -> torch.Tensor:
         """Exchange [local rows, heads, ...] into [global rows, local heads, ...].
@@ -413,7 +413,7 @@ class ParallelAttention(HeadRowExchange):
         self,
         key: torch.Tensor,
         value: torch.Tensor,
-        workspace: AttentionContextWorkspace | None,
+        workspace: AttentionBuffers | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Publish context K/V and return stream-consumable physical views.
 
@@ -458,7 +458,7 @@ class ParallelAttention(HeadRowExchange):
         context.all_gather_into_tensor(context_value, value.contiguous())
         return context_key, context_value
 
-    def finish_context(self, workspace: AttentionContextWorkspace | None) -> None:
+    def finish_context(self, workspace: AttentionBuffers | None) -> None:
         """Fence all mapped readers before the next K/V publication reuses storage."""
 
         if self.mapped:

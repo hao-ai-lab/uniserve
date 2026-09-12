@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use crate::scheduler::SchedulerStats;
 use uniserve_core::codec::stats;
 use uniserve_core::codec::stats::{
-    BaseCacheStats, DomainSchedulerStats, PrefixCacheStats, WorkerForwardStats,
+    BaseCacheStats, DomainSchedulerStats, ForwardStats, PrefixCacheStats,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -39,7 +39,7 @@ pub struct SchedulerStatsReporter {
     last_prefix_hit_tokens: u64,
     last_queue_wait_count: u64,
     last_queue_wait_us_total: u64,
-    last_worker_forward_stats: WorkerForwardStats,
+    last_worker_forward_stats: ForwardStats,
     // cumulative batch-timing counters, delta'd into per-update sums.
     last_worker_exec_us_total: u64,
     last_batch_roundtrip_us_total: u64,
@@ -178,7 +178,7 @@ impl SchedulerStatsReporter {
     }
 
     /// Returns cumulative worker-forward statistics.
-    fn worker_forward_stats(&mut self, stats: &SchedulerStats) -> Option<WorkerForwardStats> {
+    fn worker_forward_stats(&mut self, stats: &SchedulerStats) -> Option<ForwardStats> {
         let current = worker_forward_stats_snapshot(stats);
         let delta = delta_worker_forward_stats(&current, &self.last_worker_forward_stats);
         self.last_worker_forward_stats = current;
@@ -208,7 +208,7 @@ fn domain_cumulative(stats: &crate::scheduler::DomainStats) -> DomainCumulative 
 }
 
 /// Captures a coherent value snapshot of worker forward-pass counters.
-fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> WorkerForwardStats {
+fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> ForwardStats {
     let path_counts = stats
         .worker
         .spec_verify_path_counts
@@ -253,7 +253,7 @@ fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> WorkerForwardStats {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    WorkerForwardStats {
+    ForwardStats {
         mode_counts,
         mode_tokens,
         mode_us,
@@ -336,11 +336,8 @@ fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> WorkerForwardStats {
 }
 
 /// Computes saturating interval deltas between two worker counter snapshots.
-fn delta_worker_forward_stats(
-    current: &WorkerForwardStats,
-    previous: &WorkerForwardStats,
-) -> WorkerForwardStats {
-    WorkerForwardStats {
+fn delta_worker_forward_stats(current: &ForwardStats, previous: &ForwardStats) -> ForwardStats {
+    ForwardStats {
         mode_counts: delta_map(&current.mode_counts, &previous.mode_counts),
         mode_tokens: delta_map(&current.mode_tokens, &previous.mode_tokens),
         mode_us: delta_map(&current.mode_us, &previous.mode_us),

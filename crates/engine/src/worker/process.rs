@@ -14,7 +14,7 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use uniserve_worker_ipc::{ClientEndpoint, Frame, Pending, service_name};
 use uniserve_worker_ipc::{
-    ComputationId, RequestKey, Run as PhysicalRun, WorkerInfo, WorkerRequest, WorkerResponse,
+    ComputationId, RequestKey, ScheduleBatch, WorkerInfo, WorkerRequest, WorkerResponse,
 };
 
 use crate::worker::WorkerProcessArgs;
@@ -727,7 +727,7 @@ impl RankProcess {
     }
 
     /// Submits one physical run and records its outstanding operation identities.
-    pub(super) fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), RunSubmitError> {
+    pub(super) fn submit_run(&mut self, batch: ScheduleBatch) -> Result<(), RunSubmitError> {
         self.drain_ready().map_err(RunSubmitError::Failed)?;
         if self.pending.len() >= self.depth {
             return Err(RunSubmitError::WouldBlock(batch));

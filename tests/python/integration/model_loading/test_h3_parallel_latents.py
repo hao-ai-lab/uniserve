@@ -13,13 +13,11 @@ from transformers import AutoTokenizer
 
 from uniserve_eval.config import load_config
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.batch import (
-    DiffusionSamplingParams,
-    TensorTransfer,
-    WorkerEndpoint,
+from uniserve_worker.bootstrap.distributed import (
+    initialize_entries,
+    initialize_process_groups,
 )
-from uniserve_worker.execution.bounded_storage import BoundedTensorStorage
+from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.loader import LoadRequest, load_model
 from uniserve_worker.models.minimax_h3.config import (
@@ -33,14 +31,15 @@ from uniserve_worker.models.minimax_h3.packing import (
     unpatchify_video,
     video_latent_frames,
 )
-from uniserve_worker.nn.mesh import EntryBindings
 from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig, SequenceParallel
 from uniserve_worker.nn.quant.config import resolve_component_precisions
-from uniserve_worker.runtime.device_events import DeviceEventPool
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
+from uniserve_worker.protocol.batch import (
+    DiffusionSamplingParams,
+    TensorTransfer,
+    WorkerEndpoint,
 )
+from uniserve_worker.runtime.device_events import EventPool
+from uniserve_worker.runtime.tensor_buffers import TensorBuffers
 from uniserve_worker.transfer.layout import fetch_tensor
 from uniserve_worker.transfer.tickets import make_transport
 
@@ -81,7 +80,7 @@ _LAYOUTS = {
 def _generate(
     rank, rendezvous, checkpoint, kind, encoder_tp, component_precisions, requests, directory
 ):
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=4,
@@ -99,15 +98,7 @@ def _generate(
         "audio_decoder": ComponentConfig((1,)),
         "output": ComponentConfig((2,)),
     }
-    meshes = initialize_model_parallel(
-        environment,
-        {
-            name: (component.ranks, component.parallel_config)
-            for name, component in components.items()
-            if component.distribution is None
-        },
-    )
-    bindings = EntryBindings(components, meshes, environment.process_group)
+    bindings = initialize_entries(environment, components)
     loaded = load_model(
         LoadRequest(
             model_path=checkpoint,
@@ -132,17 +123,16 @@ def _generate(
     runner = loaded.model
     schedule = loaded.schedule
     assert schedule is not None
-    storage = BoundedTensorStorage.allocate(runner.resource_geometry.request_tensors, runner.device)
+    storage = TensorBuffers.allocate(runner.resource_geometry.request_tensors, runner.device)
     execution = ModelRunner(
         runner,
         loaded.worker_config,
-        environment=environment,
         schedule=schedule,
     )
     scratch = execution.scratch
     assert scratch is not None
     context_workspace = execution.context_workspace
-    transfer_events = DeviceEventPool()
+    transfer_events = EventPool()
     transport = make_transport(
         "cuda_ipc",
         byte_capacity=runner.product_storage_bytes,
@@ -165,7 +155,7 @@ def _generate(
             if runner.text_encoder is not None:
                 tokens = execution.stage_text_tokens(token_ids)
                 (encoded,) = execution.run_entry("text_encoder", tokens).values
-            owner = bindings.output_ranks("text_encoder")[0]
+            owner = bindings["text_encoder"].output_ranks[0]
             publication = transport.publish(encoded) if rank == owner else None
             descriptor = [publication]
             # The test coordinator distributes only the physical descriptor;
@@ -173,7 +163,7 @@ def _generate(
             dist.broadcast_object_list(descriptor, src=owner)
             location = descriptor[0]
             tickets = ()
-            if rank in bindings.input_ranks("denoiser") and rank != owner:
+            if rank in bindings["denoiser"].input_ranks and rank != owner:
                 conditioning = torch.empty(
                     location.shape, dtype=torch.bfloat16, device=runner.device
                 )
@@ -200,7 +190,7 @@ def _generate(
                 runner.prepare_tensors(slot, metadata, encoded, len(token_ids))
             for ticket in tickets:
                 ticket.close()
-            if bindings.owns("denoiser"):
+            if "denoiser" in bindings and bindings["denoiser"].owns:
                 for step in range(4):
                     samples = (slot.video_rows, slot.audio_rows)
                     initial = tuple(value.clone() for value in samples)
@@ -223,8 +213,8 @@ def _generate(
                         f"{kind} rank {rank} case {index} step {step}: numerical parity", flush=True
                     )
             torch.cuda.synchronize(runner.device)
-            if rank in bindings.output_ranks("denoiser"):
-                owner = bindings.output_ranks("denoiser").index(rank)
+            if rank in bindings["denoiser"].output_ranks:
+                owner = bindings["denoiser"].output_ranks.index(rank)
                 torch.save(
                     {"video": slot.video_rows.cpu(), "audio": slot.audio_rows.cpu()},
                     Path(directory) / f"case-{index}-owner-{owner}.pt",

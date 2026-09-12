@@ -5,44 +5,37 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Mapping
-from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
-from uniserve_worker.execution import operations as operation_geometry
-from uniserve_worker.execution.batch import (
-    CompletionState,
-    LaneResult,
-    PipelineStage,
-    RegistrationAck,
-    ScheduledRequest,
-    TensorPublication,
-)
 from uniserve_worker.execution.output import (
-    OutputRecord,
     PendingOutput,
 )
-from uniserve_worker.execution.rows import DecodeRuntimePublication, LaneState, Outcome
-from uniserve_worker.execution.sample import copy_runtime_scalar as _copy_runtime_scalar
 from uniserve_worker.execution.transfer import _release_locators
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.profiling import _forward_stats, record_component
-from uniserve_worker.runtime.device_products import DeviceProductWrite
-from uniserve_worker.runtime.request import RequestRuntime, SpeculativeSelection
+from uniserve_worker.protocol.batch import (
+    OpStatus,
+    PipelineStage,
+    ScheduledRequest,
+    TensorPublication,
+)
+from uniserve_worker.transfer.exports import validate_exports
+
+from .batch_state import BatchState
+from .forward_batch import concatenate_views
+from .output import logprob_entries
 
 if TYPE_CHECKING:
     from uniserve_worker.bootstrap.worker_info import WorkerInfo
     from uniserve_worker.config import WorkerConfig
-    from uniserve_worker.execution.video import VideoMuxCoordinator
-    from uniserve_worker.runtime.cache_pool import CachePool
-    from uniserve_worker.runtime.cache_publications import CachePublications
-    from uniserve_worker.runtime.device_products import DeviceProducts
-    from uniserve_worker.runtime.encoder_cache import EncoderCache
+    from uniserve_worker.media.mux import MediaMux
+    from uniserve_worker.runtime.decode_state import DecodeState
+    from uniserve_worker.runtime.kv_cache import KVCache
     from uniserve_worker.runtime.latent_pool import LatentPool
     from uniserve_worker.runtime.request import RequestPool
-    from uniserve_worker.runtime.runtime_states import RuntimeStates
-    from uniserve_worker.transfer.publications import TransferPublications
+    from uniserve_worker.runtime.tensor_store import TensorStore
     from uniserve_worker.transfer.tickets import Transport
 
 
@@ -53,56 +46,47 @@ TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 
 
-def _commit_lane(
+def _commit_group(
     run_id: int,
-    scope: LaneState,
-    outcomes: tuple[Outcome, ...],
+    completion_group: int,
+    outcomes: tuple[PendingOutput, ...],
     started: int,
     *,
-    cache_registry: CachePublications | None,
-    device_products: DeviceProducts,
-    encoder_cache: EncoderCache,
+    state: BatchState,
+    kv_cache: KVCache | None,
+    tensor_store: TensorStore,
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     request_pool: RequestPool,
-    runtime_states: RuntimeStates | None,
-    transfer_publications: TransferPublications,
+    decode_state: DecodeState | None,
     config: WorkerConfig,
-) -> LaneResult:
-    """Atomically publish validated lane resources, execution progress, and output records."""
+) -> None:
+    """Atomically publish validated completion group resources, execution progress, and output records."""
 
     commit_started = time.perf_counter_ns()
-    lane = scope.lane
-    operations = lane.operations
+    operations = state.group_operations(completion_group)
 
     # All device reads must finish and every staged resource must validate before
     # completion storage becomes immutable or any publication becomes visible.
-    _finish_device_reads(scope, device_products=device_products, encoder_cache=encoder_cache)
-    _publish_predicates(scope, device_products=device_products)
-    device_products.validate_writes(tuple(scope.device_writes))
-    encoder_cache.validate_writes(tuple(scope.encoder_writes))
+    _finish_device_reads(completion_group, tensor_store=tensor_store, state=state)
+    _publish_predicates(completion_group, tensor_store=tensor_store, state=state)
+    writes = tuple(
+        write for request in state.pending_outputs(completion_group) for write in request.writes
+    )
+    tensor_store.validate_writes(writes)
     if latent_pool is None:
-        if scope.latent_publications or scope.latent_releases:
+        if any(output.latent_params is not None for output in outcomes):
             raise RuntimeError("latent publication has no physical pool")
     else:
-        latent_pool.validate_commit(
-            scope.latent_publications,
-            scope.latent_releases,
-        )
-    scope.completion.seal()
+        latent_pool.validate_updates(outcomes)
+    state.group_buffers[completion_group].seal()
     # Prepare the execution result without mutating resident state.
     records: list[PendingOutput] = []
-    pending_completions: dict[int, CompletionState] = {}
-    speculative_selections: dict[int, SpeculativeSelection] = {}
     report_products: list[TensorPublication] = []
-    resolved_runtime: dict[int, RequestRuntime] = {}
-    layout = scope.layout
-    if layout is None or layout.operations != operations:
-        raise RuntimeError("lane commit lost its aligned candidate layout")
     for row, (operation, request, outcome) in enumerate(
         zip(
             operations,
-            layout.requests,
+            state.pending_outputs(completion_group),
             outcomes,
             strict=True,
         )
@@ -120,233 +104,223 @@ def _commit_lane(
         # The bound covers score values and prompt-position counts; framing is
         # owned by the single IPC result message, not by stored products.
         logprob_bytes = (
-            0 if outcome.logprobs is None else 4 + 12 * outcome.logprobs.max_entries()
-        ) + sum(4 + 12 * position.max_entries() for position in outcome.prompt_logprobs)
+            0
+            if outcome.logprob_range is None
+            else 4 + 12 * logprob_entries(outcome, outcome.logprob_range)
+        ) + sum(4 + 12 * logprob_entries(outcome, span) for span in outcome.prompt_logprob_ranges)
         if logprob_bytes > operation.bounds.max_completion_bytes:
             raise invalid_descriptor("logprob result exceeds its registered completion capacity")
         reports_output = config.rank == worker_info.output_rank(operation.entry)
         report_products.extend(outcome.products)
-        pending = PendingOutput(
-            request.predecessor.completion,
-            scope.completion,
-            row,
-            request.predecessor.accepted_runtime,
-            status=outcome.status,
-            reports_output=reports_output,
-            completion_tasks=(
-                *outcome.completion_tasks,
-                # Non-output ranks still retire captures after their copy events.
-                *(
-                    (() if outcome.logprobs is None else (outcome.logprobs,))
-                    + outcome.prompt_logprobs
-                    if not reports_output
-                    else ()
-                ),
-            ),
-        )
-        record = pending.bind_record(
-            OutputRecord(
-                request_key=operation.request_key,
-                op_id=operation.op_id,
-                kind=operation.kind,
-                completion_slot_generation=scope.completion.generation,
-                status=outcome.status,
-                runtime=outcome.runtime,
-                committed_tokens=outcome.committed_tokens,
-                sampling=outcome.sampling,
-                logprobs=outcome.logprobs if reports_output else None,
-                prompt_logprobs=outcome.prompt_logprobs if reports_output else (),
-                finish_flags=outcome.finish_flags,
-                product_generations=outcome.product_generations,
-                error_code=None,
-                kv_output=outcome.kv_output,
-            )
-        )
-        records.append(record)
-        pending_completions[operation.request_key.request_id] = pending
-        resolved_runtime[operation.request_key.request_id] = outcome.runtime
-        selection = outcome.selection
-        if selection is not None:
-            speculative_selections[operation.request_key.request_id] = SpeculativeSelection(
-                draft_tokens=selection.draft_tokens,
-                terminal_prefix=selection.terminal_prefix,
-                base_logical_position=selection.base_logical_position,
-                base_rng_counter=selection.base_rng_counter,
-                base_kv_visible=selection.base_kv_visible,
-                initialized_kv=selection.initialized_kv,
-            )
-    record_component(scope, "commit_lane", commit_started)
+        pending = request
+        if outcome is not pending:
+            raise RuntimeError("operation completion lost its prepared output")
+        pending._reports_output = reports_output
+        # All ranks retain their score ranges until the output buffer retires;
+        # materialization emits scores only on the designated output rank.
+        records.append(pending)
+    record_component(state.group_component_us[completion_group], "commit_lane", commit_started)
 
     # Prepare cross-resource commit records first so no publication is visible
     # until every participating owner has accepted its state transition.
-    lane_report = LaneResult(
-        lane_id=lane.lane_id,
-        completions=tuple(records),
-        products=tuple(report_products),
-        registration=RegistrationAck(visible=True),
-        worker_exec_us=(time.perf_counter_ns() - scope.started_ns) // 1000,
-        forward_stats=_forward_stats(scope.observations, scope.component_us),
+    execution_us = (time.perf_counter_ns() - state.group_started_ns[completion_group]) // 1000
+    stats = _forward_stats(
+        state.group_forward_stats[completion_group], state.group_component_us[completion_group]
     )
-    cache_publications = cache_registry
+    cache_publications = kv_cache
+    publications = tuple(
+        request.cache_publication
+        for request in state.pending_outputs(completion_group)
+        if request.cache_publication is not None
+    )
+    installations = tuple(
+        request.cache_installation
+        for request in state.pending_outputs(completion_group)
+        if request.cache_installation is not None
+    )
     if cache_publications is None:
-        if scope.cache_publications or scope.cache_installations:
+        if publications or installations:
             raise RuntimeError("cache publication has no backing KV resources")
-        cache_commit = None
     else:
-        cache_commit = cache_publications.prepare_commit(
-            scope.cache_publications,
-            scope.cache_installations,
-        )
-    request_publication = request_pool.prepare_publication(
-        run_id=run_id,
-        operations=operations,
-        candidates=scope.request_candidates,
-        runtimes=resolved_runtime,
-        completions=pending_completions,
-        speculative=speculative_selections,
-    )
-    transfer_publications.validate(scope.stage_publications)
-    # From this point the lane cannot be discarded: apply resource commits, then
+        cache_publications.validate_publications(publications, installations)
+    tensor_exports = {
+        buffer: locations
+        for request in state.pending_outputs(completion_group)
+        for buffer, locations in request.tensor_exports.items()
+    }
+    cache_exports = {
+        buffer: locations
+        for request in state.pending_outputs(completion_group)
+        for buffer, locations in request.cache_exports.items()
+    }
+    latent_exports = {
+        buffer: locations
+        for request in state.pending_outputs(completion_group)
+        for buffer, locations in request.latent_exports.items()
+    }
+    request_pool.validate_pending(records)
+    for owner, exports in (
+        (tensor_store, tensor_exports),
+        (kv_cache, cache_exports),
+        (latent_pool, latent_exports),
+    ):
+        if owner is None:
+            if exports:
+                raise RuntimeError("transport export has no backing storage")
+        else:
+            validate_exports(owner.exports, exports)
+    # From this point the completion group cannot be discarded: apply resource commits, then
     # reserve the request publication that gates successor readiness.
-    scope.publication_started = True
-    device_products.commit_writes(tuple(scope.device_writes))
-    encoder_cache.commit_writes(tuple(scope.encoder_writes))
+    state.group_published[completion_group] = True
+    tensor_store.commit_writes(writes)
     if latent_pool is not None:
-        latent_pool.apply_commit(
-            scope.latent_publications,
-            scope.latent_releases,
-        )
+        latent_pool.apply_updates(outcomes)
     if cache_publications is not None:
-        assert cache_commit is not None
-        cache_publications.apply_commit(cache_commit)
-    transfer_publications.commit(scope.stage_publications)
-    _commit_runtime_states(scope, runtime_states=runtime_states)
-    request_publication.reserve()
-    return replace(lane_report, publication=request_publication)
+        cache_publications.commit_publications(publications, installations)
+    tensor_store.exports.update(tensor_exports)
+    if kv_cache is not None:
+        kv_cache.exports.update(cache_exports)
+    if latent_pool is not None:
+        latent_pool.exports.update(latent_exports)
+    _commit_runtime_states(completion_group, decode_state=decode_state, state=state)
+    for request in state.pending_outputs(completion_group):
+        request.release_execution_references()
+    request_pool.add_pending(records)
+    state.record_outputs(
+        completion_group,
+        tuple(records),
+        products=tuple(report_products),
+        visible=True,
+        execution_us=execution_us,
+        stats=stats,
+    )
 
 
-def _commit_runtime_states(scope: LaneState, *, runtime_states: RuntimeStates | None) -> None:
-    """Publish committed token, predicate, position, cache-length, and penalty state to device rows."""
+def _commit_runtime_states(
+    completion_group: int, *, state: BatchState, decode_state: DecodeState | None
+) -> None:
+    """Commit numerical updates held by the same pending outputs as host results."""
 
-    states = runtime_states
+    requests = state.pending_outputs(completion_group)
+    states = decode_state
     if states is None:
-        if (
-            scope.runtime_publications
-            or scope.prompt_logits_publications
-            or scope.runtime_cache_lengths
+        if any(
+            request.sampled is not None
+            or request.runtime_prompt_logits is not None
+            or request.runtime_cache_length is not None
+            for request in requests
         ):
             raise RuntimeError("runtime state publication has no backing storage")
         return
 
-    # Cache lengths may advance without token publication, so apply their
-    # scalar updates before the row-level decode state transitions.
-    for slot, length in scope.runtime_cache_lengths.items():
-        _copy_runtime_scalar(states.valid_cache_lengths[slot : slot + 1], length)
-    for publication in scope.runtime_publications:
-        if isinstance(publication, DecodeRuntimePublication):
-            # Batched decode uses the fused device-state kernel, then updates
-            # request-owned penalty counts only for valid active selections.
-            states.publish_decode(
-                publication.slots,
-                device_indices=publication.device_slots,
-                tokens=publication.tokens,
-                predicates=publication.predicates,
+    # Install lengths before advancing tokens. Decode rows share one update;
+    # prefill/verification retain their explicit logical and RNG coordinates.
+    for request in requests:
+        if request.runtime_cache_length is not None:
+            states.set_cache_length(
+                int(request.request.request_pool_idx), request.runtime_cache_length
             )
-            for index, penalty_base in enumerate(publication.penalty_bases):
-                if penalty_base is None:
-                    continue
-                weight = (
-                    publication.valid[index : index + 1] & publication.active[index : index + 1]
-                ).to(dtype=penalty_base.dtype)
-                penalty_base.scatter_add_(
-                    0,
-                    publication.tokens[index : index + 1].to(dtype=torch.int64),
-                    weight,
-                )
-            continue
-
-        # Non-batched publications update the same fields explicitly while
-        # stripping the continuation tag from future input tokens.
-        slot = publication.slot
-        future_token = states.future_input_tokens[slot, :1]
-        future_token.copy_(publication.token.reshape(-1)[:1])
-        future_token.bitwise_and_(TOKEN_VALUE_MASK)
-        states.predicates[slot : slot + 1].copy_(
-            publication.predicate.reshape(-1)[:1].to(dtype=torch.bool)
+    decode = tuple(
+        request
+        for request in requests
+        if request.sampled is not None and request.runtime_decode_increment
+    )
+    if decode:
+        samples = tuple(request.sampled for request in decode if request.sampled is not None)
+        if any(sample.request_pool_indices is None for sample in samples):
+            raise RuntimeError("decode samples have no device request slots")
+        states.apply_tokens(
+            tuple(int(request.request.request_pool_idx) for request in decode),
+            device_slots=concatenate_views(
+                tuple(cast(torch.Tensor, sample.request_pool_indices) for sample in samples)
+            ),
+            tokens=concatenate_views(tuple(sample.tokens for sample in samples)),
+            predicates=concatenate_views(tuple(sample.continuation for sample in samples)),
+            penalty_bases=tuple(request.runtime_penalty_base for request in decode),
+            valid=concatenate_views(tuple(sample.valid for sample in samples)),
+            active=concatenate_views(tuple(sample.active for sample in samples)),
         )
-        _copy_runtime_scalar(
-            states.logical_lengths[slot : slot + 1],
-            publication.logical_position,
-        )
-        _copy_runtime_scalar(
-            states.sampling_positions[slot : slot + 1],
-            publication.sampling_position,
-        )
-        penalty_base = publication.penalty_base
-        if penalty_base is not None:
-            weight = (publication.valid.reshape(-1)[:1] & publication.active.reshape(-1)[:1]).to(
-                dtype=penalty_base.dtype
+    for request in requests:
+        sampled = request.sampled
+        if sampled is not None and not request.runtime_decode_increment:
+            states.apply_tokens(
+                (int(request.request.request_pool_idx),),
+                tokens=sampled.tokens,
+                predicates=sampled.continuation,
+                logical_position=request.runtime_logical_position,
+                sampling_position=request.runtime_sampling_position,
+                penalty_bases=(request.runtime_penalty_base,),
+                valid=sampled.valid,
+                active=sampled.active,
             )
-            penalty_base.scatter_add_(
-                0,
-                future_token.to(dtype=torch.int64),
-                weight,
+    for request in requests:
+        if request.runtime_prompt_logits is not None:
+            states.set_prompt_logits(
+                int(request.request.request_pool_idx), request.runtime_prompt_logits
             )
 
-    # Prompt logits have request-row lifetime and become visible only after all
-    # scalar transition fields for the lane are committed.
-    for prompt_publication in scope.prompt_logits_publications:
-        states.prompt_logits[prompt_publication.slot].copy_(
-            prompt_publication.logits.to(dtype=states.prompt_logits.dtype)
-        )
 
-
-def _discard_lane(
-    scope: LaneState,
+def _discard_group(
+    completion_group: int,
     error: BaseException | None = None,
     *,
-    cache_pool: CachePool | None,
-    device_products: DeviceProducts,
-    encoder_cache: EncoderCache,
+    state: BatchState,
+    kv_cache: KVCache | None,
+    tensor_store: TensorStore,
     latent_pool: LatentPool | None,
-    media_mux: VideoMuxCoordinator | None,
+    media_mux: MediaMux | None,
     transfer_backends: Mapping[str, Transport],
 ) -> None:
-    """Release all provisional lane resources that have not crossed publication visibility."""
+    """Release all provisional completion group resources that have not crossed publication visibility."""
 
-    _finish_device_reads(scope, device_products=device_products, encoder_cache=encoder_cache)
-    for job in scope.completion_jobs:
-        job.abandon()
-    for reservation in scope.cpu_tasks.values():
-        reservation.abandon()
-    for lease in scope.media_output_leases.values():
-        lease.defer_until_ready(scope.completion.completion_future())
-    if scope.publication_started:
-        raise RuntimeError("published lane state cannot be discarded")
+    if state.group_published[completion_group]:
+        raise RuntimeError("published completion group state cannot be discarded")
+    _finish_device_reads(completion_group, tensor_store=tensor_store, state=state)
+    # Cancellation uses the same producer fence as successful CPU work.
+    state.group_buffers[completion_group].seal()
+    for pending in state.pending_outputs(completion_group):
+        pending.abandon()
     if media_mux is not None:
-        for operation in scope.lane.operations:
+        for operation in state.group_operations(completion_group):
             if operation.kind is PipelineStage.LATENT_PREPARATION:
                 media_mux.drop(int(operation.request_key.request_id))
-    scope.completion.abandon()
-    device_products.abandon_writes(tuple(scope.device_writes))
-    encoder_cache.abandon_writes(tuple(scope.encoder_writes))
-    if cache_pool is not None:
-        cache_pool.release_buffers(
+    state.group_buffers[completion_group].abandon()
+    tensor_store.abandon_writes(
+        tuple(
+            write for request in state.pending_outputs(completion_group) for write in request.writes
+        )
+    )
+    if kv_cache is not None:
+        kv_cache.release_buffers(
             operation.kv_output
-            for operation in scope.lane.operations
+            for operation in state.group_operations(completion_group)
             if operation.kv_output is not None
         )
-    if latent_pool is not None and scope.latent_import_slots:
-        latent_pool.release_slots(tuple(scope.latent_import_slots))
+    imported_slots = tuple(
+        int(request.request.request_pool_idx)
+        for request in state.pending_outputs(completion_group)
+        if request.latent_imported
+    )
+    if latent_pool is not None and imported_slots:
+        latent_pool.release_slots(imported_slots)
     if latent_pool is not None:
         latent_pool.release_buffers(
             tuple(
                 product.buffer_id
-                for operation in scope.lane.operations
+                for operation in state.group_operations(completion_group)
                 for product in operation.tensor_outputs()
             )
         )
-    _release_locators(scope.published, transfer_backends=transfer_backends)
+    _release_locators(
+        tuple(
+            locator
+            for request in state.pending_outputs(completion_group)
+            for locator in request.exported_locators
+        ),
+        transfer_backends=transfer_backends,
+    )
+    for request in state.pending_outputs(completion_group):
+        request.release_execution_references()
 
 
 def _validate_completion_products(
@@ -363,40 +337,23 @@ def _validate_completion_products(
         product.encoded_size_bound()
 
 
-def _publish_predicates(scope: LaneState, *, device_products: DeviceProducts) -> None:
+def _publish_predicates(
+    completion_group: int, *, state: BatchState, tensor_store: TensorStore
+) -> None:
     """Publish predicate outputs after their producing operations have resolved."""
 
-    producers = {
-        operation_geometry.operation_identity(operation) for operation in scope.lane.operations
-    }
-    transitions = {id(write) for write in scope.transition_writes.values()}
-    propagated = {
-        id(write) for writes in scope.propagated_predicate_writes.values() for write in writes
-    }
-    completions = {
-        operation.completion_output
-        for operation in scope.lane.operations
-        if operation.completion_output is not None
-    }
     writes = tuple(
-        write
-        for write in scope.device_writes
-        if write.reference in completions
-        and not write.producer_recorded
-        and operation_geometry.product_identity(write.reference) in producers
-        and id(write) not in transitions
-        and id(write) not in propagated
+        request.completion_write
+        for request in state.pending_outputs(completion_group)
+        if request.status is not OpStatus.PREDICATED
+        and request.completion_write is not None
+        and not request.completion_write.producer_recorded
     )
     if not writes:
         return
-    batch = device_products.producer_scalar_batch(writes)
-    if batch is not None:
-        batch.tensor.fill_(1)
-        device_products.publish_scalar_batch(batch)
-        return
-    views = device_products.producer_write_views(writes)
+    views = tensor_store.producer_write_views(writes)
     first = views[0]
-    device_products.publish_writes(
+    tensor_store.publish_writes(
         writes,
         torch.ones(
             (len(writes),),
@@ -407,25 +364,33 @@ def _publish_predicates(scope: LaneState, *, device_products: DeviceProducts) ->
 
 
 def _finish_device_reads(
-    scope: LaneState, *, device_products: DeviceProducts, encoder_cache: EncoderCache
+    completion_group: int, *, state: BatchState, tensor_store: TensorStore
 ) -> None:
-    """Record or cancel every device-product read acquired by the lane."""
+    """Complete actual consumer reads using that operation's producer fence."""
 
-    reads = tuple(scope.device_reads)
+    reads = tuple(
+        read for request in state.pending_outputs(completion_group) for read in request.device_reads
+    )
     if reads:
-        after_writes: list[DeviceProductWrite] = []
-        for read in reads:
-            write = scope.operation_writes.get((read.reference.request_key, read.consumer_op_id))
-            if write is None:
-                after_writes.clear()
-                break
-            after_writes.append(write)
-        device_products.record_readers(
-            reads,
-            after_writes=tuple(after_writes),
+        # A source may belong to another request. Its reader's completion is
+        # ordered by the consuming operation's output, never by source identity.
+        after_writes = tuple(
+            request.producer_write
+            for request in state.pending_outputs(completion_group)
+            for _read in request.device_reads
+            if request.producer_write is not None
         )
-    scope.device_reads.clear()
-    encoder_reads = tuple(scope.encoder_reads)
-    if encoder_reads:
-        encoder_cache.record_readers(encoder_reads)
-    scope.encoder_reads.clear()
+        tensor_store.complete_reads(
+            reads,
+            after_writes=after_writes if len(after_writes) == len(reads) else (),
+        )
+    feature_reads = tuple(
+        read
+        for request in state.pending_outputs(completion_group)
+        for read in request.feature_reads
+    )
+    if feature_reads:
+        tensor_store.complete_reads(feature_reads)
+    for request in state.pending_outputs(completion_group):
+        request.device_reads.clear()
+        request.feature_reads.clear()

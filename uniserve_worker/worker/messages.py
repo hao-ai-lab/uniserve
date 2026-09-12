@@ -7,9 +7,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..bootstrap.worker_info import RequestKind, ResponseKind
-from ..execution.batch import Run, RunResult
-from ..execution.run import WorkerRun
+from ..execution.batch_state import BatchState
 from ..foundation.errors import WorkerError, invalid_descriptor
+from ..protocol.batch import BatchOutput, ScheduleBatch
 
 
 def response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
@@ -71,7 +71,7 @@ def request_kind(request: Mapping[str, Any]) -> RequestKind:
         raise invalid_descriptor(f"unknown worker request kind {raw!r}") from None
 
 
-def run_requests(run: Run) -> frozenset[int]:
+def run_requests(run: ScheduleBatch) -> frozenset[int]:
     """Collect request identifiers referenced by a run's admissions, operations, and commands."""
 
     keys = (
@@ -87,7 +87,7 @@ def raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
 
     requests: set[int] = set()
     run = request.get("run")
-    if isinstance(run, Run):
+    if isinstance(run, ScheduleBatch):
         return run_requests(run) | requests
     if not isinstance(run, Mapping):
         return frozenset(requests)
@@ -116,7 +116,7 @@ def finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
 
     finalized = dict(response)
     report = finalized.get("result")
-    if isinstance(report, RunResult):
+    if isinstance(report, BatchOutput):
         finalized["result"] = report.to_mapping()
     return finalized
 
@@ -129,7 +129,7 @@ class ServiceRequest:
     request: dict[str, Any]
     requests: frozenset[int]
     kind: RequestKind
-    run: Run | None = None
+    run: ScheduleBatch | None = None
     dependencies: int = 0
     successors: list[ServiceRequest] = field(default_factory=list)
     released: bool = False
@@ -142,7 +142,7 @@ class PendingResponse:
     sequence: int
     requests: frozenset[int]
     response: dict[str, Any]
-    run: WorkerRun | None = None
+    run: BatchState | None = None
 
 
 def with_call_id(response: dict[str, Any], request: Mapping[str, Any]) -> dict[str, Any]:

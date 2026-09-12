@@ -6,19 +6,20 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
+from uniserve_worker.bootstrap.distributed import (
+    initialize_model_parallel,
+    initialize_process_groups,
+)
 from uniserve_worker.nn.collective import collective_scope
 from uniserve_worker.nn.parallel import ParallelConfig
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from uniserve_worker.runtime.collectives import allocate_peer_reductions
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 def _run_sum_reduction(rank: int, rendezvous: str, world_size: int) -> None:
     device = torch.device("cuda", rank)
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=world_size,
@@ -30,7 +31,7 @@ def _run_sum_reduction(rank: int, rendezvous: str, world_size: int) -> None:
         environment, {"model": (tuple(reversed(range(world_size))), ParallelConfig(world_size))}
     )["model"]
     group = mesh.get_group("tp")
-    reductions = environment.sum_reductions()
+    reductions = allocate_peer_reductions((group,))
     stream = torch.cuda.Stream(device=device)
     graphs = []
     try:

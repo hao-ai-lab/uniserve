@@ -7,12 +7,12 @@ from dataclasses import dataclass
 from itertools import product
 from typing import TYPE_CHECKING
 
-from ..execution.batch import (
+from ..foundation.errors import invalid_descriptor
+from ..protocol.batch import (
     Locator,
     TensorTransfer,
     WorkerEndpoint,
 )
-from ..foundation.errors import invalid_descriptor
 
 if TYPE_CHECKING:
     import torch

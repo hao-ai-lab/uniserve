@@ -8,8 +8,8 @@ from torch import nn
 import uniserve_worker.ops as ops
 
 from ..backends.attention.base import AttentionBackend
-from ..execution.forward_batch import AttentionMode, AttentionSelection, ForwardBatch
-from ..runtime.cache_pool import CachePool
+from ..execution.forward_batch import AttentionMetadata, AttentionMode, AttentionSelection
+from ..runtime.kv_cache import KVCache
 from .attention_storage import attention_exchange_storage
 from .mesh import Communicator
 from .parallel_attention import AttentionHeadRows, AttentionRowExchange, HeadRowExchange
@@ -41,7 +41,7 @@ class RadixAttention(nn.Module):
         self.head_dim = int(head_dim)
         self.layer_id = int(layer_id)
         self.scale = self.head_dim**-0.5
-        self._cache_pool: CachePool | None = None
+        self._cache_pool: KVCache | None = None
         self._selection: AttentionSelection | None = None
         self._providers: dict[AttentionMode, AttentionBackend] = {}
         self._varlen_provider: AttentionBackend | None = None
@@ -55,32 +55,32 @@ class RadixAttention(nn.Module):
 
         self._selection = selection
 
-    def bind(self, cache_pool: CachePool, selection: AttentionSelection) -> None:
+    def bind(self, kv_cache: KVCache, selection: AttentionSelection) -> None:
         """Bind physical KV storage and select one compatible backend per attention mode."""
 
-        self._cache_pool = cache_pool
+        self._cache_pool = kv_cache
         self.bind_dense(selection)
         candidates = {
             AttentionMode.DENSE: _select_provider(
                 selection,
                 AttentionMode.DENSE,
                 head_dim=self.head_dim,
-                block_size=cache_pool.block_size,
-                device=cache_pool.k.device,
+                block_size=kv_cache.block_size,
+                device=kv_cache.k.device,
             ),
             AttentionMode.PAGED_DECODE: _select_provider(
                 selection,
                 AttentionMode.PAGED_DECODE,
                 head_dim=self.head_dim,
-                block_size=cache_pool.block_size,
-                device=cache_pool.k.device,
+                block_size=kv_cache.block_size,
+                device=kv_cache.k.device,
             ),
             AttentionMode.PAGED_VARLEN: _select_provider(
                 selection,
                 AttentionMode.PAGED_VARLEN,
                 head_dim=self.head_dim,
-                block_size=cache_pool.block_size,
-                device=cache_pool.k.device,
+                block_size=kv_cache.block_size,
+                device=kv_cache.k.device,
             ),
             AttentionMode.PACKED: (
                 _select_provider(
@@ -88,15 +88,15 @@ class RadixAttention(nn.Module):
                     AttentionMode.PACKED,
                     cuda_graph=True,
                     head_dim=self.head_dim,
-                    block_size=cache_pool.block_size,
-                    device=cache_pool.k.device,
+                    block_size=kv_cache.block_size,
+                    device=kv_cache.k.device,
                 )
                 or _select_provider(
                     selection,
                     AttentionMode.PACKED,
                     head_dim=self.head_dim,
-                    block_size=cache_pool.block_size,
-                    device=cache_pool.k.device,
+                    block_size=kv_cache.block_size,
+                    device=kv_cache.k.device,
                 )
             ),
         }
@@ -106,8 +106,8 @@ class RadixAttention(nn.Module):
         self._varlen_provider = _select_varlen_provider(
             selection,
             head_dim=self.head_dim,
-            block_size=cache_pool.block_size,
-            device=cache_pool.k.device,
+            block_size=kv_cache.block_size,
+            device=kv_cache.k.device,
         )
 
     @property
@@ -139,7 +139,7 @@ class RadixAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        context: ForwardBatch | None,
+        context: AttentionMetadata | None,
         *,
         causal: bool,
         scale: float | None = None,
@@ -179,7 +179,7 @@ class RadixAttention(nn.Module):
     def forward_heads(
         self,
         inputs: AttentionHeadRows,
-        context: ForwardBatch,
+        context: AttentionMetadata,
         *,
         causal: bool,
         scale: float | None = None,
@@ -225,7 +225,7 @@ class RadixAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        context: ForwardBatch | None,
+        context: AttentionMetadata | None,
         *,
         causal: bool,
         scale: float | None,
@@ -263,8 +263,6 @@ class RadixAttention(nn.Module):
             return self._decode(q, k, v, context, causal, effective_scale, pool)
         if context.attention_mode is AttentionMode.PAGED_VARLEN:
             return self._varlen(q, k, v, context, causal, effective_scale, pool)
-        if context.attention_mode is AttentionMode.REQUEST_INDEXED_DECODE:
-            raise ValueError("request-indexed decode metadata was not staged")
         return self._packed(q, k, v, context, effective_scale, pool)
 
     def _decode(
@@ -272,10 +270,10 @@ class RadixAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        context: ForwardBatch,
+        context: AttentionMetadata,
         causal: bool,
         scale: float,
-        pool: CachePool,
+        pool: KVCache,
     ) -> torch.Tensor:
         """Execute one-token paged decode against the selected cache group."""
 
@@ -307,10 +305,10 @@ class RadixAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        context: ForwardBatch,
+        context: AttentionMetadata,
         causal: bool,
         scale: float,
-        pool: CachePool,
+        pool: KVCache,
     ) -> torch.Tensor:
         """Execute variable-length paged prefill with packed query boundaries."""
 
@@ -354,9 +352,9 @@ class RadixAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        context: ForwardBatch,
+        context: AttentionMetadata,
         scale: float,
-        pool: CachePool,
+        pool: KVCache,
     ) -> torch.Tensor:
         """Execute cache-free packed attention across declared route spans."""
 
@@ -436,14 +434,14 @@ def bind_dense_attention_modules(model: nn.Module, selection: AttentionSelection
 
 def bind_attention_modules(
     model: nn.Module,
-    cache_pool: CachePool,
+    kv_cache: KVCache,
     selection: AttentionSelection,
 ) -> None:
     """Bind every radix-attention layer in a model to shared cache and backend resources."""
 
     for module in model.modules():
         if isinstance(module, RadixAttention):
-            module.bind(cache_pool, selection)
+            module.bind(kv_cache, selection)
 
 
 __all__ = ["RadixAttention", "bind_attention_modules", "bind_dense_attention_modules"]

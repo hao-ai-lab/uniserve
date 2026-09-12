@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.batch import COMPUTATIONS
+from uniserve_worker.protocol.batch import COMPUTATIONS
 
 from ..bootstrap.capacity import (
     DEFAULT_BLOCK_SIZE,
@@ -40,7 +40,7 @@ from ..models.runtime import (
 )
 from ..nn.diffusion.cfg import CfgRecipe
 from ..nn.diffusion.schedule import ScheduleDirection, ScheduleShiftDomain
-from ..runtime.cache_pool import CachePool
+from ..runtime.kv_cache import KVCache
 
 STUB_EOS_TOKEN_ID = 151645
 STUB_IMG_START_TOKEN_ID = 151670
@@ -163,17 +163,17 @@ class StubModel(ExecutionModel):
         self.text_max_tokens = STUB_MAX_LATENT_SIZE
         self.text_topology = ("tp",)
         self.tensorized_mixed = True
-        self._cache_pool: CachePool | None = None
+        self._cache_pool: KVCache | None = None
 
     def bind_cache_pool(
         self,
-        cache_pool: CachePool,
+        kv_cache: KVCache,
         selection: AttentionSelection,
     ) -> None:
         """Bind the physical cache that receives deterministic forward writes."""
 
         del selection
-        self._cache_pool = cache_pool
+        self._cache_pool = kv_cache
 
     @torch.inference_mode()
     def forward(
@@ -184,21 +184,24 @@ class StubModel(ExecutionModel):
     ) -> torch.Tensor:
         """Build deterministic hidden rows and record one zero KV value per query."""
 
-        query_tokens = sum(forward_batch.query_lens_cpu)
+        query_tokens = sum(forward_batch.attention.query_lens_cpu)
         device = positions.device
         if query_tokens < 1:
             raise ValueError("stub text/denoise forward requires query tokens")
         kv = torch.zeros((query_tokens, 1, 1), dtype=torch.bfloat16, device=device)
         if self._cache_pool is None:
             raise RuntimeError("stub model has no bound physical cache")
-        self._cache_pool.write_locations(0, forward_batch.out_cache_loc, kv, kv)
+        self._cache_pool.write_locations(0, forward_batch.attention.out_cache_loc, kv, kv)
 
         # Token rows encode temporal position into four predictable hidden channels.
         chunks: list[torch.Tensor | None] = [None] * forward_batch.row_count
         token_offset = 0
         for row_index, count in zip(
             forward_batch.token_row_indices,
-            tuple(forward_batch.query_lens_cpu[index] for index in forward_batch.token_row_indices),
+            tuple(
+                forward_batch.attention.query_lens_cpu[index]
+                for index in forward_batch.token_row_indices
+            ),
             strict=True,
         ):
             row_positions = positions[..., token_offset : token_offset + count]
@@ -234,7 +237,10 @@ class StubModel(ExecutionModel):
         row_lengths = [0] * forward_batch.row_count
         for row_index, count in zip(
             forward_batch.token_row_indices,
-            tuple(forward_batch.query_lens_cpu[index] for index in forward_batch.token_row_indices),
+            tuple(
+                forward_batch.attention.query_lens_cpu[index]
+                for index in forward_batch.token_row_indices
+            ),
             strict=True,
         ):
             row_lengths[row_index] = count
@@ -257,7 +263,8 @@ class StubModel(ExecutionModel):
             for row_index, count in zip(
                 forward_batch.token_row_indices,
                 tuple(
-                    forward_batch.query_lens_cpu[index] for index in forward_batch.token_row_indices
+                    forward_batch.attention.query_lens_cpu[index]
+                    for index in forward_batch.token_row_indices
                 ),
                 strict=True,
             ):

@@ -6,13 +6,12 @@ import pytest
 import torch
 
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.batch import DType, ShapeBound, StaticDim, TensorSpec
-from uniserve_worker.execution.bounded_storage import TensorSchema
+from uniserve_worker.execution.cuda_graph import CudaGraph, GraphExecutionError
 from uniserve_worker.execution.forward_batch import ForwardOutput
-from uniserve_worker.execution.graph.backend import GraphExecutionError
-from uniserve_worker.execution.graph.full import FullCudaGraphBackend
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry
+from uniserve_worker.protocol.batch import DType, ShapeBound, StaticDim, TensorSpec
+from uniserve_worker.runtime.tensor_buffers import TensorSchema
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -60,10 +59,10 @@ def test_graph_outputs_survive_independent_and_ordered_replays(shared_pool):
     current = torch.cuda.current_stream(device)
     first_stream.wait_stream(current)
     second_stream.wait_stream(current)
-    first = FullCudaGraphBackend(device=device, stream=first_stream, pool=pool)
-    second = FullCudaGraphBackend(device=device, stream=second_stream, pool=pool)
-    first.capture_one("double", lambda: first_input * 2, keepalive=(first_input,))
-    second.capture_one("offset", lambda: second_input + 7, keepalive=(second_input,))
+    first = CudaGraph(device=device, stream=first_stream, pool=pool)
+    second = CudaGraph(device=device, stream=second_stream, pool=pool)
+    first.capture(lambda: first_input * 2, keepalive=(first_input,))
+    second.capture(lambda: second_input + 7, keepalive=(second_input,))
     # Shared storage requires publication before a different executable runs.
     # Independent entries retain their outputs across the other stream's work.
     retained = []
@@ -73,13 +72,13 @@ def test_graph_outputs_survive_independent_and_ordered_replays(shared_pool):
     for offset in (1, 3):
         with torch.cuda.stream(first_stream):
             first_input.copy_(source)
-            first_value = first.replay("double")
+            first_value = first.replay()
             if shared_pool:
                 published = ForwardOutput((first_value,)).clone().values[0]
                 retained.append((published, source * 2))
         with torch.cuda.stream(second_stream):
             second_input.copy_(source)
-            second_value = second.replay("offset")
+            second_value = second.replay()
         current.wait_stream(first_stream)
         current.wait_stream(second_stream)
         torch.testing.assert_close(published if shared_pool else first_value, source * 2)
@@ -93,7 +92,7 @@ def test_graph_outputs_survive_independent_and_ordered_replays(shared_pool):
     first.close()
     second.close()
     with pytest.raises(GraphExecutionError, match="closed"):
-        first.replay("double")
+        first.replay()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -157,11 +156,9 @@ def test_capture_restores_state_and_failed_capture_preserves_other_computations(
     device = torch.device("cuda", 0)
     state = torch.full((32,), 7.0, device=device)
     baseline = state.clone()
-    backend = FullCudaGraphBackend(
-        device=device,
-        stream=torch.cuda.Stream(device=device),
-        pool=torch.cuda.graph_pool_handle(),
-    )
+    stream = torch.cuda.Stream(device=device)
+    graph = CudaGraph(device=device, stream=stream)
+    failed = CudaGraph(device=device, stream=stream)
 
     def advance():
         state.add_(3)
@@ -174,31 +171,24 @@ def test_capture_restores_state_and_failed_capture_preserves_other_computations(
         return state * 2
 
     try:
-        with pytest.raises(ValueError, match="invalid numerical input"):
-            backend.capture_one("first", rejected, restore=lambda: state.copy_(baseline))
-        backend.capture_one(
-            "step", advance, keepalive=(state,), restore=lambda: state.copy_(baseline)
-        )
+        graph.capture(advance, keepalive=(state,), restore=lambda: state.copy_(baseline))
         torch.testing.assert_close(state, baseline, rtol=0, atol=0)
-        with pytest.raises(GraphExecutionError, match="already exists"):
-            backend.capture_one("step", advance)
+        with pytest.raises(GraphExecutionError, match="already captured"):
+            graph.capture(advance)
         with pytest.raises(ValueError, match="invalid numerical input"):
-            backend.capture_one("rejected", rejected, restore=lambda: state.copy_(baseline))
+            failed.capture(rejected, restore=lambda: state.copy_(baseline))
         torch.testing.assert_close(state, baseline, rtol=0, atol=0)
-        with pytest.raises(GraphExecutionError, match="not resident"):
-            backend.replay("rejected")
-        torch.testing.assert_close(backend.replay("step"), (baseline + 3) * 2, rtol=0, atol=0)
+        with pytest.raises(GraphExecutionError, match="not captured"):
+            failed.replay()
+        torch.testing.assert_close(graph.replay(), (baseline + 3) * 2, rtol=0, atol=0)
         torch.testing.assert_close(state, baseline + 3, rtol=0, atol=0)
-        torch.cuda.current_stream(device).synchronize()
-        backend.discard("step")
-        with pytest.raises(GraphExecutionError, match="not resident"):
-            backend.replay("step")
     finally:
         torch.cuda.current_stream(device).synchronize()
-        backend.close()
-        backend.close()
+        graph.close()
+        graph.close()
+        failed.close()
     with pytest.raises(GraphExecutionError, match="closed"):
-        backend.capture_one("closed", advance)
+        graph.capture(advance)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -206,7 +196,7 @@ def test_capture_restores_state_and_failed_capture_preserves_other_computations(
 @torch.inference_mode()
 def test_denoising_first_use_and_slot_geometry_changes_advance_one_step(graphs):
     from uniserve_worker.execution.denoising import DenoisingStep
-    from uniserve_worker.execution.runners.denoise import DenoiseRunner
+    from uniserve_worker.execution.diffusion_runner import DiffusionRunner
     from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
 
     device = torch.device("cuda", 0)
@@ -217,20 +207,12 @@ def test_denoising_first_use_and_slot_geometry_changes_advance_one_step(graphs):
             lambda: (sample * 0.25 + geometry,), (sample,), lambda values: None, schedule, step
         )
 
-    backend = (
-        FullCudaGraphBackend(
-            device=device,
-            stream=torch.cuda.Stream(device=device),
-            pool=torch.cuda.graph_pool_handle(),
-        )
-        if graphs
-        else None
-    )
-    runner = DenoiseRunner(
+    capture_stream = torch.cuda.Stream(device=device) if graphs else None
+    runner = DiffusionRunner(
         bind,
         lambda sample, geometry: (sample.shape, geometry),
         device=device,
-        backend=backend,
+        capture_stream=capture_stream,
         groups=(),
         capacity=2,
     )
@@ -242,12 +224,12 @@ def test_denoising_first_use_and_slot_geometry_changes_advance_one_step(graphs):
             torch.testing.assert_close(sample, reference, rtol=0, atol=0)
             for step in (0, 1):
                 expected = bind(reference, geometry, step, schedule)()[0].clone()
-                (actual,), _ = runner.run(
+                (actual,), _ = runner.step(
                     sample, geometry, step, schedule, slot=slot, geometry=geometry
                 )
                 torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
             torch.cuda.current_stream(device).synchronize()
-            runner.discard_slot(slot)
+            runner.release_slot(slot)
     finally:
         torch.cuda.current_stream(device).synchronize()
         runner.close()

@@ -7,6 +7,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from uniserve_worker.bootstrap.distributed import initialize_entries, initialize_process_groups
 from uniserve_worker.loader.handles import TensorWeightHandle
 from uniserve_worker.loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
 from uniserve_worker.nn.layer import LayerConfig
@@ -19,7 +20,7 @@ from uniserve_worker.nn.linear import (
 from uniserve_worker.nn.mesh import DeviceMesh
 from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig, SequenceParallel
 from uniserve_worker.nn.vocab_parallel_embedding import VocabParallelEmbedding
-from uniserve_worker.runtime.distributed import init_distributed_environment
+from uniserve_worker.runtime.peer_memory import allocate_symmetric_memory
 
 pytestmark = pytest.mark.integration
 
@@ -27,7 +28,7 @@ pytestmark = pytest.mark.integration
 @torch.inference_mode()
 def _run_groups(rank: int, rendezvous: str, backend: str):
     device = f"cuda:{rank}" if backend == "nccl" else "cpu"
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=4,
@@ -35,7 +36,8 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
         backend=backend,
         init_method=rendezvous,
     )
-    bindings = environment.initialize_entries(
+    bindings = initialize_entries(
+        environment,
         {
             "denoiser": ComponentConfig(
                 (0, 1, 2, 3),
@@ -46,11 +48,11 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
             "decoder": ComponentConfig((3, 1), distribution="temporal_units", units_per_rank=2),
         },
     )
-    meshes = bindings.meshes
-    assert bindings.input_ranks("decoder") == (3, 1)
-    assert bindings.output_ranks("decoder") == (3, 1)
-    assert bindings.owns("decoder") == (rank in (3, 1))
-    if bindings.owns("decoder"):
+    meshes = {name: entry.mesh for name, entry in bindings.items() if entry.mesh is not None}
+    assert bindings["decoder"].input_ranks == (3, 1)
+    assert bindings["decoder"].output_ranks == (3, 1)
+    assert ("decoder" in bindings and bindings["decoder"].owns) == (rank in (3, 1))
+    if "decoder" in bindings and bindings["decoder"].owns:
         value = torch.tensor([rank + 1.0], device=device)
         result = meshes["decoder"].get_group("tp").all_reduce(value.clone())
         torch.testing.assert_close(result, value, rtol=0, atol=0)
@@ -134,12 +136,10 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
                 ]
             )
             torch.testing.assert_close(exchanged, reference, rtol=0, atol=0)
-            workspace = environment.symmetric_memory(
+            workspace = allocate_symmetric_memory(
                 group,
                 (rows, count * local_heads, width),
                 dtype=torch.bfloat16,
-                name="attention_output",
-                layout=(),
             )
             global_rows = rows * count
             attended = torch.full(

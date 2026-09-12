@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import torch
 
 from ...nn.parallel_attention import (
-    AttentionContextWorkspace,
+    AttentionBuffers,
     AttentionOutputTargets,
     AttentionRowExchange,
     ParallelAttention,
@@ -381,7 +381,7 @@ class VideoSparseAttentionBackend:
         outputs: tuple[torch.Tensor, ...],
         sync_input: torch.Tensor,
         sync_output: torch.Tensor,
-        context_workspace: AttentionContextWorkspace | None,
+        context_workspace: AttentionBuffers | None,
         consume_row_intervals: bool = False,
         prepared_inputs: PreparedVideoSparseInputs | None = None,
     ) -> torch.Tensor | AttentionRowExchange:

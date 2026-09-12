@@ -10,12 +10,11 @@ from typing import cast
 import torch
 
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.batch import COMPUTATIONS, Computation
 from uniserve_worker.nn.mesh import Communicator
 from uniserve_worker.nn.parallel import ComponentConfig
+from uniserve_worker.protocol.batch import COMPUTATIONS, Computation
 
 from ..config import graph_memory_budget_bytes, graph_padding_block_count
-from ..execution.batch import WorkerEndpoint
 from ..execution.input_buffers import InputGeometry
 from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..foundation.math import ceil_div
@@ -23,9 +22,10 @@ from ..models.generation import GenerationPipeline, LatentLayout
 from ..models.runtime import ExecutionModel, active_latent_capacity_tokens
 from ..nn.linear import LinearBase
 from ..nn.quant.base import LinearMethod
-from ..runtime.cache_transfer import cache_transfer_workspace_bytes
-from ..runtime.req_to_token_pool import ReqToTokenPool
-from ..runtime.runtime_states import RuntimeStates
+from ..protocol.batch import WorkerEndpoint
+from ..runtime.block_tables import BlockTables
+from ..runtime.cache_imports import cache_transfer_workspace_bytes
+from ..runtime.decode_state import DecodeState
 from .capacity import (
     ArenaCapacity,
     derive_runtime_kv_capacity,
@@ -338,12 +338,12 @@ def _token_worker_layout(
         for device in devices:
             fixed_bytes[device] += input_bytes * max(1, len(worker_config.lanes))
         schemas = (
-            ReqToTokenPool.tensor_schema(
+            BlockTables.tensor_schema(
                 group_count=1,
                 request_pool_size=worker_config.max_request_pool_size,
                 max_blocks_per_request=input_geometry.max_blocks_per_row,
             ),
-            RuntimeStates.tensor_schema(
+            DecodeState.tensor_schema(
                 request_pool_size=worker_config.max_request_pool_size,
                 vocab_size=model.vocab_size,
                 continuation_width=1,

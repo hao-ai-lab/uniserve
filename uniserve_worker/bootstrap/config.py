@@ -7,8 +7,8 @@ import math
 import os
 from dataclasses import dataclass
 
-from uniserve_worker.execution.batch import Computation, ForwardMode, PipelineStage, TransferMode
 from uniserve_worker.nn.parallel import ComponentConfig, parse_entries
+from uniserve_worker.protocol.batch import Computation, ForwardMode, PipelineStage, TransferMode
 
 from ..config import WorkerConfig, worker_config_from_namespace
 from ..loader.config import LoadConfig

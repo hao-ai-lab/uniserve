@@ -11,7 +11,7 @@ use super::{RankProcess, RunSubmitError};
 use crate::executor::{WorkerExecError, WorkerFailure};
 use anyhow::Context;
 use sha2::{Digest as _, Sha256};
-use uniserve_worker_ipc::{BatchCommand, RequestKey, Run as PhysicalRun, WorkerInfo};
+use uniserve_worker_ipc::{BatchCommand, RequestKey, ScheduleBatch, WorkerInfo};
 
 use crate::worker::WorkerProcessArgs;
 
@@ -78,7 +78,7 @@ type OperationIdentity = (u64, u64, u64, uniserve_worker_ipc::ComputationId);
 
 /// A physical batch and its participating ranks share one retirement lifetime.
 struct PendingBatch {
-    run: PhysicalRun,
+    run: ScheduleBatch,
     remaining: BTreeSet<OperationIdentity>,
     ranks: BTreeMap<usize, RankResult>,
 }
@@ -696,10 +696,10 @@ impl WorkerGroup {
 /// storage commands retain group-wide visibility, including on otherwise idle
 /// ranks; they do not create synthetic computation completions.
 fn split_rank_runs(
-    batch: &PhysicalRun,
+    batch: &ScheduleBatch,
     entries: &BTreeMap<String, crate::ComponentConfig>,
     rank_count: usize,
-) -> anyhow::Result<Vec<(usize, PhysicalRun)>> {
+) -> anyhow::Result<Vec<(usize, ScheduleBatch)>> {
     let members = batch
         .operations
         .iter()
@@ -802,7 +802,7 @@ fn split_rank_runs(
 /// once, when its final operation is consumed; they are never divided or copied.
 fn take_rank_operations(
     buffer: &mut VecDeque<WorkerResult>,
-    batch: &PhysicalRun,
+    batch: &ScheduleBatch,
     identities: &[OperationIdentity],
     retain_forward_stats: bool,
 ) -> anyhow::Result<WorkerResult> {
@@ -888,7 +888,7 @@ fn report_operation_ids(report: &WorkerResult) -> Vec<OperationIdentity> {
 /// Every participant agrees on semantic completion; only the output owner
 /// publishes host products.
 fn merge_rank_report(
-    batch: &PhysicalRun,
+    batch: &ScheduleBatch,
     canonical_report: &mut WorkerResult,
     participant_report: &WorkerResult,
     rank: usize,
@@ -957,7 +957,7 @@ fn merge_rank_report(
 
 /// Validates a rank report and orders completions to match the submitted operation sequence.
 fn validate_and_order_rank_report(
-    batch: &PhysicalRun,
+    batch: &ScheduleBatch,
     report: &mut WorkerResult,
     rank: usize,
 ) -> anyhow::Result<()> {
@@ -1160,7 +1160,7 @@ impl WorkerGroup {
     }
 
     /// Submit each operation to its entry members and lifetime commands to the rank group.
-    pub fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), RunSubmitError> {
+    pub fn submit_run(&mut self, batch: ScheduleBatch) -> Result<(), RunSubmitError> {
         if self.closed {
             return Err(RunSubmitError::Failed(anyhow::anyhow!(
                 "WorkerGroup is closed"

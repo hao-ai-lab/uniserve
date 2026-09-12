@@ -8,7 +8,7 @@ from enum import StrEnum
 from typing import cast
 
 from ..config import WorkerConfig
-from ..nn.mesh import EntryBindings
+from ..execution.model_entry import ModelEntry
 
 __all__ = ["LoadConfig", "LoadFormat", "LoadRequest"]
 
@@ -112,7 +112,7 @@ class LoadRequest:
 
     model_path: str
     execution: WorkerConfig
-    bindings: EntryBindings
+    bindings: Mapping[str, ModelEntry]
     load: LoadConfig = LoadConfig()
     quantization_config: Mapping[str, object] = field(default_factory=dict)
     max_text_rows: int = 8192

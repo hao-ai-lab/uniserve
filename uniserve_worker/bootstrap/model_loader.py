@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 
+from ..execution.model_entry import ModelEntry
 from ..loader import LoadedModel, LoadRequest, load_model
-from ..nn.mesh import EntryBindings
 from .config import WorkerProcessArgs
 
 
-def load_worker_model(config: WorkerProcessArgs, bindings: EntryBindings) -> LoadedModel:
+def load_worker_model(config: WorkerProcessArgs, bindings: Mapping[str, ModelEntry]) -> LoadedModel:
     """Load the checkpoint or the explicitly enabled deterministic stub."""
 
     if config.use_stub_model:

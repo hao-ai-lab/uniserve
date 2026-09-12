@@ -52,9 +52,10 @@ def test_architecture_without_variant_metadata_is_rejected(tmp_path):
 def test_parallel_placement_preserves_global_modality_rows_with_eight_sequence_owners():
     import torch
 
+    from uniserve_worker.execution.model_entry import ModelEntry
     from uniserve_worker.models.minimax_h3.layout import H3Layout
     from uniserve_worker.models.minimax_h3.weights import validate_h3_entries
-    from uniserve_worker.nn.mesh import Communicator, DeviceMesh, EntryBindings
+    from uniserve_worker.nn.mesh import Communicator, DeviceMesh
     from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig, SequenceParallel
 
     ranks = tuple(range(7, -1, -1))
@@ -62,11 +63,12 @@ def test_parallel_placement_preserves_global_modality_rows_with_eight_sequence_o
     entry = ComponentConfig(ranks, config)
     layouts = []
     for rank in ranks:
-        bindings = EntryBindings(
-            {"denoiser": entry},
-            {"denoiser": DeviceMesh(ranks, rank, config)},
-            Communicator(ranks=ranks, rank=rank),
-        )
+        group = Communicator(ranks=ranks, rank=rank)
+        bindings = {
+            "denoiser": ModelEntry(
+                "denoiser", entry, group, DeviceMesh(ranks, rank, config), group.device
+            )
+        }
         validate_h3_entries(bindings)
         layouts.append(H3Layout.build(bindings, frames=22, text_rows=128, audio_frames=8))
     for modality in ("text_indices", "video_indices", "audio_indices"):

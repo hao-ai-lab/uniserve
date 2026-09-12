@@ -80,7 +80,7 @@ class ModelLoader:
 
         if request.load.load_format is not self.load_format:
             raise ValueError("loader format disagrees with the load request")
-        unknown = set(request.bindings.entries) - set(entry.components)
+        unknown = set(request.bindings) - set(entry.components)
         if unknown:
             raise unsupported_setup(
                 f"{entry.architecture} has no computation entries {sorted(unknown)}"
@@ -167,6 +167,10 @@ class ModelLoader:
         if not isinstance(model, ExecutionModel):
             raise unsupported_setup(f"{type(model).__name__} must implement ExecutionModel")
         model.eval()
+        # Loading and execution retain the same placement and local mesh objects.
+        model.bindings = dict(request.bindings)
+        for name, binding in model.bindings.items():
+            binding.output_schema = model.entry_outputs.get(name, ())
         return LoadedModel(
             model=model,
             tokenizer=construction.tokenizer,
@@ -275,7 +279,7 @@ def audit_component(component: CheckpointComponent, report: LoadReport) -> None:
     """Require all resident parameters and declared persistent buffers to be loaded."""
 
     included = component_parameter_names(component)
-    if component.persistent_buffers:
+    if component.buffer_pool:
         included.update(_persistent_buffers(component.module))
     audit_load_report(
         component.module,
@@ -359,7 +363,7 @@ def _load_declared_weights(
 ) -> LoadReport:
     parameters = dict(component.module.named_parameters())
     included = component_parameter_names(component)
-    buffers = _persistent_buffers(component.module) if component.persistent_buffers else {}
+    buffers = _persistent_buffers(component.module) if component.buffer_pool else {}
     report = LoadReport()
     for handle in handles:
         name, shard = stacked_weight_name(handle.name, component.weight_name_map)

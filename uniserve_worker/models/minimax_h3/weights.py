@@ -13,6 +13,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from ...execution.model_entry import ModelEntry
 from ...loader.component import (
     CheckpointComponent,
     ModelBuildContext,
@@ -25,7 +26,7 @@ from ...loader.weight_loaders import attach_parameter_loaders, load_parameter_we
 from ...nn.diffusion.schedule import DiffusionSchedule
 from ...nn.layer import LayerConfig
 from ...nn.linear import LinearBase
-from ...nn.mesh import Communicator, EntryBindings
+from ...nn.mesh import Communicator
 from ...nn.quant.config import QuantizationConfig
 from .audio_vae import MiniMaxH3AudioVAE
 from .config import H3TransformerConfig, resolve_h3_contract
@@ -51,13 +52,14 @@ class H3Components:
     audio_vae: MiniMaxH3AudioVAE | None
 
 
-def validate_h3_entries(bindings: EntryBindings) -> None:
+def validate_h3_entries(bindings: Mapping[str, ModelEntry]) -> None:
     """Validate component placement before constructing checkpoint modules."""
 
     expected = {"denoiser", "text_encoder", "video_decoder", "audio_decoder", "output"}
-    if not bindings.entries or not set(bindings.entries) <= expected:
+    if not bindings or not set(bindings) <= expected:
         raise ValueError(f"H3 entries must belong to {sorted(expected)}")
-    for name, component in bindings.entries.items():
+    for name, entry in bindings.items():
+        component = entry.config
         config = component.parallel_config
         if name == "video_decoder":
             if component.distribution != "temporal_units" or component.units_per_rank != 1:
@@ -278,7 +280,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
         raise ValueError("H3 construction requires its diffusion schedule")
     validate_h3_entries(bindings)
     require_h3_checkpoint(context.root)
-    device = bindings.process_group.device
+    device = torch.device(request.execution.device)
     precisions = context.component_precisions
     text_capacity = ((int(request.max_text_rows) + 63) // 64) * 64
     raw_frames = math.floor(float(request.max_video_seconds) * 24.0 + 0.5)
@@ -294,7 +296,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
     components = []
     transformer = encoder = video_decoder = audio_decoder = None
     conditioner = None
-    mesh = bindings.meshes.get("denoiser")
+    mesh = bindings["denoiser"].mesh if "denoiser" in bindings else None
     if mesh is not None:
         transformer = MiniMaxH3Transformer(
             mesh,
@@ -328,7 +330,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
                 ),
             )
         )
-    mesh = bindings.meshes.get("text_encoder")
+    mesh = bindings["text_encoder"].mesh if "text_encoder" in bindings else None
     if mesh is not None:
         encoder = MiniMaxH3TextEncoder(
             mesh,
@@ -344,7 +346,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
                 dtype=torch.bfloat16,
             )
         )
-    if bindings.owns("video_decoder"):
+    if "video_decoder" in bindings and bindings["video_decoder"].owns:
         precision = precisions["video_vae"]
         dense = precision in {"fp16", "bf16"}
         dtype = torch.float16 if precision == "fp16" else torch.bfloat16
@@ -377,7 +379,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
                 strict=False,
             )
         )
-    if bindings.owns("audio_decoder"):
+    if "audio_decoder" in bindings and bindings["audio_decoder"].owns:
         from diffusers import AutoencoderKLMiniMaxH3Audio
 
         audio_config = json.loads((context.root / "audio_vae" / "config.json").read_text())
@@ -388,7 +390,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
                 audio_decoder,
                 source="audio_decoder",
                 dtype=torch.float32,
-                persistent_buffers=True,
+                buffer_pool=True,
             )
         )
 

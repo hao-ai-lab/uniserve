@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve_worker.execution.batch import (
+from uniserve_worker.execution.output import PendingOutput
+from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.media.codec import quantize_image_hwc, uint8_image_to_png_base64_bytes
+from uniserve_worker.models.generation import LatentLayout, Materialization
+from uniserve_worker.models.inputs import FeatureInjection, FeatureLayout, PatchTransform
+from uniserve_worker.models.runtime import PositionLayout
+from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
+from uniserve_worker.protocol.batch import (
     EncoderTransferValue,
     FinishFlags,
     ForwardMode,
@@ -19,36 +27,21 @@ from uniserve_worker.execution.batch import (
     TensorRef,
     TensorTransfer,
 )
-from uniserve_worker.execution.output import (
-    ImageEncoding,
-)
-from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.media.codec import quantize_image_hwc
-from uniserve_worker.models.generation import LatentLayout, Materialization
-from uniserve_worker.models.inputs import FeatureInjection, FeatureLayout, PatchTransform
-from uniserve_worker.models.runtime import PositionLayout
-from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
-from uniserve_worker.runtime.device_products import (
-    DeviceProductMetadata,
-    DeviceProductWrite,
+from uniserve_worker.runtime.cpu import CpuTask
+from uniserve_worker.runtime.tensor_store import (
+    FeatureMetadata,
+    ImageMetadata,
     ImageRange,
+    TensorRecord,
 )
-from uniserve_worker.runtime.encoder_cache import EncoderMetadata, EncoderWrite
-from uniserve_worker.runtime.latent_pool import LatentRelease
 from uniserve_worker.transfer.tickets import publish_tensor
 
-from ..runtime.latent_pool import require_latent_pool
 from . import operations as operation_geometry
 from . import transfer
+from .batch_state import BatchState
 from .forward_batch import TokenSelection
-from .image_input import PreparedImage, patch_grid_shape, prepare_image, prepare_tensor_image
-from .rows import (
-    ForwardRow,
-    LaneState,
-    OperationState,
-    Outcome,
-    StateOutcome,
-)
+from .image_input import ImageInputs, patch_grid_shape, prepare_image, prepare_tensor_image
+from .rows import ForwardRow
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -57,118 +50,27 @@ if TYPE_CHECKING:
 
     from ..bootstrap.worker_info import WorkerInfo
     from ..config import WorkerConfig
-    from ..runtime.device_products import DeviceProducts
-    from ..runtime.encoder_cache import EncoderCache
+    from ..runtime.block_tables import BlockTables
     from ..runtime.latent_pool import LatentPool
-    from ..runtime.req_to_token_pool import ReqToTokenPool
+    from ..runtime.tensor_store import TensorStore
     from ..transfer.tickets import Transport
     from .model_runner import ModelRunner
 
 
-def pack_forward(
-    state: OperationState,
+def text(
+    operation: ScheduledRequest,
+    completion_group: int,
     *,
-    device_products: DeviceProducts,
-    latent_pool: LatentPool | None,
-    model_runner: ModelRunner,
-    config: WorkerConfig,
-) -> tuple[ForwardRow, ...]:
-    """Pack an encoder or latent-decoder operation into a single-row model forward."""
-
-    if state.phase != "initial":
-        return ()
-    if state.operation.kind in {PipelineStage.VISION_ENCODING, PipelineStage.LATENT_ENCODING}:
-        return _pack_encode(
-            state,
-            device_products=device_products,
-            model_runner=model_runner,
-            config=config,
-        )
-    if state.operation.kind is PipelineStage.IMAGE_DECODING:
-        return _pack_diffusion_finalize(
-            state,
-            latent_pool=latent_pool,
-            model_runner=model_runner,
-        )
-    return ()
-
-
-def consume_forward(
-    state: OperationState,
-    outputs: tuple[torch.Tensor, ...],
-    *,
-    device_products: DeviceProducts,
-    encoder_cache: EncoderCache,
-    worker_info: WorkerInfo,
-    publication_transports: Mapping[str, Transport],
-    config: WorkerConfig,
-) -> None:
-    """Publish encoder features or begin deferred latent reconstruction from model output."""
-
-    if state.phase != "forward_pending" or len(outputs) != 1:
-        raise RuntimeError("encode forward result is not aligned")
-    if state.data["mode"] == "encode":
-        _consume_encode(
-            state,
-            outputs[0],
-            encoder_cache=encoder_cache,
-            worker_info=worker_info,
-            publication_transports=publication_transports,
-            config=config,
-        )
-    else:
-        state.data["image_tensor"] = decoded_tensor(outputs[0]).detach()
-        state.data["image_range"] = ImageRange.UNIT
-        _finish_diffusion_finalize(state, device_products=device_products)
-
-
-def run_action(
-    state: OperationState,
-    *,
-    device_products: DeviceProducts,
-    encoder_cache: EncoderCache,
+    state: BatchState,
+    tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
     model_runner: ModelRunner,
-) -> bool:
-    """Execute encoder finalization work that does not require a model forward."""
-
-    if state.phase == "initial" and state.operation.kind is PipelineStage.TEXT_ENCODING:
-        _encode_text(
-            state,
-            device_products=device_products,
-            encoder_cache=encoder_cache,
-            publication_transports=publication_transports,
-            model_runner=model_runner,
-        )
-        return True
-    if state.phase != "action":
-        return False
-    if state.data["mode"] == "frames":
-        state.outcome = diffusion_finalize_frames(
-            state.operation,
-            state.lane,
-            device_products=device_products,
-            encoder_cache=encoder_cache,
-            model_runner=model_runner,
-        )
-        state.phase = "done"
-        return True
-    _finish_diffusion_finalize(state, device_products=device_products)
-    return True
-
-
-def _encode_text(
-    state: OperationState,
-    *,
-    device_products: DeviceProducts,
-    encoder_cache: EncoderCache,
-    publication_transports: Mapping[str, Transport],
-    model_runner: ModelRunner,
-) -> None:
+) -> PendingOutput:
     """Encode admitted conditioning tokens and publish their declared tensors."""
 
-    operation, scope = state.operation, state.lane
-    request = operation_geometry.request_row(scope, operation.request_key.request_id)
+    request = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
+    )
     admission = request.request.admission
     if admission.diffusion is None or not admission.prompt_token_ids:
         raise invalid_descriptor("text conditioning requires admitted prompt tokens")
@@ -184,33 +86,32 @@ def _encode_text(
     products = transfer.publish_tensors(
         operation,
         result.values,
-        scope,
-        device_products=device_products,
-        encoder_cache=encoder_cache,
+        completion_group,
+        tensor_store=tensor_store,
         publication_transports=publication_transports,
+        state=state,
     )
-    scope.observations.append(result.observation)
-    state.outcome = Outcome(
-        status=OpStatus.OK,
-        runtime=operation_geometry.execution_runtime(request, None),
-        finish_flags=FinishFlags(),
-        product_generations=tuple(output.generation for output in operation.tensor_outputs()),
-        products=products,
-    )
-    state.phase = "done"
+    if result.stats is None:
+        raise RuntimeError("module output has no execution statistics")
+    state.group_forward_stats[completion_group].append(result.stats)
+    request.status = OpStatus.OK
+    request.projected_progress = operation_geometry.execution_runtime(request, None)
+    request.finish_flags = FinishFlags()
+    request.product_generations = tuple(output.generation for output in operation.tensor_outputs())
+    request.products = products
+    return request
 
 
-def _pack_encode(
-    state: OperationState,
+def prepare_features(
+    operation: ScheduledRequest,
+    completion_group: int,
     *,
-    device_products: DeviceProducts,
+    state: BatchState,
+    tensor_store: TensorStore,
     model_runner: ModelRunner,
-    config: WorkerConfig,
-) -> tuple[ForwardRow, ...]:
+) -> ImageInputs:
     """Stage image tensors and build the model batch for one encoder operation."""
 
-    operation = state.operation
-    scope = state.lane
     image_processor = model_runner.image_processor()
     mode = operation.kind
     if not isinstance(mode, PipelineStage) or mode not in {
@@ -224,13 +125,13 @@ def _pack_encode(
     if int(feature_output.generation) < 1:
         raise invalid_descriptor("encode feature output requires a positive generation")
     source = encode_source(
-        operation, scope, device_products=device_products, model_runner=model_runner
+        operation,
+        completion_group,
+        tensor_store=tensor_store,
+        model_runner=model_runner,
+        state=state,
     )
-    target_device = (
-        torch.device((config.generation_device or config.device))
-        if mode is PipelineStage.LATENT_ENCODING
-        else torch.device(config.device)
-    )
+    target_device = model_runner.operation_devices(operation)[1]
     if isinstance(source, tuple):
         source_tensor, source_metadata = source
         prepared = prepare_tensor_image(
@@ -242,39 +143,35 @@ def _pack_encode(
         )
     else:
         prepared = prepare_image(image_processor, mode, source, device=target_device)
-    task = encode_row(operation, mode, prepared, scope)
-    state.data.update(
-        mode="encode",
-        prepared=prepared,
-        feature_output=feature_output,
-        task=task,
-    )
-    state.rows = (task,)
-    state.phase = "forward_pending"
-    return state.rows
+    return prepared
 
 
-def _consume_encode(
-    state: OperationState,
+def publish_features(
+    operation: ScheduledRequest,
+    completion_group: int,
+    prepared: ImageInputs,
     output: torch.Tensor,
     *,
-    encoder_cache: EncoderCache,
+    state: BatchState,
+    tensor_store: TensorStore,
     worker_info: WorkerInfo,
     publication_transports: Mapping[str, Transport],
     config: WorkerConfig,
-) -> None:
+) -> PendingOutput:
     """Split encoded features by request and prepare cache or product publication."""
 
-    operation = state.operation
-    scope = state.lane
-    prepared = state.data["prepared"]
-    feature_output = state.data["feature_output"]
-    features = encode_features(output).detach()
-    write = bound_encoder_write(scope, feature_output)
-    resident = encoder_cache.publish(
+    request = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
+    )
+    feature_output = operation.encoder_output
+    if feature_output is None:
+        raise invalid_descriptor("encoder output has no feature reference")
+    features = output.detach()
+    write = bound_encoder_write(completion_group, feature_output, state=state)
+    resident = tensor_store.publish_write(
         write,
         features,
-        EncoderMetadata(height=prepared.height, width=prepared.width),
+        metadata=FeatureMetadata(height=prepared.height, width=prepared.width),
     )
     products: tuple[TensorPublication, ...] = ()
     if any(
@@ -283,10 +180,12 @@ def _consume_encode(
         locations = publish_tensor(
             publication_transports,
             resident,
-            retain=partial(encoder_cache.retain_publication, write),
+            retain=partial(tensor_store.retain_publication, write),
         )
-        scope.published.extend(locations)
-        scope.stage_publications[feature_output.buffer_id] = locations
+        request.exported_locators.extend(locations)
+        request.tensor_exports[feature_output.buffer_id] = tuple(
+            (publication_transports[location.backend], location) for location in locations
+        )
         descriptor = EncoderTransferValue(
             tensor=TensorTransfer(shape=tuple(resident.shape), locations=locations),
             payload_kind="vision_feature"
@@ -296,219 +195,220 @@ def _consume_encode(
             width=prepared.width,
         )
         products = (TensorPublication(product=feature_output, value=descriptor),)
-    state.outcome = non_state_outcome(operation, scope, products=products)
-    state.phase = "done"
+    return non_state_outcome(operation, completion_group, products=products, state=state)
 
 
-def _pack_diffusion_finalize(
-    state: OperationState,
+def materialization_latent(
+    operation: ScheduledRequest,
+    completion_group: int,
     *,
-    latent_pool: LatentPool | None,
+    state: BatchState,
+    latent_pool: LatentPool,
     model_runner: ModelRunner,
-) -> tuple[ForwardRow, ...]:
+) -> torch.Tensor:
     """Gather the final latent trajectory and build its decoder batch."""
 
-    operation = state.operation
-    scope = state.lane
-    request = operation_geometry.request_row(scope, operation.request_key.request_id)
+    request = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
+    )
     latent_input = operation.latent_input
     if latent_input is None:
-        state.data["mode"] = "frames"
-        state.phase = "action"
-        return ()
-    if int(latent_input.generation) < 1 or request.latent_product != latent_input:
+        raise invalid_descriptor("latent materialization requires a latent input")
+    if (
+        int(latent_input.generation) < 1
+        or operation_geometry.require_progress(request).latent_product != latent_input
+    ):
         raise invalid_descriptor("materialization does not name the current latent generation")
     flow = model_runner.generation()
     image_params = request.request.image
     if image_params is None:
         raise invalid_descriptor("image materialization has no admitted image parameters")
-    row = operation_geometry.latent_row(operation, scope)
-    if int(row.params.start_step) != int(image_params.steps):
+    row = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
+    )
+    params = row.input_latent_params
+    staging = row.latent_staging
+    if params is None or staging is None:
+        raise invalid_descriptor("trajectory operation has no staged latent inputs")
+    if int(params.start_step) != int(image_params.steps):
         raise invalid_descriptor("image materialization requires a completed latent trajectory")
-    current = require_latent_pool(latent_pool).gather_current(
-        row.request_pool_idx,
-        row.staging,
-        step=int(row.params.start_step),
+    current = latent_pool.gather_current(
+        row.request.request_pool_idx,
+        staging,
+        step=int(params.start_step),
         generation=int(latent_input.generation),
-        latent_units=int(row.params.latent_units),
-        height=int(row.params.height),
-        width=int(row.params.width),
+        latent_units=int(params.latent_units),
+        height=int(params.height),
+        width=int(params.width),
     )
-    latent = flow.materialization_latent(current, int(row.params.height), int(row.params.width))
-    state.data.update(
-        mode="diffusion_finalize",
-        latent_input=latent_input,
-        row=row,
-    )
-    if flow.materialization is Materialization.DECODE_ROUTE:
-        task = ForwardRow(
-            operation=operation,
-            request=request,
-            forward_mode=PipelineStage.IMAGE_DECODING,
-            latent=latent,
-            image_height=int(row.params.height),
-            image_width=int(row.params.width),
-        )
-        state.data["task"] = task
-        state.rows = (task,)
-        state.phase = "forward_pending"
-        return state.rows
-    if flow.materialization is not Materialization.RGB_LATENT:
+    latent = flow.materialization_latent(current, int(params.height), int(params.width))
+    if flow.materialization not in {Materialization.DECODE_ROUTE, Materialization.RGB_LATENT}:
         raise invalid_descriptor("model declares an unknown image materialization kind")
-    state.data["image_tensor"] = latent.detach()
-    state.data["image_range"] = ImageRange.SIGNED_UNIT
-    state.phase = "action"
-    return ()
+    return latent
 
 
-def _finish_diffusion_finalize(state: OperationState, *, device_products: DeviceProducts) -> None:
+def publish_image(
+    operation: ScheduledRequest,
+    completion_group: int,
+    image_tensor: torch.Tensor,
+    image_range: ImageRange,
+    *,
+    state: BatchState,
+    tensor_store: TensorStore,
+) -> PendingOutput:
     """Decode final latents and schedule bounded image-output publication."""
 
-    operation = state.operation
-    scope = state.lane
-    request = operation_geometry.request_row(state.lane, state.operation.request_key.request_id)
-    row = state.data["row"]
-    latent_input = state.data["latent_input"]
-    image_tensor = state.data["image_tensor"]
-    image_range = state.data["image_range"]
+    request = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
+    )
+    row = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
+    )
+    params = row.input_latent_params
+    staging = row.latent_staging
+    if params is None or staging is None:
+        raise invalid_descriptor("trajectory operation has no staged latent inputs")
+    latent_input = operation.latent_input
+    if latent_input is None:
+        raise invalid_descriptor("image publication lost its latent input")
     resident_output = operation.image_output
     if resident_output is not None:
         if int(resident_output.generation) < 1:
             raise invalid_descriptor("finalized resident image requires a positive generation")
-        write = bound_device_write(scope, resident_output)
+        write = bound_device_write(completion_group, resident_output, state=state)
         # Feedback storage uses the declared model dtype; preserve the decoder's
         # existing conversion before handing the value to the tensor store.
-        storage = device_products.producer_write_views((write,))[0]
-        device_products.publish_write(
+        storage = tensor_store.producer_write_views((write,))[0]
+        tensor_store.publish_write(
             write,
             image_tensor.to(dtype=storage.dtype),
-            metadata=DeviceProductMetadata(
-                height=int(row.params.height),
-                width=int(row.params.width),
+            metadata=ImageMetadata(
+                height=int(params.height),
+                width=int(params.width),
                 value_range=image_range,
             ),
         )
-        scope.operation_writes.setdefault(operation_geometry.operation_identity(operation), write)
+        request = operation_geometry.request_row(
+            completion_group, operation.request_key.request_id, state=state
+        )
+        if request.producer_write is None:
+            request.producer_write = write
     image_task = defer_image_encoding(
         operation,
         image_tensor,
         image_range,
-        scope,
+        completion_group,
         max_bytes=int(operation.bounds.max_completion_bytes),
+        state=state,
     )
-    request.latent_product = None
-    request.flow_step = 0
-    scope.latent_releases.append(
-        LatentRelease(
-            request_pool_idx=row.request_pool_idx,
-            page_table=row.params.page_table,
-            generation=int(latent_input.generation),
-            step=int(row.params.start_step),
-            latent_units=int(row.params.latent_units),
-            height=int(row.params.height),
-            width=int(row.params.width),
-        )
+    request.projected_progress = replace(
+        operation_geometry.require_progress(request), latent_product=None
     )
-    state.outcome = non_state_outcome(
-        operation,
-        scope,
-        completion_tasks=(image_task,),
+    request.projected_progress = replace(operation_geometry.require_progress(request), flow_step=0)
+    request.latent_params = params
+    request.latent_generation = int(latent_input.generation)
+    request.latent_step = int(params.start_step)
+    request.latent_release = True
+    return non_state_outcome(
+        operation, completion_group, completion_tasks=(image_task,), state=state
     )
-    state.phase = "done"
 
 
 def state_outcome(
     operation: ScheduledRequest,
-    outcome: StateOutcome,
-    scope: LaneState,
+    completion_group: int,
     *,
+    state: BatchState,
     products: tuple[TensorPublication, ...] = (),
-    request_tables: ReqToTokenPool | None,
-) -> Outcome:
+    request_tables: BlockTables | None,
+) -> PendingOutput:
     """Stage execution progress and defer successor publication until stateful tensors are ready."""
 
-    request = operation_geometry.request_row(scope, operation.request_key.request_id)
-    cache = operation_geometry.cache_coordinates(operation, scope, tables=request_tables)
-    selected = scope.runtime_cache_lengths.get(cache[0], cache[2])
+    request = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
+    )
+    cache = operation_geometry.cache_coordinates(
+        operation, completion_group, tables=request_tables, state=state
+    )
+    selected = request.runtime_cache_length
+    if selected is None:
+        selected = cache[2]
     if not isinstance(selected, int):
         raise RuntimeError("visual state completion has a dynamic KV length")
     cache = (cache[0], cache[1], selected, cache[3])
-    return Outcome(
-        status=OpStatus.OK,
-        runtime=operation_geometry.execution_runtime(request, cache),
-        finish_flags=FinishFlags(),
-        product_generations=operation_geometry.output_generations(operation),
-        committed_tokens=outcome.committed_tokens,
-        sampling=outcome.sampling,
-        products=products,
-        logprobs=outcome.logprobs,
-        prompt_logprobs=outcome.prompt_logprobs,
-    )
+    request.status = OpStatus.OK
+    request.projected_progress = operation_geometry.execution_runtime(request, cache)
+    request.finish_flags = FinishFlags()
+    request.product_generations = operation_geometry.output_generations(operation)
+    request.committed_tokens = ()
+    request.products = products
+    return request
 
 
 def non_state_outcome(
     operation: ScheduledRequest,
-    scope: LaneState,
+    completion_group: int,
     *,
+    state: BatchState,
     products: tuple[TensorPublication, ...] = (),
-    completion_tasks: tuple[ImageEncoding, ...] = (),
-) -> Outcome:
+    completion_tasks: tuple[CpuTask, ...] = (),
+) -> PendingOutput:
     """Record a stateless completion and its already materialized output products."""
 
-    request = operation_geometry.request_row(scope, operation.request_key.request_id)
-    return Outcome(
-        status=OpStatus.OK,
-        runtime=operation_geometry.execution_runtime(request, None),
-        finish_flags=FinishFlags(),
-        product_generations=operation_geometry.output_generations(operation),
-        products=products,
-        completion_tasks=completion_tasks,
+    request = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
     )
+    request.status = OpStatus.OK
+    request.projected_progress = operation_geometry.execution_runtime(request, None)
+    request.finish_flags = FinishFlags()
+    request.product_generations = operation_geometry.output_generations(operation)
+    request.products = products
+    request.completion_tasks = completion_tasks
+    return request
 
 
 def encode_source(
     operation: ScheduledRequest,
-    scope: LaneState,
+    completion_group: int,
     *,
-    device_products: DeviceProducts,
+    state: BatchState,
+    tensor_store: TensorStore,
     model_runner: ModelRunner,
-) -> str | tuple[torch.Tensor, DeviceProductMetadata]:
+) -> str | tuple[torch.Tensor, ImageMetadata]:
     """Resolve encoded request media and stage it according to the model’s image policy."""
 
     if operation.input_image is not None:
         return operation.input_image
     reference = operation.image_input
     if reference is not None:
-        read = device_products.consume(
+        read = tensor_store.consume(
             reference,
             consumer_op_id=operation.op_id,
-            device=model_runner.operation_device(operation),
+            device=model_runner.operation_devices(operation)[0],
         )
+        request = operation_geometry.request_row(
+            completion_group, operation.request_key.request_id, state=state
+        )
+        request.device_reads.append(read)
         metadata = read.metadata
         if (
-            metadata is None
+            not isinstance(metadata, ImageMetadata)
             or metadata.height < 1
             or metadata.width < 1
             or metadata.value_range is None
         ):
             raise invalid_descriptor("resident image product has incomplete geometry")
-        scope.device_reads.append(read)
         return read.tensor, metadata
     raise invalid_descriptor("encode operation has no source image product")
 
 
 def encode_row(
-    operation: ScheduledRequest,
     mode: PipelineStage,
-    prepared: PreparedImage,
-    scope: LaneState,
+    prepared: ImageInputs,
 ) -> ForwardRow:
     """Build a vision- or latent-encoder row from prepared image tensors."""
 
-    request = operation_geometry.request_row(scope, operation.request_key.request_id)
     return ForwardRow(
-        operation=operation,
-        request=request,
         forward_mode=mode,
         encode_pixels=prepared.pixels,
         encode_grid=prepared.grid,
@@ -522,18 +422,20 @@ def vision_state_row(
     height: int,
     width: int,
     conditioning_position: int,
-    scope: LaneState,
+    completion_group: int,
     *,
+    state: BatchState,
     close_image: bool,
     logits: bool,
-    request_tables: ReqToTokenPool | None,
+    request_tables: BlockTables | None,
     model_runner: ModelRunner,
     tokenizer: PreTrainedTokenizerBase | None,
 ) -> ForwardRow:
     """Publish vision features and construct the request runtime that references their token span."""
 
-    request = operation_geometry.request_row(scope, operation.request_key.request_id)
-    cache = operation_geometry.cache_coordinates(operation, scope, tables=request_tables)
+    cache = operation_geometry.cache_coordinates(
+        operation, completion_group, tables=request_tables, state=state
+    )
     injection = model_runner.image_processor().feature_injection
     if injection is None:
         raise invalid_descriptor("vision state stage requires declared feature injection")
@@ -567,8 +469,6 @@ def vision_state_row(
         model_runner=model_runner,
     )
     return ForwardRow(
-        operation=operation,
-        request=request,
         forward_mode=ForwardMode.PREFILL,
         token_ids=token_ids,
         token_embeddings=token_embeddings,
@@ -654,14 +554,14 @@ def latent_state_row(
     height: int,
     width: int,
     conditioning_position: int,
-    scope: LaneState,
+    completion_group: int,
     *,
-    request_tables: ReqToTokenPool | None,
+    state: BatchState,
+    request_tables: BlockTables | None,
     model_runner: ModelRunner,
 ) -> ForwardRow:
     """Publish encoded image latents and construct the request runtime for diffusion conditioning."""
 
-    request = operation_geometry.request_row(scope, operation.request_key.request_id)
     flow = model_runner.generation()
     if flow.latent_layout is not LatentLayout.PATCH_TOKENS:
         raise invalid_descriptor("flow state publication requires patch-token latents")
@@ -679,10 +579,10 @@ def latent_state_row(
     temporal[0] = conditioning_position
     temporal[-1] = conditioning_position + int(flow.rope_advance)
     indexes = torch.stack((temporal, torch.zeros_like(temporal), torch.zeros_like(temporal)))
-    cache = operation_geometry.cache_coordinates(operation, scope, tables=request_tables)
+    cache = operation_geometry.cache_coordinates(
+        operation, completion_group, tables=request_tables, state=state
+    )
     return ForwardRow(
-        operation=operation,
-        request=request,
         forward_mode=PipelineStage.DENOISING,
         positions=positions,
         timestep=latent.new_zeros(1),
@@ -702,44 +602,46 @@ def latent_state_row(
 
 def diffusion_finalize_frames(
     operation: ScheduledRequest,
-    scope: LaneState,
+    completion_group: int,
     *,
-    device_products: DeviceProducts,
-    encoder_cache: EncoderCache,
+    state: BatchState,
+    tensor_store: TensorStore,
     model_runner: ModelRunner,
-) -> Outcome:
+) -> PendingOutput:
     """Validate finalized diffusion output and return RGB frames with their numeric range."""
 
     image, metadata = transfer.fetch_product(
         operation,
-        scope,
-        device_products=device_products,
-        encoder_cache=encoder_cache,
+        completion_group,
+        tensor_store=tensor_store,
         model_runner=model_runner,
+        state=state,
     )
-    if transfer.metadata_string(metadata, "payload_kind", "") != "image_nchw":
+    if not isinstance(metadata, ImageMetadata) or min(metadata.height, metadata.width) < 1:
         raise invalid_descriptor("frame materialization source is not an image tensor")
-    value_range = ImageRange(
-        transfer.metadata_string(metadata, "value_range", ImageRange.SIGNED_UNIT.value)
-    )
+    value_range = metadata.value_range or ImageRange.SIGNED_UNIT
     image_task = defer_image_encoding(
         operation,
         image,
         value_range,
-        scope,
+        completion_group,
         max_bytes=int(operation.bounds.max_completion_bytes),
+        state=state,
     )
-    return non_state_outcome(operation, scope, completion_tasks=(image_task,))
+    return non_state_outcome(
+        operation, completion_group, completion_tasks=(image_task,), state=state
+    )
 
 
 def defer_image_encoding(
     operation: ScheduledRequest,
     image: torch.Tensor,
     value_range: ImageRange,
-    scope: LaneState,
+    completion_group: int,
     *,
+    state: BatchState,
     max_bytes: int,
-) -> ImageEncoding:
+) -> CpuTask:
     """Reserve output storage and schedule image encoding after the device copy completes."""
 
     if max_bytes < 1:
@@ -750,22 +652,47 @@ def defer_image_encoding(
     )
     if int(quantized.numel()) > max_bytes:
         raise invalid_descriptor("image staging exceeds its registered completion byte bound")
-    capture = scope.completion.capture_bytes(quantized)
-    identity = operation_geometry.operation_identity(operation)
-    reservation = scope.cpu_tasks.get(identity)
-    if reservation is None:
-        raise RuntimeError("materialization has no registered CPU task slot")
-    return ImageEncoding(
-        capture,
-        reservation,
-        max_bytes,
+    capture = state.group_buffers[completion_group].capture_bytes(quantized)
+    pending = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
     )
+    if len(pending.completion_tasks) != 1:
+        raise RuntimeError("materialization has no registered CPU task slot")
+    reservation = pending.completion_tasks[0]
+
+    def encode() -> bytes:
+        payload = uint8_image_to_png_base64_bytes(capture)
+        if not payload:
+            raise RuntimeError("image encoding task produced an invalid payload")
+        if len(payload) > max_bytes:
+            raise RuntimeError("encoded image exceeds its registered byte bound")
+        return payload
+
+    release = state.group_buffers[completion_group].retain_cpu_reader()
+    try:
+        return reservation.configure(
+            encode,
+            input_ready=state.group_buffers[completion_group].ready,
+            input_completion=state.group_buffers[completion_group].completion_future,
+            release=release,
+            profile_name="uniserve.image.encode",
+        )
+    except BaseException:
+        release()
+        raise
 
 
-def bound_device_write(scope: LaneState, reference: TensorRef) -> DeviceProductWrite:
+def bound_device_write(
+    completion_group: int, reference: TensorRef, *, state: BatchState
+) -> TensorRecord:
     """Return the staged device-product write matching a declared output reference."""
 
-    matches = tuple(write for write in scope.device_writes if write.reference == reference)
+    request = operation_geometry.request_row(
+        completion_group, reference.request_key.request_id, state=state
+    )
+    matches = tuple(
+        write for write in request.writes if write.reference == reference and not write.feature
+    )
     if len(matches) != 1:
         raise invalid_descriptor(
             "resident product does not have exactly one atomic registration binding"
@@ -773,31 +700,22 @@ def bound_device_write(scope: LaneState, reference: TensorRef) -> DeviceProductW
     return matches[0]
 
 
-def bound_encoder_write(scope: LaneState, reference: TensorRef) -> EncoderWrite:
+def bound_encoder_write(
+    completion_group: int, reference: TensorRef, *, state: BatchState
+) -> TensorRecord:
     """Return the staged encoder-cache write matching a declared output reference."""
 
-    matches = tuple(write for write in scope.encoder_writes if write.reference == reference)
+    request = operation_geometry.request_row(
+        completion_group, reference.request_key.request_id, state=state
+    )
+    matches = tuple(
+        write for write in request.writes if write.reference == reference and write.feature
+    )
     if len(matches) != 1:
         raise invalid_descriptor(
             "encoder feature does not have exactly one atomic registration binding"
         )
     return matches[0]
-
-
-def encode_features(output: torch.Tensor) -> torch.Tensor:
-    """Normalize model encoder output to a two-dimensional token-by-width tensor."""
-
-    if not isinstance(output, torch.Tensor) or not output.is_floating_point():
-        raise invalid_descriptor("encode route did not return encoder features")
-    return output
-
-
-def decoded_tensor(output: torch.Tensor) -> torch.Tensor:
-    """Extract the reconstructed image tensor from a supported model output wrapper."""
-
-    if not isinstance(output, torch.Tensor) or not output.is_floating_point():
-        raise invalid_descriptor("decode route did not return an image tensor")
-    return output
 
 
 def positions_as_three_axis(positions: torch.Tensor, query: int) -> torch.Tensor:
@@ -810,4 +728,10 @@ def positions_as_three_axis(positions: torch.Tensor, query: int) -> torch.Tensor
     raise invalid_descriptor("state positions do not align with their physical token row")
 
 
-__all__ = ["consume_forward", "pack_forward", "run_action"]
+__all__ = [
+    "text",
+    "prepare_features",
+    "publish_features",
+    "materialization_latent",
+    "publish_image",
+]

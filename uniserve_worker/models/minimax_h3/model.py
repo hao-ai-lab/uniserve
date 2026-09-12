@@ -2,20 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Hashable
+from collections.abc import Hashable, Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from uniserve_worker.execution.batch import PipelineStage
-from uniserve_worker.nn.mesh import EntryBindings
+from uniserve_worker.execution.model_entry import ModelEntry
+from uniserve_worker.protocol.batch import PipelineStage
 
-from ...execution.batch import DecodeRange, DiffusionSamplingParams, MediaTrack
-from ...execution.bounded_storage import BoundedTensorStorage
 from ...execution.denoising import DenoisingStep
 from ...nn.diffusion.schedule import DiffusionSchedule
-from ...nn.parallel_attention import AttentionContextGeometry, AttentionContextWorkspace
+from ...nn.parallel_attention import AttentionBuffers, AttentionContextGeometry
+from ...protocol.batch import DecodeRange, DiffusionSamplingParams, MediaTrack
+from ...runtime.tensor_buffers import TensorBuffers
 from ..runtime import ResourceGeometry, TensorOutputLayout
 from ..video import (
     VideoModel,
@@ -112,7 +112,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
 
     def __init__(
         self,
-        bindings: EntryBindings,
+        bindings: Mapping[str, ModelEntry],
         components: H3Components,
         layout: H3Layout,
     ) -> None:
@@ -120,9 +120,9 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
 
         super().__init__()
 
-        self.bindings: EntryBindings = bindings
-        self.owns_media_output = bindings.owns("output")
-        self.device = bindings.process_group.device
+        self.bindings: Mapping[str, ModelEntry] = bindings
+        self.owns_media_output = "output" in bindings and bindings["output"].owns
+        self.device = next(entry.device for entry in bindings.values() if entry.owns)
         self.layout = layout
         self.denoiser = components.transformer
         self.conditioner = components.conditioner
@@ -142,12 +142,13 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             ("video_decoder", self.video_decoder),
             ("audio_decoder", self.audio_decoder),
         ):
-            if bindings.owns(name) != (module is not None):
+            if (name in bindings and bindings[name].owns) != (module is not None):
                 raise ValueError(f"H3 {name} materialization disagrees with assigned membership")
         self.scratch_schema = media_tensor_schema(layout, bindings)
         self.context_geometry = None
         if self.denoiser is not None:
-            denoiser_mesh = bindings.meshes["denoiser"]
+            denoiser_mesh = bindings["denoiser"].mesh
+            assert denoiser_mesh is not None
             self.scratch_schema.update(
                 scratch_tensor_schema(
                     layout,
@@ -223,8 +224,8 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         self,
         geometry: DiffusionSamplingParams,
         num_prompt_tokens: int,
-        storage: BoundedTensorStorage,
-        context: AttentionContextWorkspace | None,
+        storage: TensorBuffers,
+        context: AttentionBuffers | None,
     ) -> H3ComputeInputs:
         """Build immutable packed metadata for a validated public geometry cache key."""
 
@@ -244,9 +245,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             self.device,
         )
 
-    def request_tensors(
-        self, storage: BoundedTensorStorage, metadata: H3ComputeInputs
-    ) -> H3Tensors:
+    def request_tensors(self, storage: TensorBuffers, metadata: H3ComputeInputs) -> H3Tensors:
         """Borrow mathematical inputs from the request's publicly owned tensor slot."""
 
         return bind_request_tensors(storage, metadata.layout)
@@ -308,8 +307,8 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         if track is MediaTrack.VIDEO:
             if self.video_decoder is None:
                 raise RuntimeError("video decode was routed to a rank without the decoder")
-            rank = self.bindings.entries["video_decoder"].ranks.index(
-                self.bindings.process_group.rank
+            rank = self.bindings["video_decoder"].config.ranks.index(
+                self.bindings["video_decoder"].process_group.rank
             )
             return self.video_decoder.prepare_input(execution, latents, cursor, max_units, rank)
         if self.audio_decoder is None:
@@ -358,10 +357,11 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
     def bind_execution(self, runner: ModelRunner) -> None:
         """Assemble numerical owners with each component's actual collective mesh."""
 
-        from ...execution.runners.denoise import DenoiseRunner
+        from ...execution.diffusion_runner import DiffusionRunner
 
         def groups(entry: str, axes: tuple[str, ...] = ("tp", "sp", "pp")):
-            mesh = self.bindings.meshes[entry]
+            mesh = self.bindings[entry].mesh
+            assert mesh is not None
             return tuple(mesh.get_group(axis) for axis in axes if mesh.size(axis) > 1)
 
         if self.video_decoder is not None:
@@ -374,24 +374,25 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             runner.bind_module("text_encoder", self.text_encoder, groups=groups("text_encoder"))
         if self.conditioner is not None:
             runner.bind_module(
-                "conditioner", self.conditioner, groups=groups("denoiser", ("tp", "sp"))
+                "conditioner",
+                self.conditioner,
+                placement="denoiser",
+                groups=groups("denoiser", ("tp", "sp")),
             )
         if self.audio_decoder is not None:
             runner.bind_module("audio_decoder", self.audio_decoder, groups=groups("audio_decoder"))
         if self.denoiser is not None:
-            runner.denoise = DenoiseRunner(
+            runner.diffusion = DiffusionRunner(
                 self.bind_denoising_step,
                 self.denoising_signature,
                 device=self.device,
-                backend=runner.graph_backend(shared_pool=True),
+                capture_stream=runner.capture_stream(),
                 groups=groups("denoiser"),
                 capacity=runner.worker_config.max_request_pool_size,
             )
 
     @torch.inference_mode()
-    def warmup_execution(
-        self, runner: ModelRunner, storage: tuple[BoundedTensorStorage, ...]
-    ) -> None:
+    def warmup_execution(self, runner: ModelRunner, storage: tuple[TensorBuffers, ...]) -> None:
         """Prepare representative denoising, pixel transform, and audio geometry."""
 
         scratch = runner.scratch
@@ -399,7 +400,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         if not storage:
             raise RuntimeError("H3 warmup requires declared request tensor storage")
         if self.denoiser is not None:
-            if runner.schedule is None or runner.denoise is None:
+            if runner.schedule is None or runner.diffusion is None:
                 raise RuntimeError("denoiser warmup requires its execution owner and schedule")
             prepared: set[Hashable] = set()
             for geometry, num_prompt_tokens in warmup_geometries(
@@ -409,17 +410,17 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
                 if key in prepared:
                     continue
                 prepared.add(key)
-                execution = runner.prepare_geometry(
+                execution = runner.diffusion.prepare_geometry(
                     key,
                     lambda: self.build_execution(
                         geometry, num_prompt_tokens, scratch, runner.context_workspace
                     ),
                 )
                 views = execution.prepare_warmup_slots(storage, self.denoiser)
-                runner.denoise.warmup(views[0], execution, runner.schedule)
-        if self.bindings.owns("output"):
+                runner.diffusion.warmup(views[0], execution, runner.schedule)
+        if "output" in self.bindings and self.bindings["output"].owns:
             assert self.video_assembler is not None
             self.video_assembler.warmup()
         if self.audio_decoder is not None:
             audio_latents = self.audio_decoder.warmup_input(self.layout.packed.audio_frames)
-            runner.modules["audio_decoder"].warmup(audio_latents)
+            runner.warmup_module("audio_decoder", audio_latents)

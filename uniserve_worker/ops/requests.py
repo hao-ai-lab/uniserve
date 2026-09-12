@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from ..execution.forward_batch import ForwardBatch
+from ..execution.forward_batch import AttentionMetadata
 
 
 @dataclass(frozen=True)
@@ -118,7 +118,7 @@ class DenseAttention:
     causal: bool
     scale: float
     attn_mask: torch.Tensor | None = None
-    ctx: ForwardBatch | None = None
+    ctx: AttentionMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -135,7 +135,7 @@ class PagedDecodeAttention:
     current_k: torch.Tensor | None = None
     current_v: torch.Tensor | None = None
     kv_cache: Any | None = None
-    ctx: ForwardBatch | None = None
+    ctx: AttentionMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -153,7 +153,7 @@ class VarlenAttention:
     scale: float
     block_table: torch.Tensor | None = None
     kv_cache: Any | None = None
-    ctx: ForwardBatch | None = None
+    ctx: AttentionMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -176,12 +176,7 @@ class VisibleEndAttention:
     prefix_k: torch.Tensor | None = None
     prefix_v: torch.Tensor | None = None
     prefix_lens: torch.Tensor | None = None
-    ctx: ForwardBatch | None = None
+    ctx: AttentionMetadata | None = None
 
 
-AttentionReq = (
-    DenseAttention
-    | PagedDecodeAttention
-    | VarlenAttention
-    | VisibleEndAttention
-)
+AttentionReq = DenseAttention | PagedDecodeAttention | VarlenAttention | VisibleEndAttention

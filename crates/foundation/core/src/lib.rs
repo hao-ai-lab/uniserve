@@ -25,7 +25,7 @@ pub mod generation;
 pub mod philox;
 /// Deterministic token sampling and log-probability scoring.
 pub mod sampling;
-pub use codec::stats::WorkerForwardStats;
+pub use codec::stats::ForwardStats;
 pub use events::{
     ArtifactEvent, DiffusionRequest, DiffusionRequestError, DiffusionSamplingParams,
     EngineCoreOutput, FinishReason, MediaKind, PositionLogprobs, Request, RuntimeFamily,

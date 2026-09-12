@@ -77,9 +77,7 @@ class _Attention(nn.Module):
         super().__init__()
         self.heads = heads
         self.head_dim = head_dim
-        self.attention = RadixAttention(
-            heads, heads, head_dim
-        )
+        self.attention = RadixAttention(heads, heads, head_dim)
         self.to_q = LinearBase(width, width, layer_config=layer_config, prefix="to_q")
         self.to_k = LinearBase(width, width, layer_config=layer_config, prefix="to_k")
         self.to_v = LinearBase(width, width, layer_config=layer_config, prefix="to_v")

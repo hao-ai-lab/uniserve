@@ -9,7 +9,8 @@ import pytest
 import torch
 
 from tests.python.fixtures.shm_publication import serve_pending_publication
-from uniserve_worker.execution.batch import (
+from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.protocol.batch import (
     BufferId,
     ComputationId,
     KvTransfer,
@@ -17,11 +18,8 @@ from uniserve_worker.execution.batch import (
     RequestKey,
     TensorTransfer,
 )
-from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.runtime.cache_pool import CachePool
-from uniserve_worker.runtime.cache_publications import CachePublications
-from uniserve_worker.runtime.device_events import DeviceEventPool
-from uniserve_worker.runtime.req_to_token_pool import ReqToTokenPool
+from uniserve_worker.runtime.device_events import EventPool
+from uniserve_worker.runtime.kv_cache import KVCache
 from uniserve_worker.transfer.tickets import make_transport
 
 pytestmark = pytest.mark.integration
@@ -32,7 +30,9 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
     parent, child = context.Pipe()
     shape = (256, 2, 1, 2)
     process = context.Process(target=serve_pending_publication, args=(child, shape))
-    pool = CachePool(
+    pool = KVCache(
+        request_pool_size=2,
+        max_blocks_per_request=1,
         num_layers=2,
         num_pages=3,
         page_size=256,
@@ -41,15 +41,8 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
         dtype=torch.float32,
         device="cpu",
     )
-    tables = ReqToTokenPool(
-        group_count=1,
-        request_pool_size=2,
-        max_blocks_per_request=1,
-        block_size=256,
-        device="cpu",
-    )
-    publications = CachePublications(pool, tables)
-    events = DeviceEventPool()
+    publications = pool
+    events = EventPool()
     consumer = make_transport("shm", byte_capacity=8192, ticket_capacity=2, event_pool=events)
     write = None
     process.start()
@@ -125,7 +118,9 @@ def _buffer(operation: int) -> BufferId:
 
 
 def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> None:
-    pool = CachePool(
+    pool = KVCache(
+        request_pool_size=1,
+        max_blocks_per_request=1,
         num_layers=1,
         num_pages=2,
         page_size=4,
@@ -134,11 +129,9 @@ def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> N
         dtype=torch.float32,
         device="cpu",
     )
-    tables = ReqToTokenPool(
-        group_count=1, request_pool_size=1, max_blocks_per_request=1, block_size=4, device="cpu"
-    )
+    tables = pool.block_tables
     tables.install(((1, 0, (1,), 4),))
-    publications = CachePublications(pool, tables)
+    publications = pool
     first = _buffer(1)
     second = replace(first, owner=replace(first.owner, request_epoch=first.owner.request_epoch + 1))
     try:
@@ -155,7 +148,7 @@ def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> N
                 buffer=source,
                 transports={},
             )
-            publications.apply_commit(publications.prepare_commit(((source, publication),), ()))
+            publications.commit_publications(((source, publication),), ())
             for mismatched in (
                 replace(
                     source,
@@ -194,9 +187,7 @@ def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> N
                 installed_buffer=installed,
                 write=write,
             )
-            publications.apply_commit(
-                publications.prepare_commit((), ((source, installed, result),))
-            )
+            publications.commit_publications((), ((source, installed, result),))
             assert publications.publication(installed) == publication
             assert publications.destination_base(source.owner, "consumer") == source
         with pytest.raises(WorkerError, match="another request"):
@@ -231,7 +222,9 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
     backend: str, device: str, source_dtype: str, target_dtype: str, page_size: int
 ) -> None:
     pools = [
-        CachePool(
+        KVCache(
+            request_pool_size=1,
+            max_blocks_per_request=3,
             num_layers=2,
             num_pages=6,
             page_size=size,
@@ -243,23 +236,12 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
         )
         for size, dtype in ((4, source_dtype), (page_size, target_dtype))
     ]
-    tables = [
-        ReqToTokenPool(
-            group_count=1,
-            request_pool_size=1,
-            max_blocks_per_request=3,
-            block_size=pool.block_size,
-            device=device,
-        )
-        for pool in pools
-    ]
+    tables = [pool.block_tables for pool in pools]
     pages = ((4, 1), (3, 1, 4) if page_size == 3 else (3, 1))
     for table, pool, assigned in zip(tables, pools, pages, strict=True):
         table.install(((1, 0, assigned, len(assigned) * pool.block_size),))
-    publications = [
-        CachePublications(pool, table) for pool, table in zip(pools, tables, strict=True)
-    ]
-    events = [DeviceEventPool(), DeviceEventPool()]
+    publications = [pool for pool, table in zip(pools, tables, strict=True)]
+    events = [EventPool(), EventPool()]
     transports = [
         make_transport(backend, byte_capacity=16384, ticket_capacity=16, event_pool=event)
         for event in events
@@ -302,9 +284,7 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
             locators.extend(
                 location for field in publication.tensors for location in field.locations
             )
-            publications[0].apply_commit(
-                publications[0].prepare_commit(((source, publication),), ())
-            )
+            publications[0].commit_publications(((source, publication),), ())
             if start:
                 for destination_pages, initialized in (
                     (pages[1], (pages[1][0],)),
@@ -344,9 +324,7 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                 installed_buffer=installed,
                 write=write,
             )
-            publications[1].apply_commit(
-                publications[1].prepare_commit((), ((source, installed, result),))
-            )
+            publications[1].commit_publications((), ((source, installed, result),))
             for layer in range(2):
                 key, value = pools[1].read(layer, pages[1], start=0, length=extent)
                 dtype = (
@@ -420,7 +398,9 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
     source_heads = total_heads if replicated else total_heads // source_ranks
     target_heads = total_heads // target_ranks
     pools = [
-        CachePool(
+        KVCache(
+            request_pool_size=1,
+            max_blocks_per_request=2,
             num_layers=layer_end - layer_start,
             total_layers=total_layers,
             layer_offset=layer_start,
@@ -461,21 +441,12 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
             ),
         )
     ]
-    tables = [
-        ReqToTokenPool(
-            group_count=1,
-            request_pool_size=1,
-            max_blocks_per_request=2,
-            block_size=pool.block_size,
-            device=device,
-        )
-        for pool in pools
-    ]
+    tables = [pool.block_tables for pool in pools]
     pages = (3, 1)
     for pool, table in zip(pools, tables, strict=True):
         table.install(((1, 0, pages, 2 * pool.block_size),))
-    owners = [CachePublications(pool, table) for pool, table in zip(pools, tables, strict=True)]
-    events = [DeviceEventPool() for _ in pools]
+    owners = [pool for pool, table in zip(pools, tables, strict=True)]
+    events = [EventPool() for _ in pools]
     backend = "cuda_ipc" if device.startswith("cuda") else "shm"
     transports = [
         make_transport(backend, byte_capacity=32768, ticket_capacity=32, event_pool=event)
@@ -516,7 +487,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                     transports={backend: transport},
                 )
                 publications.append((pool, transport, source, shard))
-                owner.apply_commit(owner.prepare_commit(((source, shard),), ()))
+                owner.commit_publications(((source, shard),), ())
                 shards.append(shard)
             # Rank descriptors identify one logical value with distributed physical coverage.
             merged = replace(
@@ -562,7 +533,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                     installed_buffer=installed,
                     write=write,
                 )
-                owner.apply_commit(owner.prepare_commit((), ((source, installed, value),)))
+                owner.commit_publications((), ((source, installed, value),))
                 for layer in range(pool.num_layers):
                     logical_layer = pool.layer_offset + layer
                     key, value = pool.read(layer, pages, start=0, length=extent)
@@ -593,7 +564,9 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
 
 def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes() -> None:
     pools = [
-        CachePool(
+        KVCache(
+            request_pool_size=1,
+            max_blocks_per_request=1,
             num_layers=1,
             num_pages=2,
             page_size=4,
@@ -606,16 +579,11 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
         )
         for heads in (2, 4, 2)
     ]
-    tables = [
-        ReqToTokenPool(
-            group_count=1, request_pool_size=1, max_blocks_per_request=1, block_size=4, device="cpu"
-        )
-        for _ in pools
-    ]
+    tables = [pool.block_tables for pool in pools]
     for table in tables:
         table.install(((1, 0, (1,), 4),))
-    owners = [CachePublications(pool, table) for pool, table in zip(pools, tables, strict=True)]
-    events = [DeviceEventPool() for _ in pools]
+    owners = [pool for pool, table in zip(pools, tables, strict=True)]
+    events = [EventPool() for _ in pools]
     transports = [
         make_transport("local", byte_capacity=4096, ticket_capacity=16, event_pool=event)
         for event in events
@@ -649,9 +617,7 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
                 transports={"local": transports[source_index]},
             )
             publications.append((source_index, source, publication))
-            owners[source_index].apply_commit(
-                owners[source_index].prepare_commit(((source, publication),), ())
-            )
+            owners[source_index].commit_publications(((source, publication),), ())
             write = owners[2].prepare_install(
                 source,
                 publication,
@@ -673,7 +639,7 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
                 installed_buffer=installed,
                 write=write,
             )
-            owners[2].apply_commit(owners[2].prepare_commit((), ((source, installed, result),)))
+            owners[2].commit_publications((), ((source, installed, result),))
             key, value = pools[2].read(0, (1,), start=0, length=extent)
             torch.testing.assert_close(key, values[:extent, :2], rtol=0, atol=0)
             torch.testing.assert_close(value, -values[:extent, :2], rtol=0, atol=0)
@@ -691,7 +657,7 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
                     transports={"local": transports[1]},
                 )
                 publications.append((1, other, replica))
-                owners[1].apply_commit(owners[1].prepare_commit(((other, replica),), ()))
+                owners[1].commit_publications(((other, replica),), ())
             base = source
     finally:
         for write in writes:

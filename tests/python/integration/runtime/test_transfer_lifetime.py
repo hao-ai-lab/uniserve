@@ -10,7 +10,8 @@ import pytest
 import torch
 
 from tests.python.fixtures.shm_publication import serve_pending_publication
-from uniserve_worker.execution.batch import (
+from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.protocol.batch import (
     BufferAllocation,
     ComputationId,
     DType,
@@ -21,12 +22,10 @@ from uniserve_worker.execution.batch import (
     TensorRef,
     WorkerEndpoint,
 )
-from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.runtime.device_events import DeviceEventPool
-from uniserve_worker.runtime.device_products import DeviceProducts
-from uniserve_worker.runtime.encoder_cache import EncoderCache
+from uniserve_worker.runtime.buffer_pool import BufferPool
+from uniserve_worker.runtime.device_events import EventPool
 from uniserve_worker.runtime.latent_pool import LatentPool
-from uniserve_worker.runtime.persistent_buffers import PersistentBuffers
+from uniserve_worker.runtime.tensor_store import TensorStore
 from uniserve_worker.transfer.layout import TensorRegion, region_view
 from uniserve_worker.transfer.tickets import make_transport
 
@@ -43,7 +42,7 @@ def _await_ticket(ticket):
 @pytest.mark.parametrize("backend", ("local", "shm", "cuda_ipc"))
 def test_transfer_writes_only_the_reserved_destination(backend: str) -> None:
     device = torch.device("cuda:0")
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport(backend, byte_capacity=16384, ticket_capacity=2, event_pool=events)
     source = torch.arange(1024, dtype=torch.float32, device=device)
     storage = torch.full((1026,), -1.0, device=device)
@@ -68,7 +67,7 @@ def test_transfer_writes_only_the_reserved_destination(backend: str) -> None:
 @pytest.mark.parametrize("backend", ("local", "shm", "cuda_ipc"))
 def test_transfer_scatters_exactly_into_disjoint_page_spans(backend: str) -> None:
     device = torch.device("cuda:0")
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport(backend, byte_capacity=16384, ticket_capacity=1, event_pool=events)
     source = torch.arange(44, dtype=torch.float32, device=device).reshape(11, 4)
     storage = torch.full((5, 4, 4), -1.0, device=device)
@@ -98,7 +97,7 @@ def test_transfer_scatters_exactly_into_disjoint_page_spans(backend: str) -> Non
 
 def _read_cuda_publications(channel) -> None:
     torch.cuda.set_device(0)
-    event_pool = DeviceEventPool()
+    event_pool = EventPool()
     transport = make_transport(
         "cuda_ipc", byte_capacity=8 << 20, ticket_capacity=2, event_pool=event_pool
     )
@@ -135,7 +134,7 @@ def _read_cuda_publications(channel) -> None:
 def test_cuda_ipc_read_does_not_wait_for_consumer_stream() -> None:
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
-    event_pool = DeviceEventPool()
+    event_pool = EventPool()
     transport = make_transport(
         "cuda_ipc", byte_capacity=8 << 20, ticket_capacity=2, event_pool=event_pool
     )
@@ -171,7 +170,7 @@ def test_cuda_ipc_read_does_not_wait_for_consumer_stream() -> None:
 def _consume_fanout(channel, device_index: int) -> None:
     device = torch.device("cuda", device_index)
     torch.cuda.set_device(device)
-    event_pool = DeviceEventPool()
+    event_pool = EventPool()
     transport = make_transport(
         "cuda_ipc", byte_capacity=8 << 20, ticket_capacity=2, event_pool=event_pool
     )
@@ -192,7 +191,7 @@ def _consume_fanout(channel, device_index: int) -> None:
 
 def test_cuda_ipc_publication_fits_the_existing_device_allocation() -> None:
     device = torch.device("cuda:0")
-    events = DeviceEventPool()
+    events = EventPool()
     source = torch.arange(65536, dtype=torch.float32, device=device).view(16, 4096).T
     destination = torch.empty(source.shape, dtype=source.dtype, device=device)
     transport = make_transport(
@@ -224,7 +223,7 @@ def test_cuda_ipc_publication_fits_the_existing_device_allocation() -> None:
 
 def test_cuda_ipc_retirement_preserves_pending_fanout_and_reclaims_capacity() -> None:
     context = mp.get_context("spawn")
-    event_pool = DeviceEventPool()
+    event_pool = EventPool()
     transport = make_transport(
         "cuda_ipc", byte_capacity=8192, ticket_capacity=2, event_pool=event_pool
     )
@@ -289,7 +288,7 @@ def test_cuda_ipc_retirement_preserves_pending_fanout_and_reclaims_capacity() ->
 
 
 def test_cuda_ipc_rejects_a_changed_registered_view() -> None:
-    event_pool = DeviceEventPool()
+    event_pool = EventPool()
     transport = make_transport(
         "cuda_ipc", byte_capacity=8 << 20, ticket_capacity=2, event_pool=event_pool
     )
@@ -311,7 +310,7 @@ def test_cuda_ipc_rejects_a_changed_registered_view() -> None:
 
 def test_local_read_keeps_its_producer_fence_after_publication_retirement() -> None:
     device = torch.device("cuda:0")
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport("local", byte_capacity=8192, ticket_capacity=2, event_pool=events)
     source = torch.zeros(1024, device=device)
     unrelated = torch.full_like(source, 9)
@@ -355,7 +354,7 @@ def _serve_unacknowledged_cuda_read(channel, invalid_handle: bool = False) -> No
 
     from uniserve_kernel.peer_memory import export_ipc
 
-    from uniserve_worker.execution.batch import CudaIpcTransfer
+    from uniserve_worker.protocol.batch import CudaIpcTransfer
 
     torch.cuda.set_device(0)
     source = torch.arange(1024, dtype=torch.float32, device="cuda:0")
@@ -403,7 +402,7 @@ def test_cuda_ipc_reports_retirement_failure_after_result_is_consumable() -> Non
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     process = context.Process(target=_serve_unacknowledged_cuda_read, args=(child,))
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport("cuda_ipc", byte_capacity=8192, ticket_capacity=1, event_pool=events)
     retirement_rejected = False
     process.start()
@@ -450,7 +449,7 @@ def test_cuda_ipc_reports_import_failure_before_acknowledgement() -> None:
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     process = context.Process(target=_serve_unacknowledged_cuda_read, args=(child, True))
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport("cuda_ipc", byte_capacity=8192, ticket_capacity=1, event_pool=events)
     retirement_rejected = False
     process.start()
@@ -526,7 +525,7 @@ def _read_granted_shm_publication(channel) -> None:
 @pytest.mark.parametrize("source_device", ["cpu", "cuda:0"])
 def test_shm_retirement_preserves_granted_fanout_and_reclaims_capacity(source_device: str) -> None:
     context = mp.get_context("spawn")
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport("shm", byte_capacity=4096, ticket_capacity=2, event_pool=events)
     consumer = make_transport("shm", byte_capacity=4096, ticket_capacity=1, event_pool=events)
     readers = []
@@ -590,7 +589,7 @@ def test_shm_retirement_preserves_granted_fanout_and_reclaims_capacity(source_de
 
 def test_cuda_ipc_retirement_retains_capacity_until_producer_completion() -> None:
     device = torch.device("cuda:0")
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport("cuda_ipc", byte_capacity=4096, ticket_capacity=1, event_pool=events)
     source = torch.ones(1024, device=device)
     locator = None
@@ -627,7 +626,7 @@ def test_shm_source_loss_wakes_pending_read_and_preserves_independent_reads() ->
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     process = context.Process(target=serve_pending_publication, args=(child,))
-    events = DeviceEventPool()
+    events = EventPool()
     consumer = make_transport("shm", byte_capacity=16384, ticket_capacity=4, event_pool=events)
     producer = make_transport("shm", byte_capacity=4096, ticket_capacity=2, event_pool=events)
     healthy = None
@@ -676,22 +675,20 @@ def test_cancelled_shard_reads_retain_destination_and_capacity_until_physical_re
     parent, child = context.Pipe()
     shape = (256, 4) if owner == "latent" else (1024,)
     process = context.Process(target=serve_pending_publication, args=(child, shape))
-    events = DeviceEventPool()
+    events = EventPool()
     consumer = make_transport("shm", byte_capacity=4096, ticket_capacity=1, event_pool=events)
     producer = make_transport("shm", byte_capacity=4096, ticket_capacity=1, event_pool=events)
-    buffers = PersistentBuffers(byte_capacity=4096, devices=("cpu",))
+    buffers = BufferPool(byte_capacity=4096, devices=("cpu",))
     if owner == "encoder":
-        store = EncoderCache(
+        store = TensorStore(
             entry_capacity=1,
             max_entry_bytes=4096,
             devices=("cpu",),
-            persistent_buffers=buffers,
+            buffer_pool=buffers,
             event_pool=events,
         )
     elif owner == "device":
-        store = DeviceProducts(
-            capacity=1, byte_capacity=4096, persistent_buffers=buffers, event_pool=events
-        )
+        store = TensorStore(capacity=1, byte_capacity=4096, buffer_pool=buffers, event_pool=events)
     else:
         store = LatentPool(
             request_pool_size=2,
@@ -718,7 +715,8 @@ def test_cancelled_shard_reads_retain_destination_and_capacity_until_physical_re
             return store.reserve_import(
                 product, request_pool_idx=1, page_table=(4, 2, 1, 3), latent_units=256
             )
-        return store.bind_outputs(
+        reserve_tensor = store.reserve_features if owner == "encoder" else store.bind_outputs
+        return reserve_tensor(
             ((product, "cpu"),), buffer_allocations={product.buffer_id: allocation}
         )[0]
 
@@ -731,7 +729,7 @@ def test_cancelled_shard_reads_retain_destination_and_capacity_until_physical_re
     binding = reserve(product, allocation)
     if isinstance(store, LatentPool):
         target = binding.spans
-    elif isinstance(store, EncoderCache):
+    elif isinstance(store, TensorStore):
         target = binding.buffer_binding.tensor
     else:
         target = store.producer_write_views((binding,))[0]
@@ -820,7 +818,7 @@ def test_cancelled_shard_reads_retain_destination_and_capacity_until_physical_re
 @pytest.mark.parametrize("backend", ("local", "shm", "cuda_ipc"))
 def test_publication_rejects_changed_producer_identity(backend: str) -> None:
     device = torch.device("cuda:0")
-    events = DeviceEventPool()
+    events = EventPool()
     endpoint = WorkerEndpoint.local("encoder-0", rank=2)
     transport = make_transport(
         backend, byte_capacity=16384, ticket_capacity=2, event_pool=events, source=endpoint
@@ -850,7 +848,7 @@ def test_publication_rejects_changed_producer_identity(backend: str) -> None:
 
 def test_local_delivery_between_workers_retains_the_publisher_until_consumption() -> None:
     device = torch.device("cuda:0")
-    producer_events, consumer_events = DeviceEventPool(), DeviceEventPool()
+    producer_events, consumer_events = EventPool(), EventPool()
     producer = make_transport(
         "local",
         byte_capacity=128,

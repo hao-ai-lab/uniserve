@@ -9,8 +9,8 @@ import torch
 import torch.nn as nn
 
 __all__ = [
-    'timestep_embedding',
-    'TimestepEmbedder',
+    "timestep_embedding",
+    "TimestepEmbedder",
 ]
 
 

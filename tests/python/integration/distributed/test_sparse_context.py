@@ -12,23 +12,25 @@ from uniserve_worker.backends.attention.video_sparse import (
     build_video_sparse_metadata,
     video_sparse_selected_tiles,
 )
+from uniserve_worker.bootstrap.distributed import (
+    initialize_model_parallel,
+    initialize_process_groups,
+)
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.nn.parallel_attention import (
     AttentionContextGeometry,
     AttentionRowExchange,
     ParallelAttention,
 )
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from uniserve_worker.runtime.attention_storage import allocate_attention_context
+from uniserve_worker.runtime.peer_memory import allocate_symmetric_memory
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None:
     device = torch.device("cuda", rank)
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=world_size,
@@ -105,19 +107,17 @@ def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None
             dtype=torch.int32,
         ),
     )
-    exchange = environment.symmetric_memory(
+    exchange = allocate_symmetric_memory(
         mesh.get_group("ulysses"),
         (local_rows, global_heads, width),
         dtype=torch.bfloat16,
-        name="sparse_context_output",
-        layout=(),
     )
     outputs = exchange.peers
     output = exchange.local
     sync_input = torch.zeros(1, device=device, dtype=torch.int32)
     sync_output = torch.empty(mesh.size("ulysses"), device=device, dtype=torch.int32)
     key_group = mesh.get_group("cp_row" if kind == "attention2d" else "cp")
-    context_workspace = environment.attention_context(
+    context_workspace = allocate_attention_context(
         AttentionContextGeometry(
             group=key_group,
             rows=context_rows * (mesh.size("cp_col") if kind == "attention2d" else 1),

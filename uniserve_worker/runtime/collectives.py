@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+from collections.abc import Iterable
 from ctypes import addressof, c_void_p
 from typing import Any
 
@@ -58,7 +59,7 @@ def supports_peer_reduction(group: Communicator) -> bool:
     return all(capabilities)
 
 
-class PeerSumReduction:
+class PeerReduction:
     """Own one serialized full-device scope's graph-replayable sum workspace.
 
     BF16/FP16 contributions accumulate in FP32 before the output rounding. The
@@ -131,7 +132,7 @@ class PeerSumReduction:
         workspace.destroy()
 
 
-class NcclStreamCollectives:
+class NcclCommunicator:
     """Own a NCCL communicator whose kernels execute on one borrowed stream.
 
     PyTorch process groups retain their own communication streams. Explicit
@@ -318,3 +319,48 @@ class NcclStreamCollectives:
         if self._comm.value:
             communicator, self._comm = self._comm.value, c_void_p()
             self._nccl.comm_destroy(communicator)
+
+
+def allocate_stream_collectives(
+    groups: Iterable[Communicator], stream: torch.cuda.Stream
+) -> dict[str, NcclCommunicator]:
+    """Allocate independent communication resources for one computation stream."""
+
+    bindings = {}
+    try:
+        for communicator in groups:
+            if communicator.world_size == 1:
+                continue
+            group = communicator._require()
+            if dist.get_backend(group) == "nccl" and group.group_name not in bindings:
+                bindings[group.group_name] = NcclCommunicator(group, stream)
+    except BaseException as error:
+        for binding in reversed(tuple(bindings.values())):
+            try:
+                binding.close()
+            except BaseException as cleanup_error:
+                error.add_note(f"collective binding cleanup failed: {cleanup_error!r}")
+        raise
+    return bindings
+
+
+def allocate_peer_reductions(groups: Iterable[Communicator]) -> dict[Any, PeerReduction]:
+    """Allocate collective scratch for one serialized full-device execution scope.
+
+    The runner invokes this before variable memory pools are sized and owns
+    the returned workspaces until all of its graph executables retire.
+    """
+
+    bindings: dict[Any, PeerReduction] = {}
+    try:
+        for group in groups:
+            if group.world_size == 1:
+                continue
+            process_group = group._require()
+            if process_group not in bindings and supports_peer_reduction(group):
+                bindings[process_group] = PeerReduction(group)
+        return bindings
+    except Exception:
+        for reduction in reversed(tuple(bindings.values())):
+            reduction.close()
+        raise

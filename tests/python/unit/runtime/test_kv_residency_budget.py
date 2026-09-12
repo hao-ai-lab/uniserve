@@ -7,9 +7,9 @@ import pytest
 from tests.python.fixtures.model_execution import TEST_WORKER_CONFIG
 from uniserve_worker.bootstrap.capacity import derive_runtime_kv_capacity
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
-from uniserve_worker.execution.batch import ForwardMode
 from uniserve_worker.models.runtime import CacheGeometry
 from uniserve_worker.models.stub import StubModel
+from uniserve_worker.protocol.batch import ForwardMode
 
 pytestmark = pytest.mark.unit
 

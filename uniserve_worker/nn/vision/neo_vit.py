@@ -11,8 +11,8 @@ from ..rope import RotaryEmbedding, apply_rotary_emb
 from .patching import build_abs_positions_from_grid_hw
 
 __all__ = [
-    'NeoVitConfig',
-    'NeoVitEncoder',
+    "NeoVitConfig",
+    "NeoVitEncoder",
 ]
 
 
@@ -83,8 +83,12 @@ class NeoVitEncoder(nn.Module):
             raise ValueError(
                 f"NeoVitEncoder expects grid_hw of shape (B, 2), got {tuple(grid_hw.shape)}"
             )
-        patch_embeds = self.gelu(self.patch_embedding(pixels)).view(-1, self.patch_embedding.out_channels)
-        patch_embeds = self._apply_2d_rope(patch_embeds.float(), grid_hw).to(dtype=patch_embeds.dtype)
+        patch_embeds = self.gelu(self.patch_embedding(pixels)).view(
+            -1, self.patch_embedding.out_channels
+        )
+        patch_embeds = self._apply_2d_rope(patch_embeds.float(), grid_hw).to(
+            dtype=patch_embeds.dtype
+        )
         return self._dense_downsample(patch_embeds, grid_shapes=grid_shapes)
 
     def _apply_2d_rope(self, patch_embeds: torch.Tensor, grid_hw: torch.Tensor) -> torch.Tensor:
@@ -143,10 +147,18 @@ class NeoVitEncoder(nn.Module):
         out = []
         cursor = 0
         for h, w in shapes:
-            image = patch_embeds[cursor:cursor + h * w].view(1, h, w, -1).permute(0, 3, 1, 2)
-            dense = self.dense_embedding(image).permute(0, 2, 3, 1).reshape(-1, self.dense_embedding.out_channels)
+            image = patch_embeds[cursor : cursor + h * w].view(1, h, w, -1).permute(0, 3, 1, 2)
+            dense = (
+                self.dense_embedding(image)
+                .permute(0, 2, 3, 1)
+                .reshape(-1, self.dense_embedding.out_channels)
+            )
             out.append(dense)
             cursor += h * w
         if cursor != patch_embeds.shape[0]:
             raise ValueError("grid shapes do not cover all NEO-ViT patch embeddings")
-        return torch.cat(out, dim=0) if out else patch_embeds.new_empty((0, self.dense_embedding.out_channels))
+        return (
+            torch.cat(out, dim=0)
+            if out
+            else patch_embeds.new_empty((0, self.dense_embedding.out_channels))
+        )

@@ -141,7 +141,11 @@ impl OutputSender {
 
 impl Scheduler {
     /// Publishes committed autoregressive tokens and advances text-generation state.
-    pub(super) fn resolve_decode_text(&mut self, id: RequestId, mut record: ModelOutput) {
+    pub(super) fn resolve_decode_text(
+        &mut self,
+        id: RequestId,
+        mut record: uniserve_worker_ipc::RequestOutput,
+    ) {
         self.activate_request_tables(id);
         if self
             .running
@@ -244,7 +248,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         operation: ScheduledRequest,
-        mut record: ModelOutput,
+        mut record: uniserve_worker_ipc::RequestOutput,
         media: Option<&SharedMedia>,
     ) {
         let operation_variant = operation.code;

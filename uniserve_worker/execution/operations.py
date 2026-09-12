@@ -2,24 +2,20 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import replace
 
-import torch
-
-from uniserve_worker.execution.batch import (
+from uniserve_worker.execution.output import PendingOutput
+from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.protocol.batch import (
     FinishFlags,
     OpStatus,
-    PipelineStage,
     ScheduledRequest,
-    TensorRef,
 )
-from uniserve_worker.execution.rows import LaneState, LatentExecution, OperationIdentity, Outcome
-from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.runtime.req_to_token_pool import ReqToTokenPool
-from uniserve_worker.runtime.request import RequestDraft, RequestRuntime
+from uniserve_worker.runtime.block_tables import BlockTables
+from uniserve_worker.runtime.request import RequestProgress
 
-if TYPE_CHECKING:
-    from uniserve_worker.config import WorkerConfig
+from .batch_state import BatchState
+from .rows import OperationIdentity
 
 
 def output_generations(operation: ScheduledRequest) -> tuple[int, ...]:
@@ -28,64 +24,74 @@ def output_generations(operation: ScheduledRequest) -> tuple[int, ...]:
     return tuple(int(reference.generation) for reference in operation.tensor_outputs())
 
 
-def latent_row(operation: ScheduledRequest, scope: LaneState) -> LatentExecution:
-    """Resolve the staged physical latent params for an operation in this lane."""
+def require_progress(output: PendingOutput) -> RequestProgress:
+    """Require real request progress for a state-consuming numerical operation."""
 
-    row = scope.latent_rows.get(operation_identity(operation))
-    if row is None:
-        raise invalid_descriptor("trajectory operation has no staged latent params")
-    return row
+    progress = output.projected_progress
+    if progress is None:
+        raise invalid_descriptor("operation does not consume request progress")
+    return progress
+
+
+def input_progress(output: PendingOutput) -> RequestProgress | None:
+    """Read the stable predecessor, preferring actual acceptance when it is known."""
+
+    predecessor = output.predecessor
+    if isinstance(predecessor, PendingOutput):
+        return predecessor.accepted_progress or predecessor.projected_progress
+    return predecessor
 
 
 def execution_runtime(
-    request: RequestDraft,
+    request: PendingOutput,
     cache: tuple[int, int, int, int] | None,
     *,
     flow_step: int | None = None,
     computed_len: int | None = None,
-) -> RequestRuntime:
-    """Stage request execution state with the initialized and visible KV extents."""
+) -> RequestProgress | None:
+    """Project actual state consumers without constructing progress for stateless work."""
 
-    parent = request.predecessor.runtime
+    progress = request.projected_progress
+    if progress is None:
+        return None
+    parent = input_progress(request)
+    assert parent is not None
     if cache is None:
         visible = parent.kv_visible_len
         computed = parent.kv_computed_len
     else:
         _slot, _group, visible, _capacity = cache
         computed = visible if computed_len is None else int(computed_len)
-    return RequestRuntime(
-        logical_position=request.logical_position,
-        rng_counter=request.rng_counter,
-        latent_product=request.latent_product,
+    return replace(
+        progress,
         kv_visible_len=visible,
         kv_computed_len=computed,
-        flow_step=request.flow_step if flow_step is None else int(flow_step),
+        flow_step=progress.flow_step if flow_step is None else int(flow_step),
     )
 
 
-def request_row(scope: LaneState, request_id: int) -> RequestDraft:
-    """Return the unique staged request draft for an identifier within the current lane."""
+def request_row(completion_group: int, request_id: int, *, state: BatchState) -> PendingOutput:
+    """Borrow the pending output assigned to this completion group."""
 
-    try:
-        return scope.request_rows[int(request_id)]
-    except KeyError:
-        raise invalid_descriptor(f"lane has no request row for request {request_id}") from None
+    return state.pending_output(completion_group, request_id)
 
 
 def cache_coordinates(
     operation: ScheduledRequest,
-    scope: LaneState,
+    completion_group: int,
     *,
-    tables: ReqToTokenPool | None,
+    state: BatchState,
+    tables: BlockTables | None,
     group_id: int = 0,
 ) -> tuple[int, int, int, int]:
     """Resolve the request slot, cache group, accepted prefix and physical token capacity."""
 
-    request = request_row(scope, operation.request_key.request_id)
+    request = request_row(completion_group, operation.request_key.request_id, state=state)
     slot = int(request.request.request_pool_idx)
     # Scheduler columns may reserve the full unobserved verifier prefix.
     # The request state owns the accepted extent used by numerical consumers.
-    visible = int(request.predecessor.runtime.kv_visible_len)
+    parent = input_progress(request)
+    visible = 0 if parent is None else int(parent.kv_visible_len)
     pool = tables
     if pool is None:
         raise unsupported_setup("operation requires request-to-token storage")
@@ -97,73 +103,22 @@ def cache_coordinates(
 
 
 def operation_identity(operation: ScheduledRequest) -> OperationIdentity:
-    """Form the lane-local identity from request generation and operation id."""
+    """Form the completion group-local identity from request generation and operation id."""
 
     return operation.request_key, operation.op_id
 
 
-def _completion_devices(
-    operations: tuple[ScheduledRequest, ...], *, config: WorkerConfig
-) -> tuple[str, ...]:
-    """List distinct devices that may contribute asynchronous completion fields."""
-
-    worker_config = config
-    generation_device = worker_config.generation_device
-    device = worker_config.device
-    selected: list[str] = []
-    for operation in operations:
-        target = (
-            generation_device
-            if generation_device is not None
-            and operation.kind
-            in {
-                PipelineStage.LATENT_PREPARATION,
-                PipelineStage.DENOISING,
-                PipelineStage.VIDEO_DECODING,
-                PipelineStage.VIDEO_ENCODING,
-                PipelineStage.AUDIO_DECODING,
-                PipelineStage.AUDIO_ENCODING,
-                PipelineStage.MUXING,
-                PipelineStage.IMAGE_DECODING,
-            }
-            else device
-        )
-        if target not in selected:
-            selected.append(target)
-    return tuple(selected)
-
-
-def _operation_device(operation: ScheduledRequest, *, config: WorkerConfig) -> torch.device:
-    """Resolve the execution device for an operation's model phase."""
-
-    return (
-        torch.device((config.generation_device or config.device))
-        if operation.kind
-        in {
-            PipelineStage.LATENT_PREPARATION,
-            PipelineStage.DENOISING,
-            PipelineStage.IMAGE_DECODING,
-        }
-        else torch.device(config.device)
-    )
-
-
 def _predicated_outcome(
     operation: ScheduledRequest,
-    scope: LaneState,
-) -> Outcome:
+    completion_group: int,
+    *,
+    state: BatchState,
+) -> PendingOutput:
     """Construct an inactive outcome while preserving declared product generations."""
 
-    request = request_row(scope, operation.request_key.request_id)
-    return Outcome(
-        status=OpStatus.PREDICATED,
-        runtime=execution_runtime(request, None),
-        finish_flags=FinishFlags(),
-        product_generations=(),
-    )
-
-
-def product_identity(reference: TensorRef) -> OperationIdentity:
-    """Identify the logical operation that produced a reference."""
-
-    return reference.request_key, reference.producer_op_id
+    request = request_row(completion_group, operation.request_key.request_id, state=state)
+    request.status = OpStatus.PREDICATED
+    request.projected_progress = execution_runtime(request, None)
+    request.finish_flags = FinishFlags()
+    request.product_generations = ()
+    return request

@@ -16,8 +16,8 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use uniserve_worker_ipc::{
-    BatchCommand, BlockTable, BufferAllocation, CachePageAllocation, Computation, ComputationId,
-    DecodeRange, ForwardBatch, LatentParams, NewRequest, RequestKey, Run as PhysicalRun, RunResult,
+    BatchCommand, BatchOutput, BlockTable, BufferAllocation, CachePageAllocation, Computation,
+    ComputationId, DecodeRange, ForwardBatch, LatentParams, NewRequest, RequestKey, ScheduleBatch,
     ScheduledRequest, TensorPublication, WorkerInfo,
 };
 
@@ -42,7 +42,7 @@ pub struct RequestPlacement {
 
 /// One logical executor submission. Physical runs are derived only inside an executor.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ScheduleBatch {
+pub struct ExecutionBatch {
     /// Logical batch identity used to correlate partial completions.
     pub id: u64,
     /// Shared computations paired with physical placement in scheduler order.
@@ -55,7 +55,7 @@ pub struct ScheduleBatch {
     pub kv_inputs: Vec<uniserve_worker_ipc::KvTransfer>,
 }
 
-impl ScheduleBatch {
+impl ExecutionBatch {
     /// Constructs a logical executor submission.
     pub fn new(
         id: u64,
@@ -394,7 +394,7 @@ impl ExecutorInfo {
 #[derive(Debug, Clone)]
 pub struct OpResult {
     /// Validated completion values; media storage is carried by `media` below.
-    pub output: uniserve_worker_ipc::ModelOutput,
+    pub output: uniserve_worker_ipc::RequestOutput,
     /// Claimed immutable output storage, or its request-local acquisition error.
     pub media: Result<Option<Arc<uniserve_core::SharedMedia>>, String>,
 }
@@ -409,14 +409,14 @@ pub struct WorkerResult {
     pub products: Vec<TensorPublication>,
     pub registration: uniserve_worker_ipc::RegistrationAck,
     pub worker_exec_us: Option<u64>,
-    pub forward_stats: Option<uniserve_worker_ipc::WorkerForwardStats>,
+    pub forward_stats: Option<uniserve_worker_ipc::ForwardStats>,
     pub done: bool,
 }
 
 impl WorkerResult {
     /// Claims all media before any fallible correlation or aggregation step.
     /// Acquisition failure belongs to the operation; independent results remain usable.
-    pub(crate) fn receive(report: RunResult) -> Self {
+    pub(crate) fn receive(report: BatchOutput) -> Self {
         let results = report
             .completions
             .into_iter()
@@ -481,7 +481,7 @@ pub struct BatchResult {
     /// Per-worker execution durations in microseconds.
     pub worker_exec_us: Vec<u64>,
     /// Per-worker model-forward statistics.
-    pub forward_stats: Vec<uniserve_worker_ipc::WorkerForwardStats>,
+    pub forward_stats: Vec<uniserve_worker_ipc::ForwardStats>,
 }
 
 /// Resolves and validates one logical completion against its submitted operation.
@@ -529,7 +529,7 @@ pub type ExecutorError = anyhow::Error;
 pub enum ExecutorSubmitError {
     #[error("executor queue is full")]
     /// Returns ownership of a batch rejected by bounded queue capacity.
-    WouldBlock(ScheduleBatch),
+    WouldBlock(ExecutionBatch),
     #[error(transparent)]
     /// Reports a terminal submission failure.
     Failed(#[from] anyhow::Error),
@@ -916,7 +916,7 @@ pub(crate) fn physical_run(
     commands: Vec<BatchCommand>,
     input_products: Vec<TensorPublication>,
     kv_inputs: Vec<uniserve_worker_ipc::KvTransfer>,
-) -> anyhow::Result<PhysicalRun> {
+) -> anyhow::Result<ScheduleBatch> {
     let mut block_tables = Vec::new();
     let mut new_cache_pages = Vec::new();
     let mut forward = ForwardBatch::default();
@@ -933,7 +933,7 @@ pub(crate) fn physical_run(
         buffer_allocations.extend(placement.buffers);
         operations.push(operation);
     }
-    let run = PhysicalRun {
+    let run = ScheduleBatch {
         batch_id,
         run_id,
         collective_seq,
@@ -963,7 +963,7 @@ pub trait Executor: Send {
     /// Whether every physical owner of a lifecycle command can accept its submission.
     fn command_has_capacity(&self, command: &BatchCommand) -> bool;
     /// Submits one logical batch without blocking for capacity.
-    fn submit(&mut self, batch: ScheduleBatch) -> Result<(), ExecutorSubmitError>;
+    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError>;
     /// Waits up to `timeout` for one partial or terminal batch result.
     fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError>;
     /// Closes the executor and its physical workers.

@@ -3,9 +3,9 @@
 import pytest
 import torch
 
+from uniserve_worker.bootstrap.distributed import initialize_process_groups
 from uniserve_worker.nn.mesh import DeviceMesh
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
-from uniserve_worker.runtime.distributed import init_distributed_environment
 
 pytestmark = pytest.mark.unit
 
@@ -14,7 +14,7 @@ def test_launch_rejects_unavailable_rank_device(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     with pytest.raises(Exception, match=r"cuda device cuda:1 is outside the 1 visible CUDA device"):
-        init_distributed_environment(rank=1, local_rank=1, world_size=2, device="cuda")
+        initialize_process_groups(rank=1, local_rank=1, world_size=2, device="cuda")
 
 
 def test_mesh_maps_ordered_members_and_independent_dimensions():

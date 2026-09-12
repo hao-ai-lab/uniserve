@@ -115,8 +115,8 @@ fn operation_for(kind: Computation, op_id: ComputationId) -> ScheduledRequest {
     }
 }
 
-fn completion_record() -> ModelOutput {
-    ModelOutput {
+fn completion_record() -> RequestOutput {
+    RequestOutput {
         sampled_logprob: Some(-0.25),
         top_logprobs: vec![
             TokenLogprob {
@@ -186,7 +186,7 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
     .unwrap()
 }
 
-fn execute_round_trip(batch: Run) -> Run {
+fn execute_round_trip(batch: ScheduleBatch) -> ScheduleBatch {
     let request = WorkerRequest::submit(batch);
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
     decoded.run().unwrap().clone()
@@ -258,12 +258,12 @@ fn batch_with_operations(
     run_id: u64,
     admissions: Vec<NewRequest>,
     operations: Vec<ScheduledRequest>,
-) -> Run {
+) -> ScheduleBatch {
     // Logical producer coordinates stay fixed when the physical run is numbered.
     let batch_id = operations
         .first()
         .map_or(run_id, |operation| operation.op_id.batch_id);
-    let mut run = Run::new(batch_id, admissions, operations);
+    let mut run = ScheduleBatch::new(batch_id, admissions, operations);
     run.run_id = run_id;
     run.collective_seq = run_id.max(1);
     let mut next_buffer_offset = 0_u64;
@@ -342,13 +342,13 @@ fn batch_with_operations(
 
 fn lane_report(
     run_id: u64,
-    completions: Vec<ModelOutput>,
+    completions: Vec<RequestOutput>,
     products: Vec<TensorPublication>,
     visible: bool,
     worker_exec_us: Option<u64>,
-    forward_stats: Option<WorkerForwardStats>,
-) -> RunResult {
-    RunResult {
+    forward_stats: Option<ForwardStats>,
+) -> BatchOutput {
+    BatchOutput {
         batch_id: completions
             .first()
             .map_or(run_id, |record| record.op_id.batch_id),
@@ -636,7 +636,7 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
     };
     let mut report = lane_report(
         5,
-        vec![ModelOutput {
+        vec![RequestOutput {
             code: Computation::Transfer(TransferMode::KvPublish),
             kv_output: Some(KvTransfer {
                 tensors: Vec::new(),
@@ -736,7 +736,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_lineage() {
         }
         let report = lane_report(
             5,
-            vec![ModelOutput {
+            vec![RequestOutput {
                 code: Computation::Transfer(TransferMode::KvPublish),
                 kv_output: Some(KvTransfer {
                     tensors,
@@ -936,7 +936,7 @@ fn product_validation_enforces_generation_and_shape_bounds() {
 
 #[test]
 fn batch_rejects_two_operations_for_one_request() {
-    let batch = Run {
+    let batch = ScheduleBatch {
         batch_id: 1,
         run_id: 1,
         collective_seq: 1,
@@ -1227,7 +1227,7 @@ fn full_image() -> ImageParams {
 
 /// One operation per closed `Computation` variant, each on its own request key so the
 /// batch admits them together; the first two keys also carry admissions.
-fn comprehensive_batch() -> Run {
+fn comprehensive_batch() -> ScheduleBatch {
     let variants = Computation::ALL;
     let mut operations = Vec::new();
     for (index, kind) in variants.into_iter().enumerate() {
@@ -1408,14 +1408,14 @@ fn video_components() -> std::collections::BTreeMap<PipelineStage, String> {
     .collect()
 }
 
-fn full_forward_stats() -> WorkerForwardStats {
+fn full_forward_stats() -> ForwardStats {
     let map = |prefix: &str, base: u64| {
         BTreeMap::from([
             (format!("{prefix}.a"), base),
             (format!("{prefix}.b"), base + 1),
         ])
     };
-    WorkerForwardStats {
+    ForwardStats {
         mode_counts: map("mode_counts", 1),
         mode_tokens: map("mode_tokens", 3),
         mode_us: map("mode_us", 5),
@@ -1449,8 +1449,8 @@ fn full_forward_stats() -> WorkerForwardStats {
     }
 }
 
-fn full_run_result() -> RunResult {
-    let mut ok_record = ModelOutput {
+fn full_run_result() -> BatchOutput {
+    let mut ok_record = RequestOutput {
         sampled_logprob: None,
         top_logprobs: Vec::new(),
         prompt_logprobs: Vec::new(),

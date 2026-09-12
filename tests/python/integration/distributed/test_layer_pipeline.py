@@ -6,18 +6,18 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
+from uniserve_worker.bootstrap.distributed import (
+    initialize_model_parallel,
+    initialize_process_groups,
+)
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.nn.parallel_pipeline import LayerPipeline
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
 
 pytestmark = pytest.mark.integration
 
 
 def _run_pipeline(rank: int, rendezvous: str, stages: int) -> None:
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=4,

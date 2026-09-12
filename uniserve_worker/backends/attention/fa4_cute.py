@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from ...execution.forward_batch import AttentionMode, ForwardBatch
+from ...execution.forward_batch import AttentionMetadata, AttentionMode
 from ..paged_kv_math import paged_kv_write, write_locations
 from .base import AttentionBackend, merge_attention_states
 from .layout import QKVLayout, normalize_kv, normalize_to
@@ -96,7 +96,7 @@ class Fa4CuteAttentionBackend(AttentionBackend):
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute dense causal or noncausal attention through FlashAttention-4 CuTe kernels."""
 
@@ -132,7 +132,7 @@ class Fa4CuteAttentionBackend(AttentionBackend):
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Write current K/V into paged storage and run FlashAttention-4 decode over the visible prefix."""
 
@@ -195,7 +195,7 @@ class Fa4CuteAttentionBackend(AttentionBackend):
         scale: float | None = None,
         use_prefix_bounds: bool = False,
         fully_visible: bool = False,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Run the hybrid ``visible_end`` mask path.
 
@@ -270,7 +270,7 @@ class Fa4CuteAttentionBackend(AttentionBackend):
         visible_current_end: torch.Tensor,
         scale: float,
         fully_visible_current: bool,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Merge FlashAttention-4 states from the live segment and each cached KV segment."""
 

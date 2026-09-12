@@ -7,25 +7,25 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from uniserve_worker.bootstrap.distributed import (
+    initialize_model_parallel,
+    initialize_process_groups,
+)
+from uniserve_worker.execution.cuda_graph import CudaGraph
 from uniserve_worker.execution.forward_batch import ForwardOutput
-from uniserve_worker.execution.graph.full import FullCudaGraphBackend
 from uniserve_worker.loader.handles import TensorWeightHandle
 from uniserve_worker.loader.weight_loaders import load_parameter_weight
 from uniserve_worker.nn.layer import LayerConfig
 from uniserve_worker.nn.logits import greedy_vocabulary
 from uniserve_worker.nn.parallel import ParallelConfig
 from uniserve_worker.nn.vocab_parallel_embedding import ParallelLMHead
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
     device = torch.device("cuda", rank)
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=2,
@@ -92,10 +92,8 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
                         greedy_vocabulary(local, partition)
                     current.wait_stream(stream)
                     current.synchronize()
-                    entry = FullCudaGraphBackend(device=device, stream=stream)
-                    entry.capture_one(
-                        "greedy", lambda: greedy_vocabulary(local, partition), keepalive=(local,)
-                    )
+                    entry = CudaGraph(device=device, stream=stream)
+                    entry.capture(lambda: greedy_vocabulary(local, partition), keepalive=(local,))
                     retained = projected.clone()
                     retained_expected = full[:, :65].clone()
                     for iteration in range(2):
@@ -107,7 +105,7 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
                         stream.wait_stream(current)
                         with torch.cuda.stream(stream):
                             local.copy_(full[:, begin : begin + partition.width])
-                            values, tokens = entry.replay("greedy")
+                            values, tokens = entry.replay()
                         current.wait_stream(stream)
                         reference_values, reference_tokens = full[:, :65].max(dim=-1)
                         torch.testing.assert_close(

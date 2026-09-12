@@ -6,16 +6,18 @@ from collections.abc import Sequence
 
 import torch
 
-from ..execution.batch import RequestKey
-from ..execution.bounded_storage import BoundedTensorStorage, TensorSchema
+from uniserve_worker.runtime.staging_buffers import StagingBuffers
+
 from ..foundation.errors import invalid_descriptor
 from ..foundation.resources import close_resources
-from .device import HostStagingRing, fill_cpu_ints
+from ..protocol.batch import RequestKey
+from ..runtime.tensor_buffers import TensorBuffers, TensorSchema
+from .device import fill_cpu_ints
 
-__all__ = ["ReqToTokenPool"]
+__all__ = ["BlockTables"]
 
 
-class ReqToTokenPool:
+class BlockTables:
     """Own request slots, group page tables, and physical KV lengths.
 
     Slot zero is permanently reserved for padding and CUDA-graph rows. A live
@@ -54,7 +56,7 @@ class ReqToTokenPool:
             raise invalid_descriptor("request-to-token pool geometry is invalid")
 
         self._table_capacity = self.request_pool_size * self.group_count
-        tensors = BoundedTensorStorage.allocate(
+        tensors = TensorBuffers.allocate(
             self.tensor_schema(
                 group_count=self.group_count,
                 request_pool_size=self.request_pool_size,
@@ -63,7 +65,7 @@ class ReqToTokenPool:
             device,
         ).capacity
         self.page_tables = tensors["page_tables"]
-        self.verified_lens = tensors["verified_lens"]
+        self.verified_lengths = tensors["verified_lengths"]
         self.alloced_lens = tensors["alloced_lens"]
         self._page_staging = tensors["_page_staging"]
         self._slot_staging = tensors["_slot_staging"]
@@ -74,25 +76,25 @@ class ReqToTokenPool:
 
         # Generation-safe pinned rings retain CPU sources until asynchronous
         # copies into all four device staging tensors have completed.
-        self._page_host = HostStagingRing(
+        self._page_host = StagingBuffers(
             (self._table_capacity, self.max_blocks_per_request),
             dtype=torch.int32,
             depth=staging_depth,
             device=self.page_tables.device,
         )
-        self._slot_host = HostStagingRing(
+        self._slot_host = StagingBuffers(
             self._table_capacity,
             dtype=torch.int64,
             depth=staging_depth,
             device=self.page_tables.device,
         )
-        self._group_host = HostStagingRing(
+        self._group_host = StagingBuffers(
             self._table_capacity,
             dtype=torch.int64,
             depth=staging_depth,
             device=self.page_tables.device,
         )
-        self._allocated_host = HostStagingRing(
+        self._allocated_host = StagingBuffers(
             self._table_capacity,
             dtype=torch.int32,
             depth=staging_depth,
@@ -112,7 +114,7 @@ class ReqToTokenPool:
             "page_tables": TensorSchema(
                 (group_count, rows, max_blocks_per_request), torch.int32, fill=0
             ),
-            "verified_lens": TensorSchema((rows,), torch.int32, fill=0),
+            "verified_lengths": TensorSchema((rows,), torch.int32, fill=0),
             "alloced_lens": TensorSchema((rows,), torch.int32, fill=0),
             "_page_staging": TensorSchema((tables, max_blocks_per_request), torch.int32),
             "_slot_staging": TensorSchema((tables,), torch.int64),
@@ -185,9 +187,9 @@ class ReqToTokenPool:
             self._group_staging[:changed_count].copy_(
                 group_host[:changed_count], non_blocking=non_blocking
             )
-            self._page_host.release(page_slot)
-            self._slot_host.release(slot_slot)
-            self._group_host.release(group_slot)
+            self._page_host.record_copy(page_slot)
+            self._slot_host.record_copy(slot_slot)
+            self._group_host.record_copy(group_slot)
             self.page_tables[
                 self._group_staging[:changed_count],
                 self._slot_staging[:changed_count],
@@ -208,8 +210,8 @@ class ReqToTokenPool:
             self._allocated_staging[:allocated_count].copy_(
                 allocated_host[:allocated_count], non_blocking=non_blocking
             )
-            self._slot_host.release(slot_slot)
-            self._allocated_host.release(allocated_slot)
+            self._slot_host.record_copy(slot_slot)
+            self._allocated_host.record_copy(allocated_slot)
             self.alloced_lens.index_copy_(
                 0,
                 self._slot_staging[:allocated_count],
@@ -254,7 +256,7 @@ class ReqToTokenPool:
             torch._assert_async(bounds, "verified length exceeds allocated KV capacity")
         elif not bool(bounds):
             raise invalid_descriptor("verified length exceeds allocated KV capacity")
-        self.verified_lens.index_copy_(0, slots, lengths)
+        self.verified_lengths.index_copy_(0, slots, lengths)
 
     def close(self) -> None:
         """Retire pinned page-table sources before their borrowed streams are destroyed."""
@@ -297,9 +299,9 @@ class ReqToTokenPool:
         fill_cpu_ints(host[:count], values)
         indices = self._slot_staging[:count]
         indices.copy_(host[:count], non_blocking=self.page_tables.device.type == "cuda")
-        self._slot_host.release(slot)
+        self._slot_host.record_copy(slot)
         self.page_tables.index_fill_(1, indices, 0)
-        self.verified_lens.index_fill_(0, indices, 0)
+        self.verified_lengths.index_fill_(0, indices, 0)
         self.alloced_lens.index_fill_(0, indices, 0)
         selected = set(values)
         for identity in tuple(self._host_tables):

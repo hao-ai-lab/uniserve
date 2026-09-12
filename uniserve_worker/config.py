@@ -11,14 +11,14 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
-from uniserve_worker.execution.batch import (
+from uniserve_worker.foundation.errors import invalid_descriptor
+from uniserve_worker.protocol.batch import (
     COMPUTATIONS,
     Computation,
     ForwardMode,
     PipelineStage,
     TransferMode,
 )
-from uniserve_worker.foundation.errors import invalid_descriptor
 
 __all__ = [
     "DEFAULT_DECODE_GRAPH_BATCH_SIZES",

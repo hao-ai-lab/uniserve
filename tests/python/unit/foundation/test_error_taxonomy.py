@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from uniserve_worker.execution.batch import ComputationId
 from uniserve_worker.foundation.errors import WorkerError, WorkerErrorCode, classify
+from uniserve_worker.protocol.batch import ComputationId
 
 pytestmark = pytest.mark.unit
 

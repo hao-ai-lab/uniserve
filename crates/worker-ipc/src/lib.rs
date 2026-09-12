@@ -1,7 +1,7 @@
 //! Versioned scheduler-to-worker protocol and shared-memory transport.
 //!
-//! [`NewRequest`] admits static state, [`Run`] submits planned operations, and
-//! [`RunResult`] returns completions and products. [`WorkerInfo`] describes a
+//! [`NewRequest`] admits static state, [`ScheduleBatch`] submits planned operations, and
+//! [`BatchOutput`] returns completions and products. [`WorkerInfo`] describes a
 //! loaded worker before execution begins. Numeric request, operation, point,
 //! and generation identities remain stable across serialization.
 
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use uniserve_core::{
     BlockId, ImageParams, KvCacheDtype, KvCacheGroup, RequestId, SamplingParams, TokenLogprob,
 };
-pub use uniserve_core::{ComputationId, WorkerForwardStats};
+pub use uniserve_core::{ComputationId, ForwardStats};
 
 /// Result type for semantic worker-message validation.
 pub type ValidationResult<T> = std::result::Result<T, ValidationError>;

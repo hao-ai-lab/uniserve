@@ -2,41 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass, replace
-from enum import StrEnum
-from typing import TYPE_CHECKING, TypeVar, cast
+from dataclasses import replace
+from functools import partial
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.batch import (
-    COMPUTATIONS,
-    Computation,
-    ComputationId,
-    ForwardMode,
-    ImageParams,
-    PipelineStage,
-    RequestKey,
-    RunLane,
-    ScheduledRequest,
-    StaticDim,
-)
 from uniserve_worker.execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
     TokenSelection,
 )
-from uniserve_worker.execution.runners.packed import (
-    FlowCapture,
+from uniserve_worker.execution.graph_inputs import (
+    DiffusionShape,
     GraphExecutionError,
-    GraphGreedyOutput,
-    MixedCapture,
-    PackedRunner,
+    MixedShape,
 )
 from uniserve_worker.foundation.errors import (
     ComputeError,
@@ -54,82 +41,69 @@ from uniserve_worker.models.runtime import ExecutionModel
 from uniserve_worker.nn.attention_storage import attention_exchange_scope
 from uniserve_worker.nn.collective import collective_scope
 from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
-from uniserve_worker.runtime.device import HostStagingRing, canonical_device, fill_cpu_ints
-from uniserve_worker.runtime.device_products import device_product_storage
+from uniserve_worker.protocol.batch import (
+    COMPUTATIONS,
+    Computation,
+    ComputationId,
+    ForwardMode,
+    ForwardStats,
+    ImageParams,
+    PipelineStage,
+    RequestKey,
+    ScheduledRequest,
+    StaticDim,
+)
+from uniserve_worker.runtime.device import canonical_device, fill_cpu_ints
+from uniserve_worker.runtime.staging_buffers import StagingBuffers
+from uniserve_worker.runtime.tensor_store import device_product_storage
 
-from ..nn.mesh import Communicator
-from .bounded_storage import BoundedTensorStorage
-from .graph.full import FullCudaGraphBackend
-from .input_buffers import AttentionInputs, InputBuffers, InputGeometry
-from .runners.denoise import DenoiseRunner
-from .runners.module import ModuleRunner, TensorOutput
+from ..nn.mesh import Communicator, DeviceMesh
+from ..nn.parallel import ComponentConfig
+from ..profiling import record_component
+from ..runtime.tensor_buffers import TensorBuffers
+from .cuda_graph import CudaGraph
+from .diffusion_runner import DiffusionRunner
+from .input_buffers import InputBuffers, InputGeometry
+from .model_entry import ModelEntry, TensorOutput, capture_required, tensor_signature
 
 if TYPE_CHECKING:
-    from ..runtime.cache_pool import CachePool
-    from ..runtime.distributed import DistributedEnvironment
-    from ..runtime.req_to_token_pool import ReqToTokenPool
-    from ..runtime.runtime_states import RuntimeStates
+    from ..runtime.block_tables import BlockTables
+    from ..runtime.decode_state import DecodeState
+    from ..runtime.kv_cache import KVCache
     from .forward_batch import AttentionSelection
-from .lane import ExecutionLaneRuntime, LaneConfig, create_green_contexts
-from .rows import ForwardRow, LaneState
+from ..config import LaneConfig
+from ..nn.collective import stream_collective_scope
+from .cuda_stream import CudaStream, create_partitioned_streams
+from .forward_batch import AttentionMode
+from .graph_inputs import (
+    _GRAPH_BINDINGS,
+    PrefillShape,
+    _attention_inputs,
+    _batch_tensors,
+    _copy_tensors,
+    _cuda_batch,
+    _decode_geometry,
+    _decode_signature,
+    _exact_signature,
+    _graph_batch,
+    _graph_provider,
+    _GraphMiss,
+    _greedy_decode,
+    _live_attention,
+    _normalize_exact_batch,
+    _pad_decode_batch,
+    _pad_prefill_batch,
+    _prefill_geometry,
+    _prefill_signature,
+    _private_pool_bytes,
+    _release_call,
+    _trim_greedy,
+    _trim_output,
+)
+from .rows import ForwardRow
+from .sampling import SamplerOutput
 
 logger = logging.getLogger(__name__)
-
-
-class RunPath(StrEnum):
-    """Identifies eager, graph-capture, graph-replay, and graph-fallback execution paths."""
-
-    EAGER = "eager"
-    GRAPH_CAPTURE = "graph_capture"
-    GRAPH_REPLAY = "graph_replay"
-    GRAPH_FALLBACK = "graph_fallback"
-
-
-@dataclass(frozen=True, slots=True)
-class RunObservation:
-    """Records route, row composition, graph padding, path, and duration for one model invocation."""
-
-    route: str
-    row_count: int
-    row_kind_counts: tuple[tuple[str, int], ...]
-    path: RunPath
-    duration_us: int
-    graph_unpadded_tokens: int
-    graph_padded_tokens: int
-
-
-@dataclass(frozen=True, slots=True)
-class ForwardResult:
-    """Pairs a model output with the route and execution-path observation that produced it."""
-
-    output: ForwardOutput
-    request_pool_indices: torch.Tensor
-    path: RunPath
-    output_event: torch.cuda.Event | None
-    observation: RunObservation
-    greedy: GraphGreedyOutput | None
-
-    def materialize_values(self) -> tuple[torch.Tensor, ...]:
-        """Order the consumer stream and collectively materialize raw outputs.
-
-        A consumer using ``greedy`` directly can retain vocabulary sharding.
-        Other consumers receive the complete unpadded logits through this
-        boundary. Every TP member must make the same consumption decision.
-        """
-
-        if self.output_event is not None:
-            torch.cuda.current_stream(self.request_pool_indices.device).wait_event(
-                self.output_event
-            )
-        return self.output.materialize().values
-
-
-@dataclass(frozen=True, slots=True)
-class EntryResult:
-    """Borrowed tensor results and the shared execution observation for an entry call."""
-
-    values: tuple[torch.Tensor, ...]
-    observation: RunObservation
 
 
 def _invoke(
@@ -188,18 +162,14 @@ def capture_image_parameters(
     )
 
 
-GeometryT = TypeVar("GeometryT")
-
-
 class ModelRunner:
-    """Own lane_runtime-local GPU resources and execute one physical model call."""
+    """Own model bindings, numerical input storage, and CUDA graph execution."""
 
     def __init__(
         self,
         model: ExecutionModel,
         worker_config: WorkerConfig,
         *,
-        environment: DistributedEnvironment | None = None,
         attention: AttentionSelection | None = None,
         schedule: DiffusionSchedule | None = None,
     ) -> None:
@@ -215,27 +185,36 @@ class ModelRunner:
         )
         bind_dense_attention_modules(model, self.attention)
         self.model = model
-        self._environment = environment
         self.schedule = schedule
         self.worker_config = worker_config
         self.uses_lanes = False
-        self.flow_captures: tuple[FlowCapture, ...] = ()
+        self.flow_captures: tuple[DiffusionShape, ...] = ()
         self.flow_cfg_branches: tuple[int, ...] = ()
-        self._mixed_qualification: dict[MixedCapture, bool] = {}
+        self._mixed_qualification: dict[MixedShape, bool] = {}
         self._startup_complete = False
-        self._packed_bindings: dict[tuple[str, Computation], PackedRunner] = {}
-        self._packed: list[PackedRunner] = []
-        self._owned_lanes: list[ExecutionLaneRuntime] = []
-        self._geometry_cache: OrderedDict[Hashable, object] = OrderedDict()
-        self.modules: dict[str, ModuleRunner] = {}
-        self.denoise: DenoiseRunner | None = None
+        self._forward_entries: dict[tuple[str, Computation], ModelEntry] = {}
+        self.batch_graphs: dict[
+            ModelEntry, dict[Hashable, CudaGraph[tuple[ForwardOutput, SamplerOutput | None]]]
+        ] = {}
+        self.graph_streams: dict[ModelEntry, torch.cuda.Stream] = {}
+        self.graph_pools: dict[ModelEntry, Any] = {}
+        self.graph_memory_budgets: dict[torch.device, int] = {}
+        self.decode_shapes: dict[ModelEntry, tuple[int, ...]] = {}
+        self.prefill_shapes: dict[ModelEntry, tuple[PrefillShape, ...]] = {}
+        self.prefill_row_sizes: tuple[int, ...] = ()
+        self.decode_context_blocks = 0
+        self.decode_predicates: torch.Tensor | None = None
+        self.kv_cache: KVCache
+        self._streams: list[CudaStream] = []
+        self.entries: dict[tuple[str, str, str], ModelEntry] = {}
+        self.diffusion: DiffusionRunner | None = None
         self._capture_stream: torch.cuda.Stream | None = None
-        self._text_staging: HostStagingRing | None = None
+        self._text_staging: StagingBuffers | None = None
         self._text_tokens: torch.Tensor | None = None
         self._preparation_stream: torch.cuda.Stream | None = None
         self._sum_reductions = {}
         self._attention_exchange_storage = {}
-        self.scratch: BoundedTensorStorage | None = None
+        self.scratch: TensorBuffers | None = None
         self.context_workspace = None
         self._closed = False
         try:
@@ -243,7 +222,7 @@ class ModelRunner:
                 "text_encoder" in model.entry_outputs
                 and getattr(model, "text_encoder", None) is not None
             ):
-                self._text_staging = HostStagingRing(
+                self._text_staging = StagingBuffers(
                     model.text_max_tokens, dtype=torch.int64, depth=2, device=worker_config.device
                 )
                 self._text_tokens = torch.empty(
@@ -254,7 +233,10 @@ class ModelRunner:
                 if bool(model.resource_geometry.request_tensors)
                 else None
             )
-            self._sum_reductions = environment.sum_reductions() if environment is not None else {}
+            from ..runtime.collectives import allocate_peer_reductions
+
+            meshes = (entry.mesh for entry in model.bindings.values() if entry.mesh is not None)
+            self._sum_reductions = allocate_peer_reductions(mesh.get_group("tp") for mesh in meshes)
             exchange_modules = tuple(
                 module
                 for module in model.modules()
@@ -265,31 +247,37 @@ class ModelRunner:
                 from ..bootstrap.capacity import packed_input_geometry
                 from ..runtime.attention_storage import allocate_attention_exchange_storage
 
-                if environment is None:
-                    raise ValueError("sequence attention requires its distributed storage owner")
                 geometry = packed_input_geometry(model, worker_config)
                 dtype = getattr(torch, worker_config.model_dtype.removeprefix("torch."))
                 for lane in worker_config.lanes or (None,):
                     lane_id = None if lane is None else lane.lane_id
                     self._attention_exchange_storage[lane_id] = allocate_attention_exchange_storage(
                         exchange_modules,
-                        environment,
                         max_tokens=geometry.max_tokens,
                         dtype=dtype,
-                        scope=("attention", id(self), lane_id),
                     )
 
             if model.scratch_schema:
-                self.scratch = BoundedTensorStorage.allocate(
-                    model.scratch_schema, worker_config.device, environment=environment
-                )
+                self.scratch = TensorBuffers.allocate(model.scratch_schema, worker_config.device)
             context = model.context_geometry
             if context is not None:
-                if environment is None:
-                    raise ValueError("context attention requires its distributed resource owner")
-                self.context_workspace = environment.attention_context(context)
+                from ..runtime.attention_storage import allocate_attention_context
+
+                self.context_workspace = allocate_attention_context(context)
 
             model.bind_execution(self)
+            if self.diffusion is None and (
+                model.generation is not None or model.resource_geometry.request_tensors
+            ):
+                self.diffusion = DiffusionRunner(
+                    generation=model.generation,
+                    device=canonical_device(
+                        worker_config.generation_device or worker_config.device
+                    ),
+                    capture_stream=None,
+                    groups=(),
+                    capacity=worker_config.max_request_pool_size,
+                )
         except BaseException as error:
             try:
                 self.close()
@@ -297,19 +285,15 @@ class ModelRunner:
                 error.add_note(f"Resource cleanup also failed: {cleanup_error!r}")
             raise
 
-    def graph_backend(self, *, shared_pool: bool = False) -> FullCudaGraphBackend | None:
-        """Construct full capture for an already-bound numerical entry."""
+    def capture_stream(self) -> torch.cuda.Stream | None:
+        """Borrow the module capture stream when CUDA graph execution is enabled."""
 
         device = canonical_device(self.worker_config.device)
         if self.worker_config.graph_policy == "off" or device.type != "cuda":
             return None
         if self._capture_stream is None:
             self._capture_stream = torch.cuda.Stream(device=device)
-        return FullCudaGraphBackend(
-            device=device,
-            stream=self._capture_stream,
-            pool=torch.cuda.graph_pool_handle() if shared_pool else None,
-        )
+        return self._capture_stream
 
     def bind_module(
         self,
@@ -318,36 +302,44 @@ class ModelRunner:
         *,
         inputs: tuple[torch.Tensor, ...] | None = None,
         groups: tuple[Communicator, ...] = (),
-    ) -> ModuleRunner:
+        placement: str | None = None,
+    ) -> ModelEntry:
         """Associate a protocol entry with the rank's actual tensor computation."""
 
-        if name in self.modules:
+        device = canonical_device(self.worker_config.device)
+        key = (name, str(device), "default")
+        if key in self.entries:
             raise ValueError(f"numerical entry {name!r} is already bound")
-        module = ModuleRunner(
-            forward,
-            device=canonical_device(self.worker_config.device),
-            backend=self.graph_backend(),
-            inputs=inputs,
-            groups=groups,
-        )
-        self.modules[name] = module
+        module = self._entry(placement or name, device)
+        if placement is not None:
+            module = replace(module, name=name)
+        module.forward = forward
+        module.fixed_inputs = inputs
+        module.output_schema = self.model.entry_outputs.get(name, ())
+        if groups:
+            module.groups = groups
+        self.entries[key] = module
         return module
 
-    def prepare_geometry(self, key: Hashable, build: Callable[[], GeometryT]) -> GeometryT:
-        """Own immutable model metadata until every dependent execution is retired."""
+    def _entry(self, name: str, device: torch.device) -> ModelEntry:
+        """Resolve checkpoint placement, or a standalone local model binding."""
 
-        if key not in self._geometry_cache:
-            if len(self._geometry_cache) >= max(2, self.worker_config.max_request_pool_size):
-                torch.cuda.current_stream(self.worker_config.device).synchronize()
-                retired = next(iter(self._geometry_cache))
-                if self.denoise is not None:
-                    self.denoise.discard_geometry(retired)
-                del self._geometry_cache[retired]
-            self._geometry_cache[key] = build()
-        self._geometry_cache.move_to_end(key)
-        return cast(GeometryT, self._geometry_cache[key])
+        if self.model.bindings:
+            entry = self.model.bindings.get(name)
+            if entry is None or not entry.owns:
+                raise ValueError(f"rank does not own computation entry {name!r}")
+            if entry.device == device:
+                return entry
+            # A model may place generation submodules on another local device.
+            # The physical binding shares rank geometry, not mutable GPU storage.
+            return ModelEntry(name, entry.config, entry.process_group, entry.mesh, device)
+        rank = self.worker_config.rank
+        group = Communicator((rank,), rank, device=device)
+        config = ComponentConfig((rank,))
+        mesh = DeviceMesh((rank,), rank, config.parallel_config, device)
+        return ModelEntry(name, config, group, mesh, device)
 
-    def warmup(self, storage: tuple[BoundedTensorStorage, ...]) -> None:
+    def warmup(self, storage: tuple[TensorBuffers, ...]) -> None:
         """Prepare model/provider geometry through its numerical execution owners."""
 
         started = time.perf_counter()
@@ -357,28 +349,31 @@ class ModelRunner:
         self.synchronize()
         logger.info("completed numerical eager warmup seconds=%.3f", time.perf_counter() - started)
 
-    def packed_forward(self, packed: PackedRunner, batch: ForwardBatch) -> ForwardOutput:
+    def batch_forward(self, entry: ModelEntry, batch: ForwardBatch) -> ForwardOutput:
         """Use the same numerical and communication binding for startup and serving."""
 
-        lane = packed.lane
-        inputs = packed.inputs
-        assert lane is not None and inputs is not None
+        lane = entry.cuda_stream
+        inputs = entry.input_buffers
+        assert inputs is not None
         ids = inputs.input_ids[:0] if batch.input_ids is None else batch.input_ids
         positions = inputs.positions[0, :0] if batch.positions is None else batch.positions
-        reductions = self._sum_reductions if lane.full_device else {}
-        exchanges = self._attention_exchange_storage.get(lane.lane_id, {})
+        reductions = self._sum_reductions if lane is None or lane.full_device else {}
+        exchanges = self._attention_exchange_storage.get(None if lane is None else lane.name, {})
         with collective_scope(reductions), attention_exchange_scope(exchanges):
-            return _invoke(self.model, ids, positions, batch)
+            assert entry.forward is not None
+            output = entry.forward(ids, positions, batch)
+            if not isinstance(output, ForwardOutput):
+                raise TypeError("batch entry must return ForwardOutput")
+            return output
 
     @torch.inference_mode()
     def capture(self, *, tokenizer, latents) -> None:
-        """Prepare configured packed inputs in dependency order before runtime warmup."""
+        """Prepare configured entry inputs in dependency order before runtime warmup."""
 
         from functools import partial
 
+        from .graph_inputs import PrefillShape
         from .runners.decode import prepare_decode
-        from .runners.flow import FlowRunner
-        from .runners.packed import PrefillCapture
         from .runners.prefill import prepare_prefill
 
         processor = self.model.image_processor
@@ -387,62 +382,70 @@ class ModelRunner:
 
         for phase in ("prefill", "decode", "flow"):
             started = time.perf_counter()
-            captures_before = sum(packed.captures for packed in self._packed)
-            logger.info("starting packed preparation phase=%s", phase)
-            for packed in self._packed:
-                lane = packed.lane
-                assert lane is not None and packed.inputs is not None
-                if lane.device != canonical_device(self.worker_config.device):
+            captures_before = sum(len(graphs) for graphs in self.batch_graphs.values())
+            logger.info("starting entry preparation phase=%s", phase)
+            for entry in self.batch_graphs:
+                lane = entry.cuda_stream
+                assert entry.input_buffers is not None
+                if entry.device != canonical_device(self.worker_config.device):
                     continue
-                context = nullcontext() if lane.stream is None else torch.cuda.stream(lane.stream)
-                if lane.stream is not None:
-                    lane.order_after(torch.cuda.current_stream(lane.device))
+                context = nullcontext() if lane is None else torch.cuda.stream(lane.stream)
+                if lane is not None:
+                    lane.wait(torch.cuda.current_stream(lane.device))
                 with context:
-                    forward = partial(self.packed_forward, packed)
+                    forward = partial(self.batch_forward, entry)
                     if (
                         phase == "prefill"
-                        and ForwardMode.PREFILL in lane.computations
+                        and ForwardMode.PREFILL in entry.computations
                         and ForwardMode.PREFILL in self.model.supported_work
                     ):
                         shapes = (
-                            packed.prefill_shapes
-                            if packed.enabled and packed.prefill_enabled
-                            else (PrefillCapture(1, 1, 1),)
+                            self.prefill_shapes[entry]
+                            if (self.worker_config.graph_policy != "off")
+                            and self.worker_config.prefill_cuda_graph
+                            else (PrefillShape(1, 1, 1),)
                         )
                         prepare_prefill(
-                            packed,
-                            packed.inputs,
+                            self,
+                            entry,
+                            entry.input_buffers,
                             forward,
                             shapes,
                             packed=self.model.tensorized_mixed,
                         )
                     elif (
                         phase == "decode"
-                        and ForwardMode.DECODE in lane.computations
+                        and ForwardMode.DECODE in entry.computations
                         and ForwardMode.DECODE in self.model.supported_work
                     ):
                         prepare_decode(
-                            packed, packed.inputs, forward, packed=self.model.tensorized_mixed
+                            self,
+                            entry,
+                            entry.input_buffers,
+                            forward,
+                            packed=self.model.tensorized_mixed,
                         )
                     elif (
                         phase == "flow"
-                        and PipelineStage.DENOISING in lane.computations
+                        and PipelineStage.DENOISING in entry.computations
                         and self.model.generation is not None
                         and latents is not None
                     ):
-                        flow = FlowRunner(
-                            packed,
-                            packed.inputs,
-                            forward,
-                            generation=self.model.generation,
-                            latents=latents,
-                            tokenizer=tokenizer,
-                            patch_size=patch_size,
-                            tensorized=self.model.tensorized_mixed,
-                        )
-                        if packed.enabled and packed.prefill_enabled and self.flow_captures:
-                            flow.capture(
-                                self.flow_captures, self.mixed_captures, self.qualify_mixed
+                        assert self.diffusion is not None
+                        if (
+                            (self.worker_config.graph_policy != "off")
+                            and self.worker_config.prefill_cuda_graph
+                            and self.flow_captures
+                        ):
+                            self.diffusion.prepare_flow(
+                                self,
+                                entry,
+                                latents,
+                                tokenizer,
+                                patch_size,
+                                self.flow_captures,
+                                self.mixed_captures,
+                                capture=True,
                             )
                         else:
                             import math
@@ -461,15 +464,24 @@ class ModelRunner:
                                         for shape in reversed(self.flow_captures)
                                         if shape.cfg_branches == branches
                                     ),
-                                    FlowCapture(1, side, side, branches),
+                                    DiffusionShape(1, side, side, branches),
                                 )
                                 for branches in self.flow_cfg_branches
                             )
-                            flow.warmup(representative, self.mixed_captures, self.qualify_mixed)
+                            self.diffusion.prepare_flow(
+                                self,
+                                entry,
+                                latents,
+                                tokenizer,
+                                patch_size,
+                                representative,
+                                self.mixed_captures,
+                                capture=False,
+                            )
             logger.info(
-                "completed packed preparation phase=%s captured_shapes=%d seconds=%.3f",
+                "completed entry preparation phase=%s captured_shapes=%d seconds=%.3f",
                 phase,
-                sum(packed.captures for packed in self._packed) - captures_before,
+                sum(len(graphs) for graphs in self.batch_graphs.values()) - captures_before,
                 time.perf_counter() - started,
             )
         self.synchronize()
@@ -490,10 +502,10 @@ class ModelRunner:
         fill_cpu_ints(host, tokens)
         target = storage[: len(tokens)]
         target.copy_(host[: len(tokens)], non_blocking=storage.is_cuda)
-        staging.release(index)
+        staging.record_copy(index)
         return target.view(1, -1)
 
-    def run_entry(self, name: str, *inputs: torch.Tensor) -> EntryResult:
+    def run_entry(self, name: str, *inputs: torch.Tensor) -> ForwardOutput:
         """Execute an entry and validate its declared logical Tensor results."""
 
         schemas = self.model.entry_outputs.get(name)
@@ -522,7 +534,7 @@ class ModelRunner:
 
         return self._run_module(name, inputs, validate)
 
-    def run_module(self, name: str, *inputs: object) -> EntryResult:
+    def run_module(self, name: str, *inputs: object) -> ForwardOutput:
         """Execute bound numerical modules over Tensor views and typed metadata.
 
         Numerical returns may be rank-local intermediate values. Logical product
@@ -539,16 +551,95 @@ class ModelRunner:
         name: str,
         inputs: tuple[object, ...],
         validate: Callable[[tuple[torch.Tensor, ...]], None] | None = None,
-    ) -> EntryResult:
+    ) -> ForwardOutput:
         """Own eager/captured selection and observations for numerical calls."""
 
-        module = self.modules.get(name)
+        module = self.entries.get(
+            (name, str(canonical_device(self.worker_config.device)), "default")
+        )
         if module is None:
             raise InputError(f"rank does not own computation entry {name!r}")
         if any(not isinstance(value, torch.Tensor) for value in inputs):
             raise InputError("module arguments must be tensors")
         tensors = cast(tuple[torch.Tensor, ...], inputs)
-        return self._observe_module(name, lambda: module.run(*tensors), validate)
+        return self._observe_module(name, lambda: self._call_module(module, tensors), validate)
+
+    @torch.inference_mode()
+    def warmup_module(self, name: str, *inputs: torch.Tensor) -> None:
+        """Initialize numerical providers using this entry's actual callable."""
+
+        entry = self.entries[(name, str(canonical_device(self.worker_config.device)), "default")]
+        values = inputs or entry.fixed_inputs
+        if values is None:
+            raise ValueError("module warmup requires representative inputs")
+        assert entry.forward is not None
+        entry.forward(*values)
+
+    def _capture_module(self, entry: ModelEntry, inputs: tuple[torch.Tensor, ...]) -> None:
+        stream = self.capture_stream()
+        if stream is None:
+            raise GraphExecutionError("module capture requires CUDA graph execution")
+        graph = CudaGraph[TensorOutput](device=entry.device, stream=stream)
+        graph.capture(
+            partial(cast(Callable[..., TensorOutput], entry.forward), *inputs), keepalive=inputs
+        )
+        entry.graph = graph
+        graph.inputs = inputs
+        entry.signature = tensor_signature(inputs)
+
+    def _call_module(
+        self, entry: ModelEntry, inputs: tuple[torch.Tensor, ...]
+    ) -> tuple[TensorOutput, str]:
+        if self._closed:
+            raise GraphExecutionError("model runner is closed")
+        if any(value.device != entry.device for value in inputs):
+            raise GraphExecutionError("module input device changed")
+        key = tensor_signature(inputs)
+        if entry.fixed_inputs is not None:
+            fixed_key = tensor_signature(entry.fixed_inputs)
+            if tuple(value[:2] for value in key) != tuple(value[:2] for value in fixed_key):
+                raise GraphExecutionError("CUDA graph input geometry changed")
+            # Strided sources are copied into the fixed destination layout.
+            key = fixed_key
+        if self.capture_stream() is None:
+            assert entry.forward is not None
+            return cast(TensorOutput, entry.forward(*inputs)), "eager"
+        missing = (
+            False
+            if entry.fixed_inputs is not None
+            else capture_required(
+                entry.signature != key or entry.graph is None, entry.groups, entry.device
+            )
+        )
+        if missing:
+            torch.cuda.current_stream(entry.device).synchronize()
+            if entry.graph is not None:
+                entry.graph.close()
+                entry.graph = None
+            entry.signature = None
+            stable = tuple(
+                torch.empty_strided(
+                    value.shape, value.stride(), dtype=value.dtype, device=value.device
+                )
+                for value in inputs
+            )
+            for source, target in zip(inputs, stable, strict=True):
+                target.copy_(source)
+            self._capture_module(entry, stable)
+        if entry.graph is None:
+            raise GraphExecutionError("module graph is not captured")
+        stable_inputs = cast(tuple[torch.Tensor, ...], entry.graph.inputs)
+        for source, target in zip(inputs, stable_inputs, strict=True):
+            target.copy_(source)
+        return entry.graph.replay(), "graph_capture" if missing else "graph_replay"
+
+    @staticmethod
+    def _close_entry(entry: ModelEntry) -> None:
+        if entry.graph is not None:
+            entry.graph.close()
+            entry.graph = None
+        entry.fixed_inputs = None
+        entry.signature = None
 
     def run_denoising(
         self,
@@ -560,15 +651,15 @@ class ModelRunner:
         *,
         slot: Hashable,
         geometry: Hashable,
-    ) -> EntryResult:
-        denoise = self.denoise
-        if denoise is None:
+    ) -> ForwardOutput:
+        diffusion = self.diffusion
+        if diffusion is None:
             raise InputError("rank does not own denoising computation")
         if count != 1:
             raise InputError("denoising calls evaluate exactly one scheduled step")
         return self._observe_module(
             "denoiser",
-            lambda: denoise.run(tensors, metadata, step, schedule, slot=slot, geometry=geometry),
+            lambda: diffusion.step(tensors, metadata, step, schedule, slot=slot, geometry=geometry),
         )
 
     @torch.inference_mode()
@@ -577,13 +668,11 @@ class ModelRunner:
         name: str,
         run: Callable[[], tuple[TensorOutput, str]],
         validate: Callable[[tuple[torch.Tensor, ...]], None] | None = None,
-    ) -> EntryResult:
+    ) -> ForwardOutput:
         started = time.perf_counter_ns()
-        path = RunPath.EAGER
         with collective_scope(self._sum_reductions):
-            output, execution_path = run()
-            path = RunPath(execution_path)
-        if path is RunPath.GRAPH_CAPTURE:
+            output, path = run()
+        if path == "graph_capture":
             logger.info(
                 "completed first-use capture entry=%s device=%s seconds=%.3f",
                 name,
@@ -600,20 +689,30 @@ class ModelRunner:
         if validate is not None:
             validate(values)
         elapsed = (time.perf_counter_ns() - started) // 1000
-        observation = RunObservation(name, 1, ((name, 1),), path, elapsed, 0, 0)
-        return EntryResult(values, observation)
+        return ForwardOutput(
+            values,
+            stats=ForwardStats(
+                mode_counts={name: 1},
+                mode_tokens={name: 1},
+                mode_us={name: elapsed},
+                component_us={"forward": elapsed},
+                cuda_graph_runtime_mode_counts={path: 1},
+                cuda_graph_captures=int(path == "graph_capture"),
+                cuda_graph_replays=int(path == "graph_replay"),
+            ),
+        )
 
     @property
-    def mixed_captures(self) -> tuple[MixedCapture, ...]:
+    def mixed_captures(self) -> tuple[MixedShape, ...]:
         return tuple(self._mixed_qualification)
 
-    def allows_mixed(self, shape: MixedCapture) -> bool:
+    def allows_mixed(self, shape: MixedShape) -> bool:
         """Allow configured startup calls, then only measured eligible service shapes."""
 
         eligible = self._mixed_qualification.get(shape)
         return eligible is not None and (not self._startup_complete or eligible)
 
-    def qualify_mixed(self, shape: MixedCapture, eligible: bool) -> bool:
+    def qualify_mixed(self, shape: MixedShape, eligible: bool) -> bool:
         """Record successful output and service qualification before admission."""
 
         if self._startup_complete or shape not in self._mixed_qualification:
@@ -622,11 +721,11 @@ class ModelRunner:
         self._mixed_qualification[shape] = qualified
         return qualified
 
-    def configure_packed(
+    def configure_inputs(
         self,
         *,
         geometry: InputGeometry,
-        cache_pool,
+        kv_cache,
         latent_pool,
         decode_predicates: torch.Tensor,
         max_operations: int,
@@ -642,8 +741,8 @@ class ModelRunner:
         from ..bootstrap.capacity import device_total_bytes
         from ..config import DEFAULT_PREFILL_GRAPH_ROW_BUCKETS, graph_memory_budget_bytes
         from ..nn.diffusion.cfg import build_flow_cfg_plan
-        from .runners.packed import (
-            PrefillCapture,
+        from .graph_inputs import (
+            PrefillShape,
             select_flow_captures,
             select_mixed_captures,
             select_prefill_captures,
@@ -651,7 +750,6 @@ class ModelRunner:
 
         worker_config = self.worker_config
         packed_model = self.model
-        attention = self.attention
         flow = packed_model.generation
         max_rows = min(
             max_operations,
@@ -691,12 +789,12 @@ class ModelRunner:
         decode_graph_batch_sizes = tuple(
             value
             for value in worker_config.decode_graph_batch_sizes
-            if 0 < int(value) <= decode_max_operations and int(value) < int(cache_pool.num_pages)
+            if 0 < int(value) <= decode_max_operations and int(value) < int(kv_cache.num_pages)
         )
         prefill_capacity = min(
             int(max_tokens),
             int(packed_model.text_max_tokens),
-            max(0, int(cache_pool.num_pages) - 1) * int(worker_config.block_size),
+            max(0, int(kv_cache.num_pages) - 1) * int(worker_config.block_size),
         )
         prefill_graph_token_sizes = tuple(
             value
@@ -789,111 +887,72 @@ class ModelRunner:
         )
         mixed_flow_graph_buckets = select_mixed_captures(flow_graph_buckets, mixed_text_batch_sizes)
         self.flow_cfg_branches = flow_cfg_branches
-        graph_budget = graph_memory_budget_bytes(device_total_bytes(worker_config.device))
+        self.kv_cache = kv_cache
+        self.decode_predicates = decode_predicates
+        self.decode_context_blocks = decode_context_blocks
+        self.prefill_row_sizes = prefill_graph_row_sizes
 
-        def packed_factory(
-            binding: ExecutionLaneRuntime,
-            inputs: InputBuffers,
-            expected_context: int | None,
-        ) -> PackedRunner:
-            """Construct a lane-scoped graph catalog within its row, token, and memory bounds."""
-
-            device = binding.device
-            lane = binding.lane
-            stream = binding.stream
-            computations = binding.computations
-            owns_model_compute = str(device) == str(torch.device(worker_config.device))
-
-            # Intersect global graph buckets with this physical lane's advertised capacity.
-            lane_max_operations = (
+        def configure_entry(entry: ModelEntry) -> None:
+            device = entry.device
+            binding = entry.cuda_stream
+            lane = None if binding is None else binding.config
+            computations = entry.computations
+            owns_model_compute = device == canonical_device(worker_config.device)
+            max_rows_for_entry = (
                 max_rows if lane is None else int(lane.max_batch_operations or max_rows)
             )
-            lane_max_tokens = (
+            max_tokens_for_entry = (
                 prefill_capacity if lane is None else int(lane.max_batch_tokens or prefill_capacity)
             )
-            lane_decode_buckets = (
-                tuple(
-                    value for value in decode_graph_batch_sizes if int(value) <= lane_max_operations
-                )
+            self.decode_shapes[entry] = (
+                tuple(value for value in decode_graph_batch_sizes if value <= max_rows_for_entry)
                 if owns_model_compute and ForwardMode.DECODE in computations
                 else ()
             )
-            lane_prefill_buckets = (
-                tuple(value for value in prefill_graph_token_sizes if int(value) <= lane_max_tokens)
+            prefill_tokens = (
+                tuple(value for value in prefill_graph_token_sizes if value <= max_tokens_for_entry)
                 if owns_model_compute and ForwardMode.PREFILL in computations
                 else ()
             )
-            lane_prefill_row_sizes = (
-                prefill_graph_row_sizes
-                if owns_model_compute and ForwardMode.PREFILL in computations
-                else ()
-            )
-            lane_prefill_catalog = (
-                tuple(PrefillCapture(value, 1, 1) for value in lane_prefill_buckets)
+            self.prefill_shapes[entry] = (
+                tuple(PrefillShape(value, 1, 1) for value in prefill_tokens)
                 if packed_model.tensorized_mixed
                 else select_prefill_captures(
-                    lane_prefill_buckets,
-                    lane_prefill_row_sizes,
-                    max_rows=lane_max_operations,
-                    max_tokens=lane_max_tokens,
+                    prefill_tokens,
+                    prefill_graph_row_sizes,
+                    max_rows=max_rows_for_entry,
+                    max_tokens=max_tokens_for_entry,
                 )
             )
-            backend: FullCudaGraphBackend[tuple[ForwardOutput, GraphGreedyOutput | None]] | None = (
-                FullCudaGraphBackend(
-                    device=device,
-                    stream=stream or torch.cuda.Stream(device=device),
-                    pool=torch.cuda.graph_pool_handle(),
-                    expected_context=expected_context,
+            self.graph_memory_budgets[device] = graph_memory_budget_bytes(
+                device_total_bytes(device)
+            )
+            if worker_config.graph_policy != "off" and device.type == "cuda":
+                self.graph_streams[entry] = (
+                    binding.stream
+                    if binding is not None and binding.context is not None
+                    else torch.cuda.Stream(device=device)
                 )
-                if worker_config.graph_policy != "off" and device.type == "cuda"
-                else None
-            )
-            return PackedRunner(
-                inputs=inputs,
-                lane=binding,
-                backend=backend,
-                enabled=worker_config.graph_policy != "off",
-                prefill_enabled=worker_config.prefill_cuda_graph,
-                cache=packed_model.cache_geometry,
-                cache_pool=cache_pool,
-                attention=attention,
-                block_size=worker_config.block_size,
-                memory_budget_bytes=graph_budget,
-                decode_batch_sizes=lane_decode_buckets,
-                decode_predicates=(
-                    decode_predicates
-                    if owns_model_compute and ForwardMode.DECODE in computations
-                    else None
-                ),
-                decode_context_blocks=decode_context_blocks,
-                packed_context_blocks=geometry.max_blocks_per_row,
-                prefill_token_sizes=(() if packed_model.tensorized_mixed else lane_prefill_buckets),
-                prefill_row_sizes=lane_prefill_row_sizes,
-                stream=stream,
-                prefill_shapes=lane_prefill_catalog,
-            )
+                self.graph_pools[entry] = torch.cuda.graph_pool_handle()
 
-        self.bind_packed(
+        self._bind_inputs(
             geometry=geometry,
             lanes=worker_config.lanes,
             max_inflight=max_inflight,
-            packed_factory=packed_factory,
+            configure_entry=configure_entry,
             flow_captures=flow_graph_buckets,
             mixed_captures=mixed_flow_graph_buckets,
         )
 
-    def bind_packed(
+    def _bind_inputs(
         self,
         *,
         geometry: InputGeometry,
-        packed_factory: Callable[
-            [ExecutionLaneRuntime, InputBuffers, int | None],
-            PackedRunner,
-        ],
+        configure_entry: Callable[[ModelEntry], None],
         lanes: tuple[LaneConfig, ...] = (),
         max_inflight: int = 1,
-        flow_captures: tuple[FlowCapture, ...] = (),
-        mixed_captures: tuple[MixedCapture, ...] = (),
+        flow_captures: tuple[DiffusionShape, ...] = (),
+        mixed_captures: tuple[MixedShape, ...] = (),
     ) -> None:
         """Construct device-and-lane runtimes around one pure execution model."""
 
@@ -908,8 +967,8 @@ class ModelRunner:
                 )
             )
         )
-        if self._owned_lanes:
-            raise RuntimeError("packed execution resources are already bound")
+        if self.batch_graphs:
+            raise RuntimeError("entry execution resources are already bound")
         self.uses_lanes = bool(lanes)
 
         def make_buffer(device: str) -> InputBuffers:
@@ -922,8 +981,9 @@ class ModelRunner:
             )
 
         startup = ExitStack()
-        bindings: list[tuple[ExecutionLaneRuntime, int | None]] = []
-        packed_runners: list[PackedRunner] = []
+        bindings: list[tuple[torch.device, CudaStream | None, int | None]] = []
+        binding: CudaStream | None
+        entries: list[ModelEntry] = []
         try:
             if lanes:
                 if len(canonical) != 1:
@@ -935,55 +995,63 @@ class ModelRunner:
                     names = ", ".join(sorted(kind.value for kind in missing))
                     raise ValueError(f"lane configuration has no binding for computations: {names}")
                 device = torch.device(canonical[0])
-                greens = create_green_contexts(lanes, device)
-                # Register every acquired context before allocating events or inputs.
-                for green in greens:
-                    startup.callback(green.close)
-                for green in greens:
-                    binding = ExecutionLaneRuntime(
-                        lane=green.lane,
-                        device=device,
-                        stream=green.stream,
-                        sm_count=green.sm_count,
-                        green=green,
-                        event_slots=int(green.lane.max_inflight or max_inflight) + 1,
-                    )
-                    binding.verify_stream()
-                    bindings.append((binding, int(green.context)))
+                streams = create_partitioned_streams(lanes, device, event_slots=max_inflight + 1)
+                for binding in streams:
+                    startup.callback(binding.close)
+                    binding.verify()
+                    bindings.append((device, binding, int(binding.context)))
             else:
                 for device_name in canonical:
                     device = torch.device(device_name)
-                    binding = ExecutionLaneRuntime(
-                        lane=None,
-                        device=device,
-                        stream=None,
-                        sm_count=(
-                            int(torch.cuda.get_device_properties(device).multi_processor_count)
-                            if device.type == "cuda"
-                            else 0
-                        ),
-                        event_slots=int(max_inflight) + 1,
+                    binding = (
+                        CudaStream(
+                            device=device,
+                            stream=torch.cuda.current_stream(device),
+                            sm_count=int(
+                                torch.cuda.get_device_properties(device).multi_processor_count
+                            ),
+                            event_slots=max_inflight + 1,
+                        )
+                        if device.type == "cuda"
+                        else None
                     )
-                    bindings.append((binding, None))
+                    if binding is not None:
+                        startup.callback(binding.close)
+                    bindings.append((device, binding, None))
 
-            for binding, expected_context in bindings:
-                context = (
-                    nullcontext() if binding.stream is None else torch.cuda.stream(binding.stream)
-                )
+            for device, binding, expected_context in bindings:
+                context = nullcontext() if binding is None else torch.cuda.stream(binding.stream)
                 with context:
-                    inputs = make_buffer(str(binding.device))
-                startup.callback(inputs.close)
-                packed = packed_factory(binding, inputs, expected_context)
-                startup.callback(packed.close)
-                if expected_context is not None and self._environment is not None:
-                    assert binding.stream is not None
-                    packed.collectives = self._environment.stream_collectives(binding.stream)
-                packed_runners.append(packed)
+                    inputs = make_buffer(str(device))
+                entry = self._entry("model", device)
+                if entries:
+                    # Each stream owns its addresses; placement and mesh stay shared.
+                    entry = ModelEntry(
+                        entry.name, entry.config, entry.process_group, entry.mesh, entry.device
+                    )
+                entry.forward = partial(_invoke, self.model)
+                entry.output_schema = self.model.entry_outputs.get(entry.name, ())
+                entry.computations = (
+                    COMPUTATIONS
+                    if binding is None or binding.config is None
+                    else binding.config.computations
+                )
+                entry.input_buffers = inputs
+                entry.cuda_stream = binding
+                self.batch_graphs[entry] = {}
+                startup.callback(self._close_batch_entry, entry)
+                configure_entry(entry)
+                if expected_context is not None:
+                    from ..runtime.collectives import allocate_stream_collectives
+
+                    assert binding is not None
+                    entry.collectives = allocate_stream_collectives(entry.groups, binding.stream)
+                entries.append(entry)
         except BaseException as error:
             try:
                 self.synchronize()
-                for binding, _context in bindings:
-                    if binding.stream is not None:
+                for _device, binding, _context in bindings:
+                    if binding is not None:
                         binding.stream.synchronize()
             except BaseException as cleanup_error:
                 error.add_note(f"Resource synchronization also failed: {cleanup_error!r}")
@@ -992,58 +1060,78 @@ class ModelRunner:
             except BaseException as cleanup_error:
                 error.add_note(f"Resource cleanup also failed: {cleanup_error!r}")
             raise
-        # Packed runners own staging; physical lanes outlive all borrowing runners.
-        self._owned_lanes.extend(binding for binding, _context in bindings)
-        self._packed.extend(packed_runners)
-        for packed in packed_runners:
-            assert packed.lane is not None
-            for kind in packed.lane.computations:
-                self._packed_bindings[(str(packed.lane.device), kind)] = packed
+        self._streams.extend(
+            binding for _device, binding, _context in bindings if binding is not None
+        )
+        for entry in entries:
+            key = (
+                entry.name,
+                str(entry.device),
+                "default" if entry.cuda_stream is None else entry.cuda_stream.name or "default",
+            )
+            self.entries[key] = entry
+            for kind in entry.computations:
+                if not isinstance(kind, ForwardMode) and kind not in {
+                    PipelineStage.VISION_ENCODING,
+                    PipelineStage.LATENT_ENCODING,
+                    PipelineStage.DENOISING,
+                    PipelineStage.IMAGE_DECODING,
+                }:
+                    continue
+                # VAE/image reconstruction inputs live with generation modules;
+                # token, vision, and learned denoising calls use the model binding.
+                device = canonical_device(
+                    worker_config.generation_device or worker_config.device
+                    if kind in {PipelineStage.LATENT_ENCODING, PipelineStage.IMAGE_DECODING}
+                    else worker_config.device
+                )
+                if entry.device == device:
+                    self._forward_entries[(entry.name, kind)] = entry
         startup.pop_all()
 
     @torch.inference_mode()
     def prepare_fixed_modules(self) -> None:
         """Warm up and capture fixed module inputs during worker startup."""
 
-        for name, module in self.modules.items():
-            if not module.fixed:
+        for module in self.entries.values():
+            name = module.name
+            if module.fixed_inputs is None:
                 continue
             started = time.perf_counter()
             with collective_scope(self._sum_reductions):
-                if module.backend is None:
-                    module.warmup()
+                if self.capture_stream() is None:
+                    self.warmup_module(name)
                 else:
-                    module.capture()
+                    self._capture_module(module, module.fixed_inputs)
             logger.info(
                 "prepared fixed module entry=%s mode=%s seconds=%.3f",
                 name,
-                "eager" if module.backend is None else "capture",
+                "eager" if module.graph is None else "capture",
                 time.perf_counter() - started,
             )
 
     def complete_startup(self) -> None:
         """Freeze attention bindings and model state after warmup completes."""
 
-        for packed in self._packed:
-            lane_runtime = packed.lane
-            assert lane_runtime is not None
-            lane_id = lane_runtime.lane_id or "default"
-            logger.info("verifying CUDA graph catalog lane=%s", lane_id)
-            try:
-                packed.complete_startup()
-            except GraphExecutionError as error:
-                raise GraphExecutionError(f"execution lane {lane_id} failed startup") from error
-            lane_runtime.verify_stream()
-            logger.info("verified CUDA graph catalog lane=%s", lane_id)
+        for device, budget in self.graph_memory_budgets.items():
+            pools = {
+                tuple(pool) for entry, pool in self.graph_pools.items() if entry.device == device
+            }
+            if _private_pool_bytes(device, pools) > budget:
+                raise GraphExecutionError("captured graph residency exceeds its device budget")
+        for entry in self.batch_graphs:
+            if entry.cuda_stream is not None:
+                entry.cuda_stream.verify()
         signature = tuple(
             (
-                lane_runtime.lane_id,
-                lane_runtime.sm_count,
-                tuple(kind.value for kind in lane_runtime.computations),
-                packed.startup_signature,
+                None if entry.cuda_stream is None else entry.cuda_stream.name,
+                0 if entry.cuda_stream is None else entry.cuda_stream.sm_count,
+                tuple(kind.value for kind in entry.computations),
+                self.decode_shapes[entry],
+                self.prefill_shapes[entry],
+                tuple(sorted(repr(key) for key in graphs)),
             )
-            for packed in self._packed
-            if (lane_runtime := packed.lane) is not None
+            for entry, graphs in self.batch_graphs.items()
         )
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             logger.info("verifying tensor-parallel execution lane agreement")
@@ -1055,41 +1143,65 @@ class ModelRunner:
 
         self._startup_complete = True
 
+    def close_graphs(self) -> None:
+        """Release drained executables before backing, keeping streams alive for allocator cleanup.
+
+        The caller has stopped execution and drained output consumers. Runtime
+        pinned buffers can still enqueue allocator events while being freed, so
+        their producer streams remain owned until close finishes teardown.
+        """
+
+        actions: list[Callable[[], object]] = [
+            partial(self._close_entry, entry) for entry in self.entries.values()
+        ]
+        if self.diffusion is not None:
+            actions.append(self.diffusion.close)
+        actions.extend(
+            graph.close for graphs in self.batch_graphs.values() for graph in graphs.values()
+        )
+        try:
+            close_resources(*actions)
+        finally:
+            for graphs in self.batch_graphs.values():
+                graphs.clear()
+
     def close(self) -> None:
         """Drain computation, then release graphs and staging before physical lanes."""
 
         if self._closed:
             return
         self._closed = True
-        actions: list[Callable[[], object]] = [self.synchronize]
-        actions.extend(module.close for module in self.modules.values())
-        if self.denoise is not None:
-            actions.append(self.denoise.close)
+        actions: list[Callable[[], object]] = [self.synchronize, self.close_graphs]
         if self._text_staging is not None:
             actions.append(self._text_staging.close)
-        actions.extend(packed.close for packed in reversed(self._packed))
-        actions.extend(lane.close for lane in reversed(self._owned_lanes))
+        actions.extend(
+            partial(self._close_batch_entry, entry) for entry in reversed(tuple(self.batch_graphs))
+        )
+        actions.extend(lane.close for lane in reversed(self._streams))
         actions.extend(
             reduction.close for reduction in reversed(tuple(self._sum_reductions.values()))
         )
         try:
             close_resources(*actions)
         finally:
-            self.modules.clear()
-            self.denoise = None
+            self.entries.clear()
+            self.diffusion = None
             self._capture_stream = None
             self._preparation_stream = None
             self._text_staging = None
             self._text_tokens = None
-            self._packed.clear()
+            self.batch_graphs.clear()
+            self.graph_pools.clear()
+            self.graph_streams.clear()
+            self.decode_shapes.clear()
+            self.prefill_shapes.clear()
             self._sum_reductions.clear()
-            self._geometry_cache.clear()
             self.context_workspace = None
             self.scratch = None
             self._attention_exchange_storage.clear()
             self._mixed_qualification.clear()
-            self._packed_bindings.clear()
-            self._owned_lanes.clear()
+            self._forward_entries.clear()
+            self._streams.clear()
 
     def synchronize(self) -> None:
         """Drain each compute and preparation stream before releasing resident resources."""
@@ -1101,9 +1213,8 @@ class ModelRunner:
             actions.append(self._preparation_stream.synchronize)
         if self._capture_stream is not None:
             actions.append(self._capture_stream.synchronize)
-        actions.extend(
-            lane.stream.synchronize for lane in self._owned_lanes if lane.stream is not None
-        )
+        actions.extend(stream.synchronize for stream in self.graph_streams.values())
+        actions.extend(lane.stream.synchronize for lane in self._streams if lane.stream is not None)
         close_resources(*actions)
 
     @contextmanager
@@ -1146,260 +1257,544 @@ class ModelRunner:
             raise invalid_descriptor("operation requires model image processing")
         return value
 
-    def operation_device(self, operation: ScheduledRequest) -> torch.device:
-        """Return the model or generation device assigned to an operation kind."""
+    def operation_devices(
+        self, operation: ScheduledRequest
+    ) -> tuple[torch.device, torch.device, torch.device]:
+        """Resolve input consumption, numerical computation, and result publication.
 
-        if operation.kind in {
-            PipelineStage.LATENT_PREPARATION,
-            PipelineStage.DENOISING,
-            PipelineStage.VIDEO_DECODING,
-            PipelineStage.VIDEO_ENCODING,
-            PipelineStage.AUDIO_DECODING,
-            PipelineStage.AUDIO_ENCODING,
-            PipelineStage.MUXING,
-            PipelineStage.IMAGE_DECODING,
-        }:
-            return canonical_device(
-                self.worker_config.generation_device or self.worker_config.device
-            )
-        return canonical_device(self.worker_config.device)
-
-    def forward_device(self, forward_mode: ForwardMode | PipelineStage) -> torch.device:
-        """Resolve the construction-time device assignment for a numerical phase."""
-
-        config = self.worker_config
-        if forward_mode in {PipelineStage.LATENT_ENCODING, PipelineStage.IMAGE_DECODING}:
-            return canonical_device(config.generation_device or config.device)
-        return canonical_device(config.device)
-
-    def plan_launches(self, lanes: tuple[RunLane, ...]) -> tuple[RunLane, ...]:
-        """Resolve compatible mixed computation without merging logical operation identities."""
-
-        decode = next(
-            (lane for lane in lanes if lane.operations[0].kind is ForwardMode.DECODE), None
-        )
-        flow = next(
-            (lane for lane in lanes if lane.operations[0].kind is PipelineStage.DENOISING), None
-        )
-        if (
-            decode is not None
-            and flow is not None
-            and self.model.tensorized_mixed
-            and {operation.kind for lane in (decode, flow) for operation in lane.operations}
-            == {ForwardMode.DECODE, PipelineStage.DENOISING}
-            and self.allows_mixed(self._mixed_bucket((decode, flow)))
-        ):
-            launch_id = min(decode.launch_id, flow.launch_id)
-            lanes = tuple(
-                replace(lane, launch_id=launch_id) if lane is decode or lane is flow else lane
-                for lane in lanes
-            )
-        return tuple(lanes)
-
-    def validate_launches(self, lanes: tuple[RunLane, ...]) -> None:
-        """Validate submitted mixed launches against the model's qualified geometry."""
-
-        groups: dict[int, list[RunLane]] = defaultdict(list)
-        for lane in lanes:
-            groups[lane.launch_id].append(lane)
-        for group_lanes in groups.values():
-            if len(group_lanes) < 2:
-                continue
-            variants = {operation.kind for lane in group_lanes for operation in lane.operations}
-            if not self.model.tensorized_mixed or variants != {
-                ForwardMode.DECODE,
-                PipelineStage.DENOISING,
-            }:
-                raise invalid_descriptor(
-                    "tensorized mixed submission exceeds the supported mixed buckets"
-                )
-            bucket = self._mixed_bucket(tuple(group_lanes))
-            if not self.allows_mixed(bucket):
-                raise invalid_descriptor(
-                    "tensorized mixed submission has no exact qualified bucket"
-                )
-
-    def _mixed_bucket(self, lanes: tuple[RunLane, ...]) -> MixedCapture:
-        """Resolve a shared captured-graph bucket for a compatible mixed lane group."""
-
-        decode_rows = sum(
-            operation.kind is ForwardMode.DECODE for lane in lanes for operation in lane.operations
-        )
-        flow_operations = tuple(
-            operation
-            for lane in lanes
-            for operation in lane.operations
-            if operation.kind is PipelineStage.DENOISING
-        )
-        latent_params = {
-            (params.request_key, params.op_id): params
-            for lane in lanes
-            for params in lane.latent_params
-        }
-        branch_counts: dict[tuple[RequestKey, ComputationId], int] = defaultdict(int)
-        generation = self.model.generation
-        if flow_operations and generation is None:
-            raise invalid_descriptor("tensorized mixed flow has no generation runtime")
-        for lane in lanes:
-            for index, operation in enumerate(lane.operations):
-                params = latent_params.get((operation.request_key, operation.op_id))
-                query_len = (
-                    None
-                    if params is None or generation is None
-                    else generation.physical_tokens(int(params.height), int(params.width))
-                )
-                branch_counts[(operation.request_key, operation.op_id)] = min(
-                    0 if generation is None else int(generation.max_cfg_branches),
-                    sum(
-                        operation_index == index
-                        and (query_len is None or lane.query_lens[row] == int(query_len))
-                        for row, operation_index in enumerate(lane.forward_operation_indices)
-                    ),
-                )
-        geometries = {
-            (
-                int(latent_params[(operation.request_key, operation.op_id)].height),
-                int(latent_params[(operation.request_key, operation.op_id)].width),
-                branch_counts[(operation.request_key, operation.op_id)],
-            )
-            for operation in flow_operations
-            if (operation.request_key, operation.op_id) in latent_params
-        }
-        if len(geometries) != 1 or len(latent_params) != len(flow_operations):
-            raise invalid_descriptor("tensorized mixed flow rows disagree on physical geometry")
-        height, width, cfg_branches = next(iter(geometries))
-        return MixedCapture(
-            decode_rows=decode_rows,
-            flow_rows=len(flow_operations),
-            height=height,
-            width=width,
-            cfg_branches=cfg_branches,
-        )
-
-    def run_wave(
-        self,
-        tasks: tuple[tuple[ForwardRow, LaneState], ...],
-        *,
-        cache: CachePool | None,
-        tables: ReqToTokenPool | None,
-        states: RuntimeStates | None,
-    ) -> tuple[torch.Tensor, ...]:
-        """Combine compatible bound computations and return values in logical row order.
-
-        Logical launch boundaries remain authoritative. Physical compatibility is
-        resolved here, where staging, streams, model geometry, and weights meet.
+        Forward inputs and outputs use the concrete numerical entry. Image
+        trajectories consume and publish on the diffusion storage device, which
+        may differ from the learned prediction's device. Module/media entries
+        inherit their loaded placement. Completion storage must cover all three.
         """
 
-        grouped: dict[tuple[object, ...], list[tuple[int, ForwardRow, LaneState]]] = defaultdict(
-            list
+        placement = self.model.bindings.get(operation.entry)
+        device = (
+            canonical_device(self.worker_config.device) if placement is None else placement.device
         )
-        for index, (task, scope) in enumerate(tasks):
-            target = self.forward_device(task.forward_mode)
-            packed = self._packed_bindings.get((str(target), task.operation.kind))
-            if packed is None:
-                raise invalid_descriptor(
-                    f"execution has no {task.operation.kind.value!r} binding for {target}"
-                )
-            phase = (
-                "textual"
-                if (
-                    isinstance(task.forward_mode, ForwardMode)
-                    or task.forward_mode is PipelineStage.DENOISING
-                )
-                and self.model.tensorized_mixed
-                else task.forward_mode.value
+        entry = self._forward_entries.get((operation.entry, operation.kind))
+        if self.model.generation is not None and operation.kind in {
+            PipelineStage.LATENT_PREPARATION,
+            PipelineStage.DENOISING,
+            PipelineStage.IMAGE_DECODING,
+        }:
+            if self.diffusion is None:
+                raise invalid_descriptor("image operation has no bound diffusion storage device")
+            device = self.diffusion.device
+        compute = device if entry is None else entry.device
+        return device, compute, device
+
+    def _close_batch_entry(self, entry: ModelEntry) -> None:
+        actions = [graph.close for graph in self.batch_graphs.get(entry, {}).values()]
+        actions.extend(binding.close for binding in entry.collectives.values())
+        if entry.input_buffers is not None:
+            actions.append(entry.input_buffers.close)
+        close_resources(*actions)
+        self.batch_graphs.pop(entry, None)
+        self.graph_pools.pop(entry, None)
+        self.graph_streams.pop(entry, None)
+        entry.collectives.clear()
+        entry.input_buffers = None
+
+    def select_graph_shape(
+        self,
+        entry: ModelEntry,
+        batch: ForwardBatch,
+        *,
+        eligible: bool,
+    ) -> tuple[tuple[object, ...], ForwardBatch, int, bool] | None:
+        """Select physical geometry while preserving each path's eager policy."""
+
+        rows = batch.row_count
+        if not eligible or self.worker_config.graph_policy == "off" or not _cuda_batch(batch):
+            return None
+        if batch.attention.attention_mode is AttentionMode.PAGED_VARLEN and (
+            not self.worker_config.prefill_cuda_graph
+            or any(
+                selection is not TokenSelection.LAST_LOGITS for selection in batch.token_selections
             )
-            shape = ()
+        ):
+            return None
+        if (
+            batch.attention.attention_mode is AttentionMode.PACKED
+            and not self.worker_config.prefill_cuda_graph
+        ):
+            return None
+        if batch.attention.attention_mode is AttentionMode.PACKED and self.kv_cache.is_quantized:
+            return None
+        try:
+            _graph_provider(
+                self.attention,
+                batch.attention.attention_mode,
+                head_dim=self.model.cache_geometry.head_dim,
+                block_size=self.worker_config.block_size,
+                device=batch.request_pool_indices.device,
+            )
+        except _GraphMiss:
+            return None
+
+        decode = _decode_geometry(
+            batch,
+            self.decode_shapes[entry],
+            self.worker_config.block_size,
+            self.decode_context_blocks,
+        )
+        prefill = (
+            None
+            if decode is not None
+            else _prefill_geometry(
+                batch,
+                tuple(shape.token_bucket for shape in self.prefill_shapes[entry])
+                if not self.model.tensorized_mixed
+                else (),
+                self.worker_config.block_size,
+                self.prefill_row_sizes,
+                self.decode_context_blocks,
+            )
+        )
+        if decode is not None:
+            execution = _pad_decode_batch(batch, *decode, self.worker_config.block_size)
+            state_key = _decode_signature(batch, *decode)
+            signature = state_key
+            padded_rows = decode[0]
+            startup_resident = True
+        elif prefill is not None:
+            execution = _pad_prefill_batch(batch, *prefill, self.worker_config.block_size)
+            state_key = _prefill_signature(batch, *prefill, self.worker_config.block_size)
+            signature = state_key
+            padded_rows = prefill[0].row_bucket
+            startup_resident = True
+        else:
+            execution = _normalize_exact_batch(
+                batch,
+                context_blocks=cast(InputBuffers, entry.input_buffers).max_blocks_per_row,
+                block_size=self.worker_config.block_size,
+            )
+            signature = _exact_signature(execution)
+            state_key = ("exact", signature)
+            padded_rows = rows
+            startup_resident = False
+
+        return state_key, execution, padded_rows, startup_resident
+
+    @torch.inference_mode()
+    def capture_batch(
+        self,
+        entry: ModelEntry,
+        batch: ForwardBatch,
+        forward: Callable[[ForwardBatch], ForwardOutput],
+    ) -> None:
+        """Capture one physical shape while restoring its mutable numerical inputs."""
+
+        if self._startup_complete:
+            raise GraphExecutionError("entry capture is outside startup preparation")
+        selected = self.select_graph_shape(entry, batch, eligible=True)
+        if selected is None:
+            self.eager_batch(entry, batch, forward)
+            return
+        state_key, execution, _, bucketed = selected
+        assert self.graph_streams[entry] is not None
+        if state_key in self.batch_graphs[entry]:
+            return
+        if self.graph_memory_budgets[entry.device] == 0:
+            raise GraphExecutionError("configured CUDA graph residency has no memory budget")
+        static = _graph_batch(execution, next(_GRAPH_BINDINGS), own_inputs=not bucketed)
+        releases: tuple[Callable[[], None], ...] = ()
+        stream = None if entry.cuda_stream is None else entry.cuda_stream.stream
+        context = nullcontext() if stream is None else torch.cuda.stream(stream)
+        with context, stream_collective_scope(entry.collectives):
+            restore = self._capture_restore(static)
+            try:
+                releases = self._prepare_graph_attention(entry, static, execution, capture=True)
+
+                def compute() -> tuple[ForwardOutput, SamplerOutput | None]:
+                    output = forward(static)
+                    return output, _greedy_decode(static, output, self.decode_predicates)
+
+                graph = CudaGraph[tuple[ForwardOutput, SamplerOutput | None]](
+                    device=entry.device,
+                    stream=self.graph_streams[entry],
+                    pool=self.graph_pools[entry],
+                    expected_context=(
+                        None if entry.cuda_stream is None else entry.cuda_stream.context
+                    ),
+                )
+                graph.capture(compute, keepalive=(static,), restore=restore)
+                self.batch_graphs[entry][state_key] = graph
+                graph.inputs = static
+                graph.releases = releases
+                releases = ()
+                graph.input_leaves = () if bucketed else tuple(_batch_tensors(static))
+                graph.attention_leaves = tuple(_attention_inputs(static))
+            except BaseException as error:
+                if stream is not None:
+                    stream.synchronize()
+                else:
+                    torch.cuda.current_stream(entry.device).synchronize()
+                self._discard_batch_graph(entry, state_key)
+                for release in reversed(releases):
+                    release()
+                error.add_note(f"entry capture device={entry.device} shape={state_key!r}")
+                raise
+            finally:
+                restore()
+                torch.cuda.current_stream(entry.device).synchronize()
+
+    def _capture_restore(self, batch: ForwardBatch) -> Callable[[], None]:
+        """Retain the bounded KV write set and graph-greedy mutable input."""
+
+        tensors: list[tuple[torch.Tensor, torch.Tensor]] = []
+        finish = batch.decode_force_finish
+        if finish is not None:
+            tensors.append((finish, finish.clone()))
+        pages = torch.unique(batch.attention.out_cache_loc // self.worker_config.block_size)
+        pages = pages[pages != 0].long()
+        cache = self.kv_cache
+        saved = (cache.k.index_select(1, pages), cache.v.index_select(1, pages))
+
+        def restore() -> None:
+            for tensor, snapshot in tensors:
+                tensor.copy_(snapshot)
+            cache.k.index_copy_(1, pages, saved[0])
+            cache.v.index_copy_(1, pages, saved[1])
+
+        return restore
+
+    def run_batch(
+        self,
+        entry: ModelEntry,
+        batch: ForwardBatch,
+        forward: Callable[[ForwardBatch], ForwardOutput],
+        *,
+        eligible: bool,
+        borrow_output: bool = False,
+    ) -> ForwardOutput:
+        """Stage metadata and replay a resident key, or use the established eager path."""
+
+        rows = batch.row_count
+        selected = self.select_graph_shape(entry, batch, eligible=eligible)
+        if selected is None:
+            return replace(
+                self.eager_batch(entry, batch, forward),
+                stats=ForwardStats(cuda_graph_runtime_mode_counts={"eager": 1}),
+            )
+        state_key, execution, padded_rows, bucketed = selected
+        captured = False
+        if state_key not in self.batch_graphs[entry]:
+            if not bucketed:
+                return replace(
+                    self.eager_batch(entry, execution, forward),
+                    stats=ForwardStats(cuda_graph_runtime_mode_counts={"eager": 1}),
+                )
+            if self._startup_complete:
+                raise GraphExecutionError("configured CUDA graph bucket is not resident")
+            # Direct execution may precede explicit startup. Materialize the
+            # configured bucket on its binding, preserving the same full policy.
+            self.capture_batch(entry, batch, forward)
+            captured = True
+        assert self.graph_streams[entry] is not None
+        graph = self.batch_graphs[entry].get(state_key)
+        if graph is None:
+            raise GraphExecutionError("entry graph has no input owner")
+        output, greedy = self._replay_batch(entry, graph, execution)
+        output = (
+            _trim_output(output, rows)
+            if borrow_output
+            else self._publish_batch_output(entry, output, rows)
+        )
+        return replace(
+            output,
+            stats=ForwardStats(
+                cuda_graph_runtime_mode_counts={"graph_capture" if captured else "graph_replay": 1},
+                cuda_graph_captures=int(captured),
+                cuda_graph_replays=int(not captured),
+                cuda_graph_unpadded_tokens=rows,
+                cuda_graph_padded_tokens=padded_rows - rows,
+            ),
+            greedy=_trim_greedy(greedy, rows),
+        )
+
+    def _discard_batch_graph(self, entry: ModelEntry, key: Hashable) -> None:
+        graph = self.batch_graphs[entry].pop(key, None)
+        if graph is not None:
+            graph.close()
+        if not self.batch_graphs[entry] and entry in self.graph_pools:
+            # CUDA retires a pool with its last graph; retained output allocations
+            # must not be reused under the retired pool identity.
+            self.graph_pools[entry] = torch.cuda.graph_pool_handle()
+
+    def eager_batch(
+        self,
+        entry: ModelEntry,
+        batch: ForwardBatch,
+        forward: Callable[[ForwardBatch], ForwardOutput],
+    ) -> ForwardOutput:
+        """Execute a numerical batch on the lane's eager path."""
+
+        stream = None if entry.cuda_stream is None else entry.cuda_stream.stream
+        context = nullcontext() if stream is None else torch.cuda.stream(stream)
+        with context, stream_collective_scope(entry.collectives):
+            return forward(batch)
+
+    def _replay_batch(
+        self,
+        entry: ModelEntry,
+        graph: CudaGraph[tuple[ForwardOutput, SamplerOutput | None]],
+        execution: ForwardBatch,
+    ) -> tuple[ForwardOutput, SamplerOutput | None]:
+        stream = None if entry.cuda_stream is None else entry.cuda_stream.stream
+        context = nullcontext() if stream is None else torch.cuda.stream(stream)
+        with context, stream_collective_scope(entry.collectives):
+            if graph.input_leaves:
+                _copy_tensors(graph.input_leaves, tuple(_batch_tensors(execution)), "forward")
+            else:
+                _copy_tensors(
+                    graph.attention_leaves, tuple(_attention_inputs(execution)), "attention"
+                )
+            self._prepare_graph_attention(
+                entry, cast(ForwardBatch, graph.inputs), execution, capture=False
+            )
+            assert self.graph_streams[entry] is not None
+            return graph.replay()
+
+    def _publish_batch_output(
+        self, entry: ModelEntry, output: ForwardOutput, rows: int
+    ) -> ForwardOutput:
+        """Publish live rows before another graph reuses capture storage."""
+
+        stream = None if entry.cuda_stream is None else entry.cuda_stream.stream
+        consumer = None if stream is None else torch.cuda.current_stream(stream.device)
+        context = nullcontext() if stream is None else torch.cuda.stream(stream)
+        with context, stream_collective_scope(entry.collectives):
+            published = _trim_output(output, rows).clone()
+        if consumer is not None and consumer != stream:
+            for value in published.values:
+                value.record_stream(consumer)
+        return published
+
+    def _prepare_graph_attention(
+        self,
+        entry: ModelEntry,
+        static_batch: ForwardBatch,
+        live_batch: ForwardBatch,
+        *,
+        capture: bool,
+    ) -> tuple[Callable[[], None], ...]:
+        """Bind static attention wrappers to live page metadata for capture or replay."""
+
+        # Dense and entry attention carry no persistent backend plan. Paged
+        # modes first copy live table views into the static graph batch.
+        static = static_batch.attention
+        live = live_batch.attention
+        if static.attention_mode is not live.attention_mode:
+            raise _GraphMiss("attention form changed for a graph bucket")
+        if static.attention_mode in {AttentionMode.DENSE, AttentionMode.PACKED}:
+            return ()
+        if static.attention_mode not in {AttentionMode.PAGED_DECODE, AttentionMode.PAGED_VARLEN}:
+            return ()
+        prepared = _live_attention(static, live)
+        key_cache, _value_cache = self.kv_cache.layer_cache(0, static.group_id)
+        backend = _graph_provider(
+            self.attention,
+            static.attention_mode,
+            head_dim=self.model.cache_geometry.head_dim,
+            block_size=self.worker_config.block_size,
+            device=key_cache.device,
+        )
+        q_dtype = key_cache.dtype
+        kv_dtype = key_cache.dtype
+        releases: list[Callable[[], None]] = []
+
+        if capture:
+            release_name = (
+                "release_paged_decode_graph_binding"
+                if static.attention_mode is AttentionMode.PAGED_DECODE
+                else "release_paged_prefill_graph_wrapper"
+            )
+            release = getattr(backend, release_name, None)
+            if callable(release):
+                releases.append(_release_call(release, static.binding))
+        try:
+            # Decode wrappers are keyed by graph binding and can be replanned for
+            # each live table while retaining fixed tensor addresses.
+            if static.attention_mode is AttentionMode.PAGED_DECODE:
+                prepare = getattr(backend, "prepare_paged_decode_cuda_graph", None)
+                if callable(prepare):
+                    prepare(
+                        static.binding,
+                        prepared,
+                        batch_size=int(cast(torch.Tensor, static.block_table).shape[0]),
+                        max_indices=max(1, int(cast(torch.Tensor, static.block_table).numel())),
+                        num_q_heads=int(self.model.cache_geometry.num_attention_heads),
+                        num_kv_heads=int(self.model.cache_geometry.num_kv_heads),
+                        head_dim=int(self.model.cache_geometry.head_dim),
+                        page_size=self.worker_config.block_size,
+                        q_dtype=q_dtype,
+                        kv_dtype=kv_dtype,
+                    )
+                return tuple(releases)
+
+            # Prefill capture owns a graph-bound wrapper until graph eviction;
+            # replay updates only its caller-owned metadata buffers.
+            if static.attention_mode is not AttentionMode.PAGED_VARLEN:
+                return ()
+            bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
+            prepare = getattr(backend, "prepare_paged_prefill_cuda_graph", None)
+            if callable(bind) and callable(prepare):
+                if capture:
+                    bind(
+                        static.binding,
+                        static,
+                        device=cast(torch.Tensor, static.block_table).device,
+                    )
+                prepare(
+                    static.binding,
+                    prepared,
+                    num_q_heads=int(self.model.cache_geometry.num_attention_heads),
+                    num_kv_heads=int(self.model.cache_geometry.num_kv_heads),
+                    head_dim=int(self.model.cache_geometry.head_dim),
+                    page_size=self.worker_config.block_size,
+                    q_dtype=q_dtype,
+                    kv_dtype=kv_dtype,
+                    causal=static.causal,
+                )
+            return tuple(releases)
+        except BaseException as error:
+            for release in reversed(releases):
+                try:
+                    release()
+                except BaseException as cleanup:
+                    error.add_note(f"attention binding cleanup failed: {cleanup!r}")
+            raise
+
+    def forward(
+        self,
+        tasks: tuple[tuple[ForwardRow, ScheduledRequest], ...],
+        *,
+        cache: KVCache | None,
+        tables: BlockTables | None,
+        states: DecodeState | None,
+    ) -> Iterator[tuple[tuple[int, ...], ForwardOutput | BaseException]]:
+        """Execute actual compatible rows, yielding results at their original indexes.
+
+        A failed model call identifies every participating row. The caller owns
+        completion groups and decides which dependent operations to suppress.
+        Fatal failures propagate immediately because later device work is unsafe.
+        """
+
+        grouped: dict[tuple[object, ...], list[int]] = defaultdict(list)
+        bindings: dict[int, ModelEntry] = {}
+        for index, (task, operation) in enumerate(tasks):
+            entry = self._forward_entries.get((operation.entry, operation.kind))
+            if entry is None:
+                yield (
+                    (index,),
+                    invalid_descriptor(
+                        f"execution has no {operation.kind.value!r} binding for {operation.entry!r}"
+                    ),
+                )
+                continue
+            target = entry.device
+            bindings[index] = entry
+            shape: tuple[int, ...] = ()
             if not (self.model.tensorized_mixed and not self.uses_lanes):
                 if task.encode_pixels is not None:
                     shape = tuple(int(value) for value in task.encode_pixels.shape)
                 elif task.latent is not None:
                     shape = (task.image_height, task.image_width)
-            key = (scope.lane.launch_id, packed, phase, str(target), shape)
-            grouped[key].append((index, task, scope))
+            grouped[(entry, task.forward_mode, str(target), shape)].append(index)
 
-        values: list[torch.Tensor | None] = [None] * len(tasks)
-        events: list[tuple[torch.device, torch.cuda.Event]] = []
-        for group in grouped.values():
-            rows = tuple(task for _index, task, _scope in group)
-            if (
-                any(task.forward_mode is PipelineStage.DENOISING for task in rows)
-                and any(isinstance(task.forward_mode, ForwardMode) for task in rows)
-                and not self.model.tensorized_mixed
-            ):
-                raise invalid_descriptor("tensorized mixed submission is outside the model limits")
-            target = self.forward_device(rows[0].forward_mode)
-            for _index, _task, scope in group:
-                scope.completion.register_device(target)
-            result = self.run_forward_group(
-                rows, group[0][2], cache=cache, tables=tables, states=states
-            )
-            output = result.materialize_values()
-            if result.output_event is not None:
-                events.append((target, result.output_event))
-            for (index, _task, _scope), value in zip(group, output, strict=True):
-                values[index] = value
-        for device, event in events:
-            torch.cuda.current_stream(device).wait_event(event)
-        return tuple(cast(torch.Tensor, value) for value in values)
+        groups = list(grouped.values())
+        if self.model.tensorized_mixed:
+            for decode in groups:
+                if not decode or tasks[decode[0]][0].forward_mode is not ForwardMode.DECODE:
+                    continue
+                for flow in groups:
+                    if (
+                        not flow
+                        or tasks[flow[0]][0].forward_mode is not PipelineStage.DENOISING
+                        or bindings[decode[0]] is not bindings[flow[0]]
+                    ):
+                        continue
+                    geometries = {
+                        (tasks[index][0].image_height, tasks[index][0].image_width)
+                        for index in flow
+                    }
+                    branches: dict[tuple[RequestKey, ComputationId], int] = defaultdict(int)
+                    for index in flow:
+                        operation = tasks[index][1]
+                        branches[(operation.request_key, operation.op_id)] += 1
+                    counts = set(branches.values())
+                    if len(geometries) != 1 or len(counts) != 1:
+                        continue
+                    height, width = next(iter(geometries))
+                    if not self.allows_mixed(
+                        MixedShape(len(decode), len(branches), height, width, next(iter(counts)))
+                    ):
+                        continue
+                    decode.extend(flow)
+                    decode.sort()
+                    flow.clear()
+                    break
+
+        groups = [group for group in groups if group]
+        for group_index, indexes in enumerate(groups):
+            rows = tuple(tasks[index][0] for index in indexes)
+            try:
+                forward_started = time.perf_counter_ns()
+                result = self.run_forward_group(
+                    rows,
+                    operations=tuple(tasks[index][1] for index in indexes),
+                    cache=cache,
+                    tables=tables,
+                    states=states,
+                )
+                if result.request_pool_indices is None:
+                    raise RuntimeError("forward output has no request slot views")
+                if result.output_event is not None:
+                    torch.cuda.current_stream(bindings[indexes[0]].device).wait_event(
+                        result.output_event
+                    )
+                if all(row.forward_mode is ForwardMode.DECODE for row in rows):
+                    if result.stats is None:
+                        raise RuntimeError("text forward lost its statistics")
+                    components = dict(result.stats.component_us)
+                    record_component(components, "text_model_forward", forward_started)
+                    result = replace(result, stats=replace(result.stats, component_us=components))
+                # A later call may replay the same graph or reuse its staging.
+                # Preserve these numerical values until their consumer runs.
+                if any(
+                    bindings[later[0]] is bindings[indexes[0]]
+                    for later in groups[group_index + 1 :]
+                ):
+                    result = result.clone()
+            except BaseException as error:
+                if classify(error).fatal:
+                    raise
+                yield tuple(indexes), error
+            else:
+                yield tuple(indexes), result
 
     def run_forward_group(
         self,
-        tasks: tuple[ForwardRow, ...],
-        scope: LaneState,
-        *,
-        cache: CachePool | None,
-        tables: ReqToTokenPool | None,
-        states: RuntimeStates | None,
-    ) -> ForwardResult:
-        """Prepare attention and execute one logical forward group on its binding."""
-
-        from .attention import columns, dense_columns
-
-        target = self.forward_device(tasks[0].forward_mode)
-        scope.completion.register_device(target)
-        textual = all(
-            (
-                isinstance(task.forward_mode, ForwardMode)
-                or task.forward_mode is PipelineStage.DENOISING
-            )
-            for task in tasks
-        )
-        attention = (
-            columns(
-                tasks, cache=cache, tables=tables, states=states, packed=self.model.tensorized_mixed
-            )
-            if textual
-            else dense_columns(len(tasks), tuple(task.query_tokens for task in tasks))
-        )
-        result = self.run(
-            tasks,
-            device=target,
-            attention=attention,
-            graph_eligible=scope.graph_eligible and textual,
-        )
-        if int(result.request_pool_indices.numel()) != len(tasks):
-            raise RuntimeError("model runner returned without aligned request slots")
-        for index, task in enumerate(tasks):
-            task.request_pool_index = result.request_pool_indices[index : index + 1]
-        scope.observations.append(result.observation)
-        return result
-
-    def run(
-        self,
         rows: tuple[ForwardRow, ...],
         *,
-        device: torch.device | str,
-        attention: AttentionInputs,
-        graph_eligible: bool,
-    ) -> ForwardResult:
+        operations: tuple[ScheduledRequest, ...],
+        cache: KVCache | None,
+        tables: BlockTables | None,
+        states: DecodeState | None,
+    ) -> ForwardOutput:
         """Stage forward rows, choose eager or CUDA graph execution, invoke the model, and validate outputs."""
 
         tasks = rows
         if not tasks:
             raise ValueError("model runner received an empty call")
         started = time.perf_counter_ns()
-        target = torch.device(device)
+        graph_eligible = all(
+            isinstance(task.forward_mode, ForwardMode)
+            or task.forward_mode is PipelineStage.DENOISING
+            for task in tasks
+        )
         modes = frozenset(task.forward_mode for task in tasks)
         if len(modes) == 1:
             forward_mode = next(iter(modes))
@@ -1409,148 +1804,58 @@ class ModelRunner:
             forward_mode = ForwardMode.MIXED
         else:
             raise ValueError("one model call cannot mix unrelated computations")
-        operations = tuple(
+        operation_keys = tuple(
             (
-                task.operation.request_key.engine_id,
-                task.operation.request_key.request_id,
-                task.operation.request_key.request_epoch,
-                task.operation.op_id,
+                operation.request_key.engine_id,
+                operation.request_key.request_id,
+                operation.request_key.request_epoch,
+                operation.op_id,
             )
-            for task in tasks
+            for operation in operations
         )
-        packed = self._packed_bindings.get((str(target), tasks[0].operation.kind))
-        if packed is None:
+        entry = self._forward_entries.get((operations[0].entry, operations[0].kind))
+        if entry is None:
             raise InputError(
-                f"model runner has no {tasks[0].operation.kind.value!r} execution lane for {target}",
+                f"model runner has no {operations[0].kind.value!r} binding for {operations[0].entry!r}",
                 phase="input_staging",
                 route=forward_mode.value,
-                operations=operations,
+                operations=operation_keys,
             )
-        lane_runtime = packed.lane
-        buffers = packed.inputs
-        assert lane_runtime is not None and buffers is not None
-        counts = _kind_counts(tasks)
+        target = entry.device
+        lane_runtime = entry.cuda_stream
+        buffers = entry.input_buffers
+        assert buffers is not None
         try:
-            if lane_runtime.stream is not None:
-                lane_runtime.order_after(torch.cuda.current_stream(target))
+            if lane_runtime is not None:
+                lane_runtime.wait(torch.cuda.current_stream(target))
             stream_context = (
-                nullcontext()
-                if lane_runtime.stream is None
-                else torch.cuda.stream(lane_runtime.stream)
+                nullcontext() if lane_runtime is None else torch.cuda.stream(lane_runtime.stream)
             )
             with stream_context:
                 batch = buffers.stage(
+                    tasks,
                     forward_mode=forward_mode,
-                    row_count=len(tasks),
-                    request_pool_indices=tuple(task.request_pool_idx for task in tasks),
-                    decode_force_finish=(
-                        tuple(bool(task.decode_force_finish) for task in tasks)
-                        if all(
-                            task.decode_predicate is not None and task.decode_predicate_tagged
-                            for task in tasks
-                        )
-                        else ()
-                    ),
-                    token_row_indices=tuple(
-                        index for index, task in enumerate(tasks) if task.token_ids is not None
-                    ),
-                    token_ids=tuple(task.token_ids for task in tasks if task.token_ids is not None),
-                    token_embeddings=tuple(
-                        task.token_embeddings for task in tasks if task.token_ids is not None
-                    ),
-                    token_embedding_masks=tuple(
-                        task.token_embedding_mask for task in tasks if task.token_ids is not None
-                    ),
-                    token_positions=tuple(
-                        cast(torch.Tensor, task.positions)
-                        for task in tasks
-                        if task.token_ids is not None
-                    ),
-                    token_selections=tuple(
-                        cast(TokenSelection, task.selection)
-                        for task in tasks
-                        if task.token_ids is not None
-                    ),
-                    flow_row_indices=tuple(
-                        index
-                        for index, task in enumerate(tasks)
-                        if task.latent is not None and task.image_tokens > 0
-                    ),
-                    flow_positions=tuple(
-                        cast(torch.Tensor, task.positions)
-                        for task in tasks
-                        if task.latent is not None and task.image_tokens > 0
-                    ),
-                    flow_timesteps=tuple(
-                        cast(torch.Tensor, task.timestep)
-                        for task in tasks
-                        if task.latent is not None and task.image_tokens > 0
-                    ),
-                    flow_latents=tuple(
-                        task.latent
-                        for task in tasks
-                        if task.latent is not None and task.image_tokens > 0
-                    ),
-                    flow_conditioning=tuple(
-                        task.flow_conditioning
-                        for task in tasks
-                        if task.latent is not None and task.image_tokens > 0
-                    ),
-                    flow_image_tokens=tuple(
-                        task.image_tokens
-                        for task in tasks
-                        if task.latent is not None and task.image_tokens > 0
-                    ),
-                    flow_heights=tuple(
-                        task.image_height
-                        for task in tasks
-                        if task.latent is not None and task.image_tokens > 0
-                    ),
-                    flow_widths=tuple(
-                        task.image_width
-                        for task in tasks
-                        if task.latent is not None and task.image_tokens > 0
-                    ),
-                    encode_pixels=tuple(
-                        task.encode_pixels for task in tasks if task.encode_pixels is not None
-                    ),
-                    encode_grids=tuple(
-                        task.encode_grid for task in tasks if task.encode_pixels is not None
-                    ),
-                    encode_grid_shapes=tuple(
-                        task.encode_grid_shape for task in tasks if task.encode_pixels is not None
-                    ),
-                    decode_latents=tuple(
-                        task.latent
-                        for task in tasks
-                        if task.latent is not None and task.image_tokens == 0
-                    ),
-                    decode_heights=tuple(
-                        task.image_height
-                        for task in tasks
-                        if task.latent is not None and task.image_tokens == 0
-                    ),
-                    decode_widths=tuple(
-                        task.image_width
-                        for task in tasks
-                        if task.latent is not None and task.image_tokens == 0
-                    ),
-                    attention=attention,
+                    cache=cache,
+                    tables=tables,
+                    states=states,
+                    packed=self.model.tensorized_mixed,
+                    binding=_binding_identity(operations),
                 )
                 request_pool_indices = batch.request_pool_indices
         except Exception as error:
-            output_event = lane_runtime.record_output()
+            output_event = None if lane_runtime is None else lane_runtime.record()
             if output_event is not None:
                 torch.cuda.current_stream(target).wait_event(output_event)
-            raise _input_failure(error, forward_mode, operations) from error
+            raise _input_failure(error, forward_mode, operation_keys) from error
 
         def invoke(value: ForwardBatch) -> ForwardOutput:
-            return self.packed_forward(packed, value)
+            return self.batch_forward(entry, value)
 
         output_event = None
         try:
             with torch.inference_mode():
-                graph_run = packed.run(
+                output = self.run_batch(
+                    entry,
                     batch,
                     invoke,
                     eligible=graph_eligible,
@@ -1561,63 +1866,34 @@ class ModelRunner:
                         for task in tasks
                     ),
                 )
-            output = graph_run.output
-            greedy = graph_run.greedy
-            path = RunPath(graph_run.path)
             output.validate_for(batch)
             _validate_outputs(output.values, tasks, target)
-            output_event = lane_runtime.record_output()
+            output_event = None if lane_runtime is None else lane_runtime.record()
             duration_us = (time.perf_counter_ns() - started) // 1000
-            observation = RunObservation(
-                route=forward_mode.value,
-                row_count=len(tasks),
-                row_kind_counts=tuple(sorted(counts.items())),
-                path=path,
-                duration_us=duration_us,
-                graph_unpadded_tokens=graph_run.row_count if path is not RunPath.EAGER else 0,
-                graph_padded_tokens=(
-                    graph_run.padded_row_count - graph_run.row_count
-                    if path is not RunPath.EAGER
-                    else 0
-                ),
+            if output.stats is None:
+                raise RuntimeError("entry forward lost its execution statistics")
+            stats = replace(
+                output.stats,
+                mode_counts={forward_mode.value: 1},
+                mode_tokens={forward_mode.value: len(tasks)},
+                mode_us={forward_mode.value: duration_us},
+                component_us={"forward": duration_us},
             )
-            return ForwardResult(
-                output=output,
+            return replace(
+                output,
                 request_pool_indices=request_pool_indices,
-                path=path,
                 output_event=output_event,
-                observation=observation,
-                greedy=greedy,
+                stats=stats,
             )
         except Exception as error:
             # A failed model can leave kernels on a lane stream. Its caller
             # retires storage behind the current stream's output fence, so join
             # every submitted lane access before reporting the failure.
             if output_event is None:
-                output_event = lane_runtime.record_output()
+                output_event = None if lane_runtime is None else lane_runtime.record()
             if output_event is not None:
                 torch.cuda.current_stream(target).wait_event(output_event)
-            raise _execution_failure(error, forward_mode, operations) from error
-
-
-def _kind_counts(tasks: tuple[ForwardRow, ...]) -> dict[str, int]:
-    """Count forward rows by stable operation-kind label."""
-
-    result: dict[str, int] = {}
-    for task in tasks:
-        # Preserve public row labels while deriving them from actual computation.
-        mode = task.forward_mode
-        label = (
-            "token"
-            if isinstance(mode, ForwardMode)
-            else "flow"
-            if mode is PipelineStage.DENOISING
-            else "decode"
-            if mode is PipelineStage.IMAGE_DECODING
-            else "encode"
-        )
-        result[label] = result.get(label, 0) + 1
-    return result
+            raise _execution_failure(error, forward_mode, operation_keys) from error
 
 
 def _validate_outputs(
@@ -1632,7 +1908,7 @@ def _validate_outputs(
             raise ValueError(f"model output is on {value.device}, expected {device}")
         if not value.is_floating_point():
             raise ValueError("raw neural outputs must use a floating dtype")
-        if task.token_ids is not None and value.ndim < 2:
+        if (task.token_ids is not None or task.token_embeddings is not None) and value.ndim < 2:
             raise ValueError("token output must retain token and feature dimensions")
         if task.latent is not None and task.image_tokens > 0 and value.shape != task.latent.shape:
             raise ValueError("flow prediction shape does not match its latent")
@@ -1693,4 +1969,17 @@ def _execution_failure(
     )
 
 
-__all__ = ["ForwardResult", "ModelRunner", "RunObservation", "RunPath"]
+__all__ = ["ModelRunner"]
+
+
+def _binding_identity(operations: tuple[ScheduledRequest, ...]) -> int:
+    """Return a shared attention binding when every forward row agrees."""
+
+    hasher = hashlib.blake2b(digest_size=8)
+    for operation in operations:
+        hasher.update(int(operation.request_key.request_id).to_bytes(8, "little"))
+        hasher.update(int(operation.request_key.request_epoch).to_bytes(8, "little"))
+        hasher.update(operation.request_key.engine_id.to_bytes(8, "little"))
+        hasher.update(operation.op_id.batch_id.to_bytes(8, "little"))
+        hasher.update(operation.op_id.request_index.to_bytes(4, "little"))
+    return int.from_bytes(hasher.digest(), "little")

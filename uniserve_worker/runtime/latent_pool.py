@@ -7,67 +7,21 @@ from collections.abc import Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..execution.output import PendingOutput
+
 
 import torch
 
-from ..execution.batch import BufferId, RequestKey, TensorRef
+from uniserve_worker.runtime.staging_buffers import StagingBuffers
+
 from ..foundation.errors import invalid_descriptor, resource_error
+from ..protocol.batch import BufferId, RequestKey, TensorRef
+from ..transfer.exports import ExportLocations, release_exports
 from ..transfer.tickets import TransferTicket
-from .device import HostStagingRing, fill_cpu_ints
-
-
-@dataclass(frozen=True, slots=True)
-class LatentSnapshot:
-    """One committed trajectory encoded for administrative recovery."""
-
-    generation: int
-    step: int
-    latent_units: int
-    height: int
-    width: int
-    value: torch.Tensor
-
-    def __post_init__(self) -> None:
-        """Validate committed latent pages, generation, step, units, and raster geometry."""
-
-        if min(int(self.generation), int(self.latent_units), int(self.height), int(self.width)) < 1:
-            raise ValueError("latent snapshot geometry is invalid")
-        if int(self.step) < 0:
-            raise ValueError("latent snapshot step is invalid")
-        if (
-            not self.value.is_floating_point()
-            or self.value.ndim != 2
-            or int(self.value.shape[0]) != int(self.latent_units)
-        ):
-            raise ValueError("latent snapshot tensor disagrees with its logical geometry")
-
-
-@dataclass(frozen=True, slots=True)
-class LatentPublication:
-    """Validated visibility change applied at the lane commit point."""
-
-    request_pool_idx: int
-    page_table: tuple[int, ...]
-    expected_generation: int
-    expected_step: int
-    generation: int
-    step: int
-    latent_units: int
-    height: int
-    width: int
-
-
-@dataclass(frozen=True, slots=True)
-class LatentRelease:
-    """Validated trajectory release applied at the lane commit point."""
-
-    request_pool_idx: int
-    page_table: tuple[int, ...]
-    generation: int
-    step: int
-    latent_units: int
-    height: int
-    width: int
+from .device import fill_cpu_ints
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +34,7 @@ class LatentStaging:
 
 
 @dataclass(slots=True)
-class LatentWrite:
+class LatentImport:
     """A reserved import range, held until its physical read retires."""
 
     product: TensorRef
@@ -93,7 +47,7 @@ class LatentWrite:
 
 
 @dataclass(slots=True)
-class LatentSource:
+class LatentExport:
     """One immutable page-bank version retained by its publication registrations."""
 
     buffer: BufferId
@@ -169,21 +123,17 @@ class LatentPool:
         self._widths = torch.zeros(rows, dtype=torch.int32)
         self._owners = torch.zeros(self.num_pages, dtype=torch.int32)
         self._slot_pages: list[tuple[int, ...]] = [() for _ in range(rows)]
-        self._imports: dict[int, LatentWrite] = {}
-        self._sources: dict[BufferId, LatentSource] = {}
+        self._imports: dict[int, LatentImport] = {}
+        self.exports: dict[BufferId, ExportLocations] = {}
+        self.export_releases: dict[BufferId, tuple[Future[None], ...]] = {}
+        self._sources: dict[BufferId, LatentExport] = {}
         self._retiring_slots: set[int] = set()
 
         # Retain a pinned source for nonblocking page-index copies into the
         # fixed gather buffer used by one latent step at a time.
-        self._page_table_staging = HostStagingRing(
+        self._page_table_staging = StagingBuffers(
             self.num_pages - 1, dtype=torch.int64, depth=1, device=self.device
         )
-
-    @property
-    def capacity_bytes(self) -> int:
-        """Measure scheduler-visible latent payload capacity, excluding pool metadata."""
-
-        return self.capacity_units * self.latent_width * self.storage.element_size()
 
     @property
     def persistent_bytes(self) -> int:
@@ -196,11 +146,6 @@ class LatentPool:
             self.timestep_pairs,
         )
         return sum(int(value.numel()) * int(value.element_size()) for value in tensors)
-
-    def resident_byte_count(self) -> int:
-        """Measure latent payload bytes owned by active request slots."""
-
-        return int(self._units.sum().item()) * self.latent_width * self.storage.element_size()
 
     @contextmanager
     def startup_values(self, rows: int, units: int):
@@ -221,8 +166,15 @@ class LatentPool:
         self,
         page_tables: Sequence[Sequence[int]],
         latent_units: Sequence[int],
+        *,
+        occupied: Sequence[LatentStaging] = (),
     ) -> tuple[LatentStaging, ...]:
-        """Stage exact page tables and return disjoint contiguous value views."""
+        """Borrow disjoint contiguous views alongside the supplied live staging.
+
+        The caller retains every live view until its numerical consumer ends.
+        Scratch ranges are selected from these actual views, so independent
+        completion groups need no duplicate allocator or allocation handles.
+        """
 
         if not page_tables or len(page_tables) != len(latent_units):
             raise invalid_descriptor("latent staging columns are not aligned")
@@ -237,10 +189,21 @@ class LatentPool:
         flattened = tuple(page for pages in canonical for page in pages)
         if len(set(flattened)) != len(flattened):
             raise invalid_descriptor("latent staging page tables overlap")
-        self._device_pages(flattened)
-        result: list[LatentStaging] = []
+        if set(flattened).intersection(page for item in occupied for page in item.page_table):
+            raise invalid_descriptor("latent staging page tables overlap live operations")
+        ranges = sorted(
+            (int(item.pages.storage_offset()), len(item.page_table)) for item in occupied
+        )
         page_offset = 0
-        unit_offset = 0
+        for start, count in ranges:
+            if page_offset + total_pages <= start:
+                break
+            page_offset = max(page_offset, start + count)
+        if page_offset + total_pages > self.num_pages - 1:
+            raise resource_error("live latent staging exceeds the fixed step buffer")
+        self._device_pages(flattened, offset=page_offset)
+        result: list[LatentStaging] = []
+        unit_offset = page_offset * self.page_units
         for pages in canonical:
             page_count = len(pages)
             padded_units = page_count * self.page_units
@@ -341,7 +304,7 @@ class LatentPool:
         request_pool_idx: int,
         page_table: Sequence[int],
         latent_units: int,
-    ) -> LatentSource:
+    ) -> LatentExport:
         """Retain the written successor bank before registering its exact page spans.
 
         The caller attaches every transport retirement with retain_publication().
@@ -367,7 +330,7 @@ class LatentPool:
         latent_units: int,
         height: int,
         width: int,
-    ) -> LatentSource:
+    ) -> LatentExport:
         """Retain an exact committed trajectory for an independently owned output.
 
         Publication does not change the request's generation or step. Multiple
@@ -400,10 +363,10 @@ class LatentPool:
         bank: int,
         pages: tuple[int, ...],
         latent_units: int,
-    ) -> LatentSource:
+    ) -> LatentExport:
         if product.buffer_id in self._sources:
             raise invalid_descriptor("latent publication generation is already registered")
-        source = LatentSource(
+        source = LatentExport(
             product.buffer_id,
             slot,
             bank,
@@ -416,7 +379,7 @@ class LatentPool:
         self._sources[source.buffer] = source
         return source
 
-    def retain_publication(self, source: LatentSource, retirement: Future[None]) -> None:
+    def retain_publication(self, source: LatentExport, retirement: Future[None]) -> None:
         """Keep the registered page-bank version until its physical readers retire."""
 
         if self._sources.get(source.buffer) is not source or source.released:
@@ -426,6 +389,7 @@ class LatentPool:
     def release_buffers(self, buffers: Sequence[BufferId]) -> None:
         """Revoke bank reservations while retaining every pending physical publication."""
 
+        release_exports(self.exports, self.export_releases, buffers)
         for buffer in buffers:
             source = self._sources.get(buffer)
             if source is not None:
@@ -485,158 +449,121 @@ class LatentPool:
         row[1].fill_(float(following))
         return row[:1], row[1:2]
 
-    def validate_commit(
+    def validate_updates(
         self,
-        publications: Sequence[LatentPublication],
-        releases: Sequence[LatentRelease],
+        outputs: Sequence[PendingOutput],
     ) -> None:
         """Validate an entire lane's visibility changes without mutation."""
 
+        publications = tuple(
+            output
+            for output in outputs
+            if output.latent_params is not None and not output.latent_release
+        )
+        releases = tuple(
+            output
+            for output in outputs
+            if output.latent_params is not None and output.latent_release
+        )
         slots = (
-            *(int(value.request_pool_idx) for value in publications),
-            *(int(value.request_pool_idx) for value in releases),
+            *(int(value.request.request_pool_idx) for value in publications),
+            *(int(value.request.request_pool_idx) for value in releases),
         )
         if len(set(slots)) != len(slots):
             raise invalid_descriptor("latent commit repeats a request slot")
         claimed_pages: set[int] = set()
         for publication in publications:
-            slot = self._validate_slot(int(publication.request_pool_idx))
-            pages = self._validate_page_table(publication.page_table, int(publication.latent_units))
+            params = publication.latent_params
+            assert params is not None
+            slot = self._validate_slot(int(publication.request.request_pool_idx))
+            pages = self._validate_page_table(params.page_table, int(params.latent_units))
             self._validate_metadata(
-                generation=int(publication.generation),
-                step=int(publication.step),
-                latent_units=int(publication.latent_units),
-                height=int(publication.height),
-                width=int(publication.width),
+                generation=int(publication.latent_generation),
+                step=int(publication.latent_step),
+                latent_units=int(params.latent_units),
+                height=int(params.height),
+                width=int(params.width),
             )
-            expected = int(publication.expected_generation)
+            expected = int(publication.latent_expected_generation)
             if expected == 0:
-                if int(publication.expected_step) != 0 or int(publication.step) != 0:
+                if int(publication.latent_expected_step) != 0 or int(publication.latent_step) != 0:
                     raise invalid_descriptor("latent initialization must publish step zero")
                 self._require_empty(slot)
                 self._require_page_owners(pages, 0, publication_slot=slot)
             else:
                 self._require_current(
                     slot,
-                    step=int(publication.expected_step),
+                    step=int(publication.latent_expected_step),
                     generation=expected,
-                    latent_units=int(publication.latent_units),
-                    height=int(publication.height),
-                    width=int(publication.width),
+                    latent_units=int(params.latent_units),
+                    height=int(params.height),
+                    width=int(params.width),
                 )
                 self._require_slot_pages(slot, pages)
                 self._require_page_owners(pages, slot)
-                if int(publication.step) <= int(publication.expected_step):
+                if int(publication.latent_step) <= int(publication.latent_expected_step):
                     raise invalid_descriptor("latent successor does not advance its step")
-            if int(publication.generation) <= expected:
+            if int(publication.latent_generation) <= expected:
                 raise invalid_descriptor("latent publication does not advance its generation")
             if not claimed_pages.isdisjoint(pages):
                 raise invalid_descriptor("latent commit publications overlap physical pages")
             claimed_pages.update(pages)
         for release in releases:
-            slot = self._validate_slot(int(release.request_pool_idx))
-            pages = self._validate_page_table(release.page_table, int(release.latent_units))
+            params = release.latent_params
+            assert params is not None
+            slot = self._validate_slot(int(release.request.request_pool_idx))
+            pages = self._validate_page_table(params.page_table, int(params.latent_units))
             self._require_current(
                 slot,
-                step=int(release.step),
-                generation=int(release.generation),
-                latent_units=int(release.latent_units),
-                height=int(release.height),
-                width=int(release.width),
+                step=int(release.latent_step),
+                generation=int(release.latent_generation),
+                latent_units=int(params.latent_units),
+                height=int(params.height),
+                width=int(params.width),
             )
             self._require_slot_pages(slot, pages)
             self._require_page_owners(pages, slot)
 
-    def apply_commit(
+    def apply_updates(
         self,
-        publications: Sequence[LatentPublication],
-        releases: Sequence[LatentRelease],
+        outputs: Sequence[PendingOutput],
     ) -> None:
-        """Apply changes already accepted by :meth:`validate_commit`."""
+        """Apply changes already accepted by :meth:`validate_updates`."""
 
+        publications = tuple(
+            output
+            for output in outputs
+            if output.latent_params is not None and not output.latent_release
+        )
+        releases = tuple(
+            output
+            for output in outputs
+            if output.latent_params is not None and output.latent_release
+        )
         for publication in publications:
-            slot = int(publication.request_pool_idx)
-            pages = tuple(int(page) for page in publication.page_table)
-            if int(publication.expected_generation) == 0:
+            params = publication.latent_params
+            assert params is not None
+            slot = int(publication.request.request_pool_idx)
+            pages = tuple(int(page) for page in params.page_table)
+            if int(publication.latent_expected_generation) == 0:
                 for page in pages:
                     self._owners[page] = slot
                 self._slot_pages[slot] = pages
             bank = 1 - int(self._active[slot].item())
             self._active[slot] = bank
-            self._steps[slot] = int(publication.step)
-            self._generations[slot] = int(publication.generation)
-            self._units[slot] = int(publication.latent_units)
-            self._heights[slot] = int(publication.height)
-            self._widths[slot] = int(publication.width)
+            self._steps[slot] = int(publication.latent_step)
+            self._generations[slot] = int(publication.latent_generation)
+            self._units[slot] = int(params.latent_units)
+            self._heights[slot] = int(params.height)
+            self._widths[slot] = int(params.width)
         for release in releases:
+            params = release.latent_params
+            assert params is not None
             self._clear_slot(
-                int(release.request_pool_idx), tuple(int(page) for page in release.page_table)
+                int(release.request.request_pool_idx),
+                tuple(int(page) for page in params.page_table),
             )
         self._reap_imports()
-
-    def snapshot(
-        self,
-        *,
-        request_pool_idx: int,
-        page_table: Sequence[int],
-    ) -> LatentSnapshot:
-        """Copy one committed trajectory to a device-independent tensor."""
-
-        slot = self._validate_slot(int(request_pool_idx))
-        generation = int(self._generations[slot].item())
-        if generation < 1:
-            raise invalid_descriptor("latent snapshot request has no committed trajectory")
-        units = int(self._units[slot].item())
-        pages = self._validate_page_table(page_table, units)
-        self._require_slot_pages(slot, pages)
-        self._require_page_owners(pages, slot)
-        device_pages = self._device_pages(pages)
-        gathered = torch.index_select(self.storage[int(self._active[slot].item())], 0, device_pages)
-        value = gathered.reshape(-1, self.latent_width)[:units].detach().cpu().contiguous()
-        return LatentSnapshot(
-            generation=generation,
-            step=int(self._steps[slot].item()),
-            latent_units=units,
-            height=int(self._heights[slot].item()),
-            width=int(self._widths[slot].item()),
-            value=value,
-        )
-
-    def restore(
-        self,
-        snapshot: LatentSnapshot,
-        *,
-        request_pool_idx: int,
-        page_table: Sequence[int],
-    ) -> None:
-        """Install one validated snapshot directly into its committed bank."""
-
-        slot = self._validate_slot(int(request_pool_idx))
-        self._require_empty(slot)
-        if int(snapshot.value.shape[1]) != self.latent_width:
-            raise invalid_descriptor("latent snapshot width is incompatible with this pool")
-        if snapshot.value.dtype != self.dtype:
-            raise invalid_descriptor("latent snapshot dtype is incompatible with this pool")
-        pages = self._validate_page_table(page_table, int(snapshot.latent_units))
-        self._require_page_owners(pages, 0)
-        padded_units = len(pages) * self.page_units
-        target = self.step_buffer[:padded_units]
-        target.zero_()
-        target[: int(snapshot.latent_units)].copy_(
-            snapshot.value,
-            non_blocking=self.device.type == "cuda",
-        )
-        device_pages = self._device_pages(pages)
-        self._write_pages(0, device_pages, target)
-        for page in pages:
-            self._owners[page] = slot
-        self._slot_pages[slot] = pages
-        self._active[slot] = 0
-        self._steps[slot] = int(snapshot.step)
-        self._generations[slot] = int(snapshot.generation)
-        self._units[slot] = int(snapshot.latent_units)
-        self._heights[slot] = int(snapshot.height)
-        self._widths[slot] = int(snapshot.width)
 
     def reserve_import(
         self,
@@ -645,7 +572,7 @@ class LatentPool:
         request_pool_idx: int,
         page_table: Sequence[int],
         latent_units: int,
-    ) -> LatentWrite:
+    ) -> LatentImport:
         """Own destination pages before granting an asynchronous transfer access.
 
         The returned first-axis spans exclude page padding. They address bank
@@ -666,13 +593,13 @@ class LatentPool:
         # Padding is outside every granted span, so its initialization cannot
         # race the independent transfer stream's payload writes.
         self.storage[0, pages[-1], int(spans[-1].shape[0]) :].zero_()
-        write = LatentWrite(product, slot, pages, spans)
+        write = LatentImport(product, slot, pages, spans)
         for page in pages:
             self._owners[page] = slot
         self._imports[slot] = write
         return write
 
-    def retain_transfer(self, write: LatentWrite, ticket: TransferTicket) -> None:
+    def retain_transfer(self, write: LatentImport, ticket: TransferTicket) -> None:
         """Retain the physical copy even if its preparation is later abandoned."""
 
         self._require_import(write)
@@ -682,7 +609,7 @@ class LatentPool:
 
     def adopt_import(
         self,
-        write: LatentWrite,
+        write: LatentImport,
         *,
         generation: int,
         step: int,
@@ -715,7 +642,7 @@ class LatentPool:
         write.adopted = True
         self._reap_imports()
 
-    def abandon_import(self, write: LatentWrite) -> None:
+    def abandon_import(self, write: LatentImport) -> None:
         """Revoke an unadopted import without reusing a still-written page."""
 
         if write.released:
@@ -755,7 +682,7 @@ class LatentPool:
             if write.product.request_key in requests and not write.adopted and not write.released:
                 self.abandon_import(write)
 
-    def _require_import(self, write: LatentWrite) -> None:
+    def _require_import(self, write: LatentImport) -> None:
         if self._imports.get(write.request_pool_idx) is not write or write.released:
             raise invalid_descriptor("latent import reservation is no longer writable")
 
@@ -793,6 +720,8 @@ class LatentPool:
         self._reap_sources()
         if self._imports or self._sources:
             raise resource_error("latent physical reads must retire before pool shutdown")
+        self.exports.clear()
+        self.export_releases.clear()
         for name, dtype in (
             ("storage", self.dtype),
             ("step_buffer", self.dtype),
@@ -961,32 +890,19 @@ class LatentPool:
             raise invalid_descriptor("latent request slot is outside physical capacity")
         return slot
 
-    def _device_pages(self, pages: Sequence[int]) -> torch.Tensor:
+    def _device_pages(self, pages: Sequence[int], *, offset: int) -> torch.Tensor:
         """Copy host page identifiers into reusable device index storage."""
 
         slot, host = self._page_table_staging.acquire()
         fill_cpu_ints(host, pages)
-        target = self.page_table_buffer[: len(pages)]
+        target = self.page_table_buffer[offset : offset + len(pages)]
         target.copy_(host[: len(pages)], non_blocking=self.device.type == "cuda")
-        self._page_table_staging.release(slot)
+        self._page_table_staging.record_copy(slot)
         return target
 
 
 __all__ = [
     "LatentPool",
-    "LatentPublication",
-    "LatentRelease",
-    "LatentSnapshot",
     "LatentStaging",
-    "LatentWrite",
+    "LatentImport",
 ]
-
-
-def require_latent_pool(pool: LatentPool | None) -> LatentPool:
-    """Require physical trajectory storage for an operation that consumes latents."""
-
-    if pool is None:
-        from ..foundation.errors import unsupported_setup
-
-        raise unsupported_setup("operation requires a physical latent pool")
-    return pool

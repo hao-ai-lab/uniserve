@@ -4,12 +4,12 @@ import os
 from collections import deque
 from pathlib import Path
 
+from tests.python.fixtures.depth_one import finalized_report
 from uniserve_worker.bootstrap.cli import create_worker_cli_parser
 from uniserve_worker.bootstrap.config import WorkerProcessArgs
 from uniserve_worker.bootstrap.ipc import WorkerIpcEndpoint
-from uniserve_worker.execution.batch import MediaOutput, PosixShmArtifact
-from uniserve_worker.execution.output import finalize_run_result
 from uniserve_worker.media.storage import publish_media_bytes
+from uniserve_worker.protocol.batch import MediaOutput, PosixShmArtifact
 from uniserve_worker.worker import Worker
 
 
@@ -36,7 +36,7 @@ def main():
                     endpoint.respond({"kind": "ok", "call_id": call_id})
                     break
                 if kind == "submit":
-                    report = finalize_run_result(worker.execute(request["run"])).to_mapping()
+                    report = finalized_report(worker, worker.submit(request["run"])).to_mapping()
                     media_case = os.environ.get("UNISERVE_TEST_MEDIA_RESPONSE")
                     media_rank = 1 if media_case == "rank-output" else 0
                     if media_case and config.execution.rank == media_rank and report["completions"]:

@@ -419,7 +419,9 @@ class RequestRecord:
             self.first_image_done_time = timestamp
         self.image_latencies.extend([latency] * count)
 
-    def attach_images(self, decoded: list[DecodedImage], *, assign_json_latency: bool = False) -> None:
+    def attach_images(
+        self, decoded: list[DecodedImage], *, assign_json_latency: bool = False
+    ) -> None:
         """Attach validated images and optionally assign response latency to each."""
 
         self.decoded_images = decoded
@@ -428,7 +430,7 @@ class RequestRecord:
             self.image_latencies = [self.latency] * self.images
 
     def record_dict(self) -> dict[str, Any]:
-        """Return the durable request record without raw media or generated text."""
+        """Return the durable request record, including generated text and media metadata."""
 
         generated_text_bytes = self.generated_text.encode("utf-8")
         http_response = (
@@ -449,7 +451,6 @@ class RequestRecord:
             "error": self.error,
             "warnings": list(self.warnings),
             "endpoint": self.endpoint,
-
             # Absolute event timestamps support cross-process timeline joins.
             "scheduled_time": self.scheduled_time,
             "client_send_time": self.start_time,
@@ -457,7 +458,6 @@ class RequestRecord:
             "first_text_time": self.first_text_time,
             "first_image_done_time": self.first_image_done_time,
             "final_event_time": self.final_event_time,
-
             # Derived durations use milliseconds in durable artifacts.
             "client_dispatch_wait_ms": (
                 dispatch_wait * 1000.0 if dispatch_wait is not None else None
@@ -465,20 +465,15 @@ class RequestRecord:
             "http_response_ms": (http_response * 1000.0 if http_response is not None else None),
             "e2e_ms": self.latency * 1000.0,
             "token_timing_available": self.token_timing_available,
-            "ttft_ms": (
-                self.ttft * 1000.0
-                if self.token_timing_available and self.ttft
-                else None
-            ),
+            "ttft_ms": (self.ttft * 1000.0 if self.token_timing_available and self.ttft else None),
             "tpot_ms": (
                 (self.latency - self.ttft) / (self.output_len - 1) * 1000.0
                 if self.token_timing_available and self.output_len > 1
                 else None
             ),
             "itl_count": len(self.itl),
-
             # Token provenance distinguishes authoritative server counts from
-            # client-side fallbacks without retaining generated text.
+            # client-side fallbacks. Text remains available for paired analysis.
             "prompt_len": self.prompt_len,
             "output_len": self.output_len,
             "requested_output_len": self.requested_output_len,
@@ -486,11 +481,11 @@ class RequestRecord:
             "output_len_source": self.output_len_source,
             "cached_prompt_tokens": self.cached_prompt_tokens,
             "cached_prompt_tokens_source": self.cached_prompt_tokens_source,
+            "generated_text": self.generated_text,
             "generated_text_bytes": len(generated_text_bytes),
             "generated_text_sha256": (
                 hashlib.sha256(generated_text_bytes).hexdigest() if generated_text_bytes else None
             ),
-
             # Media entries retain verified metadata while sample bytes live in
             # their own content-addressed artifacts.
             "images": self.images,
@@ -503,7 +498,6 @@ class RequestRecord:
             "video_output": (
                 self.decoded_video.metadata_dict() if self.decoded_video is not None else None
             ),
-
             # Transport terminal state remains available for validation reports.
             "status_code": self.status_code,
             "finish_reason": self.finish_reason,
@@ -542,7 +536,9 @@ class BenchmarkPoint:
         """Return the benchmark workload as a JSON-compatible mapping."""
 
         load = asdict(self.load)
-        load["request_rate"] = "inf" if math.isinf(self.load.request_rate) else self.load.request_rate
+        load["request_rate"] = (
+            "inf" if math.isinf(self.load.request_rate) else self.load.request_rate
+        )
         return {
             "name": self.name,
             "server": self.server,

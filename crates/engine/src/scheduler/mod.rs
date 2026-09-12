@@ -42,7 +42,7 @@ pub(crate) mod output;
 mod run;
 
 pub(crate) use crate::executor::{
-    BatchResult, Executor, ExecutorSubmitError, RequestPlacement, ScheduleBatch,
+    BatchResult, ExecutionBatch, Executor, ExecutorSubmitError, RequestPlacement,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -71,8 +71,8 @@ use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
 use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
     CachePageAllocation, Computation, ComputationId, DType, DecodeRange, DimBound, ForwardBatch,
-    LatentParams, ModelOutput, NewRequest, OpStatus, RequestKey, SamplingState, ScheduledRequest,
-    ShapeBound, TensorRef, TimingCounters, UmmRequestParams, WorkerForwardStats, WorkerInfo,
+    ForwardStats, LatentParams, NewRequest, OpStatus, RequestKey, SamplingState, ScheduledRequest,
+    ShapeBound, TensorRef, TimingCounters, UmmRequestParams, WorkerInfo,
 };
 
 use crate::executor::WorkerFailure;
@@ -486,7 +486,7 @@ pub(crate) fn sim_umm_generation_limits() -> uniserve_core::GenerationLimits {
 /// Single-threaded owner of scheduling, memory, execution, and request state.
 pub struct Scheduler {
     executor: Box<dyn Executor>,
-    pending_submissions: VecDeque<ScheduleBatch>,
+    pending_submissions: VecDeque<ExecutionBatch>,
     worker_affinity: HashMap<(RequestKey, String), crate::WorkerId>,
     info: WorkerInfo,
     generation_limits: uniserve_core::GenerationLimits,
@@ -668,7 +668,7 @@ struct KvLengths {
 }
 
 /// Serializes worker forward-pass counters into the scheduler trace schema.
-fn worker_forward_stats_trace(stats: &WorkerForwardStats) -> serde_json::Value {
+fn worker_forward_stats_trace(stats: &ForwardStats) -> serde_json::Value {
     json!({
         "mode_counts": stats.mode_counts,
         "mode_tokens": stats.mode_tokens,

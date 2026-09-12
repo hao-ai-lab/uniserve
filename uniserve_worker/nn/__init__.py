@@ -33,7 +33,7 @@ _EXPORTS: dict[str, str] = {
     # mesh (parallelism topology + transports)
     "DeviceMesh": "mesh",
     "Communicator": "mesh",
-    "SymmetricMemoryWorkspace": "mesh",
+    "SymmetricMemory": "mesh",
     "divide": "mesh",
     # moe
     "FusedMoE": "moe",
@@ -106,7 +106,7 @@ __all__ = [
     "RadixAttention",
     "SiglipNavitEncoder",
     "SiluAndMul",
-    "SymmetricMemoryWorkspace",
+    "SymmetricMemory",
     "TopK",
     "VisionEncoder",
     "VocabParallelEmbedding",
@@ -164,7 +164,7 @@ if TYPE_CHECKING:  # Expose concrete definitions to type checkers without import
     from .mesh import (
         Communicator,
         DeviceMesh,
-        SymmetricMemoryWorkspace,
+        SymmetricMemory,
         divide,
     )
     from .moe import FusedMoE, TopK

@@ -89,7 +89,7 @@ impl Scheduler {
     }
 
     /// Includes lifecycle commands in destination ordering, even when a batch has no compute.
-    fn batch_workers(&self, batch: &ScheduleBatch) -> HashSet<crate::WorkerId> {
+    fn batch_workers(&self, batch: &ExecutionBatch) -> HashSet<crate::WorkerId> {
         let mut targets = batch
             .requests
             .iter()
@@ -151,7 +151,7 @@ impl Scheduler {
     }
 
     /// Registers the computations and command receipts owned by one scheduled batch.
-    pub(super) fn register_pending_batch(&mut self, batch: &ScheduleBatch, started: Instant) {
+    pub(super) fn register_pending_batch(&mut self, batch: &ExecutionBatch, started: Instant) {
         self.pending_batches.insert(
             batch.id,
             PendingBatch {
@@ -284,7 +284,7 @@ impl Scheduler {
                 break;
             }
             let batch = self.finish_generation_batch(
-                ScheduleBatch::new(0, Vec::new(), commands, Vec::new()),
+                ExecutionBatch::new(0, Vec::new(), commands, Vec::new()),
                 Instant::now(),
             );
             self.pending_submissions.push_back(batch);
@@ -299,7 +299,7 @@ impl Scheduler {
     }
 
     /// Selects one batch under the shared queue budget and existing family fairness.
-    fn schedule_batch(&mut self) -> Option<ScheduleBatch> {
+    fn schedule_batch(&mut self) -> Option<ExecutionBatch> {
         if self.prefer_media
             && let Some(batch) = self.prepare_media_batch()
         {
@@ -394,7 +394,7 @@ impl Scheduler {
 
     /// Select eligible media requests and prepare their bounded computation inputs. Independent
     /// audio and video branches carry Tensor edges, without a state predecessor.
-    pub(super) fn prepare_media_batch(&mut self) -> Option<ScheduleBatch> {
+    pub(super) fn prepare_media_batch(&mut self) -> Option<ExecutionBatch> {
         let max_unresolved =
             usize::try_from(self.info.max_unresolved_ops.max(1)).unwrap_or(usize::MAX);
         let mut candidates = self
@@ -670,7 +670,7 @@ impl Scheduler {
             .map(|request| BatchCommand::Start { request })
             .collect::<Vec<_>>();
         batch_commands.extend(commands);
-        let batch = ScheduleBatch::new(batch_id, logical_ops, batch_commands, Vec::new());
+        let batch = ExecutionBatch::new(batch_id, logical_ops, batch_commands, Vec::new());
         self.register_pending_batch(&batch, submit_at);
         Some(batch)
     }
@@ -1380,7 +1380,7 @@ impl Scheduler {
     /// Stages one validated completion until earlier operations for the request are applied.
     pub(super) fn stage_completion(
         &mut self,
-        mut record: ModelOutput,
+        mut record: uniserve_worker_ipc::RequestOutput,
         media: Result<Option<Arc<SharedMedia>>, String>,
     ) {
         let id = record.request_key.request_id;
@@ -1448,7 +1448,7 @@ impl Scheduler {
         operation: ScheduledRequest,
         latent: Option<LatentParams>,
         decode: Option<DecodeRange>,
-        record: ModelOutput,
+        record: uniserve_worker_ipc::RequestOutput,
         media: Option<Arc<SharedMedia>>,
     ) {
         let id = record.request_key.request_id;
@@ -2240,7 +2240,7 @@ impl Scheduler {
     }
 
     /// Merges optional worker forward-pass counters into scheduler statistics.
-    pub(super) fn record_worker_forward_stats(&self, stats: Option<&WorkerForwardStats>) {
+    pub(super) fn record_worker_forward_stats(&self, stats: Option<&ForwardStats>) {
         let Some(stats) = stats else {
             return;
         };

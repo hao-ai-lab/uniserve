@@ -6,12 +6,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from threading import RLock
 
 import torch
 
 from ..backends.paged_kv_math import paged_kv_write
-from ..execution.batch import BufferId, RequestKey
 from ..foundation.errors import compute_error, invalid_descriptor, resource_error, unsupported_setup
 from ..nn.quant.kv_cache import (
     dequantize_fp8_block,
@@ -20,13 +20,24 @@ from ..nn.quant.kv_cache import (
     resolve_kv_store_dtype,
     scale_for_fp8_block,
 )
-from .cache_transfer import CacheTransfers, CacheWrite
+from ..protocol.batch import (
+    BufferId,
+    ComputationId,
+    KvTransfer,
+    Locator,
+    RequestKey,
+    TensorTransfer,
+)
+from ..transfer.exports import ExportLocations, release_exports
+from ..transfer.tickets import Transport, publish_tensor
+from .block_tables import BlockTables
+from .cache_imports import CacheImport, CacheImports
 
-__all__ = ["CachePool"]
+__all__ = ["KVCache"]
 
 
 @dataclass(slots=True)
-class CacheSource:
+class CacheExport:
     """An immutable token interval retained by its physical publications.
 
     Ranges map each physical page to its token offset and token count. A publication
@@ -41,7 +52,7 @@ class CacheSource:
 
 
 @dataclass(eq=False, slots=True)
-class CacheExecution:
+class CacheAccess:
     """Physical page intervals retained by one computation's existing completion fence."""
 
     completion: Future[None]
@@ -49,7 +60,7 @@ class CacheExecution:
     ranges: dict[int, tuple[int, int]]
 
 
-class CachePool:
+class KVCache:
     """Startup-sized layer-major KV tensors with no allocation authority."""
 
     def __init__(
@@ -69,6 +80,9 @@ class CachePool:
         store_dtype: torch.dtype | str | None = None,
         group_ranges: Sequence[tuple[int, int]] | None = None,
         import_capacity: int = 1,
+        request_pool_size: int = 1,
+        max_blocks_per_request: int | None = None,
+        staging_depth: int = 1,
     ) -> None:
         """Allocate layer-major KV pages and optional per-page FP8 scales."""
 
@@ -101,7 +115,7 @@ class CachePool:
             or self.kv_head_offset + self.n_kv > self.total_kv_heads
             or self.head_dim < 1
         ):
-            raise invalid_descriptor("CachePool geometry is invalid")
+            raise invalid_descriptor("KVCache geometry is invalid")
         if self.is_quantized and (
             self.total_kv_heads % self.n_kv or self.kv_head_offset % self.n_kv
         ):
@@ -138,11 +152,26 @@ class CachePool:
         self._validated_page_tuples: dict[
             tuple[tuple[int, ...], bool, int | None], tuple[int, ...]
         ] = {}
-        self._sources: dict[BufferId, CacheSource] = {}
-        self._executions: dict[Future[None], CacheExecution] = {}
-        self._execution_pages: dict[int, set[CacheExecution]] = {}
+        self.exports: dict[BufferId, ExportLocations] = {}
+        self.export_releases: dict[BufferId, tuple[Future[None], ...]] = {}
+        self._sources: dict[BufferId, CacheExport] = {}
+        self._executions: dict[Future[None], CacheAccess] = {}
+        self._execution_pages: dict[int, set[CacheAccess]] = {}
         self._execution_lock = RLock()
-        self.imports = CacheTransfers(self, capacity=import_capacity)
+        self.block_tables = BlockTables(
+            group_count=self.group_count,
+            request_pool_size=request_pool_size,
+            max_blocks_per_request=max(1, self.num_pages - 1)
+            if max_blocks_per_request is None
+            else max_blocks_per_request,
+            block_size=self.block_size,
+            device=device,
+            staging_depth=staging_depth,
+        )
+        self._publications: dict[BufferId, KvTransfer] = {}
+        self._destination_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]] = {}
+        self._installed_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]] = {}
+        self.imports = CacheImports(self, capacity=import_capacity)
 
     @contextmanager
     def startup_pages(self, count: int, *, group: int = 0):
@@ -200,7 +229,7 @@ class CachePool:
             execution = self._executions.get(completion)
             register = execution is None
             if execution is None:
-                execution = CacheExecution(completion, set(), {})
+                execution = CacheAccess(completion, set(), {})
                 self._executions[completion] = execution
             execution.requests.add(request)
             for page, offset, count in ranges:
@@ -257,7 +286,7 @@ class CachePool:
         group: int,
         start: int,
         length: int,
-    ) -> CacheSource:
+    ) -> CacheExport:
         """Retain the exact published interval before exporting any of its views.
 
         The caller attaches every registration's retirement future and releases
@@ -271,11 +300,11 @@ class CachePool:
         }
         if not ranges or buffer in self._sources:
             raise invalid_descriptor("KV publication has an empty or already registered interval")
-        source = CacheSource(buffer, ranges)
+        source = CacheExport(buffer, ranges)
         self._sources[source.buffer] = source
         return source
 
-    def retain_publication(self, source: CacheSource, retirement: Future[None]) -> None:
+    def retain_publication(self, source: CacheExport, retirement: Future[None]) -> None:
         """Retain the published interval until this physical registration retires."""
 
         if self._sources.get(source.buffer) is not source or source.released:
@@ -286,6 +315,7 @@ class CachePool:
         """Revoke semantic ownership while preserving every pending physical read."""
 
         selected = tuple(buffers)
+        release_exports(self.exports, self.export_releases, selected)
         self.imports.release(selected)
         for buffer in selected:
             source = self._sources.get(buffer)
@@ -405,6 +435,12 @@ class CachePool:
             raise resource_error("KV cache still has executing producers or consumers")
         if self._sources:
             raise resource_error("KV cache still has unretired physical publications")
+        self.exports.clear()
+        self.export_releases.clear()
+        self.block_tables.close()
+        self._publications.clear()
+        self._destination_bases.clear()
+        self._installed_bases.clear()
 
     def _group_ranges(
         self,
@@ -418,7 +454,7 @@ class CachePool:
             else tuple((int(offset), int(count)) for offset, count in declared)
         )
         if not ranges:
-            raise invalid_descriptor("CachePool declares no KV groups")
+            raise invalid_descriptor("KVCache declares no KV groups")
         covered = [False] * self.num_pages
         for group, (offset, count) in enumerate(ranges):
             end = offset + count
@@ -467,20 +503,6 @@ class CachePool:
             return cached
         pages = tuple(int(page) for page in pages)
         key = (pages, bool(allow_sentinel), group)
-        validated = self._validate_page_tuple(pages, allow_sentinel, group)
-        if len(self._validated_page_tuples) >= 16_384:
-            self._validated_page_tuples.clear()
-        self._validated_page_tuples[key] = validated
-        return validated
-
-    def _validate_page_tuple(
-        self,
-        pages: tuple[int, ...],
-        allow_sentinel: bool,
-        group: int | None,
-    ) -> tuple[int, ...]:
-        """Validate page identifiers, sentinel policy, and optional group ownership once per tuple."""
-
         real_pages = tuple(page for page in pages if page != 0)
         if len(set(real_pages)) != len(real_pages):
             raise invalid_descriptor("KV allocation repeats a physical page")
@@ -494,6 +516,9 @@ class CachePool:
             end = offset + count
             if any(page < offset or page >= end for page in real_pages):
                 raise invalid_descriptor("KV allocation addresses another cache group")
+        if len(self._validated_page_tuples) >= 16_384:
+            self._validated_page_tuples.clear()
+        self._validated_page_tuples[key] = pages
         return pages
 
     def zero_pages(self, group: int, page_ids: Iterable[int]) -> None:
@@ -505,7 +530,7 @@ class CachePool:
         self.require_reusable(pages, group=group, start=0, length=len(pages) * self.block_size)
         self._clear_pages(pages)
 
-    def initialize_import(self, write: CacheWrite) -> None:
+    def initialize_import(self, write: CacheImport) -> None:
         """Initialize the new pages covered by this active import reservation."""
 
         if not self.imports.owns(write):
@@ -513,7 +538,7 @@ class CachePool:
         if write.initialized_pages:
             self._clear_pages(write.initialized_pages)
 
-    def mark_import_scales(self, write: CacheWrite) -> None:
+    def mark_import_scales(self, write: CacheImport) -> None:
         """Publish initialization metadata for physically copied FP8 page scales."""
 
         if self._k_scale_set is None or self._v_scale_set is None:
@@ -810,3 +835,350 @@ class CachePool:
             scale.copy_(scale_for_fp8_block(values_f32))
             scale_set[index] = 1
         store[layer, page, offset : offset + count] = fp8_quantize(values_f32, scale)
+
+    def destination_base(self, request_key: RequestKey, destination: str) -> BufferId | None:
+        """Resolve the newest publication published to one destination for a request."""
+
+        value = self._destination_bases.get((request_key, str(destination)))
+        return None if value is None else value[0]
+
+    def publish(
+        self,
+        *,
+        request_pool_idx: int,
+        group_id: int,
+        visible_length: int,
+        destination: str,
+        expected_base: BufferId | None,
+        buffer: BufferId,
+        transports: Mapping[str, Transport],
+    ) -> KvTransfer:
+        """Export a visible KV extent under its exact buffer identity."""
+
+        installed = self._destination_bases.get((buffer.owner, destination))
+        if installed is None:
+            if expected_base is not None:
+                raise invalid_descriptor("KV publication expected base is not installed")
+            base_extent = 0
+        else:
+            installed_buffer, base_extent = installed
+            if installed_buffer != expected_base:
+                raise invalid_descriptor("KV publication expected base does not match destination")
+        pages = self.block_tables.pages(request_pool_idx, group_id)
+        visible = int(visible_length)
+        if visible > self.block_tables.allocated_length(request_pool_idx):
+            raise invalid_descriptor("KV publication exceeds its scheduler block table")
+        if visible < base_extent:
+            raise invalid_descriptor("KV publication destination is ahead of its source")
+        suffix = visible - base_extent
+        source = (
+            self.reserve_publication(
+                buffer, pages, group=group_id, start=base_extent, length=suffix
+            )
+            if suffix
+            else None
+        )
+        locators: list[Locator] = []
+        tensors: list[TensorTransfer] = []
+        try:
+            if suffix:
+                assert source is not None
+                fields = self.transfer_views(
+                    pages, group=group_id, start=base_extent, length=suffix
+                )
+                for index, views in enumerate(fields):
+                    shape = (
+                        (
+                            suffix,
+                            self.total_layers,
+                            self.total_kv_heads,
+                            self.head_dim,
+                        )
+                        if index < 2
+                        else (
+                            len(views),
+                            2,
+                            self.total_layers,
+                            self.total_kv_heads // self.n_kv,
+                        )
+                    )
+                    offset = (
+                        (0, self.layer_offset, self.kv_head_offset, 0)
+                        if index < 2
+                        else (
+                            0,
+                            0,
+                            self.layer_offset,
+                            self.kv_head_offset // self.n_kv,
+                        )
+                    )
+                    locations = publish_tensor(
+                        transports,
+                        views,
+                        retain=partial(self.retain_publication, source),
+                        offset=offset,
+                    )
+                    locators.extend(locations)
+                    tensors.append(TensorTransfer(shape=shape, locations=locations))
+        except BaseException:
+            for locator in locators:
+                transports[locator.backend].release(locator)
+            self.release_buffers((buffer,))
+            raise
+        publication = KvTransfer(
+            tensors=tuple(tensors),
+            source=buffer,
+            destination=destination,
+            base=expected_base,
+            base_extent=base_extent,
+            published_extent=visible,
+            group_id=int(group_id),
+            compute_dtype=str(self.dtype).removeprefix("torch."),
+            page_size=self.block_size,
+        )
+        return publication
+
+    def publication(self, buffer: BufferId) -> KvTransfer:
+        """Require the resident KV publication identified by a buffer identity."""
+
+        try:
+            return self._publications[buffer]
+        except KeyError:
+            raise invalid_descriptor("KV publication buffer is not resident") from None
+
+    def resident(self, buffer: BufferId) -> KvTransfer | None:
+        """Look up a resident KV publication without treating absence as an error."""
+
+        return self._publications.get(buffer)
+
+    def validate_conditioning(
+        self,
+        request_key: RequestKey,
+        buffer: BufferId,
+        *,
+        request_pool_idx: int,
+        group_id: int,
+        visible_length: int,
+        publication: KvTransfer | None = None,
+    ) -> KvTransfer:
+        """Verify that an installed buffer extends the request’s current compatible KV base."""
+
+        publication = self.publication(buffer) if publication is None else publication
+        if buffer.owner != request_key:
+            raise invalid_descriptor("KV conditioning buffer belongs to another request")
+        if (
+            int(visible_length) < publication.published_extent
+            or int(group_id) != publication.group_id
+            or self.block_tables.allocated_length(request_pool_idx) < publication.published_extent
+        ):
+            raise invalid_descriptor("KV conditioning allocation disagrees with its publication")
+        self.block_tables.pages(request_pool_idx, group_id)
+        return publication
+
+    def _validate_install(
+        self, source: BufferId, publication: KvTransfer, *, group_id: int
+    ) -> None:
+        """Check semantic lineage and the raw representation before destination access."""
+
+        if source != publication.source:
+            raise invalid_descriptor("KV installation source identity is invalid")
+        installed = self._installed_bases.get((source.owner, publication.destination))
+        if publication.base is None:
+            if installed is not None or publication.base_extent != 0:
+                raise invalid_descriptor("KV installation base is invalid")
+        elif installed != (publication.base, publication.base_extent):
+            raise invalid_descriptor("KV installation base does not match destination")
+        if int(group_id) != publication.group_id:
+            raise invalid_descriptor("KV installation group disagrees with publication")
+        if publication.tensors:
+            suffix = publication.published_extent - publication.base_extent
+            expected = (
+                suffix,
+                self.total_layers,
+                self.total_kv_heads,
+                self.head_dim,
+            )
+            if publication.tensors[0].shape != expected:
+                raise invalid_descriptor("KV transfer geometry does not match destination layers")
+
+    def prepare_install(
+        self,
+        source: BufferId,
+        publication: KvTransfer,
+        *,
+        request_pool_idx: int,
+        group_id: int,
+        page_ids: tuple[int, ...],
+        allocated_length: int,
+        initialized_pages: tuple[int, ...],
+        transports: Mapping[str, Transport],
+    ) -> CacheImport:
+        """Reserve scheduler pages and start their bounded physical import."""
+
+        self._validate_install(source, publication, group_id=group_id)
+        pages = self.validate_pages(page_ids, group=group_id)
+        initialized = self.validate_pages(initialized_pages, group=group_id)
+        if (
+            allocated_length > len(pages) * self.block_size
+            or allocated_length < publication.published_extent
+            or not set(initialized).issubset(pages)
+        ):
+            raise invalid_descriptor("KV import exceeds its scheduler block table")
+        if publication.base_extent:
+            base_pages = (publication.base_extent + self.block_size - 1) // self.block_size
+            installed_pages = self.block_tables.pages(request_pool_idx, group_id)[:base_pages]
+            if pages[:base_pages] != installed_pages or set(initialized).intersection(
+                installed_pages
+            ):
+                raise invalid_descriptor("KV import would replace its installed base pages")
+        return self.imports.reserve(
+            source,
+            publication,
+            request_pool_idx=request_pool_idx,
+            group=group_id,
+            pages=pages,
+            initialized_pages=initialized,
+            transports=transports,
+        )
+
+    def install(
+        self,
+        *,
+        request_pool_idx: int,
+        group_id: int,
+        request_key: RequestKey,
+        source: BufferId,
+        installed_buffer: BufferId,
+        write: CacheImport,
+    ) -> KvTransfer:
+        """Adopt a completed physical import under its exact source and base version."""
+
+        publication = write.publication
+        if (
+            installed_buffer.owner != source.owner
+            or source.owner != request_key
+            or write.buffer != source
+            or write.request_pool_idx != request_pool_idx
+            or write.group_id != group_id
+        ):
+            raise invalid_descriptor("installed KV buffer identity is invalid")
+        self._validate_install(source, publication, group_id=group_id)
+        if (
+            self.block_tables.pages(request_pool_idx, group_id) != write.pages
+            or self.block_tables.allocated_length(request_pool_idx) < publication.published_extent
+        ):
+            raise invalid_descriptor("KV installation scheduler block table changed")
+        self.imports.adopt(write)
+        self.block_tables.set_verified(
+            torch.tensor((request_pool_idx,), device=self.block_tables.page_tables.device),
+            torch.tensor(
+                (publication.published_extent,), device=self.block_tables.page_tables.device
+            ),
+        )
+        return publication
+
+    def validate_publications(
+        self,
+        publications: Sequence[tuple[BufferId, KvTransfer]],
+        installations: Sequence[tuple[BufferId, BufferId, KvTransfer]],
+    ) -> None:
+        """Validate touched KV versions before any group resource becomes visible."""
+
+        publications_by_buffer: dict[BufferId, KvTransfer] = {}
+        destination_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]] = {}
+        installed_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]] = {}
+        for buffer, publication in publications:
+            if buffer != publication.source:
+                raise invalid_descriptor("KV publication buffer identity is invalid")
+            existing = publications_by_buffer.get(buffer, self._publications.get(buffer))
+            if existing is not None and existing != publication:
+                raise invalid_descriptor("KV publication conflicts with its buffer identity")
+            destination_key = (buffer.owner, publication.destination)
+            current = destination_bases.get(
+                destination_key, self._destination_bases.get(destination_key)
+            )
+            expected = (
+                None if publication.base is None else (publication.base, publication.base_extent)
+            )
+            if current != expected:
+                raise invalid_descriptor("KV publication base changed before publication")
+            publications_by_buffer[buffer] = publication
+            destination_bases[destination_key] = (
+                publication.source,
+                publication.published_extent,
+            )
+        for source, installed_buffer, publication in installations:
+            if source != publication.source or installed_buffer.owner != source.owner:
+                raise invalid_descriptor("installed KV buffer identity is invalid")
+            destination_key = (installed_buffer.owner, publication.destination)
+            current = installed_bases.get(
+                destination_key, self._installed_bases.get(destination_key)
+            )
+            expected = (
+                None if publication.base is None else (publication.base, publication.base_extent)
+            )
+            if current != expected:
+                raise invalid_descriptor("KV installation base changed before publication")
+            publications_by_buffer[source] = publication
+            publications_by_buffer[installed_buffer] = publication
+            installed_bases[destination_key] = (
+                publication.source,
+                publication.published_extent,
+            )
+
+    def commit_publications(
+        self,
+        publications: Sequence[tuple[BufferId, KvTransfer]],
+        installations: Sequence[tuple[BufferId, BufferId, KvTransfer]],
+    ) -> None:
+        """Publish validated KV versions by updating only affected directory entries."""
+
+        self.validate_publications(publications, installations)
+        for buffer, publication in publications:
+            self._publications[buffer] = publication
+            self._destination_bases[(buffer.owner, publication.destination)] = (
+                publication.source,
+                publication.published_extent,
+            )
+        for source, installed_buffer, publication in installations:
+            self._publications[source] = publication
+            self._publications[installed_buffer] = publication
+            self._installed_bases[(installed_buffer.owner, publication.destination)] = (
+                publication.source,
+                publication.published_extent,
+            )
+
+    def release_operations(
+        self, releases: Sequence[tuple[RequestKey, ComputationId]]
+    ) -> tuple[BufferId, ...]:
+        """Forget semantic publications and identify buffers for the execution owner.
+
+        Locator registration and physical retirement belong to execution's
+        canonical publication table. Imported references may have no local
+        registration; removing their semantic record does not release a remote
+        publisher's storage.
+        """
+
+        identities = {(key, op_id) for key, op_id in releases}
+        publications_by_buffer = tuple(
+            buffer
+            for buffer in self._publications
+            if (buffer.owner, buffer.producer_op_id) in identities
+        )
+        for buffer in publications_by_buffer:
+            del self._publications[buffer]
+        return publications_by_buffer
+
+    def drop(self, request_id: int) -> None:
+        """Discard semantic KV state while execution retires the request's registrations."""
+
+        selected = tuple(
+            buffer
+            for buffer in self._publications
+            if int(buffer.owner.request_id) == int(request_id)
+        )
+        for buffer in selected:
+            del self._publications[buffer]
+        for table in (self._destination_bases, self._installed_bases):
+            for key in tuple(key for key in table if int(key[0].request_id) == int(request_id)):
+                del table[key]

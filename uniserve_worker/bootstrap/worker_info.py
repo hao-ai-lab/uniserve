@@ -7,17 +7,17 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from uniserve_worker.execution.batch import (
+from uniserve_worker.nn.parallel import ComponentConfig
+from uniserve_worker.protocol.batch import (
     VIDEO_STAGES,
     Computation,
     ForwardMode,
     PipelineStage,
     computation,
 )
-from uniserve_worker.nn.parallel import ComponentConfig
 
-from ..execution.batch import TensorSpec, WorkerEndpoint
 from ..foundation.errors import invalid_descriptor, unsupported_setup
+from ..protocol.batch import TensorSpec, WorkerEndpoint
 
 
 class RequestKind(StrEnum):

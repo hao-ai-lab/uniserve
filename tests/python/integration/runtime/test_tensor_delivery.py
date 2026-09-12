@@ -10,7 +10,8 @@ import threading
 import pytest
 import torch
 
-from uniserve_worker.execution.batch import (
+from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.protocol.batch import (
     BufferAllocation,
     ComputationId,
     DeviceDim,
@@ -22,10 +23,9 @@ from uniserve_worker.execution.batch import (
     TensorTransfer,
     WorkerEndpoint,
 )
-from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.runtime.device_events import DeviceEventPool
-from uniserve_worker.runtime.device_products import DeviceProducts
-from uniserve_worker.runtime.persistent_buffers import PersistentBuffers
+from uniserve_worker.runtime.buffer_pool import BufferPool
+from uniserve_worker.runtime.device_events import EventPool
+from uniserve_worker.runtime.tensor_store import FeatureMetadata, TensorStore
 from uniserve_worker.transfer.layout import TensorRegion, fetch_tensor
 from uniserve_worker.transfer.tickets import make_transport, make_transports
 
@@ -55,7 +55,7 @@ def _consume(tickets) -> None:
 def test_tensor_resharding_preserves_values_and_destination_bounds(
     backend: str, device: str, shard_axis: int
 ) -> None:
-    events = [DeviceEventPool() for _ in range(3)]
+    events = [EventPool() for _ in range(3)]
     endpoints = [WorkerEndpoint.local("encoder", rank=rank) for rank in range(2)]
     producers = [
         make_transport(
@@ -86,11 +86,11 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
         shape_bound=ShapeBound((StaticDim(6), StaticDim(8))),
     )
     arenas = [
-        PersistentBuffers(byte_capacity=piece.numel() * piece.element_size(), devices=(device,))
+        BufferPool(byte_capacity=piece.numel() * piece.element_size(), devices=(device,))
         for piece in pieces
     ]
     stores = [
-        DeviceProducts(capacity=1, byte_capacity=16, persistent_buffers=arena, event_pool=event)
+        TensorStore(capacity=1, byte_capacity=16, buffer_pool=arena, event_pool=event)
         for arena, event in zip(arenas, events[:2], strict=True)
     ]
     locations = []
@@ -144,7 +144,7 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
 
 
 def test_missing_coverage_is_rejected_before_destination_writes() -> None:
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport("local", byte_capacity=16384, ticket_capacity=2, event_pool=events)
     source = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     location = transport.publish(source)
@@ -163,7 +163,7 @@ def test_missing_coverage_is_rejected_before_destination_writes() -> None:
 
 
 def test_shard_reads_reject_aliasing_destination_pages_before_writing() -> None:
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport("local", byte_capacity=16384, ticket_capacity=2, event_pool=events)
     source = torch.arange(24, dtype=torch.float32).reshape(6, 4)
     locations = (transport.publish(source[:3]), transport.publish(source[3:], offset=(3, 0)))
@@ -183,7 +183,7 @@ def test_shard_reads_reject_aliasing_destination_pages_before_writing() -> None:
 
 
 def test_explicit_replica_binding_can_use_an_independent_live_publication() -> None:
-    events = DeviceEventPool()
+    events = EventPool()
     first = make_transport(
         "shm",
         byte_capacity=16384,
@@ -218,7 +218,7 @@ def test_explicit_replica_binding_can_use_an_independent_live_publication() -> N
 
 
 def test_shm_cuda_region_fits_its_reserved_device_allocation() -> None:
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport("shm", byte_capacity=16384, ticket_capacity=2, event_pool=events)
     source = torch.arange(24, dtype=torch.float32).reshape(4, 6)
     location = transport.publish(source)
@@ -245,7 +245,7 @@ def test_shm_cuda_region_fits_its_reserved_device_allocation() -> None:
 
 
 def _receive_tensor_shards(channel, backends: tuple[str, ...]) -> None:
-    events = DeviceEventPool()
+    events = EventPool()
     consumers = make_transports(backends, byte_capacity=16384, ticket_capacity=4, event_pool=events)
     try:
         tensor = TensorTransfer.from_mapping(channel.recv())
@@ -275,7 +275,7 @@ def test_tensor_delivery_gathers_shards_across_processes(
 ) -> None:
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
-    events = DeviceEventPool()
+    events = EventPool()
     producers = make_transports(backends, byte_capacity=16384, ticket_capacity=4, event_pool=events)
     source = torch.arange(48, dtype=torch.float32, device="cuda:0").reshape(6, 8)
     order = (4, 1, 5, 2, 0, 3) if fragmented else tuple(range(6))
@@ -313,7 +313,7 @@ def test_tensor_delivery_gathers_shards_across_processes(
 
 
 def test_backends_share_the_rank_byte_budget_until_publications_retire() -> None:
-    events = DeviceEventPool()
+    events = EventPool()
     transports = make_transports(
         ("local", "shm"), byte_capacity=64, ticket_capacity=2, event_pool=events
     )
@@ -337,7 +337,7 @@ def test_backends_share_the_rank_byte_budget_until_publications_retire() -> None
 
 
 def test_read_ticket_capacity_is_shared_across_backends() -> None:
-    events = DeviceEventPool()
+    events = EventPool()
     transports = make_transports(
         ("local", "shm"), byte_capacity=1024, ticket_capacity=1, event_pool=events
     )
@@ -375,7 +375,7 @@ def test_read_ticket_capacity_is_shared_across_backends() -> None:
     ),
 )
 def test_fragmented_layer_pages_use_one_read_into_reserved_pages(backend: str, device: str) -> None:
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport(backend, byte_capacity=32768, ticket_capacity=1, event_pool=events)
     source = torch.arange(3 * 7 * 4 * 2 * 3, dtype=torch.float32, device=device).reshape(
         3, 7, 4, 2, 3
@@ -422,10 +422,11 @@ def test_fragmented_layer_pages_use_one_read_into_reserved_pages(backend: str, d
 )
 @pytest.mark.parametrize("shard_axis", (0, 1))
 @torch.inference_mode()
+@pytest.mark.parametrize("feature", (False, True))
 def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
-    backend: str, device: str, shard_axis: int
+    backend: str, device: str, shard_axis: int, feature: bool
 ) -> None:
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport(
         backend,
         byte_capacity=4096,
@@ -446,23 +447,31 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
         ShapeBound((DeviceDim(12), StaticDim(8))),
     )
     allocation = BufferAllocation(reference.buffer_id, 0, reference.max_bytes)
-    arena = PersistentBuffers(byte_capacity=reference.max_bytes, devices=(device,))
-    store = DeviceProducts(
-        capacity=1, byte_capacity=16, persistent_buffers=arena, event_pool=events
+    arena = BufferPool(byte_capacity=reference.max_bytes, devices=(device,))
+    store = TensorStore(
+        capacity=1,
+        byte_capacity=16,
+        entry_capacity=1,
+        max_entry_bytes=reference.max_bytes,
+        devices=(device,),
+        buffer_pool=arena,
+        event_pool=events,
     )
+    metadata = FeatureMetadata(6, 8) if feature else None
+    reserve = store.reserve_features if feature else store.bind_outputs
     location = transport.publish(peer)
     # The descriptor supplies only the missing half: successfully consuming the
     # whole value therefore requires preserving the resident region.
     representation = TensorTransfer(shape=(6, 8), locations=(location,))
     imports = []
     try:
-        write = store.bind_outputs(
+        write = reserve(
             ((reference, device),),
             buffer_allocations={reference.buffer_id: allocation},
             regions={reference: region},
             shapes={reference: (6, 8)},
         )[0]
-        store.publish_write(write, resident)
+        store.publish_write(write, resident, metadata=metadata)
         store.commit_writes((write,))
         earlier = store.consume(reference, consumer_op_id=ComputationId(2, 0), device=device)
         for _ in range(2):
@@ -472,14 +481,16 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
                     representation,
                     device=device,
                     bindings={(location.source, backend): transport},
+                    metadata=metadata,
                     request_slots={},
                     buffer_allocations={reference.buffer_id: allocation},
                 )
             )
-        imports[0].close()
-        _consume(imports[1].tickets)
-        imports[1].commit()
-        imports[1].close()
+        store.complete_reads((imports[0],))
+        assert imports[1].imported is not None
+        _consume(imports[1].imported.tickets)
+        store.complete_import(imports[1])
+        store.complete_reads((imports[1],))
         complete = store.consume(reference, consumer_op_id=ComputationId(3, 0), device=device)
         assert earlier.region == region and complete.region is None
         torch.testing.assert_close(earlier.tensor, resident, rtol=0, atol=0)
@@ -491,18 +502,19 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
             representation,
             device=device,
             bindings={},
+            metadata=metadata,
             request_slots={},
             buffer_allocations={reference.buffer_id: allocation},
         )
         imports.append(repeated)
-        repeated.commit()
+        store.complete_import(repeated)
         torch.testing.assert_close(repeated.tensor, expected, rtol=0, atol=0)
-        repeated.close()
+        store.complete_reads((repeated,))
         store.release_requests((reference.request_key,))
         assert not store.retirement_ready(
             buffers=frozenset(), requests=frozenset((reference.request_key,))
         )
-        store.record_readers((earlier, complete))
+        store.complete_reads((earlier, complete))
         if device.startswith("cuda"):
             torch.cuda.synchronize(device)
         events.reap()
@@ -511,7 +523,7 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
         )
     finally:
         for imported in imports:
-            imported.close()
+            store.complete_reads((imported,))
         transport.release(location)
         transport.close()
         store.close()
@@ -530,8 +542,8 @@ def test_full_region_publishes_complete_bounded_tensor() -> None:
         ShapeBound((DeviceDim(12), StaticDim(8))),
     )
     allocation = BufferAllocation(reference.buffer_id, 0, reference.max_bytes)
-    arena = PersistentBuffers(byte_capacity=reference.max_bytes, devices=("cpu",))
-    store = DeviceProducts(capacity=1, byte_capacity=16, persistent_buffers=arena)
+    arena = BufferPool(byte_capacity=reference.max_bytes, devices=("cpu",))
+    store = TensorStore(capacity=1, byte_capacity=16, buffer_pool=arena)
     try:
         (write,) = store.bind_outputs(
             ((reference, "cpu"),),
@@ -544,14 +556,14 @@ def test_full_region_publishes_complete_bounded_tensor() -> None:
         read = store.consume(reference, consumer_op_id=ComputationId(2, 0), device="cpu")
         assert read.region is None
         torch.testing.assert_close(read.tensor, expected, rtol=0, atol=0)
-        store.record_readers((read,))
+        store.complete_reads((read,))
     finally:
         store.close()
         arena.close()
 
 
 def test_shm_allocation_failure_preserves_publication_capacity(monkeypatch) -> None:
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport("shm", byte_capacity=16, ticket_capacity=1, event_pool=events)
     consumer = make_transport("shm", byte_capacity=16, ticket_capacity=1, event_pool=events)
     source = torch.arange(4, dtype=torch.float32)
@@ -575,5 +587,39 @@ def test_shm_allocation_failure_preserves_publication_capacity(monkeypatch) -> N
         if locator is not None:
             transport.release(locator)
         consumer.close()
+        transport.close()
+        events.close()
+
+
+@pytest.mark.parametrize("backend", ("shm", "cuda_ipc"))
+def test_transfer_orders_destination_writes_before_its_copy(backend: str) -> None:
+    events = EventPool()
+    transport = make_transport(backend, byte_capacity=4096, ticket_capacity=1, event_pool=events)
+    source = torch.arange(12, dtype=torch.float32, device="cpu" if backend == "shm" else "cuda:0")
+    locator = transport.publish(source)
+    destination = torch.empty(12, device="cuda:0")
+    initializer = torch.cuda.Stream(device=0)
+    tickets = ()
+    try:
+        with torch.cuda.stream(initializer):
+            # The destination belongs to this stream until fetch hands it to the
+            # transport. Delaying its initialization exposes a missing handoff.
+            torch.cuda._sleep(1_000_000_000)
+            destination.fill_(-1)
+            tickets = fetch_tensor(
+                TensorTransfer(shape=(12,), locations=(locator,)),
+                destination,
+                bindings={(locator.source, backend): transport},
+            )
+            _consume(tickets)
+        initializer.synchronize()
+        torch.testing.assert_close(
+            destination.cpu(), torch.arange(12, dtype=torch.float32), rtol=0, atol=0
+        )
+    finally:
+        initializer.synchronize()
+        for ticket in tickets:
+            ticket.close()
+        transport.release(locator)
         transport.close()
         events.close()

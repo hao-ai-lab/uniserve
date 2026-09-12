@@ -5,10 +5,16 @@ import threading
 import pytest
 import torch
 
+from tests.python.fixtures.depth_one import finalized_report
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.bootstrap.worker_info import WorkerInfo
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.batch import (
+from uniserve_worker.execution.model_runner import ModelRunner
+from uniserve_worker.foundation.errors import ComputeError, InputError
+from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry
+from uniserve_worker.models.stub import StubModel
+from uniserve_worker.nn.parallel import ComponentConfig
+from uniserve_worker.protocol.batch import (
     Bounds,
     BufferAllocation,
     ComputationId,
@@ -19,7 +25,7 @@ from uniserve_worker.execution.batch import (
     OpStatus,
     PipelineStage,
     RequestKey,
-    Run,
+    ScheduleBatch,
     ScheduledRequest,
     ShapeBound,
     Start,
@@ -29,12 +35,6 @@ from uniserve_worker.execution.batch import (
     TensorSpec,
     TransferMode,
 )
-from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.execution.output import finalize_run_result
-from uniserve_worker.foundation.errors import ComputeError, InputError
-from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry
-from uniserve_worker.models.stub import StubModel
-from uniserve_worker.nn.parallel import ComponentConfig
 from uniserve_worker.transfer.layout import fetch_tensor
 
 pytestmark = pytest.mark.integration
@@ -79,13 +79,13 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
         bounds=Bounds(),
         outputs=(reference,),
     )
-    run = Run(
+    run = ScheduleBatch(
         batch_id=1,
         run_id=1,
         operations=(operation,),
         commands=(
             Start(
-                NewRequest.create(
+                NewRequest(
                     key,
                     request_pool_idx=1,
                     diffusion=DiffusionSamplingParams(22, 3, 4, 1000),
@@ -99,12 +99,12 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
         if separate_start:
             from dataclasses import replace
 
-            started = finalize_run_result(
-                worker.execute(Run(batch_id=2, run_id=2, commands=run.commands))
+            started = finalized_report(
+                worker, worker.submit(ScheduleBatch(batch_id=2, run_id=2, commands=run.commands))
             )
             assert started.done and not started.completions
             run = replace(run, commands=())
-        report = finalize_run_result(worker.execute(run))
+        report = finalized_report(worker, worker.submit(run))
         (completion,) = report.completions
         assert completion.status is OpStatus.OK
         assert completion.op_id == operation.op_id
@@ -142,8 +142,8 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
             inputs=(reference,),
             outputs=(copied,),
         )
-        prepared = worker.prepare_execute(
-            Run(
+        prepared = worker.submit(
+            ScheduleBatch(
                 batch_id=2,
                 run_id=3,
                 collective_seq=3,
@@ -158,7 +158,8 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
         ready = threading.Event()
         prepared.on_dependencies_ready(ready.set)
         assert ready.wait(5)
-        result = finalize_run_result(worker.execute_prepared(prepared))
+        prepared = finalized_report(worker, prepared)
+        result = prepared
         assert result.completions[0].status is OpStatus.OK
         copied_value = result.products[0].value.tensor
         tickets = fetch_tensor(
@@ -205,8 +206,9 @@ def test_text_entry_stages_successive_bounded_inputs(device):
         for prompt in prompts:
             result = runner.run_entry("text_encoder", runner.stage_text_tokens(prompt))
             outputs.append(result.values[0])
-            assert result.observation.route == "text_encoder"
-            assert result.observation.row_count == 1
+            assert result.stats is not None
+            assert result.stats.mode_counts == {"text_encoder": 1}
+            assert result.stats.mode_tokens == {"text_encoder": 1}
         for prompt, output in zip(prompts, outputs, strict=True):
             expected = torch.tensor(prompt).reshape(1, -1, 1) * 4 + torch.arange(4)
             torch.testing.assert_close(output.cpu(), expected.float(), atol=0, rtol=0)

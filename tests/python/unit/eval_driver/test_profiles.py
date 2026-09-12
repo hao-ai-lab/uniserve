@@ -12,7 +12,7 @@ from uniserve_eval.config import ROOT, load_config
 pytestmark = pytest.mark.unit
 
 
-def test_decode_runtime_suite_resolves_to_four_explicit_points() -> None:
+def test_runtime_suites_cover_declared_workloads() -> None:
     config = load_config()
     points = config.selected_points("decode-runtime")
     assert tuple(point.name for point in points) == (
@@ -20,12 +20,26 @@ def test_decode_runtime_suite_resolves_to_four_explicit_points() -> None:
         "sensenova-uniserve-i2t-c32",
         "sensenova-uniserve-t2i-c32",
         "sensenova-uniserve-interleave-c4",
+        "bagel-uniserve-sharegpt-r16",
+        "bagel-uniserve-i2t-c32",
+        "bagel-uniserve-t2i-c32",
     )
-    assert tuple((metric.name, metric.direction) for metric in points[-1].metrics) == (
+    assert tuple((metric.name, metric.direction) for metric in points[3].metrics) == (
         ("mean_ttft_ms", "lower"),
         ("mean_tpot_ms", "lower"),
         ("image_latency_ms.mean", "lower"),
     )
+
+    video_points = config.selected_points("fast_h3")
+    assert tuple(point.name for point in video_points) == (
+        "minimax-h3-5s-1k",
+        "minimax-h3-5s-10k",
+        "minimax-h3-15s-1k",
+        "minimax-h3-15s-10k",
+    )
+    formal_points = points + video_points
+    assert sum(point.load.num_prompts for point in formal_points) == 572
+    assert all(point.load.warmup_requests == 1 for point in formal_points)
 
 
 def test_serving_runtime_suite_exposes_stream_and_image_latency_metrics() -> None:

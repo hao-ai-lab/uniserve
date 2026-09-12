@@ -86,7 +86,7 @@ class VisionSelfAttention(nn.Module):
             max_seqlen_k=max_seqlen,
             causal=False,
             scale=self.scale,
-            ctx=context,
+            ctx=context.attention,
         )
         provider = self.attn.varlen_provider
         if provider is not None and ops.can_run_attention(varlen, provider=provider):

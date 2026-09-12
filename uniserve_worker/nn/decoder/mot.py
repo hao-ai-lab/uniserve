@@ -294,7 +294,7 @@ class MoTDecoderLayer(nn.Module):
             project,
             self.attention,
             finish,
-            context=context,
+            context=context.attention,
             partition=partition,
             causal=causal,
             scale=self.scale,
@@ -364,10 +364,13 @@ class MoTModel(nn.Module):
         if inputs_embeds is not None:
             token_count = int(inputs_embeds.shape[0])
         elif (
-            context.attention_mode is AttentionMode.PACKED and context.attention_indexes is not None
+            context.attention.attention_mode is AttentionMode.PACKED
+            and context.attention.attention_indexes is not None
         ):
-            token_count = int(context.attention_indexes.shape[1])
-        elif context.attention_mode is AttentionMode.PAGED_DECODE and positions is not None:
+            token_count = int(context.attention.attention_indexes.shape[1])
+        elif (
+            context.attention.attention_mode is AttentionMode.PAGED_DECODE and positions is not None
+        ):
             token_count = positions.numel()
         else:
             raise ValueError("pipeline input requires packed or decode row geometry")
@@ -387,14 +390,14 @@ class MoTModel(nn.Module):
         spans: tuple[RouteSpan, ...]
         temporal_positions: torch.Tensor
         causal: bool
-        if context.attention_mode is AttentionMode.PACKED:
-            indexes = context.attention_indexes
+        if context.attention.attention_mode is AttentionMode.PACKED:
+            indexes = context.attention.attention_indexes
             if indexes is None or indexes.ndim != 2 or int(indexes.shape[1]) != token_count:
                 raise ValueError("MoT positions must align with input tokens")
-            spans = context.route_spans
+            spans = context.attention.route_spans
             temporal_positions = indexes[0].reshape(-1)
             causal = False
-        elif context.attention_mode is AttentionMode.PAGED_DECODE:
+        elif context.attention.attention_mode is AttentionMode.PAGED_DECODE:
             if positions is None or tuple(positions.shape) != (token_count,):
                 raise ValueError("MoT paged decode positions must align with text tokens")
             spans = (RouteSpan(ExpertRoute.TEXT, 0, token_count),)

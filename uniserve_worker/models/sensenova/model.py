@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 import torch.nn as nn
 
-from uniserve_worker.execution.batch import ForwardMode, PipelineStage, TransferMode
+from uniserve_worker.protocol.batch import ForwardMode, PipelineStage, TransferMode
 
 from ...execution.device_transfer import call_on_device, tensor_to_device
 from ...execution.forward_batch import (
@@ -527,7 +527,7 @@ class _SenseLayer(nn.Module):
             project,
             self.self_attn.attention,
             finish,
-            context=context,
+            context=context.attention,
             partition=partition,
             causal=causal,
             scale=self.self_attn.scaling,
@@ -602,10 +602,13 @@ class _SenseDecoder(nn.Module):
         if inputs is not None:
             token_count = int(inputs.shape[0])
         elif (
-            context.attention_mode is AttentionMode.PACKED and context.attention_indexes is not None
+            context.attention.attention_mode is AttentionMode.PACKED
+            and context.attention.attention_indexes is not None
         ):
-            token_count = int(context.attention_indexes.shape[1])
-        elif context.attention_mode is AttentionMode.PAGED_DECODE and positions is not None:
+            token_count = int(context.attention.attention_indexes.shape[1])
+        elif (
+            context.attention.attention_mode is AttentionMode.PAGED_DECODE and positions is not None
+        ):
             token_count = positions.numel()
         else:
             raise ValueError("pipeline input requires packed or decode row geometry")
@@ -622,16 +625,18 @@ class _SenseDecoder(nn.Module):
         spans: tuple[RouteSpan, ...]
         indexes: torch.Tensor
         causal: bool
-        if context.attention_mode is AttentionMode.PACKED:
-            if context.attention_indexes is None or tuple(context.attention_indexes.shape) != (
+        if context.attention.attention_mode is AttentionMode.PACKED:
+            if context.attention.attention_indexes is None or tuple(
+                context.attention.attention_indexes.shape
+            ) != (
                 3,
                 token_count,
             ):
                 raise ValueError("SenseNova positions must have shape [3, tokens]")
-            spans = context.route_spans
-            indexes = context.attention_indexes
+            spans = context.attention.route_spans
+            indexes = context.attention.attention_indexes
             causal = False
-        elif context.attention_mode is AttentionMode.PAGED_DECODE:
+        elif context.attention.attention_mode is AttentionMode.PAGED_DECODE:
             if positions is None or tuple(positions.shape) != (token_count,):
                 raise ValueError("SenseNova paged decode positions must align with text tokens")
             spans = (RouteSpan(ExpertRoute.TEXT, 0, token_count),)
@@ -1060,7 +1065,7 @@ class NEOChatModel(ExecutionModel):
         """Interleave text and flow embeddings in row order and run the routed decoder."""
 
         decode_positions: torch.Tensor | None = None
-        if batch.attention_mode is AttentionMode.PAGED_DECODE:
+        if batch.attention.attention_mode is AttentionMode.PAGED_DECODE:
             if batch.flow_row_indices:
                 raise TypeError("SenseNova paged decode accepts token rows only")
             decode_positions = positions
@@ -1084,7 +1089,7 @@ class NEOChatModel(ExecutionModel):
         token_offset = 0
         for row_index, count in zip(
             batch.token_row_indices,
-            tuple(batch.query_lens_cpu[index] for index in batch.token_row_indices),
+            tuple(batch.attention.query_lens_cpu[index] for index in batch.token_row_indices),
             strict=True,
         ):
             chunks[row_index] = token_embeds[token_offset : token_offset + count]

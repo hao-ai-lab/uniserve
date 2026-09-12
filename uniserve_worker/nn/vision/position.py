@@ -7,11 +7,11 @@ import torch
 import torch.nn as nn
 
 __all__ = [
-    'get_1d_sincos_pos_embed_from_grid',
-    'get_2d_sincos_pos_embed_from_grid',
-    'get_2d_sincos_pos_embed',
-    'get_flattened_position_ids_extrapolate',
-    'PositionEmbedding',
+    "get_1d_sincos_pos_embed_from_grid",
+    "get_2d_sincos_pos_embed_from_grid",
+    "get_2d_sincos_pos_embed",
+    "get_flattened_position_ids_extrapolate",
+    "PositionEmbedding",
 ]
 
 

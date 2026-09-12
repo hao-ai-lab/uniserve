@@ -7,6 +7,10 @@ import torch
 import torch.multiprocessing as mp
 from safetensors.torch import save_file
 
+from uniserve_worker.bootstrap.distributed import (
+    initialize_model_parallel,
+    initialize_process_groups,
+)
 from uniserve_worker.loader.handles import SafetensorFileWeightHandle
 from uniserve_worker.loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
 from uniserve_worker.nn.layer import LayerConfig
@@ -22,10 +26,6 @@ from uniserve_worker.nn.quant import (
     DynamicW8A8Fp8LinearMethod,
 )
 from uniserve_worker.nn.quant.config import QuantizationConfig
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -45,7 +45,7 @@ def _load(module, path, name, shape, shard=None):
 
 def _run(rank, rendezvous, checkpoint):
     device = f"cuda:{rank}"
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=4,
@@ -215,7 +215,7 @@ def _run_sequence_scale(rank, rendezvous):
     from uniserve_worker.nn.quant.nvfp4 import DynamicW4A4NvFp4LinearMethod
 
     device = torch.device("cuda", rank)
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=4,

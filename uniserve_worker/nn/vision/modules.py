@@ -8,8 +8,8 @@ import torch.nn as nn
 from ..activation import get_act_fn
 
 __all__ = [
-    'PatchEmbed',
-    'MLPConnector',
+    "PatchEmbed",
+    "MLPConnector",
 ]
 
 
@@ -30,7 +30,9 @@ class PatchEmbed(nn.Module):
         super().__init__()
         self.patch_size = patch_size
         self.flatten = flatten
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size, bias=bias)
+        self.proj = nn.Conv2d(
+            in_channels, embed_dim, kernel_size=patch_size, stride=patch_size, bias=bias
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Project image patches and optionally flatten their spatial grid into token rows."""
@@ -44,7 +46,9 @@ class PatchEmbed(nn.Module):
 class MLPConnector(nn.Module):
     """ViT-to-language connector (fc1 + activation + fc2)."""
 
-    def __init__(self, input_dim: int, output_dim: int, activation: str = "gelu_pytorch_tanh") -> None:
+    def __init__(
+        self, input_dim: int, output_dim: int, activation: str = "gelu_pytorch_tanh"
+    ) -> None:
         """Build a two-layer projection from vision features to language width."""
 
         super().__init__()

@@ -13,15 +13,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ..execution.batch import BufferId, KvTransfer, RequestKey, TensorTransfer
 from ..foundation.errors import invalid_descriptor, resource_error
 from ..nn.quant.kv_cache import FP8_MAX, SCALE_EPS
+from ..protocol.batch import BufferId, KvTransfer, RequestKey, TensorTransfer
 from ..transfer.layout import TensorRegion, fetch_tensor
 from ..transfer.tickets import TransferTicket, Transport
 from .cpu import CpuPool
 
 if TYPE_CHECKING:
-    from .cache_pool import CachePool
+    from .kv_cache import KVCache
 
 
 def cache_transfer_workspace_bytes(
@@ -42,7 +42,7 @@ def cache_transfer_workspace_bytes(
 
 
 @dataclass(slots=True)
-class CacheWrite:
+class CacheImport:
     """A scheduler-owned KV destination retained through physical input access."""
 
     buffer: BufferId
@@ -57,13 +57,13 @@ class CacheWrite:
     cancelled: bool = False
     released: bool = False
     _tickets: set[TransferTicket] = field(default_factory=set, repr=False)
-    _workspace: CacheTransferWorkspace | None = field(default=None, repr=False)
+    _workspace: TransferBuffer | None = field(default=None, repr=False)
     _work_finished: bool = field(default=False, repr=False)
     _stream_finished: bool = field(default=False, repr=False)
 
 
 @dataclass(slots=True)
-class CacheTransferWorkspace:
+class TransferBuffer:
     """One physical import worker's fixed page buffers and device stream."""
 
     raw: torch.Tensor
@@ -73,10 +73,10 @@ class CacheTransferWorkspace:
     stream: torch.cuda.Stream | None
 
 
-class CacheTransfers:
+class CacheImports:
     """Own bounded import execution, destination leases and conversion storage."""
 
-    def __init__(self, pool: CachePool, *, capacity: int) -> None:
+    def __init__(self, pool: KVCache, *, capacity: int) -> None:
         self.pool = pool
         workers = min(4, int(capacity))
         self._tasks = CpuPool(capacity=capacity, workers=workers)
@@ -84,7 +84,7 @@ class CacheTransfers:
         elements = pool.block_size * pool.num_layers * pool.n_kv * pool.head_dim
         device = pool.k.device
         self._available = deque(
-            CacheTransferWorkspace(
+            TransferBuffer(
                 raw=torch.empty((2, elements * 8), dtype=torch.uint8, device=device),
                 values=torch.empty(shape, dtype=torch.float32, device=device),
                 scales=torch.empty(
@@ -97,7 +97,7 @@ class CacheTransfers:
             )
             for _ in range(workers)
         )
-        self._writes: dict[BufferId, CacheWrite] = {}
+        self._writes: dict[BufferId, CacheImport] = {}
         self._condition = Condition()
         self._closed = False
         self._wake: Callable[[], None] | None = None
@@ -132,7 +132,7 @@ class CacheTransfers:
         pages: tuple[int, ...],
         initialized_pages: tuple[int, ...],
         transports: Mapping[str, Transport],
-    ) -> CacheWrite:
+    ) -> CacheImport:
         """Reserve exact destination ranges before any host or device read starts."""
 
         suffix = publication.published_extent - publication.base_extent
@@ -144,7 +144,7 @@ class CacheTransfers:
         for page, (offset, count) in ranges.items():
             self.pool.require_reusable((page,), group=group, start=offset, length=count)
         reservation = self._tasks.reserve() if publication.tensors or initialized_pages else None
-        write = CacheWrite(
+        write = CacheImport(
             buffer, request_pool_idx, group, pages, initialized_pages, publication, ranges
         )
         try:
@@ -166,11 +166,11 @@ class CacheTransfers:
             raise
         return write
 
-    def owns(self, write: CacheWrite) -> bool:
+    def owns(self, write: CacheImport) -> bool:
         with self._condition:
             return self._writes.get(write.buffer) is write
 
-    def adopt(self, write: CacheWrite) -> None:
+    def adopt(self, write: CacheImport) -> None:
         """Hand a completed import to resident cache ownership."""
 
         if not write.completion.done():
@@ -182,7 +182,7 @@ class CacheTransfers:
             write.released = True
             self._reclaim(write)
 
-    def abandon(self, write: CacheWrite) -> None:
+    def abandon(self, write: CacheImport) -> None:
         """Revoke consumption while preserving every started physical access."""
 
         with self._condition:
@@ -234,7 +234,7 @@ class CacheTransfers:
             if self._writes:
                 raise resource_error("KV imports still own physical storage")
 
-    def _acquire(self, write: CacheWrite) -> CacheTransferWorkspace:
+    def _acquire(self, write: CacheImport) -> TransferBuffer:
         with self._condition:
             while not self._available:
                 self._require_active(write)
@@ -244,23 +244,23 @@ class CacheTransfers:
             write._workspace = workspace
             return workspace
 
-    def _require_active(self, write: CacheWrite) -> None:
+    def _require_active(self, write: CacheImport) -> None:
         if self._closed or write.cancelled:
             raise resource_error("KV import was cancelled")
 
-    def _retain(self, write: CacheWrite, ticket: TransferTicket) -> None:
+    def _retain(self, write: CacheImport, ticket: TransferTicket) -> None:
         with self._condition:
             write._tickets.add(ticket)
             ticket.add_retirement_callback(partial(self._read_retired, write, ticket))
             if write.cancelled:
                 ticket.cancel()
 
-    def _read_retired(self, write: CacheWrite, ticket: TransferTicket) -> None:
+    def _read_retired(self, write: CacheImport, ticket: TransferTicket) -> None:
         with self._condition:
             write._tickets.discard(ticket)
             self._reclaim(write)
 
-    def _reclaim(self, write: CacheWrite) -> None:
+    def _reclaim(self, write: CacheImport) -> None:
         # A failed or cancelled task can finish before its transport access.
         # Its workspace and cache pages remain unavailable until both retire.
         if not write._work_finished or not write._stream_finished or write._tickets:
@@ -277,7 +277,7 @@ class CacheTransfers:
 
     def _fetch(
         self,
-        write: CacheWrite,
+        write: CacheImport,
         tensor: TensorTransfer,
         destination: torch.Tensor | tuple[torch.Tensor, ...],
         transports: Mapping[str, Transport],
@@ -298,14 +298,14 @@ class CacheTransfers:
         )
 
     @staticmethod
-    def _consume(tickets: tuple[TransferTicket, ...], workspace: CacheTransferWorkspace) -> None:
+    def _consume(tickets: tuple[TransferTicket, ...], workspace: TransferBuffer) -> None:
         for ticket in tickets:
             ready = Event()
             ticket.add_done_callback(ready.set)
             ready.wait()
             ticket.result(workspace.stream)
 
-    def _copy(self, write: CacheWrite, transports: Mapping[str, Transport]) -> None:
+    def _copy(self, write: CacheImport, transports: Mapping[str, Transport]) -> None:
         workspace = None
         stream_finished = True
         try:
@@ -360,9 +360,9 @@ class CacheTransfers:
 
     def _copy_direct(
         self,
-        write: CacheWrite,
+        write: CacheImport,
         transports: Mapping[str, Transport],
-        workspace: CacheTransferWorkspace,
+        workspace: TransferBuffer,
     ) -> None:
         publication = write.publication
         suffix = publication.published_extent - publication.base_extent
@@ -396,9 +396,9 @@ class CacheTransfers:
 
     def _copy_converted(
         self,
-        write: CacheWrite,
+        write: CacheImport,
         transports: Mapping[str, Transport],
-        workspace: CacheTransferWorkspace,
+        workspace: TransferBuffer,
     ) -> None:
         publication = write.publication
         start = publication.base_extent
@@ -464,8 +464,8 @@ class CacheTransfers:
 
     def _convert_page(
         self,
-        write: CacheWrite,
-        workspace: CacheTransferWorkspace,
+        write: CacheImport,
+        workspace: TransferBuffer,
         source: torch.Tensor,
         *,
         field: int,

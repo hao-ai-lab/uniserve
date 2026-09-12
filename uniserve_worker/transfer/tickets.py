@@ -23,16 +23,16 @@ from enum import StrEnum
 from itertools import groupby, repeat
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from ..execution.batch import (
+from ..foundation.errors import invalid_descriptor, resource_error, unsupported_setup
+from ..foundation.shared_memory import allocate_shared_memory
+from ..protocol.batch import (
     CudaIpcTransfer,
     LocalTransfer,
     Locator,
     PosixShmTransfer,
     WorkerEndpoint,
 )
-from ..foundation.errors import invalid_descriptor, resource_error, unsupported_setup
-from ..runtime.device import allocate_shared_memory
-from ..runtime.device_events import DeviceEventPool
+from ..runtime.device_events import EventPool
 from .endpoint import PublicationEndpoint, finish_reader, open_reader
 from .layout import TensorRegion, region_view, validate_destination
 
@@ -228,7 +228,7 @@ class TransferTicket:
     physical source and mapping leases until its copy has actually completed.
     """
 
-    def __init__(self, event_pool: DeviceEventPool) -> None:
+    def __init__(self, event_pool: EventPool) -> None:
         self._events = event_pool
         self._event: torch.cuda.Event | None = None
         self._error: BaseException | None = None
@@ -239,6 +239,7 @@ class TransferTicket:
         self._work: concurrent.futures.Future[None] | None = None
         self._consumer_release: Any = None
         self._consumer_streams: dict[int, torch.cuda.Stream] = {}
+        self._destination_stream: torch.cuda.Stream | None = None
         self._consumer_events: tuple[torch.cuda.Event, ...] = ()
         self._closed = False
         self._future: concurrent.futures.Future[
@@ -484,7 +485,7 @@ class _BoundedTransferPool:
         workers: int,
         capacity: TransferCapacity,
         name: str,
-        event_pool: DeviceEventPool,
+        event_pool: EventPool,
     ) -> None:
         """Create a worker pool governed by shared byte and entry reservations."""
 
@@ -506,8 +507,16 @@ class _BoundedTransferPool:
 
         self._completion_wake = wake
 
-    def submit(self, operation: Any, *args: Any, nbytes: int) -> TransferTicket:
-        """Reserve capacity until the operation retires its physical read leases."""
+    def submit(
+        self,
+        operation: Any,
+        *args: Any,
+        nbytes: int,
+        destination: "torch.Tensor | tuple[torch.Tensor, ...] | None" = None,
+    ) -> TransferTicket:
+        """Reserve a physical read and retain the caller's destination stream."""
+
+        import torch
 
         with self._lock:
             if self._error is not None:
@@ -520,6 +529,10 @@ class _BoundedTransferPool:
             self._entries.release()
             raise
         ticket = TransferTicket(self._events)
+        if destination is not None:
+            first = destination[0] if isinstance(destination, tuple) else destination
+            if first.is_cuda:
+                ticket._destination_stream = torch.cuda.current_stream(first.device)
 
         def run() -> None:
             import torch
@@ -593,6 +606,12 @@ class _BoundedTransferPool:
         completed = None
         try:
             with torch.cuda.device(device), torch.cuda.stream(stream):
+                # The caller may still be initializing or consuming this backing.
+                # Establish its handoff before exposing copy readiness, so a later
+                # caller wait on our completion cannot create a dependency cycle.
+                if ticket._destination_stream is not None:
+                    stream.wait_stream(ticket._destination_stream)
+                    ticket._destination_stream = None
                 if producer is not None:
                     stream.wait_event(producer)
                 for target, value in pairs:
@@ -650,7 +669,7 @@ class LocalTransport(Transport):
         self,
         *,
         capacity: TransferCapacity,
-        event_pool: DeviceEventPool,
+        event_pool: EventPool,
         source: WorkerEndpoint | None = None,
     ) -> None:
         """Create a process-local tensor table with bounded retained bytes."""
@@ -782,7 +801,12 @@ class LocalTransport(Transport):
         try:
             if target is not None:
                 ticket = self._reads.submit(
-                    self._reads.copy, tensor, target, event, nbytes=locator.nbytes
+                    self._reads.copy,
+                    tensor,
+                    target,
+                    event,
+                    nbytes=locator.nbytes,
+                    destination=target,
                 )
                 ticket.add_retirement_callback(lambda: owner._release_reader(source))
                 return ticket
@@ -889,7 +913,7 @@ class ShmTransport(Transport):
         self,
         *,
         capacity: TransferCapacity,
-        event_pool: DeviceEventPool,
+        event_pool: EventPool,
         source: WorkerEndpoint | None = None,
     ) -> None:
         self._bytes = capacity
@@ -1139,7 +1163,13 @@ class ShmTransport(Transport):
             None if destination is None else _read_destination(locator, device, destination, region)
         )
         return self._reads.submit(
-            self._read_tensor, locator, device, target, region, nbytes=locator.nbytes
+            self._read_tensor,
+            locator,
+            device,
+            target,
+            region,
+            nbytes=locator.nbytes,
+            destination=target,
         )
 
     def release(self, locator: Locator) -> concurrent.futures.Future[None] | None:
@@ -1185,7 +1215,7 @@ class CudaIpcTransport(Transport):
         self,
         *,
         capacity: TransferCapacity,
-        event_pool: DeviceEventPool,
+        event_pool: EventPool,
         source: WorkerEndpoint | None = None,
     ) -> None:
         from uniserve_kernel.peer_memory import _extension
@@ -1333,7 +1363,7 @@ class CudaIpcTransport(Transport):
             None if destination is None else _read_destination(locator, device, destination, region)
         )
         return self._reads.submit(
-            self._read, locator, device, target, region, nbytes=locator.nbytes
+            self._read, locator, device, target, region, nbytes=locator.nbytes, destination=target
         )
 
     def _read(
@@ -1449,7 +1479,7 @@ def make_transport(
     *,
     byte_capacity: int,
     ticket_capacity: int,
-    event_pool: DeviceEventPool,
+    event_pool: EventPool,
     source: WorkerEndpoint | None = None,
 ) -> Transport:
     """Construct one bounded physical backend for a standalone endpoint."""
@@ -1468,7 +1498,7 @@ def make_transports(
     *,
     byte_capacity: int,
     ticket_capacity: int,
-    event_pool: DeviceEventPool,
+    event_pool: EventPool,
     source: WorkerEndpoint | None = None,
 ) -> dict[str, Transport]:
     """Construct explicitly configured backends against one rank resource budget."""

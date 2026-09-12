@@ -9,11 +9,11 @@ from typing import Generic, TypeVar
 
 import torch
 
-from ..execution.batch import DiffusionSamplingParams, MediaTrack
-from ..execution.bounded_storage import BoundedTensorStorage
 from ..execution.denoising import DenoisingStep
 from ..nn.diffusion.schedule import DiffusionSchedule
-from ..nn.parallel_attention import AttentionContextWorkspace
+from ..nn.parallel_attention import AttentionBuffers
+from ..protocol.batch import DiffusionSamplingParams, MediaTrack
+from ..runtime.tensor_buffers import TensorBuffers
 from .runtime import ExecutionModel
 
 
@@ -68,15 +68,15 @@ class VideoModel(ExecutionModel, Generic[MetadataT, TensorViewsT], ABC):
         self,
         geometry: DiffusionSamplingParams,
         num_prompt_tokens: int,
-        storage: BoundedTensorStorage,
-        context: AttentionContextWorkspace | None,
+        storage: TensorBuffers,
+        context: AttentionBuffers | None,
     ) -> MetadataT:
         """Materialize immutable mathematical metadata for the public shape cache."""
 
         raise NotImplementedError
 
     @abstractmethod
-    def request_tensors(self, storage: BoundedTensorStorage, metadata: MetadataT) -> TensorViewsT:
+    def request_tensors(self, storage: TensorBuffers, metadata: MetadataT) -> TensorViewsT:
         """Borrow immutable views for the declared geometry from public storage."""
 
         raise NotImplementedError

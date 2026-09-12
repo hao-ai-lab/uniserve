@@ -10,17 +10,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve_worker.execution import flow
 from uniserve_worker.execution import operations as operation_geometry
-from uniserve_worker.execution.batch import (
+from uniserve_worker.execution.output import PendingOutput
+from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.protocol.batch import (
     DeviceProductTransferValue,
-    DrawLayout,
     EncoderTransferValue,
-    FinishFlags,
     LatentTransferValue,
     Locator,
-    OpStatus,
-    PipelineStage,
     ScheduledRequest,
     TensorPublication,
     TensorRef,
@@ -28,214 +25,57 @@ from uniserve_worker.execution.batch import (
     TransferMode,
     TransferValue,
 )
-from uniserve_worker.execution.rows import LaneState, LatentExecution, OperationState, Outcome
-from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.runtime.cache_transfer import CacheWrite
-from uniserve_worker.runtime.device_products import (
-    DeviceProductMetadata,
-    ImageRange,
+from uniserve_worker.runtime.latent_pool import LatentExport
+from uniserve_worker.runtime.tensor_store import (
+    FeatureMetadata,
+    ImageMetadata,
     device_product_storage,
 )
-from uniserve_worker.runtime.encoder_cache import EncoderMetadata
-from uniserve_worker.runtime.latent_pool import LatentPublication, LatentSource, require_latent_pool
 from uniserve_worker.transfer.tickets import publish_tensor
 
+from .batch_state import BatchState
+
 if TYPE_CHECKING:
-    from uniserve_worker.bootstrap.worker_info import WorkerInfo
-    from uniserve_worker.config import WorkerConfig
     from uniserve_worker.execution.model_runner import ModelRunner
-    from uniserve_worker.runtime.cache_publications import CachePublications
-    from uniserve_worker.runtime.device_products import DeviceProducts
-    from uniserve_worker.runtime.encoder_cache import EncoderCache
+    from uniserve_worker.runtime.block_tables import BlockTables
+    from uniserve_worker.runtime.kv_cache import KVCache
     from uniserve_worker.runtime.latent_pool import LatentPool
-    from uniserve_worker.runtime.req_to_token_pool import ReqToTokenPool
+    from uniserve_worker.runtime.tensor_store import TensorStore
     from uniserve_worker.transfer.tickets import Transport
 
 
-def run_action(
-    state: OperationState,
+def execute(
+    operation: ScheduledRequest,
+    completion_group: int,
     *,
-    cache_registry: CachePublications | None,
-    device_products: DeviceProducts,
-    encoder_cache: EncoderCache,
-    worker_info: WorkerInfo,
+    state: BatchState,
+    kv_cache: KVCache | None,
+    tensor_store: TensorStore,
     latent_pool: LatentPool | None,
     publication_transports: Mapping[str, Transport],
-    request_tables: ReqToTokenPool | None,
+    request_tables: BlockTables | None,
     model_runner: ModelRunner,
-    config: WorkerConfig,
-) -> bool:
-    """Execute product transfer, KV publication, or KV installation without a model call."""
-
-    if state.phase != "initial":
-        return False
-    work = state.operation.kind
-    if work is PipelineStage.LATENT_PREPARATION and latent_pool is not None:
-        _prepare_media(
-            state,
-            cache_registry=cache_registry,
-            worker_info=worker_info,
-            latent_pool=latent_pool,
-            publication_transports=publication_transports,
-            request_tables=request_tables,
-            model_runner=model_runner,
-            config=config,
-        )
-        return True
-    if isinstance(work, TransferMode):
-        _transfer(
-            state,
-            cache_registry=cache_registry,
-            device_products=device_products,
-            encoder_cache=encoder_cache,
-            latent_pool=latent_pool,
-            publication_transports=publication_transports,
-            request_tables=request_tables,
-            model_runner=model_runner,
-        )
-        return True
-    return False
-
-
-def _prepare_media(
-    state: OperationState,
-    *,
-    cache_registry: CachePublications | None,
-    worker_info: WorkerInfo,
-    latent_pool: LatentPool | None,
-    publication_transports: Mapping[str, Transport],
-    request_tables: ReqToTokenPool | None,
-    model_runner: ModelRunner,
-    config: WorkerConfig,
-) -> None:
-    """Seed and publish the initial latent trajectory for one diffusion request."""
-
-    operation = state.operation
-    scope = state.lane
-    model_runner.generation()
-    request_id = operation.request_key.request_id
-
-    # Media preparation joins one visible conditioning publication to one new
-    # latent product; accepting any other arity would make ownership ambiguous.
-    conditioning = operation.kv_input
-    output = operation.latent_output
-    if conditioning is None or output is None:
-        raise invalid_descriptor(
-            "media preparation requires one exact conditioning input and latent output"
-        )
-    cache = operation_geometry.cache_coordinates(operation, scope, tables=request_tables)
-    request = operation_geometry.request_row(scope, request_id)
-    publications = cache_registry
-    if publications is None:
-        raise invalid_descriptor("media preparation requires KV publication storage")
-    publications.validate_conditioning(
-        operation.request_key,
-        conditioning,
-        request_pool_idx=request.request.request_pool_idx,
-        group_id=cache[1],
-        visible_length=cache[2],
-        publication=scope.cache_publication_inputs.get(conditioning),
-    )
-    image = request.request.image
-    if image is None:
-        raise invalid_descriptor("media preparation has no admitted image parameters")
-    if request.latent_product is not None or request.flow_step != 0:
-        raise invalid_descriptor("media preparation repeats an active latent trajectory")
-    rng = operation.rng
-    if rng is None or rng.draw_layout is not DrawLayout.FLOW_NOISE:
-        raise invalid_descriptor("media preparation requires semantic flow-noise RNG coordinates")
-    if int(rng.seed) != int(image.seed or 0):
-        raise invalid_descriptor("media preparation seed disagrees with admitted image seed")
-    if int(rng.semantic_index_base) < 1:
-        raise invalid_descriptor("flow-noise semantic image index must be positive")
-    if int(output.generation) < 1:
-        raise invalid_descriptor("media preparation latent has no logical generation")
-
-    # Noise is generated directly into request-owned staging, then installed in
-    # the pool before its generation becomes visible to downstream operations.
-    row = operation_geometry.latent_row(operation, scope)
-    pool = require_latent_pool(latent_pool)
-    row.staging.value.zero_()
-    initial = row.staging.value[: int(row.params.latent_units)]
-    flow.initial_latent(
-        operation, int(row.params.height), int(row.params.width), initial, model_runner=model_runner
-    )
-    pool.initialize(
-        row.request_pool_idx,
-        row.staging,
-        latent_units=int(row.params.latent_units),
-    )
-
-    # Publication is deferred with the lane commit so a failed lane cannot
-    # expose a partially initialized trajectory.
-    scope.latent_publications.append(
-        LatentPublication(
-            request_pool_idx=row.request_pool_idx,
-            page_table=row.params.page_table,
-            expected_generation=0,
-            expected_step=0,
-            generation=int(output.generation),
-            step=0,
-            latent_units=int(row.params.latent_units),
-            height=int(row.params.height),
-            width=int(row.params.width),
-        )
-    )
-    request.latent_product = output
-    products = flow.publish_latent_transfer(
-        operation,
-        output,
-        row,
-        step=0,
-        scope=scope,
-        worker_info=worker_info,
-        latent_pool=latent_pool,
-        publication_transports=publication_transports,
-        config=config,
-    )
-    state.outcome = Outcome(
-        status=OpStatus.OK,
-        runtime=operation_geometry.execution_runtime(request, cache, flow_step=0),
-        finish_flags=FinishFlags(),
-        product_generations=operation_geometry.output_generations(operation),
-        products=products,
-    )
-    # The operation itself is complete once all state and product publications
-    # have been staged; lane commit establishes their external visibility.
-    state.phase = "done"
-
-
-def _transfer(
-    state: OperationState,
-    *,
-    cache_registry: CachePublications | None,
-    device_products: DeviceProducts,
-    encoder_cache: EncoderCache,
-    latent_pool: LatentPool | None,
-    publication_transports: Mapping[str, Transport],
-    request_tables: ReqToTokenPool | None,
-    model_runner: ModelRunner,
-) -> None:
+) -> PendingOutput:
     """Execute a tensor transfer or KV publication/install operation and stage its result."""
 
     from . import encode
 
-    operation = state.operation
-    scope = state.lane
     transports = publication_transports
     if not transports:
         raise unsupported_setup("product transfer requires a configured transport")
     request_id = operation.request_key.request_id
     mode = operation.kind
     if mode is TransferMode.KV_PUBLISH:
-        publications = cache_registry
+        publications = kv_cache
         if publications is None:
             raise invalid_descriptor("KV publication requires cache storage")
         output = operation.kv_output
         if output is None:
             raise invalid_descriptor("KV publication requires a cache output identity")
-        cache = operation_geometry.cache_coordinates(operation, scope, tables=request_tables)
-        request = operation_geometry.request_row(scope, request_id)
+        cache = operation_geometry.cache_coordinates(
+            operation, completion_group, tables=request_tables, state=state
+        )
+        request = operation_geometry.request_row(completion_group, request_id, state=state)
         expected_base = publications.destination_base(operation.request_key, "gen")
         snapshot = publications.publish(
             request_pool_idx=request.request.request_pool_idx,
@@ -246,139 +86,158 @@ def _transfer(
             buffer=output,
             transports=transports,
         )
-        scope.cache_publications.append((output, snapshot))
+        request.cache_publication = (output, snapshot)
         for tensor in snapshot.tensors:
             for locator in tensor.locations:
-                scope.published.append(locator)
-        scope.stage_publications[output] = tuple(
-            location for tensor in snapshot.tensors for location in tensor.locations
+                request.exported_locators.append(locator)
+        request.cache_exports[output] = tuple(
+            (transports[location.backend], location)
+            for tensor in snapshot.tensors
+            for location in tensor.locations
         )
-        state.outcome = replace(encode.non_state_outcome(operation, scope), kv_output=snapshot)
+        outcome = encode.non_state_outcome(operation, completion_group, state=state)
+        outcome.kv_output = snapshot
     elif mode is TransferMode.KV_INSTALL:
-        publications = cache_registry
+        publications = kv_cache
         if publications is None:
             raise invalid_descriptor("KV installation requires cache storage")
         source = operation.kv_input
         output = operation.kv_output
         if source is None or output is None:
             raise invalid_descriptor("KV installation requires source and output identities")
-        cache = operation_geometry.cache_coordinates(operation, scope, tables=request_tables)
-        request = operation_geometry.request_row(scope, request_id)
-        prepared = scope.prepared_transfers.get(source)
-        if prepared is None:
-            raise invalid_descriptor("KV installation has no prepared physical inputs")
-        if not isinstance(prepared.destination, CacheWrite):
-            raise invalid_descriptor("KV installation lost its physical destination")
+        cache = operation_geometry.cache_coordinates(
+            operation, completion_group, tables=request_tables, state=state
+        )
+        request = operation_geometry.request_row(completion_group, request_id, state=state)
+        write = state.cache_imports.get(source)
+        if write is None:
+            raise invalid_descriptor("KV installation has no reserved physical input")
         installed = publications.install(
             request_pool_idx=request.request.request_pool_idx,
             group_id=cache[1],
             request_key=operation.request_key,
             source=source,
             installed_buffer=output,
-            write=prepared.destination,
+            write=write,
         )
-        prepared.adopt_destination()
-        scope.cache_installations.append((source, output, installed))
-        outcome = encode.non_state_outcome(
-            operation,
-            scope,
-        )
-        state.outcome = replace(
-            outcome,
-            runtime=replace(
-                outcome.runtime,
+        request.cache_installation = (source, output, installed)
+        outcome = encode.non_state_outcome(operation, completion_group, state=state)
+        if outcome.projected_progress is not None:
+            outcome.projected_progress = replace(
+                outcome.projected_progress,
                 kv_visible_len=int(installed.published_extent),
                 kv_computed_len=int(installed.published_extent),
-            ),
-        )
+            )
     else:
         inputs = operation.tensor_inputs()
         outputs = operation.tensor_outputs()
         if len(inputs) != 1 or len(outputs) != 1:
             raise invalid_descriptor("product transfer requires one physical input and one output")
         if operation.latent_input is not None:
+            if latent_pool is None:
+                raise unsupported_setup("latent transfer requires a physical latent pool")
             tensor_publication = _publish_current_latent(
                 operation,
                 inputs[0],
                 outputs[0],
-                scope,
+                completion_group,
                 latent_pool=latent_pool,
                 publication_transports=publication_transports,
+                state=state,
             )
         else:
             value, metadata = fetch_product(
                 operation,
-                scope,
-                device_products=device_products,
-                encoder_cache=encoder_cache,
+                completion_group,
+                tensor_store=tensor_store,
                 model_runner=model_runner,
+                state=state,
             )
             tensor_publication = publish_product(
                 outputs[0],
                 value,
                 metadata,
-                scope,
-                device_products=device_products,
-                encoder_cache=encoder_cache,
+                completion_group,
+                tensor_store=tensor_store,
                 publication_transports=publication_transports,
+                state=state,
             )
-        state.outcome = encode.non_state_outcome(operation, scope, products=(tensor_publication,))
-    state.phase = "done"
+        outcome = encode.non_state_outcome(
+            operation, completion_group, products=(tensor_publication,), state=state
+        )
+    return outcome
 
 
 def _publish_current_latent(
     operation: ScheduledRequest,
     reference: TensorRef,
     product: TensorRef,
-    scope: LaneState,
+    completion_group: int,
     *,
-    latent_pool: LatentPool | None,
+    state: BatchState,
+    latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
 ) -> TensorPublication:
-    request = operation_geometry.request_row(scope, operation.request_key.request_id)
-    if request.latent_product != reference:
+    request = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
+    )
+    if operation_geometry.require_progress(request).latent_product != reference:
         raise invalid_descriptor("latent transfer does not name the committed trajectory")
     if product != operation.latent_output:
         raise invalid_descriptor("product transfer changes the physical product kind")
-    row = operation_geometry.latent_row(operation, scope)
-    source = require_latent_pool(latent_pool).reserve_current_publication(
+    row = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
+    )
+    params = row.input_latent_params
+    staging = row.latent_staging
+    if params is None or staging is None:
+        raise invalid_descriptor("trajectory operation has no staged latent inputs")
+    source = latent_pool.reserve_current_publication(
         product,
-        request_pool_idx=row.request_pool_idx,
-        page_table=row.params.page_table,
+        request_pool_idx=row.request.request_pool_idx,
+        page_table=params.page_table,
         generation=reference.generation,
-        step=row.params.start_step,
-        latent_units=row.params.latent_units,
-        height=row.params.height,
-        width=row.params.width,
+        step=params.start_step,
+        latent_units=params.latent_units,
+        height=params.height,
+        width=params.width,
     )
     return publish_latent_source(
         product,
         source,
         row,
-        step=row.params.start_step,
-        scope=scope,
+        step=params.start_step,
+        completion_group=completion_group,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
+        state=state,
     )
 
 
 def publish_latent_source(
     product: TensorRef,
-    source: LatentSource,
-    row: LatentExecution,
+    source: LatentExport,
+    row: PendingOutput,
     *,
+    state: BatchState,
     step: int,
-    scope: LaneState,
-    latent_pool: LatentPool | None,
+    completion_group: int,
+    latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
 ) -> TensorPublication:
     """Register exact latent page spans and retain their bank for every reader."""
 
+    params = row.input_latent_params
+    if params is None:
+        raise invalid_descriptor("latent publication has no staged parameters")
+    request = operation_geometry.request_row(
+        completion_group, product.request_key.request_id, state=state
+    )
     transports = publication_transports
     if not transports:
         raise unsupported_setup("latent publication requires a configured transport")
-    pool = require_latent_pool(latent_pool)
-    shape = (row.params.latent_units, pool.latent_width)
+    pool = latent_pool
+    shape = (params.latent_units, pool.latent_width)
     assert shape is not None
     if not _representation_matches_product(
         shape,
@@ -390,12 +249,14 @@ def publish_latent_source(
     locations = publish_tensor(
         transports, source.spans, retain=partial(pool.retain_publication, source)
     )
-    scope.published.extend(locations)
-    scope.stage_publications[product.buffer_id] = locations
+    request.exported_locators.extend(locations)
+    request.latent_exports[product.buffer_id] = tuple(
+        (transports[location.backend], location) for location in locations
+    )
     descriptor = LatentTransferValue(
-        height=row.params.height,
-        width=row.params.width,
-        latent_units=row.params.latent_units,
+        height=params.height,
+        width=params.width,
+        latent_units=params.latent_units,
         step=step,
         tensor=TensorTransfer(shape=shape, locations=locations),
     )
@@ -405,10 +266,10 @@ def publish_latent_source(
 def publish_tensors(
     operation: ScheduledRequest,
     values: tuple[torch.Tensor, ...],
-    scope: LaneState,
+    completion_group: int,
     *,
-    device_products: DeviceProducts,
-    encoder_cache: EncoderCache,
+    state: BatchState,
+    tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
 ) -> tuple[TensorPublication, ...]:
     """Publish each numerical result from the rank owning its assigned region."""
@@ -416,16 +277,19 @@ def publish_tensors(
     outputs = operation.outputs
     if len(outputs) != len(values):
         raise invalid_descriptor("numerical results disagree with declared Tensor outputs")
-    owned = {write.reference for write in scope.device_writes}
+    request = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
+    )
+    owned = {write.reference for write in request.writes if not write.feature}
     return tuple(
         publish_product(
             output,
             value,
-            {"payload_kind": "tensor"},
-            scope,
-            device_products=device_products,
-            encoder_cache=encoder_cache,
+            None,
+            completion_group,
+            tensor_store=tensor_store,
             publication_transports=publication_transports,
+            state=state,
         )
         for output, value in zip(outputs, values, strict=True)
         if output in owned
@@ -435,11 +299,11 @@ def publish_tensors(
 def publish_product(
     product: TensorRef,
     value: torch.Tensor,
-    source_metadata: Mapping[str, object],
-    scope: LaneState,
+    source_metadata: ImageMetadata | FeatureMetadata | None,
+    completion_group: int,
     *,
-    device_products: DeviceProducts,
-    encoder_cache: EncoderCache,
+    state: BatchState,
+    tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
 ) -> TensorPublication:
     """Publish a typed device, encoder, or artifact product through the selected transport."""
@@ -449,24 +313,39 @@ def publish_product(
     transports = publication_transports
     if not transports:
         raise unsupported_setup("product publication requires a configured transport")
-    encoder_write = next(
-        (write for write in scope.encoder_writes if write.reference == product), None
+    request = operation_geometry.request_row(
+        completion_group, product.request_key.request_id, state=state
     )
-    device_write = None if encoder_write is not None else bound_device_write(scope, product)
-    height = metadata_uint(source_metadata, "height", 0)
-    width = metadata_uint(source_metadata, "width", 0)
-    source_kind = metadata_string(source_metadata, "payload_kind", "")
-    value_range = metadata_string(source_metadata, "value_range", "")
+    encoder_write = next(
+        (write for write in request.writes if write.reference == product and write.feature), None
+    )
+    device_write = (
+        None
+        if encoder_write is not None
+        else bound_device_write(completion_group, product, state=state)
+    )
+    height = 0 if source_metadata is None else source_metadata.height
+    width = 0 if source_metadata is None else source_metadata.width
+    value_range = (
+        source_metadata.value_range.value
+        if isinstance(source_metadata, ImageMetadata) and source_metadata.value_range is not None
+        else ""
+    )
+    source_kind = ""
     if encoder_write is not None:
-        if min(height, width) < 1 or source_kind not in {"vision_feature", "latent_feature"}:
-            raise invalid_descriptor("encoder transfer has incomplete geometry or encoding")
-    else:
-        if (height == 0) != (width == 0):
-            raise invalid_descriptor("device tensor transfer has incomplete image geometry")
-        if value_range not in {"", *(member.value for member in ImageRange)}:
-            raise invalid_descriptor("device tensor transfer has an invalid value range")
-        if height == 0 and value_range:
-            raise invalid_descriptor("non-image tensor carries an image range")
+        if not isinstance(source_metadata, FeatureMetadata):
+            raise invalid_descriptor("encoder transfer requires feature geometry")
+        source_operation = request.operation
+        if source_operation.vision_input is not None:
+            source_kind = "vision_feature"
+        elif source_operation.latent_feature_input is not None:
+            source_kind = "latent_feature"
+        else:
+            raise invalid_descriptor("encoder transfer has no feature source")
+    elif isinstance(source_metadata, FeatureMetadata):
+        raise invalid_descriptor("device tensor transfer cannot carry feature geometry")
+    elif height == 0 and value_range:
+        raise invalid_descriptor("non-image tensor carries an image range")
     region = None if device_write is None else device_write.region
     if region is not None and tuple(value.shape) != region.shape:
         raise invalid_descriptor("product tensor disagrees with its assigned region")
@@ -485,34 +364,26 @@ def publish_product(
     ):
         raise invalid_descriptor("product transfer changes its declared representation")
     if encoder_write is not None:
-        value = encoder_cache.publish(
-            encoder_write, value, EncoderMetadata(height=height, width=width)
-        )
+        value = tensor_store.publish_write(encoder_write, value, metadata=source_metadata)
     else:
         assert device_write is not None
-        value = device_products.publish_write(
+        value = tensor_store.publish_write(
             device_write,
             value,
-            metadata=(
-                None
-                if height == 0
-                else DeviceProductMetadata(
-                    height=height,
-                    width=width,
-                    value_range=None if not value_range else ImageRange(value_range),
-                )
-            ),
+            metadata=source_metadata,
         )
     if encoder_write is not None:
-        retain = partial(encoder_cache.retain_publication, encoder_write)
+        retain = partial(tensor_store.retain_publication, encoder_write)
     else:
         assert device_write is not None
-        retain = partial(device_products.retain_publication, device_write)
+        retain = partial(tensor_store.retain_publication, device_write)
     locations = publish_tensor(
         transports, value, retain=retain, offset=None if region is None else region.offset
     )
-    scope.published.extend(locations)
-    scope.stage_publications[product.buffer_id] = locations
+    request.exported_locators.extend(locations)
+    request.tensor_exports[product.buffer_id] = tuple(
+        (transports[location.backend], location) for location in locations
+    )
     if encoder_write is not None:
         descriptor: TransferValue = EncoderTransferValue(
             height=height,
@@ -532,72 +403,43 @@ def publish_product(
 
 def fetch_product(
     operation: ScheduledRequest,
-    scope: LaneState,
+    completion_group: int,
     *,
-    device_products: DeviceProducts,
-    encoder_cache: EncoderCache,
+    state: BatchState,
+    tensor_store: TensorStore,
     model_runner: ModelRunner,
-) -> tuple[torch.Tensor, Mapping[str, object]]:
+) -> tuple[torch.Tensor, ImageMetadata | FeatureMetadata | None]:
     """Fetch a transfer handle and stage its typed value for the consuming operation."""
 
-    for reference, encoding in (
-        (operation.vision_input, "vision_feature"),
-        (operation.latent_feature_input, "latent_feature"),
-    ):
+    request = operation_geometry.request_row(
+        completion_group, operation.request_key.request_id, state=state
+    )
+    for reference in (operation.vision_input, operation.latent_feature_input):
         if reference is None:
             continue
-        read = encoder_cache.consume(
+        read = tensor_store.consume(
             reference,
             consumer_op_id=operation.op_id,
-            device=model_runner.operation_device(operation),
+            device=model_runner.operation_devices(operation)[0],
         )
-        scope.encoder_reads.append(read)
-        return read.tensor, {
-            "payload_kind": encoding,
-            "height": read.metadata.height,
-            "width": read.metadata.width,
-        }
+        request.feature_reads.append(read)
+        metadata = read.metadata
+        if not isinstance(metadata, FeatureMetadata):
+            raise invalid_descriptor("feature transfer requires spatial metadata")
+        return read.tensor, metadata
     references = (
         *operation.inputs,
         *(value for value in (operation.token_input, operation.image_input) if value is not None),
     )
     if len(references) != 1:
         raise invalid_descriptor("tensor transfer requires one resident source")
-    device_read = device_products.consume(
+    device_read = tensor_store.consume(
         references[0],
         consumer_op_id=operation.op_id,
-        device=model_runner.operation_device(operation),
+        device=model_runner.operation_devices(operation)[0],
     )
-    scope.device_reads.append(device_read)
-    image_metadata = device_read.metadata
-    values: dict[str, object] = {}
-    if image_metadata is not None and image_metadata.height > 0:
-        values.update(
-            height=image_metadata.height,
-            width=image_metadata.width,
-            value_range=""
-            if image_metadata.value_range is None
-            else image_metadata.value_range.value,
-        )
-    return device_read.tensor, values
-
-
-def metadata_uint(metadata: Mapping[str, object], name: str, default: int) -> int:
-    """Read a nonnegative integer from transfer metadata with a validated default."""
-
-    value = metadata.get(name, default)
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise invalid_descriptor(f"product metadata field {name!r} must be a non-negative integer")
-    return value
-
-
-def metadata_string(metadata: Mapping[str, object], name: str, default: str) -> str:
-    """Read a nonempty string from transfer metadata with a validated default."""
-
-    value = metadata.get(name, default)
-    if not isinstance(value, str):
-        raise invalid_descriptor(f"product metadata field {name!r} must be a string")
-    return value
+    request.device_reads.append(device_read)
+    return device_read.tensor, device_read.metadata
 
 
 def tensor_matches_product(tensor: TensorTransfer, product: TensorRef) -> bool:
@@ -622,7 +464,7 @@ def _representation_matches_product(
     )
 
 
-__all__ = ["run_action"]
+__all__ = ["execute"]
 
 
 def _release_locators(

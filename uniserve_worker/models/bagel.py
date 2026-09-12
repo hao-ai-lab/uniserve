@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 import torch
 import torch.nn as nn
 
-from uniserve_worker.execution.batch import ForwardMode, PipelineStage, TransferMode
+from uniserve_worker.protocol.batch import ForwardMode, PipelineStage, TransferMode
 
 from ..execution.forward_batch import (
     AttentionMode,
@@ -819,7 +819,7 @@ class BagelForConditionalGeneration(ExecutionModel):
         decode_positions: torch.Tensor | None = None
 
         # Paged decode has a compact positional contract and cannot carry flow rows.
-        if batch.attention_mode is AttentionMode.PAGED_DECODE:
+        if batch.attention.attention_mode is AttentionMode.PAGED_DECODE:
             if batch.flow_row_indices:
                 raise TypeError("BAGEL paged decode accepts token rows only")
             decode_positions = positions
@@ -843,7 +843,7 @@ class BagelForConditionalGeneration(ExecutionModel):
         token_offset = 0
         for row_index, count in zip(
             batch.token_row_indices,
-            tuple(batch.query_lens_cpu[index] for index in batch.token_row_indices),
+            tuple(batch.attention.query_lens_cpu[index] for index in batch.token_row_indices),
             strict=True,
         ):
             chunks[row_index] = token_embeds[token_offset : token_offset + count]

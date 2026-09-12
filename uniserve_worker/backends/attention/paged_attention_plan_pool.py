@@ -31,12 +31,24 @@ class PagedAttentionPlanPool:
     graph_bindings: dict[tuple[Any, ...], Any] = field(default_factory=dict)
     workspaces: dict[tuple[str, int], torch.Tensor] = field(default_factory=dict)
 
-    def plan_decode(self, key: tuple[Any, ...], *, workspace: torch.Tensor | None = None, wrapper: Any | None = None) -> PagedAttentionPlan:
+    def plan_decode(
+        self,
+        key: tuple[Any, ...],
+        *,
+        workspace: torch.Tensor | None = None,
+        wrapper: Any | None = None,
+    ) -> PagedAttentionPlan:
         """Intern a decode plan by backend key and retain its workspace and wrapper."""
 
         return self._plan("decode", key, workspace=workspace, wrapper=wrapper)
 
-    def plan_prefill(self, key: tuple[Any, ...], *, workspace: torch.Tensor | None = None, wrapper: Any | None = None) -> PagedAttentionPlan:
+    def plan_prefill(
+        self,
+        key: tuple[Any, ...],
+        *,
+        workspace: torch.Tensor | None = None,
+        wrapper: Any | None = None,
+    ) -> PagedAttentionPlan:
         """Intern a prefill plan by backend key and retain its workspace and wrapper."""
 
         return self._plan("prefill", key, workspace=workspace, wrapper=wrapper)
@@ -46,7 +58,9 @@ class PagedAttentionPlanPool:
 
         self.graph_bindings[tuple(key)] = binding
 
-    def workspace(self, device: torch.device | str, size: int, *, dtype: torch.dtype = torch.uint8) -> torch.Tensor:
+    def workspace(
+        self, device: torch.device | str, size: int, *, dtype: torch.dtype = torch.uint8
+    ) -> torch.Tensor:
         """Return a reusable device workspace with at least the requested byte capacity."""
 
         target = torch.device(device)
@@ -71,6 +85,8 @@ class PagedAttentionPlanPool:
         cache_key = (str(kind), *tuple(key))
         plan = self.plans.get(cache_key)
         if plan is None:
-            plan = PagedAttentionPlan(kind=str(kind), key=cache_key, workspace=workspace, wrapper=wrapper)
+            plan = PagedAttentionPlan(
+                kind=str(kind), key=cache_key, workspace=workspace, wrapper=wrapper
+            )
             self.plans[cache_key] = plan
         return plan

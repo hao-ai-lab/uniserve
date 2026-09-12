@@ -25,7 +25,7 @@ use uniserve_engine::{
 use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable, Bounds, CachePageAllocation, Computation,
     ComputationId, DType, DimBound, ErrorCode, ForwardBatch, Locator, NewRequest, OpStatus,
-    RequestKey, Run as Batch, ScheduledRequest, ShapeBound, TensorPublication, TensorRef,
+    RequestKey, ScheduleBatch, ScheduledRequest, ShapeBound, TensorPublication, TensorRef,
     TransferHandle, TransferTransport,
 };
 
@@ -95,7 +95,7 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
     let starts = std::mem::take(&mut run.commands);
     let admission = execute(
         &mut worker,
-        Batch::new(1, vec![], vec![]).with_commands(starts),
+        ScheduleBatch::new(1, vec![], vec![]).with_commands(starts),
     )?;
     assert!(admission.done && admission.results.is_empty());
     run.batch_id = 2;
@@ -125,7 +125,7 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
 
     // Closing a request releases every participating rank's physical storage.
     worker.submit_run(
-        Batch::new(3, vec![], vec![]).with_commands(
+        ScheduleBatch::new(3, vec![], vec![]).with_commands(
             [first_key, second_key]
                 .into_iter()
                 .map(|request_key| BatchCommand::Finish {
@@ -312,9 +312,7 @@ fn native_close_drains_results_and_releases_service() -> anyhow::Result<()> {
 
 #[test]
 fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
-    use uniserve_engine::{
-        RequestPlacement, ScheduleBatch as LogicalBatch, WorkerExecutor, WorkerId,
-    };
+    use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
 
     for transfer in [
         uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?,
@@ -344,10 +342,10 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             vec![(WorkerId("worker".into()), WorkerGroup::spawn(args)?)],
             transfer,
         )?;
-        let bind = |mut batch: Batch, entry: &str| {
+        let bind = |mut batch: ScheduleBatch, entry: &str| {
             let mut operation = batch.operations.remove(0);
             operation.entry = entry.into();
-            LogicalBatch::new(
+            ExecutionBatch::new(
                 batch.batch_id,
                 vec![(
                     operation,
@@ -421,7 +419,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
         };
         logical
             .requests
-            .extend(bind(Batch::new(1, vec![], vec![publish]), "model").requests);
+            .extend(bind(ScheduleBatch::new(1, vec![], vec![publish]), "model").requests);
 
         let copy = TensorRef {
             producer_op_id: ComputationId::new(1, 2),
@@ -463,7 +461,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
         };
         logical
             .requests
-            .extend(bind(Batch::new(1, vec![], vec![consume]), "output").requests);
+            .extend(bind(ScheduleBatch::new(1, vec![], vec![consume]), "output").requests);
         executor.submit(logical)?;
         let mut completions = std::collections::BTreeMap::new();
         loop {
@@ -501,7 +499,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
 
 #[test]
 fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result<()> {
-    use uniserve_engine::{RequestPlacement, ScheduleBatch, WorkerExecutor, WorkerId};
+    use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
 
     let transfer = uniserve_engine::TransferConfig::default();
     let mut executor = WorkerExecutor::try_new(
@@ -590,7 +588,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
             )
         })
         .collect();
-    executor.submit(ScheduleBatch::new(9, requests, commands, vec![]))?;
+    executor.submit(ExecutionBatch::new(9, requests, commands, vec![]))?;
     let mut outputs = std::collections::BTreeMap::new();
     loop {
         let result = poll_logical(&mut executor)?.context("device successor did not complete")?;
@@ -622,9 +620,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
 #[test]
 fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() -> anyhow::Result<()>
 {
-    use uniserve_engine::{
-        RequestPlacement, ScheduleBatch as LogicalBatch, WorkerExecutor, WorkerId,
-    };
+    use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
     use uniserve_worker_ipc::{BufferAllocation, DiffusionSamplingParams};
 
     let transfer = uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?;
@@ -647,10 +643,10 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         vec![(WorkerId("worker".into()), WorkerGroup::spawn(args)?)],
         transfer,
     )?;
-    let bind = |mut batch: Batch, entry: &str| {
+    let bind = |mut batch: ScheduleBatch, entry: &str| {
         let mut operation = batch.operations.remove(0);
         operation.entry = entry.into();
-        LogicalBatch::new(
+        ExecutionBatch::new(
             batch.batch_id,
             vec![(
                 operation,
@@ -722,7 +718,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         predicate: None,
         rng: None,
     };
-    let mut source = Batch::new(1, vec![admission], vec![produce]);
+    let mut source = ScheduleBatch::new(1, vec![admission], vec![produce]);
     source.buffer_allocations.push(BufferAllocation {
         buffer: value.buffer_id(),
         offset: 0,
@@ -767,7 +763,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         predicate: None,
         rng: None,
     };
-    let mut consumer = Batch::new(1, vec![], vec![consume]);
+    let mut consumer = ScheduleBatch::new(1, vec![], vec![consume]);
     consumer.buffer_allocations.push(BufferAllocation {
         buffer: copied.buffer_id(),
         offset: 256,
@@ -1340,7 +1336,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         predicate: None,
         rng: None,
     };
-    let mut publish = Batch::new(10, Vec::new(), vec![operation]);
+    let mut publish = ScheduleBatch::new(10, Vec::new(), vec![operation]);
     publish.collective_seq = 6;
     publish.block_tables = tables;
 
@@ -1429,7 +1425,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     first.forward.append(finished.forward, 0);
     first.input_products.extend(finished.input_products);
     execute(&mut executor, first)?;
-    let mut close = Batch::new(2, Vec::new(), Vec::new());
+    let mut close = ScheduleBatch::new(2, Vec::new(), Vec::new());
     close.collective_seq = 2;
     close.commands.push(BatchCommand::Finish {
         request_key: finished_key,
@@ -1674,7 +1670,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         predicate: None,
         rng: None,
     };
-    let mut batch = Batch::new(3, vec![admission], vec![operation]);
+    let mut batch = ScheduleBatch::new(3, vec![admission], vec![operation]);
     batch.buffer_allocations = [(&input, 0), (&output, 256)]
         .into_iter()
         .map(|(product, offset)| uniserve_worker_ipc::BufferAllocation {
@@ -1708,8 +1704,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
 #[test]
 fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow::Result<()> {
     use uniserve_engine::{
-        ExecutorSubmitError, RequestPlacement, ScheduleBatch as LogicalBatch, WorkerExecutor,
-        WorkerId,
+        ExecutionBatch, ExecutorSubmitError, RequestPlacement, WorkerExecutor, WorkerId,
     };
 
     // Control process scheduling at the OS boundary. This keeps the occupied
@@ -1755,10 +1750,10 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     )?;
     let pid = std::fs::read_to_string(&pid_file)?.parse::<i32>()?;
     let mut paused = PausedProcess::new(pid)?;
-    let bind = |batch: Batch, worker: &str| {
+    let bind = |batch: ScheduleBatch, worker: &str| {
         assert_eq!(batch.operations.len(), 1);
         let operation = batch.operations.into_iter().next().unwrap();
-        LogicalBatch::new(
+        ExecutionBatch::new(
             batch.batch_id,
             vec![(
                 operation,
@@ -1776,7 +1771,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             batch.input_products,
         )
     };
-    let make_run = |run_id, request_index, request_id, page| -> anyhow::Result<Batch> {
+    let make_run = |run_id, request_index, request_id, page| -> anyhow::Result<ScheduleBatch> {
         let admission = text_admission(request_id, 1, page)?;
         Ok(token_batch(
             run_id,
@@ -1814,7 +1809,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     assert_eq!(resumed.results[0].output.status, OpStatus::Ok);
     // Request-relay products have no arena params, but their release must
     // still reach the rank holding the published generation.
-    let release = LogicalBatch::new(
+    let release = ExecutionBatch::new(
         4,
         Vec::new(),
         vec![BatchCommand::Free {
@@ -1874,7 +1869,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         predicate: None,
         rng: None,
     };
-    let publish = Batch::new(6, Vec::new(), vec![publish]);
+    let publish = ScheduleBatch::new(6, Vec::new(), vec![publish]);
 
     executor.submit(bind(publish, "encoder-0"))?;
     let published = poll_logical(&mut executor)?.context("source publication did not complete")?;
@@ -1919,7 +1914,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         rng: None,
     };
     executor.submit(bind(
-        Batch::new(7, vec![admission.clone()], vec![transfer]),
+        ScheduleBatch::new(7, vec![admission.clone()], vec![transfer]),
         "encoder-1",
     ))?;
     let copied = poll_logical(&mut executor)?.context("auxiliary transfer did not complete")?;
@@ -1970,7 +1965,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         predicate: None,
         rng: None,
     };
-    let mut encode = Batch::new(16, Vec::new(), vec![encode]);
+    let mut encode = ScheduleBatch::new(16, Vec::new(), vec![encode]);
     encode
         .buffer_allocations
         .push(uniserve_worker_ipc::BufferAllocation {
@@ -1985,7 +1980,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: admission.request_key,
         retained_buffers: vec![feature.buffer_id()],
     };
-    executor.submit(LogicalBatch::new(8, Vec::new(), vec![finish], Vec::new()))?;
+    executor.submit(ExecutionBatch::new(8, Vec::new(), vec![finish], Vec::new()))?;
     let closed = poll_logical(&mut executor)?.context("shared request did not retire")?;
     assert!(closed.done);
     for (batch_id, request_id, worker) in [(9, 55, "encoder-0"), (10, 56, "encoder-1")] {
@@ -2027,7 +2022,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         }
     }
     assert_eq!(tokens, 2);
-    executor.submit(LogicalBatch::new(
+    executor.submit(ExecutionBatch::new(
         13,
         Vec::new(),
         vec![
@@ -2090,7 +2085,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         predicate: None,
         rng: None,
     };
-    let mut retained = Batch::new(15, vec![next], vec![retained]);
+    let mut retained = ScheduleBatch::new(15, vec![next], vec![retained]);
     retained
         .buffer_allocations
         .push(uniserve_worker_ipc::BufferAllocation {
@@ -2331,7 +2326,7 @@ fn worker_python() -> PathBuf {
 
 fn execute(
     executor: &mut WorkerGroup,
-    batch: Batch,
+    batch: ScheduleBatch,
 ) -> anyhow::Result<uniserve_engine::WorkerResult> {
     executor.submit_run(batch)?;
     executor
@@ -2372,7 +2367,7 @@ fn token_batch(
     tokens: &[u32],
     page: BlockId,
     prefix_length: u32,
-) -> Batch {
+) -> ScheduleBatch {
     let request_pool_idx = admission.as_ref().map_or(1, |value| value.request_pool_idx);
     let token_output = TensorRef {
         request_key,
@@ -2417,7 +2412,7 @@ fn token_batch(
         rng: None,
     };
     let input_length = tokens.len() as u32;
-    let mut batch = Batch::new(run_id, admission.into_iter().collect(), vec![operation]);
+    let mut batch = ScheduleBatch::new(run_id, admission.into_iter().collect(), vec![operation]);
     batch.collective_seq = collective_seq;
     batch.block_tables = vec![BlockTable {
         request_pool_idx,
@@ -2444,11 +2439,11 @@ fn token_batch(
     batch
 }
 
-fn command_batch(run_id: u64, command: BatchCommand) -> Batch {
-    Batch::new(run_id, Vec::new(), Vec::new()).with_commands(vec![command])
+fn command_batch(run_id: u64, command: BatchCommand) -> ScheduleBatch {
+    ScheduleBatch::new(run_id, Vec::new(), Vec::new()).with_commands(vec![command])
 }
 
-fn completed_operation(record: &uniserve_worker_ipc::ModelOutput) -> ComputationId {
+fn completed_operation(record: &uniserve_worker_ipc::RequestOutput) -> ComputationId {
     record.op_id
 }
 

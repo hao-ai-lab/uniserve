@@ -65,14 +65,14 @@ def project_outputs(
         return output
 
     if (
-        batch.attention_mode is AttentionMode.PAGED_VARLEN
-        and batch.output_indices is not None
+        batch.attention.attention_mode is AttentionMode.PAGED_VARLEN
+        and batch.attention.output_indices is not None
         and len(selections) == batch.row_count
         and all(selection is TokenSelection.LAST_LOGITS for selection in selections.values())
     ):
         if owner:
             assert head is not None
-            selected = hidden.index_select(0, batch.output_indices.to(dtype=torch.long))
+            selected = hidden.index_select(0, batch.attention.output_indices.to(dtype=torch.long))
             selected_logits = head.forward_local(selected)
         else:
             selected_logits = hidden.new_empty((batch.row_count, partition.width))
@@ -85,7 +85,7 @@ def project_outputs(
 
     lengths = [0] * batch.row_count
     for index in batch.token_row_indices:
-        lengths[index] = int(batch.query_lens_cpu[index])
+        lengths[index] = int(batch.attention.query_lens_cpu[index])
     for index, count in zip(batch.flow_row_indices, batch.flow_image_tokens, strict=True):
         lengths[index] = int(count)
     # Captured token buckets can include storage-only rows after the live spans.

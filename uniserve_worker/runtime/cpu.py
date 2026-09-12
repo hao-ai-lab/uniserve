@@ -1,145 +1,225 @@
-"""Bounded worker-owned CPU job execution."""
+"""Bounded CPU tasks whose capacity and input leases follow actual execution."""
 
 from __future__ import annotations
 
 import concurrent.futures
 from collections.abc import Callable
+from functools import partial
 from threading import Lock
-from typing import ParamSpec, TypeVar
+from typing import Any, ParamSpec, TypeVar
 
 from ..foundation.errors import resource_error
+from ..foundation.resources import close_resources
+from ..profiling import profile_range
 
-__all__ = ["CpuPool", "CpuTaskReservation"]
+__all__ = ["CpuPool", "CpuTask"]
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
 
 class CpuPool:
-    """A fixed worker set with bounded registered tasks."""
+    """Own admitted tasks until cancellation before submission or actual completion."""
 
     def __init__(self, *, capacity: int, workers: int) -> None:
-        """Create a bounded thread pool and its registration accounting."""
-
         self.capacity = int(capacity)
         if self.capacity < 1:
             raise ValueError("CPU task capacity must be positive")
-        worker_count = int(workers)
-        if worker_count < 1 or worker_count > self.capacity:
+        if workers < 1 or workers > self.capacity:
             raise ValueError("CPU worker count must be within task capacity")
-        self._reserved = 0
         self._lock = Lock()
+        self._closed = False
+        self._tasks: set[CpuTask] = set()
         self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=worker_count,
-            thread_name_prefix="worker-cpu",
+            max_workers=workers, thread_name_prefix="worker-cpu"
         )
         self._completion_wake: Callable[[], None] | None = None
 
     def set_completion_wake(self, wake: Callable[[], None] | None) -> None:
-        """Install the event-loop callback invoked when a submitted CPU task finishes."""
-
         self._completion_wake = wake
 
     @property
     def reserved(self) -> int:
-        """Count executor slots held by submitted or not-yet-submitted reservations."""
+        """Count admitted tasks, including work whose result was abandoned."""
 
         with self._lock:
-            return self._reserved
+            return len(self._tasks)
 
-    def reserve(self) -> CpuTaskReservation:
-        """Reserve one executor slot without submitting work."""
-
+    def reserve(self) -> CpuTask:
         with self._lock:
-            if self._reserved >= self.capacity:
+            if self._closed:
+                raise resource_error("worker CPU pool is closed")
+            if len(self._tasks) >= self.capacity:
                 raise resource_error("worker CPU task capacity is exhausted")
-            self._reserved += 1
-        return CpuTaskReservation(self)
+            task = CpuTask(self)
+            self._tasks.add(task)
+            return task
 
-    def _submit(
-        self,
-        reservation: CpuTaskReservation,
-        function: Callable[_P, _T],
-        *args: _P.args,
-        **kwargs: _P.kwargs,
-    ) -> concurrent.futures.Future[_T]:
-        """Consume a reservation, submit host work, and release capacity after completion."""
-
+    def _submit(self, task: CpuTask) -> None:
+        error: BaseException | None = None
         with self._lock:
-            if reservation._pool is not self or reservation._released:
-                raise RuntimeError("CPU task reservation is not active")
-            if reservation._submitted:
-                raise RuntimeError("CPU task reservation was submitted more than once")
-            reservation._submitted = True
-        try:
-            future = self._executor.submit(function, *args, **kwargs)
-        except BaseException:
-            reservation.release()
-            raise
+            if self._closed or task not in self._tasks:
+                raise RuntimeError("CPU task is no longer admitted")
+            if task._future is not None:
+                raise RuntimeError("CPU task was submitted more than once")
+            if task._action is None:
+                raise RuntimeError("CPU task has no action")
+            # Serialize executor admission with close; callbacks run outside this lock.
+            try:
+                task._future = self._executor.submit(task._run)
+            except BaseException as failure:
+                error = failure
+                self._tasks.remove(task)
+        if error is not None:
+            task._finish(error=error)
+            raise error
+        assert task._future is not None
+        task._future.add_done_callback(task._completed)
 
-        def completed(_future: object) -> None:
-            """Release task capacity and wake the completion loop exactly once."""
-
-            reservation.release()
-            wake = self._completion_wake
-            if wake is not None:
-                wake()
-
-        future.add_done_callback(completed)
-        return future
-
-    def _release(self, reservation: CpuTaskReservation) -> None:
-        """Return an unused CPU task reservation to bounded capacity."""
-
+    def _remove(self, task: CpuTask) -> None:
         with self._lock:
-            if reservation._pool is not self or reservation._released:
-                return
-            reservation._released = True
-            self._reserved -= 1
-            if self._reserved < 0:
-                raise RuntimeError("worker CPU task reservation underflow")
+            self._tasks.discard(task)
 
     def close(self) -> None:
-        """Reject new reservations and shut down the bounded executor."""
+        """Reject admission, cancel unsubmitted tasks, and drain actual CPU readers."""
 
-        self._executor.shutdown(wait=True, cancel_futures=False)
+        with self._lock:
+            self._closed = True
+            unused = tuple(task for task in self._tasks if task._future is None)
+            self._tasks.difference_update(unused)
+        # Cancelling a promise can wake dependent jobs that need the pool lock.
+        try:
+            close_resources(*(task._cancel for task in unused))
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=False)
 
 
-class CpuTaskReservation:
-    """One registration-visible CPU task slot with idempotent release."""
+class CpuTask:
+    """One admitted action, result promise and input lease; no separate job owner.
 
-    __slots__ = ("_pool", "_submitted", "_released")
+    Configure after reserving the operation's capacity, once its input exists.
+    The worker calls submit_if_ready to advance deferred actions; ready is pure.
+    Abandoning submitted work does not cancel its reads or return its capacity.
+    """
 
     def __init__(self, pool: CpuPool) -> None:
-        """Take ownership of one reserved slot until submission or explicit release."""
-
         self._pool = pool
-        self._submitted = False
-        self._released = False
+        self.promise: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        self._future: concurrent.futures.Future[Any] | None = None
+        self._action: Callable[[], Any] | None = None
+        self._dependencies: tuple[concurrent.futures.Future[Any], ...] = ()
+        self._input_ready: Callable[[], bool] | None = None
+        self._input_completion: Callable[[], concurrent.futures.Future[None]] | None = None
+        self._release: Callable[[], None] | None = None
+        self._profile_name = "uniserve.cpu"
 
-    @property
-    def active(self) -> bool:
-        """Indicate whether this reservation still owns one CPU executor slot."""
+    def configure(
+        self,
+        action: Callable[[], Any],
+        *,
+        dependencies: tuple[concurrent.futures.Future[Any], ...] = (),
+        input_ready: Callable[[], bool] | None = None,
+        input_completion: Callable[[], concurrent.futures.Future[None]] | None = None,
+        release: Callable[[], None] | None = None,
+        profile_name: str = "uniserve.cpu",
+    ) -> CpuTask:
+        """Attach an action and transfer its input release responsibility to this task."""
 
-        return not self._released
+        with self._pool._lock:
+            if self not in self._pool._tasks or self._pool._closed:
+                raise RuntimeError("CPU task is no longer admitted")
+            if self._action is not None:
+                raise RuntimeError("CPU task was configured more than once")
+            self._action = action
+            self._dependencies = dependencies
+            self._input_ready = input_ready
+            self._input_completion = input_completion
+            self._release = release
+            self._profile_name = profile_name
+        return self
 
     def submit(
-        self,
-        function: Callable[_P, _T],
-        *args: _P.args,
-        **kwargs: _P.kwargs,
+        self, function: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs
     ) -> concurrent.futures.Future[_T]:
-        """Consume this reservation by submitting exactly one host callable."""
+        """Submit an immediate action using already reserved capacity."""
 
-        return self._pool._submit(self, function, *args, **kwargs)
+        self.configure(partial(function, *args, **kwargs))
+        self._pool._submit(self)
+        return self.promise
 
-    def release(self) -> None:
-        """Return an unused reservation to the CPU pool."""
+    def submit_if_ready(self) -> None:
+        """Submit a configured action after its input copy becomes CPU-readable."""
 
-        self._pool._release(self)
+        if self.promise.done() or self._future is not None:
+            return
+        if self._input_ready is None or self._input_ready():
+            self._pool._submit(self)
+
+    def _run(self) -> Any:
+        for dependency in self._dependencies:
+            dependency.result()
+        assert self._action is not None
+        with profile_range(self._profile_name):
+            return self._action()
+
+    def _completed(self, future: concurrent.futures.Future[Any]) -> None:
+        try:
+            value = future.result()
+        except BaseException as error:
+            self._finish(error=error)
+        else:
+            self._finish(value=value)
+
+    def _finish(self, *, value: Any = None, error: BaseException | None = None) -> None:
+        try:
+            self._release_input()
+        except BaseException as release_error:
+            if error is None:
+                error = release_error
+        finally:
+            self._action = None
+            self._dependencies = ()
+            self._pool._remove(self)
+        if error is None:
+            self.promise.set_result(value)
+        else:
+            self.promise.set_exception(error)
+        wake = self._pool._completion_wake
+        if wake is not None:
+            wake()
+
+    def _release_input(self) -> None:
+        release, self._release = self._release, None
+        if release is not None:
+            release()
+        self._input_ready = None
+        self._input_completion = None
+
+    def ready(self) -> bool:
+        return self.promise.done()
+
+    def result(self) -> Any:
+        """Return the completed value without blocking the worker's event loop."""
+
+        if not self.ready():
+            raise RuntimeError("CPU task result was observed before completion")
+        return self.promise.result(timeout=0)
 
     def abandon(self) -> None:
-        """Release the slot only when no task was submitted through this reservation."""
+        with self._pool._lock:
+            if self not in self._pool._tasks or self._future is not None:
+                return
+            self._pool._tasks.remove(self)
+        self._cancel()
 
-        if not self._submitted:
-            self.release()
+    def _cancel(self) -> None:
+        self.promise.cancel()
+        self._action = None
+        self._dependencies = ()
+        # Cancellation cannot authorize reuse while a preceding D2H still writes.
+        if self._input_completion is not None:
+            completion = self._input_completion()
+            if not completion.done():
+                completion.add_done_callback(lambda _future: self._release_input())
+                return
+        self._release_input()

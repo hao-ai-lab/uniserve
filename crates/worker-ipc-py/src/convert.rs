@@ -16,13 +16,14 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams, TokenLogprob};
 use uniserve_worker_ipc::{
-    ArRequestParams, ArtifactHandle, BatchCommand, BlockTable, BufferAllocation, BufferId,
-    CachePageAllocation, Computation, ComputationId, DType, DecodeRange, DiffusionSamplingParams,
-    DimBound, DrawLayout, ErrorCode, ErrorOperationIdentity, FeatureKind, FinishFlags, KvTransfer,
-    LatentParams, Locator, MediaOutput, ModelOutput, NewRequest, OpStatus, RegistrationAck,
-    RequestKey, RequestKind, Run, RunResult, ScheduledRequest, ShapeBound, TensorPublication,
-    TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferTransport, UmmRequestParams,
-    WorkerEndpoint, WorkerForwardStats, WorkerRequest, WorkerResponse, WorkerResponseError,
+    ArRequestParams, ArtifactHandle, BatchCommand, BatchOutput, BlockTable, BufferAllocation,
+    BufferId, CachePageAllocation, Computation, ComputationId, DType, DecodeRange,
+    DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, ErrorOperationIdentity, FeatureKind,
+    FinishFlags, ForwardStats, KvTransfer, LatentParams, Locator, MediaOutput, NewRequest,
+    OpStatus, RegistrationAck, RequestKey, RequestKind, RequestOutput, ScheduleBatch,
+    ScheduledRequest, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
+    TransferHandle, TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerRequest,
+    WorkerResponse, WorkerResponseError,
 };
 
 #[cfg(test)]
@@ -47,7 +48,7 @@ pub(crate) fn execute_request_to_py<'py>(
 
 /// Cached handles to the worker's operation types and enum members.
 ///
-/// The serve loop constructs one `Run` object per submission; every hot
+/// The serve loop constructs one `ScheduleBatch` object per submission; every hot
 /// record (operations, KV allocations, admission/close/release commands) is built
 /// by calling the operation dataclass constructors positionally, so the worker
 /// never re-decodes those records from IPC maps. Rare members (admissions,
@@ -102,7 +103,7 @@ impl NativeRequestTypes {
     fn build(py: Python<'_>) -> PyResult<Self> {
         // Resolve classes once so per-request conversion uses direct constructor
         // calls without repeated module or attribute lookup.
-        let module = py.import("uniserve_worker.execution.batch")?;
+        let module = py.import("uniserve_worker.protocol.batch")?;
         let class = |name: &str| -> PyResult<Py<PyAny>> { Ok(module.getattr(name)?.unbind()) };
 
         Ok(Self {
@@ -523,7 +524,7 @@ impl<'py> NativeRequestConversion<'py> {
 }
 
 /// Constructs one Python run, using typed hot-path objects and mapped rare records.
-fn run_to_py<'py>(py: Python<'py>, run: &Run) -> PyResult<Bound<'py, PyAny>> {
+fn run_to_py<'py>(py: Python<'py>, run: &ScheduleBatch) -> PyResult<Bound<'py, PyAny>> {
     let mut context = RequestConversion::new(py);
     let mut native = NativeRequestConversion::new(py)?;
 
@@ -1239,7 +1240,7 @@ fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerRe
 }
 
 /// Decodes an ordered run result from its Python mapping.
-fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<RunResult> {
+fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
@@ -1267,7 +1268,7 @@ fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<RunResult> {
         Some(value) if value.is_none() => None,
         Some(value) => Some(forward_stats_from_py(&value)?),
     };
-    Some(RunResult {
+    Some(BatchOutput {
         batch_id: u64_of(&get(dict, intern!(py, "batch_id"))?)?,
         run_id: u64_of(&get(dict, intern!(py, "run_id"))?)?,
         completions: records,
@@ -1280,10 +1281,10 @@ fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<RunResult> {
 }
 
 /// Decodes the complete set of worker forward-path counters.
-fn forward_stats_from_py(value: &Bound<'_, PyAny>) -> Option<WorkerForwardStats> {
+fn forward_stats_from_py(value: &Bound<'_, PyAny>) -> Option<ForwardStats> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
-    Some(WorkerForwardStats {
+    Some(ForwardStats {
         // Aggregate execution-mode counters.
         mode_counts: u64_map(dict, intern!(py, "mode_counts"))?,
         mode_tokens: u64_map(dict, intern!(py, "mode_tokens"))?,
@@ -1389,7 +1390,7 @@ fn token_logprobs_from_py(value: &Bound<'_, PyAny>) -> Option<Vec<TokenLogprob>>
 }
 
 /// Decodes one completion with its accepted progress and output fields.
-fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
+fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
@@ -1451,7 +1452,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
             bytes: u64_of(&get(output, intern!(py, "bytes"))?)?,
         })
     };
-    Some(ModelOutput {
+    Some(RequestOutput {
         sampled_logprob: {
             let value = get(dict, intern!(py, "sampled_logprob"))?;
             if value.is_none() {
@@ -2065,7 +2066,7 @@ mod tests {
             predicate: None,
             rng: None,
         };
-        let mut run = Run::new(
+        let mut run = ScheduleBatch::new(
             11,
             vec![admission, media_admission],
             vec![operation, media_operation, kv_operation],
@@ -2082,10 +2083,10 @@ mod tests {
 
     fn result_response() -> WorkerResponse {
         let request_key = RequestKey::new(1, RequestId(2), 1);
-        let mut response = WorkerResponse::result(RunResult {
+        let mut response = WorkerResponse::result(BatchOutput {
             batch_id: 11,
             run_id: 11,
-            completions: vec![ModelOutput {
+            completions: vec![RequestOutput {
                 sampled_logprob: Some(-0.25),
                 top_logprobs: vec![TokenLogprob {
                     token_id: 42,
@@ -2285,9 +2286,9 @@ mod tests {
             // The natively constructed batch must be exactly what the
             // canonical codec decodes from its own IPC form.
             let round_tripped = py
-                .import("uniserve_worker.execution.batch")
+                .import("uniserve_worker.protocol.batch")
                 .unwrap()
-                .getattr("Run")
+                .getattr("ScheduleBatch")
                 .unwrap()
                 .call_method1(
                     "from_mapping",

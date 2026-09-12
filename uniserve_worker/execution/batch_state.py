@@ -1,0 +1,457 @@
+"""Resources and delivery facts owned by one in-flight scheduler submission."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future
+from dataclasses import dataclass, field
+from functools import partial
+from threading import Lock
+
+import torch
+
+from uniserve_worker.execution.output import OutputBuffer, PendingOutput
+from uniserve_worker.execution.rows import (
+    OperationIdentity,
+)
+from uniserve_worker.foundation.errors import WorkerError, invalid_descriptor
+from uniserve_worker.foundation.resources import close_resources
+from uniserve_worker.protocol.batch import (
+    BatchOutput,
+    BufferId,
+    Finish,
+    ForwardStats,
+    Free,
+    KvTransfer,
+    OpStatus,
+    RegistrationAck,
+    RequestKey,
+    RequestOutput,
+    ScheduleBatch,
+    ScheduledRequest,
+    TensorPublication,
+)
+from uniserve_worker.runtime.cache_imports import CacheImport
+from uniserve_worker.runtime.kv_cache import KVCache
+from uniserve_worker.runtime.latent_pool import LatentImport, LatentPool
+from uniserve_worker.runtime.tensor_store import TensorRead, TensorStore
+from uniserve_worker.transfer.tickets import TransferTicket
+
+
+@dataclass(slots=True)
+class BatchState:
+    """Retain original input, physical dependencies, outputs, and delivery position.
+
+    Worker submits inputs, launches computation, and materializes results. This
+    object has no callback that can execute its batch or advance the worker.
+    """
+
+    batch: ScheduleBatch
+    propagate_errors: bool = False
+    tensor_reads: dict[BufferId, TensorRead] = field(default_factory=dict)
+    latent_imports: dict[BufferId, LatentImport] = field(default_factory=dict)
+    cache_imports: dict[BufferId, CacheImport] = field(default_factory=dict)
+    predicate_buffer: OutputBuffer | None = None
+    predicate_entries: list[tuple[OperationIdentity, tuple[int, int], int]] = field(
+        default_factory=list
+    )
+    predicate_transfers: tuple[tuple[OperationIdentity, BufferId, int], ...] = ()
+    predicates_sealed: bool = False
+    _predicate_values: dict[OperationIdentity, bool] | None = None
+    storage_dependencies: tuple[Future[None], ...] = ()
+    input_products: tuple[TensorPublication, ...] = ()
+    kv_inputs: tuple[KvTransfer, ...] = ()
+    inputs_submitted: bool = False
+    inputs_closed: bool = False
+    launched: bool = False
+    complete: bool = False
+    error: WorkerError | None = None
+    outputs: list[PendingOutput | RequestOutput | None] = field(default_factory=list)
+    output_groups: dict[int, tuple[int, ...]] = field(default_factory=dict)
+    completed_groups: set[int] = field(default_factory=set)
+    accepted_groups: set[int] = field(default_factory=set)
+    group_buffers: dict[int, OutputBuffer] = field(default_factory=dict)
+    group_started_ns: dict[int, int] = field(default_factory=dict)
+    group_forward_stats: dict[int, list[ForwardStats]] = field(default_factory=dict)
+    group_component_us: dict[int, dict[str, int]] = field(default_factory=dict)
+    group_forward_indices: dict[int, dict[OperationIdentity, tuple[int, ...]]] = field(
+        default_factory=dict
+    )
+    group_registered: dict[int, bool] = field(default_factory=dict)
+    group_published: dict[int, bool] = field(default_factory=dict)
+    request_indexes: dict[int, int] = field(default_factory=dict)
+    group_products: dict[int, tuple[TensorPublication, ...]] = field(default_factory=dict)
+    group_stats: dict[int, ForwardStats] = field(default_factory=dict)
+    group_execution_us: dict[int, int] = field(default_factory=dict)
+    visible_groups: set[int] = field(default_factory=set)
+    retirement_requests: frozenset[RequestKey] = frozenset()
+    retirement_local_requests: frozenset[RequestKey] = frozenset()
+    retirement_buffers: frozenset[BufferId] = frozenset()
+    retained_buffers: frozenset[BufferId] = frozenset()
+    retirement_exports: tuple[BufferId, ...] = ()
+    retirement_releases: tuple[Future[None], ...] = ()
+    retirement_events: tuple[torch.cuda.Event, ...] = ()
+    retirement_cleaned: bool = False
+    sent_groups: set[int] = field(default_factory=set)
+    terminal_sent: bool = False
+    awaiting_poll: bool = False
+
+    def __post_init__(self) -> None:
+        self.outputs = [None] * len(self.batch.operations)
+        self.request_indexes = {
+            operation.request_key.request_id: index
+            for index, operation in enumerate(self.batch.operations)
+        }
+        groups: dict[tuple[object, str], list[int]] = {}
+        for index, operation in enumerate(self.batch.operations):
+            groups.setdefault((operation.kind, operation.entry), []).append(index)
+        self.output_groups = {
+            group: tuple(indexes) for group, indexes in enumerate(groups.values(), start=1)
+        }
+
+    def group_operations(self, group: int) -> tuple[ScheduledRequest, ...]:
+        """Borrow original operation values belonging to one completion group."""
+
+        return tuple(self.batch.operations[index] for index in self.output_groups[group])
+
+    def bind_outputs(
+        self, group: int, outputs: tuple[PendingOutput, ...], buffer: OutputBuffer, started_ns: int
+    ) -> None:
+        """Bind reserved outputs to original operation indexes before resource preparation."""
+
+        for index, output in zip(self.output_groups[group], outputs, strict=True):
+            operation = self.batch.operations[index]
+            if self.outputs[index] is not None:
+                raise RuntimeError("operation output is already reserved")
+            if (output.request_key, output.op_id) != (operation.request_key, operation.op_id):
+                raise invalid_descriptor("reserved output does not match its operation")
+            self.outputs[index] = output
+        self.group_buffers[group] = buffer
+        self.group_started_ns[group] = started_ns
+        self.group_forward_stats[group] = []
+        self.group_component_us[group] = {}
+        self.group_forward_indices[group] = {}
+        self.group_registered[group] = False
+        self.group_published[group] = False
+
+    def pending_outputs(self, group: int) -> tuple[PendingOutput, ...]:
+        """Borrow the currently executing outputs of one completion group."""
+
+        values = tuple(self.outputs[index] for index in self.output_groups[group])
+        if any(not isinstance(value, PendingOutput) for value in values):
+            raise RuntimeError("completion group has no reserved pending outputs")
+        return tuple(value for value in values if isinstance(value, PendingOutput))
+
+    def pending_output(self, group: int, request_id: int) -> PendingOutput:
+        index = self.request_indexes.get(int(request_id))
+        if index is None or index not in self.output_groups[group]:
+            raise invalid_descriptor(f"completion group has no request {request_id}")
+        value = self.outputs[index]
+        if not isinstance(value, PendingOutput):
+            raise RuntimeError("request has no reserved pending output")
+        return value
+
+    @property
+    def batch_id(self) -> int:
+        return int(self.batch.batch_id)
+
+    @property
+    def run_id(self) -> int:
+        return int(self.batch.run_id)
+
+    @property
+    def request_ids(self) -> frozenset[int]:
+        return frozenset(
+            key.request_id
+            for key in (
+                *(admission.request_key for admission in self.batch.admissions),
+                *(operation.request_key for operation in self.batch.operations),
+                *(command.request_key for command in self.batch.commands),
+            )
+        )
+
+    def inputs_ready(self) -> bool:
+        """Query physical readiness without submitting inputs or executing a model."""
+
+        return (
+            self.inputs_submitted
+            and all(dependency.done() for dependency in self.storage_dependencies)
+            and all(ticket.ready() for ticket in self.input_tickets())
+            and all(write.completion.done() for write in self.cache_imports.values())
+            and (
+                self.predicate_buffer is None
+                or self._predicate_values is not None
+                or (self.predicates_sealed and self.predicate_buffer.ready())
+            )
+        )
+
+    def predicate_values(self) -> dict[OperationIdentity, bool]:
+        """Read validated predicate scalars and index them by semantic product reference."""
+
+        buffer = self.predicate_buffer
+        if buffer is None:
+            return {}
+        if self._predicate_values is not None:
+            return self._predicate_values
+        if not buffer.ready():
+            raise RuntimeError("prepared predicates were observed before readiness")
+        values: dict[OperationIdentity, bool] = {}
+        generation = buffer.generation
+        try:
+            for identity, capture, row in sorted(
+                self.predicate_entries, key=lambda entry: entry[2]
+            ):
+                captured = buffer.read_tokens(*capture)
+                if len(captured) != 1 or captured[0] not in {0, 1}:
+                    raise invalid_descriptor("operation predicate is not a canonical boolean")
+                values[identity] = bool(captured[0])
+                buffer.observe(row, generation)
+        except BaseException:
+            buffer.abandon()
+            raise
+        self._predicate_values = values
+        return values
+
+    def on_dependencies_ready(self, callback: Callable[[], None]) -> None:
+        """Wake the owner once physical dependencies permit its next preparation step."""
+
+        tickets = tuple(self.input_tickets())
+        dependencies = self.storage_dependencies + tuple(
+            write.completion for write in self.cache_imports.values()
+        )
+        if self.predicate_buffer is not None and self.predicates_sealed:
+            dependencies += (self.predicate_buffer.completion_future(),)
+        if not tickets and not dependencies:
+            callback()
+            return
+        lock = Lock()
+        fired = False
+
+        def notify_if_ready() -> None:
+            nonlocal fired
+            if self.inputs_closed:
+                return
+            if not all(ticket.ready() for ticket in tickets) or not all(
+                dependency.done() for dependency in dependencies
+            ):
+                return
+            with lock:
+                if fired:
+                    return
+                fired = True
+            callback()
+
+        for ticket in tickets:
+            ticket.add_done_callback(notify_if_ready)
+        for dependency in dependencies:
+            dependency.add_done_callback(lambda _future: notify_if_ready())
+        notify_if_ready()
+
+    def input_tickets(self) -> Iterator[TransferTicket]:
+        """Borrow physical transfers from their actual storage reservations."""
+
+        for read in self.tensor_reads.values():
+            # Completed reads release their shared import. A callback registered
+            # after synchronous execution must not revive that retired dependency.
+            if read.imported is not None:
+                yield from read.imported.tickets
+        for write in self.latent_imports.values():
+            yield from write.transfers
+
+    def input_ready(self, buffer: BufferId) -> bool:
+        """Query one reserved input without publishing or consuming it."""
+
+        if (read := self.tensor_reads.get(buffer)) is not None:
+            return read.imported is None or all(ticket.ready() for ticket in read.imported.tickets)
+        if (latent := self.latent_imports.get(buffer)) is not None:
+            return all(ticket.ready() for ticket in latent.transfers)
+        if (cache := self.cache_imports.get(buffer)) is not None:
+            return cache.completion.done()
+        return False
+
+    def close_inputs(
+        self, tensor_store: TensorStore, latent_pool: LatentPool | None, kv_cache: KVCache | None
+    ) -> None:
+        """Release this submission's readers and unadopted physical destinations.
+
+        Shared tensor fills outlive cancellation while another read retains
+        them. Latent and cache owners retain cancelled writes until retirement.
+        """
+
+        if self.inputs_closed:
+            return
+        self.inputs_closed = True
+        actions: list[Callable[[], object]] = []
+        if self.latent_imports:
+            assert latent_pool is not None
+            actions.extend(
+                partial(latent_pool.abandon_import, write)
+                for write in self.latent_imports.values()
+                if not write.adopted
+            )
+        if self.cache_imports:
+            assert kv_cache is not None
+            actions.extend(
+                partial(kv_cache.imports.abandon, write)
+                for write in self.cache_imports.values()
+                if not write.released
+            )
+        if self.predicate_buffer is not None and self._predicate_values is None:
+            actions.append(self.predicate_buffer.abandon)
+        if self.tensor_reads:
+            actions.append(partial(tensor_store.complete_reads, tuple(self.tensor_reads.values())))
+        actions.extend(
+            ticket.close for write in self.latent_imports.values() for ticket in write.transfers
+        )
+        close_resources(*actions)
+
+    def record_outputs(
+        self,
+        group: int,
+        outputs: tuple[PendingOutput | RequestOutput, ...],
+        *,
+        products: tuple[TensorPublication, ...] = (),
+        visible: bool,
+        execution_us: int,
+        stats: ForwardStats,
+    ) -> None:
+        """Retain original operation outputs and statistics at their completion boundary."""
+
+        if group in self.group_stats:
+            raise RuntimeError("completion group was published more than once")
+        indexes = self.output_groups[group]
+        for index, output in zip(indexes, outputs, strict=True):
+            operation = self.batch.operations[index]
+            previous = self.outputs[index]
+            if (
+                isinstance(output, PendingOutput)
+                and previous is not None
+                and previous is not output
+            ):
+                raise RuntimeError("result replaced another reserved output")
+            if (output.request_key, output.op_id) != (operation.request_key, operation.op_id):
+                raise invalid_descriptor("result does not match its submitted operation")
+            self.outputs[index] = output
+        identities = {(output.request_key, output.op_id) for output in outputs}
+        if any(
+            (value.product.request_key, value.product.producer_op_id) not in identities
+            for value in products
+        ):
+            raise invalid_descriptor("product does not belong to its completion group")
+        self.group_products[group] = products
+        self.group_stats[group] = stats
+        self.group_execution_us[group] = execution_us
+        self.group_buffers.pop(group, None)
+        self.group_forward_indices.pop(group, None)
+        self.group_forward_stats.pop(group, None)
+        self.group_component_us.pop(group, None)
+        if visible:
+            self.visible_groups.add(group)
+
+    @property
+    def successors_ready(self) -> bool:
+        """Report actual successor visibility independently of host payload readiness."""
+
+        return self.complete or (
+            self.launched
+            and bool(self.outputs)
+            and all(
+                group in self.accepted_groups
+                or all(
+                    isinstance(output := self.outputs[index], PendingOutput)
+                    and output.successors_ready
+                    for index in indexes
+                )
+                for group, indexes in self.output_groups.items()
+            )
+        )
+
+    def ready(self) -> bool:
+        """Query whether the delivery position has a completed group or terminal error."""
+
+        if self.error is not None:
+            return not self.terminal_sent
+        return bool(self.completed_groups - self.sent_groups) or (
+            self.complete and not self.terminal_sent
+        )
+
+    def take_output(self) -> BatchOutput:
+        """Consume final values for one entry, preserving the final command fragment."""
+
+        if self.error is not None:
+            raise RuntimeError("terminal error must be consumed through take_error")
+        groups = tuple(
+            group
+            for group in self.output_groups
+            if group in self.completed_groups and group not in self.sent_groups
+        )
+        if groups:
+            entries = {
+                group: self.batch.operations[indexes[0]].entry
+                for group, indexes in self.output_groups.items()
+            }
+            entry = entries[groups[0]]
+            groups = tuple(group for group in groups if entries[group] == entry)
+            self.sent_groups.update(groups)
+            done = (
+                self.complete
+                and len(self.sent_groups) == len(self.output_groups)
+                and not any(isinstance(command, (Free, Finish)) for command in self.batch.commands)
+            )
+            self.terminal_sent = done
+            values: list[RequestOutput] = []
+            for group in groups:
+                for index in self.output_groups[group]:
+                    value = self.outputs[index]
+                    if not isinstance(value, RequestOutput):
+                        raise RuntimeError("batch delivery encountered an unmaterialized output")
+                    values.append(value)
+            successful = {
+                (value.request_key, value.op_id) for value in values if value.status is OpStatus.OK
+            }
+            return BatchOutput(
+                batch_id=self.batch_id,
+                run_id=self.run_id,
+                completions=tuple(values),
+                products=tuple(
+                    value
+                    for group in groups
+                    for value in self.group_products[group]
+                    if (value.product.request_key, value.product.producer_op_id) in successful
+                ),
+                registration=RegistrationAck(
+                    visible=all(group in self.visible_groups for group in groups)
+                ),
+                worker_exec_us=max(self.group_execution_us[group] for group in groups),
+                forward_stats=ForwardStats.combine(
+                    tuple(self.group_stats[group] for group in groups)
+                ),
+                done=done,
+            )
+        if self.complete and not self.terminal_sent:
+            self.terminal_sent = True
+            return BatchOutput(batch_id=self.batch_id, run_id=self.run_id, done=True)
+        raise RuntimeError("batch has no ready output")
+
+    def take_error(self) -> WorkerError:
+        error = self.error
+        if error is None or self.terminal_sent:
+            raise RuntimeError("batch has no unread terminal error")
+        self.terminal_sent = True
+        return error
+
+    def pending(self) -> bool:
+        return not self.terminal_sent
+
+    def close(
+        self, tensor_store: TensorStore, latent_pool: LatentPool | None, kv_cache: KVCache | None
+    ) -> None:
+        """Abandon delivery while physical readers retain their own resource leases."""
+
+        actions: list[Callable[[], object]] = [
+            partial(self.close_inputs, tensor_store, latent_pool, kv_cache)
+        ]
+        actions.extend(
+            output.abandon for output in self.outputs if isinstance(output, PendingOutput)
+        )
+        close_resources(*actions)

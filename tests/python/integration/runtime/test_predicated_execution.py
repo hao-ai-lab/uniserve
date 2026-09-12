@@ -7,6 +7,7 @@ from tests.python.fixtures.depth_one import (
     ar_params,
     diffusion_prepare_operation,
     execution_run,
+    finalized_report,
     kv_publication_operation,
     record_completion,
     root_parent,
@@ -14,7 +15,8 @@ from tests.python.fixtures.depth_one import (
     umm_params,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.execution.batch import (
+from uniserve_worker.models.stub import _next_token
+from uniserve_worker.protocol.batch import (
     ComputationId,
     DType,
     Finish,
@@ -28,8 +30,6 @@ from uniserve_worker.execution.batch import (
     ShapeBound,
     TensorRef,
 )
-from uniserve_worker.execution.output import finalize_run_result
-from uniserve_worker.models.stub import _next_token
 
 
 def _with_transition_predicate(
@@ -53,8 +53,9 @@ def _with_transition_predicate(
 
 
 def _release_relay_outputs(worker, *operations: ScheduledRequest) -> None:
-    finalize_run_result(
-        worker.execute(
+    finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=max(operation.op_id.batch_id for operation in operations) + 1,
                 commands=tuple(
@@ -68,7 +69,7 @@ def _release_relay_outputs(worker, *operations: ScheduledRequest) -> None:
                     if output is not None
                 ),
             )
-        )
+        ),
     )
 
 
@@ -103,14 +104,15 @@ def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> Non
         transition_output=transition,
     )
 
-    report = finalize_run_result(
-        worker.execute(
+    report = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=1,
                 admissions=(admission,),
                 operations=(operation,),
             )
-        )
+        ),
     )
 
     assert report.completions[0].status is OpStatus.OK
@@ -125,7 +127,7 @@ def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> Non
 def test_false_device_predicate_preserves_parent_cutoff_across_registered_descendants() -> None:
     worker = execution_worker(device="cpu", pipeline_depth=2)
     base = ar_params(51, block_ids=(0,))
-    admission = NewRequest.create(
+    admission = NewRequest(
         base.request_key,
         request_pool_idx=base.request_pool_idx,
         ar=replace(base.ar, finish_token_ids=(_next_token(4),)),
@@ -137,7 +139,7 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    parent_report = worker.execute(
+    parent_report = worker.submit(
         execution_run(
             run_id=1,
             admissions=(admission,),
@@ -153,14 +155,14 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         tokens=(0,),
         predicate=continuation,
     )
-    successor_report = worker.execute(
+    successor_report = worker.submit(
         execution_run(
             run_id=2,
             admissions=(),
             operations=(successor,),
         )
     )
-    successor_report = finalize_run_result(successor_report)
+    successor_report = finalized_report(worker, successor_report)
     successor_continuation = successor.token_output
     descendant = token_operation(
         admission.request_key,
@@ -170,14 +172,15 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         tokens=(0,),
         predicate=successor_continuation,
     )
-    descendant_report = finalize_run_result(
-        worker.execute(
+    descendant_report = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=3,
                 admissions=(),
                 operations=(descendant,),
             )
-        )
+        ),
     )
     completion = successor_report.completions[0]
     completion.validate()
@@ -185,7 +188,8 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
     descendant_completion = descendant_report.completions[0]
     descendant_completion.validate()
     assert descendant_completion.status is OpStatus.PREDICATED
-    parent_completion = finalize_run_result(parent_report).completions[0]
+    parent_report = finalized_report(worker, parent_report)
+    parent_completion = parent_report.completions[0]
     assert completion.position == parent_completion.position
     assert completion.kv_visible_len == parent_completion.kv_visible_len
     assert completion.kv_computed_len == parent_completion.kv_computed_len
@@ -205,19 +209,20 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         mode=ForwardMode.DECODE,
         tokens=(7,),
     )
-    later_completion = finalize_run_result(
-        worker.execute(
+    later_completion = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=5,
                 admissions=(),
                 operations=(later,),
             )
-        )
+        ),
     ).completions[0]
     assert later_completion.status is OpStatus.OK
     assert later_completion.position == parent_completion.position + 1
 
-    close_report = worker.execute(
+    close_report = worker.submit(
         execution_run(
             run_id=7,
             admissions=(),
@@ -229,6 +234,7 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
             ),
         )
     )
+    close_report = finalized_report(worker, close_report)
     assert close_report.completions == ()
 
 
@@ -236,7 +242,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     worker = execution_worker(device="cpu", pipeline_depth=2)
     generation = umm_params(52, ImageParams(steps=2, height=16, width=16, seed=29))
     understanding = ar_params(52, block_ids=(0,))
-    admission = NewRequest.create(
+    admission = NewRequest(
         understanding.request_key,
         request_pool_idx=understanding.request_pool_idx,
         ar=understanding.ar,
@@ -249,20 +255,21 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    initial_report = worker.execute(
+    initial_report = worker.submit(
         execution_run(
             run_id=1,
             admissions=(admission,),
             operations=(initial,),
         )
     )
+    initial_report = finalized_report(worker, initial_report)
     initial_observation = record_completion(initial, initial_report)
     publication, conditioning = kv_publication_operation(
         admission.request_key,
         op_id=ComputationId(2, 0),
         predecessor=initial_observation.op_id,
     )
-    worker.execute(
+    worker.submit(
         execution_run(
             run_id=2,
             operations=(publication,),
@@ -277,7 +284,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         tokens=(_next_token(4),),
     )
     predecessor = _with_transition_predicate(predecessor, 4_242)
-    parent_report = worker.execute(
+    parent_report = worker.submit(
         execution_run(
             run_id=3,
             operations=(predecessor,),
@@ -293,14 +300,17 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     candidate = replace(candidate, predicate=transition_predicate)
 
     candidate_batch = execution_run(run_id=4, operations=(candidate,))
-    prepared = worker.prepare_execute(candidate_batch)
+    prepared = worker.submit(candidate_batch)
     assert prepared is not None
     deadline = time.monotonic() + 1.0
-    while not prepared.ready() and time.monotonic() < deadline:
+    while not prepared.inputs_ready() and time.monotonic() < deadline:
+        worker.advance_inputs(prepared)
         time.sleep(0.0001)
-    assert prepared.ready()
-    candidate_report = finalize_run_result(worker.execute_prepared(prepared))
-    parent_completion = finalize_run_result(parent_report).completions[0]
+    assert prepared.inputs_ready()
+    prepared = finalized_report(worker, prepared)
+    candidate_report = prepared
+    parent_report = finalized_report(worker, parent_report)
+    parent_completion = parent_report.completions[0]
     candidate_completion = candidate_report.completions[0]
     assert candidate_completion.status is OpStatus.PREDICATED
     assert candidate_completion.position == parent_completion.position
@@ -317,14 +327,15 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         predecessor=parent_observation.op_id,
         conditioning=conditioning,
     )
-    selected_report = finalize_run_result(
-        worker.execute(
+    selected_report = finalized_report(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=5,
                 operations=(selected,),
                 commands=(),
             )
-        )
+        ),
     )
     assert selected_report.completions[0].status is OpStatus.OK
     assert selected_report.completions[0].product_generations

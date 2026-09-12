@@ -41,7 +41,7 @@ class CheckpointComponent:
     dtype: torch.dtype | None = None
     parameter_dtypes: tuple[tuple[str, torch.dtype], ...] = ()
     module_devices: tuple[tuple[str, torch.device], ...] = ()
-    persistent_buffers: bool = False
+    buffer_pool: bool = False
     strict: bool = True
     post_load: Callable[[Mapping[str, WeightHandle]], None] | None = None
 
@@ -74,7 +74,7 @@ class ModelBuildContext:
     def packed_decoder_layers(self, entry: str) -> LayerConfig:
         """Bind packed attention shards and resident layers to an execution entry."""
 
-        mesh = self.request.bindings.meshes.get(entry)
+        mesh = self.request.bindings[entry].mesh if entry in self.request.bindings else None
         if mesh is None:
             raise ValueError(f"packed decoder entry {entry!r} is not assigned to this rank")
         if mesh.parallel_config.sequence_parallel.kind not in {"local", "ulysses"}:

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use super::{RunSubmitError, WorkerGroup};
 use crate::executor::{
-    BatchResult, CommandOutcome, Executor, ExecutorInfo, ExecutorSubmitError, RequestPlacement,
-    ScheduleBatch, TransferConfig, WorkerFailure, WorkerId, logical_result, physical_run,
+    BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
+    RequestPlacement, TransferConfig, WorkerFailure, WorkerId, logical_result, physical_run,
 };
 use anyhow::Context;
 use uniserve_core::CommandWaker;
@@ -53,7 +53,7 @@ impl PendingBatch {
 
 #[derive(Clone)]
 struct WorkerSubmission {
-    batch: ScheduleBatch,
+    batch: ExecutionBatch,
     dependencies: Vec<BufferId>,
 }
 
@@ -104,7 +104,7 @@ impl WorkerSubmission {
                     .cloned()
                     .collect();
                 let mut batch =
-                    ScheduleBatch::new(batch_id, operations, Vec::new(), input_transfers);
+                    ExecutionBatch::new(batch_id, operations, Vec::new(), input_transfers);
                 batch.kv_inputs = kv_inputs
                     .iter()
                     .filter(|publication| consumed.contains(&publication.source))
@@ -1107,7 +1107,7 @@ impl Executor for WorkerExecutor {
     }
 
     /// Partitions a logical batch across owning workers and registers aggregate completion state.
-    fn submit(&mut self, batch: ScheduleBatch) -> Result<(), ExecutorSubmitError> {
+    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
         if self.closed {
             return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
                 "Executor is closed"

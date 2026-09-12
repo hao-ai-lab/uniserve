@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from uniserve_worker.execution.batch import ForwardMode
+from uniserve_worker.protocol.batch import ForwardMode
 
 from ..execution.forward_batch import (
     ForwardBatch,

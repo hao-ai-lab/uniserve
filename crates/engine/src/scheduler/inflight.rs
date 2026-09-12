@@ -28,7 +28,7 @@ pub(super) struct InflightOp {
 
 /// Completion held until earlier request operations are applied.
 pub(super) struct PendingCompletion {
-    pub(super) record: ModelOutput,
+    pub(super) record: uniserve_worker_ipc::RequestOutput,
     /// Claimed media storage stays alive while its result waits or is discarded.
     pub(super) media: Option<Arc<SharedMedia>>,
     pub(super) arrival_seq: u64,

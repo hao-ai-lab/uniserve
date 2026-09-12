@@ -14,20 +14,20 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as vision
 
-from uniserve_worker.execution.batch import PipelineStage
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.models.inputs import (
     ImageProcessor,
     PatchTransform,
     StrideResize,
 )
+from uniserve_worker.protocol.batch import PipelineStage
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedImage:
+class ImageInputs:
     """Holds normalized image pixels, patch-grid coordinates, and original media dimensions."""
 
     pixels: torch.Tensor
@@ -43,7 +43,7 @@ def prepare_image(
     encoded: str,
     *,
     device: torch.device,
-) -> PreparedImage:
+) -> ImageInputs:
     """Decode, resize, normalize, and stage one encoded image for the selected model tower."""
 
     image = _decode_rgb(encoded)
@@ -65,7 +65,7 @@ def prepare_image(
             .reshape(grid_height * grid_width, channels * patch * patch)
         )
         grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
-        return PreparedImage(
+        return ImageInputs(
             _stage(pixels, processor, device),
             grid.to(device=device, non_blocking=True),
             (grid_height, grid_width),
@@ -79,7 +79,7 @@ def prepare_image(
     height, width = canvas.height, canvas.width
     tower_image = _resize_stride(canvas, transform.resize)
     pixels = _normalize(tower_image, transform.normalization)
-    return PreparedImage(_stage(pixels, processor, device), None, None, height, width)
+    return ImageInputs(_stage(pixels, processor, device), None, None, height, width)
 
 
 def prepare_tensor_image(
@@ -89,7 +89,7 @@ def prepare_tensor_image(
     *,
     device: torch.device,
     signed_unit: bool,
-) -> PreparedImage:
+) -> ImageInputs:
     """Apply the declared image transform to an already decoded RGB tensor."""
 
     value = image.detach().to(dtype=torch.float32)
@@ -125,7 +125,7 @@ def prepare_tensor_image(
             .reshape(grid_height * grid_width, channels * patch * patch)
         )
         grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
-        return PreparedImage(
+        return ImageInputs(
             _stage(pixels, processor, device),
             grid.to(device=device, non_blocking=True),
             (grid_height, grid_width),
@@ -160,7 +160,7 @@ def prepare_tensor_image(
         )
     value = _resize_tensor(value, target_height, target_width)
     normalized = _normalize_tensor(value, transform.normalization)
-    return PreparedImage(
+    return ImageInputs(
         _stage(normalized, processor, device),
         None,
         None,
@@ -331,7 +331,7 @@ def _stage(value: torch.Tensor, processor: ImageProcessor, device: torch.device)
 
 
 __all__ = [
-    "PreparedImage",
+    "ImageInputs",
     "patch_grid_shape",
     "prepare_image",
     "prepare_tensor_image",

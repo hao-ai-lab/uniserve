@@ -8,11 +8,12 @@ from transformers import Qwen3Config
 from transformers.configuration_utils import PretrainedConfig
 
 __all__ = [
-    'NeoVisionConfig',
-    'NeoLlmConfig',
-    'build_neo_llm_config',
-    'NeoChatConfig',
+    "NeoVisionConfig",
+    "NeoLlmConfig",
+    "build_neo_llm_config",
+    "NeoChatConfig",
 ]
+
 
 def _vision_stage_scalar(value: Any, field_name: str) -> Any:
     """Normalize a vision config field that may be serialized per stage."""
@@ -34,9 +35,10 @@ def _ensure_layer_types(config: PretrainedConfig) -> None:
     existing = getattr(config, "layer_types", None)
     if existing and len(existing) == config.num_hidden_layers:
         return
-    use_swa = bool(getattr(config, "use_sliding_window", False)) and getattr(
-        config, "sliding_window", None
-    ) is not None
+    use_swa = (
+        bool(getattr(config, "use_sliding_window", False))
+        and getattr(config, "sliding_window", None) is not None
+    )
     max_window_layers = int(getattr(config, "max_window_layers", 0) or 0)
     config.layer_types = [
         "sliding_attention" if (use_swa and i >= max_window_layers) else "full_attention"
@@ -79,6 +81,7 @@ class NeoVisionConfig(PretrainedConfig):
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
 
+
 class NeoLlmConfig(Qwen3Config):
     """Normalizes decoder width, head, layer, expert, rotary, and vocabulary settings for SenseNova."""
 
@@ -92,7 +95,9 @@ class NeoLlmConfig(Qwen3Config):
 
         super().__init__(**kwargs)
         if not hasattr(self, "rope_theta"):
-            rope = getattr(self, "rope_parameters", None) or getattr(self, "rope_scaling", None) or {}
+            rope = (
+                getattr(self, "rope_parameters", None) or getattr(self, "rope_scaling", None) or {}
+            )
             self.rope_theta = rope.get("rope_theta", 10000.0) if isinstance(rope, dict) else 10000.0
         self.rope_theta_hw = rope_theta_hw
         self.max_position_embeddings_hw = max_position_embeddings_hw

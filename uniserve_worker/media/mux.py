@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import io
+from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
 from threading import RLock
@@ -10,11 +12,20 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
+from ..foundation.errors import invalid_descriptor
+from ..protocol.batch import ComputationId, MediaOutput, MediaTrack, PosixShmArtifact, RequestKey
+from .storage import publish_media_bytes
+
 if TYPE_CHECKING:
+    import torch
     from av.audio.stream import AudioStream
     from av.container.output import OutputContainer
     from av.packet import Packet
     from av.video.stream import VideoStream
+
+    from ..execution.output import OutputBuffer
+    from ..runtime.cpu import CpuTask
+    from .buffers import MediaLease
 
 __all__ = ["AvMuxConfig", "AvMuxSession", "require_media_codecs"]
 
@@ -247,3 +258,224 @@ class AvMuxSession:
             self._closed = True
         if not completed:
             self._buffer.close()
+
+
+@dataclass(slots=True)
+class MuxSession:
+    """Container and accepted track submissions for one request epoch.
+
+    Submission cursors are advanced by the execution thread. Encoder futures
+    preserve independent video/audio ordering until finalization consumes both.
+    """
+
+    container: AvMuxSession
+    video_tail: concurrent.futures.Future[object] | None = None
+    audio_tail: concurrent.futures.Future[object] | None = None
+    video_units: int = 0
+    audio_written: bool = False
+    finalized: bool = False
+
+
+class MediaMux:
+    """Request-indexed mux sessions with independent video and audio tails."""
+
+    def __init__(self, *, rank: int) -> None:
+        """Initialize per-request mux sessions and temporal overlap tails."""
+
+        self.rank = rank
+        self._sessions: dict[RequestKey, MuxSession] = {}
+
+    def open(self, request_key: RequestKey, *, geometry) -> None:
+        """Create the request-owned mux session for a validated output geometry."""
+
+        if request_key in self._sessions:
+            return
+        self._sessions[request_key] = MuxSession(
+            AvMuxSession(
+                AvMuxConfig(
+                    width=int(geometry.width),
+                    height=int(geometry.height),
+                    frame_count=int(geometry.frame_count),
+                    frame_rate=int(geometry.frame_rate),
+                    audio_rate=int(geometry.audio_rate),
+                    video_unit_frames=tuple(int(value) for value in geometry.unit_frames),
+                )
+            )
+        )
+
+    def validate_track(
+        self, request_key: RequestKey, track: MediaTrack, cursor: int, count: int
+    ) -> None:
+        """Reject duplicate tracks and temporal gaps before numerical assembly."""
+
+        session = self._sessions.get(request_key)
+        if session is None:
+            raise invalid_descriptor("media output has no active session")
+        if session.finalized:
+            raise invalid_descriptor("media output is already finalized")
+        if track is MediaTrack.VIDEO and (
+            cursor != session.video_units
+            or count < 1
+            or cursor + count > len(session.container.config.video_unit_frames)
+        ):
+            raise invalid_descriptor("video assembly requires the next temporal range")
+        if track is MediaTrack.AUDIO and session.audio_written:
+            raise invalid_descriptor("audio output is already written")
+
+    def _task(
+        self,
+        request_key: RequestKey,
+        reservation: CpuTask,
+        action: Callable[[AvMuxSession], object],
+        output: OutputBuffer | None,
+        dependencies: tuple[concurrent.futures.Future[object], ...],
+        ring_lease: MediaLease | None = None,
+        *,
+        profile_name: str,
+    ) -> CpuTask:
+        """Submit one ordered mux action and release its reservation and ring lease on completion."""
+
+        session = self._sessions.get(request_key)
+        if session is None:
+            raise RuntimeError("video mux session is not active")
+        return reservation.configure(
+            lambda: action(session.container),
+            dependencies=dependencies,
+            input_ready=None if output is None else output.ready,
+            input_completion=None if output is None else output.completion_future,
+            release=None if ring_lease is None else ring_lease.release,
+            profile_name=profile_name,
+        )
+
+    def video(
+        self,
+        request_key: RequestKey,
+        start_unit: int,
+        unit_count: int,
+        frames: torch.Tensor,
+        output: OutputBuffer,
+        reservation: CpuTask,
+        ring_lease: MediaLease,
+        operation_id: ComputationId,
+    ) -> CpuTask:
+        """Schedule ordered RGB frame encoding from a captured output-ring slot."""
+
+        self.validate_track(request_key, MediaTrack.VIDEO, start_unit, unit_count)
+        dependency = self._sessions[request_key].video_tail
+        task = self._task(
+            request_key,
+            reservation,
+            lambda session: session.write_video(start_unit, unit_count, frames.numpy()),
+            output,
+            () if dependency is None else (dependency,),
+            ring_lease,
+            profile_name=(
+                f"uniserve.video.mux request={_key_label(request_key)} "
+                f"op={operation_id} kind=video start_unit={start_unit} "
+                f"unit_count={unit_count} rank={self.rank}"
+            ),
+        )
+        self._sessions[request_key].video_tail = task.promise
+        self._sessions[request_key].video_units += unit_count
+        return task
+
+    def audio(
+        self,
+        request_key: RequestKey,
+        pcm: torch.Tensor,
+        output: OutputBuffer,
+        reservation: CpuTask,
+        ring_lease: MediaLease,
+        operation_id: ComputationId,
+    ) -> CpuTask:
+        """Schedule PCM encoding from a captured output-ring slot."""
+
+        self.validate_track(request_key, MediaTrack.AUDIO, 0, 1)
+        dependency = self._sessions[request_key].audio_tail
+        task = self._task(
+            request_key,
+            reservation,
+            lambda session: session.write_audio(
+                pcm.numpy().reshape(-1).view(np.int16).reshape(-1, 2)
+            ),
+            output,
+            () if dependency is None else (dependency,),
+            ring_lease,
+            profile_name=(
+                f"uniserve.video.mux request={_key_label(request_key)} "
+                f"op={operation_id} kind=audio rank={self.rank}"
+            ),
+        )
+        self._sessions[request_key].audio_tail = task.promise
+        self._sessions[request_key].audio_written = True
+        return task
+
+    def finalize_artifact(
+        self,
+        request_key: RequestKey,
+        reservation: CpuTask,
+        operation_id: ComputationId,
+    ) -> CpuTask:
+        """Schedule mux finalization and shared-memory publication after all segment jobs."""
+
+        state = self._sessions.get(request_key)
+        if (
+            state is None
+            or state.video_units != len(state.container.config.video_unit_frames)
+            or not state.audio_written
+            or state.finalized
+        ):
+            raise invalid_descriptor("media finalization requires both completed output tracks")
+        dependencies = tuple(
+            tail
+            for tail in (
+                self._sessions[request_key].video_tail,
+                self._sessions[request_key].audio_tail,
+            )
+            if tail is not None
+        )
+
+        def publish(session: AvMuxSession) -> MediaOutput:
+            """Close the container and publish its final bytes after both tracks."""
+
+            payload = session.close()
+            name = publish_media_bytes(payload)
+            return MediaOutput(
+                handle=PosixShmArtifact(name=name),
+                bytes=len(payload),
+            )
+
+        task = self._task(
+            request_key,
+            reservation,
+            publish,
+            None,
+            dependencies,
+            profile_name=(
+                f"uniserve.video.mux request={_key_label(request_key)} "
+                f"op={operation_id} kind=artifact rank={self.rank}"
+            ),
+        )
+        state.finalized = True
+        return task
+
+    def drop(self, request_id: int) -> None:
+        """Abort and remove every mux session owned by a request identifier."""
+
+        selected = [key for key in self._sessions if key.request_id == int(request_id)]
+        for key in selected:
+            session = self._sessions.pop(key)
+            session.container.abort()
+
+    def close(self) -> None:
+        """Abort all active mux sessions and reject new media work."""
+
+        for session in self._sessions.values():
+            session.container.abort()
+        self._sessions.clear()
+
+
+def _key_label(request_key: RequestKey) -> str:
+    """Format a stable request key for media task profiling."""
+
+    return f"{request_key.engine_id}:{request_key.request_id}:{request_key.request_epoch}"

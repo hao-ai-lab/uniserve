@@ -7,40 +7,46 @@ from threading import Event
 import pytest
 import torch
 
-from uniserve_worker.execution.batch import (
+from uniserve_worker.execution.output import OutputBuffer, OutputPool
+from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.protocol.batch import (
+    Bounds,
     BufferAllocation,
     BufferId,
     ComputationId,
     DType,
+    ImageParams,
+    LatentParams,
+    NewRequest,
+    PipelineStage,
     RequestKey,
+    ScheduledRequest,
     ShapeBound,
     StaticDim,
     TensorRef,
+    UmmRequestParams,
 )
-from uniserve_worker.execution.output import CpuJob, OutputPool
-from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.runtime.cache_pool import CachePool
+from uniserve_worker.runtime.buffer_pool import BufferPool
 from uniserve_worker.runtime.cpu import CpuPool
-from uniserve_worker.runtime.device_events import DeviceEventPool
-from uniserve_worker.runtime.device_products import DeviceProducts
-from uniserve_worker.runtime.encoder_cache import EncoderCache, EncoderMetadata
+from uniserve_worker.runtime.device_events import EventPool
+from uniserve_worker.runtime.kv_cache import KVCache
 from uniserve_worker.runtime.latent_pool import LatentPool
-from uniserve_worker.runtime.persistent_buffers import PersistentBuffers
+from uniserve_worker.runtime.request import RequestPool
+from uniserve_worker.runtime.tensor_store import FeatureMetadata, TensorStore
 from uniserve_worker.transfer.layout import TensorRegion
 from uniserve_worker.transfer.tickets import make_transport
 
 
 def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() -> None:
     pool = CpuPool(capacity=2, workers=1)
-    predecessor = CpuJob(pool.reserve(), lambda: 1, profile_name="output.predecessor")
-    successor = CpuJob(
-        pool.reserve(),
+    predecessor = pool.reserve().configure(lambda: 1, profile_name="output.predecessor")
+    successor = pool.reserve().configure(
         lambda: 2,
         dependencies=(predecessor.promise,),
         profile_name="output.successor",
     )
     try:
-        successor.start()
+        successor.submit_if_ready()
         predecessor.abandon()
         with pytest.raises(CancelledError):
             successor.promise.result(timeout=5)
@@ -63,7 +69,7 @@ def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
     )
     second = replace(reference, producer_op_id=ComputationId(2, 0))
     third = replace(reference, producer_op_id=ComputationId(3, 0))
-    buffers = PersistentBuffers(byte_capacity=512, devices=("cpu",), compact=True)
+    buffers = BufferPool(byte_capacity=512, devices=("cpu",), compact=True)
     first_binding = buffers.bind(
         reference,
         BufferAllocation(reference.buffer_id, 4096, 512),
@@ -122,7 +128,7 @@ def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
 def test_kv_computation_retains_pages_through_output_completion_and_reuse(
     device: str, abandoned: bool
 ) -> None:
-    cache = CachePool(
+    cache = KVCache(
         num_layers=1,
         num_pages=3,
         page_size=4,
@@ -131,7 +137,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
         dtype=torch.float32,
         device=device,
     )
-    events = DeviceEventPool()
+    events = EventPool()
     outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
     request = RequestKey(1, 1, 1)
     values = torch.arange(1, 5, dtype=torch.float32, device=device).reshape(4, 1, 1)
@@ -179,7 +185,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
         assert cache.retirement_ready(requests=(request,))
         if not abandoned:
             assert output.ready()
-            assert output.read_tokens(capture) == (6,)
+            assert output.read_tokens(*capture) == (6,)
             output.abandon()
         assert completion.done()
         assert cache.retirement_ready(requests=(request,))
@@ -207,7 +213,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
 
 @pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
 def test_fp8_kv_append_preserves_page_scales_until_page_reuse(device: str) -> None:
-    pool = CachePool(
+    pool = KVCache(
         num_layers=2,
         num_pages=4,
         page_size=4,
@@ -248,10 +254,10 @@ def test_fp8_kv_append_preserves_page_scales_until_page_reuse(device: str) -> No
 
 
 def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reuse() -> None:
-    events = DeviceEventPool()
+    events = EventPool()
     outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
     transport = make_transport("local", byte_capacity=4096, ticket_capacity=2, event_pool=events)
-    pool = CachePool(
+    pool = KVCache(
         num_layers=1,
         num_pages=5,
         page_size=4,
@@ -333,20 +339,18 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
 
 @pytest.mark.parametrize("storage", ("encoder", "tensor"))
 def test_free_retains_an_acquired_consumer_until_it_records_completion(storage: str) -> None:
-    events = DeviceEventPool()
-    buffers = PersistentBuffers(byte_capacity=16, devices=("cpu",))
+    events = EventPool()
+    buffers = BufferPool(byte_capacity=16, devices=("cpu",))
     store = (
-        EncoderCache(
+        TensorStore(
             entry_capacity=1,
             max_entry_bytes=16,
             devices=("cpu",),
-            persistent_buffers=buffers,
+            buffer_pool=buffers,
             event_pool=events,
         )
         if storage == "encoder"
-        else DeviceProducts(
-            capacity=1, byte_capacity=1, persistent_buffers=buffers, event_pool=events
-        )
+        else TensorStore(capacity=1, byte_capacity=1, buffer_pool=buffers, event_pool=events)
     )
     product = TensorRef(
         request_key=RequestKey(1, 1, 1),
@@ -359,31 +363,33 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(storage: 
     replacement = replace(product, generation=2)
     value = torch.arange(4, dtype=torch.float32)
     try:
-        write = store.bind_outputs(
+        reserve = store.reserve_features if storage == "encoder" else store.bind_outputs
+        write = reserve(
             ((product, "cpu"),),
             buffer_allocations={product.buffer_id: BufferAllocation(product.buffer_id, 0, 16)},
         )[0]
-        if isinstance(store, EncoderCache):
-            store.publish(write, value, EncoderMetadata(height=1, width=4))
-        else:
-            store.publish_write(write, value)
+        store.publish_write(
+            write,
+            value,
+            metadata=FeatureMetadata(height=1, width=4) if storage == "encoder" else None,
+        )
         store.commit_writes((write,))
         store.release_requests((product.request_key,), retained=frozenset((product.buffer_id,)))
         read = store.consume(product, consumer_op_id=ComputationId(2, 0))
         store.release_buffers((product.buffer_id,))
         with pytest.raises(WorkerError):
-            store.bind_outputs(
+            reserve(
                 ((replacement, "cpu"),),
                 buffer_allocations={
                     replacement.buffer_id: BufferAllocation(replacement.buffer_id, 0, 16)
                 },
             )
         torch.testing.assert_close(read.tensor, value, rtol=0, atol=0)
-        store.record_readers((read,))
+        store.complete_reads((read,))
         # Completion recording is idempotent, including the ordinary lane
         # cleanup that follows a read already fenced by its output producer.
-        store.record_readers((read,))
-        reused = store.bind_outputs(
+        store.complete_reads((read,))
+        reused = reserve(
             ((replacement, "cpu"),),
             buffer_allocations={
                 replacement.buffer_id: BufferAllocation(replacement.buffer_id, 0, 16)
@@ -397,11 +403,9 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(storage: 
 
 
 def test_tensor_publication_enforces_its_logical_region_and_representation() -> None:
-    buffers = PersistentBuffers(byte_capacity=24, devices=("cpu",))
-    events = DeviceEventPool()
-    store = DeviceProducts(
-        capacity=1, byte_capacity=16, persistent_buffers=buffers, event_pool=events
-    )
+    buffers = BufferPool(byte_capacity=24, devices=("cpu",))
+    events = EventPool()
+    store = TensorStore(capacity=1, byte_capacity=16, buffer_pool=buffers, event_pool=events)
     reference = TensorRef(
         request_key=RequestKey(1, 1, 1),
         producer_op_id=ComputationId(1, 0),
@@ -432,7 +436,7 @@ def test_tensor_publication_enforces_its_logical_region_and_representation() -> 
         read = store.consume(reference, consumer_op_id=ComputationId(2, 0))
         assert read.region == region
         torch.testing.assert_close(read.tensor, expected, rtol=0, atol=0)
-        store.record_readers((read,))
+        store.complete_reads((read,))
     finally:
         store.close()
         buffers.close()
@@ -440,7 +444,7 @@ def test_tensor_publication_enforces_its_logical_region_and_representation() -> 
 
 
 def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport("local", byte_capacity=4096, ticket_capacity=1, event_pool=events)
     pool = LatentPool(
         request_pool_size=2,
@@ -464,20 +468,31 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
         write = pool.reserve_import(
             product, request_pool_idx=1, page_table=(3, 1, 4), latent_units=11
         )
-        with pytest.raises(WorkerError, match="no committed trajectory"):
-            pool.snapshot(request_pool_idx=1, page_table=(3, 1, 4))
+        staging = pool.stage(((3, 1, 4),), (11,))[0]
+        with pytest.raises(WorkerError, match="committed trajectory"):
+            pool.gather_current(
+                1, staging, generation=3, step=2, latent_units=11, height=16, width=176
+            )
         ticket = transport.fetch(locator, device=torch.device("cpu"), destination=write.spans)
         pool.retain_transfer(write, ticket)
         ready = Event()
         ticket.add_done_callback(ready.set)
         assert ready.wait(5)
         pool.adopt_import(write, generation=3, step=2, height=16, width=176)
-        snapshot = pool.snapshot(request_pool_idx=1, page_table=(3, 1, 4))
-        assert (snapshot.generation, snapshot.step, snapshot.latent_units) == (3, 2, 11)
-        assert (snapshot.height, snapshot.width) == (16, 176)
-        torch.testing.assert_close(snapshot.value, expected, rtol=0, atol=0)
+        actual = pool.gather_current(
+            1, staging, generation=3, step=2, latent_units=11, height=16, width=176
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         with pytest.raises(WorkerError, match="page table does not match"):
-            pool.snapshot(request_pool_idx=1, page_table=(1, 3, 4))
+            pool.gather_current(
+                1,
+                pool.stage(((1, 3, 4),), (11,))[0],
+                generation=3,
+                step=2,
+                latent_units=11,
+                height=16,
+                width=176,
+            )
         retired = Event()
         ticket.add_retirement_callback(retired.set)
         assert retired.wait(5)
@@ -496,11 +511,49 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
         events.close()
 
 
-@pytest.mark.parametrize("committed", (False, True))
-def test_published_latent_bank_waits_for_every_reader_before_reuse(committed: bool) -> None:
-    from uniserve_worker.runtime.latent_pool import LatentPublication
+@pytest.fixture
+def latent_output():
+    """Prepare real operation outputs used by the public latent commit interface."""
 
-    events = DeviceEventPool()
+    events = EventPool()
+    outputs = []
+
+    def create(slot, pages, units, height, width):
+        requests = RequestPool(max_request_pool_size=slot)
+        key = RequestKey(1, slot, 1)
+        operation = ScheduledRequest(
+            request_key=key,
+            op_id=ComputationId(1, 0),
+            predecessor=ComputationId(0, 0),
+            kind=PipelineStage.LATENT_PREPARATION,
+            bounds=Bounds(),
+        )
+        requests.start(
+            NewRequest(
+                key,
+                request_pool_idx=slot,
+                umm=UmmRequestParams(ImageParams(height=height, width=width)),
+            )
+        )
+        buffer = OutputBuffer(1, token_capacity=1, event_pool=events)
+        (output,) = requests.create_outputs((operation,), (slot,), buffer)
+        output.latent_params = LatentParams(key, operation.op_id, pages, units, height, width, 0, 0)
+        output.latent_generation = 1
+        outputs.append(output)
+        return output
+
+    yield create
+    for output in outputs:
+        output.abandon()
+    events.close()
+
+
+@pytest.mark.parametrize("committed", (False, True))
+def test_published_latent_bank_waits_for_every_reader_before_reuse(
+    committed: bool, latent_output
+) -> None:
+
+    events = EventPool()
     transport = make_transport("local", byte_capacity=4096, ticket_capacity=4, event_pool=events)
     pool = LatentPool(
         request_pool_size=2,
@@ -520,15 +573,15 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(committed: bo
     )
     pages = (3, 1, 4)
     staging = pool.stage((pages,), (11,))[0]
-    commit = LatentPublication(1, pages, 0, 0, 1, 0, 11, 16, 176)
+    commit = latent_output(1, pages, 11, 16, 176)
     locations = []
     readers = []
     try:
         staging.value.fill_(1)
         pool.initialize(1, staging, latent_units=11)
         if committed:
-            pool.validate_commit((commit,), ())
-            pool.apply_commit((commit,), ())
+            pool.validate_updates((commit,))
+            pool.apply_updates((commit,))
             source = pool.reserve_current_publication(
                 product,
                 request_pool_idx=1,
@@ -552,8 +605,8 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(committed: bo
             offset += span.shape[0]
         borrowed = tuple(reader.result() for reader in readers)
         if not committed:
-            pool.validate_commit((commit,), ())
-            pool.apply_commit((commit,), ())
+            pool.validate_updates((commit,))
+            pool.apply_updates((commit,))
 
         # The next step uses the other bank and can proceed during fan-out.
         staging.value.fill_(2)
@@ -566,13 +619,18 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(committed: bo
             height=16,
             width=176,
         )
-        second = replace(commit, expected_generation=1, generation=2, step=1)
-        pool.validate_commit((second,), ())
-        pool.apply_commit((second,), ())
+        second = latent_output(1, pages, 11, 16, 176)
+        second.latent_expected_generation = 1
+        second.latent_generation = 2
+        second.latent_step = 1
+        pool.validate_updates((second,))
+        pool.apply_updates((second,))
         for value in borrowed:
             torch.testing.assert_close(value, torch.ones_like(value), rtol=0, atol=0)
         torch.testing.assert_close(
-            pool.snapshot(request_pool_idx=1, page_table=pages).value,
+            pool.gather_current(
+                1, staging, generation=2, step=1, latent_units=11, height=16, width=176
+            ),
             torch.full((11, 4), 2.0),
             rtol=0,
             atol=0,
@@ -609,11 +667,17 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(committed: bo
             height=16,
             width=176,
         )
-        third = replace(second, expected_generation=2, expected_step=1, generation=3, step=2)
-        pool.validate_commit((third,), ())
-        pool.apply_commit((third,), ())
+        third = latent_output(1, pages, 11, 16, 176)
+        third.latent_expected_generation = 2
+        third.latent_expected_step = 1
+        third.latent_generation = 3
+        third.latent_step = 2
+        pool.validate_updates((third,))
+        pool.apply_updates((third,))
         torch.testing.assert_close(
-            pool.snapshot(request_pool_idx=1, page_table=pages).value,
+            pool.gather_current(
+                1, staging, generation=3, step=2, latent_units=11, height=16, width=176
+            ),
             torch.full((11, 4), 3.0),
             rtol=0,
             atol=0,
@@ -628,16 +692,16 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(committed: bo
         events.close()
 
 
-def test_failed_latent_publication_retains_its_pages_without_poisoning_other_requests() -> None:
+def test_failed_latent_publication_retains_its_pages_without_poisoning_other_requests(
+    latent_output,
+) -> None:
     import hashlib
     import json
     import socket
     from contextlib import suppress
     from multiprocessing import shared_memory
 
-    from uniserve_worker.runtime.latent_pool import LatentPublication
-
-    events = DeviceEventPool()
+    events = EventPool()
     transport = make_transport("shm", byte_capacity=4096, ticket_capacity=2, event_pool=events)
     pool = LatentPool(
         request_pool_size=2,
@@ -662,9 +726,9 @@ def test_failed_latent_publication_retains_its_pages_without_poisoning_other_req
     locator = transport.publish(source.spans[0])
     retirement = transport.publication_retirement(locator)
     pool.retain_publication(source, retirement)
-    commit = LatentPublication(1, (1,), 0, 0, 1, 0, 4, 16, 64)
-    pool.validate_commit((commit,), ())
-    pool.apply_commit((commit,), ())
+    commit = latent_output(1, (1,), 4, 16, 64)
+    pool.validate_updates((commit,))
+    pool.apply_updates((commit,))
     try:
         descriptor = locator.to_mapping()
         digest = hashlib.sha256(
@@ -698,11 +762,13 @@ def test_failed_latent_publication_retains_its_pages_without_poisoning_other_req
         independent = pool.stage(((2,),), (4,))[0]
         independent.value.fill_(7)
         pool.initialize(2, independent, latent_units=4)
-        next_commit = replace(commit, request_pool_idx=2, page_table=(2,))
-        pool.validate_commit((next_commit,), ())
-        pool.apply_commit((next_commit,), ())
+        next_commit = latent_output(2, (2,), 4, 16, 64)
+        pool.validate_updates((next_commit,))
+        pool.apply_updates((next_commit,))
         torch.testing.assert_close(
-            pool.snapshot(request_pool_idx=2, page_table=(2,)).value,
+            pool.gather_current(
+                2, independent, generation=1, step=0, latent_units=4, height=16, width=64
+            ),
             torch.full((4, 4), 7.0),
             rtol=0,
             atol=0,
@@ -724,12 +790,12 @@ def test_failed_latent_publication_retains_its_pages_without_poisoning_other_req
 
 @pytest.mark.gpu
 def test_media_capture_releases_capacity_after_its_completion_fence():
-    from uniserve_worker.execution.video import VideoOutputRing
+    from uniserve_worker.media.buffers import MediaBuffers
     from uniserve_worker.models.video import VideoOutputGeometry
 
-    events = DeviceEventPool()
+    events = EventPool()
     outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
-    ring = VideoOutputRing(
+    ring = MediaBuffers(
         state_slots=1,
         unresolved_window=1,
         max_video_frames_per_round=1,
@@ -739,12 +805,12 @@ def test_media_capture_releases_capacity_after_its_completion_fence():
     try:
         output = outputs.acquire(1, token_capacity=8, devices=("cuda:0",))
         value = torch.arange(12, dtype=torch.uint8, device="cuda:0")
-        capture = output.capture_bytes_into(value, lease.storage)
-        lease.defer_until_ready(capture.buffer.completion_future())
+        output.capture_bytes_into(value, lease.storage)
+        lease.defer_until_ready(output.completion_future())
         with pytest.raises(WorkerError, match="output ring is exhausted"):
             ring.reserve("video")
         # Closing the output owner completes its copy and retires the borrowed
-        # ring capacity even while both the lease and capture remain referenced.
+        # ring capacity even while the lease remains referenced.
         outputs.close()
         replacement = ring.reserve("video")
         try:
@@ -756,3 +822,41 @@ def test_media_capture_releases_capacity_after_its_completion_fence():
     finally:
         outputs.close()
         events.close()
+
+
+def test_latent_staging_preserves_live_trajectories(latent_output) -> None:
+    pool = LatentPool(
+        request_pool_size=2,
+        num_pages=5,
+        page_units=4,
+        latent_width=4,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    try:
+        first = pool.stage(((3, 1),), (7,))[0]
+        first.value.fill_(7)
+        second = pool.stage(((4, 2),), (7,), occupied=(first,))[0]
+        second.value.fill_(9)
+        with pytest.raises(WorkerError, match="overlap"):
+            pool.stage(((1,),), (4,), occupied=(first, second))
+
+        # Both consumers run after both inputs were staged. Their original
+        # values and page order must survive staging an independent operation.
+        pool.initialize(1, first, latent_units=7)
+        pool.initialize(2, second, latent_units=7)
+        updates = (
+            latent_output(1, (3, 1), 7, 16, 112),
+            latent_output(2, (4, 2), 7, 16, 112),
+        )
+        pool.validate_updates(updates)
+        pool.apply_updates(updates)
+        for slot, staging, expected in ((1, first, 7), (2, second, 9)):
+            actual = pool.gather_current(
+                slot, staging, step=0, generation=1, latent_units=7, height=16, width=112
+            )
+            torch.testing.assert_close(
+                actual, torch.full((7, 4), expected), rtol=0, atol=0, check_dtype=False
+            )
+    finally:
+        pool.close()

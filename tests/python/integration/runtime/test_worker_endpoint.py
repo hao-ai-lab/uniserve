@@ -1,5 +1,3 @@
-from uniserve_worker.execution.batch import ComputationId, ForwardMode
-
 """Endpoint ownership across real native IPC and worker launch failures."""
 
 import json
@@ -10,6 +8,7 @@ import pytest
 from uniserve_worker.bootstrap.cli import parse_worker_args
 from uniserve_worker.bootstrap.ipc import WorkerIpcEndpoint
 from uniserve_worker.bootstrap.launch import run_worker
+from uniserve_worker.protocol.batch import ComputationId, ForwardMode
 
 pytestmark = pytest.mark.integration
 
@@ -213,7 +212,7 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
     )
     from tests.python.fixtures.execution_worker import execution_worker
     from uniserve_worker.config import LaneConfig, WorkerConfig
-    from uniserve_worker.execution.batch import COMPUTATIONS, OpStatus
+    from uniserve_worker.protocol.batch import COMPUTATIONS, OpStatus
 
     policy = WorkerConfig(
         prefill_cuda_graph=False,
@@ -273,13 +272,14 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
             tokens=(3, 4),
         )
         result = finalized_report(
-            worker.execute(
+            worker,
+            worker.submit(
                 execution_run(
                     run_id=1,
                     admissions=(admission,),
                     operations=(operation,),
                 )
-            )
+            ),
         )
         assert result.completions[0].status is OpStatus.OK
         assert result.completions[0].committed_tokens

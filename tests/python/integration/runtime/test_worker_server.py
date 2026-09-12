@@ -14,20 +14,20 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
-from uniserve_worker.execution.batch import (
+from uniserve_worker.protocol.batch import (
     ComputationId,
     Finish,
     ForwardMode,
     NewRequest,
     RequestKey,
-    Run,
+    ScheduleBatch,
     ScheduledRequest,
 )
 
 pytestmark = pytest.mark.integration
 
 
-def _request(call_id: int, run: Run) -> dict[str, object]:
+def _request(call_id: int, run: ScheduleBatch) -> dict[str, object]:
     return {"kind": "submit", "call_id": call_id, "run": run}
 
 
@@ -37,7 +37,7 @@ def _token_run(
     op_id: ComputationId,
     run_id: int,
     tokens: tuple[int, ...],
-) -> tuple[NewRequest, ScheduledRequest, Run]:
+) -> tuple[NewRequest, ScheduledRequest, ScheduleBatch]:
     admission = ar_params(request_id, block_ids=(request_id,))
     operation = token_operation(
         admission.request_key,
@@ -215,7 +215,7 @@ def test_unbound_run_failure_closes_worker_at_scope_exit() -> None:
     with pytest.raises(RuntimeError, match="closed"):
         worker.bind(QueuedWorkerIpc())
     with pytest.raises(RuntimeError, match="closed"):
-        worker.execute(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
+        worker.submit(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
     worker.close()
 
 
@@ -241,7 +241,7 @@ def test_service_is_single_use_and_scope_exit_prevents_reuse() -> None:
         with pytest.raises(RuntimeError, match="closed"):
             action()
     with pytest.raises(RuntimeError, match="closed"):
-        worker.execute(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
+        worker.submit(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
     worker.close()
 
 
@@ -316,7 +316,7 @@ def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
     assert endpoint.responses == []
     assert not endpoint.closed
     with pytest.raises(RuntimeError, match="closed"):
-        worker.execute(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
+        worker.submit(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
     if cleanup_failure:
         assert any("executor shutdown failed" in note for note in failure.__notes__)
 
@@ -343,7 +343,7 @@ def test_transport_failure_releases_worker_and_restores_gc(gc_enabled: bool) -> 
         assert gc.isenabled() == gc_enabled
         assert not endpoint.closed
         with pytest.raises(RuntimeError, match="closed"):
-            worker.execute(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
+            worker.submit(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
     finally:
         (gc.enable if was_enabled else gc.disable)()
         worker.close()

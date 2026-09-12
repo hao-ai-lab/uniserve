@@ -1,7 +1,7 @@
 """Paged attention planning and replay with changing logical rows and physical pages."""
 
+from dataclasses import replace
 from itertools import accumulate
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
+from uniserve_worker.execution.forward_batch import AttentionMetadata, AttentionMode
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -24,8 +25,13 @@ def test_paged_prefill_replay_tracks_lengths_and_page_remapping(causal):
     query = torch.randn((259, query_heads, width), dtype=dtype, device=device)
     keys = torch.randn((16, page_size, kv_heads, width), dtype=dtype, device=device)
     values = torch.randn_like(keys)
-    context = SimpleNamespace(
-        binding=None,
+    context = AttentionMetadata(
+        attention_mode=AttentionMode.PAGED_VARLEN,
+        prefix_lens=torch.empty(3, dtype=torch.int32, device=device),
+        out_cache_loc=torch.zeros(259, dtype=torch.int64, device=device),
+        has_cache_writes=False,
+        causal=causal,
+        binding=0,
         block_table=torch.empty((3, 6), dtype=torch.int32, device=device),
         cu_seqlens_q=torch.empty(4, dtype=torch.int32, device=device),
         cu_seqlens_k=torch.empty(4, dtype=torch.int32, device=device),
@@ -47,9 +53,15 @@ def test_paged_prefill_replay_tracks_lengths_and_page_remapping(causal):
     )
 
     def stage(query_lens, seq_lens, pages):
-        context.query_lens_cpu = query_lens
-        context.seq_lens_cpu = seq_lens
+        nonlocal context
+        prefix_lens = tuple(
+            total - query for total, query in zip(seq_lens, query_lens, strict=True)
+        )
+        context = replace(
+            context, query_lens_cpu=query_lens, seq_lens_cpu=seq_lens, prefix_lens_cpu=prefix_lens
+        )
         for name, data in (
+            ("prefix_lens", prefix_lens),
             ("query_lens", query_lens),
             ("seq_lens", seq_lens),
             ("cu_seqlens_q", tuple(accumulate(query_lens, initial=0))),
@@ -109,7 +121,7 @@ def test_paged_prefill_replay_tracks_lengths_and_page_remapping(causal):
 
     stage(*layouts[0])
     torch.testing.assert_close(execute(), reference(*layouts[0]), rtol=2e-2, atol=2e-2)
-    context.binding = 618
+    context = replace(context, binding=618)
     backend.bind_paged_prefill_graph_wrapper(context.binding, context, device=device)
     graph = torch.cuda.CUDAGraph()
     try:

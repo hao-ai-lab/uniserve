@@ -14,7 +14,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
-    from uniserve_worker.execution.batch import ComputationId
+    from uniserve_worker.protocol.batch import ComputationId
 
 __all__ = [
     "WorkerErrorCode",

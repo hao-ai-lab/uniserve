@@ -5,10 +5,10 @@ from __future__ import annotations
 import torch
 
 __all__ = [
-    'patchify',
-    'patchify_batch',
-    'unpatchify_batch',
-    'build_abs_positions_from_grid_hw',
+    "patchify",
+    "patchify_batch",
+    "unpatchify_batch",
+    "build_abs_positions_from_grid_hw",
 ]
 
 
@@ -24,7 +24,9 @@ def patchify(image: torch.Tensor, patch_size: int) -> torch.Tensor:
     return image.reshape(-1, p * p * c)
 
 
-def patchify_batch(images: torch.Tensor, patch_size: int, *, channel_first: bool = False) -> torch.Tensor:
+def patchify_batch(
+    images: torch.Tensor, patch_size: int, *, channel_first: bool = False
+) -> torch.Tensor:
     """Convert ``(N,3,H,W)`` images into ``(N,L,patch_size**2*3)`` patch rows."""
 
     p = int(patch_size)

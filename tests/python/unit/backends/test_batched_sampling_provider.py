@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.execution.top_k_sampling import SamplingParameters, sample_top_k
+from uniserve_worker.execution.top_k_sampling import sample_top_k
 
 pytestmark = pytest.mark.unit
 
@@ -13,24 +13,10 @@ pytestmark = pytest.mark.unit
 def _reference(
     logits: torch.Tensor,
     draws: torch.Tensor,
-    penalty_token_ids: torch.Tensor,
-    penalty_counts: torch.Tensor,
     parameters: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
     work = logits.float().clone()
-    for row in range(work.shape[0]):
-        repetition, frequency, presence = parameters[row, 3:].tolist()
-        for token_id, count in zip(
-            penalty_token_ids[row].tolist(),
-            penalty_counts[row].tolist(),
-            strict=True,
-        ):
-            if count <= 0:
-                continue
-            value = work[row, token_id]
-            value = value / repetition if value > 0 else value * repetition
-            work[row, token_id] = value - frequency * count - presence
     work /= torch.where(parameters[:, :1] > 0, parameters[:, :1], 1)
     candidate_values, candidate_ids = torch.topk(work, top_k, dim=-1, sorted=True)
     for row in range(work.shape[0]):
@@ -64,36 +50,25 @@ def _inputs(device: torch.device) -> tuple[torch.Tensor, ...]:
         device=device,
     )
     draws = torch.tensor([0.25, 0.76], dtype=torch.float32, device=device)
-    penalty_token_ids = torch.tensor(
-        [
-            [1, 3],
-            [2, 5],
-        ],
-        dtype=torch.long,
-        device=device,
-    )
-    penalty_counts = torch.tensor([[2.0, 1.0], [3.0, 0.0]], device=device)
     parameters = torch.tensor(
         [
-            [0.7, 0.84, 0.08, 1.1, 0.2, 0.1],
-            [0.0, 0.92, 0.0, 1.2, 0.1, 0.05],
+            [0.7, 0.84, 0.08],
+            [0.0, 0.92, 0.0],
         ],
         dtype=torch.float32,
         device=device,
     )
-    return logits, draws, penalty_token_ids, penalty_counts, parameters
+    return logits, draws, parameters
 
 
 def test_top_k_provider_matches_the_full_expression() -> None:
     inputs = _inputs(torch.device("cpu"))
 
-    logits, draws, penalty_token_ids, penalty_counts, parameters = inputs
+    logits, draws, parameters = inputs
     tokens, valid = sample_top_k(
         logits,
         draws,
-        penalty_token_ids,
-        penalty_counts,
-        SamplingParameters.from_columns(parameters),
+        parameters,
         4,
     )
 
@@ -106,14 +81,13 @@ def test_top_k_provider_matches_the_full_expression() -> None:
 def test_top_k_provider_is_capture_eligible_and_matches_eager_tokens() -> None:
     inputs = _inputs(torch.device("cuda"))
     expected = _reference(*inputs, 4)
-    logits, draws, penalty_token_ids, penalty_counts, parameters = inputs
-    packed = SamplingParameters.from_columns(parameters)
-    sample_top_k(logits, draws, penalty_token_ids, penalty_counts, packed, 4)
+    logits, draws, parameters = inputs
+    sample_top_k(logits, draws, parameters, 4)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
 
     with torch.cuda.graph(graph):
-        captured, valid = sample_top_k(logits, draws, penalty_token_ids, penalty_counts, packed, 4)
+        captured, valid = sample_top_k(logits, draws, parameters, 4)
     graph.replay()
     torch.cuda.synchronize()
 
@@ -140,20 +114,16 @@ def test_top_k_provider_accepts_every_serving_wave_row_count() -> None:
             device=device,
             generator=generator,
         ).clamp_(1e-7, 1.0 - 1e-7)
-        penalty_token_ids = torch.empty((row_count, 0), dtype=torch.long, device=device)
-        penalty_counts = torch.empty((row_count, 0), dtype=torch.float32, device=device)
         parameters = torch.tensor(
-            [0.0, 1.0, 0.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
             dtype=torch.float32,
             device=device,
-        ).expand(row_count, 6)
+        ).expand(row_count, 3)
 
         tokens, valid = sample_top_k(
             logits,
             draws,
-            penalty_token_ids,
-            penalty_counts,
-            SamplingParameters.from_columns(parameters),
+            parameters,
             1,
         )
 

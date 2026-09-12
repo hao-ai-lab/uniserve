@@ -7,14 +7,14 @@ use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RequestId, SamplingParam
 
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
-    ArRequestParams, ArtifactHandle, BatchCommand, BlockTable, Bounds, BufferAllocation, BufferId,
-    CachePageAllocation, Computation, ComputationId, DType, DecodeRange, DiffusionSamplingParams,
-    DimBound, DrawLayout, ErrorCode, ErrorOperationIdentity, FeatureKind, FinishFlags,
-    ForwardBatch, ForwardMode, KvCacheConfig, KvTransfer, LatentParams, Locator, MediaOutput,
-    ModelOutput, NewRequest, OpStatus, PipelineStage, RegistrationAck, RequestKey, RequestKind,
-    ResponseKind, Rng, Run, RunResult, SamplingState, ScheduledRequest, ShapeBound,
-    TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferMode,
-    TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerForwardStats, WorkerInfo,
+    ArRequestParams, ArtifactHandle, BatchCommand, BatchOutput, BlockTable, Bounds,
+    BufferAllocation, BufferId, CachePageAllocation, Computation, ComputationId, DType,
+    DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, ErrorOperationIdentity,
+    FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats, KvCacheConfig, KvTransfer,
+    LatentParams, Locator, MediaOutput, NewRequest, OpStatus, PipelineStage, RegistrationAck,
+    RequestKey, RequestKind, RequestOutput, ResponseKind, Rng, SamplingState, ScheduleBatch,
+    ScheduledRequest, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
+    TransferHandle, TransferMode, TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerInfo,
     WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
@@ -251,10 +251,10 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
 }
 
 /// Decodes an owned run and validates all nested operation and params contracts.
-fn run_from_table(run: fbs::Run<'_>) -> CodecResult<Run> {
+fn run_from_table(run: fbs::ScheduleBatch<'_>) -> CodecResult<ScheduleBatch> {
     // Preserve wire order for operations, controls, and products because later
     // validation and execution interpret those collections positionally.
-    let run = Run {
+    let run = ScheduleBatch {
         batch_id: run.batch_id(),
         run_id: run.run_id(),
         collective_seq: run.collective_seq(),
@@ -740,10 +740,10 @@ fn rng_from_table(rng: fbs::Rng<'_>) -> CodecResult<Rng> {
 }
 
 /// Decodes a run result, preserving report order, then validates the aggregate.
-fn run_result_from_table(report: fbs::RunResult<'_>) -> CodecResult<RunResult> {
+fn run_result_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutput> {
     // Completions and products are independent ordered streams whose identities
-    // are reconciled by `RunResult::validate` after both are materialized.
-    let report = RunResult {
+    // are reconciled by `BatchOutput::validate` after both are materialized.
+    let report = BatchOutput {
         batch_id: report.batch_id(),
         run_id: report.run_id(),
         completions: report
@@ -781,7 +781,7 @@ fn run_result_from_table(report: fbs::RunResult<'_>) -> CodecResult<RunResult> {
 }
 
 /// Decodes a model output and validates its status-dependent result data.
-fn completion_record_from_table(record: fbs::ModelOutput<'_>) -> CodecResult<ModelOutput> {
+fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<RequestOutput> {
     let finish_flags = record
         .finish_flags()
         .context("completion result has no finish flags")?;
@@ -813,7 +813,7 @@ fn completion_record_from_table(record: fbs::ModelOutput<'_>) -> CodecResult<Mod
         .timing_counters()
         .context("completion record has no timing counters")?;
 
-    let record = ModelOutput {
+    let record = RequestOutput {
         sampled_logprob: record.sampled_logprob(),
         top_logprobs: record
             .top_logprobs()
@@ -1095,8 +1095,8 @@ fn image_from_table(image: fbs::ImageParams<'_>) -> CodecResult<uniserve_core::I
 }
 
 /// Decodes per-mode, attention, graph, relay, and verification counters.
-fn forward_stats_from_table(stats: fbs::WorkerForwardStats<'_>) -> WorkerForwardStats {
-    WorkerForwardStats {
+fn forward_stats_from_table(stats: fbs::ForwardStats<'_>) -> ForwardStats {
+    ForwardStats {
         // Aggregate execution-mode counters.
         mode_counts: map_from_table(stats.mode_counts()),
         mode_tokens: map_from_table(stats.mode_tokens()),
@@ -1253,10 +1253,10 @@ fn response_to_fb(response: &WorkerResponse) -> CodecResult<fbs::WorkerResponseT
     })
 }
 
-fn run_to_fb(run: &Run) -> CodecResult<fbs::RunT> {
+fn run_to_fb(run: &ScheduleBatch) -> CodecResult<fbs::ScheduleBatchT> {
     run.validate()?;
 
-    Ok(fbs::RunT {
+    Ok(fbs::ScheduleBatchT {
         batch_id: run.batch_id,
         run_id: run.run_id,
         collective_seq: run.collective_seq,
@@ -1644,9 +1644,9 @@ fn rng_to_fb(rng: &Rng) -> fbs::RngT {
 }
 
 /// Converts a completion report into its FlatBuffers object representation.
-fn run_result_to_fb(report: &RunResult) -> CodecResult<fbs::RunResultT> {
+fn run_result_to_fb(report: &BatchOutput) -> CodecResult<fbs::BatchOutputT> {
     report.validate()?;
-    Ok(fbs::RunResultT {
+    Ok(fbs::BatchOutputT {
         batch_id: report.batch_id,
         run_id: report.run_id,
         completions: Some(
@@ -1693,8 +1693,8 @@ fn token_logprob_to_fb(entry: &TokenLogprob) -> fbs::TokenLogprobT {
     }
 }
 
-fn completion_record_to_fb(record: &ModelOutput) -> fbs::ModelOutputT {
-    fbs::ModelOutputT {
+fn completion_record_to_fb(record: &RequestOutput) -> fbs::RequestOutputT {
+    fbs::RequestOutputT {
         sampled_logprob: record.sampled_logprob,
         top_logprobs: Some(
             record
@@ -2110,8 +2110,8 @@ fn image_to_fb(image: &uniserve_core::ImageParams) -> fbs::ImageParamsT {
 }
 
 /// Converts forward-path counters into their wire table.
-fn forward_stats_to_fb(stats: &WorkerForwardStats) -> fbs::WorkerForwardStatsT {
-    fbs::WorkerForwardStatsT {
+fn forward_stats_to_fb(stats: &ForwardStats) -> fbs::ForwardStatsT {
+    fbs::ForwardStatsT {
         // Aggregate execution-mode counters.
         mode_counts: Some(map_to_fb(&stats.mode_counts)),
         mode_tokens: Some(map_to_fb(&stats.mode_tokens)),

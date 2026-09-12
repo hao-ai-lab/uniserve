@@ -1,6 +1,6 @@
 """Paged decode preserves attention results while replanning captured batches."""
 
-from types import SimpleNamespace
+from dataclasses import replace
 
 import pytest
 import torch
@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
+from uniserve_worker.execution.forward_batch import AttentionMetadata, AttentionMode
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -22,7 +23,12 @@ def test_tensor_core_decode_replans_and_replays_changed_pages():
     query = torch.randn((batch, query_heads, width), dtype=dtype, device=device)
     keys = torch.randn((6, page_size, kv_heads, width), dtype=dtype, device=device)
     values = torch.randn_like(keys)
-    context = SimpleNamespace(
+    context = AttentionMetadata(
+        attention_mode=AttentionMode.PAGED_DECODE,
+        prefix_lens=torch.empty(batch, dtype=torch.int32, device=device),
+        query_lens=torch.ones(batch, dtype=torch.int32, device=device),
+        out_cache_loc=torch.zeros(batch, dtype=torch.int64, device=device),
+        has_cache_writes=False,
         binding=619,
         block_table=torch.empty((batch, 2), dtype=torch.int32, device=device),
         seq_lens=torch.empty(batch, dtype=torch.int32, device=device),
@@ -41,7 +47,16 @@ def test_tensor_core_decode_replans_and_replays_changed_pages():
     )
 
     def stage(lengths, pages):
-        context.seq_lens_cpu = lengths
+        nonlocal context
+        context = replace(
+            context,
+            seq_lens_cpu=lengths,
+            prefix_lens_cpu=tuple(n - 1 for n in lengths),
+            query_lens_cpu=(1,) * batch,
+        )
+        context.prefix_lens.copy_(
+            torch.tensor(context.prefix_lens_cpu, dtype=torch.int32, device=device)
+        )
         context.seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
         context.block_table.copy_(torch.tensor(pages, dtype=torch.int32, device=device))
         backend.prepare_paged_decode_cuda_graph(

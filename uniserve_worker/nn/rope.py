@@ -59,14 +59,12 @@ def _cos_sin_bshd(
     # Form every batch/position phase as an outer product with the frequency
     # vector. Duplicating the phases matches the two halves consumed by
     # ``rotate_half``-style rotary application.
-    inv_freq_expanded = inv_freq[None, :, None].float().expand(
-        position_ids.shape[0], -1, 1
-    ).to(x.device)
+    inv_freq_expanded = (
+        inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+    )
     position_ids_expanded = position_ids[:, None, :].float()
     device_type = (
-        x.device.type
-        if isinstance(x.device.type, str) and x.device.type != "mps"
-        else "cpu"
+        x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
     )
 
     # Phase construction stays in fp32 with autocast disabled; the final
@@ -126,10 +124,7 @@ class RotaryEmbedding(nn.Module):
         inv_dim = self.dim * 2 if self.keep_freq_range else self.dim
         inv_freq = 1.0 / (
             self.theta
-            ** (
-                torch.arange(0, inv_dim, 2, dtype=torch.float32, device=device)
-                / inv_dim
-            )
+            ** (torch.arange(0, inv_dim, 2, dtype=torch.float32, device=device) / inv_dim)
         )
         self.inv_freq = inv_freq[::2] if self.keep_freq_range else inv_freq
 
@@ -164,9 +159,7 @@ def _compute_default_rope_parameters(
     dim = int(head_dim * partial_rotary_factor)
     attention_factor = 1.0
 
-    inv_freq = 1.0 / (
-        base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim)
-    )
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
     return inv_freq, attention_factor
 
 

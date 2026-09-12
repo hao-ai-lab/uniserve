@@ -111,7 +111,7 @@ pub struct CudagraphStat {
 ///
 /// Values are per-update deltas when carried in [`SchedulerStats`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct WorkerForwardStats {
+pub struct ForwardStats {
     /// Forward executions grouped by runtime mode.
     #[serde(default)]
     pub mode_counts: BTreeMap<String, u64>,
@@ -204,7 +204,7 @@ pub struct WorkerForwardStats {
     pub spec_verify_path_counts: BTreeMap<String, u64>,
 }
 
-impl WorkerForwardStats {
+impl ForwardStats {
     /// Returns whether every worker counter and breakdown is empty or zero.
     pub fn is_empty(&self) -> bool {
         // Map-backed breakdowns and scalar counters form one aggregate delta;
@@ -334,7 +334,7 @@ pub struct SchedulerStats {
     pub perf_stats: Option<PerfStats>,
     /// Worker-local forward/kernel counters since the previous stats snapshot.
     #[serde(default)]
-    pub worker_forward_stats: Option<WorkerForwardStats>,
+    pub worker_forward_stats: Option<ForwardStats>,
     /// Worker-reported execution time accumulated in the interval, in microseconds.
     #[serde(default)]
     pub worker_exec_us: u64,

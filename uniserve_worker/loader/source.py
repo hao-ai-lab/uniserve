@@ -169,7 +169,10 @@ def resolve_weight_sources(
     if not sources or len({source.name for source in sources}) != len(sources):
         raise ValueError("checkpoint sources require unique nonempty component names")
     sources = tuple(
-        source for source in sources if source.entry is None or request.bindings.owns(source.entry)
+        source
+        for source in sources
+        if source.entry is None
+        or (source.entry in request.bindings and request.bindings[source.entry].owns)
     )
     # Synthetic loading carries a source identity without checkpoint files.
     if request.load.load_format is LoadFormat.DUMMY:

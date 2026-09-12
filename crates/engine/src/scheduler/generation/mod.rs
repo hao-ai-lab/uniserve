@@ -9,8 +9,8 @@ use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
 
 use uniserve_core::{GenerationRequest, ImageIngestStep, RequestId, SamplingParams};
 use uniserve_worker_ipc::{
-    Bounds, BufferId, Computation, ComputationId, DType, DimBound, DrawLayout, ModelOutput,
-    OpStatus, RequestKey, Rng, SamplingState, ScheduledRequest, ShapeBound, TensorRef,
+    Bounds, BufferId, Computation, ComputationId, DType, DimBound, DrawLayout, OpStatus,
+    RequestKey, RequestOutput, Rng, SamplingState, ScheduledRequest, ShapeBound, TensorRef,
 };
 
 use crate::scheduler::image_artifact::png_artifact_dims_b64;
@@ -161,7 +161,7 @@ impl super::RequestState {
     pub(crate) fn process_generation_result(
         &mut self,
         operation: &ScheduledRequest,
-        record: &ModelOutput,
+        record: &RequestOutput,
     ) -> Result<(), GenerationResultError> {
         if operation.op_id.batch_id == 0 {
             return Err(GenerationResultError::MissingOperationId);
@@ -717,7 +717,7 @@ pub(crate) fn validate_generation_result(
     image_kv: Option<(u32, Option<u32>)>,
     start_step: Option<u32>,
     state: &super::RequestState,
-    record: &ModelOutput,
+    record: &RequestOutput,
     media: Option<&uniserve_core::SharedMedia>,
 ) -> Result<(), GenerationResultError> {
     let request = &state.req;

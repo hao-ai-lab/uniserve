@@ -1,101 +1,25 @@
-"""Batched GPU token sampling and device-resident sample publication."""
+"""Batched numerical token selection, predicates, and speculative acceptance."""
 
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from typing import cast
 
 import torch
 
 from uniserve_worker.backends.triton import triton_available
-from uniserve_worker.execution.batch import SamplingParams
 from uniserve_worker.execution.forward_batch import packed_tensor_views
-from uniserve_worker.execution.output import (
-    LogprobCapture,
-    LogprobOutputRow,
-    OutputBuffer,
-    SamplingCapture,
-    SamplingOutputRow,
-)
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.foundation.math import bucketed_length
-from uniserve_worker.runtime.device_products import (
-    DeviceProductRead,
-    DeviceProducts,
-    DeviceProductScalarBatch,
-    DeviceProductWrite,
-)
+from uniserve_worker.protocol.batch import SamplingParams
 
 from ..nn.mesh import Communicator
-from .rows import (
-    ForwardRow,
-    SampleBatchVectors,
-    SampleResult,
-    SampleRow,
-    SampleWork,
-)
-from .runners.packed import GraphGreedyOutput
-from .top_k_sampling import SamplingParameters, sample_top_k
+from .sampling import LogprobValues, SamplerOutput, SamplingMetadata
+from .top_k_sampling import sample_top_k
 
 SAMPLING_COMPLETION_FIELDS = 4
 TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
-
-
-def sample_result(value: object) -> SampleResult:
-    """Validate and return the single tensor produced by a sampling operator."""
-
-    if not isinstance(value, SampleResult):
-        raise RuntimeError("sampling task returned an invalid result")
-    return value
-
-
-def sampling_task_tensors(
-    rows: Sequence[SampleRow],
-    *,
-    vocab: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack row sampling controls, suppression masks, and penalty counts into device tensors."""
-
-    # Penalties are applied densely from the device-resident count base in the
-    # general sampling path; the fused top-k path never receives a penalty-
-    # bearing operation. The sparse penalty tensors are therefore always empty
-    # and exist only to satisfy the shared batch layout for the fused path.
-    width = min(vocab, bucketed_length(0))
-    padding: list[int] = []
-    candidate = vocab - 1
-    while len(padding) < width:
-        padding.append(candidate)
-        candidate -= 1
-    token_ids = torch.tensor(
-        tuple(padding),
-        dtype=torch.long,
-        device=device,
-    ).reshape(1, width)
-    counts = torch.zeros((1, width), dtype=torch.float32, device=device)
-    row_count = len(rows)
-    parameter_values = torch.tensor(
-        [
-            (
-                float(row.parameters.temperature),
-                float(row.parameters.top_p),
-                float(row.parameters.min_p),
-                float(row.parameters.repetition_penalty),
-                float(row.parameters.frequency_penalty),
-                float(row.parameters.presence_penalty),
-            )
-            for row in rows
-        ],
-        dtype=torch.float32,
-        device=device,
-    )
-    return (
-        token_ids.expand(row_count, width),
-        counts.expand(row_count, width),
-        parameter_values,
-    )
 
 
 def device_greedy_parameters(parameters: SamplingParams) -> bool:
@@ -113,68 +37,15 @@ def device_greedy_parameters(parameters: SamplingParams) -> bool:
     )
 
 
-def device_greedy_row(row: SampleRow) -> bool:
-    """Return whether one sampling row can use the captured device-greedy path."""
-
-    return (
-        device_greedy_parameters(row.parameters)
-        and int(row.n_logprobs) == 0
-        and row.allowed is None
-    )
-
-
-def graph_greedy_compatible(
-    tasks: tuple[SampleWork, ...],
-    forward_tasks: Sequence[ForwardRow],
-    output: GraphGreedyOutput | None,
-) -> bool:
-    """Validate that graph-produced greedy outputs match every sampling task and forward row."""
-
-    if output is None or len(tasks) != len(forward_tasks):
-        return False
-    count = len(tasks)
-    vectors = (
-        output.request_pool_indices,
-        output.tokens,
-        output.valid,
-        output.active,
-        output.finish,
-        output.continuation,
-        output.tagged_tokens,
-    )
-    return (
-        count > 0
-        and all(int(value.numel()) == count for value in vectors)
-        and int(output.completion.numel()) == SAMPLING_COMPLETION_FIELDS * count
-        and all(
-            not task.draft_token_ids
-            and len(task.rows) == 1
-            and device_greedy_row(task.rows[0])
-            and not task.rows[0].suppress
-            and not task.rows[0].finish_token_ids
-            and not task.rows[0].transition_token_ids
-            and task.transition_product is None
-            and task.request_pool_index is not None
-            and forward_task.decode_predicate is not None
-            and forward_task.decode_predicate_tagged
-            and bool(task.rows[0].force_finish) == bool(forward_task.decode_force_finish)
-            for task, forward_task in zip(tasks, forward_tasks, strict=True)
-        )
-    )
-
-
 @torch.inference_mode()
 def sample(
-    tasks: Sequence[SampleWork],
-    completion: OutputBuffer | None = None,
+    tasks: Sequence[SamplingMetadata],
     *,
-    device_products: DeviceProducts | None = None,
-    device_reads: tuple[DeviceProductRead, ...] = (),
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None = None,
-) -> tuple[SampleResult, ...]:
+) -> tuple[SamplerOutput, ...]:
     """Shape and draw every compatible sampling row in each device batch."""
 
-    grouped: dict[tuple[torch.device, int, int, int], list[tuple[int, SampleWork]]] = defaultdict(
+    grouped: dict[tuple[torch.device, int, int], list[tuple[int, SamplingMetadata]]] = defaultdict(
         list
     )
     for index, task in enumerate(tasks):
@@ -183,11 +54,14 @@ def sample(
             or not task.logits.is_floating_point()
             or int(task.logits.shape[0]) < 1
             or int(task.logits.shape[1]) < 1
-            or int(task.logits.shape[0]) != len(task.rows)
+            or int(task.logits.shape[0]) != len(task.allowed)
+            or len(task.penalty_counts) != len(task.allowed)
         ):
             raise invalid_descriptor("sampling task logits must be shaped [rows, vocab]")
-        device_greedy = not task.draft_token_ids and all(
-            device_greedy_row(row) for row in task.rows
+        device_greedy = (
+            not task.draft_token_ids
+            and device_greedy_parameters(task.parameters)
+            and all(value is None for value in task.allowed)
         )
         if device_greedy:
             if (
@@ -195,43 +69,31 @@ def sample(
                     value is not None
                     for value in (
                         task.draws,
-                        task.penalty_token_ids,
-                        task.penalty_counts,
                         task.parameter_values,
                     )
                 )
                 or task.draft_token_ids
-                or len(task.rows) != 1
+                or len(task.allowed) != 1
             ):
                 raise invalid_descriptor("greedy sampling task has shaped metadata")
         else:
             draws = cast(torch.Tensor, task.draws)
-            penalty_token_ids = cast(torch.Tensor, task.penalty_token_ids)
-            penalty_counts = cast(torch.Tensor, task.penalty_counts)
             parameter_values = cast(torch.Tensor, task.parameter_values)
             if (
                 draws.device != task.logits.device
-                or tuple(draws.shape) != (len(task.rows),)
+                or tuple(draws.shape) != (len(task.allowed),)
                 or not draws.is_floating_point()
             ):
                 raise invalid_descriptor("sampling task draws must align with its rows")
-            if (
-                penalty_token_ids.device != task.logits.device
-                or penalty_counts.device != task.logits.device
-                or penalty_token_ids.ndim != 2
-                or penalty_counts.shape != penalty_token_ids.shape
-                or int(penalty_token_ids.shape[0]) != len(task.rows)
-            ):
-                raise invalid_descriptor("sampling task penalty tensors do not align")
             if parameter_values.device != task.logits.device or parameter_values.shape != (
-                len(task.rows),
-                6,
+                len(task.allowed),
+                3,
             ):
                 raise invalid_descriptor("sampling task parameter vectors do not align")
         if task.draft_token_ids:
-            if len(task.rows) != len(task.draft_token_ids) + 1:
+            if len(task.allowed) != len(task.draft_token_ids) + 1:
                 raise invalid_descriptor("speculative sampling rows do not cover the draft chain")
-        elif len(task.rows) != 1:
+        elif len(task.allowed) != 1:
             raise invalid_descriptor("ordinary sampling tasks must contain exactly one row")
         vocab = int(task.logits.shape[1])
         if vocab > TOKEN_VALUE_MASK:
@@ -239,309 +101,102 @@ def sample(
         if any(value < 0 or value >= vocab for value in task.draft_token_ids):
             raise invalid_descriptor("speculative draft token is outside the model vocabulary")
         sampling_path = (
-            (-2 if any(row.suppress for row in task.rows) else -1)
-            if device_greedy
-            else _fused_top_k(task, vocab)
+            (-2 if task.suppress else -1) if device_greedy else _fused_top_k(task, vocab)
         )
-        penalty_width = (
-            int(cast(torch.Tensor, task.penalty_token_ids).shape[1]) if sampling_path > 0 else 0
-        )
-        grouped[(task.logits.device, vocab, sampling_path, penalty_width)].append((index, task))
+        grouped[(task.logits.device, vocab, sampling_path)].append((index, task))
 
-    result: list[SampleResult | None] = [None] * len(tasks)
-    for (_device, _vocab, sampling_path, _penalty_width), compatible in grouped.items():
+    result: list[SamplerOutput | None] = [None] * len(tasks)
+    for (_device, _vocab, sampling_path), compatible in grouped.items():
         indexes, group = zip(*compatible, strict=True)
         if sampling_path < 0:
             sampled_group = sample_device_greedy_group(
                 tuple(group),
-                completion,
                 apply_suppression=sampling_path == -2,
-                device_products=device_products,
-                device_reads=device_reads,
                 selection_broadcast=selection_broadcast,
             )
         elif sampling_path > 0:
             sampled_group = _sample_fused_top_k_group(
                 tuple(group),
                 sampling_path,
-                completion,
-                device_products=device_products,
-                device_reads=device_reads,
                 selection_broadcast=selection_broadcast,
             )
         else:
             sampled_group = _sample_task_group(
                 tuple(group),
-                completion,
-                device_products=device_products,
-                device_reads=device_reads,
                 selection_broadcast=selection_broadcast,
             )
         for index, sampled in zip(indexes, sampled_group, strict=True):
             result[index] = sampled
-    return tuple(cast(SampleResult, value) for value in result)
+    return tuple(cast(SamplerOutput, value) for value in result)
 
 
 def sample_device_greedy_group(
-    tasks: tuple[SampleWork, ...],
-    completion: OutputBuffer | None,
+    tasks: tuple[SamplingMetadata, ...],
     *,
     apply_suppression: bool,
-    device_products: DeviceProducts | None,
-    device_reads: tuple[DeviceProductRead, ...],
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
-    preselected: GraphGreedyOutput | None = None,
-) -> tuple[SampleResult, ...]:
-    """Resolve predicates, greedy tokens, finish state, publications, and completions for a task group."""
+) -> tuple[SamplerOutput, ...]:
+    """Resolve predicates, greedy tokens, finish state, and completion values for a group."""
 
-    # Materialize one row-major logit matrix unless graph replay already
-    # supplied its device-resident token and predicate decisions.
-    selection_logits: torch.Tensor | None = None
-    if preselected is None:
-        logits = packed_tensor_views(tuple(task.logits for task in tasks))
-        if logits is None:
-            logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
-        else:
-            logits = logits.reshape(len(tasks), -1)
-        selection_logits = logits
-        if apply_suppression:
-            selection_logits = logits.to(dtype=torch.float32, copy=True)
-            vocab = int(selection_logits.shape[1])
-            for row_index, task in enumerate(tasks):
-                for token_id in dict.fromkeys(int(value) for value in task.rows[0].suppress):
-                    if 0 <= token_id < vocab:
-                        selection_logits[row_index, token_id].fill_(float("-inf"))
-    # Scalar product arenas allow selection and later publication to share the
-    # same storage. A heterogeneous binding falls back to independent writes.
-    products = tuple(task.token_product for task in tasks)
-    bound_products = device_products is not None and all(
-        product is not None for product in products
-    )
-    product_table = cast(DeviceProducts, device_products) if bound_products else None
-    product_writes = (
-        tuple(cast(DeviceProductWrite, product) for product in products)
-        if product_table is not None
-        else ()
-    )
-    product_batch = (
-        product_table.producer_scalar_batch(product_writes) if product_table is not None else None
-    )
-    packed_output = product_batch.tensor if product_batch is not None else None
-    transition_writes = tuple(
-        task.transition_product for task in tasks if task.transition_product is not None
-    )
-    transition_batch: DeviceProductScalarBatch | None = None
-    if transition_writes and device_products is not None:
-        transition_batch = device_products.producer_scalar_batch(transition_writes)
-    grouped_publication = (
-        product_table is not None
-        and product_batch is not None
-        and (not transition_writes or transition_batch is not None)
-    )
-    # Select directly into publication storage when all token products form one
-    # linked scalar batch; otherwise retain a transient result tensor.
-    if preselected is not None:
-        device_tokens = preselected.tokens
-        max_values = None
-    elif packed_output is None or int(packed_output.numel()) != len(tasks):
-        assert selection_logits is not None
-        device_tokens = torch.argmax(selection_logits, dim=-1)
-        max_values = None
-    elif grouped_publication:
-        assert selection_logits is not None
-        device_tokens = packed_output
-        max_values = torch.empty(
-            len(tasks),
-            dtype=selection_logits.dtype,
-            device=selection_logits.device,
-        )
-        torch.max(selection_logits, dim=-1, out=(max_values, device_tokens))
+    logits = packed_tensor_views(tuple(task.logits for task in tasks))
+    if logits is None:
+        logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
     else:
-        assert selection_logits is not None
-        device_tokens = packed_output
-        max_values = None
-        torch.argmax(selection_logits, dim=-1, out=device_tokens)
+        logits = logits.reshape(len(tasks), -1)
+    selection_logits = logits
+    if apply_suppression:
+        selection_logits = logits.to(dtype=torch.float32, copy=True)
+        vocab = int(selection_logits.shape[1])
+        for row_index, task in enumerate(tasks):
+            for token_id in dict.fromkeys(int(value) for value in task.suppress):
+                if 0 <= token_id < vocab:
+                    selection_logits[row_index, token_id].fill_(float("-inf"))
+    device_tokens = torch.argmax(selection_logits, dim=-1)
     valid = (
-        preselected.valid
-        if preselected is not None
-        else torch.isfinite(max_values)
-        if max_values is not None
-        else (
-            ~torch.isnan(cast(torch.Tensor, selection_logits)).any(dim=-1)
-            & ~torch.isposinf(cast(torch.Tensor, selection_logits)).any(dim=-1)
-            & torch.isfinite(cast(torch.Tensor, selection_logits)).any(dim=-1)
-        )
+        ~torch.isnan(selection_logits).any(dim=-1)
+        & ~torch.isposinf(selection_logits).any(dim=-1)
+        & torch.isfinite(selection_logits).any(dim=-1)
     )
     if selection_broadcast is not None:
         selection_broadcast(device_tokens)
-
-    # Finish, continuation, and transition predicates are derived from the same
-    # selected token vector so they cannot observe different sampling outcomes.
-    empty_finish = grouped_publication and all(
-        not task.rows[0].force_finish and not task.rows[0].finish_token_ids for task in tasks
+    active = _sample_predicates(tasks, device_tokens.device)
+    device_finish, continuation_values = _resolve_sampled_finish_values(
+        tasks, device_tokens, valid, active, torch.zeros_like(active, dtype=torch.bool)
     )
-    active = (
-        preselected.active
-        if preselected is not None
-        else _sample_predicates(tasks, device_tokens.device)
-    )
-    device_finish: torch.Tensor | None
-    if preselected is not None:
-        device_finish = preselected.finish
-        continuation_values = preselected.continuation
-    elif grouped_publication:
-        if empty_finish:
-            device_finish = torch.zeros_like(valid, dtype=torch.bool)
-            continuation_values = active & valid
-        else:
-            device_finish = _device_finish_values(tasks, device_tokens, valid & active)
-            continuation_values = active & valid & ~device_finish
-    else:
-        device_finish, continuation_values = _resolve_sampled_finish_values(
-            tasks,
-            device_tokens,
-            valid,
-            active,
-            torch.zeros_like(active, dtype=torch.bool),
-        )
-    resolved_transition_writes, transition_values = _sampled_transition_values(
-        tasks,
-        device_tokens,
-        valid,
-        active,
-        destination=(
-            transition_batch.tensor
-            if grouped_publication
-            and transition_batch is not None
-            and transition_batch.tensor.dtype is torch.bool
-            else None
-        ),
-    )
-    if len(resolved_transition_writes) != len(transition_writes) or any(
-        resolved is not expected
-        for resolved, expected in zip(
-            resolved_transition_writes,
-            transition_writes,
-            strict=True,
-        )
-    ):
-        raise RuntimeError("sampling transition publication lost its output alignment")
-    if transition_writes and device_products is None:
-        raise RuntimeError("sampling transition outputs have no device-product owner")
-    if grouped_publication and transition_batch is not None:
-        if transition_values is None:
-            raise RuntimeError("sampling transition publication lost its device values")
-        target = transition_batch.tensor.reshape(-1)
-        aliases_target = (
-            transition_values.device == target.device
-            and transition_values.dtype == target.dtype
-            and transition_values.untyped_storage().data_ptr()
-            == target.untyped_storage().data_ptr()
-            and int(transition_values.storage_offset()) == int(target.storage_offset())
-        )
-        if not aliases_target:
-            target.copy_(transition_values)
-    if transition_writes and not grouped_publication:
-        if transition_values is None:
-            raise RuntimeError("sampling transition publication lost its device values")
-        publish_device_writes(
-            transition_writes,
-            transition_values,
-            cast(DeviceProducts, device_products),
-            device_reads,
-        )
-    # Capture host-facing token metadata before publishing products. The output
-    # buffer owns the asynchronous device-to-host lifetime from this point.
-    span = (
-        capture_preselected_span(preselected, completion)
-        if preselected is not None
-        else _capture_sample_span(
-            valid,
-            active,
-            device_tokens,
-            device_finish if empty_finish else torch.zeros_like(device_tokens),
-            completion,
-        )
-    )
-    tagged_tokens = (
-        preselected.tagged_tokens
-        if preselected is not None
-        else tagged_token_values(
-            device_tokens,
-            continuation_values,
-            in_place=packed_output is not None and int(packed_output.numel()) == len(tasks),
-        )
-    )
-    if preselected is not None and packed_output is not None:
-        packed_output.copy_(tagged_tokens)
-    # Group publication records one dependency edge for every linked scalar
-    # output, preserving atomic visibility after all consumed reads complete.
-    published = product_table is not None
-    if product_table is not None:
-        if grouped_publication:
-            side_batches: tuple[DeviceProductScalarBatch, ...] = (
-                (transition_batch,) if transition_batch is not None else ()
-            )
-            product_table.publish_scalar_group(
-                (*side_batches, cast(DeviceProductScalarBatch, product_batch)),
-                after_reads=device_reads,
-            )
-            device_finish = None
-        elif product_batch is None:
-            product_table.publish_writes(
-                product_writes,
-                tagged_tokens,
-            )
-        else:
-            product_table.publish_scalar_batch(
-                product_batch,
-                after_reads=device_reads,
-            )
-    batch_vectors = (
-        SampleBatchVectors(
-            request_pool_indices=(
-                preselected.request_pool_indices
-                if preselected is not None
-                else sample_request_pool_indices(tasks)
-            ),
-            tokens=device_tokens,
-            valid=valid,
-            active=active,
-            continuation=continuation_values,
-            penalty_bases=tuple(task.penalty_base for task in tasks),
-        )
-        if all(task.request_pool_index is not None for task in tasks)
-        else None
-    )
+    transitions = _sampled_transition_values(tasks, device_tokens, valid, active)
+    span = sampling_columns(valid, active, device_tokens, torch.zeros_like(device_tokens))
+    tagged_tokens = tagged_token_values(device_tokens, continuation_values, in_place=False)
     return tuple(
-        SampleResult(
-            completion=SamplingOutputRow(span, index),
-            device_token=device_tokens[index : index + 1],
+        SamplerOutput(
+            request_pool_indices=tasks[index].request_pool_index,
+            completion=span,
+            completion_index=index,
+            tokens=device_tokens[index : index + 1],
             logprobs=None,
-            device_valid=valid[index : index + 1],
-            device_active=active[index : index + 1],
-            device_finish=(None if device_finish is None else device_finish[index : index + 1]),
-            device_continuation=continuation_values[index : index + 1],
-            device_product_published=published,
-            device_batch=batch_vectors,
-            device_batch_index=index if batch_vectors is not None else -1,
+            valid=valid[index : index + 1],
+            active=active[index : index + 1],
+            finish=(None if device_finish is None else device_finish[index : index + 1]),
+            continuation=continuation_values[index : index + 1],
+            tagged_tokens=tagged_tokens[index : index + 1],
+            transition=transitions.get(index),
         )
         for index, task in enumerate(tasks)
     )
 
 
-def _fused_top_k(task: SampleWork, vocab: int) -> int:
+def _fused_top_k(task: SamplingMetadata, vocab: int) -> int:
     """Return a fused top-k width when the task satisfies the kernel's sampling contract."""
 
     if task.logits.device.type != "cuda":
         return 0
     if task.draft_token_ids:
         return 0
-    row = task.rows[0]
-    parameters = row.parameters
+    parameters = task.parameters
     top_k = int(parameters.top_k)
     wants_logprobs = (
-        parameters.return_logprobs or int(row.n_logprobs) > 0 or bool(parameters.logprob_token_ids)
+        parameters.return_logprobs
+        or int(parameters.n_logprobs) > 0
+        or bool(parameters.logprob_token_ids)
     )
     uses_penalties = (
         parameters.repetition_penalty != 1.0
@@ -551,8 +206,8 @@ def _fused_top_k(task: SampleWork, vocab: int) -> int:
     if (
         wants_logprobs
         or uses_penalties
-        or row.allowed is not None
-        or row.suppress
+        or task.allowed[0] is not None
+        or task.suppress
         or parameters.logit_bias
         or float(parameters.typical_p) < 1.0
         or top_k <= 0
@@ -564,35 +219,23 @@ def _fused_top_k(task: SampleWork, vocab: int) -> int:
 
 
 def _sample_fused_top_k_group(
-    tasks: tuple[SampleWork, ...],
+    tasks: tuple[SamplingMetadata, ...],
     top_k: int,
-    completion: OutputBuffer | None,
     *,
-    device_products: DeviceProducts | None,
-    device_reads: tuple[DeviceProductRead, ...],
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
-) -> tuple[SampleResult, ...]:
-    """Sample a homogeneous fused-top-k task group and publish its device-resident results."""
+) -> tuple[SamplerOutput, ...]:
+    """Sample a homogeneous fused-top-k group and return its numerical selections."""
 
     # The compiled kernel consumes one contiguous column for each sampling
     # input, so compatible task rows are packed before a single launch.
-    rows = tuple(task.rows[0] for task in tasks)
     logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
     draws = torch.cat(tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0)
-    penalty_token_ids = torch.cat(
-        tuple(cast(torch.Tensor, task.penalty_token_ids) for task in tasks), dim=0
-    )
-    penalty_counts = torch.cat(
-        tuple(cast(torch.Tensor, task.penalty_counts) for task in tasks), dim=0
-    )
     parameters = torch.cat(
         tuple(cast(torch.Tensor, task.parameter_values) for task in tasks), dim=0
     )
     tokens, valid = _run_fused_top_k_sampling(
         logits,
         draws,
-        penalty_token_ids,
-        penalty_counts,
         parameters,
         top_k,
     )
@@ -609,45 +252,29 @@ def _sample_fused_top_k_group(
         active,
         torch.zeros_like(active, dtype=torch.bool),
     )
-    _publish_sampled_transition_values(
-        tasks,
-        tokens,
-        valid,
-        active,
-        device_products,
-        device_reads,
-    )
-
-    # Completion storage retains the host-visible sampling fields while token
-    # products remain device-resident for successor operations.
-    published = _publish_sampled_device_values(
-        tasks,
-        "token_product",
-        tagged_token_values(tokens, continuation_values),
-        device_products,
-        device_reads,
-    )
-    span = _capture_sample_span(valid, active, tokens, torch.zeros_like(tokens), completion)
+    transitions = _sampled_transition_values(tasks, tokens, valid, active)
+    tagged_tokens = tagged_token_values(tokens, continuation_values)
+    span = sampling_columns(valid, active, tokens, torch.zeros_like(tokens))
     return tuple(
-        SampleResult(
-            SamplingOutputRow(span, index),
-            tokens[index : index + 1],
-            None,
-            device_valid=valid[index : index + 1],
-            device_active=active[index : index + 1],
-            device_finish=(None if device_finish is None else device_finish[index : index + 1]),
-            device_continuation=continuation_values[index : index + 1],
-            device_product_published=published,
+        SamplerOutput(
+            request_pool_indices=tasks[index].request_pool_index,
+            completion=span,
+            completion_index=index,
+            tokens=tokens[index : index + 1],
+            valid=valid[index : index + 1],
+            active=active[index : index + 1],
+            finish=(None if device_finish is None else device_finish[index : index + 1]),
+            continuation=continuation_values[index : index + 1],
+            tagged_tokens=tagged_tokens[index : index + 1],
+            transition=transitions.get(index),
         )
-        for index in range(len(rows))
+        for index in range(len(tasks))
     )
 
 
 def _run_fused_top_k_sampling(
     logits: torch.Tensor,
     draws: torch.Tensor,
-    penalty_token_ids: torch.Tensor,
-    penalty_counts: torch.Tensor,
     parameters: torch.Tensor,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -658,21 +285,16 @@ def _run_fused_top_k_sampling(
     return sample_top_k(
         logits,
         draws,
-        penalty_token_ids,
-        penalty_counts,
-        SamplingParameters.from_columns(parameters),
+        parameters,
         int(top_k),
     )
 
 
 def _sample_task_group(
-    tasks: tuple[SampleWork, ...],
-    completion: OutputBuffer | None,
+    tasks: tuple[SamplingMetadata, ...],
     *,
-    device_products: DeviceProducts | None,
-    device_reads: tuple[DeviceProductRead, ...],
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
-) -> tuple[SampleResult, ...]:
+) -> tuple[SamplerOutput, ...]:
     """Sample arbitrary compatible tasks, resolve speculative acceptance, and capture outputs."""
 
     # Flatten task-local candidate rows into one sampling matrix while retaining
@@ -683,16 +305,22 @@ def _sample_task_group(
     offset = 0
     for task in tasks:
         offsets.append(offset)
-        offset += len(task.rows)
-    rows = tuple(row for task in tasks for row in task.rows)
+        offset += len(task.allowed)
+    parameters = tuple(task.parameters for task in tasks for _ in task.allowed)
     logits = torch.cat(tuple(task.logits.float() for task in tasks), dim=0)
     draws = torch.cat(tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0)
-    work, valid = _shape_sampling_logits_batch(logits, rows)
+    work, valid = _shape_sampling_logits_batch(
+        logits,
+        parameters,
+        tuple(value for task in tasks for value in task.allowed),
+        tuple(task.suppress for task in tasks for _ in task.allowed),
+        tuple(value for task in tasks for value in task.penalty_counts),
+    )
 
     # Temperature-zero rows use deterministic argmax; remaining rows invert the
     # categorical CDF with their precomputed RNG draw.
     temperatures = torch.tensor(
-        [float(row.parameters.temperature) for row in rows],
+        [float(value.temperature) for value in parameters],
         dtype=work.dtype,
         device=device,
     )
@@ -766,8 +394,8 @@ def _sample_task_group(
     # legal vocabulary candidate under its sampling constraints.
     task_valid = torch.stack(
         tuple(
-            valid[offsets[index] : offsets[index] + len(task.rows)][
-                torch.arange(len(task.rows), device=device) < points[index]
+            valid[offsets[index] : offsets[index] + len(task.allowed)][
+                torch.arange(len(task.allowed), device=device) < points[index]
             ].all()
             for index, task in enumerate(tasks)
         )
@@ -780,56 +408,41 @@ def _sample_task_group(
         active,
         terminal_finish,
     )
-    _publish_sampled_transition_values(
-        tasks,
-        task_tokens,
-        task_valid,
-        active,
-        device_products,
-        device_reads,
-    )
-
-    # Publish device-side dependencies before capturing the compact host
-    # completion and any requested log-probability details.
-    published = _publish_sampled_device_values(
-        tasks,
-        "token_product",
-        tagged_token_values(task_tokens, continuation_values),
-        device_products,
-        device_reads,
-    )
-    span = _capture_sample_span(task_valid, active, task_tokens, counts, completion)
+    transitions = _sampled_transition_values(tasks, task_tokens, task_valid, active)
+    tagged_tokens = tagged_token_values(task_tokens, continuation_values)
+    span = sampling_columns(task_valid, active, task_tokens, counts)
     details = logprob_details(
         work,
         output_indexes - terminal_finish.to(dtype=torch.long),
         task_tokens,
-        tuple(task.rows[0] for task in tasks),
-        completion,
+        tuple(task.parameters for task in tasks),
     )
     return tuple(
-        SampleResult(
-            completion=SamplingOutputRow(span, index),
-            device_token=task_tokens[index : index + 1],
-            logprobs=details.get(index),
-            device_accepted_draft_count=counts[index : index + 1],
-            device_accepted_token_count=points[index : index + 1],
-            device_valid=task_valid[index : index + 1],
-            device_active=active[index : index + 1],
-            device_finish=(None if device_finish is None else device_finish[index : index + 1]),
-            device_continuation=continuation_values[index : index + 1],
-            device_product_published=published,
+        SamplerOutput(
+            request_pool_indices=tasks[index].request_pool_index,
+            completion=span,
+            completion_index=index,
+            tokens=task_tokens[index : index + 1],
+            logprobs=details,
+            accepted_draft_count=counts[index : index + 1],
+            accepted_token_count=points[index : index + 1],
+            valid=task_valid[index : index + 1],
+            active=active[index : index + 1],
+            finish=(None if device_finish is None else device_finish[index : index + 1]),
+            continuation=continuation_values[index : index + 1],
+            tagged_tokens=tagged_tokens[index : index + 1],
+            transition=transitions.get(index),
         )
         for index in range(len(tasks))
     )
 
 
-def _capture_sample_span(
+def sampling_columns(
     valid: torch.Tensor,
     active: torch.Tensor,
     tokens: torch.Tensor,
     accepted: torch.Tensor,
-    completion: OutputBuffer | None,
-) -> SamplingCapture:
+) -> torch.Tensor:
     """Pack validity, activity, token, and acceptance vectors into completion storage."""
 
     count = int(tokens.numel())
@@ -849,39 +462,11 @@ def _capture_sample_span(
     )
     if int(metadata.numel()) != SAMPLING_COMPLETION_FIELDS * count:
         raise RuntimeError("sampling completion field count exceeds its fixed capacity")
-    owns_completion = completion is None
-    if metadata.device.type != "cuda":
-        values = tuple(int(value) for value in metadata.tolist())
-        if owns_completion and not all(
-            bool(values[index]) or not bool(values[count + index]) for index in range(count)
-        ):
-            raise invalid_descriptor("sampling policy masked every vocabulary entry")
-        return SamplingCapture(None, count, values)
-    if completion is None:
-        raise RuntimeError("CUDA sampling requires a server completion lease")
-    span = SamplingCapture(completion.capture(metadata), count)
-    return span
-
-
-def capture_preselected_span(
-    output: GraphGreedyOutput,
-    completion: OutputBuffer | None,
-) -> SamplingCapture:
-    """Capture graph-selected token, validity, activity, and acceptance vectors into host output."""
-
-    count = int(output.tokens.numel())
-    if int(output.completion.numel()) != SAMPLING_COMPLETION_FIELDS * count:
-        raise RuntimeError("graph sampling completion vectors do not align")
-    if output.completion.device.type != "cuda":
-        values = tuple(int(value) for value in output.completion.tolist())
-        return SamplingCapture(None, count, values)
-    if completion is None:
-        raise RuntimeError("CUDA graph sampling requires a server completion lease")
-    return SamplingCapture(completion.capture(output.completion), count)
+    return metadata
 
 
 def _device_finish_values(
-    tasks: tuple[SampleWork, ...],
+    tasks: tuple[SamplingMetadata, ...],
     device_tokens: torch.Tensor,
     valid: torch.Tensor,
 ) -> torch.Tensor:
@@ -895,11 +480,10 @@ def _device_finish_values(
     if count == 0:
         return validity.to(dtype=torch.bool)
 
-    rows = tuple(task.rows[0] for task in tasks)
-    first = rows[0]
+    first = tasks[0]
     if all(
         row.force_finish == first.force_finish and row.finish_token_ids == first.finish_token_ids
-        for row in rows[1:]
+        for row in tasks[1:]
     ):
         if first.force_finish:
             return validity.to(dtype=torch.bool)
@@ -911,7 +495,7 @@ def _device_finish_values(
         return matched & validity
 
     values: list[torch.Tensor] = []
-    for index, row in enumerate(rows):
+    for index, row in enumerate(tasks):
         selected = tokens[index]
         if row.force_finish:
             finish = torch.ones((), dtype=torch.bool, device=tokens.device)
@@ -929,7 +513,7 @@ def _device_finish_values(
 
 
 def _sample_predicates(
-    tasks: tuple[SampleWork, ...],
+    tasks: tuple[SamplingMetadata, ...],
     device: torch.device,
 ) -> torch.Tensor:
     """Collect one active predicate per task, decoding tagged continuation values when needed."""
@@ -971,138 +555,26 @@ def tagged_token_values(
     return target
 
 
-def copy_runtime_scalar(target: torch.Tensor, value: int | torch.Tensor) -> None:
-    """Copy a scalar or one-element tensor into fixed device runtime storage."""
-
-    if isinstance(value, torch.Tensor):
-        target.copy_(value.reshape(-1)[:1].to(device=target.device, dtype=target.dtype))
-    else:
-        target.fill_(int(value))
-
-
-def request_pool_index(task: ForwardRow) -> torch.Tensor:
-    """Return the validated scalar request-pool index carried by a forward row."""
-
-    index = task.request_pool_index
-    if index is None:
-        raise RuntimeError("forward task has no staged request slot")
-    return index
-
-
-def _packed_required_views(
-    values: Sequence[torch.Tensor | None],
-    message: str,
-) -> torch.Tensor:
-    """Return one packed view of required aligned tensors, concatenating when necessary."""
-
-    if not values or any(value is None for value in values):
-        raise RuntimeError(message)
-    tensors = tuple(cast(torch.Tensor, value).reshape(-1) for value in values)
-    packed = packed_tensor_views(tensors)
-    return torch.cat(tensors, dim=0) if packed is None else packed
-
-
-def sample_request_pool_indices(tasks: Sequence[SampleWork]) -> torch.Tensor:
-    """Collect one validated request-pool index for each sampling task."""
-
-    return _packed_required_views(
-        tuple(task.request_pool_index for task in tasks),
-        "sample batch lost its staged request slots",
-    )
-
-
-def sample_result_vector(
-    samples: Sequence[SampleResult],
-    field_name: str,
-) -> torch.Tensor:
-    """Concatenate an optional device-result field across sampling rows."""
-
-    return _packed_required_views(
-        tuple(cast(torch.Tensor | None, getattr(sample, field_name)) for sample in samples),
-        f"sample batch lost device field {field_name}",
-    )
-
-
-def _publish_sampled_device_values(
-    tasks: tuple[SampleWork, ...],
-    product_field: str,
-    device_values: torch.Tensor,
-    device_products: DeviceProducts | None,
-    device_reads: tuple[DeviceProductRead, ...],
-    *,
-    producer_event: torch.cuda.Event | None = None,
-) -> bool:
-    """Publish one aligned sampled-value vector when every task declares the product."""
-
-    products = tuple(getattr(task, product_field) for task in tasks)
-    if device_products is None or not all(product is not None for product in products):
-        return False
-    writes = tuple(cast(DeviceProductWrite, product) for product in products)
-    publish_device_writes(
-        writes,
-        device_values.reshape(-1),
-        device_products,
-        device_reads,
-        producer_event=producer_event,
-    )
-    return True
-
-
-def _publish_sampled_transition_values(
-    tasks: tuple[SampleWork, ...],
-    device_tokens: torch.Tensor,
-    valid: torch.Tensor,
-    active: torch.Tensor,
-    device_products: DeviceProducts | None,
-    device_reads: tuple[DeviceProductRead, ...],
-) -> None:
-    """Publish transition-token matches for tasks that declare transition products."""
-
-    writes, transitions = _sampled_transition_values(
-        tasks,
-        device_tokens,
-        valid,
-        active,
-    )
-    if not writes:
-        return
-    if device_products is None:
-        raise RuntimeError("sampling transition outputs have no device-product owner")
-    if transitions is None:
-        raise RuntimeError("sampling transition publication lost its device values")
-    publish_device_writes(
-        writes,
-        transitions,
-        device_products,
-        device_reads,
-    )
-
-
 def _sampled_transition_values(
-    tasks: tuple[SampleWork, ...],
+    tasks: tuple[SamplingMetadata, ...],
     device_tokens: torch.Tensor,
     valid: torch.Tensor,
     active: torch.Tensor,
     *,
     destination: torch.Tensor | None = None,
-) -> tuple[tuple[DeviceProductWrite, ...], torch.Tensor | None]:
-    """Match selected tokens against per-task transition sets and return aligned writes."""
+) -> dict[int, torch.Tensor]:
+    """Match selected tokens against requested transition sets and return numerical row views."""
 
     # Only operations declaring a transition product participate; indexes keep
     # their token and eligibility rows aligned after filtering.
-    selected = tuple(
-        (index, task, task.transition_product)
-        for index, task in enumerate(tasks)
-        if task.transition_product is not None
-    )
+    selected = tuple((index, task) for index, task in enumerate(tasks) if task.return_transition)
     if not selected:
-        return (), None
+        return {}
     tokens = device_tokens.reshape(-1)
     eligibility = valid.reshape(-1).to(dtype=torch.bool) & active.reshape(-1).to(dtype=torch.bool)
     if int(tokens.numel()) != len(tasks) or int(eligibility.numel()) != len(tasks):
         raise RuntimeError("sampling transition vectors do not align")
-    indexes = tuple(index for index, _task, _write in selected)
-    writes = tuple(write for _index, _task, write in selected)
+    indexes = tuple(index for index, _task in selected)
     selected_tokens = select_device_values(tokens, indexes)
     selected_eligibility = select_device_values(eligibility, indexes)
 
@@ -1120,7 +592,7 @@ def _sampled_transition_values(
 
     # Shared transition sets avoid materializing a per-row token matrix; mixed
     # policies use a padded matrix with -1 as the non-token sentinel.
-    transition_sets = tuple(task.rows[0].transition_token_ids for _index, task, _write in selected)
+    transition_sets = tuple(task.transition_token_ids for _index, task in selected)
     first = transition_sets[0]
     if all(values == first for values in transition_sets[1:]):
         if not first:
@@ -1149,11 +621,11 @@ def _sampled_transition_values(
             target.copy_(transitions)
             transitions = target
     transitions.logical_and_(selected_eligibility)
-    return writes, transitions
+    return {index: transitions[row : row + 1] for row, (index, _task) in enumerate(selected)}
 
 
 def _resolve_sampled_finish_values(
-    tasks: tuple[SampleWork, ...],
+    tasks: tuple[SamplingMetadata, ...],
     device_tokens: torch.Tensor,
     valid: torch.Tensor,
     active: torch.Tensor,
@@ -1183,70 +655,30 @@ def select_device_values(values: torch.Tensor, indexes: tuple[int, ...]) -> torc
     return torch.cat(views, dim=0) if packed is None else packed.reshape(-1)
 
 
-def publish_device_writes(
-    writes: tuple[DeviceProductWrite, ...],
-    device_values: torch.Tensor,
-    device_products: DeviceProducts,
-    device_reads: tuple[DeviceProductRead, ...],
-    *,
-    producer_event: torch.cuda.Event | None = None,
-) -> torch.cuda.Event | None:
-    """Publish a batch of device-resident scalar products with shared producer synchronization."""
-
-    values = device_values.reshape(-1)
-    product_batch = device_products.producer_scalar_batch(writes)
-    if product_batch is not None and int(product_batch.tensor.numel()) == len(writes):
-        product_batch.tensor.reshape(-1).copy_(values)
-        device_products.publish_scalar_batch(
-            product_batch,
-            after_reads=device_reads,
-            producer_event=producer_event,
-        )
-    else:
-        device_products.publish_writes(
-            writes,
-            values,
-            producer_event=producer_event,
-        )
-    return writes[0].producer_event
-
-
-def semantic_sampling_draws(
-    rows: Sequence[SampleRow],
-    *,
-    device: torch.device,
-) -> torch.Tensor:
-    """Materialize deterministic uniform RNG draws for sampling rows on the target device."""
-
-    # Each row's draw is the canonical Philox uniform for its semantic
-    # coordinate, computed from host-known identity when the descriptor was
-    # built. Greedy rows carry a zero draw. Uploading the host-resident vector
-    # keeps the request path free of any device-to-host observation.
-    return torch.tensor(
-        [float(row.draw) for row in rows],
-        dtype=torch.float32,
-        device=device,
-    )
-
-
 def _shape_sampling_logits_batch(
     logits: torch.Tensor,
-    rows: Sequence[SampleRow],
+    parameters: Sequence[SamplingParams],
+    allowed_tokens: Sequence[tuple[int, ...] | None],
+    suppressed_tokens: Sequence[tuple[int, ...]],
+    penalty_counts: Sequence[torch.Tensor | None],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the canonical shaping and truncation order to a logits matrix."""
 
     work = logits.to(dtype=torch.float32, copy=True)
     row_count, vocab = (int(value) for value in work.shape)
-    if row_count != len(rows):
+    if any(
+        row_count != len(column)
+        for column in (parameters, allowed_tokens, suppressed_tokens, penalty_counts)
+    ):
         raise invalid_descriptor("sampling parameters do not align with logits rows")
 
     allowed_rows: list[int] = []
     allowed_flat: list[int] = []
-    for row_index, row in enumerate(rows):
-        if row.allowed is None:
+    for row_index, allowed_values in enumerate(allowed_tokens):
+        if allowed_values is None:
             continue
         allowed = tuple(
-            dict.fromkeys(int(value) for value in row.allowed if 0 <= int(value) < vocab)
+            dict.fromkeys(int(value) for value in allowed_values if 0 <= int(value) < vocab)
         )
         allowed_rows.append(row_index)
         allowed_flat.extend(row_index * vocab + value for value in allowed)
@@ -1262,8 +694,8 @@ def _shape_sampling_logits_batch(
 
     suppressed_flat = tuple(
         row_index * vocab + value
-        for row_index, row in enumerate(rows)
-        for value in dict.fromkeys(int(token) for token in row.suppress if 0 <= int(token) < vocab)
+        for row_index, suppressed in enumerate(suppressed_tokens)
+        for value in dict.fromkeys(int(token) for token in suppressed if 0 <= int(token) < vocab)
     )
     if suppressed_flat:
         work.reshape(-1).index_fill_(
@@ -1278,19 +710,19 @@ def _shape_sampling_logits_batch(
     # frequency scales with the count, and presence is a flat once-appeared
     # subtraction. Masked (-inf) entries are preserved.
     penalty_rows = [
-        row_index for row_index, row in enumerate(rows) if row.penalty_counts is not None
+        row_index for row_index, value in enumerate(penalty_counts) if value is not None
     ]
     if penalty_rows:
         row_index_tensor = torch.tensor(penalty_rows, dtype=torch.long, device=work.device)
         counts = torch.stack(
-            [cast(torch.Tensor, rows[row_index].penalty_counts) for row_index in penalty_rows]
+            [cast(torch.Tensor, penalty_counts[row_index]) for row_index in penalty_rows]
         ).to(dtype=work.dtype)
         params = torch.tensor(
             [
                 (
-                    float(rows[row_index].parameters.repetition_penalty),
-                    float(rows[row_index].parameters.frequency_penalty),
-                    float(rows[row_index].parameters.presence_penalty),
+                    float(parameters[row_index].repetition_penalty),
+                    float(parameters[row_index].frequency_penalty),
+                    float(parameters[row_index].presence_penalty),
                 )
                 for row_index in penalty_rows
             ],
@@ -1309,8 +741,8 @@ def _shape_sampling_logits_batch(
 
     bias_indexes: list[int] = []
     bias_values: list[float] = []
-    for row_index, row in enumerate(rows):
-        for token_id, bias in row.parameters.logit_bias:
+    for row_index, row in enumerate(parameters):
+        for token_id, bias in row.logit_bias:
             index = int(token_id)
             if 0 <= index < vocab:
                 bias_indexes.append(row_index * vocab + index)
@@ -1331,11 +763,11 @@ def _shape_sampling_logits_batch(
     parameter_values = torch.tensor(
         [
             (
-                float(row.parameters.temperature),
-                float(row.parameters.min_p),
-                float(row.parameters.top_p),
+                float(row.temperature),
+                float(row.min_p),
+                float(row.top_p),
             )
-            for row in rows
+            for row in parameters
         ],
         dtype=work.dtype,
         device=work.device,
@@ -1349,8 +781,8 @@ def _shape_sampling_logits_batch(
     work.div_(divisors.unsqueeze(1))
 
     top_k_groups: dict[int, list[int]] = defaultdict(list)
-    for index, row in enumerate(rows):
-        top_k = int(row.parameters.top_k)
+    for index, row in enumerate(parameters):
+        top_k = int(row.top_k)
         if 0 < top_k < vocab:
             top_k_groups[top_k].append(index)
     for top_k, row_indexes in top_k_groups.items():
@@ -1385,8 +817,8 @@ def _shape_sampling_logits_batch(
 
     top_p_rows = tuple(
         index
-        for index, row in enumerate(rows)
-        if (0.0 < float(row.parameters.top_p) < 1.0 and not 0 < int(row.parameters.top_k) < vocab)
+        for index, row in enumerate(parameters)
+        if (0.0 < float(row.top_p) < 1.0 and not 0 < int(row.top_k) < vocab)
     )
     if top_p_rows:
         indexes = torch.tensor(top_p_rows, dtype=torch.long, device=work.device)
@@ -1411,7 +843,7 @@ def _shape_sampling_logits_batch(
         truncated.scatter_(1, token_indexes, ordered)
         work.index_copy_(0, indexes, truncated)
 
-    min_p_rows = tuple(index for index, row in enumerate(rows) if float(row.parameters.min_p) > 0.0)
+    min_p_rows = tuple(index for index, row in enumerate(parameters) if float(row.min_p) > 0.0)
     if min_p_rows:
         indexes = torch.tensor(min_p_rows, dtype=torch.long, device=work.device)
         subset = work.index_select(0, indexes)
@@ -1421,13 +853,13 @@ def _shape_sampling_logits_batch(
         work.index_copy_(0, indexes, subset)
 
     typical_rows = tuple(
-        index for index, row in enumerate(rows) if float(row.parameters.typical_p) < 1.0
+        index for index, row in enumerate(parameters) if float(row.typical_p) < 1.0
     )
     if typical_rows:
         indexes = torch.tensor(typical_rows, dtype=torch.long, device=work.device)
         subset = work.index_select(0, indexes)
         typical_p = torch.tensor(
-            [float(rows[index].parameters.typical_p) for index in typical_rows],
+            [float(parameters[index].typical_p) for index in typical_rows],
             dtype=work.dtype,
             device=work.device,
         )
@@ -1460,21 +892,18 @@ def logprob_details(
     work: torch.Tensor,
     output_rows: torch.Tensor,
     output_tokens: torch.Tensor,
-    rows: Sequence[SampleRow],
-    completion: OutputBuffer | None,
-) -> Mapping[int, LogprobOutputRow]:
+    parameters: Sequence[SamplingParams],
+) -> LogprobValues | None:
     """Compute selected-token, top-k, and requested-token log probabilities and ranks."""
 
     vocab = int(work.shape[1])
     requested_rows = tuple(
         index
-        for index, row in enumerate(rows)
-        if row.parameters.return_logprobs
-        or int(row.n_logprobs) > 0
-        or bool(row.parameters.logprob_token_ids)
+        for index, row in enumerate(parameters)
+        if row.return_logprobs or int(row.n_logprobs) > 0 or bool(row.logprob_token_ids)
     )
     if not requested_rows:
-        return {}
+        return None
     request_indexes = torch.tensor(
         requested_rows,
         dtype=torch.long,
@@ -1486,7 +915,9 @@ def logprob_details(
     selected_values = scores.gather(1, selected_tokens.unsqueeze(1))[:, 0]
     selected_ranks = (scores > selected_values.unsqueeze(1)).sum(dim=-1, dtype=torch.long) + 1
 
-    counts = tuple(min(max(0, int(rows[index].n_logprobs)), vocab) for index in requested_rows)
+    counts = tuple(
+        min(max(0, int(parameters[index].n_logprobs)), vocab) for index in requested_rows
+    )
     max_count = max(counts, default=0)
     if max_count:
         top_values, top_indexes = torch.topk(scores, max_count, dim=-1, sorted=True)
@@ -1525,7 +956,7 @@ def logprob_details(
         tuple(
             dict.fromkeys(
                 int(value)
-                for value in rows[index].parameters.logprob_token_ids
+                for value in parameters[index].logprob_token_ids
                 if 0 <= int(value) < vocab
             )
         )
@@ -1582,29 +1013,7 @@ def logprob_details(
             candidate_ranks.reshape(-1).to(torch.long),
         )
     )
-    if packed.device.type != "cuda":
-        values = tuple(int(value) for value in packed.tolist())
-        batch = LogprobCapture(
-            None,
-            requested_rows,
-            counts,
-            requested_ids,
-            max_count,
-            max_requested,
-            values,
-        )
-    else:
-        if completion is None:
-            raise RuntimeError("CUDA logprob materialization requires a server completion lease")
-        batch = LogprobCapture(
-            completion.capture(packed),
-            requested_rows,
-            counts,
-            requested_ids,
-            max_count,
-            max_requested,
-        )
-    return {result_index: LogprobOutputRow(batch, result_index) for result_index in requested_rows}
+    return packed, requested_rows, counts, requested_ids, max_count, max_requested
 
 
 def broadcast_selection(group: Communicator | None, value: torch.Tensor) -> torch.Tensor:

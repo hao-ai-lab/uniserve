@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from ...execution.forward_batch import AttentionMode, ForwardBatch
+from ...execution.forward_batch import AttentionMetadata, AttentionMode
 from .base import AttentionBackend
 from .layout import QKVLayout, normalize_kv, normalize_to
 
@@ -67,7 +67,7 @@ class FlashAttentionBackend(AttentionBackend):
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute dense attention with flash-attn after normalizing head layout."""
 
@@ -100,7 +100,7 @@ class FlashAttentionBackend(AttentionBackend):
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Write current K/V and compute paged decode with flash-attn’s KV-cache kernel."""
 
@@ -142,7 +142,7 @@ class FlashAttentionBackend(AttentionBackend):
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute packed variable-length attention with flash-attn cumulative offsets."""
 

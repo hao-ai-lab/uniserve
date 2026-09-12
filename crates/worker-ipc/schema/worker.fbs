@@ -308,7 +308,7 @@ struct TokenLogprob {
 
 table PositionLogprobs { entries:[TokenLogprob]; }
 
-table ModelOutput {
+table RequestOutput {
   request_key:RequestKey;
   op_id:ComputationId;
   status:OpStatus;
@@ -369,7 +369,7 @@ table NewRequest {
   prompt_token_ids:[uint];
 }
 
-table Run {
+table ScheduleBatch {
   batch_id:ulong;
   // Strictly increasing in Submit order for this worker, independent of batch_id.
   run_id:ulong;
@@ -464,19 +464,19 @@ table TensorPublication {
   value:TransferHandle;
 }
 
-table RunResult {
+table BatchOutput {
   batch_id:ulong;
   run_id:ulong;
-  completions:[ModelOutput];
+  completions:[RequestOutput];
   products:[TensorPublication];
   registration:RegistrationAck;
   worker_exec_us:ulong = null;
-  forward_stats:WorkerForwardStats;
+  forward_stats:ForwardStats;
   // Free/Finish acknowledgement follows operation fragments as an empty terminal result.
   done:bool;
 }
 
-table WorkerForwardStats {
+table ForwardStats {
   mode_counts:[StringU64Pair];
   mode_tokens:[StringU64Pair];
   mode_us:[StringU64Pair];
@@ -512,7 +512,7 @@ table WorkerForwardStats {
 table WorkerRequest {
   kind:ReqKind;
   call_id:ulong = null;
-  run:Run;
+  run:ScheduleBatch;
   poll_run_id:ulong = null;
 }
 
@@ -525,7 +525,7 @@ table WorkerResponse {
   kind:RespKind;
   call_id:ulong = null;
   info:WorkerInfo;
-  result:RunResult;
+  result:BatchOutput;
   message:string;
   code:string;
   retryable:bool = null;

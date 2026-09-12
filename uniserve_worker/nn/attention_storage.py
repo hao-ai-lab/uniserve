@@ -7,14 +7,18 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from math import prod
+from typing import TYPE_CHECKING
 
 import torch
 
 from .mesh import Communicator
 
+if TYPE_CHECKING:
+    from ..runtime.tensor_buffers import TensorBuffers
+
 
 @dataclass(frozen=True)
-class AttentionExchangeStorage:
+class ExchangeBuffers:
     """Disjoint byte capacities borrowed by one serialized execution domain.
 
     Q/K/V buffers may be reused once attention finishes reading them. Output
@@ -22,7 +26,7 @@ class AttentionExchangeStorage:
     The runtime retains the backing allocations through all graph lifetimes.
     """
 
-    buffers: Mapping[str, torch.Tensor]
+    storage: TensorBuffers
 
     def view(
         self,
@@ -34,7 +38,7 @@ class AttentionExchangeStorage:
     ) -> torch.Tensor:
         """Borrow a contiguous view; offset is measured in elements of like.dtype."""
 
-        storage = self.buffers[name]
+        storage = self.storage.capacity[name]
         elements = prod(shape)
         begin = offset * like.element_size()
         size = elements * like.element_size()
@@ -48,14 +52,14 @@ class AttentionExchangeStorage:
         return storage.narrow(0, begin, size).view(like.dtype).view(shape)
 
 
-_ACTIVE_STORAGE: ContextVar[Mapping[Communicator, AttentionExchangeStorage]] = ContextVar(
+_ACTIVE_STORAGE: ContextVar[Mapping[Communicator, ExchangeBuffers]] = ContextVar(
     "attention_exchange_storage", default={}
 )
 
 
 @contextmanager
 def attention_exchange_scope(
-    storage: Mapping[Communicator, AttentionExchangeStorage],
+    storage: Mapping[Communicator, ExchangeBuffers],
 ) -> Iterator[None]:
     """Bind an execution domain's reusable transfer buffers while enqueueing work."""
 
@@ -66,7 +70,7 @@ def attention_exchange_scope(
         _ACTIVE_STORAGE.reset(token)
 
 
-def attention_exchange_storage(group: Communicator) -> AttentionExchangeStorage | None:
+def attention_exchange_storage(group: Communicator) -> ExchangeBuffers | None:
     """Return storage assigned to the current execution domain and communicator."""
 
     return _ACTIVE_STORAGE.get().get(group)

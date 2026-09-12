@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
-from uniserve_kernel import flash_attn_jagged
 
+from uniserve_kernel import flash_attn_jagged
 from uniserve_worker.backends.attention.fa4_cute import Fa4CuteAttentionBackend
 
 

@@ -1,22 +1,33 @@
 """Numerical token inputs for bounded packed startup preparation."""
 
+from __future__ import annotations
+
+from dataclasses import replace
+from typing import TYPE_CHECKING
+
+from ..model_entry import ModelEntry
+
+if TYPE_CHECKING:
+    from ..model_runner import ModelRunner
+
 from collections.abc import Callable, Sequence
 
 import torch
 
-from uniserve_worker.execution.batch import ForwardMode
+from uniserve_worker.protocol.batch import ForwardMode
 
 from ...foundation.math import bucketed_length, ceil_div
-from ...runtime.cache_pool import CachePool
+from ...runtime.kv_cache import KVCache
 from ..attention import physical_columns
 from ..forward_batch import ForwardBatch, ForwardOutput, TokenSelection
+from ..graph_inputs import PrefillShape
 from ..input_buffers import InputBuffers
-from .packed import PackedRunner, PrefillCapture
+from ..rows import ForwardRow
 
 
 def stage_text(
     buffers: InputBuffers,
-    cache: CachePool,
+    cache: KVCache,
     tokens: tuple[tuple[int, ...], ...],
     pages: Sequence[Sequence[int]],
     *,
@@ -53,26 +64,40 @@ def stage_text(
         packed=packed,
         decode=decode,
     )
-    return buffers.stage(
-        forward_mode=ForwardMode.DECODE if decode else ForwardMode.PREFILL,
-        row_count=rows,
-        request_pool_indices=slots or tuple(range(1, rows + 1)),
-        decode_force_finish=(False,) * rows if decode else (),
-        token_row_indices=tuple(range(rows)),
-        token_ids=tuple(torch.tensor(value, dtype=torch.int64) for value in tokens),
-        token_embeddings=(None,) * rows,
-        token_embedding_masks=(None,) * rows,
-        token_positions=positions,
-        token_selections=(selection,) * rows,
+    slots = slots or tuple(range(1, rows + 1))
+    mode = ForwardMode.DECODE if decode else ForwardMode.PREFILL
+    batch = buffers.stage(
+        tuple(
+            ForwardRow(
+                forward_mode=mode,
+                token_ids=torch.tensor(value, dtype=torch.int64),
+                positions=position,
+                selection=selection,
+                request_pool_idx=slot,
+                seq_len=prefix,
+                write_kv=True,
+            )
+            for value, position, slot, prefix in zip(
+                tokens, positions, slots, prefixes, strict=True
+            )
+        ),
+        forward_mode=mode,
         attention=attention,
     )
+    if decode:
+        # Startup captures the same force-finish address used by live decode.
+        force_finish = buffers.decode_force_finish[:rows]
+        force_finish.zero_()
+        batch = replace(batch, decode_force_finish=force_finish)
+    return batch
 
 
 def prepare_prefill(
-    runner: PackedRunner,
+    runner: ModelRunner,
+    entry: ModelEntry,
     buffers: InputBuffers,
     forward: Callable[[ForwardBatch], ForwardOutput],
-    shapes: tuple[PrefillCapture, ...],
+    shapes: tuple[PrefillShape, ...],
     *,
     packed: bool,
 ) -> None:
@@ -84,13 +109,13 @@ def prepare_prefill(
         reverse=True,
     ):
         lengths = (shape.token_bucket - shape.live_rows + 1, *(1,) * (shape.live_rows - 1))
-        counts = tuple(ceil_div(length, runner.block_size) for length in lengths)
-        with runner.cache_pool.startup_pages(sum(counts)) as scratch:
+        counts = tuple(ceil_div(length, runner.worker_config.block_size) for length in lengths)
+        with runner.kv_cache.startup_pages(sum(counts)) as scratch:
             pages = tuple(
                 scratch[sum(counts[:index]) : sum(counts[: index + 1])]
                 for index in range(len(counts))
             )
             batch = stage_text(
-                buffers, runner.cache_pool, tuple((0,) * n for n in lengths), pages, packed=packed
+                buffers, runner.kv_cache, tuple((0,) * n for n in lengths), pages, packed=packed
             )
-            runner.capture(batch, forward)
+            runner.capture_batch(entry, batch, forward)

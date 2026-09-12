@@ -7,9 +7,9 @@ import torch
 from .triton import triton_available
 
 __all__ = [
-    'write_locations',
-    'decode_write_locations',
-    'paged_kv_write',
+    "write_locations",
+    "decode_write_locations",
+    "paged_kv_write",
 ]
 
 try:  # pragma: no cover - availability depends on the serving environment.

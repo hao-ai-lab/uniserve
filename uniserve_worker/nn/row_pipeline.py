@@ -8,7 +8,7 @@ from typing import Generic, Protocol, TypeVar
 
 import torch
 
-from ..execution.forward_batch import ForwardBatch
+from ..execution.forward_batch import AttentionMetadata
 from .attention import RadixAttention
 from .attention_storage import attention_exchange_storage
 from .linear import GatheredLinear, LinearBase
@@ -202,7 +202,7 @@ def packed_row_stage(
     attention: RadixAttention,
     finish: Callable[[slice, torch.Tensor, RowTensors], RowTensors],
     *,
-    context: ForwardBatch,
+    context: AttentionMetadata,
     partition: SequencePartition | None,
     causal: bool,
     scale: float,

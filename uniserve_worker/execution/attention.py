@@ -2,37 +2,30 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve_worker.execution.batch import ForwardMode
 from uniserve_worker.execution.forward_batch import AttentionMode, ExpertRoute, RouteSpan
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.foundation.math import bucketed_length
+from uniserve_worker.protocol.batch import ForwardMode
 
 from ..models.runtime import CacheGeometry
-from .forward_batch import AttentionSelection
+from .forward_batch import AttentionMetadata, AttentionSelection
 from .rows import ForwardRow
 
 if TYPE_CHECKING:
-    from ..runtime.cache_pool import CachePool
-    from ..runtime.req_to_token_pool import ReqToTokenPool
-    from ..runtime.runtime_states import RuntimeStates
-    from .input_buffers import AttentionColumns, AttentionInputs
+    from ..runtime.block_tables import BlockTables
+    from ..runtime.kv_cache import KVCache
 
 
-def columns(
-    tasks: tuple[ForwardRow, ...],
-    *,
-    tables: ReqToTokenPool | None,
-    cache: CachePool | None,
-    states: RuntimeStates | None,
-    packed: bool,
-) -> AttentionInputs:
-    """Build packed attention mode, sequence, cache, position, and route tensors for forward rows."""
+def cache_pages(
+    tasks: tuple[ForwardRow, ...], *, tables: BlockTables | None, cache: KVCache | None
+) -> tuple[tuple[tuple[int, ...], ...], int]:
+    """Validate scheduler cache extents and return physical pages and bounded width."""
 
     if not tasks:
         raise invalid_descriptor("attention metadata requires forward rows")
@@ -46,14 +39,6 @@ def columns(
     prefix_lens = tuple(int(task.seq_len) for task in tasks)
     if any(length < 1 for length in query_lens) or any(length < 0 for length in prefix_lens):
         raise invalid_descriptor("forward attention lengths are invalid")
-    causal_rows = tuple(bool(task.causal) for task in tasks)
-    pure_decode = all(
-        task.operation.kind is ForwardMode.DECODE
-        and task.token_ids is not None
-        and task.query_tokens == 1
-        for task in tasks
-    )
-    binding = _binding_identity(tasks)
     pages = tuple(tables.pages(task.request_pool_idx, group_id) for task in tasks)
     capacities = tuple(tables.allocated_length(task.request_pool_idx) for task in tasks)
     for task, prefix, query, capacity, row_pages in zip(
@@ -71,28 +56,31 @@ def columns(
         bucketed_length(max(1, max(map(len, pages)))),
         tables.max_blocks_per_request,
     )
-    if pure_decode and all(task.request_indexed_decode for task in tasks):
-        if (
-            states is not None
-            and states.device.type == "cuda"
-            and tables.page_tables.device == states.device
-        ):
-            return {
-                "attention_mode": AttentionMode.REQUEST_INDEXED_DECODE,
-                "prefix_lens_cpu": prefix_lens,
-                "query_lens_cpu": query_lens,
-                "seq_lens_cpu": tuple(length + 1 for length in prefix_lens),
-                "causal_rows_cpu": causal_rows,
-                "causal": len(set(causal_rows)) == 1 and causal_rows[0],
-                "group_id": group_id,
-                "binding": binding,
-                "request_page_tables": tables.page_tables,
-                "request_cache_lengths": tables.verified_lens,
-                "request_tokens": states.future_input_tokens[:, 0],
-                "request_positions": states.logical_lengths,
-                "table_width": width,
-                "page_size": cache.block_size,
-            }
+    return pages, width
+
+
+def columns(
+    tasks: tuple[ForwardRow, ...],
+    *,
+    tables: BlockTables | None,
+    cache: KVCache | None,
+    packed: bool,
+    binding: int,
+) -> AttentionMetadata:
+    """Build packed attention mode, sequence, cache, position, and route tensors for forward rows."""
+
+    pages, width = cache_pages(tasks, tables=tables, cache=cache)
+    assert cache is not None
+    group_id = tasks[0].group_id
+    query_lens = tuple(task.query_tokens for task in tasks)
+    prefix_lens = tuple(task.seq_len for task in tasks)
+    causal_rows = tuple(task.causal for task in tasks)
+    pure_decode = all(
+        task.forward_mode is ForwardMode.DECODE
+        and task.token_ids is not None
+        and task.query_tokens == 1
+        for task in tasks
+    )
     return physical_columns(
         pages=pages,
         prefix_lens=prefix_lens,
@@ -132,7 +120,7 @@ def physical_columns(
     binding: int = 0,
     packed: bool = False,
     decode: bool = False,
-) -> AttentionColumns:
+) -> AttentionMetadata:
     """Build numerical attention metadata for serving and startup inputs alike."""
 
     block_table = torch.zeros((len(query_lens), width), dtype=torch.int32)
@@ -146,20 +134,20 @@ def physical_columns(
         write_rows,
         block_size,
     )
-    common: AttentionColumns = {
-        "attention_mode": AttentionMode.PAGED_VARLEN,
-        "prefix_lens": torch.tensor(prefix_lens, dtype=torch.int32),
-        "query_lens": torch.tensor(query_lens, dtype=torch.int32),
-        "out_cache_loc": out_cache_loc,
-        "has_cache_writes": any(write_rows),
-        "block_table": block_table,
-        "prefix_lens_cpu": prefix_lens,
-        "query_lens_cpu": query_lens,
-        "causal_rows_cpu": causal_rows,
-        "causal": len(set(causal_rows)) == 1 and causal_rows[0],
-        "group_id": group_id,
-        "binding": binding,
-    }
+    common = AttentionMetadata(
+        attention_mode=AttentionMode.PAGED_VARLEN,
+        prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
+        query_lens=torch.tensor(query_lens, dtype=torch.int32),
+        out_cache_loc=out_cache_loc,
+        has_cache_writes=any(write_rows),
+        block_table=block_table,
+        prefix_lens_cpu=prefix_lens,
+        query_lens_cpu=query_lens,
+        causal_rows_cpu=causal_rows,
+        causal=len(set(causal_rows)) == 1 and causal_rows[0],
+        group_id=group_id,
+        binding=binding,
+    )
     if packed and not decode:
         return _packed_columns(
             common,
@@ -173,46 +161,43 @@ def physical_columns(
             causal_rows,
         )
     seq_lens = tuple(prefix + query for prefix, query in zip(prefix_lens, query_lens, strict=True))
-    common["seq_lens"] = torch.tensor(seq_lens, dtype=torch.int32)
-    common["seq_lens_cpu"] = seq_lens
-    common["max_seqlen_k"] = width * block_size
-    if decode:
-        common["attention_mode"] = AttentionMode.PAGED_DECODE
-        return common
-    common.update(
-        {
-            "attention_mode": AttentionMode.PAGED_VARLEN,
-            "cu_seqlens_q": _cumulative(query_lens),
-            "cu_seqlens_k": _cumulative(seq_lens),
-            "output_indices": torch.tensor(
-                tuple(sum(query_lens[: index + 1]) - 1 for index in range(len(query_lens))),
-                dtype=torch.int64,
-            ),
-            "max_seqlen_q": max(query_lens),
-        }
+    return replace(
+        common,
+        attention_mode=AttentionMode.PAGED_DECODE if decode else AttentionMode.PAGED_VARLEN,
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+        seq_lens_cpu=seq_lens,
+        max_seqlen_k=width * block_size,
+        cu_seqlens_q=None if decode else _cumulative(query_lens),
+        cu_seqlens_k=None if decode else _cumulative(seq_lens),
+        output_indices=None
+        if decode
+        else torch.tensor(
+            tuple(sum(query_lens[: index + 1]) - 1 for index in range(len(query_lens))),
+            dtype=torch.int64,
+        ),
+        max_seqlen_q=0 if decode else max(query_lens),
     )
-    return common
 
 
-def dense_columns(row_count: int, query_lens: Sequence[int]) -> AttentionColumns:
+def dense_columns(row_count: int, query_lens: Sequence[int]) -> AttentionMetadata:
     """Build cumulative query offsets and maximum lengths for dense packed rows."""
 
     lengths = tuple(int(value) for value in query_lens)
-    return {
-        "attention_mode": AttentionMode.DENSE,
-        "prefix_lens": torch.zeros(row_count, dtype=torch.int32),
-        "query_lens": torch.tensor(lengths, dtype=torch.int32),
-        "out_cache_loc": torch.zeros(sum(lengths), dtype=torch.int64),
-        "has_cache_writes": False,
-        "prefix_lens_cpu": (0,) * row_count,
-        "query_lens_cpu": lengths,
-        "seq_lens_cpu": lengths,
-        "causal_rows_cpu": (),
-    }
+    return AttentionMetadata(
+        attention_mode=AttentionMode.DENSE,
+        prefix_lens=torch.zeros(row_count, dtype=torch.int32),
+        query_lens=torch.tensor(lengths, dtype=torch.int32),
+        out_cache_loc=torch.zeros(sum(lengths), dtype=torch.int64),
+        has_cache_writes=False,
+        prefix_lens_cpu=(0,) * row_count,
+        query_lens_cpu=lengths,
+        seq_lens_cpu=lengths,
+        causal_rows_cpu=(),
+    )
 
 
 def _packed_columns(
-    common: AttentionColumns,
+    common: AttentionMetadata,
     positions: tuple[torch.Tensor, ...],
     token_rows: tuple[bool, ...],
     text_local_indices: tuple[tuple[int, ...], ...],
@@ -221,7 +206,7 @@ def _packed_columns(
     width: int,
     block_size: int,
     causal_rows: tuple[bool, ...],
-) -> AttentionColumns:
+) -> AttentionMetadata:
     """Build packed attention boundaries, cache tables, write locations, and route spans."""
 
     max_query = bucketed_length(max(query_lens))
@@ -272,22 +257,20 @@ def _packed_columns(
             append_span(ExpertRoute.TEXT, run_end - run_start)
             cursor = run_end
         append_span(ExpertRoute.FLOW, query - cursor)
-    common.update(
-        {
-            "attention_mode": AttentionMode.PACKED,
-            "attention_indexes": torch.cat(indexes, dim=1),
-            "route_spans": tuple(spans),
-            "visible_end": visible,
-            "cu_seqlens_q": _cumulative(query_lens),
-            "max_seqlen_q": max_query,
-            "max_seqlen_k": width * block_size,
-            "fully_visible": not any(causal_rows),
-            "seq_lens_cpu": tuple(
-                prefix + query for prefix, query in zip(prefix_lens, query_lens, strict=True)
-            ),
-        }
+    return replace(
+        common,
+        attention_mode=AttentionMode.PACKED,
+        attention_indexes=torch.cat(indexes, dim=1),
+        route_spans=tuple(spans),
+        visible_end=visible,
+        cu_seqlens_q=_cumulative(query_lens),
+        max_seqlen_q=max_query,
+        max_seqlen_k=width * block_size,
+        fully_visible=not any(causal_rows),
+        seq_lens_cpu=tuple(
+            prefix + query for prefix, query in zip(prefix_lens, query_lens, strict=True)
+        ),
     )
-    return common
 
 
 def _output_locations(
@@ -336,26 +319,13 @@ def _cumulative(lengths: Sequence[int]) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32)
 
 
-def _binding_identity(tasks: Sequence[ForwardRow]) -> int:
-    """Return a shared attention binding when every forward row agrees."""
-
-    hasher = hashlib.blake2b(digest_size=8)
-    for task in tasks:
-        hasher.update(int(task.operation.request_key.request_id).to_bytes(8, "little"))
-        hasher.update(int(task.operation.request_key.request_epoch).to_bytes(8, "little"))
-        hasher.update(task.operation.request_key.engine_id.to_bytes(8, "little"))
-        hasher.update(task.operation.op_id.batch_id.to_bytes(8, "little"))
-        hasher.update(task.operation.op_id.request_index.to_bytes(4, "little"))
-    return int.from_bytes(hasher.digest(), "little")
-
-
 __all__ = ["columns", "dense_columns"]
 
 
 def supports_flow_attention(
     selection: AttentionSelection,
     geometry: CacheGeometry,
-    pool: CachePool,
+    pool: KVCache,
     device: torch.device,
 ) -> bool:
     """Return whether the selected backend can execute the model's flow-attention geometry."""

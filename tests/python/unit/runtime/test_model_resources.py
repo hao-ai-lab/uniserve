@@ -15,11 +15,11 @@ from uniserve_worker.bootstrap.capacity import (
     tensor_slot_capacity,
 )
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
-from uniserve_worker.execution.batch import ForwardMode, PipelineStage
-from uniserve_worker.execution.bounded_storage import TensorSchema
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.foundation.math import ceil_div
 from uniserve_worker.nn.mesh import Communicator
+from uniserve_worker.protocol.batch import ForwardMode, PipelineStage
+from uniserve_worker.runtime.tensor_buffers import TensorSchema
 
 pytestmark = pytest.mark.unit
 
@@ -160,7 +160,11 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     import torch
 
     from uniserve_worker.config import WorkerConfig
-    from uniserve_worker.execution.batch import (
+    from uniserve_worker.models.runtime import (
+        ExecutionModel,
+        ResourceGeometry,
+    )
+    from uniserve_worker.protocol.batch import (
         BufferAllocation,
         DeviceDim,
         DType,
@@ -170,12 +174,8 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
         TensorRef,
         TensorSpec,
     )
-    from uniserve_worker.execution.bounded_storage import TensorSchema
-    from uniserve_worker.models.runtime import (
-        ExecutionModel,
-        ResourceGeometry,
-    )
-    from uniserve_worker.runtime.persistent_buffers import PersistentBuffers
+    from uniserve_worker.runtime.buffer_pool import BufferPool
+    from uniserve_worker.runtime.tensor_buffers import TensorSchema
 
     model = ExecutionModel()
     model.architecture = "TensorEntryModel"
@@ -191,7 +191,7 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     }
     config = WorkerConfig(device="cpu", max_request_pool_size=2)
     info = build_worker_layout(model, config, queue_depth=8, completion_payload_bytes=1024).info
-    arena = PersistentBuffers(byte_capacity=info.buffer_pool_bytes, devices=("cpu",))
+    arena = BufferPool(byte_capacity=info.buffer_pool_bytes, devices=("cpu",))
     bindings = []
     offset = 0
     try:
@@ -245,7 +245,10 @@ def test_cuda_capacity_query_failure_is_not_an_empty_budget(monkeypatch) -> None
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
 def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(rank):
     from uniserve_worker.bootstrap.capacity import local_product_storage_bytes
-    from uniserve_worker.execution.batch import (
+    from uniserve_worker.execution.model_entry import ModelEntry
+    from uniserve_worker.nn.mesh import DeviceMesh
+    from uniserve_worker.nn.parallel import ComponentConfig
+    from uniserve_worker.protocol.batch import (
         DeviceDim,
         DType,
         PipelineStage,
@@ -253,8 +256,6 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(rank)
         StaticDim,
         TensorSpec,
     )
-    from uniserve_worker.nn.mesh import DeviceMesh, EntryBindings
-    from uniserve_worker.nn.parallel import ComponentConfig
 
     entries = {
         "encode": ComponentConfig((2,)),
@@ -262,15 +263,19 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(rank)
         "decode": ComponentConfig((1, 3), distribution="temporal_units", units_per_rank=2),
         "assemble": ComponentConfig((0,)),
     }
-    bindings = EntryBindings(
-        entries,
-        {
-            name: DeviceMesh(config.ranks, rank, config.parallel_config, torch.device("cpu"))
-            for name, config in entries.items()
+    group = Communicator((0, 1, 2, 3), rank)
+    bindings = {
+        name: ModelEntry(
+            name,
+            config,
+            group,
+            DeviceMesh(config.ranks, rank, config.parallel_config, group.device)
             if config.distribution is None and rank in config.ranks
-        },
-        Communicator((0, 1, 2, 3), rank),
-    )
+            else None,
+            group.device,
+        )
+        for name, config in entries.items()
+    }
     outputs = {
         "encode": (TensorSpec("embedding", DType.F32, ShapeBound((StaticDim(128),))),),
         "predict": (TensorSpec("latents", DType.F32, ShapeBound((StaticDim(256),))),),

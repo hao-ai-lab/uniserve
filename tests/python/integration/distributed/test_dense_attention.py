@@ -5,18 +5,19 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from uniserve_worker.bootstrap.distributed import (
+    initialize_model_parallel,
+    initialize_process_groups,
+)
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.nn.parallel_attention import AttentionContextGeometry, ParallelAttention
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from uniserve_worker.runtime.attention_storage import allocate_attention_context
 
 pytestmark = pytest.mark.integration
 
 
 def _run_attention(rank: int, rendezvous: str) -> None:
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=4,
@@ -58,7 +59,7 @@ def _run_attention(rank: int, rendezvous: str) -> None:
                     local_value = attention.exchange_heads(value[begin : begin + local_rows])
                     context = None
                     if kind == "allgather":
-                        context = environment.attention_context(
+                        context = allocate_attention_context(
                             AttentionContextGeometry(
                                 group=mesh.get_group("cp"),
                                 rows=local_rows,

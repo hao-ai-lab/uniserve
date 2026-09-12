@@ -9,9 +9,9 @@ import pytest
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
 from uniserve_worker.config import LaneConfig, WorkerConfig
-from uniserve_worker.execution.batch import COMPUTATIONS, ForwardMode, PipelineStage
 from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry
 from uniserve_worker.models.stub import StubModel, stub_worker_config
+from uniserve_worker.protocol.batch import COMPUTATIONS, ForwardMode, PipelineStage
 from uniserve_worker.worker import Worker
 
 pytestmark = pytest.mark.integration

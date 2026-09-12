@@ -6,23 +6,24 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
+from uniserve_worker.bootstrap.distributed import (
+    initialize_model_parallel,
+    initialize_process_groups,
+)
 from uniserve_worker.config import LaneConfig
-from uniserve_worker.execution.batch import COMPUTATIONS, ForwardMode
-from uniserve_worker.execution.graph.full import FullCudaGraphBackend
-from uniserve_worker.execution.lane import create_green_contexts
+from uniserve_worker.execution.cuda_graph import CudaGraph
+from uniserve_worker.execution.cuda_stream import create_partitioned_streams
 from uniserve_worker.nn.collective import stream_collective_scope
 from uniserve_worker.nn.parallel import ParallelConfig
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from uniserve_worker.protocol.batch import COMPUTATIONS, ForwardMode
+from uniserve_worker.runtime.collectives import allocate_stream_collectives
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 def _run_collectives(rank: int, rendezvous: str):
     device = torch.device("cuda", rank)
-    with init_distributed_environment(
+    with initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=2,
@@ -34,7 +35,7 @@ def _run_collectives(rank: int, rendezvous: str):
             "model"
         ]
         group = mesh.get_group("tp")
-        greens = create_green_contexts(
+        greens = create_partitioned_streams(
             (
                 LaneConfig("decode", 64, (ForwardMode.DECODE, ForwardMode.VERIFY)),
                 LaneConfig(
@@ -51,8 +52,8 @@ def _run_collectives(rank: int, rendezvous: str):
         )
         try:
             for green in greens:
-                bindings = environment.stream_collectives(green.stream)
-                graph = FullCudaGraphBackend(
+                bindings = allocate_stream_collectives((group,), green.stream)
+                graph = CudaGraph(
                     device=device, stream=green.stream, expected_context=int(green.context)
                 )
                 value = torch.arange(8, dtype=torch.float32, device=device).view(2, 4) + rank * 10
@@ -87,13 +88,13 @@ def _run_collectives(rank: int, rendezvous: str):
                         )
 
                 try:
-                    graph.capture_one("collectives", execute, keepalive=(value,))
+                    graph.capture(execute, keepalive=(value,))
                     for iteration in range(2):
                         with torch.cuda.stream(green.stream):
                             value.copy_(
                                 torch.arange(8, device=device).view(2, 4) + rank * 10 + iteration
                             )
-                            actual = graph.replay("collectives")
+                            actual = graph.replay()
                         green.stream.synchronize()
                         base = (
                             torch.arange(8, dtype=torch.float32, device=device).view(2, 4)

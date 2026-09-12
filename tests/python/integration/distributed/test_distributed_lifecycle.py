@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from uniserve_worker.runtime.distributed import init_distributed_environment
+from uniserve_worker.bootstrap.distributed import initialize_process_groups
 
 pytestmark = pytest.mark.integration
 
@@ -26,7 +26,7 @@ def _construction_scope(rank, directory):
                 patch.setattr(dist, "destroy_process_group", failing_destroy)
 
             try:
-                with init_distributed_environment(
+                with initialize_process_groups(
                     rank=rank,
                     local_rank=rank,
                     world_size=2,

@@ -6,54 +6,49 @@ import concurrent.futures
 import struct
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import partial
 from threading import RLock
-from typing import Any, Final, cast
+from typing import Final
 
 import torch
 
-from uniserve_worker.execution.batch import Computation, ComputationId
+from uniserve_worker.protocol.batch import Computation, ComputationId
 
-from ..execution.batch import (
-    CompletionState,
+from ..foundation.errors import WorkerError, WorkerErrorCode, resource_error
+from ..foundation.resources import close_resources
+from ..media.buffers import MediaLease
+from ..media.storage import publish_media_bytes
+from ..profiling import timing_events_enabled
+from ..protocol.batch import (
+    BufferId,
     ErrorCode,
     FinishFlags,
     KvTransfer,
-    LaneResult,
+    LatentParams,
+    Locator,
     MediaOutput,
-    ModelOutput,
     OpStatus,
     PosixShmArtifact,
     RequestKey,
-    RunResult,
+    RequestOutput,
+    ScheduledRequest,
+    TensorPublication,
     TimingCounters,
 )
-from ..foundation.errors import WorkerError, WorkerErrorCode, resource_error
-from ..foundation.resources import close_resources
-from ..media.codec import uint8_image_to_png_base64_bytes
-from ..media.storage import publish_media_bytes
-from ..profiling import profile_range, timing_events_enabled
-from ..runtime.cpu import CpuTaskReservation
+from ..runtime.cpu import CpuTask
 from ..runtime.device import canonical_device
-from ..runtime.device_events import DeviceEventPool
-from ..runtime.request import RequestRuntime
+from ..runtime.device_events import EventPool
+from ..runtime.latent_pool import LatentStaging
+from ..runtime.request import RequestProgress, RequestState
+from ..runtime.tensor_store import TensorRead, TensorRecord
+from ..transfer.exports import ExportLocations
+from .sampling import LogprobValues, SamplerOutput
 
 __all__ = [
-    "CpuJob",
     "PendingOutput",
-    "ImageEncoding",
-    "LogprobCapture",
-    "LogprobOutputRow",
-    "SamplingCapture",
-    "SamplingOutputRow",
-    "ByteCapture",
     "OutputBuffer",
     "OutputPool",
-    "TokenCapture",
-    "run_result_ready",
-    "finalize_run_result",
-    "lane_completion_ready",
 ]
 
 _SAMPLING_FIELDS_PER_OPERATION: Final[int] = 4
@@ -70,55 +65,6 @@ def _invariant(message: str) -> WorkerError:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class TokenCapture:
-    """One token range copied into a lane's pinned output buffer."""
-
-    buffer: OutputBuffer
-    offset: int
-    count: int
-
-    def ready(self) -> bool:
-        """Indicate whether the token copy event has completed."""
-
-        return self.buffer.ready()
-
-    def values(self) -> tuple[int, ...]:
-        """Read this row's captured tokens after the owning buffer becomes ready."""
-
-        return self.buffer.read_tokens(self)
-
-
-@dataclass(frozen=True, slots=True)
-class ByteCapture:
-    """One shaped byte range copied into a lane's pinned output buffer."""
-
-    buffer: OutputBuffer
-    offset: int
-    count: int
-    shape: tuple[int, ...]
-    external: torch.Tensor | None = None
-
-    def ready(self) -> bool:
-        """Indicate whether the byte-range copy event has completed."""
-
-        return self.buffer.ready()
-
-    def tensor(self) -> torch.Tensor:
-        """Expose this capture's shaped CPU byte view after readiness."""
-
-        return self.buffer.read_bytes(self)
-
-    def numpy(self) -> Any:
-        """Return the captured byte range as a shaped NumPy view after readiness."""
-
-        if self.external is not None:
-            if int(self.external.numel()) != int(self.count):
-                raise _invariant("external completion byte storage has an invalid extent")
-            return self.external.view(self.shape).numpy()
-        return self.tensor().numpy()
-
-
 class OutputBuffer:
     """Pinned host storage and completion events for one lane commit."""
 
@@ -131,6 +77,8 @@ class OutputBuffer:
         "_token_cursor",
         "_byte_cursor",
         "_token_cache",
+        "logprob_layouts",
+        "_logprob_cache",
         "_start_events",
         "_producer_events",
         "_events",
@@ -150,6 +98,8 @@ class OutputBuffer:
         "_completion_registered",
         "_release_to_pool",
         "_released_to_pool",
+        "_cpu_readers",
+        "_reader_lock",
     )
 
     def __init__(
@@ -158,7 +108,7 @@ class OutputBuffer:
         *,
         token_capacity: int,
         devices: Sequence[torch.device | str] = (),
-        event_pool: DeviceEventPool,
+        event_pool: EventPool,
         release_to_pool: Callable[[OutputBuffer], None] | None = None,
     ) -> None:
         """Reserve pinned completion rows and generation-tagged CUDA copy state."""
@@ -189,6 +139,13 @@ class OutputBuffer:
         self._token_cursor = 0
         self._byte_cursor = 0
         self._token_cache: dict[tuple[int, int], tuple[int, ...]] = {}
+        self.logprob_layouts: dict[
+            tuple[int, int],
+            tuple[tuple[int, ...], tuple[int, ...], tuple[tuple[int, ...], ...], int, int],
+        ] = {}
+        self._logprob_cache: dict[
+            tuple[int, int], dict[int, tuple[float, tuple[tuple[int, float, int], ...]]]
+        ] = {}
         self._start_events: dict[str, torch.cuda.Event] = {}
         self._producer_events: dict[str, torch.cuda.Event] = {}
         self._events: dict[str, torch.cuda.Event] = {}
@@ -208,6 +165,8 @@ class OutputBuffer:
         self._completion_registered = False
         self._release_to_pool = release_to_pool
         self._released_to_pool = False
+        self._cpu_readers = 0
+        self._reader_lock = RLock()
 
     def reset(
         self,
@@ -251,6 +210,8 @@ class OutputBuffer:
         self._token_cursor = 0
         self._byte_cursor = 0
         self._token_cache.clear()
+        self.logprob_layouts.clear()
+        self._logprob_cache.clear()
         self._start_events.clear()
         self._producer_events.clear()
         self._events.clear()
@@ -275,12 +236,6 @@ class OutputBuffer:
         """Identify the lease generation guarding all captures from this buffer use."""
 
         return self._generation
-
-    @property
-    def row_count(self) -> int:
-        """Count completion rows reserved by the active buffer lease."""
-
-        return self._rows
 
     def register_device(self, device: torch.device | str) -> None:
         """Verify that a CUDA producer belongs to the devices declared for this lease."""
@@ -329,7 +284,7 @@ class OutputBuffer:
         self.event_pool.record(event, device)
         self._producer_events[name] = event
 
-    def capture(self, tokens: torch.Tensor) -> TokenCapture:
+    def capture(self, tokens: torch.Tensor) -> tuple[int, int]:
         """Copy a token tensor into the next bounded span of pinned host storage."""
 
         if self._sealed:
@@ -351,10 +306,14 @@ class OutputBuffer:
         else:
             host.copy_(flat.to(device="cpu"))
         self._token_cursor = end
-        return TokenCapture(self, offset, count)
+        return offset, count
 
-    def capture_bytes(self, value: torch.Tensor) -> ByteCapture:
-        """Copy a contiguous uint8 tensor into the byte region growing from the buffer tail."""
+    def capture_bytes(self, value: torch.Tensor) -> torch.Tensor:
+        """Copy uint8 values into the buffer tail and borrow their shaped host view.
+
+        The caller must wait for this buffer's completion before reading the
+        view, and retain a CPU reader until its last asynchronous use finishes.
+        """
 
         if value.dtype is not torch.uint8:
             raise ValueError("completion byte capture requires uint8 storage")
@@ -380,19 +339,18 @@ class OutputBuffer:
         else:
             host.copy_(flat.to(device="cpu"))
         self._byte_cursor += count
-        return ByteCapture(
-            self,
-            offset,
-            count,
-            tuple(int(value) for value in contiguous.shape),
-        )
+        return host.view(contiguous.shape)
 
     def capture_bytes_into(
         self,
         value: torch.Tensor,
         storage: torch.Tensor,
-    ) -> ByteCapture:
-        """Copy bytes into caller-owned pinned storage under this buffer's events."""
+    ) -> torch.Tensor:
+        """Copy bytes into caller-owned pinned storage under this buffer's events.
+
+        The returned host view is readable only after this buffer completes.
+        Its caller retains the external storage through the final CPU reader.
+        """
 
         if value.dtype is not torch.uint8:
             raise ValueError("completion byte capture requires uint8 storage")
@@ -417,13 +375,7 @@ class OutputBuffer:
             host.copy_(flat, non_blocking=True)
         else:
             host.copy_(flat.to(device="cpu"))
-        return ByteCapture(
-            self,
-            0,
-            count,
-            tuple(int(item) for item in contiguous.shape),
-            host,
-        )
+        return host.view(contiguous.shape)
 
     def _byte_floor(self) -> int:
         """Return the first byte offset not reserved for fixed completion words."""
@@ -508,40 +460,34 @@ class OutputBuffer:
         if future is not None:
             self._resolve_completion(future)
 
-    def read_tokens(self, capture: TokenCapture) -> tuple[int, ...]:
-        """Read and cache a validated token capture after its copy completes."""
+    def read_tokens(self, offset: int, count: int) -> tuple[int, ...]:
+        """Read a registered integer range only after its producer copy completes."""
 
-        if capture.buffer is not self:
-            raise _invariant("completion capture belongs to a different pinned output buffer")
-        key = (int(capture.offset), int(capture.count))
+        key = (int(offset), int(count))
         cached = self._token_cache.get(key)
         if cached is not None:
             return cached
         if not self.ready():
             raise _invariant("completion storage was observed before its copy event was ready")
-        end = capture.offset + capture.count
-        if capture.offset < 0 or end > self._token_cursor:
+        end = offset + count
+        if offset < 0 or end > self._token_cursor:
             raise _invariant("completion capture range is outside its registered token extent")
-        values = tuple(int(value) for value in self._host[capture.offset : end].tolist())
+        values = tuple(int(value) for value in self._host[offset:end].tolist())
         self._token_cache[key] = values
         return values
 
-    def read_bytes(self, capture: ByteCapture) -> torch.Tensor:
-        """Return a validated shaped view of captured bytes after readiness."""
+    def logprob_values(
+        self, span: tuple[int, int, int]
+    ) -> tuple[float, tuple[tuple[int, float, int], ...]]:
+        """Decode one row, sharing parsing of its packed column with other rows."""
 
-        if capture.buffer is not self:
-            raise _invariant("completion byte capture belongs to a different pinned output buffer")
-        if not self.ready():
-            raise _invariant("completion byte storage was observed before its copy event was ready")
-        if capture.external is not None:
-            if int(capture.external.numel()) != int(capture.count):
-                raise _invariant("external completion byte storage has an invalid extent")
-            return capture.external.view(capture.shape)
-        end = int(capture.offset) + int(capture.count)
-        total = int(self._host.numel()) * int(self._host.element_size())
-        if capture.offset < 0 or end > total:
-            raise _invariant("completion byte range is outside its registered extent")
-        return self._host.view(torch.uint8)[capture.offset : end].view(capture.shape)
+        offset, count, index = span
+        key = (offset, count)
+        details = self._logprob_cache.get(key)
+        if details is None:
+            details = decode_logprobs(self.read_tokens(offset, count), self.logprob_layouts[key])
+            self._logprob_cache[key] = details
+        return details[index]
 
     def observe(self, row: int, generation: int) -> tuple[int, int]:
         """Mark one result row observed and return copy and host-observation timing."""
@@ -662,12 +608,34 @@ class OutputBuffer:
         self._complete_dependents()
         self._return_to_pool()
 
-    def _return_to_pool(self) -> None:
-        """Return the fully released completion buffer to its owning pool."""
+    def retain_cpu_reader(self) -> Callable[[], None]:
+        """Retain pinned storage until a configured CPU task finishes reading it."""
 
-        if self._released_to_pool or self._release_to_pool is None:
-            return
-        self._released_to_pool = True
+        with self._reader_lock:
+            if self._released_to_pool:
+                raise _invariant("CPU reader acquired a retired output buffer")
+            self._cpu_readers += 1
+        return self._release_cpu_reader
+
+    def _release_cpu_reader(self) -> None:
+        with self._reader_lock:
+            if self._cpu_readers < 1:
+                raise _invariant("output CPU reader count underflow")
+            self._cpu_readers -= 1
+        self._return_to_pool()
+
+    def _return_to_pool(self) -> None:
+        """Return storage only after both device writes and CPU readers retire."""
+
+        with self._reader_lock:
+            if (
+                self._released_to_pool
+                or not self._events_released
+                or self._cpu_readers
+                or self._release_to_pool is None
+            ):
+                return
+            self._released_to_pool = True
         self._release_to_pool(self)
 
 
@@ -679,7 +647,7 @@ class OutputPool:
         *,
         capacity: int,
         max_words: int,
-        event_pool: DeviceEventPool,
+        event_pool: EventPool,
     ) -> None:
         """Allocate a bounded set of reusable pinned completion buffers."""
 
@@ -763,726 +731,421 @@ class _PredicatedOperation(RuntimeError):
     pass
 
 
-class SamplingCapture:
-    """Contiguous validity, activity, token, and acceptance metadata."""
+def capture_logprobs(
+    details: LogprobValues | None,
+    output: OutputBuffer,
+) -> dict[int, tuple[int, int, int]]:
+    """Store one packed score column and return its operation row ranges."""
 
-    __slots__ = ("capture", "count", "_values")
-
-    def __init__(
-        self,
-        capture: TokenCapture | None,
-        count: int,
-        values: tuple[int, ...] | None = None,
-    ) -> None:
-        """Bind packed sampling metadata to row layouts or predecoded values."""
-
-        self.capture = capture
-        self.count = int(count)
-        self._values = values
-
-    def ready(self) -> bool:
-        """Indicate whether the packed sampling metadata can be decoded without blocking."""
-
-        return self._values is not None or (self.capture is not None and self.capture.ready())
-
-    def finalize(self) -> tuple[int, ...]:
-        """Decode and cache validity, activity, token, and acceptance vectors from pinned output."""
-
-        if self._values is None:
-            if self.capture is None:
-                raise RuntimeError("sampling completion metadata has no capture")
-            values = self.capture.values()
-            if len(values) != self.count * 4:
-                raise RuntimeError("sampling completion metadata has an invalid extent")
-            self._values = values
-        return self._values
-
-    def token(self, index: int) -> int:
-        """Return the selected token after enforcing predicate and distribution validity."""
-
-        values = self.finalize()
-        if not bool(values[self.count + index]):
-            raise _PredicatedOperation("operation predicate selected no state")
-        if not bool(values[index]):
-            raise _InvalidSamplingDistribution("sampling policy produced an invalid distribution")
-        return values[self.count * 2 + index]
-
-    def accepted(self, index: int) -> int:
-        """Return the accepted speculative-prefix length for one valid active row."""
-
-        values = self.finalize()
-        if not bool(values[self.count + index]):
-            raise _PredicatedOperation("operation predicate selected no state")
-        if not bool(values[index]):
-            raise _InvalidSamplingDistribution("sampling policy produced an invalid distribution")
-        return values[self.count * 3 + index]
+    if details is None:
+        return {}
+    packed, rows, counts, requested_ids, max_count, max_requested = details
+    capture = output.capture(packed)
+    key = capture
+    output.logprob_layouts[key] = (rows, counts, requested_ids, max_count, max_requested)
+    return {index: (*key, index) for index in rows}
 
 
-@dataclass(frozen=True, slots=True)
-class SamplingOutputRow:
-    """One operation's view of a contiguous sampling metadata capture."""
+def capture_samples(
+    samples: Sequence[SamplerOutput],
+    requests: Sequence[PendingOutput],
+    output: OutputBuffer,
+) -> None:
+    """Attach row ranges while copying each shared sampling column only once.
 
-    capture: SamplingCapture
-    index: int
-    draft_tokens: tuple[int, ...] = ()
-    terminal_prefix: int | None = None
-    logical_base: int | None = None
-    kv_base: int | None = None
+    Call on the producer stream before sealing the output buffer. Its fence
+    protects all sampling and score ranges until their PendingOutput retires.
+    """
 
-    def ready(self) -> bool:
-        """Indicate whether this row's speculative sampling capture is host-visible."""
+    spans: dict[int, tuple[int, int]] = {}
+    details: dict[int, dict[int, tuple[int, int, int]]] = {}
+    for sample, request in zip(samples, requests, strict=True):
+        metadata = sample.completion
+        count = int(metadata.numel()) // _SAMPLING_FIELDS_PER_OPERATION
+        if metadata.numel() != count * _SAMPLING_FIELDS_PER_OPERATION or not (
+            0 <= sample.completion_index < count
+        ):
+            raise RuntimeError("sampling completion vectors do not align")
+        key = id(metadata)
+        span = spans.get(key)
+        if span is None:
+            capture = output.capture(metadata)
+            span = capture
+            spans[key] = span
+        request.sampling_range = (*span, sample.completion_index)
+        if sample.logprobs is not None:
+            key = id(sample.logprobs)
+            if key not in details:
+                details[key] = capture_logprobs(sample.logprobs, output)
+            request.logprob_range = details[key].get(sample.completion_index)
 
-        return self.capture.ready()
 
-    def materialize(self) -> tuple[int, ...]:
-        """Return accepted draft tokens and the continuation unless the accepted prefix terminates."""
+def sampled_tokens(record: PendingOutput) -> tuple[int, ...]:
+    """Resolve validity and speculative acceptance from one captured sampling row."""
 
-        token = self.capture.token(int(self.index))
-        accepted = self.capture.accepted(int(self.index))
-        if not self.draft_tokens:
-            return (token,)
-        if accepted < 0 or accepted > len(self.draft_tokens):
-            raise RuntimeError("speculative acceptance count is outside the draft span")
-        if self.terminal_prefix is not None and accepted >= self.terminal_prefix:
-            tokens = self.draft_tokens[:accepted]
-        else:
-            tokens = (*self.draft_tokens[:accepted], token)
-        return tokens
+    if record.sampling_range is None:
+        return record.committed_tokens
+    offset, extent, index = record.sampling_range
+    values = record._sampling_values
+    if values is None:
+        if record._buffer is None:
+            raise RuntimeError("sampling output lost its pinned range")
+        values = record._buffer.read_tokens(offset, extent)
+        record._sampling_values = values
+    count = extent // _SAMPLING_FIELDS_PER_OPERATION
+    if not bool(values[count + index]):
+        raise _PredicatedOperation("operation predicate selected no state")
+    if not bool(values[index]):
+        raise _InvalidSamplingDistribution("sampling policy produced an invalid distribution")
+    token = values[count * 2 + index]
+    accepted = values[count * 3 + index]
+    draft = record.draft_tokens
+    if not draft:
+        return (token,)
+    if accepted < 0 or accepted > len(draft):
+        raise RuntimeError("speculative acceptance count is outside the draft span")
+    if record.terminal_prefix is not None and accepted >= record.terminal_prefix:
+        return draft[:accepted]
+    return (*draft[:accepted], token)
 
 
-class LogprobCapture:
-    """Packed query-ready logprob tensors shared by a sampling group."""
+def logprob_entries(record: PendingOutput, span: tuple[int, int, int]) -> int:
+    """Return the declared maximum score entries for completion-byte validation."""
 
-    __slots__ = (
-        "capture",
-        "rows",
-        "counts",
-        "requested_ids",
-        "max_count",
-        "max_requested",
-        "_details",
-    )
+    if record._buffer is None:
+        raise RuntimeError("logprob output lost its pinned range")
+    offset, count, index = span
+    rows, counts, requested_ids, _max_count, _max_requested = record._buffer.logprob_layouts[
+        (offset, count)
+    ]
+    local = rows.index(index)
+    return 1 + counts[local] + len(requested_ids[local])
 
-    def __init__(
-        self,
-        capture: TokenCapture | None,
-        rows: tuple[int, ...],
-        counts: tuple[int, ...],
-        requested_ids: tuple[tuple[int, ...], ...],
-        max_count: int,
-        max_requested: int,
-        values: tuple[int, ...] | None = None,
-    ) -> None:
-        """Bind packed log-probability metadata to its requested row schemas."""
 
-        self.capture = capture
-        self.rows = rows
-        self.counts = counts
-        self.requested_ids = requested_ids
-        self.max_count = int(max_count)
-        self.max_requested = int(max_requested)
-        self._details: dict[int, tuple[float, tuple[tuple[int, float, int], ...]]] | None = None
-        if values is not None:
-            self._details = self._decode(values)
+def decode_logprobs(
+    values: tuple[int, ...],
+    layout: tuple[tuple[int, ...], tuple[int, ...], tuple[tuple[int, ...], ...], int, int],
+) -> dict[int, tuple[float, tuple[tuple[int, float, int], ...]]]:
+    """Decode the sampler's packed float bits and row-major rank columns."""
 
-    def ready(self) -> bool:
-        """Indicate whether all selected and requested log-probability entries are host-visible."""
+    rows, counts, requested_ids, max_count, max_requested = layout
 
-        return self._details is not None or (self.capture is not None and self.capture.ready())
-
-    @staticmethod
-    def _float(value: int) -> float:
-        """Decode a float32 value from its unsigned integer bit pattern."""
-
+    def float_value(value: int) -> float:
         return struct.unpack("<f", struct.pack("<I", value & 0xFFFFFFFF))[0]
 
-    def finalize(self) -> dict[int, tuple[float, tuple[tuple[int, float, int], ...]]]:
-        """Decode and cache selected, top-k, and explicitly requested token log probabilities."""
+    row_count = len(rows)
+    cursor = 0
 
-        if self._details is not None:
-            return self._details
-        if self.capture is None:
-            raise RuntimeError("logprob completion metadata has no capture")
-        self._details = self._decode(self.capture.values())
-        return self._details
+    def vector(width: int) -> tuple[tuple[int, ...], ...]:
+        """Consume one row-major field of fixed width from the packed capture."""
 
-    def _decode(
-        self,
-        values: tuple[int, ...],
-    ) -> dict[int, tuple[float, tuple[tuple[int, float, int], ...]]]:
-        """Decode flattened completion fields into token, chosen, and requested log probabilities."""
+        nonlocal cursor
+        total = row_count * width
+        part = values[cursor : cursor + total]
+        if len(part) != total:
+            raise RuntimeError("logprob completion metadata is truncated")
+        cursor += total
+        return tuple(tuple(part[row * width : (row + 1) * width]) for row in range(row_count))
 
-        row_count = len(self.rows)
-        cursor = 0
-
-        def vector(width: int) -> tuple[tuple[int, ...], ...]:
-            """Consume one row-major field of fixed width from the packed capture."""
-
-            nonlocal cursor
-            total = row_count * width
-            part = values[cursor : cursor + total]
-            if len(part) != total:
-                raise RuntimeError("logprob completion metadata is truncated")
-            cursor += total
-            return tuple(tuple(part[row * width : (row + 1) * width]) for row in range(row_count))
-
-        selected_tokens = vector(1)
-        selected_values = vector(1)
-        selected_ranks = vector(1)
-        top_indexes = vector(self.max_count)
-        top_values = vector(self.max_count)
-        top_ranks = vector(self.max_count)
-        candidate_values = vector(self.max_requested)
-        candidate_ranks = vector(self.max_requested)
-        if cursor != len(values):
-            raise RuntimeError("logprob completion metadata has trailing values")
-        details: dict[int, tuple[float, tuple[tuple[int, float, int], ...]]] = {}
-        for local, result_index in enumerate(self.rows):
-            selected = selected_tokens[local][0]
-            selected_value = self._float(selected_values[local][0])
-            entries: list[tuple[int, float, int]] = [
-                (selected, selected_value, selected_ranks[local][0])
-            ]
-            seen = {selected}
-            for index in range(self.counts[local]):
-                candidate = top_indexes[local][index]
-                if candidate not in seen:
-                    entries.append(
-                        (
-                            candidate,
-                            self._float(top_values[local][index]),
-                            top_ranks[local][index],
-                        )
+    selected_tokens = vector(1)
+    selected_values = vector(1)
+    selected_ranks = vector(1)
+    top_indexes = vector(max_count)
+    top_values = vector(max_count)
+    top_ranks = vector(max_count)
+    candidate_values = vector(max_requested)
+    candidate_ranks = vector(max_requested)
+    if cursor != len(values):
+        raise RuntimeError("logprob completion metadata has trailing values")
+    details: dict[int, tuple[float, tuple[tuple[int, float, int], ...]]] = {}
+    for local, result_index in enumerate(rows):
+        selected = selected_tokens[local][0]
+        selected_value = float_value(selected_values[local][0])
+        entries: list[tuple[int, float, int]] = [
+            (selected, selected_value, selected_ranks[local][0])
+        ]
+        seen = {selected}
+        for index in range(counts[local]):
+            candidate = top_indexes[local][index]
+            if candidate not in seen:
+                entries.append(
+                    (
+                        candidate,
+                        float_value(top_values[local][index]),
+                        top_ranks[local][index],
                     )
-                    seen.add(candidate)
-            for index, candidate in enumerate(self.requested_ids[local]):
-                if candidate not in seen:
-                    entries.append(
-                        (
-                            candidate,
-                            self._float(candidate_values[local][index]),
-                            candidate_ranks[local][index],
-                        )
-                    )
-                    seen.add(candidate)
-            details[result_index] = (selected_value, tuple(entries))
-        return details
-
-
-@dataclass(frozen=True, slots=True)
-class LogprobOutputRow:
-    """One operation or prompt position in a packed logprob capture."""
-
-    capture: LogprobCapture
-    index: int
-
-    def ready(self) -> bool:
-        """Indicate whether this row's shared log-probability capture is host-visible."""
-
-        return self.capture.ready()
-
-    def finalize(self) -> tuple[float, tuple[tuple[int, float, int], ...]]:
-        """Select this row's decoded log-probability record from the shared capture."""
-
-        return self.capture.finalize()[int(self.index)]
-
-    def max_entries(self) -> int:
-        """Return the maximum unique log-probability entries this row can encode."""
-
-        local = self.capture.rows.index(int(self.index))
-        return 1 + int(self.capture.counts[local]) + len(self.capture.requested_ids[local])
-
-
-class CpuJob:
-    """A bounded CPU action gated by dependencies and optional CUDA readiness."""
-
-    __slots__ = (
-        "capture",
-        "reservation",
-        "dependencies",
-        "action",
-        "_future",
-        "promise",
-        "_submission_error",
-        "profile_name",
-        "ready_event",
-        "_release",
-        "_defer_release",
-        "_resource_released",
-    )
-
-    def __init__(
-        self,
-        reservation: CpuTaskReservation,
-        action: Callable[[], object],
-        *,
-        capture: ByteCapture | None = None,
-        dependencies: tuple[concurrent.futures.Future[object], ...] = (),
-        profile_name: str,
-        release: Callable[[], None] | None = None,
-        defer_release: Callable[[concurrent.futures.Future[None]], None] | None = None,
-    ) -> None:
-        """Retain a bounded CPU reservation and lazily submitted host operation."""
-
-        self.capture = capture
-        self.reservation = reservation
-        self.dependencies = dependencies
-        self.action = action
-        self._future: concurrent.futures.Future[object] | None = None
-        self.promise: concurrent.futures.Future[object] = concurrent.futures.Future()
-        self._submission_error: BaseException | None = None
-        self.profile_name = profile_name
-        self.ready_event: torch.cuda.Event | None = None
-        self._release = release
-        self._defer_release = defer_release
-        self._resource_released = False
-
-    def _release_now(self) -> None:
-        """Release the CPU task reservation unless submission already transferred ownership."""
-
-        if self._resource_released or self._release is None:
-            return
-        self._resource_released = True
-        self._release()
-
-    def _release_after_capture(self) -> None:
-        """Release the task reservation after captured output ownership is established."""
-
-        if self._resource_released or self._release is None:
-            return
-        self._resource_released = True
-        if self.capture is not None and self._defer_release is not None:
-            self._defer_release(self.capture.buffer.completion_future())
-        else:
-            self._release()
-
-    def _run(self) -> object:
-        """Execute one host job and capture its value or exception exactly once."""
-
-        try:
-            if self.ready_event is not None:
-                self.ready_event.synchronize()
-            for dependency in self.dependencies:
-                dependency.result()
-            with profile_range(self.profile_name):
-                value = self.action()
-        except BaseException as error:
-            self.promise.set_exception(error)
-            raise
-        else:
-            self.promise.set_result(value)
-        finally:
-            self._release_now()
-        return value
-
-    def start(self, ready_event: torch.cuda.Event | None = None) -> None:
-        """Submit the bounded host action, optionally gated by a CUDA readiness event."""
-
-        if self._submission_error is not None:
-            return
-        if self._future is not None:
-            raise RuntimeError("output CPU job was submitted more than once")
-        self.ready_event = ready_event
-        try:
-            self._future = self.reservation.submit(self._run)
-        except BaseException as error:
-            self._submission_error = error
-            self._release_now()
-            if not self.promise.done():
-                self.promise.set_exception(error)
-
-    def ready(self) -> bool:
-        """Start eligible work lazily and report whether the host action has completed."""
-
-        if self._submission_error is not None:
-            return True
-        if self._future is None:
-            if self.capture is not None and not self.capture.ready():
-                return False
-            self.start()
-        return self._future is None or bool(self._future.done())
-
-    def finalize(self) -> object:
-        """Return the completed host result or raise its captured failure without blocking."""
-
-        if not self.ready():
-            raise RuntimeError("output CPU job was observed before it was ready")
-        if self._submission_error is not None:
-            raise self._submission_error
-        if self._future is None:
-            raise RuntimeError("output CPU job lost its submitted future")
-        return self._future.result(timeout=0)
-
-    def abandon(self) -> None:
-        """Release an unsubmitted job; submitted work retains storage until its completion."""
-
-        if self._future is not None:
-            return
-        self.reservation.abandon()
-        self._submission_error = concurrent.futures.CancelledError("output job was abandoned")
-        self.promise.cancel()
-        if self.capture is None or self.capture.ready():
-            self._release_now()
-        else:
-            self._release_after_capture()
-
-
-class ImageEncoding:
-    """Pinned D2H image capture followed by bounded asynchronous PNG encoding."""
-
-    __slots__ = (
-        "capture",
-        "reservation",
-        "max_bytes",
-        "_future",
-        "_value",
-        "_submission_error",
-    )
-
-    def __init__(
-        self,
-        capture: ByteCapture,
-        reservation: CpuTaskReservation,
-        max_bytes: int,
-    ) -> None:
-        """Own a captured image tensor and deferred bounded host encoding job."""
-
-        self.capture = capture
-        self.reservation = reservation
-        self.max_bytes = int(max_bytes)
-        self._future: Any | None = None
-        self._value: bytes | None = None
-        self._submission_error: Exception | None = None
-
-    def ready(self) -> bool:
-        """Return whether image bytes are encoded or all deferred encoding work is complete."""
-
-        if self._value is not None or self._submission_error is not None:
-            return True
-        if self._future is None:
-            if not self.capture.ready():
-                return False
-            try:
-                self._future = self.reservation.submit(
-                    uint8_image_to_png_base64_bytes,
-                    self.capture.tensor(),
                 )
-            except Exception as error:
-                self._submission_error = error
-                return True
-        return bool(self._future.done())
-
-    def finalize(self) -> bytes:
-        """Return encoded image bytes, materializing the deferred host result when necessary."""
-
-        if self._value is not None:
-            return self._value
-        if not self.ready():
-            raise RuntimeError("image payload was observed before CPU encoding was ready")
-        if self._submission_error is not None:
-            raise self._submission_error
-        if self._future is None:
-            raise RuntimeError("image encoding task lost its CPU future")
-        value = self._future.result(timeout=0)
-        if not isinstance(value, bytes) or not value:
-            raise RuntimeError("image encoding task produced an invalid payload")
-        if len(value) > self.max_bytes:
-            raise RuntimeError("encoded image exceeds its registered byte bound")
-        self._value = value
-        return self._value
-
-    def abandon(self) -> None:
-        """Release encoding admission when its completion will not be consumed."""
-
-        self.reservation.abandon()
-
-
-@dataclass(frozen=True, slots=True)
-class OutputRecord:
-    """One unresolved output row retained outside the public wire model."""
-
-    request_key: RequestKey
-    op_id: ComputationId
-    kind: Computation
-    completion_slot_generation: int
-    status: OpStatus
-    runtime: RequestRuntime
-    committed_tokens: tuple[int, ...]
-    sampling: SamplingOutputRow | None
-    logprobs: LogprobOutputRow | None
-    prompt_logprobs: tuple[LogprobOutputRow, ...]
-    finish_flags: FinishFlags
-    product_generations: tuple[int, ...]
-    error_code: ErrorCode | None
-
-    kv_output: KvTransfer | None = None
+                seen.add(candidate)
+        for index, candidate in enumerate(requested_ids[local]):
+            if candidate not in seen:
+                entries.append(
+                    (
+                        candidate,
+                        float_value(candidate_values[local][index]),
+                        candidate_ranks[local][index],
+                    )
+                )
+                seen.add(candidate)
+        details[result_index] = (selected_value, tuple(entries))
+    return details
 
 
 class PendingOutput:
-    """A query-ready completion backed by one pinned output-buffer row."""
+    """One operation's stable predecessor, projected progress, and eventual output.
 
-    __slots__ = (
-        "_record",
-        "_parent",
-        "_buffer",
-        "_row",
-        "_generation",
-        "_completion_timing",
-        "_done",
-        "_observed",
-        "_invalid_sampling",
-        "_predicated",
-        "_predicated_parent",
-        "_selected_runtime",
-        "_resolved_callback",
-        "_completion_tasks",
-        "_reports_output",
-        "_completion_error",
-        "_media_output",
-        "_value",
-    )
+    The output row and CPU tasks retain their actual storage until materialized
+    or abandoned. No request progress is installed by this object: RequestPool
+    applies accepted snapshots in predecessor order.
+    """
 
     def __init__(
         self,
-        parent: CompletionState | None,
+        operation: ScheduledRequest,
+        request: RequestState,
         buffer: OutputBuffer,
         row: int,
-        predicated_parent: Callable[[], RequestRuntime],
-        *,
-        status: OpStatus,
-        reports_output: bool,
-        resolved_callback: Callable[[ModelOutput], None] | None = None,
-        completion_tasks: tuple[CpuJob | ImageEncoding | LogprobOutputRow, ...] = (),
+        predecessor: PendingOutput | RequestProgress | None,
     ) -> None:
-        """Bind deferred device, CPU, transport, and media work to one completion record."""
-
-        self._record: OutputRecord | None = None
-        self._parent = parent
+        self.operation = operation
+        self.request = request
+        self.predecessor = predecessor
+        self.projected_progress: RequestProgress | None = (
+            predecessor.accepted_progress or predecessor.projected_progress
+            if isinstance(predecessor, PendingOutput)
+            else predecessor
+        )
+        self.accepted_progress: RequestProgress | None = None
+        self.successors_ready: bool = False
+        self.status = OpStatus.OK
+        self.committed_tokens: tuple[int, ...] = ()
+        self.sampling_range: tuple[int, int, int] | None = None
+        self._sampling_values: tuple[int, ...] | None = None
+        self.logprob_range: tuple[int, int, int] | None = None
+        self.prompt_logprob_ranges: tuple[tuple[int, int, int], ...] = ()
+        self.logprobs: tuple[float, tuple[tuple[int, float, int], ...]] | None = None
+        self.prompt_logprobs: tuple[tuple[tuple[int, float, int], ...], ...] = ()
+        self.finish_flags = FinishFlags()
+        self.product_generations: tuple[int, ...] = ()
+        self.error_code: ErrorCode | None = None
+        # Numerical updates are borrowed until the completed group commits to
+        # DecodeState. Host acceptance continues to use projected_progress and
+        # the completion ranges, independently of these device references.
+        self.tensor_exports: dict[BufferId, ExportLocations] = {}
+        self.cache_exports: dict[BufferId, ExportLocations] = {}
+        self.latent_exports: dict[BufferId, ExportLocations] = {}
+        self.exported_locators: list[Locator] = []
+        self.cache_publication: tuple[BufferId, KvTransfer] | None = None
+        self.cache_installation: tuple[BufferId, BufferId, KvTransfer] | None = None
+        self.device_reads: list[TensorRead] = []
+        self.feature_reads: list[TensorRead] = []
+        self.writes: list[TensorRecord] = []
+        self.predicate: tuple[torch.Tensor, bool] | None = None
+        self.token_write: TensorRecord | None = None
+        self.transition_write: TensorRecord | None = None
+        self.completion_write: TensorRecord | None = None
+        self.producer_write: TensorRecord | None = None
+        self.sampled: SamplerOutput | None = None
+        self.runtime_logical_position: int | torch.Tensor = 0
+        self.runtime_sampling_position: int | torch.Tensor = 0
+        self.runtime_penalty_base: torch.Tensor | None = None
+        self.runtime_decode_increment = False
+        self.runtime_cache_length: int | torch.Tensor | None = None
+        self.runtime_prompt_logits: torch.Tensor | None = None
+        self.kv_output: KvTransfer | None = None
+        self.products: tuple[TensorPublication, ...] = ()
+        # Physical latent versions are staged here and committed with the output group.
+        self.input_latent_params: LatentParams | None = None
+        self.latent_staging: LatentStaging | None = None
+        self.latent_imported = False
+        self.latent_params: LatentParams | None = None
+        self.latent_expected_generation = 0
+        self.latent_expected_step = 0
+        self.latent_generation = 0
+        self.latent_step = 0
+        self.latent_release = False
+        # Verification keeps only the host metadata needed to check acceptance.
+        self.draft_tokens: tuple[int, ...] | None = None
+        self.terminal_prefix: int | None = None
+        self.base_logical_position = 0
+        self.base_rng_counter = 0
+        self.base_kv_visible = 0
+        self.initialized_kv = 0
         self._buffer: OutputBuffer | None = buffer
         self._row = int(row)
         self._generation = int(buffer.generation)
         self._completion_timing: tuple[int, int, int, int] | None = None
-        self._done = False
         self._observed = False
-        self._invalid_sampling = False
-        self._predicated = status is OpStatus.PREDICATED
-        self._predicated_parent: Callable[[], RequestRuntime] | None = predicated_parent
-        self._selected_runtime: RequestRuntime | None = None
-        self._resolved_callback = resolved_callback
-        self._completion_tasks = completion_tasks
-        self._reports_output = reports_output
-        self._completion_error = False
+        self.completion_tasks: tuple[CpuTask, ...] = ()
+        self.media_lease: MediaLease | None = None
+        self._reports_output = True
         self._media_output: MediaOutput | None = None
-        self._value: ModelOutput | None = None
+        self.value: RequestOutput | None = None
 
-    def bind_record(self, record: OutputRecord) -> PendingOutput:
-        """Bind the one record backed by this pending output row."""
+    def release_execution_references(self) -> None:
+        """Drop borrowed views after stores commit/abandon writes and fence reads.
 
-        if self._record is not None:
-            raise RuntimeError("completion record was bound more than once")
-        if int(record.completion_slot_generation) != self._generation:
-            raise RuntimeError("completion record generation does not match its output buffer")
-        if (record.status is OpStatus.PREDICATED) != self._predicated:
-            raise RuntimeError("completion record status changed during binding")
-        self._record = record
-        return self
+        Host completion may outlive every product, so retaining the request tail
+        must not keep these numerical allocations alive after their owners free
+        them. The caller completes store handoff before invoking this method.
+        """
+
+        self.writes.clear()
+        self.tensor_exports.clear()
+        self.cache_exports.clear()
+        self.latent_exports.clear()
+        self.exported_locators.clear()
+        self.cache_publication = None
+        self.cache_installation = None
+        self.input_latent_params = None
+        self.latent_staging = None
+        self.latent_imported = False
+        self.predicate = None
+        self.token_write = None
+        self.transition_write = None
+        self.completion_write = None
+        self.producer_write = None
+        self.sampled = None
+        self.runtime_penalty_base = None
+        self.runtime_prompt_logits = None
+        self.runtime_cache_length = None
+        self.runtime_logical_position = 0
+        self.runtime_sampling_position = 0
 
     @property
     def request_key(self) -> RequestKey:
-        """Identify the request generation that owns the bound completion record."""
-
-        if self._record is None:
-            raise RuntimeError("completion has no bound record")
-        return self._record.request_key
+        return self.operation.request_key
 
     @property
     def op_id(self) -> ComputationId:
-        """Identify the operation within the bound request generation."""
-
-        if self._record is None:
-            raise RuntimeError("completion has no bound record")
-        return self._record.op_id
+        return self.operation.op_id
 
     @property
-    def status(self) -> OpStatus:
-        """Expose the status staged by device execution before final host materialization."""
-
-        if self._record is None:
-            raise RuntimeError("completion has no bound record")
-        return self._record.status
+    def kind(self) -> Computation:
+        return self.operation.kind
 
     def ready(self) -> bool:
-        """Return whether sampling, transfers, media, CPU work, and completion copies are all ready."""
+        """Query host output readiness without changing request acceptance."""
 
-        if self._record is None:
-            raise RuntimeError("completion has no bound record")
-        if self._done:
+        if self.value is not None:
             return True
-        if self._parent is not None and not self._parent.ready():
+        parent = self.predecessor
+        if isinstance(parent, PendingOutput) and not parent.ready():
             return False
         if self._buffer is None or not self._buffer.ready():
             return False
-        for task in self._completion_tasks:
+        for task in self.completion_tasks:
             if not task.ready():
                 return False
-        if self._record.logprobs is not None and not self._record.logprobs.ready():
-            return False
-        return all(position.ready() for position in self._record.prompt_logprobs)
+        return True
 
-    def finalize(self) -> ModelOutput:
-        """Materialize one operation result, publish payload handles, and attach measured timing."""
+    def materialize(self) -> RequestOutput:
+        """Resolve output fields once, using the stable predecessor's actual acceptance."""
 
-        if not self._done:
-            if not self.ready():
-                raise RuntimeError("completion was resolved before query-ready")
-            record = self._record
-            if record is None:
-                raise RuntimeError("completion has no bound record")
-            parent = self._parent
-            if parent is not None:
-                parent.finalize()
-                self._parent = None
-            if self._predicated:
-                self._resolve_predicated()
+        if self.value is not None:
+            return self.value
+        if not self.ready():
+            raise RuntimeError("completion was resolved before query-ready")
+        parent = self.predecessor
+        if isinstance(parent, PendingOutput):
+            parent.materialize()
+            accepted_parent = parent.accepted_progress
+        else:
+            accepted_parent = parent
+        predicated = self.status is OpStatus.PREDICATED
+        completion_error = False
+        invalid_sampling = False
+        if not predicated:
+            try:
+                for task in self.completion_tasks:
+                    result = task.result()
+                    if isinstance(result, bytes) and self._reports_output:
+                        result = MediaOutput(
+                            handle=PosixShmArtifact(name=publish_media_bytes(result)),
+                            bytes=len(result),
+                        )
+                    if isinstance(result, MediaOutput):
+                        if self._media_output is not None:
+                            raise RuntimeError("completion produced more than one media output")
+                        self._media_output = result
+                if self._buffer is None:
+                    raise RuntimeError("completion lost its pinned output buffer")
+                if self.logprob_range is not None:
+                    self.logprobs = self._buffer.logprob_values(self.logprob_range)
+                self.prompt_logprobs = tuple(
+                    self._buffer.logprob_values(span)[1] for span in self.prompt_logprob_ranges
+                )
+            except Exception:
+                completion_error = True
             else:
                 try:
-                    for task in self._completion_tasks:
-                        result = task.finalize()
-                        if isinstance(task, ImageEncoding) and self._reports_output:
-                            payload = cast(bytes, result)
-                            result = MediaOutput(
-                                handle=PosixShmArtifact(name=publish_media_bytes(payload)),
-                                bytes=len(payload),
-                            )
-                        if isinstance(result, MediaOutput):
-                            if self._media_output is not None:
-                                raise RuntimeError("completion produced more than one media output")
-                            self._media_output = result
-                    if record.logprobs is not None:
-                        record.logprobs.finalize()
-                    for position in record.prompt_logprobs:
-                        position.finalize()
-                except Exception:
-                    self._completion_error = True
-                else:
-                    try:
-                        concrete = _concrete_record(record)
-                        if self._resolved_callback is not None:
-                            self._resolved_callback(concrete)
-                    except _PredicatedOperation:
-                        self._predicated = True
-                        self._resolve_predicated()
-                    except _InvalidSamplingDistribution:
-                        self._invalid_sampling = True
-            buffer = self._buffer
-            if buffer is None:
-                raise RuntimeError("completion lost its pinned output buffer")
-            buffer.observe(self._row, self._generation)
-            self._completion_timing = buffer.timing()
-            self._observed = True
-            self._buffer = None
-            self._done = True
-            self._predicated_parent = None
-            self._resolved_callback = None
-            timing = TimingCounters(
-                queued_us=self._completion_timing[0],
-                device_us=self._completion_timing[1],
-                copy_us=self._completion_timing[2],
-                host_us=self._completion_timing[3],
+                    _concrete_record(self)
+                except _PredicatedOperation:
+                    predicated = True
+                except _InvalidSamplingDistribution:
+                    invalid_sampling = True
+        buffer = self._buffer
+        if buffer is None:
+            raise RuntimeError("completion lost its pinned output buffer")
+        buffer.observe(self._row, self._generation)
+        self._completion_timing = buffer.timing()
+        self._observed = True
+        self._buffer = None
+        timing = TimingCounters(
+            queued_us=self._completion_timing[0],
+            device_us=self._completion_timing[1],
+            copy_us=self._completion_timing[2],
+            host_us=self._completion_timing[3],
+        )
+        concrete = _concrete_record(
+            self,
+            timing=timing,
+            media_output=self._media_output,
+            suppress_tokens=completion_error or invalid_sampling or predicated,
+        )
+        if completion_error:
+            concrete = _completion_error_record(concrete)
+        elif invalid_sampling:
+            concrete = _invalid_sampling_record(concrete)
+        elif predicated:
+            concrete = _predicated_record(concrete, accepted_parent)
+        projected = self.projected_progress
+        if concrete.status in (OpStatus.PREDICATED, OpStatus.ERROR):
+            self.accepted_progress = accepted_parent
+        elif projected is not None:
+            rng_counter = projected.rng_counter
+            if self.draft_tokens is not None:
+                accepted = len(concrete.committed_tokens)
+                if (
+                    accepted > len(self.draft_tokens) + 1
+                    or concrete.kv_computed_len != self.initialized_kv
+                    or concrete.kv_visible_len != self.base_kv_visible + accepted
+                    or concrete.kv_visible_len > concrete.kv_computed_len
+                    or concrete.position != self.base_logical_position + accepted
+                ):
+                    raise RuntimeError("speculative acceptance exceeds initialized KV state")
+                rng_counter = self.base_rng_counter + accepted
+            self.accepted_progress = replace(
+                projected,
+                logical_position=concrete.position,
+                rng_counter=rng_counter,
+                kv_visible_len=concrete.kv_visible_len,
+                kv_computed_len=concrete.kv_computed_len,
             )
-            materialized_record = (
-                replace(
-                    record, committed_tokens=(), sampling=None, logprobs=None, prompt_logprobs=()
-                )
-                if self._completion_error or self._invalid_sampling or self._predicated
-                else record
-            )
-            concrete = _concrete_record(
-                materialized_record,
-                timing=timing,
-                media_output=self._media_output,
-            )
-            if self._completion_error:
-                concrete = _completion_error_record(concrete)
-            elif self._invalid_sampling:
-                concrete = _invalid_sampling_record(concrete)
-            elif self._predicated:
-                selected_runtime = self._selected_runtime
-                if selected_runtime is None:
-                    raise RuntimeError("predicated operation lost its selected runtime state")
-                concrete = _predicated_record(
-                    concrete,
-                    selected_runtime,
-                )
-            concrete.validate()
-            self._value = concrete
-        if self._value is None:
-            raise RuntimeError("completion output was not materialized")
-        return self._value
-
-    def _resolve_predicated(self) -> None:
-        """Resolve inactive output rows without waiting for model or CPU work."""
-
-        predicated_parent = self._predicated_parent
-        if predicated_parent is None:
-            raise RuntimeError("predicated completion lost its parent resolver")
-        runtime = predicated_parent()
-        self._selected_runtime = runtime
-
-    def completion_timing(self) -> tuple[int, int, int, int]:
-        """Finalize the record and expose its output-buffer lifecycle timestamps."""
-
-        self.finalize()
-        return self._completion_timing or (0, 0, 0, 0)
-
-    @property
-    def media_output(self) -> MediaOutput | None:
-        """Finalize the record and expose its published media artifact, if any."""
-
-        self.finalize()
-        return self._media_output
-
-    @property
-    def invalid_sampling(self) -> bool:
-        """Indicate whether token selection produced no valid finite candidate."""
-
-        self.finalize()
-        return self._invalid_sampling
-
-    @property
-    def predicated(self) -> bool:
-        """Indicate whether device predicate resolution suppressed this operation."""
-
-        self.finalize()
-        return self._predicated
-
-    @property
-    def completion_error(self) -> bool:
-        """Indicate whether deferred CPU or media completion failed."""
-
-        self.finalize()
-        return self._completion_error
-
-    @property
-    def selected_runtime(self) -> RequestRuntime:
-        """Expose the request state selected by a predicated operation."""
-
-        self.finalize()
-        if self._selected_runtime is None:
-            raise RuntimeError("predicated operation lost its selected runtime state")
-        return self._selected_runtime
-
-    def __deepcopy__(self, memo: dict[int, object]) -> PendingOutput:
-        """Preserve identity because this object uniquely owns asynchronous completion state."""
-
-        memo[id(self)] = self
-        return self
+        concrete.validate()
+        self.value = concrete
+        self.completion_tasks = ()
+        return concrete
 
     def abandon(self) -> None:
-        """Release unobserved host work and retire the result through its device fence."""
+        """Stop result delivery while actual CPU and GPU readers retain their buffers."""
 
-        tasks, self._completion_tasks = self._completion_tasks, ()
-        actions = [task.abandon for task in tasks if isinstance(task, (CpuJob, ImageEncoding))]
+        tasks, self.completion_tasks = self.completion_tasks, ()
+        actions = [task.abandon for task in tasks]
+        lease, self.media_lease = self.media_lease, None
+        if lease is not None:
+            if self._buffer is None:
+                raise RuntimeError("unconsumed media storage lost its producer buffer")
+            actions.append(partial(lease.defer_until_ready, self._buffer.completion_future()))
         buffer, self._buffer = self._buffer, None
         if buffer is not None and not self._observed:
             self._observed = True
@@ -1490,40 +1153,32 @@ class PendingOutput:
         close_resources(*actions)
 
 
-def _record_ready(record: ModelOutput | CompletionState) -> bool:
-    """Return whether a completion's device and CPU output work has landed."""
-
-    return isinstance(record, ModelOutput) or record.ready()
-
-
-def _finalized_record(record: ModelOutput | CompletionState) -> ModelOutput:
-    """Require and return a concrete model-output record."""
-
-    return record if isinstance(record, ModelOutput) else record.finalize()
-
-
 def _concrete_record(
-    record: OutputRecord,
+    record: PendingOutput,
     *,
     timing: TimingCounters = TimingCounters(),
     media_output: MediaOutput | None = None,
-) -> ModelOutput:
+    suppress_tokens: bool = False,
+) -> RequestOutput:
     """Freeze a host-visible output record after resolving deferred sampling fields."""
 
-    runtime = record.runtime
-    tokens = record.committed_tokens
-    sampling = record.sampling
-    if sampling is not None:
+    runtime = record.projected_progress
+    tokens = () if suppress_tokens else record.committed_tokens
+    if not suppress_tokens and record.sampling_range is not None:
         # Rejected draft positions remain initialized in KV but are invisible
         # to the successor. Sampling determines the actual accepted prefix.
-        tokens = sampling.materialize()
+        tokens = sampled_tokens(record)
         accepted = len(tokens)
-        if sampling.logical_base is not None:
-            runtime = replace(runtime, logical_position=int(sampling.logical_base) + accepted)
-        if sampling.kv_base is not None:
-            runtime = replace(runtime, kv_visible_len=int(sampling.kv_base) + accepted)
-    scores = None if record.logprobs is None else record.logprobs.finalize()
-    return ModelOutput(
+        if runtime is None:
+            raise RuntimeError("sampling output has no request progress")
+        if record.draft_tokens is not None:
+            runtime = replace(
+                runtime,
+                logical_position=record.base_logical_position + accepted,
+                kv_visible_len=record.base_kv_visible + accepted,
+            )
+    scores = None if suppress_tokens or not record._reports_output else record.logprobs
+    return RequestOutput(
         request_key=record.request_key,
         op_id=record.op_id,
         status=record.status,
@@ -1531,21 +1186,23 @@ def _concrete_record(
         error_code=record.error_code,
         timing_counters=timing,
         kind=record.kind,
-        position=int(runtime.logical_position),
-        kv_visible_len=int(runtime.kv_visible_len),
-        kv_computed_len=int(runtime.kv_computed_len),
-        num_completed_steps=int(runtime.flow_step),
+        position=(0 if runtime is None else int(runtime.logical_position)),
+        kv_visible_len=(0 if runtime is None else int(runtime.kv_visible_len)),
+        kv_computed_len=(0 if runtime is None else int(runtime.kv_computed_len)),
+        num_completed_steps=(0 if runtime is None else int(runtime.flow_step)),
         committed_tokens=tokens,
         sampled_logprob=None if scores is None else scores[0],
         top_logprobs=() if scores is None else scores[1],
-        prompt_logprobs=tuple(position.finalize()[1] for position in record.prompt_logprobs),
+        prompt_logprobs=(
+            () if suppress_tokens or not record._reports_output else record.prompt_logprobs
+        ),
         finish_flags=record.finish_flags,
         media_output=media_output,
         kv_output=record.kv_output,
     )
 
 
-def _invalid_sampling_record(record: ModelOutput) -> ModelOutput:
+def _invalid_sampling_record(record: RequestOutput) -> RequestOutput:
     """Return an output record representing a sampling-policy rejection."""
 
     return replace(
@@ -1562,7 +1219,7 @@ def _invalid_sampling_record(record: ModelOutput) -> ModelOutput:
     )
 
 
-def _completion_error_record(record: ModelOutput) -> ModelOutput:
+def _completion_error_record(record: RequestOutput) -> RequestOutput:
     """Return an output record for a failed completion capture or host artifact."""
 
     return replace(
@@ -1580,18 +1237,18 @@ def _completion_error_record(record: ModelOutput) -> ModelOutput:
 
 
 def _predicated_record(
-    record: ModelOutput,
-    runtime: RequestRuntime,
-) -> ModelOutput:
+    record: RequestOutput,
+    runtime: RequestProgress | None,
+) -> RequestOutput:
     """Report the parent execution state for an operation suppressed by its predicate."""
 
     return replace(
         record,
         status=OpStatus.PREDICATED,
-        position=int(runtime.logical_position),
-        kv_visible_len=int(runtime.kv_visible_len),
-        kv_computed_len=int(runtime.kv_computed_len),
-        num_completed_steps=int(runtime.flow_step),
+        position=(0 if runtime is None else int(runtime.logical_position)),
+        kv_visible_len=(0 if runtime is None else int(runtime.kv_visible_len)),
+        kv_computed_len=(0 if runtime is None else int(runtime.kv_computed_len)),
+        num_completed_steps=(0 if runtime is None else int(runtime.flow_step)),
         committed_tokens=(),
         sampled_logprob=None,
         top_logprobs=(),
@@ -1601,68 +1258,3 @@ def _predicated_record(
         kv_output=None,
         error_code=None,
     )
-
-
-def run_result_ready(report: RunResult) -> bool:
-    """Return whether every completion token and artifact can be read
-    without a stall."""
-
-    for record in report.completions:
-        if not _record_ready(record):
-            return False
-    return report.retirement is None or report.retirement()
-
-
-def lane_completion_ready(lane: LaneResult) -> bool:
-    """Return whether every pending output in a lane can be finalized without blocking."""
-
-    for record in lane.completions:
-        if not _record_ready(record):
-            return False
-    return True
-
-
-def finalize_run_result(report: RunResult) -> RunResult:
-    """Materialize query-ready lanes into host-owned values."""
-
-    changed = False
-    lanes: list[LaneResult] = []
-    for lane in report.lanes:
-        completions = tuple(
-            _finalized_record(record) if _record_ready(record) else record
-            for record in lane.completions
-        )
-        nonpublishing_ops = {
-            record.op_id for record in completions if record.status is not OpStatus.OK
-        }
-        products = tuple(
-            product
-            for product in lane.products
-            if product.product.producer_op_id not in nonpublishing_ops
-        )
-        publication = lane.publication
-        publication_ready = publication is not None and all(
-            isinstance(record, ModelOutput) for record in completions
-        )
-        if publication_ready:
-            assert publication is not None
-            publication.finish(cast(tuple[ModelOutput, ...], completions))
-        if (
-            not all(new is old for new, old in zip(completions, lane.completions, strict=True))
-            or len(products) != len(lane.products)
-            or not all(new is old for new, old in zip(products, lane.products))
-            or publication_ready
-        ):
-            changed = True
-            lane = replace(
-                lane,
-                completions=completions,
-                products=products,
-                publication=None if publication_ready else publication,
-            )
-        lanes.append(lane)
-    retirement = report.retirement
-    if retirement is not None and retirement():
-        retirement = None
-        changed = True
-    return replace(report, lanes=tuple(lanes), retirement=retirement) if changed else report

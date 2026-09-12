@@ -45,7 +45,7 @@ pub enum WorkerRequest {
         /// Optional request-response correlation identity.
         call_id: Option<u64>,
         /// Fully lowered worker run.
-        run: Run,
+        run: ScheduleBatch,
     },
     /// Polls a run for additional completions.
     Poll {
@@ -93,7 +93,7 @@ impl WorkerRequest {
     }
 
     /// Returns the submitted run carried by this request, if any.
-    pub const fn run(&self) -> Option<&Run> {
+    pub const fn run(&self) -> Option<&ScheduleBatch> {
         match self {
             Self::Submit { run, .. } => Some(run),
             _ => None,
@@ -105,7 +105,7 @@ impl WorkerRequest {
         Self::Info { call_id: None }
     }
     /// Constructs a run-submission request.
-    pub fn submit(run: Run) -> Self {
+    pub fn submit(run: ScheduleBatch) -> Self {
         Self::Submit { call_id: None, run }
     }
     /// Constructs a completion-poll request for `run_id`.
@@ -179,7 +179,7 @@ pub enum WorkerResponse {
         /// Optional request-response correlation identity.
         call_id: Option<u64>,
         /// Physical run result.
-        result: RunResult,
+        result: BatchOutput,
     },
     /// Acknowledges a successful control request.
     Ok {
@@ -227,7 +227,7 @@ impl WorkerResponse {
     }
 
     /// Returns the run result carried by this response, if any.
-    pub const fn report(&self) -> Option<&RunResult> {
+    pub const fn report(&self) -> Option<&BatchOutput> {
         match self {
             Self::Result { result, .. } => Some(result),
             _ => None,
@@ -243,7 +243,7 @@ impl WorkerResponse {
     }
 
     /// Constructs a run-result response.
-    pub fn result(result: RunResult) -> Self {
+    pub fn result(result: BatchOutput) -> Self {
         Self::Result {
             call_id: None,
             result,

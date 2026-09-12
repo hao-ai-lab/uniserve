@@ -4,7 +4,10 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve_worker.execution.bounded_storage import BoundedTensorStorage, TensorSchema
+from uniserve_worker.bootstrap.distributed import (
+    initialize_model_parallel,
+    initialize_process_groups,
+)
 from uniserve_worker.nn.attention import RadixAttention
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.nn.parallel_attention import (
@@ -14,17 +17,14 @@ from uniserve_worker.nn.parallel_attention import (
 )
 from uniserve_worker.nn.parallel_sequence import SequencePartition
 from uniserve_worker.runtime.attention_storage import allocate_attention_exchange_storage
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from uniserve_worker.runtime.tensor_buffers import TensorBuffers, TensorSchema
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 def _run_exchange(rank: int, rendezvous: str) -> None:
     device = torch.device("cuda", rank)
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=2,
@@ -46,7 +46,7 @@ def _run_exchange(rank: int, rendezvous: str) -> None:
         ):
             group = mesh.get_group("ulysses")
             attention = ParallelAttention(mesh=mesh)
-            storage = BoundedTensorStorage.allocate(
+            storage = TensorBuffers.allocate(
                 {
                     name: TensorSchema(
                         (shape[0] * 2, *shape[1:]) if name == "incoming" else shape,
@@ -57,7 +57,6 @@ def _run_exchange(rank: int, rendezvous: str) -> None:
                     for name in ("outgoing", "incoming", "staging")
                 },
                 device,
-                environment=environment,
             )
             outgoing, incoming = (storage.capacity[name] for name in ("outgoing", "incoming"))
             staging = storage.capacity["staging"]
@@ -118,7 +117,7 @@ def test_attention_row_exchange_replays_updated_values_in_logical_rank_order(tmp
 
 def _run_head_rows(rank, rendezvous):
     device = torch.device("cuda", rank)
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=2,
@@ -146,18 +145,14 @@ def _run_head_rows(rank, rendezvous):
                     local = partition.local(complete).clone()
                     storage = allocate_attention_exchange_storage(
                         (RadixAttention(4, kv_heads, 128, sequence=partition.group),),
-                        environment,
                         max_tokens=max(19, rows),
                         dtype=torch.bfloat16,
-                        scope=("head_rows", kv_heads),
                     )[partition.group]
 
                     independent_storage = allocate_attention_exchange_storage(
                         (RadixAttention(4, kv_heads, 128, sequence=partition.group),),
-                        environment,
                         max_tokens=max(19, rows),
                         dtype=torch.bfloat16,
-                        scope=("independent_head_rows", kv_heads),
                     )[partition.group]
 
                     def execute(storage=storage):

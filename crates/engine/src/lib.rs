@@ -16,8 +16,8 @@ mod worker;
 
 pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank};
 pub use crate::executor::{
-    BatchResult, CommandOutcome, ComponentConfig, ComponentDistribution, Executor, ExecutorError,
-    ExecutorInfo, ExecutorSubmitError, OpResult, ParallelConfig, RequestPlacement, ScheduleBatch,
+    BatchResult, CommandOutcome, ComponentConfig, ComponentDistribution, ExecutionBatch, Executor,
+    ExecutorError, ExecutorInfo, ExecutorSubmitError, OpResult, ParallelConfig, RequestPlacement,
     SequenceParallel, TransferBackend, TransferConfig, TransferConfigError, TransferEdge,
     WorkerExecError, WorkerFailure, WorkerId, WorkerResult,
 };

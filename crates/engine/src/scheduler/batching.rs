@@ -16,7 +16,7 @@ impl Scheduler {
     ///
     /// Each request contributes at most one operation, prefill chunks consume only
     /// the remaining token budget, and first dispatch carries typed admission.
-    pub(super) fn assemble(&mut self) -> Option<ScheduleBatch> {
+    pub(super) fn assemble(&mut self) -> Option<ExecutionBatch> {
         let ids = self.assembly_order();
         let lane = self.select_batch_kind(&ids);
         let batch = self.assemble_pass(&ids, lane);
@@ -128,8 +128,8 @@ impl Scheduler {
         &mut self,
         ids: &[RequestId],
         lane: Option<BatchKind>,
-    ) -> Option<ScheduleBatch> {
-        let mut batch = ScheduleBatch::new(0, Vec::new(), Vec::new(), Vec::new());
+    ) -> Option<ExecutionBatch> {
+        let mut batch = ExecutionBatch::new(0, Vec::new(), Vec::new(), Vec::new());
         let submit_at = Instant::now();
         // The per-step token budget is the binding limit; individual prefill
         // chunks are clipped to its remaining capacity.
@@ -480,7 +480,7 @@ impl Scheduler {
         admitted: bool,
         planned_us: u64,
         submit_at: Instant,
-        batch: &mut ScheduleBatch,
+        batch: &mut ExecutionBatch,
     ) -> Option<()> {
         let request_id = operation.request_key.request_id;
 
@@ -909,9 +909,9 @@ impl Scheduler {
     /// Finalizes batch statistics and pending-result ownership before submission.
     pub(super) fn finish_generation_batch(
         &mut self,
-        mut batch: ScheduleBatch,
+        mut batch: ExecutionBatch,
         submit_at: Instant,
-    ) -> ScheduleBatch {
+    ) -> ExecutionBatch {
         if batch.id == 0 {
             batch.id = self.next_batch_id();
         }

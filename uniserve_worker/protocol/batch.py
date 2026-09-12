@@ -5,63 +5,15 @@ from __future__ import annotations
 import math
 import os
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import lru_cache
-from typing import Any, Protocol, TypeAlias, TypeVar, cast
+from typing import Any, TypeAlias, TypeVar, cast
 
 from ..foundation.errors import invalid_descriptor
 
 MAX_TRANSFER_HANDLE_BYTES = 64 * 1024
-
-
-class CompletionState(Protocol):
-    """Structural interface for one pending output row."""
-
-    @property
-    def request_key(self) -> RequestKey: ...
-
-    @property
-    def op_id(self) -> ComputationId: ...
-
-    @property
-    def status(self) -> OpStatus: ...
-
-    def ready(self) -> bool:
-        """Return whether the pending row can be finalized without blocking."""
-
-        ...
-
-    def finalize(self) -> ModelOutput:
-        """Materialize the completed row into its wire-ready payload."""
-
-        ...
-
-    def abandon(self) -> None:
-        """Retire an unobserved row without reusing storage before device completion."""
-
-        ...
-
-
-class LanePublication(Protocol):
-    """One-shot request-state publication owned by a lane result."""
-
-    def finish(self, completions: tuple[ModelOutput, ...]) -> None:
-        """Atomically publish successor-visible request state from finalized lane completions."""
-
-        ...
-
-    def cancel(self) -> None:
-        """Discard the unpublished request-state transition."""
-
-        ...
-
-    @property
-    def successors_ready(self) -> bool:
-        """Return whether the request-state transition is visible to successor operations."""
-
-        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -653,15 +605,6 @@ def computation(value: object, where: str) -> Computation:
     raise invalid_descriptor(f"{where} is not a supported computation")
 
 
-class AttentionRegime(StrEnum):
-    """Specifies whether an operation uses no attention, causal attention, bidirectional attention, or a hybrid mask."""
-
-    NONE = "none"
-    CAUSAL = "causal"
-    BIDIRECTIONAL = "bidirectional"
-    HYBRID = "hybrid"
-
-
 class DType(StrEnum):
     """Defines wire-stable scalar dtypes supported by scheduler descriptors."""
 
@@ -743,10 +686,10 @@ def native_run(
     commands: tuple[BatchCommand, ...],
     input_products: Sequence[object],
     kv_inputs: Sequence[object],
-) -> Run:
+) -> ScheduleBatch:
     """Assemble a physical run from transport-constructed members."""
 
-    run = object.__new__(Run)
+    run = object.__new__(ScheduleBatch)
     set_field = object.__setattr__
     set_field(run, "batch_id", batch_id)
     set_field(run, "run_id", run_id)
@@ -793,7 +736,6 @@ def native_run(
         ),
     )
     set_field(run, "kv_inputs", tuple(KvTransfer.from_mapping(value) for value in kv_inputs))
-    set_field(run, "lanes", ())
     return run
 
 
@@ -1901,7 +1843,7 @@ class MediaOutput:
 
 
 @dataclass(frozen=True, slots=True)
-class ModelOutput:
+class RequestOutput:
     """An operation completion with accepted progress, tokens, products, and timing."""
 
     request_key: RequestKey
@@ -1963,7 +1905,7 @@ class ModelOutput:
             )
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "completion") -> ModelOutput:
+    def from_mapping(cls, value: object, where: str = "completion") -> RequestOutput:
         """Parse a completion and enforce its status-specific result and error contract."""
 
         data = _map(value, where)
@@ -2302,13 +2244,13 @@ class NewRequest:
 
     request_key: RequestKey
     request_pool_idx: int
-    ar: ArRequestParams | None
-    umm: UmmRequestParams | None
+    ar: ArRequestParams | None = None
+    umm: UmmRequestParams | None = None
     diffusion: DiffusionSamplingParams | None = None
     prompt_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        """Require exactly one parameter family compatible with the request kind."""
+        """Require a valid request slot, family parameters, and diffusion prompt tokens."""
 
         if self.diffusion is not None and not self.prompt_token_ids:
             raise invalid_descriptor("diffusion prompt tokens must not be empty")
@@ -2316,21 +2258,6 @@ class NewRequest:
             raise invalid_descriptor("request-pool index must be positive")
         if self.ar is None and self.umm is None and self.diffusion is None:
             raise invalid_descriptor("request start must declare one runtime-family parameter set")
-
-    @classmethod
-    def create(
-        cls,
-        request_key: RequestKey,
-        *,
-        request_pool_idx: int,
-        ar: ArRequestParams | None = None,
-        umm: UmmRequestParams | None = None,
-        diffusion: DiffusionSamplingParams | None = None,
-        prompt_token_ids: tuple[int, ...] = (),
-    ) -> NewRequest:
-        """Construct a new request while requiring exactly one parameter family."""
-
-        return cls(request_key, request_pool_idx, ar, umm, diffusion, prompt_token_ids)
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "admission") -> NewRequest:
@@ -2683,246 +2610,8 @@ def _validate_buffer_allocations(
 
 
 @dataclass(frozen=True, slots=True)
-class RunLane:
-    """Carries one lane’s ordered operations, row tables, parameters, and collective identity."""
-
-    lane_id: int
-    launch_id: int
-    collective_seq: int
-    route: int
-    attention: AttentionRegime
-    shape_class: int
-    operations: tuple[ScheduledRequest, ...]
-    block_tables: tuple[BlockTable, ...] = ()
-    new_cache_pages: tuple[CachePageAllocation, ...] = ()
-    forward_operation_indices: tuple[int, ...] = ()
-    request_pool_indices: tuple[int, ...] = ()
-    seq_lens: tuple[int, ...] = ()
-    query_lens: tuple[int, ...] = ()
-    write_kv: tuple[bool, ...] = ()
-    latent_params: tuple[LatentParams, ...] = ()
-    decode_ranges: tuple[DecodeRange, ...] = ()
-    buffer_allocations: tuple[BufferAllocation, ...] = ()
-
-    def __post_init__(self) -> None:
-        """Validate aligned lane columns, operation ownership, parameters, and collective identity."""
-
-        if (
-            min(
-                self.lane_id,
-                self.launch_id,
-                self.collective_seq,
-            )
-            < 1
-        ):
-            raise invalid_descriptor("batch lane identity must be positive")
-        if self.route < 0 or self.shape_class < 0:
-            raise invalid_descriptor("batch lane route and shape class must be unsigned")
-        if not self.operations:
-            raise invalid_descriptor("batch lane must carry at least one operation")
-        if any(operation.kind is not self.operations[0].kind for operation in self.operations):
-            raise invalid_descriptor("batch lane must contain one computation kind")
-        operations = {
-            (operation.request_key, operation.op_id): operation for operation in self.operations
-        }
-        tables = {(table.request_pool_idx, table.group_id): table for table in self.block_tables}
-        if len(tables) != len(self.block_tables):
-            raise invalid_descriptor("batch lane repeats a block table")
-        allocation_ids: set[tuple[int, int]] = set()
-        for allocation in self.new_cache_pages:
-            identity = (allocation.request_pool_idx, allocation.group_id)
-            if identity in allocation_ids:
-                raise invalid_descriptor("batch lane repeats a cache-page allocation")
-            allocation_ids.add(identity)
-            table = tables.get(identity)
-            if table is None or not set(allocation.page_ids).issubset(table.page_ids):
-                raise invalid_descriptor("cache-page allocation has no matching block table")
-        _validate_forward_inputs(
-            len(self.operations),
-            self.forward_operation_indices,
-            self.request_pool_indices,
-            self.seq_lens,
-            self.query_lens,
-            self.write_kv,
-        )
-        latent_ids: set[tuple[RequestKey, ComputationId]] = set()
-        latent_pages: set[int] = set()
-
-        def addresses_trajectory(operation: ScheduledRequest) -> bool:
-            """Identify operations that require an explicit physical latent params."""
-
-            return (
-                operation.kind
-                in {
-                    PipelineStage.LATENT_PREPARATION,
-                    PipelineStage.DENOISING,
-                }
-                or operation.latent_input is not None
-            )
-
-        for latent_params in self.latent_params:
-            latent_identity = (latent_params.request_key, latent_params.op_id)
-            if latent_identity in latent_ids:
-                raise invalid_descriptor("batch lane repeats a latent params identity")
-            latent_ids.add(latent_identity)
-            operation = operations.get(latent_identity)
-            if operation is None:
-                raise invalid_descriptor("latent params does not name a lane operation")
-            if not addresses_trajectory(operation):
-                raise invalid_descriptor(
-                    "latent params names an operation that does not address a trajectory"
-                )
-            if not latent_pages.isdisjoint(latent_params.page_table):
-                raise invalid_descriptor("latent parameters overlap physical pages")
-            latent_pages.update(latent_params.page_table)
-        if any(
-            addresses_trajectory(operation)
-            and (operation.request_key, operation.op_id) not in latent_ids
-            for operation in self.operations
-        ):
-            raise invalid_descriptor("operation that addresses a trajectory has no latent params")
-        decode_ids: set[tuple[RequestKey, ComputationId]] = set()
-        for params in self.decode_ranges:
-            decode_identity = (params.request_key, params.op_id)
-            if decode_identity in decode_ids:
-                raise invalid_descriptor("batch lane repeats a decode params identity")
-            decode_ids.add(decode_identity)
-            operation = operations.get(decode_identity)
-            if operation is None or operation.kind not in {
-                PipelineStage.VIDEO_DECODING,
-                PipelineStage.VIDEO_ENCODING,
-                PipelineStage.AUDIO_DECODING,
-                PipelineStage.AUDIO_ENCODING,
-            }:
-                raise invalid_descriptor("decode params does not name a media decode operation")
-            if operation.kind in {PipelineStage.AUDIO_DECODING, PipelineStage.AUDIO_ENCODING} and (
-                params.cursor != 0 or params.max_units != 1
-            ):
-                raise invalid_descriptor("audio decode range must address its single sample stream")
-        if any(
-            operation.kind
-            in {
-                PipelineStage.VIDEO_DECODING,
-                PipelineStage.AUDIO_DECODING,
-                PipelineStage.VIDEO_ENCODING,
-                PipelineStage.AUDIO_ENCODING,
-            }
-            and (operation.request_key, operation.op_id) not in decode_ids
-            for operation in self.operations
-        ):
-            raise invalid_descriptor("media reconstruction operation has no decode params")
-        _validate_buffer_allocations(self.operations, self.buffer_allocations, "batch lane")
-
-    @classmethod
-    def from_mapping(
-        cls,
-        value: object,
-        where: str = "batch lane",
-    ) -> RunLane:
-        """Parse one physical lane and validate its operations, rows, cache tables, and parameters."""
-
-        data = _map(value, where)
-        fields = dict(
-            lane_id=_uint(data.get("lane_id"), f"{where}.lane_id"),
-            launch_id=_uint(data.get("launch_id"), f"{where}.launch_id"),
-            collective_seq=_uint(data.get("collective_seq"), f"{where}.collective_seq"),
-            route=_uint(data.get("route"), f"{where}.route"),
-            attention=AttentionRegime(_str(data.get("attention"), f"{where}.attention")),
-            shape_class=_uint(data.get("shape_class"), f"{where}.shape_class"),
-            operations=tuple(
-                ScheduledRequest.from_mapping(
-                    item,
-                    f"{where}.operations[{index}]",
-                )
-                for index, item in enumerate(
-                    _seq(data.get("operations", ()), f"{where}.operations")
-                )
-            ),
-            block_tables=tuple(
-                BlockTable.from_mapping(
-                    item,
-                    f"{where}.block_tables[{index}]",
-                )
-                for index, item in enumerate(
-                    _seq(data.get("block_tables", ()), f"{where}.block_tables")
-                )
-            ),
-            new_cache_pages=tuple(
-                CachePageAllocation.from_mapping(
-                    item,
-                    f"{where}.new_cache_pages[{index}]",
-                )
-                for index, item in enumerate(
-                    _seq(data.get("new_cache_pages", ()), f"{where}.new_cache_pages")
-                )
-            ),
-            forward_operation_indices=_uints(
-                data.get("forward_operation_indices", ()),
-                "forward inputs.forward_operation_indices",
-            ),
-            request_pool_indices=_uints(
-                data.get("request_pool_indices", ()), "forward inputs.request_pool_indices"
-            ),
-            seq_lens=_uints(data.get("seq_lens", ()), "forward inputs.seq_lens"),
-            query_lens=_uints(data.get("query_lens", ()), "forward inputs.query_lens"),
-            write_kv=tuple(
-                _bool(value, "forward inputs.write_kv")
-                for value in _seq(data.get("write_kv", ()), "forward inputs.write_kv")
-            ),
-            latent_params=tuple(
-                LatentParams.from_mapping(item, f"{where}.latent_params[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("latent_params", ()), f"{where}.latent_params")
-                )
-            ),
-            decode_ranges=tuple(
-                DecodeRange.from_mapping(item, f"{where}.decode_ranges[{index}]")
-                for index, item in enumerate(
-                    _seq(
-                        data.get("decode_ranges", ()),
-                        f"{where}.decode_ranges",
-                    )
-                )
-            ),
-            buffer_allocations=tuple(
-                BufferAllocation.from_mapping(item, f"{where}.buffer_allocations[{index}]")
-                for index, item in enumerate(
-                    _seq(
-                        data.get("buffer_allocations", ()),
-                        f"{where}.buffer_allocations",
-                    )
-                )
-            ),
-        )
-        return cls(**cast(Any, fields))
-
-    def to_mapping(self) -> dict[str, object]:
-        """Encode one physical lane with its routing, row, cache, and params tables."""
-
-        return {
-            "lane_id": self.lane_id,
-            "launch_id": self.launch_id,
-            "collective_seq": self.collective_seq,
-            "route": self.route,
-            "attention": self.attention.value,
-            "shape_class": self.shape_class,
-            "operations": [operation.to_mapping() for operation in self.operations],
-            "block_tables": [table.to_mapping() for table in self.block_tables],
-            "new_cache_pages": [allocation.to_mapping() for allocation in self.new_cache_pages],
-            "forward_operation_indices": list(self.forward_operation_indices),
-            "request_pool_indices": list(self.request_pool_indices),
-            "seq_lens": list(self.seq_lens),
-            "query_lens": list(self.query_lens),
-            "write_kv": list(self.write_kv),
-            "latent_params": [params.to_mapping() for params in self.latent_params],
-            "decode_ranges": [params.to_mapping() for params in self.decode_ranges],
-            "buffer_allocations": [params.to_mapping() for params in self.buffer_allocations],
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class Run:
-    """Describes one scheduler-submitted collection of lane operations."""
+class ScheduleBatch:
+    """Describes one scheduler-submitted collection of operations."""
 
     batch_id: int
     run_id: int
@@ -2941,66 +2630,10 @@ class Run:
     commands: tuple[BatchCommand, ...] = ()
     input_products: tuple[TensorPublication, ...] = ()
     kv_inputs: tuple[KvTransfer, ...] = ()
-    lanes: tuple[RunLane, ...] = field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        """Validate run identity, lane uniqueness, and lifecycle-operation consistency."""
+        """Validate run identity and lifecycle-operation consistency."""
 
-        if self.lanes and not self.operations:
-            set_field = object.__setattr__
-            set_field(self, "collective_seq", self.lanes[0].collective_seq)
-            set_field(
-                self,
-                "operations",
-                tuple(operation for lane in self.lanes for operation in lane.operations),
-            )
-            set_field(
-                self,
-                "block_tables",
-                tuple(value for lane in self.lanes for value in lane.block_tables),
-            )
-            set_field(
-                self,
-                "new_cache_pages",
-                tuple(value for lane in self.lanes for value in lane.new_cache_pages),
-            )
-            operation_offset = 0
-            operation_indices: list[int] = []
-            for lane in self.lanes:
-                operation_indices.extend(
-                    index + operation_offset for index in lane.forward_operation_indices
-                )
-                operation_offset += len(lane.operations)
-            set_field(self, "forward_operation_indices", tuple(operation_indices))
-            set_field(
-                self,
-                "request_pool_indices",
-                tuple(value for lane in self.lanes for value in lane.request_pool_indices),
-            )
-            set_field(
-                self, "seq_lens", tuple(value for lane in self.lanes for value in lane.seq_lens)
-            )
-            set_field(
-                self, "query_lens", tuple(value for lane in self.lanes for value in lane.query_lens)
-            )
-            set_field(
-                self, "write_kv", tuple(value for lane in self.lanes for value in lane.write_kv)
-            )
-            set_field(
-                self,
-                "latent_params",
-                tuple(value for lane in self.lanes for value in lane.latent_params),
-            )
-            set_field(
-                self,
-                "decode_ranges",
-                tuple(value for lane in self.lanes for value in lane.decode_ranges),
-            )
-            set_field(
-                self,
-                "buffer_allocations",
-                tuple(value for lane in self.lanes for value in lane.buffer_allocations),
-            )
         self.validate()
 
     @property
@@ -3010,7 +2643,7 @@ class Run:
         return tuple(command.request for command in self.commands if isinstance(command, Start))
 
     def validate(self) -> None:
-        """Enforce run identity, command ordering, lane uniqueness, operation counts, and token bounds."""
+        """Enforce run identity, command ordering, operation counts, and token bounds."""
 
         if not self.operations and not self.commands:
             raise invalid_descriptor(
@@ -3090,8 +2723,8 @@ class Run:
         _validate_buffer_allocations(self.operations, self.buffer_allocations, "run")
 
     @classmethod
-    def from_mapping(cls, value: object) -> Run:
-        """Parse a scheduler run and validate all lifecycle commands and physical lanes."""
+    def from_mapping(cls, value: object) -> ScheduleBatch:
+        """Parse a scheduler run and validate all lifecycle commands and physical inputs."""
 
         data = _map(value, "execute run")
         batch_id = _uint(data.get("batch_id"), "execute run.batch_id")
@@ -3362,7 +2995,7 @@ class SamplingState:
 
 
 @dataclass(frozen=True, slots=True)
-class WorkerForwardStats:
+class ForwardStats:
     """Aggregates model-path, attention, graph, relay, and speculative-decoding measurements for a run."""
 
     mode_counts: Mapping[str, int] = field(default_factory=dict)
@@ -3397,7 +3030,28 @@ class WorkerForwardStats:
     spec_verify_path_counts: Mapping[str, int] = field(default_factory=dict)
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "worker forward stats") -> WorkerForwardStats:
+    def combine(cls, values: Sequence[ForwardStats]) -> ForwardStats:
+        """Sum scalar and keyed counters without changing their wire definitions."""
+
+        if not values:
+            return cls()
+        if len(values) == 1:
+            return values[0]
+        merged: dict[str, object] = {}
+        for name in cls.__dataclass_fields__:
+            fields = tuple(getattr(value, name) for value in values)
+            if isinstance(fields[0], Mapping):
+                totals: dict[str, int] = {}
+                for field_value in fields:
+                    for key, count in cast(Mapping[str, int], field_value).items():
+                        totals[key] = totals.get(key, 0) + count
+                merged[name] = totals
+            else:
+                merged[name] = sum(cast(tuple[int, ...], fields))
+        return cls(**cast(Any, merged))
+
+    @classmethod
+    def from_mapping(cls, value: object, where: str = "worker forward stats") -> ForwardStats:
         """Parse aggregate execution counters and reject malformed mode, backend, or speculative statistics."""
 
         data = _map(value, where)
@@ -3496,34 +3150,64 @@ class WorkerForwardStats:
 
 
 @dataclass(frozen=True, slots=True)
-class LaneResult:
-    """Carries the ordered operation results produced by one execution lane."""
+class BatchOutput:
+    """One wire-ready response fragment containing only host-owned values."""
 
-    lane_id: int
-    completions: tuple[ModelOutput | CompletionState, ...]
+    batch_id: int
+    run_id: int
+    completions: tuple[RequestOutput, ...] = ()
     products: tuple[TensorPublication, ...] = ()
     registration: RegistrationAck = field(default_factory=RegistrationAck)
     worker_exec_us: int | None = None
-    forward_stats: WorkerForwardStats | None = None
-    publication: LanePublication | None = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
+    forward_stats: ForwardStats | None = None
+    done: bool = True
 
     @classmethod
-    def from_mapping(
-        cls,
-        value: object,
-        where: str = "lane completion",
-    ) -> LaneResult:
-        """Parse one lane completion with ordered operation outputs and optional publication state."""
+    def combine(cls, fragments: Sequence[BatchOutput]) -> BatchOutput:
+        """Collect response fragments from one run without changing field ordering."""
+
+        if not fragments:
+            raise ValueError("batch output requires at least one fragment")
+        first = fragments[0]
+        if any(
+            (value.batch_id, value.run_id) != (first.batch_id, first.run_id) for value in fragments
+        ):
+            raise invalid_descriptor("output fragments belong to different batches")
+        payloads = tuple(
+            value
+            for value in fragments
+            if value.completions
+            or value.products
+            or value.worker_exec_us is not None
+            or value.forward_stats is not None
+        )
+        durations = tuple(
+            value.worker_exec_us for value in payloads if value.worker_exec_us is not None
+        )
+        stats = tuple(value.forward_stats for value in payloads if value.forward_stats is not None)
+        return cls(
+            batch_id=first.batch_id,
+            run_id=first.run_id,
+            completions=tuple(output for value in fragments for output in value.completions),
+            products=tuple(output for value in fragments for output in value.products),
+            registration=RegistrationAck(
+                visible=bool(payloads) and all(value.registration.visible for value in payloads)
+            ),
+            worker_exec_us=max(durations) if durations else None,
+            forward_stats=ForwardStats.combine(stats) if stats else None,
+            done=fragments[-1].done,
+        )
+
+    @classmethod
+    def from_mapping(cls, value: object, where: str = "completion report") -> BatchOutput:
+        """Parse the unchanged flat response fields without execution wrappers."""
 
         data = _map(value, where)
         return cls(
-            lane_id=_uint(data.get("lane_id"), f"{where}.lane_id"),
+            batch_id=_uint(data.get("batch_id"), f"{where}.batch_id"),
+            run_id=_uint(data.get("run_id"), f"{where}.run_id"),
             completions=tuple(
-                ModelOutput.from_mapping(item, f"{where}.completions[{index}]")
+                RequestOutput.from_mapping(item, f"{where}.completions[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("completions", ()), f"{where}.completions")
                 )
@@ -3539,145 +3223,18 @@ class LaneResult:
             forward_stats=(
                 None
                 if data.get("forward_stats") is None
-                else WorkerForwardStats.from_mapping(
-                    data["forward_stats"], f"{where}.forward_stats"
-                )
+                else ForwardStats.from_mapping(data["forward_stats"], f"{where}.forward_stats")
             ),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Encode one lane’s operation completions in execution order."""
-
-        return {
-            "lane_id": self.lane_id,
-            "completions": [cast(ModelOutput, value).to_mapping() for value in self.completions],
-            "products": [value.to_mapping() for value in self.products],
-            "registration": self.registration.to_mapping(),
-            "worker_exec_us": self.worker_exec_us,
-            "forward_stats": None
-            if self.forward_stats is None
-            else self.forward_stats.to_mapping(),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class RunResult:
-    """Carries the completed lane results and aggregate forward statistics for one run."""
-
-    batch_id: int
-    run_id: int
-    lanes: tuple[LaneResult, ...]
-    done: bool = True
-    # Rank-local physical completion query; never serialized to the wire.
-    retirement: Callable[[], bool] | None = field(default=None, compare=False, repr=False)
-
-    @property
-    def completions(self) -> tuple[ModelOutput | CompletionState, ...]:
-        """Flatten lane completions in physical lane and operation order."""
-
-        return tuple(completion for lane in self.lanes for completion in lane.completions)
-
-    @property
-    def products(self) -> tuple[TensorPublication, ...]:
-        """Flatten lane product payloads in physical lane order."""
-
-        return tuple(product for lane in self.lanes for product in lane.products)
-
-    @property
-    def registration(self) -> RegistrationAck:
-        """Report visibility only after every physical lane acknowledges registration."""
-
-        return RegistrationAck(
-            visible=bool(self.lanes) and all(lane.registration.visible for lane in self.lanes)
-        )
-
-    @property
-    def worker_exec_us(self) -> int | None:
-        """Use the slowest lane duration as the run's wall-clock execution time."""
-
-        values = tuple(
-            lane.worker_exec_us for lane in self.lanes if lane.worker_exec_us is not None
-        )
-        return None if not values else max(values)
-
-    @property
-    def forward_stats(self) -> WorkerForwardStats | None:
-        """Merge lane counters by summing scalars and keyed counter maps."""
-
-        values = tuple(lane.forward_stats for lane in self.lanes if lane.forward_stats is not None)
-        if not values:
-            return None
-        if len(values) == 1:
-            return values[0]
-        merged: dict[str, object] = {}
-        for name in WorkerForwardStats.__dataclass_fields__:
-            fields = tuple(getattr(value, name) for value in values)
-            if isinstance(fields[0], Mapping):
-                totals: dict[str, int] = {}
-                for field_value in fields:
-                    for key, count in cast(Mapping[str, int], field_value).items():
-                        totals[key] = totals.get(key, 0) + count
-                merged[name] = totals
-            else:
-                merged[name] = sum(cast(tuple[int, ...], fields))
-        return WorkerForwardStats(**cast(Any, merged))
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str = "completion report") -> RunResult:
-        """Parse a run completion and its lane reports, registration acknowledgement, and forward statistics."""
-
-        data = _map(value, where)
-        completions = tuple(
-            ModelOutput.from_mapping(item, f"{where}.completions[{index}]")
-            for index, item in enumerate(_seq(data.get("completions", ()), f"{where}.completions"))
-        )
-        products = tuple(
-            TensorPublication.from_mapping(item, f"{where}.products[{index}]")
-            for index, item in enumerate(_seq(data.get("products", ()), f"{where}.products"))
-        )
-        registration = RegistrationAck.from_mapping(
-            data.get("registration", {}), f"{where}.registration"
-        )
-        forward_stats = (
-            None
-            if data.get("forward_stats") is None
-            else WorkerForwardStats.from_mapping(data["forward_stats"], f"{where}.forward_stats")
-        )
-        has_payload = bool(
-            completions
-            or products
-            or data.get("worker_exec_us") is not None
-            or forward_stats is not None
-        )
-        return cls(
-            batch_id=_uint(data.get("batch_id"), f"{where}.batch_id"),
-            run_id=_uint(data.get("run_id"), f"{where}.run_id"),
-            lanes=(
-                LaneResult(
-                    lane_id=1,
-                    completions=completions,
-                    products=products,
-                    registration=registration,
-                    worker_exec_us=_optional_uint(
-                        data.get("worker_exec_us"), f"{where}.worker_exec_us"
-                    ),
-                    forward_stats=forward_stats,
-                ),
-            )
-            if has_payload
-            else (),
             done=_bool(data.get("done", True), f"{where}.done"),
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode the completed run, lane outputs, registration state, and aggregate statistics."""
+        """Encode final values in protocol order; pending resources cannot enter this type."""
 
-        if self.retirement is not None and not self.retirement():
-            raise RuntimeError("run commands still retain physical resources")
         return {
             "batch_id": self.batch_id,
             "run_id": self.run_id,
-            "completions": [cast(ModelOutput, value).to_mapping() for value in self.completions],
+            "completions": [value.to_mapping() for value in self.completions],
             "products": [value.to_mapping() for value in self.products],
             "registration": self.registration.to_mapping(),
             "worker_exec_us": self.worker_exec_us,
@@ -3976,19 +3533,6 @@ def _fast_tensor_refs(value: object) -> tuple[TensorRef, ...] | None:
             return None
         references.append(reference)
     return tuple(references)
-
-
-def _fast_work(value: object) -> Computation | None:
-    """Decode a trusted compact work descriptor and its kind-specific payload."""
-
-    if (
-        isinstance(value, (ForwardMode, PipelineStage, TransferMode))
-        and value is not ForwardMode.MIXED
-    ):
-        return value
-    if type(value) is str:
-        return _COMPUTATION_BY_VALUE.get(value)
-    return None
 
 
 @lru_cache(maxsize=256)

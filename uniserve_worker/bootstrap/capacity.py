@@ -9,18 +9,19 @@ from typing import Any
 import torch
 
 from ..config import WorkerConfig
-from ..execution.batch import DeviceDim, PipelineStage, TensorSpec
-from ..execution.bounded_storage import TensorSchema
 from ..execution.input_buffers import InputGeometry
+from ..execution.model_entry import ModelEntry
 from ..foundation.errors import unsupported_setup
 from ..foundation.math import ceil_div
 from ..models.generation import GenerationPipeline
 from ..models.inputs import FeatureLayout
 from ..models.runtime import ExecutionModel
-from ..nn.mesh import Communicator, EntryBindings
-from ..runtime.cache_pool import CachePool
+from ..nn.mesh import Communicator
+from ..protocol.batch import DeviceDim, PipelineStage, TensorSpec
 from ..runtime.device import canonical_device, device_memory_budget
-from ..runtime.device_products import DeviceProducts, device_product_capacity_bytes
+from ..runtime.kv_cache import KVCache
+from ..runtime.tensor_buffers import TensorSchema
+from ..runtime.tensor_store import TensorStore, device_product_capacity_bytes
 
 _DEVICE_PRODUCTS_PER_OPERATION = 6
 _DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
@@ -135,7 +136,7 @@ def request_tensor_window(pipeline_depth: int, request_slots: int) -> int:
 def local_product_storage_bytes(
     entry_outputs: Mapping[str, tuple[TensorSpec, ...]],
     *,
-    bindings: EntryBindings | None,
+    bindings: Mapping[str, ModelEntry],
     pipeline_components: Mapping[PipelineStage, str],
     max_unresolved_ops: int,
 ) -> int:
@@ -145,7 +146,7 @@ def local_product_storage_bytes(
     disjoint regions may subsequently be imported into that allocation. A
     temporal-unit stage only retains its unresolved groups of leading-axis
     units. Non-streaming results retain their declared capacity until their
-    consumers finish. Alignment follows PersistentBuffers' allocation contract.
+    consumers finish. Alignment follows BufferPool' allocation contract.
     """
 
     if max_unresolved_ops < 1:
@@ -171,15 +172,15 @@ def local_product_storage_bytes(
     }
     total = 0
     for entry, outputs in entry_outputs.items():
-        if bindings is not None:
-            residents = set(bindings.output_ranks(entry))
+        if bindings:
+            residents = set(bindings[entry].output_ranks)
             for consumer in consumers.get(entry, ()):
-                residents.update(bindings.entries[consumer].ranks)
-            if bindings.process_group.rank not in residents:
+                residents.update(bindings[consumer].config.ranks)
+            if bindings[entry].process_group.rank not in residents:
                 continue
         units_per_operation = 1
-        if bindings is not None and entry in streamed:
-            config = bindings.entries[entry]
+        if bindings and entry in streamed:
+            config = bindings[entry].config
             units_per_operation = len(config.ranks) * config.units_per_rank
         for output in outputs:
             size = output.max_bytes
@@ -250,7 +251,7 @@ class ArenaCapacity:
     """Budgets latent storage, device products, transfers, and CPU tasks for one worker arena."""
 
     latent_pool_bytes: int
-    device_products: int
+    tensor_store: int
     device_product_bytes: int
     transfer_bytes: int
     transfer_tickets: int
@@ -280,7 +281,7 @@ def request_tensor_arena_capacity(
     state_slots = int(worker_config.max_request_pool_size)
     slots = depth * max_operations
     unresolved_window = request_tensor_window(depth, state_slots)
-    device_products = _DEVICE_PRODUCTS_PER_OPERATION * (
+    tensor_store = _DEVICE_PRODUCTS_PER_OPERATION * (
         slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
     )
     relay_bytes = (
@@ -290,9 +291,9 @@ def request_tensor_arena_capacity(
     )
     return ArenaCapacity(
         latent_pool_bytes=0,
-        device_products=device_products,
+        tensor_store=tensor_store,
         device_product_bytes=(
-            device_product_capacity_bytes(device_products, 1, max_value_bytes=1) + relay_bytes
+            device_product_capacity_bytes(tensor_store, 1, max_value_bytes=1) + relay_bytes
         ),
         transfer_bytes=max(1, state_slots * product_bytes_per_request),
         transfer_tickets=max(1, min(slots, _MAX_TRANSFER_ENTRIES)),
@@ -370,7 +371,7 @@ def model_arena_capacity(
         1,
     )
     device_product_slots = slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
-    device_products = _DEVICE_PRODUCTS_PER_OPERATION * device_product_slots
+    tensor_store = _DEVICE_PRODUCTS_PER_OPERATION * device_product_slots
     device_count = len(
         {
             str(worker_config.device),
@@ -378,10 +379,10 @@ def model_arena_capacity(
         }
     )
     # Resident images and tensor products borrow scheduler-assigned storage
-    # from PersistentBuffers, whose complete grant is counted by the layout
-    # owner. DeviceProducts owns scalar backing and request relays separately.
+    # from BufferPool, whose complete grant is counted by the layout
+    # owner. TensorStore owns scalar backing and request relays separately.
     device_product_bytes = device_product_capacity_bytes(
-        device_products,
+        tensor_store,
         device_count,
         max_value_bytes=1,
     )
@@ -394,7 +395,7 @@ def model_arena_capacity(
 
     return ArenaCapacity(
         latent_pool_bytes=latent_pool_bytes,
-        device_products=device_products,
+        tensor_store=tensor_store,
         device_product_bytes=device_product_bytes,
         transfer_bytes=max_transfer_bytes * transfer_tickets,
         transfer_tickets=transfer_tickets,
@@ -559,7 +560,7 @@ def resolve_request_capacity(
 
 
 def decode_context_blocks(
-    model: ExecutionModel, worker_config: WorkerConfig, pool: CachePool | None
+    model: ExecutionModel, worker_config: WorkerConfig, pool: KVCache | None
 ) -> int:
     """Return the maximum paged-decode context blocks supported by this worker."""
 
@@ -575,7 +576,7 @@ def decode_context_blocks(
 
 
 def check_startup_memory(
-    worker_config: WorkerConfig, product_capacity_bytes: int, device_products: DeviceProducts
+    worker_config: WorkerConfig, product_capacity_bytes: int, tensor_store: TensorStore
 ) -> None:
     """Check resident startup allocations and reserved products against device grants."""
 
@@ -596,7 +597,7 @@ def check_startup_memory(
             continue
         available, free = device_memory_budget(device, worker_config.kv_memory_fraction)
         total = device_total_bytes(device)
-        remaining = max(0, product_bytes - device_products.resident_bytes(device))
+        remaining = max(0, product_bytes - tensor_store.resident_bytes(device))
         if remaining > available or total - free > int(total * worker_config.kv_memory_fraction):
             raise unsupported_setup(
                 f"initialized runtime on {device} exceeds its static memory grant: "

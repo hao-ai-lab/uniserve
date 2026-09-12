@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from functools import partial
 from itertools import product
 from math import prod
-from types import MappingProxyType
 from typing import Any, Mapping
 
 import torch
@@ -16,7 +15,7 @@ import torch.distributed as dist
 
 from ..profiling import profile_range
 from .collective import stream_collectives, try_sum_reduction
-from .parallel import ComponentConfig, ParallelConfig
+from .parallel import ParallelConfig
 
 RowChunkProducer = Callable[[slice, tuple[torch.Tensor, ...]], None]
 
@@ -259,7 +258,7 @@ def _send_recv_fake(value, output, dst, src, group_name):
 
 
 @dataclass(frozen=True)
-class SymmetricMemoryWorkspace:
+class SymmetricMemory:
     """Runtime-owned allocation with peer views ordered by logical membership."""
 
     coordinator: Communicator
@@ -284,12 +283,12 @@ class SymmetricMemoryWorkspace:
 
 
 @dataclass(frozen=True)
-class PeerTensorWorkspace:
+class PeerTensor:
     """A logically contiguous tensor whose leading-axis storage lives on peers.
 
     Each owner writes its local allocation. A group fence must complete before
     kernels read the global view, and again before any owner reuses its local
-    storage. The distributed runtime owns both the allocation and its mapping.
+    storage. The numerical owner retains both the allocation and its mapping.
     """
 
     coordinator: Communicator
@@ -831,63 +830,3 @@ class DeviceMesh:
     @classmethod
     def trivial(cls, device: torch.device | str = "cpu") -> DeviceMesh:
         return cls(local_device=torch.device(device))
-
-
-@dataclass(frozen=True)
-class EntryBindings:
-    """Bind configured entries to this rank's meshes and process communicator.
-
-    The configured member order defines pipeline coordinates. Tensor replicas
-    share one logical output; sequence and temporal members retain their rows.
-    """
-
-    entries: Mapping[str, ComponentConfig]
-    meshes: Mapping[str, DeviceMesh]
-    process_group: Communicator
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "entries", MappingProxyType(dict(self.entries)))
-        object.__setattr__(self, "meshes", MappingProxyType(dict(self.meshes)))
-        if not self.entries or not any(self.owns(name) for name in self.entries):
-            raise ValueError("rank has no configured computation entry")
-        for name, entry in self.entries.items():
-            if any(rank not in self.process_group.ranks for rank in entry.ranks):
-                raise ValueError(f"entry {name} members lie outside its Worker")
-            if entry.distribution is None:
-                mesh = self.meshes.get(name)
-                if (mesh is not None) != self.owns(name):
-                    raise ValueError(f"entry {name} requires its local mesh")
-                if mesh is not None and (
-                    mesh.ranks != entry.ranks or mesh.parallel_config != entry.parallel_config
-                ):
-                    raise ValueError(f"entry {name} mesh disagrees with configuration")
-
-    def owns(self, entry: str) -> bool:
-        """Whether this rank executes the configured entry."""
-        configured = self.entries.get(entry)
-        return configured is not None and self.process_group.rank in configured.ranks
-
-    def input_ranks(self, entry: str) -> tuple[int, ...]:
-        """First pipeline-stage input members in configured order."""
-        config = self.entries[entry]
-        if config.distribution is not None:
-            return config.ranks
-        width = config.parallel_config.world_size // config.parallel_config.pipeline_parallel_size
-        return config.ranks[:width]
-
-    def output_ranks(self, entry: str) -> tuple[int, ...]:
-        """Final pipeline-stage members with tensor replicas counted once."""
-        config = self.entries[entry]
-        if config.distribution is not None:
-            return config.ranks
-        geometry = DeviceMesh(
-            config.ranks, config.ranks[0], config.parallel_config, self.process_group.device
-        )
-        axes = tuple(name for name, _ in geometry.dimensions)
-        return tuple(
-            rank
-            for rank in config.ranks
-            if geometry.get_coordinate(rank)[axes.index("tp")] == 0
-            and geometry.get_coordinate(rank)[axes.index("pp")]
-            == config.parallel_config.pipeline_parallel_size - 1
-        )

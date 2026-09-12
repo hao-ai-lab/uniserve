@@ -2,79 +2,31 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal, NotRequired, TypeAlias, TypedDict
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, cast
 
 import torch
 
-from uniserve_worker.execution.batch import ForwardMode, PipelineStage
 from uniserve_worker.ops.staging import gather_request_decode_inputs
-from uniserve_worker.runtime.device import HostStagingRing, fill_cpu_bools, fill_cpu_ints
+from uniserve_worker.protocol.batch import ForwardMode, PipelineStage
+from uniserve_worker.runtime.device import fill_cpu_bools, fill_cpu_ints
+from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
-from .bounded_storage import BoundedTensorStorage, TensorSchema
+from ..runtime.tensor_buffers import TensorBuffers, TensorSchema
 from .forward_batch import (
+    AttentionMetadata,
     AttentionMode,
     FlowPatches,
     ForwardBatch,
-    RouteSpan,
     TokenSelection,
     packed_tensor_views,
 )
+from .rows import ForwardRow
 
-
-class AttentionColumns(TypedDict):
-    """Materialized attention inputs copied into a lane's fixed tensor storage."""
-
-    attention_mode: Literal[
-        AttentionMode.DENSE,
-        AttentionMode.PAGED_DECODE,
-        AttentionMode.PAGED_VARLEN,
-        AttentionMode.PACKED,
-    ]
-    prefix_lens: torch.Tensor
-    query_lens: torch.Tensor
-    out_cache_loc: torch.Tensor
-    has_cache_writes: bool
-    block_table: NotRequired[torch.Tensor | None]
-    seq_lens: NotRequired[torch.Tensor | None]
-    cu_seqlens_q: NotRequired[torch.Tensor | None]
-    cu_seqlens_k: NotRequired[torch.Tensor | None]
-    output_indices: NotRequired[torch.Tensor | None]
-    attention_indexes: NotRequired[torch.Tensor | None]
-    visible_end: NotRequired[torch.Tensor | None]
-    route_spans: NotRequired[tuple[RouteSpan, ...]]
-    max_seqlen_q: NotRequired[int]
-    max_seqlen_k: NotRequired[int]
-    causal: NotRequired[bool]
-    causal_rows_cpu: NotRequired[tuple[bool, ...]]
-    prefix_lens_cpu: NotRequired[tuple[int, ...]]
-    query_lens_cpu: NotRequired[tuple[int, ...]]
-    seq_lens_cpu: NotRequired[tuple[int, ...]]
-    group_id: NotRequired[int]
-    fully_visible: NotRequired[bool]
-    binding: NotRequired[int]
-
-
-class RequestDecodeColumns(TypedDict):
-    """Resident request columns gathered directly into decode staging storage."""
-
-    attention_mode: Literal[AttentionMode.REQUEST_INDEXED_DECODE]
-    prefix_lens_cpu: tuple[int, ...]
-    query_lens_cpu: tuple[int, ...]
-    seq_lens_cpu: tuple[int, ...]
-    causal_rows_cpu: tuple[bool, ...]
-    causal: bool
-    group_id: int
-    binding: int
-    request_page_tables: torch.Tensor
-    request_cache_lengths: torch.Tensor
-    request_tokens: torch.Tensor
-    request_positions: torch.Tensor
-    table_width: int
-    page_size: int
-
-
-AttentionInputs: TypeAlias = AttentionColumns | RequestDecodeColumns
+if TYPE_CHECKING:
+    from ..runtime.block_tables import BlockTables
+    from ..runtime.decode_state import DecodeState
+    from ..runtime.kv_cache import KVCache
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +99,7 @@ class InputBuffers:
         self.max_blocks_per_row = geometry.max_blocks_per_row
         self.hidden_size = geometry.hidden_size
         self.device = torch.device(device)
-        tensors = BoundedTensorStorage.allocate(geometry.tensor_schema(), self.device).capacity
+        tensors = TensorBuffers.allocate(geometry.tensor_schema(), self.device).capacity
         self.input_ids = tensors["input_ids"]
         self.positions = tensors["positions"]
         self.embedding_mask = tensors["embedding_mask"]
@@ -170,10 +122,10 @@ class InputBuffers:
         self.write_token_indices = tensors["write_token_indices"]
         self.flow_timesteps = tensors["flow_timesteps"]
         self.input_embeddings = tensors.get("input_embeddings")
-        self._request_pool_indices_host = HostStagingRing(
+        self._request_pool_indices_host = StagingBuffers(
             self.max_rows, dtype=torch.int64, depth=max_inflight, device=self.device
         )
-        self._decode_force_finish_host = HostStagingRing(
+        self._decode_force_finish_host = StagingBuffers(
             self.max_rows, dtype=torch.bool, depth=max_inflight, device=self.device
         )
 
@@ -185,88 +137,109 @@ class InputBuffers:
 
     def stage(
         self,
+        rows: tuple[ForwardRow, ...],
         *,
         forward_mode: ForwardMode | PipelineStage,
-        row_count: int,
-        request_pool_indices: tuple[int, ...],
-        decode_force_finish: tuple[bool, ...] = (),
-        token_row_indices: tuple[int, ...] = (),
-        token_ids: tuple[torch.Tensor, ...] = (),
-        token_embeddings: tuple[torch.Tensor | None, ...] = (),
-        token_embedding_masks: tuple[torch.Tensor | None, ...] = (),
-        token_positions: tuple[torch.Tensor, ...] = (),
-        token_selections: tuple[TokenSelection, ...] = (),
-        flow_row_indices: tuple[int, ...] = (),
-        flow_positions: tuple[torch.Tensor, ...] = (),
-        flow_timesteps: tuple[torch.Tensor, ...] = (),
-        flow_latents: tuple[torch.Tensor, ...] = (),
-        flow_conditioning: tuple[FlowPatches | None, ...] = (),
-        flow_image_tokens: tuple[int, ...] = (),
-        flow_heights: tuple[int, ...] = (),
-        flow_widths: tuple[int, ...] = (),
-        encode_pixels: tuple[torch.Tensor, ...] = (),
-        encode_grids: tuple[torch.Tensor | None, ...] = (),
-        encode_grid_shapes: tuple[tuple[int, int] | None, ...] = (),
-        decode_latents: tuple[torch.Tensor, ...] = (),
-        decode_heights: tuple[int, ...] = (),
-        decode_widths: tuple[int, ...] = (),
-        attention: AttentionInputs,
+        attention: AttentionMetadata | None = None,
+        cache: KVCache | None = None,
+        tables: BlockTables | None = None,
+        states: DecodeState | None = None,
+        packed: bool = False,
+        binding: int = 0,
     ) -> ForwardBatch:
-        """Copy row metadata and model inputs into fixed-address lane buffers and return bounded views."""
+        """Stage numerical rows into fixed addresses, including attention and decode gather.
 
-        if row_count < 1 or row_count > self.max_rows:
+        Startup may supply physical attention geometry for its reserved scratch
+        pages. Serving derives it from the actual cache and request tables.
+        """
+
+        from .attention import cache_pages, columns, dense_columns
+
+        tasks = rows
+        row_count = len(tasks)
+        if not 0 < row_count <= self.max_rows:
             raise ValueError("forward row count exceeds input-buffer capacity")
-        if len(request_pool_indices) != row_count:
-            raise ValueError("forward request-slot column is not row-aligned")
-        if decode_force_finish and len(decode_force_finish) != row_count:
-            raise ValueError("forward decode finish column is not row-aligned")
-        token_count = len(token_row_indices)
-        if any(
-            len(values) != token_count
-            for values in (
-                token_ids,
-                token_embeddings,
-                token_embedding_masks,
-                token_positions,
-                token_selections,
+        if attention is None:
+            textual = all(
+                isinstance(task.forward_mode, ForwardMode)
+                or task.forward_mode is PipelineStage.DENOISING
+                for task in tasks
             )
-        ):
-            raise ValueError("forward token columns are not aligned")
-        if attention["attention_mode"] is AttentionMode.REQUEST_INDEXED_DECODE:
-            if any(
-                (
-                    flow_row_indices,
-                    flow_positions,
-                    flow_timesteps,
-                    flow_latents,
-                    flow_conditioning,
-                    flow_image_tokens,
-                    flow_heights,
-                    flow_widths,
-                    encode_pixels,
-                    encode_grids,
-                    encode_grid_shapes,
-                    decode_latents,
-                    decode_heights,
-                    decode_widths,
+            if (
+                textual
+                and states is not None
+                and tables is not None
+                and cache is not None
+                and states.device.type == "cuda"
+                and tables.page_tables.device == states.device == self.device
+                and all(
+                    task.forward_mode is ForwardMode.DECODE and task.request_indexed_decode
+                    for task in tasks
                 )
             ):
-                raise ValueError("request-indexed decode cannot mix non-token rows")
-            return self._stage_request_indexed_decode(
-                forward_mode=forward_mode,
-                row_count=row_count,
-                request_pool_indices=request_pool_indices,
-                decode_force_finish=decode_force_finish,
-                token_row_indices=token_row_indices,
-                token_ids=token_ids,
-                token_embeddings=token_embeddings,
-                token_embedding_masks=token_embedding_masks,
-                token_positions=token_positions,
-                token_selections=token_selections,
-                attention=attention,
+                _, width = cache_pages(tasks, cache=cache, tables=tables)
+                return self._stage_request_indexed_decode(
+                    tasks,
+                    forward_mode=forward_mode,
+                    cache=cache,
+                    tables=tables,
+                    states=states,
+                    table_width=width,
+                    binding=binding,
+                )
+            attention = (
+                columns(tasks, cache=cache, tables=tables, packed=packed, binding=binding)
+                if textual
+                else dense_columns(len(tasks), tuple(task.query_tokens for task in tasks))
             )
+        # Keep row selection local to the owner of the resulting tensor views.
+        token_row_indices = tuple(
+            index for index, row in enumerate(tasks) if row.token_ids is not None
+        )
+        flow_row_indices = tuple(
+            index
+            for index, row in enumerate(tasks)
+            if row.latent is not None and row.image_tokens > 0
+        )
+        token_rows = tuple(tasks[index] for index in token_row_indices)
+        flow_rows = tuple(tasks[index] for index in flow_row_indices)
+        encode_rows = tuple(row for row in tasks if row.encode_pixels is not None)
+        decode_rows = tuple(
+            row for row in tasks if row.latent is not None and row.image_tokens == 0
+        )
+        if any(row.positions is None or row.selection is None for row in token_rows):
+            raise ValueError("token rows require positions and output selections")
+        if any(row.positions is None or row.timestep is None for row in flow_rows):
+            raise ValueError("flow rows require positions and timesteps")
+        request_pool_indices = tuple(row.request_pool_idx for row in tasks)
+        decode_force_finish = (
+            tuple(row.decode_force_finish for row in tasks)
+            if all(
+                row.decode_predicate is not None and row.decode_predicate_tagged for row in tasks
+            )
+            else ()
+        )
+        token_count = len(token_rows)
+        token_ids = tuple(cast(torch.Tensor, row.token_ids) for row in token_rows)
+        token_embeddings = tuple(row.token_embeddings for row in token_rows)
+        token_embedding_masks = tuple(row.token_embedding_mask for row in token_rows)
+        token_positions = tuple(cast(torch.Tensor, row.positions) for row in token_rows)
+        token_selections = tuple(cast(TokenSelection, row.selection) for row in token_rows)
+        flow_positions = tuple(cast(torch.Tensor, row.positions) for row in flow_rows)
+        flow_timesteps = tuple(cast(torch.Tensor, row.timestep) for row in flow_rows)
+        flow_latents = tuple(cast(torch.Tensor, row.latent) for row in flow_rows)
+        flow_conditioning = tuple(row.flow_conditioning for row in flow_rows)
+        flow_image_tokens = tuple(row.image_tokens for row in flow_rows)
+        flow_heights = tuple(row.image_height for row in flow_rows)
+        flow_widths = tuple(row.image_width for row in flow_rows)
+        encode_pixels = tuple(cast(torch.Tensor, row.encode_pixels) for row in encode_rows)
+        encode_grids = tuple(row.encode_grid for row in encode_rows)
+        encode_grid_shapes = tuple(row.encode_grid_shape for row in encode_rows)
+        decode_latents = tuple(cast(torch.Tensor, row.latent) for row in decode_rows)
+        decode_heights = tuple(row.image_height for row in decode_rows)
+        decode_widths = tuple(row.image_width for row in decode_rows)
         self._scrub(
-            attention["attention_mode"],
+            attention.attention_mode,
             embeddings=any(value is not None for value in token_embeddings),
         )
         request_slot, request_host = self._request_pool_indices_host.acquire()
@@ -275,7 +248,7 @@ class InputBuffers:
             request_host[:row_count],
             non_blocking=self.device.type == "cuda",
         )
-        self._request_pool_indices_host.release(request_slot)
+        self._request_pool_indices_host.record_copy(request_slot)
         staged_decode_force_finish: torch.Tensor | None = None
         if decode_force_finish:
             staged_decode_force_finish = self.decode_force_finish[:row_count]
@@ -286,7 +259,7 @@ class InputBuffers:
                     finish_host[:row_count],
                     non_blocking=self.device.type == "cuda",
                 )
-                self._decode_force_finish_host.release(finish_slot)
+                self._decode_force_finish_host.record_copy(finish_slot)
 
         flattened_ids = tuple(value.reshape(-1) for value in token_ids)
         query_lens = [int(value.numel()) for value in flattened_ids]
@@ -311,7 +284,14 @@ class InputBuffers:
             default=1,
         )
         packed_positions: torch.Tensor | None = None
-        if token_positions and all(value.ndim == 1 for value in token_positions):
+        # Host prefixes and device continuation positions may share one call.
+        # Concatenation requires a common source device; heterogeneous columns
+        # copy directly into their destination spans below.
+        if (
+            token_positions
+            and all(value.ndim == 1 for value in token_positions)
+            and len({value.device for value in token_positions}) == 1
+        ):
             position_parts = tuple(value.reshape(-1) for value in token_positions)
             packed_positions = packed_tensor_views(position_parts)
             if packed_positions is None:
@@ -384,30 +364,8 @@ class InputBuffers:
         return ForwardBatch(
             forward_mode=forward_mode,
             row_count=row_count,
-            attention_mode=staged_attention["attention_mode"],
+            attention=staged_attention,
             request_pool_indices=self.request_pool_indices[:row_count],
-            prefix_lens=staged_attention["prefix_lens"],
-            query_lens=staged_attention["query_lens"],
-            out_cache_loc=staged_attention["out_cache_loc"],
-            has_cache_writes=bool(staged_attention["has_cache_writes"]),
-            block_table=staged_attention.get("block_table"),
-            seq_lens=staged_attention.get("seq_lens"),
-            cu_seqlens_q=staged_attention.get("cu_seqlens_q"),
-            cu_seqlens_k=staged_attention.get("cu_seqlens_k"),
-            output_indices=staged_attention.get("output_indices"),
-            attention_indexes=staged_attention.get("attention_indexes"),
-            visible_end=staged_attention.get("visible_end"),
-            route_spans=staged_attention.get("route_spans", ()),
-            max_seqlen_q=int(staged_attention.get("max_seqlen_q", 0)),
-            max_seqlen_k=int(staged_attention.get("max_seqlen_k", 0)),
-            causal=bool(staged_attention.get("causal", True)),
-            causal_rows_cpu=staged_attention.get("causal_rows_cpu", ()),
-            prefix_lens_cpu=staged_attention.get("prefix_lens_cpu", ()),
-            query_lens_cpu=staged_attention.get("query_lens_cpu", ()),
-            seq_lens_cpu=staged_attention.get("seq_lens_cpu", ()),
-            group_id=int(staged_attention.get("group_id", 0)),
-            fully_visible=bool(staged_attention.get("fully_visible", False)),
-            binding=int(staged_attention.get("binding", 0)),
             decode_force_finish=staged_decode_force_finish,
             token_row_indices=token_row_indices,
             flow_row_indices=flow_row_indices,
@@ -440,39 +398,40 @@ class InputBuffers:
 
     def _stage_request_indexed_decode(
         self,
+        tasks: tuple[ForwardRow, ...],
         *,
         forward_mode: ForwardMode | PipelineStage,
-        row_count: int,
-        request_pool_indices: tuple[int, ...],
-        decode_force_finish: tuple[bool, ...],
-        token_row_indices: tuple[int, ...],
-        token_ids: tuple[torch.Tensor, ...],
-        token_embeddings: tuple[torch.Tensor | None, ...],
-        token_embedding_masks: tuple[torch.Tensor | None, ...],
-        token_positions: tuple[torch.Tensor, ...],
-        token_selections: tuple[TokenSelection, ...],
-        attention: RequestDecodeColumns,
+        cache: KVCache,
+        tables: BlockTables,
+        states: DecodeState,
+        table_width: int,
+        binding: int,
     ) -> ForwardBatch:
-        """Gather one-token decode rows from request-indexed state into fixed buffers."""
+        """Snapshot mutable request columns directly into graph-stable input addresses."""
 
-        # This fast path derives tokens, positions, lengths, and block tables
-        # from stable request slots; caller-provided per-token payloads are not
-        # permitted because they could disagree with resident state.
-        if (
-            token_row_indices != tuple(range(row_count))
-            or len(token_ids) != row_count
-            or len(token_positions) != row_count
-            or len(token_selections) != row_count
-            or any(int(value.numel()) != 1 for value in token_ids)
-            or any(int(value.numel()) != 1 for value in token_positions)
-            or any(value is not None for value in token_embeddings)
-            or any(value is not None for value in token_embedding_masks)
-            or len(attention["prefix_lens_cpu"]) != row_count
-            or len(attention["seq_lens_cpu"]) != row_count
-            or attention["query_lens_cpu"] != (1,) * row_count
+        row_count = len(tasks)
+        if row_count > self.max_rows or any(
+            task.token_ids is None
+            or task.token_ids.numel() != 1
+            or task.positions is None
+            or task.positions.numel() != 1
+            or task.token_embeddings is not None
+            or task.token_embedding_mask is not None
+            or task.selection is None
+            for task in tasks
         ):
             raise ValueError("request-indexed decode requires one plain token per row")
-
+        request_pool_indices = tuple(task.request_pool_idx for task in tasks)
+        decode_force_finish = (
+            tuple(task.decode_force_finish for task in tasks)
+            if all(
+                task.decode_predicate is not None and task.decode_predicate_tagged for task in tasks
+            )
+            else ()
+        )
+        prefix_lens = tuple(task.seq_len for task in tasks)
+        causal_rows = tuple(task.causal for task in tasks)
+        group_id = tasks[0].group_id
         # Request indices cross through pinned host storage so the copy can be
         # enqueued without synchronizing a CUDA execution stream.
         request_slot, request_host = self._request_pool_indices_host.acquire()
@@ -481,7 +440,7 @@ class InputBuffers:
             request_host[:row_count],
             non_blocking=self.device.type == "cuda",
         )
-        self._request_pool_indices_host.release(request_slot)
+        self._request_pool_indices_host.record_copy(request_slot)
         staged_decode_force_finish: torch.Tensor | None = None
         if decode_force_finish:
             staged_decode_force_finish = self.decode_force_finish[:row_count]
@@ -492,8 +451,8 @@ class InputBuffers:
                     finish_host[:row_count],
                     non_blocking=self.device.type == "cuda",
                 )
-                self._decode_force_finish_host.release(finish_slot)
-        width = int(attention["table_width"])
+                self._decode_force_finish_host.record_copy(finish_slot)
+        width = int(table_width)
         if width < 1 or width > int(self.block_tables.shape[1]):
             raise ValueError("request-indexed decode table width exceeds staging capacity")
 
@@ -501,10 +460,10 @@ class InputBuffers:
         # graph-stable staging addresses for this decode launch.
         gather_request_decode_inputs(
             request_pool_indices=self.request_pool_indices,
-            request_page_tables=attention["request_page_tables"],
-            request_cache_lengths=attention["request_cache_lengths"],
-            request_tokens=attention["request_tokens"],
-            request_positions=attention["request_positions"],
+            request_page_tables=tables.page_tables,
+            request_cache_lengths=tables.verified_lengths,
+            request_tokens=states.future_input_tokens[:, 0],
+            request_positions=states.logical_lengths,
             input_ids=self.input_ids,
             positions=self.positions[0],
             block_tables=self.block_tables[:, :width],
@@ -514,84 +473,78 @@ class InputBuffers:
             decode_page_ids=self.decode_page_ids,
             decode_page_offsets=self.decode_page_offsets,
             rows=row_count,
-            group_id=int(attention["group_id"]),
-            page_size=int(attention["page_size"]),
+            group_id=int(group_id),
+            page_size=int(cache.block_size),
         )
         output_locations = self.write_page_ids[:row_count]
         output_locations.copy_(self.decode_page_ids[:row_count])
-        output_locations.mul_(int(attention["page_size"]))
+        output_locations.mul_(int(cache.block_size))
         output_locations.add_(self.decode_page_offsets[:row_count])
 
         # Cache write locations are flattened page-and-offset coordinates; the
         # returned batch retains the two-dimensional table for attention reads.
         return ForwardBatch(
+            attention=AttentionMetadata(
+                attention_mode=AttentionMode.PAGED_DECODE,
+                prefix_lens=self.cache_lengths[:row_count],
+                query_lens=self.query_lengths[:row_count],
+                out_cache_loc=output_locations,
+                has_cache_writes=True,
+                block_table=self.block_tables[:row_count, :width],
+                seq_lens=self.kv_lengths[:row_count],
+                max_seqlen_k=width * int(cache.block_size),
+                causal=bool(len(set(causal_rows)) == 1 and causal_rows[0]),
+                causal_rows_cpu=causal_rows,
+                prefix_lens_cpu=prefix_lens,
+                query_lens_cpu=(1,) * row_count,
+                seq_lens_cpu=tuple(value + 1 for value in prefix_lens),
+                group_id=int(group_id),
+                binding=int(binding),
+            ),
             forward_mode=forward_mode,
             row_count=row_count,
-            attention_mode=AttentionMode.PAGED_DECODE,
             request_pool_indices=self.request_pool_indices[:row_count],
-            prefix_lens=self.cache_lengths[:row_count],
-            query_lens=self.query_lengths[:row_count],
-            out_cache_loc=output_locations,
-            has_cache_writes=True,
-            block_table=self.block_tables[:row_count, :width],
-            seq_lens=self.kv_lengths[:row_count],
-            max_seqlen_k=width * int(attention["page_size"]),
-            causal=bool(attention["causal"]),
-            causal_rows_cpu=attention["causal_rows_cpu"],
-            prefix_lens_cpu=attention["prefix_lens_cpu"],
-            query_lens_cpu=attention["query_lens_cpu"],
-            seq_lens_cpu=attention["seq_lens_cpu"],
-            group_id=int(attention["group_id"]),
-            binding=int(attention["binding"]),
             decode_force_finish=staged_decode_force_finish,
-            token_row_indices=token_row_indices,
+            token_row_indices=tuple(range(row_count)),
             input_ids=self.input_ids[:row_count],
             positions=self.positions[0, :row_count],
-            token_selections=token_selections,
+            token_selections=tuple(cast(TokenSelection, task.selection) for task in tasks),
         )
 
-    def stage_attention(self, attention: AttentionInputs) -> AttentionColumns:
-        """Copy validated attention side tables into their fixed-address staging buffers."""
+    def stage_attention(self, attention: AttentionMetadata) -> AttentionMetadata:
+        """Copy attention tensors into fixed storage and return its borrowed views."""
 
-        if attention["attention_mode"] is AttentionMode.REQUEST_INDEXED_DECODE:
-            raise ValueError("request-indexed decode must use fused input staging")
-        staged = attention.copy()
-        staged["prefix_lens"] = self._copy_vector(self.cache_lengths, attention["prefix_lens"])
-        staged["query_lens"] = self._copy_vector(self.query_lengths, attention["query_lens"])
-        staged["out_cache_loc"] = self._copy_vector(self.write_page_ids, attention["out_cache_loc"])
-        block_table = attention.get("block_table")
-        staged["block_table"] = (
-            None if block_table is None else self._copy_matrix(self.block_tables, block_table)
+        return replace(
+            attention,
+            prefix_lens=self._copy_vector(self.cache_lengths, attention.prefix_lens),
+            query_lens=self._copy_vector(self.query_lengths, attention.query_lens),
+            out_cache_loc=self._copy_vector(self.write_page_ids, attention.out_cache_loc),
+            block_table=None
+            if attention.block_table is None
+            else self._copy_matrix(self.block_tables, attention.block_table),
+            seq_lens=None
+            if attention.seq_lens is None
+            else self._copy_vector(self.kv_lengths, attention.seq_lens),
+            cu_seqlens_q=None
+            if attention.cu_seqlens_q is None
+            else self._copy_vector(self.cumulative_query_lengths, attention.cu_seqlens_q),
+            cu_seqlens_k=None
+            if attention.cu_seqlens_k is None
+            else self._copy_vector(self.cumulative_kv_lengths, attention.cu_seqlens_k),
+            output_indices=None
+            if attention.output_indices is None
+            else self._copy_vector(self.output_indices, attention.output_indices),
+            attention_indexes=None
+            if attention.attention_indexes is None
+            else self._copy_matrix(self.attention_indexes, attention.attention_indexes),
+            visible_end=None
+            if attention.visible_end is None
+            else self._copy_matrix(self.visible_end, attention.visible_end),
         )
-        vectors: tuple[
-            tuple[
-                Literal["seq_lens", "cu_seqlens_q", "cu_seqlens_k", "output_indices"], torch.Tensor
-            ],
-            ...,
-        ] = (
-            ("seq_lens", self.kv_lengths),
-            ("cu_seqlens_q", self.cumulative_query_lengths),
-            ("cu_seqlens_k", self.cumulative_kv_lengths),
-            ("output_indices", self.output_indices),
-        )
-        for key, target in vectors:
-            value = attention.get(key)
-            staged[key] = None if value is None else self._copy_vector(target, value)
-        indexes = attention.get("attention_indexes")
-        staged["attention_indexes"] = (
-            None if indexes is None else self._copy_matrix(self.attention_indexes, indexes)
-        )
-        visible = attention.get("visible_end")
-        staged["visible_end"] = (
-            None if visible is None else self._copy_matrix(self.visible_end, visible)
-        )
-        return staged
 
     def _scrub(self, mode: AttentionMode, *, embeddings: bool) -> None:
         """Zero reusable fields whose stale values could affect the next staged mode."""
 
-        if mode is AttentionMode.REQUEST_INDEXED_DECODE:
-            raise ValueError("request-indexed decode must use fused input staging")
         self.input_ids.fill_(1)
         self.positions.zero_()
         if embeddings and self.input_embeddings is not None:

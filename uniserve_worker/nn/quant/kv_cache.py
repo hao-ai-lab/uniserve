@@ -10,18 +10,18 @@ from __future__ import annotations
 import torch
 
 __all__ = [
-    'FP8_MAX',
-    'SCALE_EPS',
-    'fp8_quantize',
-    'fp8_scale_from',
-    'resolve_kv_store_dtype',
-    'is_fp8_kv_dtype',
-    'kv_store_dtype_name',
-    'kv_store_itemsize',
-    'kv_cache_bytes_per_token',
-    'scale_for_fp8_block',
-    'quantize_fp8_block',
-    'dequantize_fp8_block',
+    "FP8_MAX",
+    "SCALE_EPS",
+    "fp8_quantize",
+    "fp8_scale_from",
+    "resolve_kv_store_dtype",
+    "is_fp8_kv_dtype",
+    "kv_store_dtype_name",
+    "kv_store_itemsize",
+    "kv_cache_bytes_per_token",
+    "scale_for_fp8_block",
+    "quantize_fp8_block",
+    "dequantize_fp8_block",
 ]
 
 FP8_MAX = 448.0
@@ -112,7 +112,9 @@ def kv_cache_bytes_per_token(
     """Calculate both K and V storage bytes per token across all cache layers."""
 
     resolved = resolve_kv_store_dtype(compute_dtype, store_dtype)
-    return int(int(num_kv_heads) * int(head_dim) * 2 * int(num_layers) * kv_store_itemsize(resolved))
+    return int(
+        int(num_kv_heads) * int(head_dim) * 2 * int(num_layers) * kv_store_itemsize(resolved)
+    )
 
 
 def scale_for_fp8_block(block: torch.Tensor) -> torch.Tensor:
@@ -128,7 +130,9 @@ def quantize_fp8_block(block: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return fp8_quantize(block.to(torch.float32), scale)
 
 
-def dequantize_fp8_block(block: torch.Tensor, scale: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+def dequantize_fp8_block(
+    block: torch.Tensor, scale: torch.Tensor, *, dtype: torch.dtype
+) -> torch.Tensor:
     """Restore one FP8 KV block to the requested floating-point compute dtype."""
 
     out = block.to(torch.float32) * scale.to(torch.float32)

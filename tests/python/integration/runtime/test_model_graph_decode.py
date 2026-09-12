@@ -7,20 +7,22 @@ import torch
 
 from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
-from uniserve_worker.execution.batch import ForwardMode
+from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.forward_batch import (
+    AttentionMetadata,
     AttentionMode,
     AttentionSelection,
     ForwardBatch,
     TokenSelection,
 )
-from uniserve_worker.execution.graph.full import FullCudaGraphBackend
-from uniserve_worker.execution.runners.packed import PackedRunner
+from uniserve_worker.execution.input_buffers import InputGeometry
+from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.models.sensenova.config import NeoChatConfig
 from uniserve_worker.models.sensenova.model import NEOChatModel
 from uniserve_worker.nn.layer import LayerConfig
 from uniserve_worker.nn.mesh import Communicator
-from uniserve_worker.runtime.cache_pool import CachePool
+from uniserve_worker.protocol.batch import ForwardMode
+from uniserve_worker.runtime.kv_cache import KVCache
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -86,7 +88,7 @@ def numerical_model(request):
             parameter.fill_(1)
         else:
             parameter.normal_(std=0.05)
-    pool = CachePool(
+    pool = KVCache(
         num_layers=2,
         num_pages=16,
         page_size=64,
@@ -110,83 +112,111 @@ def numerical_model(request):
 @torch.inference_mode()
 def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind, numerical_model):
     model, pool, selection, device = numerical_model
-    cache = model.cache_geometry
     rows = 3
     # A context-bounded view retains the wider staging allocation's row stride.
     # Only the first four physical pages per request contain live KV tokens.
     tables = torch.zeros((rows, 4096), dtype=torch.int32, device=device)
     tables[:, :4].copy_(torch.arange(1, 13, dtype=torch.int32, device=device).view(rows, 4))
     batch = ForwardBatch(
+        attention=AttentionMetadata(
+            attention_mode=AttentionMode.PAGED_DECODE,
+            prefix_lens=torch.tensor([62, 61, 60], dtype=torch.int32, device=device),
+            query_lens=torch.ones(rows, dtype=torch.int32, device=device),
+            out_cache_loc=torch.tensor([126, 381, 636], dtype=torch.int64, device=device),
+            block_table=tables[:, :1319],
+            seq_lens=torch.tensor([63, 62, 61], dtype=torch.int32, device=device),
+            max_seqlen_k=1319 * 64,
+            prefix_lens_cpu=(62, 61, 60),
+            query_lens_cpu=(1,) * rows,
+            seq_lens_cpu=(63, 62, 61),
+        ),
         forward_mode=ForwardMode.DECODE,
         row_count=rows,
-        attention_mode=AttentionMode.PAGED_DECODE,
         request_pool_indices=torch.arange(1, rows + 1, device=device),
-        prefix_lens=torch.tensor([62, 61, 60], dtype=torch.int32, device=device),
-        query_lens=torch.ones(rows, dtype=torch.int32, device=device),
-        out_cache_loc=torch.tensor([126, 381, 636], dtype=torch.int64, device=device),
-        block_table=tables[:, :1319],
-        seq_lens=torch.tensor([63, 62, 61], dtype=torch.int32, device=device),
-        max_seqlen_k=1319 * 64,
-        prefix_lens_cpu=(62, 61, 60),
-        query_lens_cpu=(1,) * rows,
-        seq_lens_cpu=(63, 62, 61),
         token_row_indices=tuple(range(rows)),
         input_ids=torch.tensor([1, 3, 5], device=device),
         positions=torch.tensor([62, 61, 60], dtype=torch.int64, device=device),
         token_selections=(selection_kind,) * rows,
         decode_force_finish=torch.zeros(rows, dtype=torch.bool, device=device),
     )
-    runner = PackedRunner(
-        backend=FullCudaGraphBackend(
-            device=device,
-            stream=torch.cuda.Stream(device=device),
-            pool=torch.cuda.graph_pool_handle(),
+    runner = ModelRunner(
+        model,
+        WorkerConfig(
+            device=str(device),
+            block_size=64,
+            graph_policy="full",
+            prefill_cuda_graph=True,
+            decode_graph_batch_sizes=(rows,),
+            prefill_graph_token_sizes=(),
         ),
-        enabled=True,
-        prefill_enabled=True,
-        cache=cache,
-        cache_pool=pool,
         attention=selection,
-        block_size=64,
-        memory_budget_bytes=512 << 20,
-        decode_batch_sizes=(rows,),
-        decode_context_blocks=1319,
-        decode_predicates=torch.ones(rows + 1, dtype=torch.bool, device=device),
     )
+    predicates = torch.ones(rows + 1, dtype=torch.bool, device=device)
+    runner.configure_inputs(
+        geometry=InputGeometry(rows, rows, rows, 1319, 512),
+        kv_cache=pool,
+        latent_pool=None,
+        decode_predicates=predicates,
+        max_operations=rows,
+        request_slots=rows,
+        max_tokens=rows,
+        latent_capacity_units=0,
+        decode_context_blocks=1319,
+        variants=frozenset((ForwardMode.DECODE,)),
+        max_inflight=1,
+    )
+    entry = next(iter(runner.entries.values()))
 
     def forward(value):
         return model.project(model(value.input_ids, value.positions, value), value)
 
     try:
-        runner.capture(batch, forward)
+        runner.capture_batch(entry, batch, forward)
         runner.complete_startup()
         for index, (lengths, tokens) in enumerate(
             (((198, 211, 200), (9, 11, 13)), ((199, 212, 201), (4, 2, 19)))
         ):
             batch.input_ids.copy_(torch.tensor(tokens, device=device))
-            batch.seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
-            batch.prefix_lens.copy_(batch.seq_lens - 1)
-            batch.positions.copy_(batch.prefix_lens)
-            page_columns = batch.prefix_lens.long() // 64
-            pages = batch.block_table.gather(1, page_columns[:, None])[:, 0]
-            batch.out_cache_loc.copy_(pages.long() * 64 + batch.prefix_lens % 64)
+            batch.attention.seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+            batch.attention.prefix_lens.copy_(batch.attention.seq_lens - 1)
+            batch.positions.copy_(batch.attention.prefix_lens)
+            page_columns = batch.attention.prefix_lens.long() // 64
+            pages = batch.attention.block_table.gather(1, page_columns[:, None])[:, 0]
+            batch.attention.out_cache_loc.copy_(
+                pages.long() * 64 + batch.attention.prefix_lens % 64
+            )
             # Eager invocations use distinct plan identities after metadata
             # changes; Graph replay owns its persistent binding separately.
             batch = replace(
                 batch,
-                binding=batch.binding + 10000,
-                seq_lens_cpu=lengths,
-                prefix_lens_cpu=tuple(n - 1 for n in lengths),
+                attention=replace(
+                    batch.attention,
+                    binding=batch.attention.binding + 10000,
+                    seq_lens_cpu=lengths,
+                    prefix_lens_cpu=tuple(n - 1 for n in lengths),
+                ),
             )
-            execution = runner.run(batch, forward, eligible=True)
-            actual = execution.output
+            predicates[1:].copy_(torch.tensor([True, False, True], device=device))
+            batch.decode_force_finish.copy_(torch.tensor([False, False, True], device=device))
+            execution = runner.run_batch(entry, batch, forward, eligible=True)
+            actual = execution
             expected = forward(batch)
             for result, reference in zip(actual.values, expected.values, strict=True):
                 torch.testing.assert_close(result, reference, rtol=2e-2, atol=2e-2)
             if selection_kind is TokenSelection.HIDDEN:
                 # Hidden-state consumers must not receive vocabulary samples.
                 assert execution.greedy is None
-            elif execution.greedy is not None:
+            else:
+                assert execution.greedy is not None
+                torch.testing.assert_close(
+                    execution.greedy.active, torch.tensor([True, False, True], device=device)
+                )
+                torch.testing.assert_close(
+                    execution.greedy.finish, torch.tensor([False, False, True], device=device)
+                )
+                torch.testing.assert_close(
+                    execution.greedy.continuation, torch.tensor([True, False, False], device=device)
+                )
                 logits = torch.cat(expected.materialize().values, dim=0)
                 torch.testing.assert_close(execution.greedy.tokens, logits.argmax(dim=-1))
     finally:
@@ -198,37 +228,43 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind,
 @pytest.mark.parametrize("numerical_model", ["qwen"], indirect=True)
 @torch.inference_mode()
 def test_model_prefill_padding_preserves_live_outputs(numerical_model):
-    from uniserve_worker.execution.input_buffers import InputBuffers, InputGeometry
-    from uniserve_worker.execution.runners.packed import select_prefill_captures
-    from uniserve_worker.execution.runners.prefill import prepare_prefill, stage_text
+    from uniserve_worker.execution.runners.prefill import stage_text
 
     model, pool, selection, device = numerical_model
-    buffers = InputBuffers(geometry=InputGeometry(8, 16, 16, 4, 512), device=device)
-    shapes = select_prefill_captures((8, 16), (4,), max_rows=3, max_tokens=16)
-    runner = PackedRunner(
-        backend=FullCudaGraphBackend(
-            device=device,
-            stream=torch.cuda.Stream(device=device),
-            pool=torch.cuda.graph_pool_handle(),
+    runner = ModelRunner(
+        model,
+        WorkerConfig(
+            device=str(device),
+            block_size=64,
+            graph_policy="full",
+            prefill_cuda_graph=True,
+            decode_graph_batch_sizes=(),
+            prefill_graph_token_sizes=(8, 16),
         ),
-        enabled=True,
-        prefill_enabled=True,
-        cache=model.cache_geometry,
-        cache_pool=pool,
         attention=selection,
-        block_size=64,
-        memory_budget_bytes=512 << 20,
-        prefill_token_sizes=(8, 16),
-        prefill_row_sizes=(4,),
-        decode_context_blocks=4,
-        prefill_shapes=shapes,
     )
+    runner.configure_inputs(
+        geometry=InputGeometry(8, 16, 16, 4, 512),
+        kv_cache=pool,
+        latent_pool=None,
+        decode_predicates=torch.ones(4, dtype=torch.bool, device=device),
+        max_operations=3,
+        request_slots=3,
+        max_tokens=16,
+        latent_capacity_units=0,
+        decode_context_blocks=4,
+        variants=frozenset((ForwardMode.PREFILL,)),
+        max_inflight=1,
+    )
+    entry = next(iter(runner.entries.values()))
+    buffers = entry.input_buffers
+    assert buffers is not None
 
     def forward(batch):
         return model.project(model(batch.input_ids, batch.positions, batch), batch)
 
     try:
-        prepare_prefill(runner, buffers, forward, shapes, packed=False)
+        runner.capture(tokenizer=None, latents=None)
         runner.complete_startup()
         with pool.startup_pages(3) as pages:
             for lengths in ((3,), (3, 2), (4, 5), (1, 5, 4)):
@@ -241,10 +277,9 @@ def test_model_prefill_padding_preserves_live_outputs(numerical_model):
                     packed=False,
                 )
                 expected = forward(batch).clone()
-                actual = runner.run(batch, forward, eligible=True).output
+                actual = runner.run_batch(entry, batch, forward, eligible=True)
                 for result, reference in zip(actual.values, expected.values, strict=True):
                     torch.testing.assert_close(result, reference, rtol=2e-2, atol=2e-2)
     finally:
         torch.cuda.synchronize(device)
         runner.close()
-        buffers.close()

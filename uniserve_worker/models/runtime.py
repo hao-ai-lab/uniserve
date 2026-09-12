@@ -12,20 +12,20 @@ import torch
 from torch import nn
 
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.batch import Computation, PipelineStage
+from uniserve_worker.protocol.batch import Computation, PipelineStage
 
-from ..execution.batch import DecodeRange, DiffusionSamplingParams, TensorSpec
-from ..execution.bounded_storage import BoundedTensorStorage, TensorSchema
 from ..execution.forward_batch import AttentionSelection, ForwardBatch, ForwardOutput
+from ..execution.model_entry import ModelEntry
 from ..foundation.errors import invalid_descriptor
-from ..nn.mesh import EntryBindings
 from ..nn.parallel_attention import AttentionContextGeometry
+from ..protocol.batch import DecodeRange, DiffusionSamplingParams, TensorSpec
+from ..runtime.tensor_buffers import TensorBuffers, TensorSchema
 from ..transfer.layout import TensorRegion
 
 if TYPE_CHECKING:
     from ..execution.model_runner import ModelRunner
     from ..loader.component import CheckpointComponent, ModelBuildContext, ModelConstruction
-    from ..runtime.cache_pool import CachePool
+    from ..runtime.kv_cache import KVCache
     from .generation import GenerationPipeline
     from .inputs import ImageProcessor
 
@@ -138,7 +138,7 @@ class ExecutionModel(nn.Module):
     # Result declarations contain numerical geometry only. Request identities,
     # allocation, physical locations and reader lifetimes belong to the runtime.
     entry_outputs: Mapping[str, tuple[TensorSpec, ...]] = MappingProxyType({})
-    bindings: EntryBindings | None = None
+    bindings: Mapping[str, ModelEntry] = MappingProxyType({})
     pipeline_components: Mapping[PipelineStage, str] = MappingProxyType({})
     num_inference_steps: int = 0
     ordered_collective_execution: bool = False
@@ -146,9 +146,7 @@ class ExecutionModel(nn.Module):
     def bind_execution(self, runner: ModelRunner) -> None:
         """Bind this rank's numerical callables to their execution owners."""
 
-    def warmup_execution(
-        self, runner: ModelRunner, storage: tuple[BoundedTensorStorage, ...]
-    ) -> None:
+    def warmup_execution(self, runner: ModelRunner, storage: tuple[TensorBuffers, ...]) -> None:
         """Prepare representative numerical inputs after runtime storage exists."""
 
     def output_layout(
@@ -230,14 +228,14 @@ class ExecutionModel(nn.Module):
 
     def bind_cache_pool(
         self,
-        cache_pool: CachePool,
+        kv_cache: KVCache,
         selection: AttentionSelection,
     ) -> None:
         """Bind every model-owned attention layer to its process KV allocation."""
 
         from ..nn.attention import bind_attention_modules
 
-        bind_attention_modules(self, cache_pool, selection)
+        bind_attention_modules(self, kv_cache, selection)
 
 
 def active_latent_capacity_tokens(

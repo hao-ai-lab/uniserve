@@ -10,17 +10,17 @@ from einops import rearrange
 from torch import Tensor, nn
 
 __all__ = [
-    'AutoEncoderParams',
-    'FLUX_VAE_PARAMS',
-    'default_ae_params',
-    'AttnBlock',
-    'ResnetBlock',
-    'Downsample',
-    'Upsample',
-    'Encoder',
-    'Decoder',
-    'DiagonalGaussian',
-    'AutoEncoder',
+    "AutoEncoderParams",
+    "FLUX_VAE_PARAMS",
+    "default_ae_params",
+    "AttnBlock",
+    "ResnetBlock",
+    "Downsample",
+    "Upsample",
+    "Encoder",
+    "Decoder",
+    "DiagonalGaussian",
+    "AutoEncoder",
 ]
 
 # GroupNorm group count used throughout the FLUX-VAE blocks (fixed by the
@@ -84,7 +84,9 @@ class AttnBlock(nn.Module):
         """Build channel-preserving spatial QKV projections around group normalization."""
 
         super().__init__()
-        self.norm = nn.GroupNorm(num_groups=_GN_GROUPS, num_channels=in_channels, eps=_GN_EPS, affine=True)
+        self.norm = nn.GroupNorm(
+            num_groups=_GN_GROUPS, num_channels=in_channels, eps=_GN_EPS, affine=True
+        )
         self.q = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         self.k = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         self.v = nn.Conv2d(in_channels, in_channels, kernel_size=1)
@@ -127,12 +129,18 @@ class ResnetBlock(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.norm1 = nn.GroupNorm(num_groups=_GN_GROUPS, num_channels=in_channels, eps=_GN_EPS, affine=True)
+        self.norm1 = nn.GroupNorm(
+            num_groups=_GN_GROUPS, num_channels=in_channels, eps=_GN_EPS, affine=True
+        )
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        self.norm2 = nn.GroupNorm(num_groups=_GN_GROUPS, num_channels=out_channels, eps=_GN_EPS, affine=True)
+        self.norm2 = nn.GroupNorm(
+            num_groups=_GN_GROUPS, num_channels=out_channels, eps=_GN_EPS, affine=True
+        )
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
         if self.in_channels != self.out_channels:
-            self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+            self.nin_shortcut = nn.Conv2d(
+                in_channels, out_channels, kernel_size=1, stride=1, padding=0
+            )
 
     def forward(self, x: Tensor) -> Tensor:
         """Apply two normalized convolutions and add the channel-aligned residual."""
@@ -233,7 +241,9 @@ class Encoder(nn.Module):
             downsample = Downsample(block_in) if i_level != self.num_resolutions - 1 else None
             self.down.append(_EncoderLevel(block, downsample))
         self.mid = _MiddleBlocks(block_in)
-        self.norm_out = nn.GroupNorm(num_groups=_GN_GROUPS, num_channels=block_in, eps=_GN_EPS, affine=True)
+        self.norm_out = nn.GroupNorm(
+            num_groups=_GN_GROUPS, num_channels=block_in, eps=_GN_EPS, affine=True
+        )
         self.conv_out = nn.Conv2d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
@@ -274,7 +284,9 @@ class Decoder(nn.Module):
                 block_in = block_out
             upsample = Upsample(block_in) if i_level != 0 else None
             self.up.insert(0, _DecoderLevel(block, upsample))
-        self.norm_out = nn.GroupNorm(num_groups=_GN_GROUPS, num_channels=block_in, eps=_GN_EPS, affine=True)
+        self.norm_out = nn.GroupNorm(
+            num_groups=_GN_GROUPS, num_channels=block_in, eps=_GN_EPS, affine=True
+        )
         self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
 
     def forward(self, z):

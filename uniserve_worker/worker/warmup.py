@@ -9,46 +9,39 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve_worker.execution.batch import (
+from uniserve_worker.protocol.batch import (
     ComputationId,
     ForwardMode,
     PipelineStage,
     TransferMode,
 )
 
-from ..execution.batch import (
-    AttentionRegime,
+from ..execution.graph_inputs import DiffusionShape
+from ..execution.model_runner import capture_image_parameters
+from ..foundation.errors import invalid_descriptor
+from ..foundation.math import ceil_div
+from ..models.generation import GenerationPipeline
+from ..nn.diffusion.cfg import build_flow_cfg_plan
+from ..protocol.batch import (
     BatchCommand,
+    BatchOutput,
     BlockTable,
     BufferAllocation,
     BufferId,
     CachePageAllocation,
-    Computation,
     Finish,
     Free,
     LatentParams,
-    ModelOutput,
     NewRequest,
     OpStatus,
     RequestKey,
-    Run,
-    RunLane,
-    RunResult,
+    RequestOutput,
+    ScheduleBatch,
     ScheduledRequest,
     Start,
     TensorPublication,
     TensorRef,
 )
-from ..execution.model_runner import capture_image_parameters
-from ..execution.output import (
-    finalize_run_result,
-    run_result_ready,
-)
-from ..execution.runners.packed import FlowCapture
-from ..foundation.errors import invalid_descriptor
-from ..foundation.math import ceil_div
-from ..models.generation import GenerationPipeline
-from ..nn.diffusion.cfg import build_flow_cfg_plan
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -84,7 +77,7 @@ class _WarmupRequests:
         # requests have no further scheduler messages and can leave the table.
         self.worker.requests.drop(request_id)
         for group_id in range(
-            0 if self.worker.cache_pool is None else self.worker.cache_pool.group_count
+            0 if self.worker.kv_cache is None else self.worker.kv_cache.group_count
         ):
             self._kv_pages.pop((request.request_key, group_id), None)
         self._prefix_pages.pop(request.request_key, None)
@@ -111,7 +104,7 @@ class _WarmupRequests:
         self._run_id += 1
         _execute_warmup(
             self,
-            Run(
+            ScheduleBatch(
                 batch_id=self._run_id,
                 run_id=self._run_id,
                 commands=commands,
@@ -176,116 +169,88 @@ def _warmup_batch(
     latent_params: dict[tuple[RequestKey, ComputationId], LatentParams],
     buffer_allocations: tuple[BufferAllocation, ...],
     input_products: tuple[TensorPublication, ...] = (),
-    tensorized_mixed: bool = False,
-) -> Run:
-    """Assemble warmup operations into computation lanes with their physical allocations."""
+) -> ScheduleBatch:
+    """Assemble warmup operations and their physical input columns."""
 
-    # Preserve operation order within each computation kind while assigning a
-    # shared launch identity only for tensorized mixed qualification.
-    groups: list[tuple[Computation, int, list[ScheduledRequest]]] = []
-    for operation in operations:
-        existing = next(
-            (members for kind, _route, members in groups if kind is operation.kind),
-            None,
-        )
-        if existing is None:
-            groups.append((operation.kind, 0, [operation]))
-        else:
-            existing.append(operation)
-    # Every lane carries only the tables, rows, and buffers referenced by its members.
-    lanes = tuple(
-        RunLane(
-            lane_id=index,
-            launch_id=1 if tensorized_mixed else index,
-            collective_seq=max(
-                1,
-                int(run_id) * 16 + (1 if tensorized_mixed else index),
-            ),
-            route=route,
-            attention=AttentionRegime.HYBRID,
-            shape_class=0,
-            operations=tuple(members),
-            block_tables=tuple(
-                table
-                for operation in members
-                for table in block_tables.get(
-                    (operation.request_key, operation.op_id),
-                    (),
-                )
-            ),
-            new_cache_pages=tuple(
-                allocation
-                for operation in members
-                for allocation in new_cache_pages.get(
-                    (operation.request_key, operation.op_id),
-                    (),
-                )
-            ),
-            forward_operation_indices=tuple(
-                operation_index
-                for operation_index, operation in enumerate(members)
-                for _ in forward_inputs.get(
-                    (operation.request_key, operation.op_id), ((), (), (), ())
-                )[0]
-            ),
-            request_pool_indices=tuple(
-                value
-                for operation in members
-                for value in forward_inputs.get(
-                    (operation.request_key, operation.op_id), ((), (), (), ())
-                )[0]
-            ),
-            seq_lens=tuple(
-                value
-                for operation in members
-                for value in forward_inputs.get(
-                    (operation.request_key, operation.op_id), ((), (), (), ())
-                )[1]
-            ),
-            query_lens=tuple(
-                value
-                for operation in members
-                for value in forward_inputs.get(
-                    (operation.request_key, operation.op_id), ((), (), (), ())
-                )[2]
-            ),
-            write_kv=tuple(
-                value
-                for operation in members
-                for value in forward_inputs.get(
-                    (operation.request_key, operation.op_id), ((), (), (), ())
-                )[3]
-            ),
-            latent_params=tuple(
-                latent_params[(operation.request_key, operation.op_id)]
-                for operation in members
-                if operation.kind
-                in {
-                    PipelineStage.LATENT_PREPARATION,
-                    PipelineStage.DENOISING,
-                    PipelineStage.IMAGE_DECODING,
-                }
-            ),
-            buffer_allocations=tuple(
-                allocation
-                for allocation in buffer_allocations
-                if any(
-                    product.buffer_id == allocation.buffer
-                    for operation in members
-                    for product in (
-                        *operation.tensor_inputs(),
-                        *operation.tensor_outputs(),
-                        *((operation.predicate,) if operation.predicate is not None else ()),
-                    )
-                )
-            ),
-        )
-        for index, (_kind, route, members) in enumerate(groups, start=1)
-    )
-    return Run(
+    return ScheduleBatch(
         batch_id=run_id,
         run_id=run_id,
-        lanes=lanes,
+        collective_seq=max(1, int(run_id) * 16 + 1),
+        operations=operations,
+        block_tables=tuple(
+            table
+            for operation in operations
+            for table in block_tables.get(
+                (operation.request_key, operation.op_id),
+                (),
+            )
+        ),
+        new_cache_pages=tuple(
+            allocation
+            for operation in operations
+            for allocation in new_cache_pages.get(
+                (operation.request_key, operation.op_id),
+                (),
+            )
+        ),
+        forward_operation_indices=tuple(
+            operation_index
+            for operation_index, operation in enumerate(operations)
+            for _ in forward_inputs.get((operation.request_key, operation.op_id), ((), (), (), ()))[
+                0
+            ]
+        ),
+        request_pool_indices=tuple(
+            value
+            for operation in operations
+            for value in forward_inputs.get(
+                (operation.request_key, operation.op_id), ((), (), (), ())
+            )[0]
+        ),
+        seq_lens=tuple(
+            value
+            for operation in operations
+            for value in forward_inputs.get(
+                (operation.request_key, operation.op_id), ((), (), (), ())
+            )[1]
+        ),
+        query_lens=tuple(
+            value
+            for operation in operations
+            for value in forward_inputs.get(
+                (operation.request_key, operation.op_id), ((), (), (), ())
+            )[2]
+        ),
+        write_kv=tuple(
+            value
+            for operation in operations
+            for value in forward_inputs.get(
+                (operation.request_key, operation.op_id), ((), (), (), ())
+            )[3]
+        ),
+        latent_params=tuple(
+            latent_params[(operation.request_key, operation.op_id)]
+            for operation in operations
+            if operation.kind
+            in {
+                PipelineStage.LATENT_PREPARATION,
+                PipelineStage.DENOISING,
+                PipelineStage.IMAGE_DECODING,
+            }
+        ),
+        buffer_allocations=tuple(
+            allocation
+            for allocation in buffer_allocations
+            if any(
+                product.buffer_id == allocation.buffer
+                for operation in operations
+                for product in (
+                    *operation.tensor_inputs(),
+                    *operation.tensor_outputs(),
+                    *((operation.predicate,) if operation.predicate is not None else ()),
+                )
+            )
+        ),
         input_products=input_products,
         commands=tuple(Start(request) for request in admissions),
     )
@@ -296,7 +261,7 @@ def _warmup_token_output(
 ) -> TensorRef:
     """Declare a packed int64 token relay for warmup sampling."""
 
-    from ..execution.batch import DType, ShapeBound
+    from ..protocol.batch import DType, ShapeBound
 
     return TensorRef(
         request_key=request_key,
@@ -310,16 +275,25 @@ def _warmup_token_output(
 
 def _execute_warmup(
     requests: _WarmupRequests,
-    batch: Run,
+    batch: ScheduleBatch,
     *,
     retain_device_outputs: bool = False,
-) -> RunResult:
+) -> BatchOutput:
     """Execute a runtime scenario and optionally retain its published outputs."""
 
-    report = requests.worker._execute_batch(batch, propagate_errors=True)
-    while not run_result_ready(report):
-        time.sleep(0.00005)
-    finalized = finalize_run_result(report)
+    worker = requests.worker
+    state = worker.submit(batch, propagate_errors=True)
+    fragments: list[BatchOutput] = []
+    while True:
+        worker.advance()
+        output = worker.poll(state)
+        if output is None:
+            time.sleep(0.00005)
+            continue
+        fragments.append(output)
+        if output.done:
+            break
+    finalized = BatchOutput.combine(fragments)
     device_buffers = tuple(
         output.buffer_id
         for operation in batch.operations
@@ -337,9 +311,9 @@ def _execute_warmup(
             ),
         )
     )
-    failures: list[ModelOutput] = []
+    failures: list[RequestOutput] = []
     for completion in finalized.completions:
-        if not isinstance(completion, ModelOutput):
+        if not isinstance(completion, RequestOutput):
             raise RuntimeError("finalized warmup result retains unresolved device output")
         if completion.status is OpStatus.ERROR:
             failures.append(completion)
@@ -361,9 +335,8 @@ def _build_warmup_batch(
     admissions: tuple[NewRequest, ...],
     operations: tuple[ScheduledRequest, ...],
     input_products: tuple[TensorPublication, ...] = (),
-    tensorized_mixed: bool = False,
     image_geometry: tuple[int, int] | None = None,
-) -> Run:
+) -> ScheduleBatch:
     """Derive cache, latent, buffer, and row allocations for a warmup submission."""
 
     requests._run_id += 1
@@ -413,7 +386,7 @@ def _build_warmup_batch(
             raise invalid_descriptor("warmup KV admission requires an empty prefix")
         visible = 0
         if request is not None:
-            runtime = request.current.runtime
+            runtime = request.accepted_progress
             visible = int(runtime.kv_visible_len)
         input_length = (
             int(operation.bounds.max_tokens)
@@ -427,21 +400,21 @@ def _build_warmup_batch(
         )
         tables: list[BlockTable] = []
         allocations: list[CachePageAllocation] = []
-        if requests.worker.cache_pool is None:
+        if requests.worker.kv_cache is None:
             raise invalid_descriptor("warmup KV operation requires cache storage")
-        for group_id in range(requests.worker.cache_pool.group_count):
+        for group_id in range(requests.worker.kv_cache.group_count):
             lease_key = (operation.request_key, group_id)
             block_table = requests._kv_pages.setdefault(lease_key, [])
             target_pages = ceil_div(
                 visible + input_length,
-                int(requests.worker.cache_pool.block_size),
+                int(requests.worker.kv_cache.block_size),
             )
             missing = target_pages - len(block_table)
             if missing < 0:
                 raise invalid_descriptor("warmup operation regresses its KV capacity")
             allocated = tuple(
                 candidate
-                for candidate in requests.worker.cache_pool.page_ids(group_id)
+                for candidate in requests.worker.kv_cache.page_ids(group_id)
                 if candidate not in occupied_blocks
             )[:missing]
             if len(allocated) != missing:
@@ -449,7 +422,7 @@ def _build_warmup_batch(
                     "warmup KV allocation exceeds resident capacity: "
                     f"request={operation.request_key.request_id}, group={group_id}, "
                     f"required_pages={missing}, available_pages={len(allocated)}, "
-                    f"resident_pages={len(requests.worker.cache_pool.page_ids(group_id))}, "
+                    f"resident_pages={len(requests.worker.kv_cache.page_ids(group_id))}, "
                     f"leased_pages={len(occupied_blocks)}"
                 )
             block_table.extend(allocated)
@@ -459,7 +432,7 @@ def _build_warmup_batch(
                     request_pool_idx=request_pool_indices[operation.request_key],
                     group_id=group_id,
                     page_ids=tuple(block_table),
-                    allocated_tokens=len(block_table) * requests.worker.cache_pool.block_size,
+                    allocated_tokens=len(block_table) * requests.worker.kv_cache.block_size,
                 )
             )
             if allocated:
@@ -513,7 +486,7 @@ def _build_warmup_batch(
         page_table.extend(allocated)
         occupied_latent_pages.update(allocated)
         request = requests.worker.requests.peek(int(operation.request_key.request_id))
-        start_step = 0 if request is None else int(request.flow_step)
+        start_step = 0 if request is None else int(request.accepted_progress.flow_step)
         latent_params[(operation.request_key, operation.op_id)] = LatentParams(
             request_key=operation.request_key,
             op_id=operation.op_id,
@@ -551,7 +524,6 @@ def _build_warmup_batch(
         latent_params=latent_params,
         buffer_allocations=tuple(buffer_allocations.values()),
         input_products=input_products,
-        tensorized_mixed=tensorized_mixed,
     )
 
 
@@ -581,7 +553,7 @@ def _warmup_flow_tables(
         renorm_min=float(image.cfg_renorm_min),
         use_cfg=True,
     )
-    runtime = request.current.runtime
+    runtime = request.accepted_progress
     query = generation.physical_tokens(height, width)
     image_prompt = image.image_prompts[0] if image.image_prompts else ""
     # Branches either reuse the conditioned request slot or share one alternative prefix.
@@ -601,9 +573,9 @@ def _warmup_flow_tables(
     if len(alternatives) > 1:
         raise invalid_descriptor("warmup flow has multiple distinct alternative prefixes")
     alternative = next(iter(alternatives), ())
-    if requests.worker.cache_pool is None:
+    if requests.worker.kv_cache is None:
         raise invalid_descriptor("warmup flow requires KV cache storage")
-    required = ceil_div(len(alternative), requests.worker.cache_pool.block_size)
+    required = ceil_div(len(alternative), requests.worker.kv_cache.block_size)
     lease = requests._prefix_pages.setdefault(operation.request_key, [])
     missing = required - len(lease)
     occupied = {
@@ -615,7 +587,7 @@ def _warmup_flow_tables(
     occupied.update(page for pages in requests._kv_pages.values() for page in pages)
     # Prefix pages persist across warmup shapes so graph capture observes stable tables.
     allocated = tuple(
-        page for page in requests.worker.cache_pool.page_ids(0) if page not in occupied
+        page for page in requests.worker.kv_cache.page_ids(0) if page not in occupied
     )[:missing]
     if len(allocated) != missing:
         raise invalid_descriptor("warmup alternative prefix exceeds KV capacity")
@@ -639,7 +611,7 @@ def _warmup_flow_tables(
                 request_pool_idx=alternative_slot,
                 group_id=0,
                 page_ids=tuple(lease),
-                allocated_tokens=len(lease) * requests.worker.cache_pool.block_size,
+                allocated_tokens=len(lease) * requests.worker.kv_cache.block_size,
             ),
         )
         if allocated:
@@ -676,11 +648,6 @@ def warmup_requests(worker: Worker) -> None:
     """
 
     requests = _WarmupRequests(worker)
-    product_devices = (
-        worker.worker_config.device,
-        worker.worker_config.generation_device or worker.worker_config.device,
-    )
-    worker.device_products.warmup_scattered_publication(product_devices)
     if torch.device(worker.worker_config.device).type == "cuda":
         if ForwardMode.PREFILL in worker.info.supported_ops:
             _warmup_tokens(requests)
@@ -707,7 +674,7 @@ def _warmup_image_geometry(requests: _WarmupRequests) -> tuple[int, int]:
 def _warmup_tokens(requests: _WarmupRequests) -> None:
     """Exercise extend-to-decode token handoff and release its synthetic request."""
 
-    from ..execution.batch import (
+    from ..protocol.batch import (
         ArRequestParams,
         Bounds,
         NewRequest,
@@ -719,7 +686,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
     variants = requests.worker.info.supported_ops
     if ForwardMode.PREFILL not in variants:
         return
-    pool = requests.worker.cache_pool
+    pool = requests.worker.kv_cache
     if pool is None:
         raise invalid_descriptor("autoregressive warmup requires KV cache storage")
     if requests.worker.requests.request_ids():
@@ -728,7 +695,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
     request_ids = tuple(range(1, max(batch_sizes) + 1))
     keys = {sid: RequestKey(0, sid, 1) for sid in request_ids}
     admissions = {
-        sid: NewRequest.create(
+        sid: NewRequest(
             keys[sid],
             request_pool_idx=sid,
             ar=ArRequestParams(
@@ -835,7 +802,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
 def _warmup_flow(requests: _WarmupRequests) -> None:
     """Drive one denoise quantum through the real flow forward path."""
 
-    from ..execution.batch import (
+    from ..protocol.batch import (
         ArRequestParams,
         Bounds,
         DeviceDim,
@@ -871,7 +838,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                 for shape in reversed(requests.worker.runner.flow_captures)
                 if shape.cfg_branches == branches
             ),
-            FlowCapture(1, *_warmup_image_geometry(requests), branches),
+            DiffusionShape(1, *_warmup_image_geometry(requests), branches),
         )
         for branches in requests.worker.runner.flow_cfg_branches
     )
@@ -900,7 +867,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         next_request_id += batch_size
         keys = tuple(RequestKey(0, request_id, 1) for request_id in request_ids)
         admissions = tuple(
-            NewRequest.create(
+            NewRequest(
                 key,
                 request_pool_idx=index,
                 umm=UmmRequestParams(
@@ -919,7 +886,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         next_request_id += text_request_count
         text_keys = {request_id: RequestKey(0, request_id, 1) for request_id in text_request_ids}
         text_admissions = {
-            request_id: NewRequest.create(
+            request_id: NewRequest(
                 text_keys[request_id],
                 request_pool_idx=batch_size + index,
                 ar=ArRequestParams(
@@ -1162,7 +1129,6 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                         requests,
                         admissions=(),
                         operations=(*text_operations, *flow_operations),
-                        tensorized_mixed=True,
                         image_geometry=(height, width),
                     ),
                     retain_device_outputs=True,

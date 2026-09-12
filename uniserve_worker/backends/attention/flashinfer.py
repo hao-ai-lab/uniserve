@@ -11,7 +11,7 @@ __all__ = [
     "FlashInferAttentionBackend",
 ]
 
-from ...execution.forward_batch import AttentionMode, ForwardBatch
+from ...execution.forward_batch import AttentionMetadata, AttentionMode
 from .base import AttentionBackend
 from .flashinfer_kernels import (
     _decode_effective_seqlens,
@@ -142,7 +142,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Compute dense attention through FlashInfer’s single-request prefill operator."""
 
@@ -173,7 +173,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Plan and execute FlashInfer paged decode, including an optional current-token cache write."""
 
@@ -369,7 +369,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Plan and execute FlashInfer paged prefill for packed variable-length queries."""
 
@@ -443,7 +443,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         visible_current_end: torch.Tensor,
         scale: float,
         fully_visible_current: bool,
-        context: ForwardBatch | None = None,
+        context: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """Evaluate live and cached KV segments with FlashInfer and merge their attention states."""
 

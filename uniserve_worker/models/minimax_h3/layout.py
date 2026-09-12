@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve_worker.nn.mesh import EntryBindings
+from uniserve_worker.execution.model_entry import ModelEntry
 
 from ...backends.attention.video_sparse import video_sparse_selected_tiles
-from ...execution.batch import (
+from ...nn.mesh import DeviceMesh
+from ...nn.parallel_attention import AttentionBuffers
+from ...protocol.batch import (
     DecodeRange,
     DeviceDim,
     DiffusionSamplingParams,
@@ -20,9 +23,7 @@ from ...execution.batch import (
     StaticDim,
     TensorSpec,
 )
-from ...execution.bounded_storage import BoundedTensorStorage, TensorSchema
-from ...nn.mesh import DeviceMesh
-from ...nn.parallel_attention import AttentionContextWorkspace
+from ...runtime.tensor_buffers import TensorBuffers, TensorSchema
 from ...transfer.layout import TensorRegion
 from ..runtime import TensorOutputLayout
 from .encoder import H3TextEncoderConfig
@@ -153,7 +154,7 @@ class H3Layout:
     @classmethod
     def build(
         cls,
-        bindings: EntryBindings,
+        bindings: Mapping[str, ModelEntry],
         *,
         frames: int,
         text_rows: int,
@@ -161,9 +162,9 @@ class H3Layout:
     ) -> "H3Layout":
         """Partition one packed request evenly across the mesh sequence ranks."""
 
-        mesh = bindings.meshes.get("denoiser")
-        entry = bindings.entries.get("denoiser")
-        config = None if entry is None else entry.parallel_config
+        mesh = bindings["denoiser"].mesh if "denoiser" in bindings else None
+        entry = bindings.get("denoiser")
+        config = None if entry is None else entry.config.parallel_config
         size = 1 if config is None else config.sequence_parallel_size
         rank = mesh.coord("sp") if mesh is not None else 0
         packed = build_packed_layout(
@@ -184,7 +185,7 @@ class H3Layout:
             sequence_kind="local" if config is None else config.sequence_parallel.kind,
             context_col_size=1 if config is None else dict(config.dimensions).get("cp_col", 1),
             denoiser_participant=mesh is not None,
-            output_owner=bindings.owns("output"),
+            output_owner=("output" in bindings and bindings["output"].owns),
             local_start=rank * shard if mesh is not None else 0,
             local_end=(rank + 1) * shard if mesh is not None else 0,
             frame_count=int(frames),
@@ -332,7 +333,7 @@ class H3Tensors:
     video_overlap: torch.Tensor
 
 
-def bind_request_tensors(storage: BoundedTensorStorage, layout: H3Layout) -> H3Tensors:
+def bind_request_tensors(storage: TensorBuffers, layout: H3Layout) -> H3Tensors:
     """Borrow validated views without allocating or taking ownership of buffers."""
 
     denoiser = layout.denoiser_participant
@@ -392,7 +393,7 @@ class H3Scratch:
     projection_sync_output: torch.Tensor
     attention_workspace: torch.Tensor
     attention_output: torch.Tensor
-    context_workspace: AttentionContextWorkspace | None
+    context_workspace: AttentionBuffers | None
     tile_scores: torch.Tensor
     block_indices: torch.Tensor
     block_counts: torch.Tensor
@@ -495,12 +496,14 @@ def scratch_tensor_schema(
     return schema
 
 
-def media_tensor_schema(layout: H3Layout, bindings: EntryBindings) -> dict[str, TensorSchema]:
+def media_tensor_schema(
+    layout: H3Layout, bindings: Mapping[str, ModelEntry]
+) -> dict[str, TensorSchema]:
     """Declare only the local numerical decoder and output intermediates."""
 
-    video = bindings.owns("video_decoder")
-    audio = bindings.owns("audio_decoder")
-    output = bindings.owns("output")
+    video = "video_decoder" in bindings and bindings["video_decoder"].owns
+    audio = "audio_decoder" in bindings and bindings["audio_decoder"].owns
+    output = "output" in bindings and bindings["output"].owns
     return {
         "video_input": TensorSchema((int(video), 24, 7, 48, 84), torch.float32),
         "reconstruction_rows": TensorSchema((7 * 24 * 42 if video else 0, 96), torch.float32),
@@ -514,10 +517,10 @@ def media_tensor_schema(layout: H3Layout, bindings: EntryBindings) -> dict[str, 
 
 
 def bind_compute_tensors(
-    storage: BoundedTensorStorage,
+    storage: TensorBuffers,
     layout: H3Layout,
     mesh: DeviceMesh | None,
-    context: AttentionContextWorkspace | None,
+    context: AttentionBuffers | None,
 ) -> tuple[H3Scratch | None, H3MediaScratch]:
     """Bind explicit borrowed views without allocating execution storage in the model."""
 
@@ -618,10 +621,10 @@ class H3ComputeInputs:
     @classmethod
     def bind(
         cls,
-        bindings: EntryBindings,
+        bindings: Mapping[str, ModelEntry],
         layout: H3Layout,
-        storage: BoundedTensorStorage,
-        context: AttentionContextWorkspace | None,
+        storage: TensorBuffers,
+        context: AttentionBuffers | None,
         transformer_metadata: H3TransformerMetadata | None,
         device: torch.device,
     ) -> H3ComputeInputs:
@@ -637,7 +640,10 @@ class H3ComputeInputs:
             device=device,
         )
         scratch, media = bind_compute_tensors(
-            storage, layout, bindings.meshes.get("denoiser"), context
+            storage,
+            layout,
+            (bindings["denoiser"].mesh if "denoiser" in bindings else None),
+            context,
         )
         return cls(
             layout=layout,
@@ -715,7 +721,7 @@ class H3ComputeInputs:
 
     def prepare_warmup_slots(
         self,
-        storage: tuple[BoundedTensorStorage, ...],
+        storage: tuple[TensorBuffers, ...],
         transformer: MiniMaxH3Transformer,
     ) -> tuple[H3Tensors, ...]:
         """Bind and initialize every resident slot for one warmup geometry."""
@@ -771,7 +777,7 @@ class H3ComputeInputs:
 
 
 def tensor_output_layout(
-    bindings: EntryBindings,
+    bindings: Mapping[str, ModelEntry],
     entry: str,
     output_index: int,
     decode: DecodeRange | None,
@@ -783,7 +789,7 @@ def tensor_output_layout(
 ) -> TensorOutputLayout | None:
     """Describe one entry's logical H3 tensor and this rank's produced region."""
 
-    if bindings.process_group.rank not in bindings.output_ranks(entry):
+    if bindings[entry].process_group.rank not in bindings[entry].output_ranks:
         return None
     if entry == "text_encoder":
         return TensorOutputLayout((1, prompt_tokens, H3TextEncoderConfig().hidden_size))
@@ -807,7 +813,7 @@ def tensor_output_layout(
     if entry == "video_decoder":
         if decode is None:
             raise ValueError("video reconstruction requires a temporal range")
-        rank = bindings.entries[entry].ranks.index(bindings.process_group.rank)
+        rank = bindings[entry].config.ranks.index(bindings[entry].process_group.rank)
         if rank >= decode.max_units:
             return None
         shape = (decode.max_units, 1, 3, 25, PROFILE_HEIGHT, PROFILE_WIDTH)

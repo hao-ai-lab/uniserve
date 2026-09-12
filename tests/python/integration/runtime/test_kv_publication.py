@@ -24,7 +24,8 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
-from uniserve_worker.execution.batch import (
+from uniserve_worker.protocol.batch import (
+    BatchOutput,
     BlockTable,
     Bounds,
     BufferId,
@@ -38,7 +39,6 @@ from uniserve_worker.execution.batch import (
     NewRequest,
     OpStatus,
     PosixShmTransfer,
-    RunResult,
     ScheduledRequest,
     TransferMode,
 )
@@ -81,13 +81,14 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     tokens=tokens,
                 )
                 extended = finalized_report(
-                    owner.execute(
+                    owner,
+                    owner.submit(
                         execution_run(
                             run_id=1,
                             admissions=(request,),
                             operations=(extend,),
                         )
-                    )
+                    ),
                 )
                 observation = record_completion(extend, extended)
                 publication, _product = _publication_operation(
@@ -96,7 +97,8 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     predecessor=observation.op_id,
                 )
                 published = finalized_report(
-                    owner.execute(execution_run(run_id=2, operations=(publication,), commands=()))
+                    owner,
+                    owner.submit(execution_run(run_id=2, operations=(publication,), commands=())),
                 )
                 publications.append(published.completions[0].kv_output)
                 commits.append(observation)
@@ -194,7 +196,7 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 try:
                     response = ipc.receive()
                     assert response["call_id"] == 5, response
-                    completed = RunResult.from_mapping(response["result"])
+                    completed = BatchOutput.from_mapping(response["result"])
                     assert completed.completions[0].status is OpStatus.OK
 
                     reader.sendall(b"A")
@@ -202,7 +204,7 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     reader_held = False
                     response = ipc.receive()
                     assert response["call_id"] == 3, response
-                    assert RunResult.from_mapping(response["result"]).done
+                    assert BatchOutput.from_mapping(response["result"]).done
                     assert accepted.wait(5), "retiring storage did not start the dependent read"
                     grant.set()
 
@@ -210,13 +212,13 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     # physical import must wake the sleeping process itself.
                     response = ipc.receive()
                     assert response["call_id"] == 4, response
-                    report = RunResult.from_mapping(response["result"])
+                    report = BatchOutput.from_mapping(response["result"])
                     assert report.completions[0].status is OpStatus.OK
                     assert report.completions[0].kv_visible_len == 2
                     serving.result(timeout=5)
-                    for layer in range(worker.cache_pool.num_layers):
-                        expected = producer.cache_pool.read(layer, (1,), start=0, length=2)
-                        actual = worker.cache_pool.read(layer, (1,), start=0, length=2)
+                    for layer in range(worker.kv_cache.num_layers):
+                        expected = producer.kv_cache.read(layer, (1,), start=0, length=2)
+                        actual = worker.kv_cache.read(layer, (1,), start=0, length=2)
                         for left, right in zip(actual, expected, strict=True):
                             torch.testing.assert_close(left, right, rtol=0, atol=0)
                 finally:
@@ -275,13 +277,14 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    first_result = worker.execute(
+    first_result = worker.submit(
         execution_run(
             run_id=1,
             admissions=(admission,),
             operations=(extend,),
         )
     )
+    first_result = finalized_report(worker, first_result)
     first_observation = record_completion(extend, first_result)
     closure_template = token_operation(
         admission.request_key,
@@ -301,14 +304,15 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         outputs=(),
     )
     closure_result = finalized_report(
-        worker.execute(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=2,
                 admissions=(),
                 operations=(closure,),
                 commands=(),
             )
-        )
+        ),
     )
     closure_record = closure_result.completions[0]
     assert closure_record.position == 2
@@ -322,14 +326,15 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         predecessor=second_observation.op_id,
     )
     publication_result = finalized_report(
-        worker.execute(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=3,
                 admissions=(),
                 operations=(publication,),
                 commands=(),
             )
-        )
+        ),
     )
 
     assert publication_result.completions[0].kv_visible_len == 3
@@ -357,13 +362,14 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         outputs=(),
     )
     suffix_result = finalized_report(
-        worker.execute(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=4,
                 admissions=(),
                 operations=(suffix_closure,),
             )
-        )
+        ),
     )
     assert suffix_result.completions[0].kv_visible_len == 4
 
@@ -374,14 +380,15 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         predecessor=suffix_observation.op_id,
     )
     incremental_result = finalized_report(
-        worker.execute(
+        worker,
+        worker.submit(
             execution_run(
                 run_id=5,
                 admissions=(),
                 operations=(incremental,),
                 commands=(),
             )
-        )
+        ),
     )
     incremental_snapshot = incremental_result.completions[0].kv_output
     assert isinstance(incremental_snapshot, KvTransfer)
@@ -404,13 +411,14 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         tokens=(3, 4),
     )
     try:
-        extended = producer.execute(
+        extended = producer.submit(
             execution_run(
                 run_id=1,
                 admissions=(admission,),
                 operations=(extend,),
             )
         )
+        extended = finalized_report(producer, extended)
         observation = record_completion(extend, extended)
         publication, source = _publication_operation(
             admission.request_key,
@@ -418,13 +426,14 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             predecessor=observation.op_id,
         )
         published = finalized_report(
-            producer.execute(
+            producer,
+            producer.submit(
                 execution_run(
                     run_id=2,
                     operations=(publication,),
                     commands=(),
                 )
-            )
+            ),
         )
         assert isinstance(published.completions[0].kv_output, KvTransfer)
         installation, installed = _installation_operation(
@@ -440,13 +449,15 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             kv_inputs=(published.completions[0].kv_output,),
             **_installation_allocation(installation, 2),
         )
-        prepared = consumer.prepare_execute(batch)
+        prepared = consumer.submit(batch)
         assert prepared is not None
         deadline = time.monotonic() + 5.0
-        while not prepared.ready() and time.monotonic() < deadline:
+        while not prepared.inputs_ready() and time.monotonic() < deadline:
+            consumer.advance_inputs(prepared)
             time.sleep(0.001)
-        assert prepared.ready()
-        report = finalized_report(consumer.execute_prepared(prepared))
+        assert prepared.inputs_ready()
+        prepared = finalized_report(consumer, prepared)
+        report = prepared
         assert report.completions[0].status.value == "ok"
         assert report.completions[0].kv_visible_len == 2
 
@@ -458,7 +469,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             predecessor=observation.op_id,
         )
         repeated = finalized_report(
-            producer.execute(execution_run(run_id=4, operations=(repeated_publication,)))
+            producer, producer.submit(execution_run(run_id=4, operations=(repeated_publication,)))
         )
         repeated_install, repeated_installed = _installation_operation(
             admission,
@@ -472,19 +483,21 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             kv_inputs=(repeated.completions[0].kv_output,),
             block_tables=(BlockTable(admission.request_pool_idx, 0, (1,), 2),),
         )
-        repeated_prepared = consumer.prepare_execute(repeated_batch)
+        repeated_prepared = consumer.submit(repeated_batch)
         assert repeated_prepared is not None
-        assert repeated_prepared.ready()
-        repeated_report = finalized_report(consumer.execute_prepared(repeated_prepared))
+        assert repeated_prepared.inputs_ready()
+        repeated_prepared = finalized_report(consumer, repeated_prepared)
+        repeated_report = repeated_prepared
         assert repeated_report.completions[0].status.value == "ok"
         assert repeated_report.completions[0].kv_visible_len == 2
         finalized_report(
-            producer.execute(
+            producer,
+            producer.submit(
                 execution_run(
                     run_id=6,
                     commands=(Free(source),),
                 )
-            )
+            ),
         )
         expired_install, _ = _installation_operation(
             admission,
@@ -492,7 +505,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             predecessor=root_parent(admission),
             source=source,
         )
-        expired = released_consumer.prepare_execute(
+        expired = released_consumer.submit(
             execution_run(
                 run_id=5,
                 admissions=(admission,),
@@ -503,10 +516,12 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         )
         assert expired is not None
         deadline = time.monotonic() + 5.0
-        while not expired.ready() and time.monotonic() < deadline:
+        while not expired.inputs_ready() and time.monotonic() < deadline:
+            released_consumer.advance_inputs(expired)
             time.sleep(0.001)
-        assert expired.ready()
-        expired_report = finalized_report(released_consumer.execute_prepared(expired))
+        assert expired.inputs_ready()
+        expired = finalized_report(released_consumer, expired)
+        expired_report = expired
         assert expired_report.completions[0].status.value == "error"
     finally:
         producer.close()
@@ -526,13 +541,14 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
         tokens=(7, 8),
     )
     try:
-        extended = producer.execute(
+        extended = producer.submit(
             execution_run(
                 run_id=1,
                 admissions=(admission,),
                 operations=(extend,),
             )
         )
+        extended = finalized_report(producer, extended)
         observation = record_completion(extend, extended)
         publication, source = _publication_operation(
             admission.request_key,
@@ -541,7 +557,8 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
         )
         published = (
             finalized_report(
-                producer.execute(execution_run(run_id=2, operations=(publication,), commands=()))
+                producer,
+                producer.submit(execution_run(run_id=2, operations=(publication,), commands=())),
             )
             .completions[0]
             .kv_output
@@ -564,7 +581,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             predecessor=root_parent(admission),
             source=source,
         )
-        prepared = consumer.prepare_execute(
+        prepared = consumer.submit(
             execution_run(
                 run_id=3,
                 admissions=(admission,),
@@ -575,12 +592,14 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
         )
         assert prepared is not None
         deadline = time.monotonic() + 5.0
-        while not prepared.ready() and time.monotonic() < deadline:
+        while not prepared.inputs_ready() and time.monotonic() < deadline:
+            consumer.advance_inputs(prepared)
             time.sleep(0.001)
-        assert prepared.ready()
+        assert prepared.inputs_ready()
 
-        report = consumer.execute_prepared(prepared)
+        report = prepared
 
+        report = finalized_report(consumer, report)
         assert report.completions[0].status.value == "error"
         assert report.completions[0].error_code is not None
 
@@ -590,7 +609,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             predecessor=root_parent(admission),
             source=source,
         )
-        prepared_retry = consumer.prepare_execute(
+        prepared_retry = consumer.submit(
             execution_run(
                 run_id=4,
                 admissions=(admission,),
@@ -601,10 +620,12 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
         )
         assert prepared_retry is not None
         deadline = time.monotonic() + 5.0
-        while not prepared_retry.ready() and time.monotonic() < deadline:
+        while not prepared_retry.inputs_ready() and time.monotonic() < deadline:
+            consumer.advance_inputs(prepared_retry)
             time.sleep(0.001)
-        assert prepared_retry.ready()
-        retry_report = finalized_report(consumer.execute_prepared(prepared_retry))
+        assert prepared_retry.inputs_ready()
+        prepared_retry = finalized_report(consumer, prepared_retry)
+        retry_report = prepared_retry
         assert retry_report.completions[0].status.value == "ok"
         assert retry_report.completions[0].kv_visible_len == 2
     finally:
