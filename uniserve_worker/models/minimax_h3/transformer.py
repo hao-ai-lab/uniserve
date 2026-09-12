@@ -72,6 +72,7 @@ class H3TransformerMetadata:
     local_text_indices: torch.Tensor
     global_text_indices: torch.Tensor
     local_video_indices: torch.Tensor
+    local_reference_indices: torch.Tensor
     local_audio_indices: torch.Tensor
     timestep_indices: torch.Tensor
     adaln_indices: torch.Tensor
@@ -96,6 +97,10 @@ def build_transformer_metadata(layout: H3Layout, device: torch.device) -> H3Tran
         vsa = VideoSparseAttentionBackend(metadata)
     local_tags = layout.packed.token_tags[layout.local_start : layout.local_end]
     timestep_indices = (local_tags == AUDIO_TAG).to(torch.long)
+    reference_indices = layout.local_indices(layout.packed.reference_indices)
+    # Presentation vision tokens retain target-video time; only VAE rows use
+    # the fixed visual conditioning clock (row 2 in the modulation plan).
+    timestep_indices[reference_indices] = 2
     global_text = layout.packed.text_indices[
         (layout.packed.text_indices >= layout.local_start)
         & (layout.packed.text_indices < layout.local_end)
@@ -106,6 +111,7 @@ def build_transformer_metadata(layout: H3Layout, device: torch.device) -> H3Tran
         local_text_indices=layout.local_indices(layout.packed.text_indices).to(device),
         global_text_indices=global_text.to(device),
         local_video_indices=layout.local_indices(layout.packed.video_indices).to(device),
+        local_reference_indices=reference_indices.to(device),
         local_audio_indices=layout.local_indices(layout.packed.audio_indices).to(device),
         timestep_indices=timestep_indices.to(device),
         adaln_indices=(timestep_indices * MODALITIES + local_tags).to(device),
@@ -869,9 +875,12 @@ class MiniMaxH3Transformer(nn.Module):
                 )
                 hidden.index_copy_(1, metadata.local_text_indices, scratch.local_text_hidden)
             for rows, projection, indices in (
+                (slot.reference_rows, self.proj_in, metadata.local_reference_indices),
                 (slot.video_rows, self.proj_in, metadata.local_video_indices),
                 (slot.audio_rows, self.audio_proj_in, metadata.local_audio_indices),
             ):
+                if not rows.numel():
+                    continue
                 projected = scratch.projected_input[: rows.shape[0]]
                 torch.addmm(
                     projection.bias,

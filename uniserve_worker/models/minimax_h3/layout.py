@@ -167,6 +167,8 @@ class H3Layout:
         attention_backend: str = "VIDEO_SPARSE_ATTN",
         attention: str = "vsa",
         video_dtype: torch.dtype = torch.float16,
+        reference_shape: tuple[int, int] | None = None,
+        presentation_tags: torch.Tensor | None = None,
     ) -> "H3Layout":
         """Partition one packed request evenly across the mesh sequence ranks."""
 
@@ -181,6 +183,8 @@ class H3Layout:
             text_rows=text_rows,
             num_frames=frames,
             audio_frames=audio_frames,
+            reference_shape=reference_shape,
+            presentation_tags=presentation_tags,
             # Four logical row partitions define tensorwise activation scales;
             # physical sequence ownership does not redefine those domains.
             row_multiple=64 * math.lcm(4, size),
@@ -224,14 +228,17 @@ class H3Layout:
         return max(0, min(end, prefix + self.packed.video_tiles) - max(start, prefix))
 
     @property
-    def shape_key(self) -> tuple[int, int, int]:
+    def shape_key(self) -> tuple:
         """Identify layouts by video frames, padded text rows, and audio frames."""
 
-        return (
+        key = (
             self.frame_count,
             int(self.packed.text_indices.numel()),
             int(self.packed.audio_frames),
         )
+        if self.packed.reference_shape is None:
+            return key
+        return (*key, self.packed.reference_shape, tuple(self.packed.presentation_tags.tolist()))
 
     @property
     def local_rows(self) -> int:
@@ -302,6 +309,10 @@ def request_tensor_schema(layout: H3Layout) -> dict[str, TensorSchema]:
             memory="pinned",
         ),
         "text_condition": TensorSchema((1, text, 5376), torch.bfloat16),
+        "reference_rows": TensorSchema(
+            (min(packed.reference_indices.numel(), layout.local_rows) if denoiser else 0, 96),
+            torch.float32,
+        ),
         "video_rows": TensorSchema(
             (min(packed.video_indices.numel(), layout.local_rows), 96), torch.float32
         ),
@@ -337,6 +348,7 @@ class H3Tensors:
     video_source: torch.Tensor
     audio_source: torch.Tensor
     text_condition: torch.Tensor
+    reference_rows: torch.Tensor
     video_rows: torch.Tensor
     audio_rows: torch.Tensor
     tile_valid_sizes: torch.Tensor
@@ -361,6 +373,7 @@ def bind_request_tensors(storage: BoundedTensorStorage, layout: H3Layout) -> H3T
             "video_source": (layout.local_video_rows if denoiser else 0, 96),
             "audio_source": (layout.local_audio_rows if denoiser else 0, 32),
             "text_condition": (1, int(packed.text_indices.numel()) if denoiser else 0, 5376),
+            "reference_rows": (int(layout.local_indices(packed.reference_indices).numel()), 96),
             "video_rows": (layout.local_video_rows, 96),
             "audio_rows": (layout.local_audio_rows, 32),
             "tile_valid_sizes": (int(packed.tile_valid_sizes.numel()) if denoiser else 0,),
@@ -381,6 +394,7 @@ def bind_request_tensors(storage: BoundedTensorStorage, layout: H3Layout) -> H3T
         video_source=views["video_source"],
         audio_source=views["audio_source"],
         text_condition=views["text_condition"],
+        reference_rows=views["reference_rows"],
         video_rows=views["video_rows"],
         audio_rows=views["audio_rows"],
         tile_valid_sizes=views["tile_valid_sizes"],
@@ -453,7 +467,7 @@ def scratch_tensor_schema(
     local_text = min(int(layout.packed.text_indices.numel()), rows)
     local_video = min(int(layout.packed.video_indices.numel()), rows)
     local_audio = min(int(layout.packed.audio_indices.numel()), rows)
-    projected = max(local_video, local_audio)
+    projected = max(local_video, local_audio, min(layout.packed.reference_indices.numel(), rows))
     gather_group = (
         mesh.get_group("sp")
         if mesh.size("tp") == 1 and mesh.size("cp") == 1 and mesh.size("sp") > 1
@@ -566,7 +580,11 @@ def bind_compute_tensors(
         local_text = int(layout.local_indices(layout.packed.text_indices).numel())
         local_video = int(layout.local_video_rows)
         local_audio = int(layout.local_audio_rows)
-        projected_rows = max(local_video, local_audio)
+        projected_rows = max(
+            local_video,
+            local_audio,
+            int(layout.local_indices(layout.packed.reference_indices).numel()),
+        )
         shapes.update(
             {
                 "packed_hidden": (1, local_rows, 5376),
@@ -729,9 +747,10 @@ class H3ComputeInputs:
         positions = self.scratch.rotary_positions
         positions.copy_(self.transformer_metadata.positions)
         non_text_start = int(self.layout.packed.text_indices.numel())
-        positions[non_text_start:, 0].add_(
-            int(text_rows) - int(self.layout.packed.text_indices.numel())
-        )
+        if self.layout.packed.reference_shape is None:
+            positions[non_text_start:, 0].add_(
+                int(text_rows) - int(self.layout.packed.text_indices.numel())
+            )
         transformer.rope.forward_into(
             positions,
             slot.rotary_cosine,
@@ -746,13 +765,57 @@ class H3ComputeInputs:
         encoded: torch.Tensor | None,
         text_rows: int,
         transformer: MiniMaxH3Transformer | None,
+        *,
+        presentation_tags: torch.Tensor | None = None,
+        reference_image: torch.Tensor | None = None,
+        video_vae=None,
     ) -> None:
-        """Install conditioning and shape metadata into one request tensor slot."""
+        """Install presentation states and one fixed image into resident inputs.
+
+        Image input is decoded HWC uint8 RGB. The layout must already reserve
+        its geometry and presentation tags. VAE rows are separate from target
+        solver state; all reference pages participate as dense attention keys.
+        """
+
+        packed = self.layout.packed
+        if packed.reference_shape is not None:
+            if (
+                presentation_tags is None
+                or not torch.equal(presentation_tags.cpu(), packed.presentation_tags)
+                or text_rows != presentation_tags.numel()
+            ):
+                raise ValueError("presentation tags must match the bound image layout")
+            if transformer is not None and transformer.pipeline.first:
+                if reference_image is None or video_vae is None:
+                    raise ValueError("image conditioning requires decoded pixels and a video VAE")
+                if tuple(reference_image.shape) != (*packed.reference_shape, 3):
+                    raise ValueError("reference raster does not match the bound layout")
+                latents = video_vae.encode(reference_image)
+                expected = (
+                    1,
+                    24,
+                    1,
+                    packed.reference_shape[0] // 16,
+                    packed.reference_shape[1] // 16,
+                )
+                if tuple(latents.shape) != expected:
+                    raise ValueError(f"image VAE latents must have shape {expected}")
+                rows = patchify_video(latents)[0]
+                owned = (packed.reference_indices >= self.layout.local_start) & (
+                    packed.reference_indices < self.layout.local_end
+                )
+                slot.reference_rows.copy_(rows[owned.to(rows.device)])
+        elif presentation_tags is not None or reference_image is not None:
+            raise ValueError("image conditioning requires a reference layout")
 
         if transformer is not None:
             if transformer.pipeline.first:
                 if encoded is None:
                     raise RuntimeError("denoiser input owner did not receive text conditioning")
+                if encoded.shape != (1, text_rows, slot.text_condition.shape[2]):
+                    raise ValueError(
+                        "conditioning must contain exactly the declared presentation rows"
+                    )
                 slot.text_condition.zero_()
                 slot.text_condition[:, : encoded.shape[1]].copy_(encoded)
             self._prepare_tile_metadata(slot, text_rows)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -67,6 +67,19 @@ class H3PackedLayout:
     latent_height: int
     latent_width: int
     audio_frames: int
+    reference_indices: torch.Tensor = field(
+        default_factory=lambda: torch.empty(0, dtype=torch.long)
+    )
+    reference_shape: tuple[int, int] | None = None
+    presentation_tags: torch.Tensor | None = None
+
+    @property
+    def reference_segments(self) -> tuple[tuple[int, int], ...]:
+        """Dense image spans in transport coordinates (start, row count)."""
+
+        if not self.reference_indices.numel():
+            return ()
+        return ((int(self.reference_indices[0]), int(self.reference_indices.numel())),)
 
 
 def dense_key_mask(tile_valid_sizes: torch.Tensor, *, tile_size: int = 64) -> torch.Tensor:
@@ -112,6 +125,8 @@ def build_packed_layout(
     patch_size: tuple[int, int, int] = (1, 2, 2),
     row_multiple: int = 256,
     audio_frames: int | None = None,
+    reference_shape: tuple[int, int] | None = None,
+    presentation_tags: torch.Tensor | None = None,
 ) -> H3PackedLayout:
     """Build the fixed-profile `[text | audio | tiled video | padding]` row layout."""
 
@@ -132,8 +147,24 @@ def build_packed_layout(
     video_rows = video_frames // patch_t * rows_per_frame
     if text_rows % 64:
         raise ValueError("the fixed text span must be tile-64 aligned")
+    reference_rows = 0
+    if reference_shape is not None:
+        rh, rw = reference_shape
+        if min(rh, rw) < 32 or rh % 32 or rw % 32 or patch_size != (1, 2, 2):
+            raise ValueError("one reference image must be spatially divisible by 32")
+        if presentation_tags is None or presentation_tags.ndim != 1:
+            raise ValueError("image conditioning requires presentation tags")
+        if not 0 < presentation_tags.numel() <= text_rows or not bool(
+            ((presentation_tags == TEXT_TAG) | (presentation_tags == VIDEO_TAG)).all()
+        ):
+            raise ValueError("invalid image presentation tags or capacity")
+        reference_rows = (rh // 32) * (rw // 32)
+    elif presentation_tags is not None:
+        raise ValueError("presentation tags require an image reference")
+    reference_block_rows = math.ceil(reference_rows / 64) * 64
+    audio_start = text_rows + reference_block_rows
     audio_block_rows = math.ceil(audio_rows / 64) * 64
-    video_start = text_rows + audio_block_rows
+    video_start = audio_start + audio_block_rows
 
     # Sparse attention consumes 4x4x4 spatiotemporal tiles. Boundary tiles reserve
     # 64 transport rows and pack their valid raster rows at the front.
@@ -163,11 +194,12 @@ def build_packed_layout(
     padded_rows = math.ceil(transport_rows / max(row_multiple, 128)) * max(row_multiple, 128)
     if padded_rows // 64 % 2:
         padded_rows += 64
-    semantic_rows = text_rows + audio_rows + video_rows
+    semantic_rows = text_rows + reference_rows + audio_rows + video_rows
 
     # Map semantic video raster rows to their tile-major transport positions.
     text_indices = torch.arange(text_rows, dtype=torch.long)
-    audio_indices = torch.arange(text_rows, text_rows + audio_rows, dtype=torch.long)
+    reference_indices = torch.arange(text_rows, text_rows + reference_rows, dtype=torch.long)
+    audio_indices = torch.arange(audio_start, audio_start + audio_rows, dtype=torch.long)
     video_indices_parts: list[torch.Tensor] = []
     video_raster_parts: list[torch.Tensor] = []
     for tile_index, block in enumerate(tiled_raster):
@@ -180,7 +212,9 @@ def build_packed_layout(
     raster_to_transport[video_raster_indices] = video_indices
     tags = torch.full((padded_rows,), VIDEO_TAG, dtype=torch.long)
     tags[text_indices] = TEXT_TAG
-    tags[text_rows:video_start] = AUDIO_TAG
+    tags[audio_start:video_start] = AUDIO_TAG
+    if presentation_tags is not None:
+        tags[: presentation_tags.numel()] = presentation_tags.cpu()
 
     # Rotary coordinates share a temporal origin at the end of the text prefix;
     # video rows additionally carry normalized height and width coordinates.
@@ -211,14 +245,41 @@ def build_packed_layout(
     # and pair-alignment padding without changing the fixed row allocation.
     tile_valid_sizes = torch.zeros((padded_rows // 64,), dtype=torch.int32)
     tile_valid_sizes[: text_rows // 64] = 64
-    audio_tile_start = text_rows // 64
+    for offset in range(reference_block_rows // 64):
+        tile_valid_sizes[text_rows // 64 + offset] = min(64, reference_rows - offset * 64)
+    audio_tile_start = audio_start // 64
     for offset in range(audio_block_rows // 64):
         tile_valid_sizes[audio_tile_start + offset] = max(0, min(64, audio_rows - offset * 64))
     video_tile_start = video_start // 64
     tile_valid_sizes[video_tile_start : video_tile_start + video_tiles] = torch.tensor(
         video_valid_sizes, dtype=torch.int32
     )
+    if reference_shape is not None:
+        # Reuse semantic Ref2VA coordinates, then map target raster rows into
+        # the resident tiled transport. Padding never advances the media clock.
+        from .reference import H3ReferenceGeometry, build_reference_layout
+
+        assert presentation_tags is not None
+        semantic = build_reference_layout(
+            text_token_tags=presentation_tags,
+            references=(H3ReferenceGeometry("image", 1, rh // 16, rw // 16),),
+            video_frames=video_frames,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            audio_frames=audio_frames,
+        )
+        positions[reference_indices] = semantic.position_ids[
+            semantic.video_indices[:reference_rows]
+        ]
+        positions[audio_indices] = semantic.position_ids[semantic.target_audio_indices]
+        positions[video_indices] = semantic.position_ids[semantic.target_video_indices][
+            video_raster_indices
+        ]
+
     return H3PackedLayout(
+        reference_indices=reference_indices,
+        reference_shape=reference_shape,
+        presentation_tags=None if presentation_tags is None else presentation_tags.cpu().clone(),
         semantic_rows=semantic_rows,
         padded_rows=padded_rows,
         position_ids=positions,

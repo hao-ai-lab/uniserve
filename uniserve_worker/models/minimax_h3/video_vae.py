@@ -26,6 +26,7 @@ from ...ops.residual import (
     weighted_rms_norm_absmax,
 )
 from ...ops.rope import qk_rms_norm_partial_rope_
+from .image_vae import H3ImageEncoder
 from .layout import PROFILE_HEIGHT, PROFILE_WIDTH, H3ComputeInputs, H3Tensors
 from .packing import unpatchify_video_into
 
@@ -270,6 +271,8 @@ class MiniMaxH3VideoDecoder(nn.Module):
 
         super().__init__()
         with torch.device(parameter_device):
+            self.encoder = H3ImageEncoder()
+            self.quant_conv = nn.Conv3d(48, 48, kernel_size=1)
             self.post_quant_conv = nn.Conv3d(24, 24, kernel_size=1)
             self.decoder = _VideoTransformer(layer_config.child("decoder"), buffer_device)
 
@@ -531,6 +534,54 @@ class MiniMaxH3VideoVAE(nn.Module):
         """Return the device that owns the decoder's learned parameters."""
 
         return next(self.vae.parameters()).device
+
+    @torch.inference_mode()
+    def encode(self, image: torch.Tensor) -> torch.Tensor:
+        """Encode one HWC uint8 RGB image to normalized [1,24,1,H/16,W/16].
+
+        The causal CNN runs in FP32, with spatial tiling identical to decoding.
+        Posterior sampling uses the released independent CPU seed 42 and FP16
+        round-trip before channel normalization, not the target-noise RNG.
+        """
+
+        if image.ndim != 3 or image.shape[-1] != 3 or image.dtype != torch.uint8:
+            raise ValueError("H3 reference image must be HWC uint8 RGB")
+        height, width = image.shape[:2]
+        if min(height, width) < 32 or height % 32 or width % 32:
+            raise ValueError("H3 reference image dimensions must be divisible by 32")
+        pixels = image.permute(2, 0, 1)[None, :, None].to(self.device, torch.float32) / 255.0
+        mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+        std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+        pixels = (pixels - mean) / std
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            if self.vae.use_tiling:
+                ys, hs, yo = self.vae._split_tiles(
+                    height, self.vae.tile_sample_min_height, self.vae.tile_sample_min_overlap_height
+                )
+                xs, ws, xo = self.vae._split_tiles(
+                    width, self.vae.tile_sample_min_width, self.vae.tile_sample_min_overlap_width
+                )
+                tiles = [
+                    [
+                        self.vae.quant_conv(self.vae.encoder(pixels[..., y : y + h, x : x + w]))
+                        for x, w in zip(xs, ws, strict=True)
+                    ]
+                    for y, h in zip(ys, hs, strict=True)
+                ]
+                moments = self.vae._stitch_tiles(
+                    tiles, [v // 16 for v in yo], [v // 16 for v in xo]
+                )
+            else:
+                moments = self.vae.quant_conv(self.vae.encoder(pixels))
+        expected = (1, 48, 1, height // 16, width // 16)
+        if tuple(moments.shape) != expected or moments.dtype != torch.float32:
+            raise ValueError(f"image posterior must be FP32 with shape {expected}")
+        mean, logvar = moments.chunk(2, dim=1)
+        noise = torch.randn(
+            mean.shape, generator=torch.Generator("cpu").manual_seed(42), dtype=mean.dtype
+        ).to(mean.device)
+        sampled = (mean + (0.5 * logvar.clamp(-30, 20)).exp() * noise).half().float()
+        return (sampled - self.latents_mean) / self.latents_std
 
     def _decode_segment(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode one temporal latent segment and remove its prepended overlap frames."""

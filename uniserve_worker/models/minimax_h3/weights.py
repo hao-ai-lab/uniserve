@@ -181,6 +181,12 @@ def _prepare_modulation(
             for video, audio in zip(schedule.timesteps[0], schedule.timesteps[1], strict=True)
         )
     )
+    condition_activated = torch.stack(
+        tuple(
+            torch.nn.functional.silu(embedding(video.clamp_min(0.999).reshape(1)))
+            for video in schedule.timesteps[0]
+        )
+    )
     del embedding
 
     def projection(prefix: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -197,6 +203,23 @@ def _prepare_modulation(
         ),
         projection("norm_out.linear") if model.pipeline.last else None,
         layer_count=len(model.pipeline.layers),
+    )
+    # Project the fixed clock separately so adding references does not change
+    # the existing target-clock GEMM geometry or its numerical results.
+    condition = ModulationPlan.materialize(
+        condition_activated,
+        (
+            projection(f"transformer_blocks.{index}.adaln_proj.linear")
+            for index in model.pipeline.layers
+        ),
+        projection("norm_out.linear") if model.pipeline.last else None,
+        layer_count=len(model.pipeline.layers),
+    )
+    model.modulation_plan = ModulationPlan(
+        torch.cat((model.modulation_plan.blocks, condition.blocks), dim=2),
+        torch.cat((model.modulation_plan.final, condition.final), dim=1)
+        if model.modulation_plan.final is not None
+        else None,
     )
 
 
@@ -389,7 +412,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
                         isinstance(module, LinearBase)
                         and (dense or module.quant_method.is_quantized)
                     )
-                    or (dense and isinstance(module, torch.nn.Conv3d))
+                    or (dense and name == "post_quant_conv")
                 ),
                 strict=False,
             )
