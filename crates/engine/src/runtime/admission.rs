@@ -134,13 +134,14 @@ impl EngineLoop {
     fn media_tensor_specs(
         &self,
         geometry: uniserve_core::MediaGeometry,
+        image_reference: bool,
     ) -> Option<Vec<(String, u32, DType, ShapeBound)>> {
         use uniserve_worker_ipc::MediaStageRole;
 
         let plan = self.info.media_plan.as_ref()?;
         let mut specs = Vec::new();
         for (role, outputs) in [
-            (MediaStageRole::Encode, 1),
+            (MediaStageRole::Encode, if image_reference { 2 } else { 1 }),
             (MediaStageRole::Denoise, 2),
             (MediaStageRole::VideoDecode, 1),
             (MediaStageRole::AudioDecode, 1),
@@ -153,10 +154,13 @@ impl EngineLoop {
                 .components
                 .iter()
                 .find(|component| component.name == bound)?;
-            if component.outputs.len() != outputs {
+            // Reference-capable encoders also serve text-only requests with one output.
+            if component.outputs.len() < outputs
+                || (role != MediaStageRole::Encode && component.outputs.len() != outputs)
+            {
                 return None;
             }
-            for (index, output) in component.outputs.iter().enumerate() {
+            for (index, output) in component.outputs.iter().take(outputs).enumerate() {
                 let mut shape = output.shape_bound.clone();
                 if role == MediaStageRole::Encode {
                     let mut selected = false;
@@ -165,7 +169,12 @@ impl EngineLoop {
                             if geometry.prompt_tokens == 0 || geometry.prompt_tokens > max {
                                 return None;
                             }
-                            *dim = DimBound::Static(geometry.prompt_tokens);
+                            // Presentation labels and patches expand beyond prompt tokens.
+                            // Keep the worker-declared bound until the encoder publishes its
+                            // actual shape; text-only products retain their exact geometry.
+                            if !image_reference {
+                                *dim = DimBound::Static(geometry.prompt_tokens);
+                            }
                             selected = true;
                         }
                     }
@@ -219,7 +228,7 @@ impl EngineLoop {
             });
             return;
         }
-        if self.media_tensor_specs(request.geometry).is_none() {
+        if self.media_tensor_specs(request.geometry, request.image_reference.is_some()).is_none() {
             let _ = submission.event_tx.send(Event::Rejected {
                 message: "loaded media entries cannot represent the requested tensor geometry"
                     .into(),
@@ -280,7 +289,7 @@ impl EngineLoop {
                 break;
             };
             let specs = self
-                .media_tensor_specs(geometry)
+                .media_tensor_specs(geometry, submission.request.image_reference.is_some())
                 .expect("queued media has valid result geometry");
             let mut tensors = HashMap::new();
             let mut reserved = true;
