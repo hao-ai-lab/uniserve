@@ -295,6 +295,8 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
         audio_frames=audio_latent_frames(max_frames),
         sparsity=contract["sparsity"],
         attention_backend=contract["attention_backend"],
+        attention=str(contract["attention"]),
+        video_dtype=torch.float32 if precisions["video_vae"] == "fp32" else torch.float16,
     )
     components = []
     transformer = encoder = video_decoder = audio_decoder = None
@@ -306,6 +308,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
             parameter_device="meta",
             attention_linear_precision=precisions["transformer.attention"],
             mlp_linear_precision=precisions["transformer.mlp"],
+            attention=str(contract["attention"]),
         )
         if transformer.pipeline.first:
             conditioner = build_conditioner(mesh, "meta")
@@ -351,8 +354,12 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
         )
     if bindings.owns("video_decoder"):
         precision = precisions["video_vae"]
-        dense = precision in {"fp16", "bf16"}
-        dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+        dense = precision in {"fp32", "fp16", "bf16"}
+        dtype = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }.get(precision, torch.bfloat16)
         # The 24-channel input projection is not aligned for NVFP4 packing.
         quantization = (
             None

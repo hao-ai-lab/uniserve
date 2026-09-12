@@ -25,6 +25,10 @@ pub struct VideoGenerationRequest {
     /// Requested duration in seconds.
     #[serde(default = "default_video_seconds")]
     pub seconds: f64,
+    /// Scheduler grid points, including the terminal point; defaults to the checkpoint recipe.
+    #[serde(default)]
+    #[validate(range(min = 2, max = 1000))]
+    pub steps: Option<u32>,
 }
 
 impl Normalizable for VideoGenerationRequest {}

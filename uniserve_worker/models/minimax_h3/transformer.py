@@ -53,7 +53,7 @@ from ...ops import (
 )
 from .config import H3TransformerConfig
 from .layout import H3Layout, H3Scratch, H3Tensors
-from .packing import AUDIO_TAG
+from .packing import AUDIO_TAG, dense_key_mask
 
 __all__ = [
     "H3TransformerMetadata",
@@ -68,7 +68,7 @@ class H3TransformerMetadata:
     """Holds rank-local row indices, routing masks, positions, and sparse-attention metadata for one H3 forward."""
 
     layout: H3Layout
-    vsa: VideoSparseAttentionBackend
+    vsa: VideoSparseAttentionBackend | None
     local_text_indices: torch.Tensor
     global_text_indices: torch.Tensor
     local_video_indices: torch.Tensor
@@ -82,16 +82,18 @@ class H3TransformerMetadata:
 def build_transformer_metadata(layout: H3Layout, device: torch.device) -> H3TransformerMetadata:
     """Build device indices and sparse-attention metadata for one packed page layout."""
 
-    metadata = build_video_sparse_metadata(
-        padded_rows=layout.packed.padded_rows,
-        prefix_tiles=layout.packed.prefix_tiles,
-        video_tiles=layout.packed.video_tiles,
-        valid_sizes=layout.packed.tile_valid_sizes,
-        device=device,
-        sparsity=layout.sparsity,
-        attention_backend=layout.attention_backend,
-    )
-    vsa = VideoSparseAttentionBackend(metadata)
+    vsa = None
+    if layout.attention == "vsa":
+        metadata = build_video_sparse_metadata(
+            padded_rows=layout.packed.padded_rows,
+            prefix_tiles=layout.packed.prefix_tiles,
+            video_tiles=layout.packed.video_tiles,
+            valid_sizes=layout.packed.tile_valid_sizes,
+            device=device,
+            sparsity=layout.sparsity,
+            attention_backend=layout.attention_backend,
+        )
+        vsa = VideoSparseAttentionBackend(metadata)
     local_tags = layout.packed.token_tags[layout.local_start : layout.local_end]
     timestep_indices = (local_tags == AUDIO_TAG).to(torch.long)
     global_text = layout.packed.text_indices[
@@ -309,12 +311,14 @@ class _H3Attention(nn.Module):
         linear_precision: LinearPrecision,
         layer_config: LayerConfig,
         device: torch.device | str,
+        attention: str = "vsa",
     ) -> None:
-        """Bind sharded projections to the sparse-video attention workspace contract."""
+        """Bind sharded projections to the selected attention workspace contract."""
 
         super().__init__()
         inner = config.heads * config.head_dim
         self.config = config
+        self.projection_count = 3 if attention == "dense" else 4
         self.sequence_size = mesh.size("ulysses")
         self.tensor_heads = config.heads // mesh.size("tp")
         self.local_heads = self.tensor_heads // self.sequence_size
@@ -326,11 +330,12 @@ class _H3Attention(nn.Module):
         )
         projection_config = LayerConfig(projection_group, None, layer_config.prefix)
         self.parallel_attention = ParallelAttention(mesh=mesh)
+        self.dense_attention = RadixAttention(self.local_heads, self.local_heads, config.head_dim)
         with torch.device(device):
             self.to_qkvg = InterleavedMergedColumnParallelLinear(
                 config.hidden_size,
                 inner,
-                4,
+                self.projection_count,
                 config.head_dim,
                 layer_config=projection_config,
                 prefix="to_qkvg",
@@ -422,7 +427,7 @@ class _H3Attention(nn.Module):
         pooled_value: torch.Tensor,
         compressed_tiles: torch.Tensor,
         topk_indices_i32: torch.Tensor,
-        backend: VideoSparseAttentionBackend,
+        backend: VideoSparseAttentionBackend | None,
         consume_row_intervals: bool = False,
         prepared_projection: ProjectedRows[PreparedVideoSparseInputs] | None = None,
     ) -> torch.Tensor | AttentionRowExchange:
@@ -435,18 +440,23 @@ class _H3Attention(nn.Module):
         prepared_inputs = None
         if prepared_projection is not None:
             projected, prepared_inputs = prepared_projection.finish()
-            exchanged = projected.view(global_rows, self.local_heads, 4, head_dim)
+            exchanged = projected.view(
+                global_rows, self.local_heads, self.projection_count, head_dim
+            )
         elif self.projected_head:
             exchanged = self.to_qkvg.forward_sequence_parallel(local, attention_workspace).view(
                 global_rows,
                 self.local_heads,
-                4,
+                self.projection_count,
                 head_dim,
             )
         else:
-            projected = self.to_qkvg(local).view(local_rows, self.tensor_heads, 4, head_dim)
+            projected = self.to_qkvg(local).view(
+                local_rows, self.tensor_heads, self.projection_count, head_dim
+            )
             exchanged = self.parallel_attention.exchange_heads(projected)
-        query, key, value, gate = exchanged.unbind(2)
+        query, key, value = exchanged[:, :, :3].unbind(2)
+        gate = exchanged[:, :, 3] if self.projection_count == 4 else None
         cosine, sine = rotary
         start = self.context_rank * global_rows
         cosine, sine = cosine[start : start + global_rows], sine[start : start + global_rows]
@@ -464,6 +474,31 @@ class _H3Attention(nn.Module):
                 self.config.qk_norm_eps,
                 in_place=True,
             )
+        if backend is None:
+            # Base H3 is ordinary all-to-all attention: the checkpoint's VSA
+            # compression gate has no role in its dense numerical recipe.
+            parallel = self.parallel_attention
+            key, value = parallel.distribute_key_value(key, value, context_workspace)
+            mask = dense_key_mask(tile_valid_sizes)
+            if parallel.mapped:
+                assert context_workspace is not None
+                owners = parallel.key_group.world_size
+                capacity = key.shape[0] // owners
+                logical = mask.numel() // owners
+                mask = F.pad(mask.reshape(owners, logical), (0, capacity - logical))
+                mask = mask.reshape(1, 1, 1, -1)
+            result = self.dense_attention(
+                query.transpose(0, 1).unsqueeze(0),
+                key.transpose(0, 1).unsqueeze(0),
+                value.transpose(0, 1).unsqueeze(0),
+                None,
+                causal=False,
+                attn_mask=mask,
+            )
+            result = result.squeeze(0).transpose(0, 1).contiguous()
+            parallel.finish_context(context_workspace)
+            return parallel.restore_rows(result)
+
         workspace = VideoSparseAttentionWorkspace(
             attention_output=attention_output,
             tile_scores=tile_scores,
@@ -508,8 +543,9 @@ class _TransformerBlock(nn.Module):
         mlp_linear_precision: LinearPrecision,
         layer_config: LayerConfig,
         device: torch.device | str,
+        attention: str = "vsa",
     ) -> None:
-        """Assemble one adaptive sparse-attention and gated feed-forward block."""
+        """Assemble one adaptive attention and gated feed-forward block."""
 
         super().__init__()
         self.norm1 = RMSNorm(config.hidden_size, config.norm_eps, device=device)
@@ -519,6 +555,7 @@ class _TransformerBlock(nn.Module):
             linear_precision=attention_linear_precision,
             layer_config=layer_config.child("attn"),
             device=device,
+            attention=attention,
         )
         self.norm2 = RMSNorm(config.hidden_size, config.norm_eps, device=device)
         with torch.device(device):
@@ -560,7 +597,7 @@ class _TransformerBlock(nn.Module):
         pooled_value: torch.Tensor,
         compressed_tiles: torch.Tensor,
         topk_indices_i32: torch.Tensor,
-        backend: VideoSparseAttentionBackend,
+        backend: VideoSparseAttentionBackend | None,
         prepared_projection: ProjectedRows[PreparedVideoSparseInputs] | None = None,
         row_consumer: Callable[[slice, torch.Tensor], None] | None = None,
     ) -> torch.Tensor:
@@ -735,6 +772,7 @@ class MiniMaxH3Transformer(nn.Module):
         parameter_device: torch.device | str = "meta",
         attention_linear_precision: LinearPrecision,
         mlp_linear_precision: LinearPrecision,
+        attention: str = "vsa",
     ) -> None:
         """Construct rank-sharded H3 projections, sparse blocks, and layout-index buffers."""
 
@@ -774,6 +812,7 @@ class MiniMaxH3Transformer(nn.Module):
                 str(layer): _TransformerBlock(
                     config,
                     mesh,
+                    attention=attention,
                     attention_linear_precision=attention_linear_precision,
                     mlp_linear_precision=mlp_linear_precision,
                     layer_config=layer_config.child(f"transformer_blocks.{layer}"),
@@ -920,7 +959,8 @@ class MiniMaxH3Transformer(nn.Module):
                 return projection
 
             accepts_rows = (
-                block.attn.projected_head
+                metadata.vsa is not None
+                and block.attn.projected_head
                 and block.attn.sequence_size > 1
                 and independent_linear_rows(block.attn.to_qkvg)
             )

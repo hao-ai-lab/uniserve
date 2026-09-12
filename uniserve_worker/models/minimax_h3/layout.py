@@ -79,7 +79,7 @@ def entry_output_schema(layout: H3Layout) -> dict[str, tuple[TensorSpec, ...]]:
         "video_decoder": (
             TensorSpec(
                 "video_segments",
-                DType.F16,
+                DType.F32 if layout.video_dtype == torch.float32 else DType.F16,
                 ShapeBound(
                     (
                         DeviceDim(layout.video_reconstruction_units),
@@ -135,6 +135,8 @@ class H3Layout:
     reconstruction_unit_frames: tuple[int, ...]
     sparsity: float = 0.9
     attention_backend: str = "VIDEO_SPARSE_ATTN"
+    attention: str = "vsa"
+    video_dtype: torch.dtype = torch.float16
     local_video_rows: int = field(init=False)
     local_audio_rows: int = field(init=False)
 
@@ -163,9 +165,13 @@ class H3Layout:
         audio_frames: int,
         sparsity: float = 0.9,
         attention_backend: str = "VIDEO_SPARSE_ATTN",
+        attention: str = "vsa",
+        video_dtype: torch.dtype = torch.float16,
     ) -> "H3Layout":
         """Partition one packed request evenly across the mesh sequence ranks."""
 
+        if attention not in {"vsa", "dense"}:
+            raise ValueError(f"unsupported H3 attention {attention!r}")
         mesh = bindings.meshes.get("denoiser")
         entry = bindings.entries.get("denoiser")
         config = None if entry is None else entry.parallel_config
@@ -196,6 +202,8 @@ class H3Layout:
             local_end=(rank + 1) * shard if mesh is not None else 0,
             frame_count=int(frames),
             reconstruction_unit_frames=reconstruction_unit_frames(int(frames)),
+            attention=attention,
+            video_dtype=video_dtype,
         )
 
     @property
@@ -309,7 +317,8 @@ def request_tensor_schema(layout: H3Layout) -> dict[str, TensorSchema]:
         "rotary_cosine": TensorSchema((rows, 96), torch.float32),
         "rotary_sine": TensorSchema((rows, 96), torch.float32),
         "video_overlap": TensorSchema(
-            (int(layout.output_owner), 3, 5, PROFILE_HEIGHT, PROFILE_WIDTH), torch.float16
+            (int(layout.output_owner), 3, 5, PROFILE_HEIGHT, PROFILE_WIDTH),
+            layout.video_dtype,
         ),
     }
 
@@ -503,6 +512,19 @@ def scratch_tensor_schema(
         "rotary_positions": TensorSchema((global_rows, 3), torch.float32),
         "rotary_frequencies": TensorSchema((global_rows, 3, 16), torch.float32),
     }
+    if layout.attention == "dense":
+        # Dense providers do not score, pool, select, or compress video tiles.
+        for name in (
+            "tile_scores",
+            "block_indices",
+            "block_counts",
+            "pooled_query",
+            "pooled_key",
+            "pooled_value",
+            "compressed_tiles",
+            "topk_indices_i32",
+        ):
+            schema[name] = TensorSchema((0,), schema[name].dtype)
     return schema
 
 
@@ -571,6 +593,19 @@ def bind_compute_tensors(
                 "rotary_frequencies": (global_rows, 3, 16),
             }
         )
+    if layout.attention == "dense":
+        for name in (
+            "tile_scores",
+            "block_indices",
+            "block_counts",
+            "pooled_query",
+            "pooled_key",
+            "pooled_value",
+            "compressed_tiles",
+            "topk_indices_i32",
+        ):
+            if name in shapes:
+                shapes[name] = (0,)
     shapes["audio_latents"] = (shapes["audio_latents"][0], 32, layout.packed.audio_frames)
     shapes["rgb_round"] = (
         layout.frame_count if shapes["rgb_round"][0] else 0,

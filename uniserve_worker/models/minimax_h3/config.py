@@ -130,10 +130,16 @@ def resolve_h3_contract(root: Path, contract_path: Path | None = None) -> H3Cont
     selected = contract_path or os.environ.get("UNISERVE_H3_CONTRACT")
     path = Path(selected) if selected else root / "fastvideo_inference.json"
     if not path.is_file():
-        raise ValueError(
-            "MiniMax H3 requires fastvideo_inference.json or an explicit "
-            "UNISERVE_H3_CONTRACT sidecar for a full local export"
-        )
+        if selected:
+            raise ValueError(f"H3 contract sidecar does not exist: {path}")
+        from .base_contract import resolve_base_h3_contract
+
+        if not (root / "modular_model_index.json").is_file():
+            raise ValueError(
+                "MiniMax H3 requires a pinned base root or an explicit "
+                "UNISERVE_H3_CONTRACT sidecar for a full local export"
+            )
+        return resolve_base_h3_contract(root)
     manifest = json.loads(path.read_text(encoding="utf-8"))
     expected = {
         "schema_version": "fasth3-inference-contract-v1",

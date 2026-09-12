@@ -641,7 +641,10 @@ impl ResolvedModel {
                     "suggested_seconds": suggested_seconds,
                     "min_frames": 22, "fps": 24, "width": 1344, "height": 768,
                     "max_prompt_tokens": description.max_prompt_tokens,
-                    "request_fields": ["model", "prompt", "seconds", "seed"],
+                    "request_fields": ["model", "prompt", "seconds", "seed", "steps"],
+                    "default_steps": description.denoise_steps + 1,
+                    "supported_steps": [description.denoise_steps + 1],
+                    "guidance_scale": 1.0,
                 })
             }
             _ => serde_json::Value::Null,
@@ -654,6 +657,7 @@ impl ResolvedModel {
         request_id: &crate::serving::ServeRequestId,
         prompt: &str,
         seconds: f64,
+        steps: Option<u32>,
     ) -> Result<(uniserve_core::MediaGeometry, Vec<u32>)> {
         let Self::Media(description) = self else {
             return Err(ServeError::UnsupportedFeature {
@@ -661,6 +665,17 @@ impl ResolvedModel {
                 feature: "video_generation",
             });
         };
+        // Fixed checkpoint plans and their precomputed modulation products are
+        // one numerical recipe. Never silently truncate or substitute its grid.
+        let grid_points = description.denoise_steps + 1;
+        if steps.is_some_and(|requested| requested != grid_points) {
+            return Err(ServeError::Tokenize {
+                request_id: request_id.clone(),
+                source: crate::serving::TokenizeError::Invalid(format!(
+                    "steps must equal the served checkpoint recipe ({grid_points} grid points)"
+                )),
+            });
+        }
         // Tokenize and bound the prompt before deriving any media allocation.
         let prompt_token_ids = description
             .tokenizer

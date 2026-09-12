@@ -10,11 +10,13 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("steps", [4, 49])
 def test_streamed_modulation_preserves_projection_batch_and_step_outputs(
     dtype: torch.dtype,
+    steps: int,
 ) -> None:
     generator = torch.Generator().manual_seed(53)
-    inputs = torch.randn((4, 2, 64), generator=generator)
+    inputs = torch.randn((steps, 2, 64), generator=generator)
     weights = tuple(torch.randn((96, 64), generator=generator).to(dtype) for _ in range(3))
     biases = tuple(torch.randn((96,), generator=generator).to(dtype) for _ in range(3))
     final_weight = torch.randn((32, 64), generator=generator).to(dtype)
@@ -24,20 +26,20 @@ def test_streamed_modulation_preserves_projection_batch_and_step_outputs(
     )
     expected = torch.stack(
         tuple(
-            F.linear(inputs.flatten(0, 1).to(dtype), weight, bias).view(4, 2, 96)
+            F.linear(inputs.flatten(0, 1).to(dtype), weight, bias).view(steps, 2, 96)
             for weight, bias in zip(weights, biases, strict=True)
         ),
         dim=1,
     )
-    final = F.linear(inputs.flatten(0, 1).to(dtype), final_weight, final_bias).view(4, 2, 32)
+    final = F.linear(inputs.flatten(0, 1).to(dtype), final_weight, final_bias).view(steps, 2, 32)
     block_output = torch.empty((3, 2, 96), dtype=dtype)
     final_output = torch.empty((2, 32), dtype=dtype)
-    for step in (3, 0, 2, 1, 0):
+    for step in (steps - 1, 0, 2, 1, 0):
         plan.copy_step(step, block_output, final_output)
         torch.testing.assert_close(block_output, expected[step], atol=0, rtol=0)
         torch.testing.assert_close(final_output, final[step], atol=0, rtol=0)
     with pytest.raises(ValueError, match="outside"):
-        plan.copy_step(4, block_output, final_output)
+        plan.copy_step(steps, block_output, final_output)
 
 
 @pytest.mark.parametrize("count", [1, 3])

@@ -177,9 +177,9 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         self.media_plan = MediaExecutionPlan(
             tuple(
                 replace(stage, count=denoise_steps)
-                if stage.repeat is MediaPlanRepeat.FIXED
+                if stage.operation is OpCode.DIFFUSION_STEP
                 else stage
-                for stage in self.media_plan.stages
+                for stage in type(self).media_plan.stages
             )
         )
 
@@ -293,6 +293,8 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             audio_frames=audio_frames,
             sparsity=self.layout.sparsity,
             attention_backend=self.layout.attention_backend,
+            attention=self.layout.attention,
+            video_dtype=self.layout.video_dtype,
         )
         return H3ComputeInputs.bind(
             self.bindings,

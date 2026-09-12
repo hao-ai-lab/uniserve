@@ -13,6 +13,7 @@ from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..loader.source import WeightSourceConfig
 from ..models.bagel import BagelForConditionalGeneration
 from ..models.minimax_h3 import MiniMaxH3Model
+from ..models.minimax_h3.base_contract import BASE_H3_GRID_POINTS, BASE_H3_SHIFTS
 from ..models.minimax_h3.config import (
     FASTH3_LADDER,
     FASTH3_SHIFTS,
@@ -135,6 +136,27 @@ def _checkpoint_schedule(
     return DiffusionSchedule.build(ladder, shifts, scale=FASTH3_TIME_SCALE, device=device)
 
 
+BASE_H3_ENTRY = replace(
+    MINIMAX_H3_ENTRY,
+    component_precisions=partial(
+        resolve_component_precisions,
+        supported={**SUPPORTED_PRECISIONS, "video_vae": ("fp32", "fp16", "bf16", "nvfp4")},
+        presets={
+            **PRECISION_PRESETS,
+            "quality": {**PRECISION_PRESETS["quality"], "video_vae": "fp32"},
+        },
+        shorthands=PRECISION_SHORTHANDS,
+        default_mode="quality",
+    ),
+    create_schedule=lambda device: DiffusionSchedule.uniform_grid(
+        BASE_H3_GRID_POINTS, BASE_H3_SHIFTS, device=device
+    ),
+    sidecars=tuple(
+        path for path in MINIMAX_H3_ENTRY.sidecars if path != "fastvideo_inference.json"
+    ),
+)
+
+
 def resolve_catalog_entry(
     architectures: list[str] | tuple[str, ...], *, root: Path | None = None
 ) -> CatalogEntry:
@@ -151,6 +173,8 @@ def resolve_catalog_entry(
             if root is None:
                 return MINIMAX_H3_ENTRY
             contract = resolve_h3_contract(root)
+            if contract["attention"] == "dense":
+                return BASE_H3_ENTRY
             return replace(
                 MINIMAX_H3_ENTRY,
                 create_schedule=partial(

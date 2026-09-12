@@ -352,6 +352,8 @@ pub struct VideoGenerationInput {
     pub seed: u64,
     /// Requested video duration in seconds.
     pub seconds: f64,
+    /// Optional scheduler grid-point count; the checkpoint owns the default.
+    pub steps: Option<u32>,
 }
 
 impl ServingRuntime {
@@ -422,6 +424,7 @@ impl ServingRuntime {
             &request.request_id,
             &request.prompt,
             request.seconds,
+            request.steps,
         )?;
         let submission = MediaSubmission::new(
             request.request_id.to_string(),

@@ -19,10 +19,20 @@ pub fn lower_video_generation_request(
             Some("prompt"),
         ));
     }
+    if request
+        .steps
+        .is_some_and(|steps| !(2..=1000).contains(&steps))
+    {
+        return Err(ApiError::invalid_request(
+            "steps must be between 2 and 1000 grid points".to_string(),
+            Some("steps"),
+        ));
+    }
     Ok(VideoGenerationInput {
         request_id: ServeRequestId::from(format!("vid-{}", context.request_id)),
         prompt: request.prompt,
         seed: request.seed,
         seconds: request.seconds,
+        steps: request.steps,
     })
 }

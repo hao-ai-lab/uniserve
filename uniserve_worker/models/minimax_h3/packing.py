@@ -69,6 +69,18 @@ class H3PackedLayout:
     audio_frames: int
 
 
+def dense_key_mask(tile_valid_sizes: torch.Tensor, *, tile_size: int = 64) -> torch.Tensor:
+    """Return a broadcastable dense key mask excluding all transport padding.
+
+    Valid rows occupy each tile's prefix, including partially filled video
+    boundary tiles. Query padding is discarded by modality output gathering;
+    masking only keys avoids an otherwise quadratic mask allocation.
+    """
+
+    offsets = torch.arange(tile_size, device=tile_valid_sizes.device)
+    return (offsets[None, :] < tile_valid_sizes[:, None]).reshape(1, 1, 1, -1)
+
+
 def _spatial_grid(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
     """Choose a patch-aligned spatial extent near the target square-root area."""
 
