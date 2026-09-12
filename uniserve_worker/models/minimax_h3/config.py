@@ -139,7 +139,9 @@ def resolve_h3_contract(root: Path, contract_path: Path | None = None) -> H3Cont
                 "MiniMax H3 requires a pinned base H3 root or an explicit "
                 "UNISERVE_H3_CONTRACT sidecar for a full local export"
             )
-        return resolve_base_h3_contract(root)
+        # A top-level reference denoiser selects the image recipe. Explicit
+        # distilled manifests and sidecars retain precedence over root discovery.
+        return resolve_base_h3_contract(root, reference=(root / "transformer_ref").exists())
     manifest = json.loads(path.read_text(encoding="utf-8"))
     expected = {
         "schema_version": "fasth3-inference-contract-v1",

@@ -6,6 +6,8 @@ Local roots require revision receipts for every consumed configuration, index an
 
 The contract fixes output to 480×832×124 at 24 FPS, with 32 kHz audio. Sampling uses the base CPU-FP32 50-point uniform grid, shifts 12/3, 49 transformer forwards and guidance 1.0. Attention is dense for both reference and target spans; reference-aware VSA is not implemented. The capability is `references: {max: 1, kinds: [image]}`.
 
+Checkpoint inspection and worker catalog resolution automatically select the reference recipe when a local pinned root contains a top-level `transformer_ref`. Its configuration and weight sources are validated instead of the base denoiser. Explicit distilled manifests and operator sidecars retain precedence; a root without `transformer_ref` selects the base recipe.
+
 ## Execution boundary
 
-Catalog selection is not HTTP admission authorization. The serving and worker execution paths must propagate the selected contract, expanded presentation geometry and tags, decoded pixels, and the image-VAE product before the capability can be advertised by a live endpoint. Resident target layout currently uses 768×1344; the fixed reference-serving output profile requires explicit runtime geometry support. Admission remains closed until that connected path is implemented and tested.
+Catalog selection is not HTTP admission authorization. The serving and worker execution paths must propagate expanded presentation geometry and tags, decoded pixels, and the image-VAE product before the capability can be advertised by a live endpoint. Resident target layout currently uses 768×1344; the fixed reference-serving output profile requires explicit runtime geometry support. Admission remains closed until that connected path is implemented and tested.

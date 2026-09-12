@@ -202,6 +202,8 @@ def resolve_catalog_entry(
             if root is None:
                 return MINIMAX_H3_ENTRY
             contract = resolve_h3_contract(root)
+            if contract.get("variant") == "ref":
+                return REFERENCE_H3_ENTRY
             if contract["attention"] == "dense":
                 return BASE_H3_ENTRY
             return replace(

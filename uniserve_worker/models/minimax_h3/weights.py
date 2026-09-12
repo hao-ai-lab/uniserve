@@ -97,7 +97,8 @@ def require_h3_checkpoint(root: Path) -> None:
     """Validate checkpoint component files and tensor dimensions against the H3 architecture."""
 
     contract = resolve_h3_contract(root)
-    transformer = json.loads((root / "transformer" / "config.json").read_text(encoding="utf-8"))
+    component = str(contract.get("transformer_component", "transformer"))
+    transformer = json.loads((root / component / "config.json").read_text(encoding="utf-8"))
     transformer_config = H3TransformerConfig()
     expected_transformer = {
         "num_attention_heads": transformer_config.heads,

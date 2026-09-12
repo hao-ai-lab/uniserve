@@ -8,12 +8,14 @@ import torch
 
 from uniserve_worker.backends.attention.torch_sdpa import TorchSDPAAttentionBackend
 from uniserve_worker.bootstrap.catalog import resolve_catalog_entry
+from uniserve_worker.bootstrap.inspect_model import inspect_model
 from uniserve_worker.models.minimax_h3.base_contract import (
     BASE_H3_REVISION,
     resolve_base_h3_contract,
 )
 from uniserve_worker.models.minimax_h3.config import resolve_h3_contract
 from uniserve_worker.models.minimax_h3.packing import build_packed_layout, dense_key_mask
+from uniserve_worker.models.minimax_h3.weights import require_h3_checkpoint
 from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
 
 pytestmark = pytest.mark.unit
@@ -65,7 +67,7 @@ def test_dense_attention_padding_does_not_change_semantic_output():
 
 
 @pytest.fixture
-def base_root(tmp_path: Path):
+def base_root(tmp_path: Path, request):
     def install(relative, content):
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,7 +77,10 @@ def base_root(tmp_path: Path):
         receipt.write_text(BASE_H3_REVISION + "\nreceipt-etag\n0\n")
 
     install("modular_model_index.json", '{"_class_name":"MiniMaxH3ModularPipeline"}')
-    for component in ("transformer", "transformer_ref", "text_encoder", "vae", "audio_vae"):
+    components = ["transformer", "text_encoder", "vae", "audio_vae"]
+    if getattr(request, "param", False):
+        components.append("transformer_ref")
+    for component in components:
         install(f"{component}/config.json", "{}")
         shards = [
             f"model-{i}.safetensors"
@@ -93,6 +98,46 @@ def base_root(tmp_path: Path):
         install(f"tokenizer/{filename}", "{}")
         install(f"text_encoder/{filename}", "{}")
     install("text_encoder/preprocessor_config.json", "{}")
+    transformer = {
+        "num_attention_heads": 56,
+        "attention_head_dim": 128,
+        "hidden_size": 5376,
+        "num_layers": 50,
+        "num_refiner_layers": 2,
+        "ffn_dim": 14336,
+        "in_channels": 24,
+        "audio_in_channels": 32,
+        "patch_size": [1, 2, 2],
+        "text_dim": 5120,
+        "freq_dim": 256,
+        "time_embed_hidden_dim": 5376,
+        "time_embed_dim": 2688,
+        "rope_freq_dim": 16,
+        "rope_theta": 10000.0,
+        "norm_eps": 1e-5,
+        "qk_norm_eps": 1e-5,
+        "final_norm_eps": 1e-5,
+    }
+    for component in (name for name in components if name.startswith("transformer")):
+        install(f"{component}/config.json", json.dumps(transformer))
+    install(
+        "text_encoder/config.json",
+        json.dumps(
+            {
+                "text_config": {
+                    "vocab_size": 151936,
+                    "hidden_size": 5120,
+                    "intermediate_size": 25600,
+                    "num_hidden_layers": 64,
+                    "num_attention_heads": 64,
+                    "num_key_value_heads": 8,
+                    "head_dim": 128,
+                    "rope_theta": 5000000.0,
+                    "rms_norm_eps": 1e-6,
+                }
+            }
+        ),
+    )
     return tmp_path
 
 
@@ -111,6 +156,7 @@ def test_base_contract_identifies_dense_49_forward_recipe(base_root):
     assert contract["guidance_scale"] == 1.0
 
 
+@pytest.mark.parametrize("base_root", [True], indirect=True)
 def test_reference_contract_identifies_fixed_dense_image_recipe(base_root):
     contract = resolve_base_h3_contract(base_root, reference=True)
     entry = resolve_catalog_entry(("minimax-h3-ref",), root=base_root)
@@ -129,6 +175,7 @@ def test_reference_contract_identifies_fixed_dense_image_recipe(base_root):
 @pytest.mark.parametrize(
     "defect", ["missing", "revision", "nested", "unsafe_index", "missing_index", "processor"]
 )
+@pytest.mark.parametrize("base_root", [True], indirect=True)
 def test_reference_catalog_requires_top_level_pinned_reference_weights(base_root, defect):
     if defect == "missing":
         path = base_root / "transformer_ref/model-0.safetensors"
@@ -153,6 +200,33 @@ def test_reference_catalog_requires_top_level_pinned_reference_weights(base_root
         index.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="base H3"):
         resolve_catalog_entry(("minimax-h3-ref",), root=base_root)
+    with pytest.raises(ValueError, match="H3"):
+        require_h3_checkpoint(base_root)
+
+
+@pytest.mark.parametrize("base_root", [False, True], indirect=True)
+def test_root_inspection_and_worker_catalog_select_same_recipe(base_root):
+    reference = (base_root / "transformer_ref").exists()
+    # No safetensors payload is read: these files are inventory placeholders.
+    inspected = inspect_model(str(base_root))
+    assert inspected["contract"]["variant"] == ("ref" if reference else "base")
+    entry = resolve_catalog_entry(("MiniMaxH3Transformer3DModel",), root=base_root)
+    denoiser = next(source for source in entry.sources if source.name == "denoiser")
+    assert denoiser.directory == ("transformer_ref" if reference else "transformer")
+    assert entry.create_schedule("cpu").timesteps[0].numel() == 49
+
+
+@pytest.mark.parametrize("base_root", [True], indirect=True)
+def test_reference_checkpoint_validates_selected_transformer_dimensions(base_root):
+    # A broken unselected base config must not affect reference inspection.
+    (base_root / "transformer/config.json").write_text("{}")
+    require_h3_checkpoint(base_root)
+    selected = base_root / "transformer_ref/config.json"
+    config = json.loads(selected.read_text())
+    config["hidden_size"] = 1
+    selected.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="hidden_size"):
+        require_h3_checkpoint(base_root)
 
 
 def test_explicit_missing_contract_does_not_select_base_recipe(base_root, monkeypatch):
