@@ -75,9 +75,12 @@ def base_root(tmp_path: Path):
         receipt.write_text(BASE_H3_REVISION + "\nreceipt-etag\n0\n")
 
     install("modular_model_index.json", '{"_class_name":"MiniMaxH3ModularPipeline"}')
-    for component in ("transformer", "text_encoder", "vae", "audio_vae"):
+    for component in ("transformer", "transformer_ref", "text_encoder", "vae", "audio_vae"):
         install(f"{component}/config.json", "{}")
-        shards = [f"model-{i}.safetensors" for i in range(14 if component == "transformer" else 1)]
+        shards = [
+            f"model-{i}.safetensors"
+            for i in range(14 if component in {"transformer", "transformer_ref"} else 1)
+        ]
         install(
             f"{component}/model.safetensors.index.json",
             json.dumps({"weight_map": {f"weight{i}": name for i, name in enumerate(shards)}}),
@@ -104,6 +107,40 @@ def test_base_contract_identifies_dense_49_forward_recipe(base_root):
     assert contract["num_inference_steps"] == 50
     assert contract["denoise_steps"] == 49
     assert contract["guidance_scale"] == 1.0
+
+
+def test_reference_contract_identifies_fixed_dense_image_recipe(base_root):
+    contract = resolve_base_h3_contract(base_root, reference=True)
+    entry = resolve_catalog_entry(("minimax-h3-ref",), root=base_root)
+    schedule = entry.create_schedule("cpu")
+    assert contract["references"] == {"max": 1, "kinds": ["image"]}
+    assert (contract["height"], contract["width"], contract["num_frames"]) == (480, 832, 124)
+    assert contract["transformer_component"] == "transformer_ref"
+    assert contract["attention"] == contract["reference_attention"] == "dense"
+    assert contract["revision"] == BASE_H3_REVISION
+    for shift, sigmas in zip((12.0, 3.0), schedule.sigmas, strict=True):
+        grid = torch.linspace(1.0, 0.0, 50, dtype=torch.float32)
+        torch.testing.assert_close(sigmas, shift * grid / (1 + (shift - 1) * grid), rtol=0, atol=0)
+    assert schedule.timesteps[0].numel() == 49
+
+
+@pytest.mark.parametrize("defect", ["missing", "revision", "nested", "unsafe_index"])
+def test_reference_catalog_requires_top_level_pinned_reference_weights(base_root, defect):
+    if defect == "missing":
+        path = base_root / "transformer_ref/model-0.safetensors"
+        path.rename(path.with_suffix(".missing"))
+    elif defect == "revision":
+        receipt = base_root / ".cache/huggingface/download/transformer_ref/config.json.metadata"
+        receipt.write_text("0" * 40 + "\n")
+    elif defect == "nested":
+        base_root = base_root / "Ref2VA"
+    else:
+        index = base_root / "transformer_ref/model.safetensors.index.json"
+        data = json.loads(index.read_text())
+        data["weight_map"]["weight0"] = "../transformer/model-0.safetensors"
+        index.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="base H3"):
+        resolve_catalog_entry(("minimax-h3-ref",), root=base_root)
 
 
 def test_explicit_missing_contract_does_not_select_base_recipe(base_root, monkeypatch):

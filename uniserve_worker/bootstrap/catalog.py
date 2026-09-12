@@ -13,7 +13,11 @@ from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..loader.source import WeightSourceConfig
 from ..models.bagel import BagelForConditionalGeneration
 from ..models.minimax_h3 import MiniMaxH3Model
-from ..models.minimax_h3.base_contract import BASE_H3_GRID_POINTS, BASE_H3_SHIFTS
+from ..models.minimax_h3.base_contract import (
+    BASE_H3_GRID_POINTS,
+    BASE_H3_SHIFTS,
+    resolve_base_h3_contract,
+)
 from ..models.minimax_h3.config import (
     FASTH3_LADDER,
     FASTH3_SHIFTS,
@@ -157,12 +161,32 @@ BASE_H3_ENTRY = replace(
 )
 
 
+REFERENCE_H3_ENTRY = replace(
+    BASE_H3_ENTRY,
+    sources=tuple(
+        WeightSourceConfig("denoiser", "transformer_ref", entry="denoiser")
+        if source.name == "denoiser"
+        else source
+        for source in BASE_H3_ENTRY.sources
+    ),
+    sidecars=tuple(
+        "transformer_ref/config.json" if path == "transformer/config.json" else path
+        for path in BASE_H3_ENTRY.sidecars
+    ),
+)
+
+
 def resolve_catalog_entry(
     architectures: list[str] | tuple[str, ...], *, root: Path | None = None
 ) -> CatalogEntry:
     """Resolve one exact configured checkpoint architecture."""
 
     match tuple(str(architecture) for architecture in architectures):
+        case ("minimax-h3-ref",):
+            if root is None:
+                raise invalid_descriptor("minimax-h3-ref requires a pinned checkpoint root")
+            resolve_base_h3_contract(root, reference=True)
+            return REFERENCE_H3_ENTRY
         case ("Qwen3ForCausalLM",):
             return QWEN3_ENTRY
         case ("BagelForConditionalGeneration",):
