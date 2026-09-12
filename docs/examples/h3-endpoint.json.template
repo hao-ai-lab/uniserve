@@ -1,0 +1,13 @@
+{
+  "id": "uniserve-h3-rack3",
+  "kind": "uniserve",
+  "name": "UniServe H3 rack 3",
+  "base_url": "http://COMPUTE_HOST:8100",
+  "health_path": "/health",
+  "metrics_path": "/metrics",
+  "api_key_file": "/ABSOLUTE/PATH/TO/api-key",
+  "slurm_job_id": "JOB_ID",
+  "run_id": "REGISTERED_RUN_ID",
+  "expires_utc": "EXPIRY_RFC3339_UTC",
+  "models": ["minimax-h3-8step", "minimax-h3-base", "minimax-h3-ref"]
+}

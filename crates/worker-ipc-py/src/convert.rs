@@ -2178,16 +2178,16 @@ mod tests {
             DiffusionRequestParams {
                 references: vec![uniserve_worker_ipc::DecodedReference {
                     kind: "image".into(),
-                    task: "first_last_frame".into(),
-                    role: "last_frame".into(),
+                    task: "first_frame".into(),
+                    role: "first_frame".into(),
                     include_audio: false,
                     pixels: Some(ProductRef {
                         request_key: media_key,
-                        producer_op_id: OpId(0),
-                        output_index: 0,
+                        producer_op_id: OpId(2),
+                        output_index: u16::MAX,
                         generation: 1,
                         kind: ProductKind::Tensor,
-                        storage_class: StorageClass::DeviceTensor,
+                        storage_class: StorageClass::HostStaging,
                         dtype: DType::U8,
                         shape_bound: ShapeBound {
                             dims: [1, 16, 24, 3].map(DimBound::Static).to_vec(),
@@ -2209,18 +2209,20 @@ mod tests {
             },
         )
         .unwrap();
+        let pixels = media_admission.diffusion.as_ref().unwrap().references[0]
+            .pixels
+            .as_ref()
+            .unwrap()
+            .clone();
         let media_operation = Operation {
             request_key: media_key,
             op_id: OpId(2),
-            parent: Some(Checkpoint::admission_root(OpId(0))),
-            entry: "model".into(),
+            parent: None,
+            entry: "text_encoder".into(),
             payload: OpPayload::new(
-                OpCode::DiffusionPrepare,
-                Bounds {
-                    max_points: 1,
-                    ..Bounds::default()
-                },
-                Vec::new(),
+                OpCode::EncoderText,
+                Bounds::default(),
+                vec![pixels.clone()],
                 Vec::new(),
                 None,
                 None,
@@ -2228,16 +2230,6 @@ mod tests {
             ),
         }
         .sealed();
-        let latent_params = vec![LatentParams {
-            request_key: media_key,
-            op_id: OpId(2),
-            page_table: vec![1],
-            latent_units: 64,
-            height: 768,
-            width: 1344,
-            start_step: 0,
-            step_count: 0,
-        }];
         let mut run = Run::new(
             11,
             vec![admission, media_admission],
@@ -2246,11 +2238,16 @@ mod tests {
         run.block_tables = block_tables;
         run.new_cache_pages = new_cache_pages;
         run.forward_rows = forward_rows;
-        run.latent_params = latent_params;
-        let mut request = WorkerRequest::submit(run.with_input_products(vec![ProductPayload {
-            product: input,
-            value: InlineValue::Bytes(uniserve_worker_ipc::encode_token_product_bytes(&[7, 8])),
-        }]));
+        let mut request = WorkerRequest::submit(run.with_input_products(vec![
+            ProductPayload {
+                product: input,
+                value: InlineValue::Bytes(uniserve_worker_ipc::encode_token_product_bytes(&[7, 8])),
+            },
+            ProductPayload {
+                product: pixels,
+                value: InlineValue::Bytes(vec![17; 16 * 24 * 3]),
+            },
+        ]));
         request.set_call_id(Some(9));
         request
     }
@@ -2350,7 +2347,27 @@ mod tests {
                     .unwrap()
                     .extract::<String>()
                     .unwrap(),
-                "last_frame"
+                "first_frame"
+            );
+            let payload = native_run
+                .getattr("input_products")
+                .unwrap()
+                .get_item(1)
+                .unwrap();
+            assert_eq!(
+                payload
+                    .getattr("payload")
+                    .unwrap()
+                    .extract::<Vec<u8>>()
+                    .unwrap(),
+                vec![17; 16 * 24 * 3]
+            );
+            assert!(
+                payload
+                    .getattr("product")
+                    .unwrap()
+                    .eq(reference.getattr("pixels").unwrap())
+                    .unwrap()
             );
             assert_eq!(
                 reference
