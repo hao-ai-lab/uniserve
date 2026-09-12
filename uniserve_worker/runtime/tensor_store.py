@@ -282,7 +282,9 @@ class TensorStore:
         # arenas reserve stable request/lane addresses for graph capture.
         self._allocated_bytes = 0
         self._relay_arenas: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
-        self._relay_slots: dict[tuple[str, int, int, torch.dtype, int], RelaySlot] = {}
+        # Group fields by physical lane so allocation and retirement inspect only
+        # this request's owners, independently of other admitted requests.
+        self._relay_slots: dict[tuple[str, int, int], dict[tuple[torch.dtype, int], RelaySlot]] = {}
         self._relay_operation_lanes: dict[tuple[str, int, RequestKey, ComputationId], int] = {}
 
         # Logical references point at generation-tagged physical writes. The
@@ -643,11 +645,8 @@ class TensorStore:
     ) -> bool:
         """Return whether a request relay lane has no bound operation."""
 
-        return not any(
-            slot.owner is not None
-            for (name, row, candidate, _dtype, _field), slot in self._relay_slots.items()
-            if name == device_name and row == request_slot and candidate == lane
-        )
+        fields = self._relay_slots.get((device_name, request_slot, lane))
+        return fields is None or all(slot.owner is None for slot in fields.values())
 
     def _relay_slot_locked(
         self,
@@ -661,8 +660,10 @@ class TensorStore:
         """Resolve or create one stable scalar relay slot inside its geometry-specific arena."""
 
         device_name = str(device)
-        key = (device_name, request_slot, lane, dtype, int(field))
-        slot = self._relay_slots.get(key)
+        lane_key = (device_name, request_slot, lane)
+        fields = self._relay_slots.setdefault(lane_key, {})
+        key = (dtype, int(field))
+        slot = fields.get(key)
         if slot is None:
             arena_key = (device_name, dtype, int(field))
             arena = self._relay_arenas.get(arena_key)
@@ -681,7 +682,7 @@ class TensorStore:
                 shape=(1,),
                 dtype=dtype,
             )
-            self._relay_slots[key] = slot
+            fields[key] = slot
         if slot.relay_lane is not None and slot.relay_lane[:4] != operation:
             raise _invariant("request-relay slot retained a conflicting operation identity")
         slot.relay_lane = (*operation, lane)
@@ -867,19 +868,14 @@ class TensorStore:
             )
 
         source = flat.to(dtype=first.dtype)
-        for index, tensor in enumerate(tensors):
-            source_view = source[index : index + 1]
-            aliases_destination = (
-                source_view.device == tensor.device
-                and source_view.dtype == tensor.dtype
-                and source_view.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
-                and int(source_view.storage_offset()) == int(tensor.storage_offset())
-            )
-            if not aliases_destination:
-                tensor.copy_(
-                    source_view,
-                    non_blocking=source.device.type == "cuda",
-                )
+        # Keep the scalar batch in one native copy operation. CUDA can scatter
+        # these independent destinations together; other device combinations
+        # retain PyTorch's ordinary copy and non-blocking semantics.
+        torch._foreach_copy_(
+            tensors,
+            source.reshape(-1, 1).unbind(0),
+            non_blocking=source.device.type == "cuda",
+        )
 
         event: torch.cuda.Event | None = None
         if first.device.type == "cuda":
@@ -1717,7 +1713,8 @@ class TensorStore:
                 operation = association[:4]
                 self._release_relay_operation_locked(operation)
                 if operation not in self._relay_operation_lanes:
-                    for candidate in self._relay_slots.values():
+                    fields = self._relay_slots[(association[0], association[1], association[4])]
+                    for candidate in fields.values():
                         if (
                             candidate.relay_lane is not None
                             and candidate.relay_lane[:4] == operation

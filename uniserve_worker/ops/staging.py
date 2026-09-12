@@ -21,7 +21,7 @@ except Exception:
 
 if triton is not None:
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["rows", "table_width", "group_id"])
     def _gather_request_decode_inputs_kernel(
         request_pool_indices,
         request_page_tables,
@@ -44,13 +44,15 @@ if triton is not None:
         request_position_stride: tl.constexpr,
         block_table_row_stride: tl.constexpr,
         max_rows: tl.constexpr,
-        table_width: tl.constexpr,
-        group_id: tl.constexpr,
+        table_width,
+        group_id,
         page_size: tl.constexpr,
         block: tl.constexpr,
     ):
         """Gather block-table cells and per-row decode scalars by request slot."""
 
+        # Request counts and table extents change during serving. Keep them as
+        # runtime values so an arrival does not load another kernel variant.
         # The flattened launch covers both the two-dimensional block table and
         # the one-dimensional scalar buffers. Each program handles whichever
         # domains contain its offsets.

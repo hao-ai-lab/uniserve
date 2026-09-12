@@ -12,7 +12,9 @@ except Exception:  # pragma: no cover
 
 if triton is not None:
 
-    @triton.jit
+    @triton.jit(
+        do_not_specialize=["row", "valid_cache_length", "logical_length", "sampling_position"]
+    )
     def _reset_row_kernel(
         future_tokens_ptr,
         penalty_counts_ptr,
@@ -47,7 +49,7 @@ if triton is not None:
         tl.store(sampling_positions_ptr + row + offsets, sampling_position, mask=scalar)
         tl.store(cache_lengths_ptr + row + offsets, valid_cache_length, mask=scalar)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["count"])
     def _publish_decode_kernel(
         indices_ptr,
         tokens_ptr,

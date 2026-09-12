@@ -14,19 +14,98 @@ from tests.python.fixtures.depth_one import (
     token_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
+from uniserve_worker.config import WorkerConfig
 from uniserve_worker.models.stub import _next_token
 from uniserve_worker.protocol.batch import (
     ComputationId,
     DrawLayout,
     ForwardMode,
+    OpStatus,
     Rng,
     SamplingParams,
+    SamplingState,
 )
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
 ]
+
+
+@pytest.mark.parametrize("graphs", [False, True])
+@pytest.mark.parametrize("finish_policy", ["admission", "operation", "force"])
+def test_decode_terminal_policy_suppresses_only_its_own_successor(graphs, finish_policy) -> None:
+    policy = WorkerConfig(
+        graph_policy="full" if graphs else "off",
+        prefill_cuda_graph=False,
+        decode_graph_batch_sizes=(2,),
+    )
+    first = ar_params(34, block_ids=(0,))
+    second = ar_params(35, block_ids=(1,))
+    terminal = _next_token(_next_token(4))
+    if finish_policy == "admission":
+        assert first.ar is not None
+        first = replace(first, ar=replace(first.ar, finish_token_ids=(terminal,)))
+
+    with execution_worker(device="cuda:0", pipeline_depth=3, execution=policy) as worker:
+        parents = tuple(
+            token_operation(
+                admission.request_key,
+                op_id=ComputationId(1, index),
+                predecessor=root_parent(admission),
+                mode=ForwardMode.PREFILL,
+                tokens=(3, 4),
+            )
+            for index, admission in enumerate((first, second))
+        )
+        parent_report = worker.submit(
+            execution_run(run_id=1, admissions=(first, second), operations=parents)
+        )
+        decodes = tuple(
+            token_operation(
+                parent.request_key,
+                op_id=ComputationId(2, index),
+                predecessor=parent.op_id,
+                mode=ForwardMode.DECODE,
+                tokens=(0,),
+                predicate=parent.token_output,
+            )
+            for index, parent in enumerate(parents)
+        )
+        if finish_policy != "admission":
+            decodes = (
+                replace(
+                    decodes[0],
+                    sampling_state=SamplingState(
+                        finish_token_ids=(terminal,) if finish_policy == "operation" else (),
+                        force_finish=finish_policy == "force",
+                    ),
+                ),
+                decodes[1],
+            )
+        decode_report = worker.submit(execution_run(run_id=2, operations=decodes))
+        successors = tuple(
+            token_operation(
+                decode.request_key,
+                op_id=ComputationId(3, index),
+                predecessor=decode.op_id,
+                mode=ForwardMode.DECODE,
+                tokens=(0,),
+                predicate=decode.token_output,
+            )
+            for index, decode in enumerate(decodes)
+        )
+        # Queue the dependent work before consuming either parent's host result.
+        successor_report = worker.submit(execution_run(run_id=3, operations=successors))
+        finalized_report(worker, parent_report)
+        selected = finalized_report(worker, decode_report).completions
+        following = finalized_report(worker, successor_report).completions
+
+        assert tuple(output.committed_tokens for output in selected) == ((terminal,), (terminal,))
+        assert following[0].status is OpStatus.PREDICATED
+        assert following[0].committed_tokens == ()
+        assert following[1].status is OpStatus.OK
+        assert following[1].committed_tokens == (_next_token(terminal),)
 
 
 def test_same_request_continues_before_parent_report_materialization() -> None:

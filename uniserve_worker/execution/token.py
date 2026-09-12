@@ -578,6 +578,8 @@ def graph_decode_samples(
     ):
         return None
 
+    finish_sets: list[tuple[int, ...]] = []
+    forced: list[bool] = []
     for operation, request, task in zip(operations, requests, tasks, strict=True):
         parameters = request.request.sampling
         sampling_state = operation.sampling_state or SamplingState()
@@ -599,7 +601,6 @@ def graph_decode_samples(
             or bool(parameters.forced_token_ids)
             or sampling_state.allowed_token_ids is not None
             or bool(sampling_state.suppressed_token_ids)
-            or bool(finish_token_ids)
             or bool(sampling_state.transition_token_ids)
             or request.transition_write is not None
             or task.decode_predicate is None
@@ -608,8 +609,24 @@ def graph_decode_samples(
             or write is None
         ):
             return None
+        finish_sets.append(finish_token_ids)
+        forced.append(bool(sampling_state.force_finish))
 
     broadcast_selection(sampling_group, output.tokens)
+    if any(finish_sets):
+        # Graph selection already resolved logits and device activity. Apply the
+        # same terminal policy as eager sampling without selecting those logits
+        # again; new continuation tensors preserve the borrowed graph storage.
+        finish = sampling.sampled_finish_values(
+            tuple(finish_sets), tuple(forced), output.tokens, output.valid & output.active
+        )
+        continuation = output.valid & output.active & ~finish
+        output = replace(
+            output,
+            finish=finish,
+            continuation=continuation,
+            tagged_tokens=sampling.tagged_token_values(output.tokens, continuation),
+        )
     return tuple(output.row(index) for index in range(count))
 
 
@@ -752,7 +769,7 @@ def token_task(
     if len(token_ids) != len(positions) or not token_ids:
         raise invalid_descriptor("token task ids and positions must align")
     if len(token_ids) == 1 and isinstance(token_ids[0], torch.Tensor):
-        token_values = token_ids[0].reshape(1).to(dtype=torch.long)
+        token_values = token_ids[0].reshape(1)
     else:
         token_values = torch.tensor(
             tuple(int(value) for value in token_ids),
@@ -769,8 +786,11 @@ def token_task(
     return ForwardRow(
         forward_mode=cast(ForwardMode, operation.kind),
         token_ids=token_values,
+        # InputBuffers owns the model's integer dtype. Borrow device positions
+        # here: indexed decode gathers them in bulk, and mixed staging converts
+        # them while copying into its fixed destination, without per-row casts.
         positions=(
-            positions.reshape(-1).to(dtype=torch.long)
+            positions.reshape(-1)
             if isinstance(positions, torch.Tensor)
             else torch.tensor(positions, dtype=torch.long)
         ),

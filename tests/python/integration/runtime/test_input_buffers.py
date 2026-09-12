@@ -12,14 +12,15 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 @pytest.mark.parametrize("devices", (("cpu", "cuda:0"), ("cuda:0", "cpu")))
-def test_token_positions_preserve_row_order_across_source_devices(devices):
+@pytest.mark.parametrize("position_dtype", (torch.int32, torch.int64))
+def test_token_positions_preserve_row_order_across_source_devices(devices, position_dtype):
     # A host-created prefix may share a call with a device continuation. Both
     # remain ordinary numerical rows, regardless of where their values originate.
     rows = tuple(
         ForwardRow(
             forward_mode=ForwardMode.PREFILL,
             token_ids=torch.tensor([token], dtype=torch.long, device=device),
-            positions=torch.tensor([position], dtype=torch.long, device=device),
+            positions=torch.tensor([position], dtype=position_dtype, device=device),
             selection=TokenSelection.LAST_LOGITS,
             request_pool_idx=index + 1,
         )
@@ -44,6 +45,7 @@ def test_token_positions_preserve_row_order_across_source_devices(devices):
     try:
         batch = buffers.stage(rows, forward_mode=ForwardMode.PREFILL, attention=attention)
         assert batch.input_ids is not None and batch.positions is not None
+        assert batch.input_ids.dtype == batch.positions.dtype == torch.int64
         assert batch.input_ids.cpu().tolist() == [5, 9]
         assert batch.positions.cpu().tolist() == [17, 23]
     finally:

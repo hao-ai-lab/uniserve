@@ -712,18 +712,13 @@ class KVCache:
         if k.shape != v.shape or k.ndim != 3 or int(k.shape[0]) != int(flat_locations.numel()):
             raise invalid_descriptor("KV output locations do not align with current K/V")
         if not self.is_quantized:
-            persists = flat_locations > 0
-            pages = torch.where(
-                persists,
-                torch.div(flat_locations, self.block_size, rounding_mode="floor"),
-                -1,
-            )
-            offsets = torch.remainder(flat_locations, self.block_size)
+            # The shared scatter consumes the encoded slot directly, including
+            # non-writing sentinels, without materializing per-layer addresses.
             paged_kv_write(
                 self.k[layer_id],
                 self.v[layer_id],
-                pages,
-                offsets,
+                flat_locations,
+                None,
                 k,
                 v,
                 cast=k.dtype != self.k.dtype or v.dtype != self.v.dtype,

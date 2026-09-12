@@ -312,3 +312,45 @@ def test_multi_axis_qk_norm_rope_preserves_shared_normalization_groups(device, d
             rotated.append(torch.cat((left * cos - right * sin, right * cos + left * sin), dim=-1))
         expected = torch.cat(rotated, dim=-1)
         torch.testing.assert_close(result.double(), expected, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.parametrize(
+    "shape", ((1, 3, 1, 128), (17, 64, 8, 128), (3, 5, 2, 96), (2, 3, 1, 1024))
+)
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16, torch.float32))
+def test_full_width_qk_norm_rope_preserves_strided_heads_and_tail_rows(device, dtype, shape):
+    from uniserve_worker import ops
+
+    tokens, query_heads, key_heads, width = shape
+    generator = torch.Generator(device=device).manual_seed(83)
+    packed = torch.randn(
+        (tokens, query_heads + 2 * key_heads, width),
+        generator=generator,
+        device=device,
+        dtype=dtype,
+    )
+    query, key, _value = packed.split((query_heads, key_heads, key_heads), dim=1)
+    original = packed.clone()
+    # Query and key weights may have different storage dtypes. Both affine
+    # transforms belong to the same FP32 normalization/rotation contract.
+    weights = (
+        torch.randn(width, generator=generator, device=device, dtype=torch.float32),
+        torch.randn(width, generator=generator, device=device, dtype=dtype),
+    )
+    angles = torch.randn((tokens, width // 2), generator=generator, device=device)
+    cosine, sine = angles.cos(), angles.sin()
+    with torch.inference_mode():
+        actual = ops.qk_norm_rope(query, key, *weights, cosine, sine, 1e-6)
+
+    for source, weight, result in zip((query, key), weights, actual, strict=True):
+        values = source.double()
+        normalized = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-6)
+        left, right = (normalized * weight.double()).chunk(2, dim=-1)
+        cos, sin = cosine.double().unsqueeze(1), sine.double().unsqueeze(1)
+        expected = torch.cat((left * cos - right * sin, right * cos + left * sin), dim=-1)
+        if dtype is torch.float32:
+            torch.testing.assert_close(result, expected.float())
+        else:
+            tolerance = 2e-2 if dtype is torch.bfloat16 else 2e-3
+            torch.testing.assert_close(result.double(), expected, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(packed, original, rtol=0, atol=0)

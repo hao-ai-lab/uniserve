@@ -72,30 +72,27 @@ class DecodeState:
         self._ones_int32 = tensors["_ones_int32"]
         self._ones_int64 = tensors["_ones_int64"]
 
-        # Zero-count launches compile representative block sizes without
-        # modifying any request row.
+        # Prepare the same capacity-bounded kernel used by live publications.
+        # A zero count leaves all request rows unchanged.
         if (
             kernels.triton is not None
             and self.device.type == "cuda"
             and triton_available(self.device)
         ):
             self._reset_device_row(0, 0, 0, 0)
-            for block_size in (1, 2, 4, 8, 16, 32, 64, 128):
-                if block_size > self.request_pool_size:
-                    break
-                kernels._publish_decode_kernel[(1,)](
-                    self._ones_int64,
-                    self.future_input_tokens[:, 0],
-                    self.predicates,
-                    self.future_input_tokens,
-                    self.predicates,
-                    self.logical_lengths,
-                    self.sampling_positions,
-                    self.valid_cache_lengths,
-                    count=0,
-                    continuation_width=self.continuation_width,
-                    block_size=block_size,
-                )
+            kernels._publish_decode_kernel[(1,)](
+                self._ones_int64,
+                self.future_input_tokens[:, 0],
+                self.predicates,
+                self.future_input_tokens,
+                self.predicates,
+                self.logical_lengths,
+                self.sampling_positions,
+                self.valid_cache_lengths,
+                count=0,
+                continuation_width=self.continuation_width,
+                block_size=kernels.triton.next_power_of_2(self.request_pool_size),
+            )
 
     @staticmethod
     def tensor_schema(
@@ -259,7 +256,9 @@ class DecodeState:
             and self.device.type == "cuda"
             and triton_available(self.device)
         ):
-            block_size = kernels.triton.next_power_of_2(count)
+            # Unique validated slots bound count by the owned pool capacity.
+            # Mask live rows without specializing on each arriving batch size.
+            block_size = kernels.triton.next_power_of_2(self.request_pool_size)
             kernels._publish_decode_kernel[(1,)](
                 indices,
                 values[0],

@@ -465,43 +465,45 @@ def sampling_columns(
     return metadata
 
 
-def _device_finish_values(
-    tasks: tuple[SamplingMetadata, ...],
+def sampled_finish_values(
+    finish_token_ids: tuple[tuple[int, ...], ...],
+    force_finish: tuple[bool, ...],
     device_tokens: torch.Tensor,
     valid: torch.Tensor,
 ) -> torch.Tensor:
     """Evaluate per-row terminal token policies entirely on the sampling device."""
 
-    count = len(tasks)
+    count = len(finish_token_ids)
     tokens = device_tokens.reshape(-1)
     validity = valid.reshape(-1)
-    if int(tokens.numel()) != count or int(validity.numel()) != count:
+    if len(force_finish) != count or int(tokens.numel()) != count or int(validity.numel()) != count:
         raise RuntimeError("sampling finish vectors do not align")
     if count == 0:
         return validity.to(dtype=torch.bool)
 
-    first = tasks[0]
+    first_ids = finish_token_ids[0]
+    first_force = force_finish[0]
     if all(
-        row.force_finish == first.force_finish and row.finish_token_ids == first.finish_token_ids
-        for row in tasks[1:]
+        forced == first_force and ids == first_ids
+        for forced, ids in zip(force_finish[1:], finish_token_ids[1:], strict=True)
     ):
-        if first.force_finish:
+        if first_force:
             return validity.to(dtype=torch.bool)
-        if not first.finish_token_ids:
+        if not first_ids:
             return torch.zeros_like(validity, dtype=torch.bool)
-        matched = tokens == first.finish_token_ids[0]
-        for token_id in first.finish_token_ids[1:]:
+        matched = tokens == first_ids[0]
+        for token_id in first_ids[1:]:
             matched |= tokens == token_id
         return matched & validity
 
     values: list[torch.Tensor] = []
-    for index, row in enumerate(tasks):
+    for index, (ids, forced) in enumerate(zip(finish_token_ids, force_finish, strict=True)):
         selected = tokens[index]
-        if row.force_finish:
+        if forced:
             finish = torch.ones((), dtype=torch.bool, device=tokens.device)
-        elif row.finish_token_ids:
+        elif ids:
             finish_ids = torch.tensor(
-                row.finish_token_ids,
+                ids,
                 dtype=tokens.dtype,
                 device=tokens.device,
             )
@@ -633,9 +635,12 @@ def _resolve_sampled_finish_values(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Combine token, speculative-terminal, validity, and activity finish policies."""
 
-    finish_values = _device_finish_values(tasks, device_tokens, valid & active) | (
-        terminal_finish.reshape(-1).to(dtype=torch.bool) & valid & active
-    )
+    finish_values = sampled_finish_values(
+        tuple(task.finish_token_ids for task in tasks),
+        tuple(task.force_finish for task in tasks),
+        device_tokens,
+        valid & active,
+    ) | (terminal_finish.reshape(-1).to(dtype=torch.bool) & valid & active)
     continuation_values = active & valid & ~finish_values
     return finish_values, continuation_values
 

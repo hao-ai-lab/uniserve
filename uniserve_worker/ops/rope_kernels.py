@@ -58,6 +58,66 @@ if triton is not None:
         tl.store(out_ptr + offs, out, mask=mask)
 
     @triton.jit
+    def _rms_norm_rope_rows(
+        source,
+        weight,
+        cosine,
+        sine,
+        output,
+        first_row,
+        row_count: tl.constexpr,
+        heads: tl.constexpr,
+        stride_token: tl.constexpr,
+        stride_head: tl.constexpr,
+        stride_feature: tl.constexpr,
+        dim: tl.constexpr,
+        half: tl.constexpr,
+        epsilon: tl.constexpr,
+        block: tl.constexpr,
+        rows_per_program: tl.constexpr,
+    ):
+        """Normalize and rotate independent head rows without crossing row reductions."""
+
+        rows = first_row + tl.arange(0, rows_per_program)
+        columns = tl.arange(0, block)
+        tokens = rows // heads
+        head = rows % heads
+        bases = tokens * stride_token + head * stride_head
+        mask = (rows[:, None] < row_count) & (columns[None, :] < dim)
+        values = tl.load(
+            source + bases[:, None] + columns[None, :] * stride_feature,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        variance = tl.sum(values * values, axis=1) / dim
+        inverse = tl.rsqrt(variance + epsilon)
+        offsets = columns % half
+        left = tl.load(
+            source + bases[:, None] + offsets[None, :] * stride_feature,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        right = tl.load(
+            source + bases[:, None] + (half + offsets[None, :]) * stride_feature,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        left_weight = tl.load(weight + offsets, mask=columns < dim, other=0.0).to(tl.float32)
+        right_weight = tl.load(weight + half + offsets, mask=columns < dim, other=0.0).to(
+            tl.float32
+        )
+        factors = tokens[:, None] * half + offsets[None, :]
+        cos = tl.load(cosine + factors, mask=mask, other=0.0).to(tl.float32)
+        sin = tl.load(sine + factors, mask=mask, other=0.0).to(tl.float32)
+        # Keep normalization, learned scale and rotation in FP32 until store.
+        left = left * inverse[:, None] * left_weight[None, :]
+        right = right * inverse[:, None] * right_weight[None, :]
+        rotated = tl.where(
+            columns[None, :] < half, left * cos - right * sin, right * cos + left * sin
+        )
+        tl.store(output + rows[:, None] * dim + columns[None, :], rotated, mask=mask)
+
+    @triton.jit
     def _qk_rms_norm_rope_kernel(
         q_ptr,
         k_ptr,
@@ -82,70 +142,52 @@ if triton is not None:
         q_eps: tl.constexpr,
         k_eps: tl.constexpr,
         block: tl.constexpr,
+        rows_per_program: tl.constexpr,
     ):
-        """Normalize and rotate Q/K head rows in one flattened launch domain."""
+        """Process Q/K tiles in disjoint CTA ranges with one normalization per row."""
 
         pid = tl.program_id(0)
-        offs = tl.arange(0, block)
-        col_mask = offs < dim
-        d_half = offs % half
-        second_offs = half + d_half
-        first_half = offs < half
-
-        # Query rows occupy the first program-id range. One fp32 reduction
-        # provides the reciprocal RMS shared by both rotary halves.
-        q_mask = (pid < q_rows) & col_mask
-        q_token = pid // q_heads
-        q_head = pid - q_token * q_heads
-        q_base = q_token * q_stride_0 + q_head * q_stride_1
-        q_vec = tl.load(q_ptr + q_base + offs * q_stride_2, mask=q_mask, other=0.0).to(tl.float32)
-        q_var = tl.sum(q_vec * q_vec, axis=0) / dim
-        q_inv = tl.rsqrt(q_var + q_eps)
-        q1 = tl.load(q_ptr + q_base + d_half * q_stride_2, mask=q_mask, other=0.0).to(tl.float32)
-        q2 = tl.load(
-            q_ptr + q_base + second_offs * q_stride_2,
-            mask=q_mask,
-            other=0.0,
-        ).to(tl.float32)
-        qw1 = tl.load(qw_ptr + d_half, mask=col_mask, other=0.0).to(tl.float32)
-        qw2 = tl.load(qw_ptr + second_offs, mask=col_mask, other=0.0).to(tl.float32)
-        cos = tl.load(cos_ptr + q_token * half + d_half, mask=q_mask, other=0.0).to(tl.float32)
-        sin = tl.load(sin_ptr + q_token * half + d_half, mask=q_mask, other=0.0).to(tl.float32)
-
-        # Keep normalization, learned scale, and rotation in FP32 until store.
-        q1_norm = q1 * q_inv * qw1
-        q2_norm = q2 * q_inv * qw2
-        q_rot = tl.where(first_half, q1_norm * cos - q2_norm * sin, q2_norm * cos + q1_norm * sin)
-        tl.store(q_out_ptr + pid * dim + offs, q_rot, mask=q_mask)
-
-        # Key rows follow the query range and may use distinct token, head,
-        # stride, weight, and epsilon parameters.
-        k_pid = pid - q_rows
-        k_mask = (k_pid >= 0) & (k_pid < k_rows) & col_mask
-        k_token = k_pid // k_heads
-        k_head = k_pid - k_token * k_heads
-        k_base = k_token * k_stride_0 + k_head * k_stride_1
-        k_vec = tl.load(k_ptr + k_base + offs * k_stride_2, mask=k_mask, other=0.0).to(tl.float32)
-        k_var = tl.sum(k_vec * k_vec, axis=0) / dim
-        k_inv = tl.rsqrt(k_var + k_eps)
-        k1 = tl.load(k_ptr + k_base + d_half * k_stride_2, mask=k_mask, other=0.0).to(tl.float32)
-        k2 = tl.load(
-            k_ptr + k_base + second_offs * k_stride_2,
-            mask=k_mask,
-            other=0.0,
-        ).to(tl.float32)
-        kw1 = tl.load(kw_ptr + d_half, mask=col_mask, other=0.0).to(tl.float32)
-        kw2 = tl.load(kw_ptr + second_offs, mask=col_mask, other=0.0).to(tl.float32)
-        k_cos = tl.load(cos_ptr + k_token * half + d_half, mask=k_mask, other=0.0).to(tl.float32)
-        k_sin = tl.load(sin_ptr + k_token * half + d_half, mask=k_mask, other=0.0).to(tl.float32)
-        k1_norm = k1 * k_inv * kw1
-        k2_norm = k2 * k_inv * kw2
-        k_rot = tl.where(
-            first_half,
-            k1_norm * k_cos - k2_norm * k_sin,
-            k2_norm * k_cos + k1_norm * k_sin,
-        )
-        tl.store(k_out_ptr + k_pid * dim + offs, k_rot, mask=k_mask)
+        query_programs = tl.cdiv(q_rows, rows_per_program)
+        # The branch is uniform within each CTA. Separate domains also preserve
+        # independent Q/K weights, strides, epsilons and incomplete final tiles.
+        if pid < query_programs:
+            _rms_norm_rope_rows(
+                q_ptr,
+                qw_ptr,
+                cos_ptr,
+                sin_ptr,
+                q_out_ptr,
+                pid * rows_per_program,
+                q_rows,
+                q_heads,
+                q_stride_0,
+                q_stride_1,
+                q_stride_2,
+                dim,
+                half,
+                q_eps,
+                block,
+                rows_per_program,
+            )
+        else:
+            _rms_norm_rope_rows(
+                k_ptr,
+                kw_ptr,
+                cos_ptr,
+                sin_ptr,
+                k_out_ptr,
+                (pid - query_programs) * rows_per_program,
+                k_rows,
+                k_heads,
+                k_stride_0,
+                k_stride_1,
+                k_stride_2,
+                dim,
+                half,
+                k_eps,
+                block,
+                rows_per_program,
+            )
 
     @triton.jit
     def _qk_rms_norm_partial_rope_inplace_kernel(
@@ -723,7 +765,12 @@ def try_triton_qk_rms_norm_rope(
     k_out = torch.empty_like(k, memory_format=torch.contiguous_format)
     q_rows = q_tokens * q_heads
     k_rows = k_tokens * k_heads
-    _qk_rms_norm_rope_kernel[(q_rows + k_rows,)](
+    block = triton.next_power_of_2(dim)
+    # Small heads share a CTA; bounding the feature tile limits register growth
+    # for wider heads. At width 128, each of four warps reduces one head.
+    rows_per_program = min(4, max(1, 512 // block))
+    grid = (triton.cdiv(q_rows, rows_per_program) + triton.cdiv(k_rows, rows_per_program),)
+    _qk_rms_norm_rope_kernel[grid](
         q,
         k,
         q_weight,
@@ -746,7 +793,8 @@ def try_triton_qk_rms_norm_rope(
         dim // 2,
         float(q_eps),
         float(k_eps),
-        triton.next_power_of_2(dim),
+        block,
+        rows_per_program,
         num_warps=4,
     )
     return q_out, k_out

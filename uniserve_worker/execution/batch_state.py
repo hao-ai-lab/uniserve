@@ -79,7 +79,7 @@ class BatchState:
     )
     group_registered: dict[int, bool] = field(default_factory=dict)
     group_published: dict[int, bool] = field(default_factory=dict)
-    request_indexes: dict[int, int] = field(default_factory=dict)
+    request_locations: dict[int, tuple[int, int]] = field(default_factory=dict)
     group_products: dict[int, tuple[TensorPublication, ...]] = field(default_factory=dict)
     group_stats: dict[int, ForwardStats] = field(default_factory=dict)
     group_execution_us: dict[int, int] = field(default_factory=dict)
@@ -98,15 +98,18 @@ class BatchState:
 
     def __post_init__(self) -> None:
         self.outputs = [None] * len(self.batch.operations)
-        self.request_indexes = {
-            operation.request_key.request_id: index
-            for index, operation in enumerate(self.batch.operations)
-        }
         groups: dict[tuple[object, str], list[int]] = {}
         for index, operation in enumerate(self.batch.operations):
             groups.setdefault((operation.kind, operation.entry), []).append(index)
         self.output_groups = {
             group: tuple(indexes) for group, indexes in enumerate(groups.values(), start=1)
+        }
+        # Resolve group ownership alongside the output index. Looking up one
+        # request must not scan the other requests in its completion group.
+        self.request_locations = {
+            self.batch.operations[index].request_key.request_id: (group, index)
+            for group, indexes in self.output_groups.items()
+            for index in indexes
         }
 
     def group_operations(self, group: int) -> tuple[ScheduledRequest, ...]:
@@ -143,10 +146,10 @@ class BatchState:
         return tuple(value for value in values if isinstance(value, PendingOutput))
 
     def pending_output(self, group: int, request_id: int) -> PendingOutput:
-        index = self.request_indexes.get(int(request_id))
-        if index is None or index not in self.output_groups[group]:
+        location = self.request_locations.get(int(request_id))
+        if location is None or location[0] != group:
             raise invalid_descriptor(f"completion group has no request {request_id}")
-        value = self.outputs[index]
+        value = self.outputs[location[1]]
         if not isinstance(value, PendingOutput):
             raise RuntimeError("request has no reserved pending output")
         return value
