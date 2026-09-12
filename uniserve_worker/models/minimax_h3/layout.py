@@ -61,6 +61,17 @@ def entry_output_schema(layout: H3Layout) -> dict[str, tuple[TensorSpec, ...]]:
                     )
                 ),
             ),
+            *(
+                (
+                    TensorSpec(
+                        "presentation_tags",
+                        DType.I64,
+                        ShapeBound((DeviceDim(int(layout.packed.text_indices.numel())),)),
+                    ),
+                )
+                if layout.packed.reference_shape is not None
+                else ()
+            ),
         ),
         "denoiser": (
             TensorSpec(
@@ -941,12 +952,16 @@ def tensor_output_layout(
     audio_frames: int,
     height: int = 768,
     width: int = 1344,
+    reference_shape: tuple[int, int] | None = None,
+    presentation_tags: torch.Tensor | None = None,
 ) -> TensorOutputLayout | None:
     """Describe one entry's logical H3 tensor and this rank's produced region."""
 
     if bindings.process_group.rank not in bindings.output_ranks(entry):
         return None
     if entry == "text_encoder":
+        if output_index == 1:
+            return TensorOutputLayout((prompt_tokens,))
         return TensorOutputLayout((1, prompt_tokens, H3TextEncoderConfig().hidden_size))
     if entry == "denoiser":
         layout = H3Layout.build(
@@ -956,6 +971,8 @@ def tensor_output_layout(
             audio_frames=audio_frames,
             height=height,
             width=width,
+            reference_shape=reference_shape,
+            presentation_tags=presentation_tags,
         )
         indices = layout.packed.video_indices if output_index == 0 else layout.packed.audio_indices
         count = layout.local_video_rows if output_index == 0 else layout.local_audio_rows

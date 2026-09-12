@@ -82,6 +82,7 @@ def test_token_only_is_byte_identical(encoder):
     before = encoder.language_model(tokens, torch.arange(3))
     assert torch.equal(before.view(torch.uint8), encoder(tokens).view(torch.uint8))
     assert torch.equal(before.view(torch.uint8), encoder(tokens, []).view(torch.uint8))
+    assert torch.equal(before.view(torch.uint8), encoder.numerical_entry(tokens).view(torch.uint8))
 
 
 @torch.no_grad()
@@ -106,7 +107,12 @@ def test_image_presentation_and_processor_grid(encoder):
         tags.tolist()
         == [TEXT_TAG] * label_count + [VIDEO_TAG] * (vision_count + 2) + [TEXT_TAG] * 3
     )
-    assert torch.equal(states, encoder.numerical_entry(tokens, image))
+    published, published_tags = encoder.numerical_entry(tokens, image.unsqueeze(0))
+    assert torch.equal(states, published)
+    assert torch.equal(tags, published_tags)
+    from uniserve_worker.models.minimax_h3.presentation import image_presentation_tags
+
+    assert tuple(tags.tolist()) == image_presentation_tags(encoder.processor, (480, 832), 3)
     changed, _ = encoder.encode_presentation(tokens, [torch.zeros_like(image)])
     assert not torch.equal(states, changed)
     encoder.visual.deepstack_scale = 0.0

@@ -320,6 +320,13 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
     frames = int(contract.get("num_frames", max_frames))
     if frames > max_frames:
         raise ValueError("H3 worker_config capacity is smaller than the checkpoint frame count")
+    presentation_processor = None
+    if contract.get("references"):
+        from transformers import AutoProcessor
+
+        presentation_processor = AutoProcessor.from_pretrained(
+            context.root / "text_encoder", local_files_only=True
+        )
     layout = H3Layout.build(
         bindings,
         frames=frames,
@@ -331,6 +338,11 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
         attention_backend=contract["attention_backend"],
         attention=str(contract["attention"]),
         video_dtype=torch.float32 if precisions["video_vae"] == "fp32" else torch.float16,
+        # Reserve the admitted decoded-image spatial bound on reference workers only.
+        reference_shape=(4096, 4096) if presentation_processor is not None else None,
+        presentation_tags=torch.ones(text_capacity, dtype=torch.long)
+        if presentation_processor is not None
+        else None,
     )
     components = []
     transformer = encoder = video_decoder = audio_decoder = None
@@ -453,6 +465,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
             ),
             layout,
             denoise_steps=contract["denoise_steps"],
+            presentation_processor=presentation_processor,
         )
 
     return ModelConstruction(tuple(components), assemble, config)

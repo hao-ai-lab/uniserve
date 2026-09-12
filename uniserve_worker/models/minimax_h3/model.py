@@ -46,6 +46,7 @@ from .layout import (
     warmup_geometries,
 )
 from .packing import audio_latent_frames
+from .presentation import H3MediaGeometry, image_presentation_tags
 from .transformer import MiniMaxH3Transformer, build_transformer_metadata
 from .video_vae import H3VideoAssembler
 from .weights import H3Components, build_h3_checkpoint
@@ -168,6 +169,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         layout: H3Layout,
         *,
         denoise_steps: int = len(FASTH3_LADDER),
+        presentation_processor=None,
     ) -> None:
         """Bind H3 model components to runtime-owned state, scratch, and device products."""
 
@@ -185,6 +187,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         self.owns_media_output = bindings.owns("output")
         self.device = bindings.process_group.device
         self.layout = layout
+        self.presentation_processor = presentation_processor
         self.denoiser = components.transformer
         self.conditioner = components.conditioner
         if (self.denoiser is not None and self.denoiser.pipeline.first) != (
@@ -259,10 +262,36 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
 
         return build_h3_checkpoint(config, context)
 
-    def execution_key(self, geometry: MediaGeometry) -> tuple[int, int, int, int, int]:
+    def media_geometry(self, media) -> MediaGeometry:
+        """Resolve reference rows identically on every entry owner before product allocation."""
+
+        if not media.references:
+            return media.geometry
+        if self.presentation_processor is None:
+            raise ValueError("this H3 checkpoint does not support references")
+        if len(media.references) != 1:
+            raise ValueError("H3 requires one image reference")
+        reference = media.references[0]
+        if reference.kind != "image" or reference.task != "reference" or reference.pixels is None:
+            raise ValueError("H3 requires an image reference task")
+        shape = tuple(dim.extent for dim in reference.pixels.shape_bound.dims)[1:3]
+        tags = image_presentation_tags(
+            self.presentation_processor, shape, media.geometry.prompt_tokens
+        )
+        return H3MediaGeometry(
+            media.geometry.frame_count,
+            media.geometry.video_units,
+            media.geometry.prompt_tokens,
+            media.geometry.denoise_steps,
+            shape,
+            tags,
+        )
+
+    def execution_key(self, geometry: MediaGeometry) -> tuple:
         """Validate admitted bounds and describe equivalent packed metadata."""
 
-        page_rows = ((geometry.prompt_tokens + 63) // 64) * 64
+        tags = getattr(geometry, "presentation_tags", ())
+        page_rows = ((len(tags) or geometry.prompt_tokens) + 63) // 64 * 64
         audio_frames = audio_latent_frames(geometry.frame_count)
         if (
             page_rows > int(self.layout.packed.text_indices.numel())
@@ -273,7 +302,13 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         units = reconstruction_unit_frames(geometry.frame_count)
         if geometry.video_units != len(units) or geometry.denoise_steps != self.denoise_steps:
             raise ValueError("the H3 worker received invalid computation bounds")
-        return geometry.frame_count, page_rows, audio_frames, self.layout.height, self.layout.width
+        key = (geometry.frame_count, page_rows, audio_frames, self.layout.height, self.layout.width)
+        shape = getattr(geometry, "reference_shape", None)
+        if shape is None:
+            return key
+        if min(shape) < 32 or max(shape) > 4096 or any(size % 32 for size in shape):
+            raise ValueError("H3 reference dimensions must be multiples of 32 within 4096")
+        return (*key, shape, tags)
 
     def build_execution(
         self,
@@ -283,7 +318,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
     ) -> H3ComputeInputs:
         """Build immutable packed metadata for a validated public geometry cache key."""
 
-        frames, text_rows, audio_frames, height, width = self.execution_key(geometry)
+        frames, text_rows, audio_frames, height, width = self.execution_key(geometry)[:5]
         layout = H3Layout.build(
             self.bindings,
             frames=frames,
@@ -295,6 +330,10 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             attention_backend=self.layout.attention_backend,
             attention=self.layout.attention,
             video_dtype=self.layout.video_dtype,
+            reference_shape=getattr(geometry, "reference_shape", None),
+            presentation_tags=torch.tensor(geometry.presentation_tags, dtype=torch.long)
+            if getattr(geometry, "presentation_tags", ())
+            else None,
         )
         return H3ComputeInputs.bind(
             self.bindings,
@@ -356,7 +395,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
 
         if media is None:
             raise ValueError("H3 tensor results require media geometry")
-        frames, text_rows, audio_frames, height, width = self.execution_key(media)
+        frames, text_rows, audio_frames, height, width = self.execution_key(media)[:5]
         return tensor_output_layout(
             self.bindings,
             entry,
@@ -364,7 +403,11 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             decode,
             frames=frames,
             text_rows=text_rows,
-            prompt_tokens=media.prompt_tokens,
+            prompt_tokens=len(getattr(media, "presentation_tags", ())) or media.prompt_tokens,
+            reference_shape=getattr(media, "reference_shape", None),
+            presentation_tags=torch.tensor(media.presentation_tags, dtype=torch.long)
+            if getattr(media, "presentation_tags", ())
+            else None,
             audio_frames=audio_frames,
             height=height,
             width=width,

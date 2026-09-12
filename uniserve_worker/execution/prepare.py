@@ -1209,7 +1209,13 @@ def _reserve_outputs(
                 layout = execution_model.output_layout(
                     operation.entry,
                     output.output_index,
-                    None if media is None else media.geometry,
+                    None
+                    if media is None
+                    else (
+                        execution_model.media_geometry(media)
+                        if isinstance(execution_model, VideoModel)
+                        else media.geometry
+                    ),
                     decode,
                 )
                 if layout is None:

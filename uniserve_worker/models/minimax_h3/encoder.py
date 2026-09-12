@@ -136,9 +136,16 @@ class MiniMaxH3TextEncoder(nn.Module):
         positions = torch.arange(token_ids.shape[1], dtype=torch.long, device=token_ids.device)
         return self.language_model(token_ids, positions)
 
-    def numerical_entry(self, token_ids: torch.Tensor, *images: torch.Tensor) -> torch.Tensor:
-        """Adapt the numerical runner's flat tensor inputs to ordered decoded images."""
-        return self(token_ids, list(images) if images else None)
+    def numerical_entry(
+        self, token_ids: torch.Tensor, *images: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Publish presentation states and tags for decoded THWC image products."""
+
+        if not images:
+            return self(token_ids)
+        if len(images) != 1 or images[0].ndim != 4 or images[0].shape[0] != 1:
+            raise ValueError("H3 requires one single-frame THWC reference")
+        return self.encode_presentation(token_ids, [images[0][0]])
 
     def prepare_images(self, images: list[torch.Tensor]):
         """Process decoded HWC uint8 RGB rasters with the checkpoint's Qwen processor."""

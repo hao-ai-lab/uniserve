@@ -145,6 +145,11 @@ class VideoModel(ExecutionModel, Generic[MetadataT, TensorViewsT], ABC):
 
         raise NotImplementedError
 
+    def media_geometry(self, media) -> MediaGeometry:
+        """Resolve worker geometry from admitted media before allocating entry products."""
+
+        return media.geometry
+
     @abstractmethod
     def execution_key(self, geometry: MediaGeometry) -> Hashable:
         """Validate geometry and identify reusable mathematical metadata."""
