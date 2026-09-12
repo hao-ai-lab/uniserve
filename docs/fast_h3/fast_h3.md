@@ -5,7 +5,7 @@ UniServe serves full FastVideo-exported FastH3 checkpoints as text-to-video-and-
 ## Requirements
 
 - Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA SM100 GPUs such as B200 or GB200.
-- The full FastH3 VSA checkpoint. Base partitions and adapter-only checkpoints are unsupported.
+- A full FastH3 VSA checkpoint or the pinned top-level MiniMax-H3 base root described below. Nested task partitions and adapter-only checkpoints are unsupported.
 - Enough GPU memory for weights, two resident requests, and CUDA graphs. Four local GPUs are the standard setup.
 - Shared memory and pinned-memory access for worker IPC. The container command below provisions 4 GiB of shared memory and unlimited locked memory.
 
@@ -82,6 +82,10 @@ python -m uniserve_worker.bootstrap.inspect_model --model "$H3_MODEL"
 
 An explicit sidecar must equal an embedded manifest when both exist; it cannot override a release. For `uniserve-deploy/serve-fasth3.sbatch`, export `H3_MODEL` and optionally `H3_CONTRACT` (the script exports it as `UNISERVE_H3_CONTRACT`). Record both the checkpoint and sidecar in the serving run before submission. Use `UNISERVE_ROOT` to select the installed UniServe checkout. H3 VSA uses segment-pure prefix tiles, dense prefix queries, always-visible prefix keys, video-only top-k selection, and the trained gated pooled-attention branch. Padding tiles are excluded from logical attention and compression.
 
+### Dense base checkpoint
+
+The top-level `MiniMaxAI/MiniMax-H3@9bfb6693f2cf6de171db46d1aa586f67d773a1da` root resolves a dense T2VA recipe with 50 FP32 scheduler grid points, 49 transformer forwards, and video/audio shifts 12/3. It requires revision receipts for the consumed files (or the corresponding pinned Hugging Face snapshot layout), complete indexed shards, and no distilled manifest. The base `quality` preset uses FP32 video VAE execution and is the default for this root. An explicitly selected missing sidecar is an error; it never falls through to base resolution. Base contract and schedule integration have CPU coverage, not end-to-end GPU validation in this worktree. This root currently loads `transformer`, not `transformer_ref`.
+
 ## Start the server
 
 ```bash
@@ -136,7 +140,7 @@ The first startup compiles native GPU providers and captures shapes on first use
 
 ## Generate a video
 
-Only `model`, `prompt`, `seconds`, and `seed` are accepted. `seconds` defaults to 5 and `seed` defaults to 0.
+The request accepts `model`, `prompt`, `seconds`, `seed`, optional `steps`, and `references`. `seconds` defaults to 5 and `seed` defaults to 0. `steps` counts scheduler grid points, including the terminal point, and must match the checkpoint's configured count; omission uses that count. `references` defaults to an empty array. Nonempty references are not executable and are rejected as unsupported conditioning; they are never silently treated as T2VA.
 
 ```bash
 curl --fail-with-body --max-time 600 \
@@ -195,7 +199,7 @@ Example:
 - The checkpoint contract selects denoiser forward count, schedule and attention settings. The pinned four-step release preserves `[1, 0.75, 0.5, 0.25, 0]` and video/audio sigma shifts `12/3`. The eight-step release uses integer ladder `[999, 874, 749, 624, 500, 375, 250, 125] / 1000`, terminal zero, shifts `10/3`, guidance 1, and eight forwards.
 - VSA sparse attention uses tile size 64 and manifest sparsity (0.9 for the pinned four-step release, 0.8 for the eight-step H3 VSA release). The shared provider selects the installed implementation from the execution device; SM100 uses the native SM100a kernel and supports incremental row production. Dense attention selects a compatible provider from each request’s dtype, head layout and mask. GB200 has end-to-end validation; other hardware requires its own validation before performance claims.
 - Fixed 1344×768 output, 24 fps, and stereo 32-kHz audio.
-- Text-only conditioning. Image/video references, LoRA, variable resolution, guidance changes, and step-count changes are rejected.
+- Text-only conditioning. Nonempty image/video/audio reference bundles, LoRA, variable resolution, guidance changes, and changes to the checkpoint's configured grid-point count are rejected. Parsing an ordered reference descriptor does not enable Ref2VA serving.
 
 ## Quick fixes
 
