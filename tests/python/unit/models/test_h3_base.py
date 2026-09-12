@@ -91,6 +91,8 @@ def base_root(tmp_path: Path):
         install(f"{component}/scheduler_config.json", json.dumps({"shift": shift}))
     for filename in ("tokenizer.json", "tokenizer_config.json"):
         install(f"tokenizer/{filename}", "{}")
+        install(f"text_encoder/{filename}", "{}")
+    install("text_encoder/preprocessor_config.json", "{}")
     return tmp_path
 
 
@@ -124,7 +126,9 @@ def test_reference_contract_identifies_fixed_dense_image_recipe(base_root):
     assert schedule.timesteps[0].numel() == 49
 
 
-@pytest.mark.parametrize("defect", ["missing", "revision", "nested", "unsafe_index"])
+@pytest.mark.parametrize(
+    "defect", ["missing", "revision", "nested", "unsafe_index", "missing_index", "processor"]
+)
 def test_reference_catalog_requires_top_level_pinned_reference_weights(base_root, defect):
     if defect == "missing":
         path = base_root / "transformer_ref/model-0.safetensors"
@@ -134,6 +138,14 @@ def test_reference_catalog_requires_top_level_pinned_reference_weights(base_root
         receipt.write_text("0" * 40 + "\n")
     elif defect == "nested":
         base_root = base_root / "Ref2VA"
+    elif defect in {"missing_index", "processor"}:
+        relative = (
+            "transformer_ref/model.safetensors.index.json"
+            if defect == "missing_index"
+            else "text_encoder/preprocessor_config.json"
+        )
+        path = base_root / relative
+        path.rename(path.with_suffix(".missing"))
     else:
         index = base_root / "transformer_ref/model.safetensors.index.json"
         data = json.loads(index.read_text())

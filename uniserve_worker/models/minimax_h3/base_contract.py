@@ -60,6 +60,8 @@ def resolve_base_h3_contract(root: Path, *, reference: bool = False) -> dict[str
                 raise ValueError(f"base H3 {component} has an invalid weight index")
             shards = set(mapping.values())
         else:
+            if reference and component == transformer:
+                raise ValueError("base H3 transformer_ref requires one weight index")
             shards = {path.name for path in directory.glob("*.safetensors")}
         if not shards or (component == transformer and len(shards) != 14):
             raise ValueError(f"base H3 {component} has an invalid shard count")
@@ -74,6 +76,11 @@ def resolve_base_h3_contract(root: Path, *, reference: bool = False) -> dict[str
         "tokenizer/tokenizer_config.json",
     ):
         require_file(relative)
+    if reference:
+        # The image processor and presentation tokenizer are consumed directly
+        # from text_encoder, independently of the admission tokenizer directory.
+        for filename in ("preprocessor_config.json", "tokenizer.json", "tokenizer_config.json"):
+            require_file(f"text_encoder/{filename}")
     for component, shift in zip(("scheduler", "audio_scheduler"), BASE_H3_SHIFTS, strict=True):
         config = json.loads((root / component / "scheduler_config.json").read_text())
         if config.get("shift") != shift:

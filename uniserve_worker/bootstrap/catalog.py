@@ -172,6 +172,11 @@ REFERENCE_H3_ENTRY = replace(
     sidecars=tuple(
         "transformer_ref/config.json" if path == "transformer/config.json" else path
         for path in BASE_H3_ENTRY.sidecars
+    )
+    + (
+        "text_encoder/preprocessor_config.json",
+        "text_encoder/tokenizer.json",
+        "text_encoder/tokenizer_config.json",
     ),
 )
 
@@ -210,6 +215,6 @@ def resolve_catalog_entry(
     raise unsupported_setup(
         "configured checkpoint must declare exactly one architecture from "
         "Qwen3ForCausalLM, BagelForConditionalGeneration, NEOChatModel, or "
-        "MiniMaxH3Transformer3DModel; "
+        "MiniMaxH3Transformer3DModel, or the minimax-h3-ref serving recipe; "
         f"found {architectures!r}"
     )
