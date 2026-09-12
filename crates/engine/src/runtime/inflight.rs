@@ -132,9 +132,12 @@ impl InflightWindow {
                 }
                 if independent
                     && operation.inputs().iter().any(|input| {
-                        queue
-                            .iter()
-                            .any(|producer| producer.operation.op_id == input.producer_op_id)
+                        // Inline host inputs already exist at admission. Their
+                        // namespaced producer ID is not a scheduled dependency.
+                        input.storage_class != StorageClass::HostStaging
+                            && queue
+                                .iter()
+                                .any(|producer| producer.operation.op_id == input.producer_op_id)
                     })
                 {
                     continue;

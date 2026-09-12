@@ -91,7 +91,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
     )
     pixels = ProductRef(
         key,
-        1,
+        99,  # Request-owned source identity is independent of its consuming operation.
         65535,
         1,
         ProductKind.TENSOR,
@@ -129,7 +129,9 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
                 )
             ),
         ),
-        input_products=(ProductPayload(pixels, bytes([1, 2, 3]) * (32 * 32)),) if with_image else (),
+        input_products=(ProductPayload(pixels, bytes([1, 2, 3]) * (32 * 32)),)
+        if with_image
+        else (),
         buffer_allocations=(BufferAllocation(reference.buffer_id, 0, reference.max_bytes),),
     )
     try:

@@ -88,7 +88,9 @@ class BoundedTensorStorage:
                     field.shape,
                     dtype=field.dtype,
                     device="cpu" if field.memory == "pinned" else device,
-                    pin_memory=field.memory == "pinned",
+                    # Page locking serves asynchronous CUDA transfers. A CPU
+                    # owner uses ordinary host storage and synchronous copies.
+                    pin_memory=field.memory == "pinned" and torch.device(device).type == "cuda",
                 )
                 if field.fill is not None:
                     tensors[name].fill_(field.fill)

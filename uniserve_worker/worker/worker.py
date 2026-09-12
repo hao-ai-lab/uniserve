@@ -551,6 +551,7 @@ class Worker:
             self.media_mux, self.media_output_ring = (
                 create_media_resources(
                     model,
+                    device=self._generation_device,
                     rank=worker_config.rank,
                     owns_output=model.owns_media_output
                     and worker_config.rank == info.output_rank("output"),

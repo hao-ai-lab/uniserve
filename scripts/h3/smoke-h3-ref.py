@@ -3,10 +3,10 @@
 
 import argparse
 import base64
-from datetime import datetime, timezone
 import json
-from pathlib import Path
 import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
 
 DEPLOY = Path("/mnt/lustre/vlm-wlsaidhi/src/uniserve-deploy")
 OUTPUT = Path("/mnt/lustre/vlm-wlsaidhi/fastvideo/eval/uniserve-smoke/ref")

@@ -1324,12 +1324,16 @@ impl NewRequest {
             for reference in &diffusion.references {
                 reference.validate(self.request_key)?;
                 ensure_valid!(
-                    reference.kind == "image" && reference.task == "reference" && reference.role == "reference",
+                    reference.kind == "image"
+                        && reference.task == "reference"
+                        && reference.role == "reference",
                     "references requires image with task=reference and role=reference"
                 );
                 let pixels = reference.pixels.as_ref().expect("validated image pixels");
                 ensure_valid!(
-                    pixels.shape_bound.dims[1..3].iter().all(|dim| matches!(dim, DimBound::Static(n) if n % 32 == 0)),
+                    pixels.shape_bound.dims[1..3]
+                        .iter()
+                        .all(|dim| matches!(dim, DimBound::Static(n) if n % 32 == 0)),
                     "references image dimensions must be multiples of 32"
                 );
             }
@@ -1901,9 +1905,10 @@ impl Run {
                 .filter(|input| input.storage_class == StorageClass::HostStaging)
             {
                 ensure_valid!(
-                    input.request_key == operation.request_key
-                        && input.producer_op_id == operation.op_id,
-                    "a host-staging input is not owned by its consuming operation"
+                    // Inline inputs are request-owned data, not scheduled
+                    // producer results. Several entries can consume one raster.
+                    input.request_key == operation.request_key,
+                    "a host-staging input is not owned by its consuming request"
                 );
             }
         }

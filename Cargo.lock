@@ -4179,6 +4179,7 @@ dependencies = [
  "uniserve-core",
  "uniserve-engine",
  "uniserve-observability",
+ "uniserve-worker-ipc",
  "uuid",
  "validator",
  "winnow 1.0.3",

@@ -251,6 +251,12 @@ pub enum ServeError {
         /// Stable feature name.
         feature: &'static str,
     },
+    /// A reference descriptor, capability, or raster violates a public admission rule.
+    #[error("{rule}")]
+    InvalidReferences {
+        /// Safe static rule text; never contains source payloads or decoder diagnostics.
+        rule: &'static str,
+    },
     /// The prompt exceeds the profile context limit.
     #[error(
         "request `{request_id}` has {prompt_tokens} prompt tokens, exceeding the {max_tokens}-token profile limit"
@@ -427,10 +433,8 @@ impl ServingRuntime {
         let image_reference = references::admit_references(
             &request.references,
             self.model.supports_image_references(),
-        ).map_err(|message| ServeError::Tokenize {
-            request_id: request.request_id.clone(),
-            source: TokenizeError::Invalid(message.to_owned()),
-        })?;
+        )
+        .map_err(|rule| ServeError::InvalidReferences { rule })?;
         let (geometry, prompt_token_ids) = self.model.resolve_video_request_geometry(
             &request.request_id,
             &request.prompt,

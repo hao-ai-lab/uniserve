@@ -249,7 +249,8 @@ class ModelRunner:
                 )
             self._preparation_stream = (
                 torch.cuda.Stream(device=worker_config.device)
-                if bool(model.resource_geometry.request_tensors)
+                if model.resource_geometry.request_tensors
+                and torch.device(worker_config.device).type == "cuda"
                 else None
             )
             self._sum_reductions = environment.sum_reductions() if environment is not None else {}
@@ -492,12 +493,31 @@ class ModelRunner:
         staging.release(index)
         return target.view(1, -1)
 
-    def run_entry(self, name: str, *inputs: torch.Tensor) -> EntryResult:
-        """Execute an entry and validate its declared logical Tensor results."""
+    def run_entry(
+        self,
+        name: str,
+        *inputs: torch.Tensor,
+        output_indices: tuple[int, ...] | None = None,
+    ) -> EntryResult:
+        """Execute an entry and validate the logical results selected by its request.
+
+        The entry schema declares available products. A request can select a
+        subset, such as conditioning alone for text or conditioning plus image
+        presentation tags. Results must match the selected schemas in order.
+        Omitting the selection requires every declared result.
+        """
 
         schemas = self.model.entry_outputs.get(name)
         if schemas is None:
             raise InputError(f"model does not declare computation entry {name!r}")
+        if output_indices is not None:
+            if (
+                not output_indices
+                or len(set(output_indices)) != len(output_indices)
+                or any(index < 0 or index >= len(schemas) for index in output_indices)
+            ):
+                raise InputError(f"entry {name!r} selected undeclared tensor results")
+            schemas = tuple(schemas[index] for index in output_indices)
 
         def validate(values: tuple[torch.Tensor, ...]) -> None:
             if len(values) != len(schemas):
@@ -1115,7 +1135,15 @@ class ModelRunner:
 
         stream = self._preparation_stream
         if stream is None:
-            raise RuntimeError("input preparation requires an assigned execution stream")
+            if torch.device(self.worker_config.device).type == "cuda":
+                raise RuntimeError("input preparation requires an assigned execution stream")
+            # Host copies are synchronous; CPU execution has no stream to join.
+            for destination, source in transfers:
+                if destination.shape != source.shape or destination.dtype != source.dtype:
+                    raise ValueError("prepared input must match destination shape and dtype")
+                destination.copy_(source)
+            yield
+            return
         try:
             with torch.cuda.stream(stream):
                 for destination, source in transfers:

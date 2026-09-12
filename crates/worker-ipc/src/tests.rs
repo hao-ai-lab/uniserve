@@ -998,7 +998,7 @@ fn batch_carries_host_supplied_input_product_values() {
 }
 
 #[test]
-fn admitted_image_pixels_reach_encoder_inputs() {
+fn admitted_image_pixels_are_request_owned_across_consumers() {
     let pixels = ProductRef {
         request_key: request_key(),
         producer_op_id: OpId(11),
@@ -1039,6 +1039,8 @@ fn admitted_image_pixels_reach_encoder_inputs() {
         ),
     }
     .sealed();
+    let mut second_consumer = operation.clone();
+    second_consumer.op_id = OpId(12);
     let run = batch_with_operations(1, vec![admission], vec![operation]).with_input_products(vec![
         ProductPayload {
             product: pixels,
@@ -1046,6 +1048,15 @@ fn admitted_image_pixels_reach_encoder_inputs() {
         },
     ]);
     assert_eq!(execute_round_trip(run.clone()), run);
+    let second = batch_with_operations(2, Vec::new(), vec![second_consumer])
+        .with_input_products(run.input_products.clone());
+    assert_eq!(execute_round_trip(second.clone()), second);
+    let mut foreign = second;
+    foreign.operations[0].request_key.request_id = RequestId(42);
+    assert!(
+        foreign.validate().is_err(),
+        "cross-request host input accepted"
+    );
     for length in [32 * 32 * 3 - 1, 32 * 32 * 3 + 1] {
         let mut invalid = run.clone();
         invalid.input_products[0].value = InlineValue::Bytes(vec![0; length]);

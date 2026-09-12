@@ -3695,12 +3695,14 @@ class Run:
         }
         for operation in self.operations:
             for product in operation.inputs:
-                if product.storage_class is StorageClass.HOST_STAGING and (
-                    product.request_key != operation.request_key
-                    or product.producer_op_id != operation.op_id
+                # Inline data is request-owned and can feed multiple entries;
+                # its producer ID namespaces the source, not an execution edge.
+                if (
+                    product.storage_class is StorageClass.HOST_STAGING
+                    and product.request_key != operation.request_key
                 ):
                     raise invalid_descriptor(
-                        "a host-staging input is not owned by its consuming operation"
+                        "a host-staging input is not owned by its consuming request"
                     )
         supplied_inputs: set[ProductRef] = set()
         for payload in self.input_products:

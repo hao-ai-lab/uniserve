@@ -188,7 +188,7 @@ def _encode_text(
         reference = media.references[0]
         if (
             reference.kind != "image"
-            or reference.task not in {"reference", "first_frame"}
+            or reference.task != "reference"
             or reference.pixels is None
             or tuple(operation.inputs) != (reference.pixels,)
         ):
@@ -203,6 +203,7 @@ def _encode_text(
         operation.entry,
         tokens,
         *reference_inputs,
+        output_indices=tuple(output.output_index for output in operation.outputs),
     )
     if len(result.values) != len(operation.outputs):
         raise invalid_descriptor("text encoder output declarations disagree with the loaded entry")

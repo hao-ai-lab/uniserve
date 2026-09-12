@@ -131,11 +131,14 @@ fn reference_admission_is_capability_gated_and_decode_bounded() {
     use uniserve_server::serving::references::admit_references;
     for format in [image::ImageFormat::Png, image::ImageFormat::Jpeg] {
         let reference = image_reference(format, 64, 32);
-        assert!(
-            admit_references(&[reference.clone()], false)
-                .unwrap_err()
-                .contains("model contract")
+        let rule = admit_references(&[reference.clone()], false).unwrap_err();
+        let error = uniserve_server::openai::error::serve_error_to_api(
+            uniserve_server::serving::ServeError::InvalidReferences { rule },
         );
+        assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        let response = error.to_error_response();
+        assert!(response.error.message.contains("model contract"));
+        assert_eq!(response.error.param.as_deref(), Some("references"));
         let image = admit_references(&[reference.clone()], true)
             .unwrap()
             .unwrap();

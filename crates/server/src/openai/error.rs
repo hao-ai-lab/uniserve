@@ -150,6 +150,9 @@ pub fn serve_error_to_api(error: ServeError) -> ApiError {
         | ServeError::ContextCapacityExceeded { .. }
         | ServeError::DuplicateRequestId { .. }
         | ServeError::Tokenize { .. }) => ApiError::invalid_request(error.to_string(), None),
+        ServeError::InvalidReferences { rule } => {
+            ApiError::invalid_request(rule.to_owned(), Some("references"))
+        }
         ServeError::ModelResolution(source) => {
             ApiError::server_error(format!("model resolution error: {source}"))
         }

@@ -21,8 +21,7 @@ from uniserve_worker.nn.parallel import ParallelConfig
 CHECKPOINT = Path("/mnt/lustre/vlm-k1kong/models/MiniMax-H3/text_encoder")
 
 
-@pytest.fixture
-def encoder():
+def make_encoder():
     torch.manual_seed(7)
     config = H3TextEncoderConfig(
         vocab_size=151936,
@@ -71,6 +70,11 @@ def encoder():
         text_config=SimpleNamespace(rope_parameters={"mrope_section": [2, 1, 1]}),
     )
     return model.eval()
+
+
+@pytest.fixture
+def encoder():
+    return make_encoder()
 
 
 @torch.no_grad()

@@ -84,6 +84,7 @@ def require_video_codecs() -> None:
 def create_media_resources(
     model: VideoModel,
     *,
+    device: torch.device | str,
     rank: int,
     owns_output: bool,
     state_slots: int,
@@ -97,6 +98,7 @@ def create_media_resources(
     return (
         VideoMuxCoordinator(rank=rank),
         VideoOutputRing(
+            device=device,
             state_slots=state_slots,
             unresolved_window=unresolved_window,
             max_video_frames_per_round=model.decode_frame_capacity,
@@ -106,11 +108,12 @@ def create_media_resources(
 
 
 class VideoOutputRing:
-    """Bounded pinned captures shared by bounded video decode implementations."""
+    """Bounded host captures, page-locked when their producer executes on CUDA."""
 
     def __init__(
         self,
         *,
+        device: torch.device | str,
         state_slots: int,
         unresolved_window: int,
         max_video_frames_per_round: int,
@@ -136,12 +139,13 @@ class VideoOutputRing:
         )
         if min(video_bytes, audio_bytes) < 1:
             raise ValueError("video output-ring media capacities must be positive")
+        pin_memory = torch.device(device).type == "cuda"
         self._video_storage = tuple(
-            torch.empty(video_bytes, dtype=torch.uint8, pin_memory=True)
+            torch.empty(video_bytes, dtype=torch.uint8, pin_memory=pin_memory)
             for _ in range(self.video_capacity)
         )
         self._audio_storage = tuple(
-            torch.empty(audio_bytes, dtype=torch.uint8, pin_memory=True)
+            torch.empty(audio_bytes, dtype=torch.uint8, pin_memory=pin_memory)
             for _ in range(self.audio_capacity)
         )
         self._video_free = list(range(self.video_capacity - 1, -1, -1))

@@ -759,6 +759,7 @@ def test_media_capture_releases_capacity_after_its_completion_fence():
     events = DeviceEventPool()
     outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
     ring = VideoOutputRing(
+        device="cuda:0",
         state_slots=1,
         unresolved_window=1,
         max_video_frames_per_round=1,
