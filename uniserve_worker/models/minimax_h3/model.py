@@ -198,6 +198,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         self.text_max_tokens = int(layout.packed.text_indices.numel())
         self.entry_outputs = entry_output_schema(layout)
         self.video_decoder = components.video_vae
+        self.image_vae = components.image_vae
         self.audio_decoder = components.audio_vae
         self.video_assembler = H3VideoAssembler(self.device) if self.owns_media_output else None
         for name, module in (
@@ -287,6 +288,11 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             tags,
         )
 
+    def conditioning_rows(self, geometry: MediaGeometry) -> int:
+        """Count all presentation rows, including label and merged vision spans."""
+
+        return len(getattr(geometry, "presentation_tags", ())) or geometry.prompt_tokens
+
     def execution_key(self, geometry: MediaGeometry) -> tuple:
         """Validate admitted bounds and describe equivalent packed metadata."""
 
@@ -308,6 +314,9 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             return key
         if min(shape) < 32 or max(shape) > 4096 or any(size % 32 for size in shape):
             raise ValueError("H3 reference dimensions must be multiples of 32 within 4096")
+        capacity_shape = self.layout.packed.reference_shape
+        if capacity_shape is None or shape[0] * shape[1] > capacity_shape[0] * capacity_shape[1]:
+            raise ValueError("H3 reference geometry exceeds the configured model capacity")
         return (*key, shape, tags)
 
     def build_execution(
@@ -366,6 +375,12 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
     ) -> None:
         """Install refined presentation and optional decoded image in a bound layout."""
 
+        if presentation_tags is None and (
+            self.denoiser is None or not self.denoiser.pipeline.first
+        ):
+            # Only the input stage consumes encoder products; later stages still
+            # bind identical row tags and rotary geometry from shape-only planning.
+            presentation_tags = execution.layout.packed.presentation_tags
         execution.prepare_tensors(
             slot,
             encoded,
@@ -373,7 +388,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             self.denoiser,
             presentation_tags=presentation_tags,
             reference_image=reference_image,
-            video_vae=self.video_decoder,
+            video_vae=self.image_vae,
         )
 
     @torch.inference_mode()

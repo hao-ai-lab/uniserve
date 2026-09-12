@@ -479,13 +479,13 @@ def run_action(
     scratch = model_runner.scratch
     if scratch is None:
         raise RuntimeError("video execution has no allocated scratch storage")
-    media_geometry = media.geometry
+    media_geometry = model.media_geometry(media)
     metadata = model_runner.prepare_geometry(
         model.execution_key(media_geometry),
         lambda: model.build_execution(media_geometry, scratch, model_runner.context_workspace),
     )
     slot = model.request_tensors(
-        request_pool.tensors(request.request.request_pool_idx), media.geometry, metadata
+        request_pool.tensors(request.request.request_pool_idx), media_geometry, metadata
     )
     mux = media_mux
     if operation.kind in {OpCode.MEDIA_APPEND, OpCode.DIFFUSION_FINALIZE} and mux is None:
@@ -505,8 +505,39 @@ def run_action(
         inputs = tuple(
             product for product in operation.inputs if product.kind is ProductKind.TENSOR
         )
-        if len(inputs) != 1:
-            raise invalid_descriptor("video preparation requires one conditioning Tensor")
+        expected_inputs = 3 if media.references else 1
+        if len(inputs) != expected_inputs:
+            raise invalid_descriptor("video preparation conditioning products are incomplete")
+        presentation_tags = reference_image = None
+        if media.references:
+            if len(media.references) != 1 or inputs[2] != media.references[0].pixels:
+                raise invalid_descriptor("video preparation requires its declared image pixels")
+            tags_read = device_products.consume(
+                inputs[1],
+                consumer_op_id=operation.op_id,
+                device=model_runner.operation_device(operation),
+            )
+            scope.device_reads.append(tags_read)
+            if tags_read.region is not None:
+                raise invalid_descriptor("presentation tags require complete product coverage")
+            presentation_tags = tags_read.tensor
+            # Inline decoded pixels are request-owned host tensors, whereas a
+            # transported pixel product is leased from the device-product owner.
+            pixels = scope.input_tensors.get(inputs[2])
+            if pixels is None:
+                pixel_read = device_products.consume(
+                    inputs[2],
+                    consumer_op_id=operation.op_id,
+                    device=model_runner.operation_device(operation),
+                )
+                scope.device_reads.append(pixel_read)
+                if pixel_read.region is not None:
+                    raise invalid_descriptor("reference pixels require complete product coverage")
+                pixels = pixel_read.tensor
+            if pixels is not None:
+                if pixels.ndim != 4 or pixels.shape[0] != 1:
+                    raise invalid_descriptor("reference pixels must contain one THWC image")
+                reference_image = pixels[0]
         conditioning = device_products.consume(
             inputs[0],
             consumer_op_id=operation.op_id,
@@ -528,7 +559,17 @@ def run_action(
                 if len(result.values) != 1:
                     raise invalid_descriptor("conditioning computation must return one Tensor")
                 encoded = result.values[0]
-            model.prepare_tensors(slot, metadata, encoded, len(media.prompt_token_ids))
+            if media.references:
+                model.prepare_tensors(
+                    slot,
+                    metadata,
+                    encoded,
+                    model.conditioning_rows(media_geometry),
+                    presentation_tags=presentation_tags,
+                    reference_image=reference_image,
+                )
+            else:
+                model.prepare_tensors(slot, metadata, encoded, len(media.prompt_token_ids))
     elif operation.kind is OpCode.DIFFUSION_STEP:
         params = trajectory_params(scope.lane, operation)
         start_step, step_count = int(params.start_step), int(params.step_count)

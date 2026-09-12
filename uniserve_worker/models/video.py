@@ -150,6 +150,11 @@ class VideoModel(ExecutionModel, Generic[MetadataT, TensorViewsT], ABC):
 
         return media.geometry
 
+    def conditioning_rows(self, geometry: MediaGeometry) -> int:
+        """Return the logical encoder sequence length for preparation."""
+
+        return geometry.prompt_tokens
+
     @abstractmethod
     def execution_key(self, geometry: MediaGeometry) -> Hashable:
         """Validate geometry and identify reusable mathematical metadata."""
@@ -182,6 +187,9 @@ class VideoModel(ExecutionModel, Generic[MetadataT, TensorViewsT], ABC):
         metadata: MetadataT,
         encoded: torch.Tensor | None,
         text_rows: int,
+        *,
+        presentation_tags: torch.Tensor | None = None,
+        reference_image: torch.Tensor | None = None,
     ) -> None:
         """Install computed conditioning and mathematical metadata into request tensor views."""
 

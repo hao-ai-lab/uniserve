@@ -245,8 +245,8 @@ class _VideoTransformer(nn.Module):
         self.rope = _RotaryEmbedding(device=buffer_device)
 
 
-class MiniMaxH3VideoDecoder(nn.Module):
-    """Checkpoint VAE weights: causal image encoder and 36-layer ViT decoder."""
+class H3ImagePosterior(nn.Module):
+    """Causal image posterior weights and shared checkpoint spatial tiling."""
 
     spatial_compression_ratio = 16
     temporal_compression_ratio = 4
@@ -263,18 +263,14 @@ class MiniMaxH3VideoDecoder(nn.Module):
     def __init__(
         self,
         *,
-        layer_config: LayerConfig,
         parameter_device: torch.device | str = "meta",
-        buffer_device: torch.device | str | None = None,
     ) -> None:
-        """Allocate the checkpoint-defined decoder on its parameter and buffer devices."""
+        """Allocate only the FP32 weights consumed by image conditioning."""
 
         super().__init__()
         with torch.device(parameter_device):
             self.encoder = H3ImageEncoder()
             self.quant_conv = nn.Conv3d(48, 48, kernel_size=1)
-            self.post_quant_conv = nn.Conv3d(24, 24, kernel_size=1)
-            self.decoder = _VideoTransformer(layer_config.child("decoder"), buffer_device)
 
     @staticmethod
     def _split_tiles(
@@ -331,6 +327,22 @@ class MiniMaxH3VideoDecoder(nn.Module):
                 assembled.append(tile)
             assembled_rows.append(torch.cat(assembled, dim=-1))
         return torch.cat(assembled_rows, dim=-2)
+
+
+class MiniMaxH3VideoDecoder(H3ImagePosterior):
+    """Checkpoint VAE weights: causal image encoder and 36-layer ViT decoder."""
+
+    def __init__(
+        self,
+        *,
+        layer_config: LayerConfig,
+        parameter_device: torch.device | str = "meta",
+        buffer_device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__(parameter_device=parameter_device)
+        with torch.device(parameter_device):
+            self.post_quant_conv = nn.Conv3d(24, 24, kernel_size=1)
+            self.decoder = _VideoTransformer(layer_config.child("decoder"), buffer_device)
 
     def forward(self, projected_latents: torch.Tensor) -> torch.Tensor:
         """Decode projected `[B, 24, T, H, W]` latents into full-resolution RGB tensors."""
@@ -454,7 +466,7 @@ class MiniMaxH3VideoVAE(nn.Module):
     latents_mean: torch.Tensor
     latents_std: torch.Tensor
 
-    def __init__(self, vae: MiniMaxH3VideoDecoder, *, linear_precision: LinearPrecision) -> None:
+    def __init__(self, vae: H3ImagePosterior, *, linear_precision: LinearPrecision) -> None:
         """Prepare one resident video decoder with fixed precision and normalization buffers."""
 
         super().__init__()

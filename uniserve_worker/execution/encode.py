@@ -188,11 +188,11 @@ def _encode_text(
         reference = media.references[0]
         if (
             reference.kind != "image"
-            or reference.task != "first_frame"
+            or reference.task not in {"reference", "first_frame"}
             or reference.pixels is None
             or tuple(operation.inputs) != (reference.pixels,)
         ):
-            raise invalid_descriptor("text conditioning requires a declared first-frame image")
+            raise invalid_descriptor("text conditioning requires a declared image reference")
         pixels = scope.input_tensors.get(reference.pixels)
         if pixels is None:
             raise invalid_descriptor("image conditioning has no admitted pixel product")

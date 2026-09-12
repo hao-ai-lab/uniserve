@@ -7,33 +7,18 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
-from torch import nn
-from transformers import AutoProcessor
+from transformers import AutoProcessor, Qwen3VLVisionConfig
 
 from uniserve_worker.backends.attention.torch_sdpa import TorchSDPAAttentionBackend
 from uniserve_worker.execution.forward_batch import AttentionSelection
 from uniserve_worker.models.minimax_h3.encoder import H3TextEncoderConfig, MiniMaxH3TextEncoder
 from uniserve_worker.models.minimax_h3.packing import TEXT_TAG, VIDEO_TAG
+from uniserve_worker.models.minimax_h3.vision import H3VisionModel
 from uniserve_worker.nn.attention import bind_dense_attention_modules
 from uniserve_worker.nn.mesh import DeviceMesh
 from uniserve_worker.nn.parallel import ParallelConfig
 
 CHECKPOINT = Path("/mnt/lustre/vlm-k1kong/models/MiniMax-H3/text_encoder")
-
-
-class VisionTower(nn.Module):
-    """Deterministic Qwen tower double with full-width DeepStack outputs."""
-
-    def __init__(self):
-        super().__init__()
-        self.deepstack_scale = 1.0
-        self.patch_embed = nn.Module()
-        self.patch_embed.proj = nn.Linear(1, 1, dtype=torch.bfloat16)
-
-    def forward(self, pixels, grid):
-        rows = int(grid.prod(dim=1).sum()) // 4
-        features = torch.full((rows, 16), float(pixels.float().mean()), dtype=torch.bfloat16)
-        return features, [torch.full_like(features, self.deepstack_scale)]
 
 
 @pytest.fixture
@@ -65,7 +50,19 @@ def encoder():
             else:
                 parameter.copy_(torch.randn(parameter.shape) / 8)
     model.processor = AutoProcessor.from_pretrained(CHECKPOINT, local_files_only=True)
-    model.visual = VisionTower()
+    vision = Qwen3VLVisionConfig(
+        depth=1,
+        hidden_size=16,
+        intermediate_size=32,
+        num_heads=2,
+        out_hidden_size=16,
+        patch_size=16,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[0],
+    )
+    model.visual = H3VisionModel(vision).to(torch.bfloat16)
     model.vision_config = SimpleNamespace(
         image_token_id=151655,
         vision_start_token_id=151652,
@@ -115,9 +112,6 @@ def test_image_presentation_and_processor_grid(encoder):
     assert tuple(tags.tolist()) == image_presentation_tags(encoder.processor, (480, 832), 3)
     changed, _ = encoder.encode_presentation(tokens, [torch.zeros_like(image)])
     assert not torch.equal(states, changed)
-    encoder.visual.deepstack_scale = 0.0
-    without_deepstack, _ = encoder.encode_presentation(tokens, [image])
-    assert not torch.equal(states[:, -3:], without_deepstack[:, -3:])
 
 
 def test_invalid_decoded_raster(encoder):

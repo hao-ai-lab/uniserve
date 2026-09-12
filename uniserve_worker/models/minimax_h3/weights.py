@@ -37,7 +37,7 @@ from .transformer import (
     MiniMaxH3Transformer,
     build_conditioner,
 )
-from .video_vae import MiniMaxH3VideoDecoder, MiniMaxH3VideoVAE
+from .video_vae import H3ImagePosterior, MiniMaxH3VideoDecoder, MiniMaxH3VideoVAE
 
 
 @dataclass(slots=True)
@@ -49,6 +49,7 @@ class H3Components:
     encoder: MiniMaxH3TextEncoder | None
     video_vae: MiniMaxH3VideoVAE | None
     audio_vae: MiniMaxH3AudioVAE | None
+    image_vae: MiniMaxH3VideoVAE | None = None
 
 
 def validate_h3_entries(bindings: EntryBindings) -> None:
@@ -279,7 +280,7 @@ def _map_encoder(model: MiniMaxH3TextEncoder, handles: Iterable[WeightHandle]) -
     return report
 
 
-def _map_video_decoder(model: MiniMaxH3VideoDecoder, handles: Iterable[WeightHandle]) -> LoadReport:
+def _map_video_decoder(model: nn.Module, handles: Iterable[WeightHandle]) -> LoadReport:
     """Translate the checkpoint's value-first feed-forward projection names."""
 
     parameters = dict(model.named_parameters())
@@ -436,6 +437,22 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
                 strict=False,
             )
         )
+    image_posterior = None
+    if presentation_processor is not None and conditioner is not None:
+        # Reference pixels are consumed by each denoiser input-stage replica.
+        # Decoder entry placement is independent; share weights only when colocated.
+        image_posterior = video_decoder
+        if image_posterior is None:
+            image_posterior = H3ImagePosterior(parameter_device="meta")
+            components.append(
+                CheckpointComponent(
+                    image_posterior,
+                    source="video_decoder",
+                    map_weights=partial(_map_video_decoder, image_posterior),
+                    dtype=torch.float32,
+                    strict=False,
+                )
+            )
     if bindings.owns("audio_decoder"):
         from diffusers import AutoencoderKLMiniMaxH3Audio
 
@@ -462,6 +479,9 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
                 if video_decoder is not None
                 else None,
                 audio_vae=MiniMaxH3AudioVAE(audio_decoder) if audio_decoder is not None else None,
+                image_vae=MiniMaxH3VideoVAE(image_posterior, linear_precision="fp32")
+                if image_posterior is not None
+                else None,
             ),
             layout,
             denoise_steps=contract["denoise_steps"],
