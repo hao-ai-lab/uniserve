@@ -990,6 +990,8 @@ class ComputationId:
     batch_id: int
     request_index: int
 
+    _hash_value: int | None = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         if not 0 <= self.batch_id <= 0xFFFFFFFFFFFFFFFF:
             raise invalid_descriptor("computation batch id is outside uint64")
@@ -997,6 +999,15 @@ class ComputationId:
             raise invalid_descriptor("computation request index is outside uint32")
         if self.batch_id == 0 and self.request_index != 0:
             raise invalid_descriptor("admission identity requires request index zero")
+
+    def __hash__(self) -> int:
+        """Reuse the hash of these immutable integer identity coordinates."""
+
+        value = self._hash_value
+        if value is None:
+            value = hash((self.batch_id, self.request_index))
+            object.__setattr__(self, "_hash_value", value)
+        return value
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "computation_id") -> ComputationId:
@@ -1020,12 +1031,23 @@ class RequestKey:
     request_id: int
     request_epoch: int
 
+    _hash_value: int | None = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         """Validate the non-negative request identifier and epoch."""
 
         _nonnegative(self.engine_id, "request_key.engine_id")
         _nonnegative(self.request_id, "request_key.request_id")
         _nonnegative(self.request_epoch, "request_key.request_epoch")
+
+    def __hash__(self) -> int:
+        """Reuse the hash of these immutable integer identity coordinates."""
+
+        value = self._hash_value
+        if value is None:
+            value = hash((self.engine_id, self.request_id, self.request_epoch))
+            object.__setattr__(self, "_hash_value", value)
+        return value
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "request_key") -> RequestKey:
@@ -1184,6 +1206,8 @@ class TensorRef:
     dtype: DType
     shape_bound: ShapeBound
 
+    _buffer_id: BufferId | None = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         """Validate allocation generation and bounded tensor capacity."""
 
@@ -1193,14 +1217,18 @@ class TensorRef:
 
     @property
     def buffer_id(self) -> BufferId:
-        """Derive the persistent-buffer identity carried by this product generation."""
+        """Borrow the immutable storage identity shared by this reference's consumers."""
 
-        return BufferId(
-            owner=self.request_key,
-            producer_op_id=self.producer_op_id,
-            output_index=self.output_index,
-            generation=self.generation,
-        )
+        identity = self._buffer_id
+        if identity is None:
+            identity = BufferId(
+                owner=self.request_key,
+                producer_op_id=self.producer_op_id,
+                output_index=self.output_index,
+                generation=self.generation,
+            )
+            object.__setattr__(self, "_buffer_id", identity)
+        return identity
 
     @property
     def max_bytes(self) -> int:
@@ -1249,11 +1277,22 @@ class BufferId:
     output_index: int
     generation: int
 
+    _hash_value: int | None = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         """Validate the owning request, operation identifier, and version."""
 
         if self.generation < 1:
             raise invalid_descriptor("buffer id has no logical generation")
+
+    def __hash__(self) -> int:
+        """Reuse the hash of these immutable integer identity coordinates."""
+
+        value = self._hash_value
+        if value is None:
+            value = hash((self.owner, self.producer_op_id, self.output_index, self.generation))
+            object.__setattr__(self, "_hash_value", value)
+        return value
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "buffer_id") -> BufferId:
@@ -3403,6 +3442,7 @@ def _interned_request_key(engine_id: int, request_id: int, request_epoch: int) -
     object.__setattr__(key, "engine_id", engine_id)
     object.__setattr__(key, "request_id", request_id)
     object.__setattr__(key, "request_epoch", request_epoch)
+    object.__setattr__(key, "_hash_value", None)
     return key
 
 
@@ -3516,6 +3556,7 @@ def _fast_tensor_ref(value: object) -> TensorRef | None:
     set_field(reference, "generation", generation)
     set_field(reference, "dtype", dtype)
     set_field(reference, "shape_bound", shape_bound)
+    set_field(reference, "_buffer_id", None)
     return reference
 
 
