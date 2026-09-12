@@ -2792,16 +2792,130 @@ class MediaGeometry:
 
 
 @dataclass(frozen=True, slots=True)
+class DecodedReference:
+    """Ordered RGB u8 THWC pixels and prepared 32-kHz stereo f32 audio products.
+
+    Source credentials never cross this boundary. Tensor storage and release use
+    the same request-owned product protocol as other model inputs.
+    """
+
+    kind: str
+    task: str
+    role: str
+    include_audio: bool
+    pixels: ProductRef | None
+    audio: ProductRef | None
+    fps_num: int
+    fps_den: int
+
+    def __post_init__(self) -> None:
+        visual = self.kind in ("image", "video")
+        valid_task = (
+            (self.task == "reference" and self.role == "reference")
+            or (self.kind == "image" and self.task == "first_frame" and self.role == "first_frame")
+            or (
+                self.kind == "image"
+                and self.task == "first_last_frame"
+                and self.role in ("first_frame", "last_frame")
+            )
+            or (
+                self.kind == "video"
+                and self.task in ("continue_scene", "continue_shot")
+                and self.role == "preceding"
+            )
+        )
+        if not (visual or self.kind == "audio") or not valid_task:
+            raise invalid_descriptor("invalid reference modality, task or role")
+        if (self.pixels is not None) != visual:
+            raise invalid_descriptor("reference pixels disagree with modality")
+        if type(self.include_audio) is not bool or (self.include_audio and self.kind != "video"):
+            raise invalid_descriptor("soundtrack selection requires video")
+        if (self.audio is not None) != (self.kind == "audio" or self.include_audio):
+            raise invalid_descriptor("reference audio disagrees with soundtrack policy")
+        _nonnegative(self.fps_num, "reference fps_num")
+        _nonnegative(self.fps_den, "reference fps_den")
+        if self.fps_den == 0 or (
+            self.fps_num == 0 if self.kind == "video" else (self.fps_num, self.fps_den) != (0, 1)
+        ):
+            raise invalid_descriptor("invalid reference frame rate")
+        for product in (self.pixels, self.audio):
+            if product is None:
+                continue
+            if product.kind != ProductKind.TENSOR:
+                raise invalid_descriptor("reference must name a tensor product")
+            if not all(
+                isinstance(dim, StaticDim) and dim.extent > 0 for dim in product.shape_bound.dims
+            ):
+                raise invalid_descriptor("decoded reference dimensions must be static and positive")
+        if self.pixels is not None:
+            dims = tuple(dim.extent for dim in self.pixels.shape_bound.dims)
+            if self.pixels.dtype != DType.U8 or len(dims) != 4 or dims[3] != 3:
+                raise invalid_descriptor("reference pixels must be RGB u8 THWC")
+            frames, height, width, _ = dims
+            if (
+                frames > 720
+                or height > 4096
+                or width > 4096
+                or frames * height * width > 128 * 1024 * 1024
+            ):
+                raise invalid_descriptor("reference pixel budget exceeded")
+            if self.kind == "image" and frames != 1:
+                raise invalid_descriptor("image reference must have one frame")
+        if self.audio is not None:
+            dims = tuple(dim.extent for dim in self.audio.shape_bound.dims)
+            if self.audio.dtype != DType.F32 or len(dims) != 2 or dims[0] != 2 or dims[1] > 960_000:
+                raise invalid_descriptor(
+                    "reference audio must be stereo f32 with at most 30 seconds at 32 kHz"
+                )
+
+    @classmethod
+    def from_mapping(cls, value: object, where: str = "decoded reference") -> DecodedReference:
+        """Parse resolved descriptors without fetching or decoding media."""
+        data = _map(value, where)
+        return cls(
+            kind=_str(data.get("kind"), f"{where}.kind"),
+            task=_str(data.get("task"), f"{where}.task"),
+            role=_str(data.get("role"), f"{where}.role"),
+            include_audio=data.get("include_audio"),
+            pixels=None if data.get("pixels") is None else ProductRef.from_mapping(data["pixels"]),
+            audio=None if data.get("audio") is None else ProductRef.from_mapping(data["audio"]),
+            fps_num=_uint(data.get("fps_num"), f"{where}.fps_num"),
+            fps_den=_uint(data.get("fps_den"), f"{where}.fps_den"),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        """Serialize descriptors and request-owned product identities in order."""
+        return {
+            "kind": self.kind,
+            "task": self.task,
+            "role": self.role,
+            "include_audio": self.include_audio,
+            "pixels": None if self.pixels is None else self.pixels.to_mapping(),
+            "audio": None if self.audio is None else self.audio.to_mapping(),
+            "fps_num": self.fps_num,
+            "fps_den": self.fps_den,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class DiffusionRequestParams:
     """Defines latent geometry, integration steps, guidance scales, and deterministic noise coordinates."""
 
     prompt_token_ids: tuple[int, ...]
     seed: int
     geometry: MediaGeometry
+    references: tuple[DecodedReference, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate latent geometry, integration steps, guidance, and noise coordinates."""
 
+        if len(self.references) > 12:
+            raise invalid_descriptor("too many reference sources")
+        for kind, limit in (("image", 9), ("video", 3), ("audio", 3)):
+            if sum(item.kind == kind for item in self.references) > limit:
+                raise invalid_descriptor("reference modality count exceeded")
+        if self.references and all(item.kind == "audio" for item in self.references):
+            raise invalid_descriptor("references require visual media")
         if not self.prompt_token_ids:
             raise invalid_descriptor("diffusion prompt tokens must not be empty")
         _nonnegative(self.seed, "diffusion seed")
@@ -2819,6 +2933,9 @@ class DiffusionRequestParams:
             prompt_token_ids=_uints(data.get("prompt_token_ids", ()), f"{where}.prompt_token_ids"),
             seed=_uint(data.get("seed"), f"{where}.seed"),
             geometry=MediaGeometry.from_mapping(data.get("geometry"), f"{where}.geometry"),
+            references=tuple(
+                DecodedReference.from_mapping(item) for item in data.get("references", ())
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -2828,6 +2945,7 @@ class DiffusionRequestParams:
             "prompt_token_ids": list(self.prompt_token_ids),
             "seed": self.seed,
             "geometry": self.geometry.to_mapping(),
+            "references": [item.to_mapping() for item in self.references],
         }
 
 
@@ -2844,6 +2962,11 @@ class NewRequest:
     def __post_init__(self) -> None:
         """Require exactly one parameter family compatible with the request kind."""
 
+        if self.diffusion is not None:
+            for reference in self.diffusion.references:
+                for product in (reference.pixels, reference.audio):
+                    if product is not None and product.request_key != self.request_key:
+                        raise invalid_descriptor("reference tensor must belong to its request")
         if self.request_pool_idx < 1:
             raise invalid_descriptor("request-pool index must be positive")
         if self.ar is None and self.umm is None and self.diffusion is None:

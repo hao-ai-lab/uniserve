@@ -428,6 +428,9 @@ impl WorkerExecutor {
     /// Returns the command workers eligible for cache admission.
     fn cache_admissions(&mut self, admissions: &[NewRequest]) -> anyhow::Result<()> {
         for admission in admissions {
+            // Reject foreign or unbounded decoded-media products before caching
+            // descriptors that will be replicated to subsequent stage workers.
+            admission.validate()?;
             if let Some(existing) = self.admissions.get(&admission.request_key) {
                 anyhow::ensure!(
                     existing == admission,

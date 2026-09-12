@@ -344,6 +344,7 @@ impl EngineLoop {
                 request_key,
                 request_pool_idx,
                 DiffusionRequestParams {
+                    references: Vec::new(),
                     prompt_token_ids: submission.request.prompt_token_ids.clone(),
                     seed: submission.request.seed,
                     geometry: MediaGeometry {

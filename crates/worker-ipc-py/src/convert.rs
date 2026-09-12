@@ -857,6 +857,34 @@ fn diffusion_params_to_py<'py>(
         diffusion.geometry.denoise_steps,
     )?;
     dict.set_item(intern!(py, "geometry"), geometry)?;
+    let mut context = RequestConversion::new(py);
+    dict.set_item(
+        intern!(py, "references"),
+        dict_list(py, &diffusion.references, |item| {
+            let reference = PyDict::new(py);
+            reference.set_item("kind", &item.kind)?;
+            reference.set_item("task", &item.task)?;
+            reference.set_item("role", &item.role)?;
+            reference.set_item("include_audio", item.include_audio)?;
+            reference.set_item("fps_num", item.fps_num)?;
+            reference.set_item("fps_den", item.fps_den)?;
+            reference.set_item(
+                "pixels",
+                item.pixels
+                    .as_ref()
+                    .map(|product| product_ref_to_py(py, product, &mut context))
+                    .transpose()?,
+            )?;
+            reference.set_item(
+                "audio",
+                item.audio
+                    .as_ref()
+                    .map(|product| product_ref_to_py(py, product, &mut context))
+                    .transpose()?,
+            )?;
+            Ok(reference)
+        })?,
+    )?;
     Ok(dict)
 }
 
@@ -2148,6 +2176,28 @@ mod tests {
             media_key,
             2,
             DiffusionRequestParams {
+                references: vec![uniserve_worker_ipc::DecodedReference {
+                    kind: "image".into(),
+                    task: "first_last_frame".into(),
+                    role: "last_frame".into(),
+                    include_audio: false,
+                    pixels: Some(ProductRef {
+                        request_key: media_key,
+                        producer_op_id: OpId(0),
+                        output_index: 0,
+                        generation: 1,
+                        kind: ProductKind::Tensor,
+                        storage_class: StorageClass::DeviceTensor,
+                        dtype: DType::U8,
+                        shape_bound: ShapeBound {
+                            dims: [1, 16, 24, 3].map(DimBound::Static).to_vec(),
+                        },
+                        point_range: PointRange::default(),
+                    }),
+                    audio: None,
+                    fps_num: 0,
+                    fps_den: 1,
+                }],
                 prompt_token_ids: media_prompt_token_ids,
                 seed: 29,
                 geometry: MediaGeometry {
@@ -2292,6 +2342,25 @@ mod tests {
                     .extract::<Vec<u32>>()
                     .unwrap(),
                 vec![17, 23, 65_537]
+            );
+            let reference = media.getattr("references").unwrap().get_item(0).unwrap();
+            assert_eq!(
+                reference
+                    .getattr("role")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "last_frame"
+            );
+            assert_eq!(
+                reference
+                    .getattr("pixels")
+                    .unwrap()
+                    .getattr("dtype")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "u8"
             );
             // The natively constructed batch must be exactly what the
             // canonical codec decodes from its own IPC form.

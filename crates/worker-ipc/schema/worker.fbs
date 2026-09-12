@@ -532,10 +532,23 @@ table MediaGeometry {
   denoise_steps:uint;
 }
 
+// Decoded products share the normal request-owned tensor transport.
+table DecodedReference {
+  kind:string;
+  task:string;
+  role:string;
+  include_audio:bool;
+  pixels:ValueRef;
+  audio:ValueRef;
+  fps_num:uint;
+  fps_den:uint = 1;
+}
+
 table DiffusionRequestParams {
   prompt_token_ids:[uint];
   seed:ulong;
   geometry:MediaGeometry;
+  references:[DecodedReference];
 }
 
 table NewRequest {

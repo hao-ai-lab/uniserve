@@ -10,6 +10,12 @@ The HTTP video schema and Rust lowering preserve ordered reference descriptors a
 
 At most 12 sources are admitted, with at most 9 images, 3 videos and 3 standalone audio sources, and at least one visual source. Standard base64 payloads have a 32-MiB decoded per-source bound and a 96-MiB bundle bound. The server's independent 64-MiB HTTP body limit also applies. URLs have an 8192-byte descriptor bound and require HTTP(S) syntax; this is not network destination authorization. Debug formatting redacts both sources and URLs.
 
+## Decoded-media IPC contract
+
+Worker admissions carry ordered `DecodedReference` records through FlatBuffers and the native Python converter. Each record binds modality/task/role, explicit soundtrack selection, exact rational presentation FPS and optional pixel/audio `ProductRef` identities. RGB pixels use u8 `[frames, height, width, 3]`; prepared stereo audio uses f32 `[2, samples]` at 32 kHz. These are ordinary request-owned device-tensor products, not embedded sources or a separate transport. The executor validates admissions before caching their descriptors for stage workers.
+
+Static positive shapes are required. Pixel descriptors are limited to 720 frames, 4096 pixels per spatial axis and 128 Mi-pixels per source; images have exactly one frame. Audio is limited to 960,000 samples per channel. Ordered bundles retain the public modality/count/visual requirements. These descriptor bounds do not implement pre-decode resource admission, finite-sample checks, aggregate decoded-memory budgeting or source fetching. Scheduler media admission currently constructs an empty decoded bundle, and the encoder does not consume decoded products. Completing the source-to-product producer, scheduler dependencies and worker consumer is still required; schema round trips do not demonstrate tensor execution.
+
 ## Required implementation
 
 1. Finish shared media admission and IPC: an SSRF-safe bounded fetcher must validate resolved addresses, bind connections to validated destinations, disallow unauthorized redirect destinations, bound streamed bytes and decode resources, and transport decoded geometry and products through request-owned IPC lifetimes. Encoded source limits do not bound decoded dimensions or duration. Cache keys must include the complete reference geometry, not only target/prompt dimensions.

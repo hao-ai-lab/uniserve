@@ -406,6 +406,27 @@ fn diffusion_params_from_table(
             .prompt_token_ids()
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
+        references: admission
+            .references()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        Ok(crate::DecodedReference {
+                            kind: item.kind().context("reference has no modality")?.to_owned(),
+                            task: item.task().context("reference has no task")?.to_owned(),
+                            role: item.role().context("reference has no role")?.to_owned(),
+                            include_audio: item.include_audio(),
+                            pixels: item.pixels().map(product_ref_from_table).transpose()?,
+                            audio: item.audio().map(product_ref_from_table).transpose()?,
+                            fps_num: item.fps_num(),
+                            fps_den: item.fps_den(),
+                        })
+                    })
+                    .collect::<CodecResult<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
         seed: admission.seed(),
         geometry: MediaGeometry {
             frame_count: geometry.frame_count(),
@@ -1702,6 +1723,7 @@ fn admission_to_fb(admission: &NewRequest) -> CodecResult<fbs::NewRequestT> {
             .diffusion
             .as_ref()
             .map(diffusion_params_to_fb)
+            .transpose()?
             .map(Box::new),
     })
 }
@@ -1724,8 +1746,38 @@ fn umm_params_to_fb(admission: &UmmRequestParams) -> fbs::UmmRequestParamsT {
 }
 
 /// Converts diffusion admission parameters and resolved geometry.
-fn diffusion_params_to_fb(admission: &DiffusionRequestParams) -> fbs::DiffusionRequestParamsT {
-    fbs::DiffusionRequestParamsT {
+fn diffusion_params_to_fb(
+    admission: &DiffusionRequestParams,
+) -> CodecResult<fbs::DiffusionRequestParamsT> {
+    Ok(fbs::DiffusionRequestParamsT {
+        references: Some(
+            admission
+                .references
+                .iter()
+                .map(|item| {
+                    Ok(fbs::DecodedReferenceT {
+                        kind: Some(item.kind.clone()),
+                        task: Some(item.task.clone()),
+                        role: Some(item.role.clone()),
+                        include_audio: item.include_audio,
+                        pixels: item
+                            .pixels
+                            .as_ref()
+                            .map(product_ref_to_fb)
+                            .transpose()?
+                            .map(Box::new),
+                        audio: item
+                            .audio
+                            .as_ref()
+                            .map(product_ref_to_fb)
+                            .transpose()?
+                            .map(Box::new),
+                        fps_num: item.fps_num,
+                        fps_den: item.fps_den,
+                    })
+                })
+                .collect::<CodecResult<Vec<_>>>()?,
+        ),
         prompt_token_ids: Some(admission.prompt_token_ids.clone()),
         seed: admission.seed,
         geometry: Some(Box::new(fbs::MediaGeometryT {
@@ -1734,7 +1786,7 @@ fn diffusion_params_to_fb(admission: &DiffusionRequestParams) -> fbs::DiffusionR
             prompt_tokens: admission.geometry.prompt_tokens,
             denoise_steps: admission.geometry.denoise_steps,
         })),
-    }
+    })
 }
 
 /// Converts a logical KV block table while preserving page order.

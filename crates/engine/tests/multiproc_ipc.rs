@@ -501,6 +501,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         key,
         1,
         DiffusionRequestParams {
+            references: Vec::new(),
             prompt_token_ids: vec![7],
             seed: 1000,
             geometry: uniserve_worker_ipc::MediaGeometry {

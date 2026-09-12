@@ -1119,6 +1119,111 @@ pub struct MediaGeometry {
     pub denoise_steps: u32,
 }
 
+/// Ordered decoded reference media. Pixels are RGB u8 `[frames, height, width, 3]`;
+/// audio is prepared stereo f32 `[2, samples]` at 32 kHz. Products use the
+/// ordinary request-owned transport and lifetime, never source URLs or payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodedReference {
+    pub kind: String,
+    pub task: String,
+    pub role: String,
+    pub include_audio: bool,
+    pub pixels: Option<ProductRef>,
+    pub audio: Option<ProductRef>,
+    /// Exact presentation frame rate; images and standalone audio use 0/1.
+    pub fps_num: u32,
+    pub fps_den: u32,
+}
+
+impl DecodedReference {
+    /// Validate resolved geometry before any decoder or device allocation.
+    pub fn validate(&self, owner: RequestKey) -> ValidationResult<()> {
+        let visual = matches!(self.kind.as_str(), "image" | "video");
+        ensure_valid!(visual || self.kind == "audio", "invalid reference modality");
+        let valid_task = match self.task.as_str() {
+            "reference" => self.role == "reference",
+            "first_frame" => self.kind == "image" && self.role == "first_frame",
+            "first_last_frame" => {
+                self.kind == "image" && matches!(self.role.as_str(), "first_frame" | "last_frame")
+            }
+            "continue_scene" | "continue_shot" => self.kind == "video" && self.role == "preceding",
+            _ => false,
+        };
+        ensure_valid!(valid_task, "invalid reference task or role");
+        ensure_valid!(
+            self.pixels.is_some() == visual,
+            "reference pixels disagree with modality"
+        );
+        ensure_valid!(
+            !self.include_audio || self.kind == "video",
+            "soundtrack selection requires video"
+        );
+        ensure_valid!(
+            self.audio.is_some() == (self.kind == "audio" || self.include_audio),
+            "reference audio disagrees with soundtrack policy"
+        );
+        ensure_valid!(
+            self.fps_den > 0
+                && if self.kind == "video" {
+                    self.fps_num > 0
+                } else {
+                    self.fps_num == 0 && self.fps_den == 1
+                },
+            "invalid reference frame rate"
+        );
+        for product in self.pixels.iter().chain(self.audio.iter()) {
+            product.validate()?;
+            ensure_valid!(
+                product.request_key == owner && product.kind == ProductKind::Tensor,
+                "reference tensor must belong to its request"
+            );
+            ensure_valid!(
+                product
+                    .shape_bound
+                    .dims
+                    .iter()
+                    .all(|dim| matches!(dim, DimBound::Static(n) if *n > 0)),
+                "decoded reference dimensions must be static and positive"
+            );
+        }
+        if let Some(pixels) = &self.pixels {
+            let dims: Vec<u32> = pixels
+                .shape_bound
+                .dims
+                .iter()
+                .map(|dim| match dim {
+                    DimBound::Static(n) => *n,
+                    _ => unreachable!(),
+                })
+                .collect();
+            ensure_valid!(
+                pixels.dtype == DType::U8 && dims.len() == 4 && dims[3] == 3,
+                "reference pixels must be RGB u8 THWC"
+            );
+            ensure_valid!(
+                dims[0] <= 720
+                    && dims[1] <= 4096
+                    && dims[2] <= 4096
+                    && u64::from(dims[0]) * u64::from(dims[1]) * u64::from(dims[2])
+                        <= 128 * 1024 * 1024,
+                "reference pixel budget exceeded"
+            );
+            ensure_valid!(
+                self.kind != "image" || dims[0] == 1,
+                "image reference must have one frame"
+            );
+        }
+        if let Some(audio) = &self.audio {
+            ensure_valid!(
+                audio.dtype == DType::F32
+                    && matches!(audio.shape_bound.dims.as_slice(), [DimBound::Static(2), DimBound::Static(samples)] if *samples <= 960_000),
+                "reference audio must be stereo f32 with at most 30 seconds at 32 kHz"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Static diffusion parameters admitted for one request lineage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffusionRequestParams {
@@ -1128,6 +1233,9 @@ pub struct DiffusionRequestParams {
     pub seed: u64,
     /// Fixed media and trajectory dimensions.
     pub geometry: MediaGeometry,
+    /// Ordered decoded conditioning products, empty for text-only generation.
+    #[serde(default)]
+    pub references: Vec<DecodedReference>,
 }
 
 /// Request-start framing. Carries the per-domain parameters a request
@@ -1209,6 +1317,29 @@ impl NewRequest {
             branch.image.validate()?;
         }
         if let Some(diffusion) = &self.diffusion {
+            ensure_valid!(
+                diffusion.references.len() <= 12,
+                "too many reference sources"
+            );
+            for (kind, limit) in [("image", 9), ("video", 3), ("audio", 3)] {
+                ensure_valid!(
+                    diffusion
+                        .references
+                        .iter()
+                        .filter(|item| item.kind == kind)
+                        .count()
+                        <= limit,
+                    "reference modality count exceeded"
+                );
+            }
+            ensure_valid!(
+                diffusion.references.is_empty()
+                    || diffusion.references.iter().any(|item| item.kind != "audio"),
+                "references require visual media"
+            );
+            for reference in &diffusion.references {
+                reference.validate(self.request_key)?;
+            }
             ensure_valid!(
                 !diffusion.prompt_token_ids.is_empty(),
                 "diffusion prompt tokens must not be empty"
