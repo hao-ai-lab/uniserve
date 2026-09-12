@@ -8,6 +8,7 @@ import io
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -289,10 +290,22 @@ def _stride_shape(width: int, height: int, scale: float, stride: int) -> tuple[i
 
 
 def _normalize(image: Image.Image, name: str) -> torch.Tensor:
-    """Apply channel-wise normalization to a PIL image converted to a tensor."""
+    """Normalize decoded RGB bytes into contiguous FP32 CHW model inputs."""
 
-    tensor = vision.to_tensor(image).to(torch.float32)
-    return _normalize_tensor(tensor, name)
+    # PIL decoding and resizing produce host bytes. Keep the pointwise FP32
+    # transform in one owned CHW array instead of dispatching each pass through
+    # the process-wide tensor thread pool on the serving thread.
+    pixels = np.asarray(image).transpose(2, 0, 1).astype(np.float32, order="C")
+    pixels /= np.float32(255.0)
+    if name == "signed_unit":
+        pixels -= np.float32(0.5)
+        pixels /= np.float32(0.5)
+    elif name == "imagenet":
+        pixels -= np.asarray(_IMAGENET_MEAN, dtype=np.float32)[:, None, None]
+        pixels /= np.asarray(_IMAGENET_STD, dtype=np.float32)[:, None, None]
+    else:
+        raise invalid_descriptor(f"unknown image normalization {name!r}")
+    return torch.from_numpy(pixels)
 
 
 def _normalize_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:

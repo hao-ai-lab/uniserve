@@ -14,7 +14,7 @@ from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_se
 from uniserve_worker.protocol.batch import SamplingParams
 
 from ..nn.mesh import Communicator
-from .sampling import LogprobValues, SamplerOutput, SamplingMetadata
+from .sampling import LogprobValues, SamplerOutput, SamplerRow, SamplingMetadata
 from .top_k_sampling import sample_top_k
 
 SAMPLING_COMPLETION_FIELDS = 4
@@ -42,7 +42,7 @@ def sample(
     tasks: Sequence[SamplingMetadata],
     *,
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None = None,
-) -> tuple[SamplerOutput, ...]:
+) -> tuple[SamplerRow, ...]:
     """Shape and draw every compatible sampling row in each device batch."""
 
     grouped: dict[tuple[torch.device, int, int], list[tuple[int, SamplingMetadata]]] = defaultdict(
@@ -105,7 +105,7 @@ def sample(
         )
         grouped[(task.logits.device, vocab, sampling_path)].append((index, task))
 
-    result: list[SamplerOutput | None] = [None] * len(tasks)
+    result: list[SamplerRow | None] = [None] * len(tasks)
     for (_device, _vocab, sampling_path), compatible in grouped.items():
         indexes, group = zip(*compatible, strict=True)
         if sampling_path < 0:
@@ -127,7 +127,7 @@ def sample(
             )
         for index, sampled in zip(indexes, sampled_group, strict=True):
             result[index] = sampled
-    return tuple(cast(SamplerOutput, value) for value in result)
+    return tuple(cast(SamplerRow, value) for value in result)
 
 
 def sample_device_greedy_group(
@@ -135,7 +135,7 @@ def sample_device_greedy_group(
     *,
     apply_suppression: bool,
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
-) -> tuple[SamplerOutput, ...]:
+) -> tuple[SamplerRow, ...]:
     """Resolve predicates, greedy tokens, finish state, and completion values for a group."""
 
     logits = packed_tensor_views(tuple(task.logits for task in tasks))
@@ -166,18 +166,19 @@ def sample_device_greedy_group(
     transitions = _sampled_transition_values(tasks, device_tokens, valid, active)
     span = sampling_columns(valid, active, device_tokens, torch.zeros_like(device_tokens))
     tagged_tokens = tagged_token_values(device_tokens, continuation_values, in_place=False)
+    output = SamplerOutput(
+        tokens=device_tokens,
+        valid=valid,
+        active=active,
+        finish=device_finish,
+        continuation=continuation_values,
+        tagged_tokens=tagged_tokens,
+        completion=span,
+    )
     return tuple(
-        SamplerOutput(
-            request_pool_indices=tasks[index].request_pool_index,
-            completion=span,
-            completion_index=index,
-            tokens=device_tokens[index : index + 1],
-            logprobs=None,
-            valid=valid[index : index + 1],
-            active=active[index : index + 1],
-            finish=(None if device_finish is None else device_finish[index : index + 1]),
-            continuation=continuation_values[index : index + 1],
-            tagged_tokens=tagged_tokens[index : index + 1],
+        output.row(
+            index,
+            request_pool_index=task.request_pool_index,
             transition=transitions.get(index),
         )
         for index, task in enumerate(tasks)
@@ -223,7 +224,7 @@ def _sample_fused_top_k_group(
     top_k: int,
     *,
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
-) -> tuple[SamplerOutput, ...]:
+) -> tuple[SamplerRow, ...]:
     """Sample a homogeneous fused-top-k group and return its numerical selections."""
 
     # The compiled kernel consumes one contiguous column for each sampling
@@ -255,20 +256,22 @@ def _sample_fused_top_k_group(
     transitions = _sampled_transition_values(tasks, tokens, valid, active)
     tagged_tokens = tagged_token_values(tokens, continuation_values)
     span = sampling_columns(valid, active, tokens, torch.zeros_like(tokens))
+    output = SamplerOutput(
+        tokens=tokens,
+        valid=valid,
+        active=active,
+        finish=device_finish,
+        continuation=continuation_values,
+        tagged_tokens=tagged_tokens,
+        completion=span,
+    )
     return tuple(
-        SamplerOutput(
-            request_pool_indices=tasks[index].request_pool_index,
-            completion=span,
-            completion_index=index,
-            tokens=tokens[index : index + 1],
-            valid=valid[index : index + 1],
-            active=active[index : index + 1],
-            finish=(None if device_finish is None else device_finish[index : index + 1]),
-            continuation=continuation_values[index : index + 1],
-            tagged_tokens=tagged_tokens[index : index + 1],
+        output.row(
+            index,
+            request_pool_index=task.request_pool_index,
             transition=transitions.get(index),
         )
-        for index in range(len(tasks))
+        for index, task in enumerate(tasks)
     )
 
 
@@ -294,7 +297,7 @@ def _sample_task_group(
     tasks: tuple[SamplingMetadata, ...],
     *,
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
-) -> tuple[SamplerOutput, ...]:
+) -> tuple[SamplerRow, ...]:
     """Sample arbitrary compatible tasks, resolve speculative acceptance, and capture outputs."""
 
     # Flatten task-local candidate rows into one sampling matrix while retaining
@@ -417,23 +420,25 @@ def _sample_task_group(
         task_tokens,
         tuple(task.parameters for task in tasks),
     )
+    output = SamplerOutput(
+        tokens=task_tokens,
+        valid=task_valid,
+        active=active,
+        finish=device_finish,
+        continuation=continuation_values,
+        tagged_tokens=tagged_tokens,
+        completion=span,
+        logprobs=details,
+        accepted_draft_count=counts,
+        accepted_token_count=points,
+    )
     return tuple(
-        SamplerOutput(
-            request_pool_indices=tasks[index].request_pool_index,
-            completion=span,
-            completion_index=index,
-            tokens=task_tokens[index : index + 1],
-            logprobs=details,
-            accepted_draft_count=counts[index : index + 1],
-            accepted_token_count=points[index : index + 1],
-            valid=task_valid[index : index + 1],
-            active=active[index : index + 1],
-            finish=(None if device_finish is None else device_finish[index : index + 1]),
-            continuation=continuation_values[index : index + 1],
-            tagged_tokens=tagged_tokens[index : index + 1],
+        output.row(
+            index,
+            request_pool_index=task.request_pool_index,
             transition=transitions.get(index),
         )
-        for index in range(len(tasks))
+        for index, task in enumerate(tasks)
     )
 
 

@@ -61,43 +61,29 @@ class RadixAttention(nn.Module):
         self._cache_pool = kv_cache
         self.bind_dense(selection)
         candidates = {
-            AttentionMode.DENSE: _select_provider(
-                selection,
+            AttentionMode.DENSE: selection.select_provider(
                 AttentionMode.DENSE,
                 head_dim=self.head_dim,
                 block_size=kv_cache.block_size,
                 device=kv_cache.k.device,
             ),
-            AttentionMode.PAGED_DECODE: _select_provider(
-                selection,
+            AttentionMode.PAGED_DECODE: selection.select_provider(
                 AttentionMode.PAGED_DECODE,
                 head_dim=self.head_dim,
                 block_size=kv_cache.block_size,
                 device=kv_cache.k.device,
             ),
-            AttentionMode.PAGED_VARLEN: _select_provider(
-                selection,
+            AttentionMode.PAGED_VARLEN: selection.select_provider(
                 AttentionMode.PAGED_VARLEN,
                 head_dim=self.head_dim,
                 block_size=kv_cache.block_size,
                 device=kv_cache.k.device,
             ),
-            AttentionMode.PACKED: (
-                _select_provider(
-                    selection,
-                    AttentionMode.PACKED,
-                    cuda_graph=True,
-                    head_dim=self.head_dim,
-                    block_size=kv_cache.block_size,
-                    device=kv_cache.k.device,
-                )
-                or _select_provider(
-                    selection,
-                    AttentionMode.PACKED,
-                    head_dim=self.head_dim,
-                    block_size=kv_cache.block_size,
-                    device=kv_cache.k.device,
-                )
+            AttentionMode.PACKED: selection.select_provider(
+                AttentionMode.PACKED,
+                head_dim=self.head_dim,
+                block_size=kv_cache.block_size,
+                device=kv_cache.k.device,
             ),
         }
         self._providers = {
@@ -380,29 +366,6 @@ class RadixAttention(nn.Module):
             ),
             provider=self.provider(AttentionMode.PACKED),
         )
-
-
-def _select_provider(
-    selection: AttentionSelection,
-    mode: AttentionMode,
-    *,
-    head_dim: int,
-    block_size: int,
-    device: torch.device,
-    cuda_graph: bool = False,
-) -> AttentionBackend | None:
-    """Select the first backend that supports the requested mode and concrete geometry."""
-
-    for provider in selection.providers:
-        if provider.can_bind(
-            mode,
-            head_dim=head_dim,
-            block_size=block_size,
-            device=device,
-            cuda_graph=cuda_graph,
-        ):
-            return provider
-    return None
 
 
 def _select_varlen_provider(

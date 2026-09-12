@@ -37,7 +37,7 @@ from .rows import (
     ForwardRow,
 )
 from .sample import broadcast_selection
-from .sampling import SamplerOutput, SamplingMetadata
+from .sampling import SamplerOutput, SamplerRow, SamplingMetadata, sample_columns
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -260,7 +260,7 @@ def publish_sample(
     task: ForwardRow,
     logits: torch.Tensor,
     sample_work: SamplingMetadata | None,
-    sampled: SamplerOutput,
+    sampled: SamplerRow,
     *,
     state: BatchState,
     execution_model: ExecutionModel,
@@ -554,7 +554,8 @@ def graph_decode_samples(
     output: SamplerOutput | None,
     *,
     sampling_group: Communicator | None,
-) -> tuple[SamplerOutput, ...] | None:
+    request_pool_indices: torch.Tensor,
+) -> tuple[SamplerRow, ...] | None:
     """Validate and synchronize graph selections before common token publication."""
 
     if output is None:
@@ -562,7 +563,7 @@ def graph_decode_samples(
     count = len(operations)
     columns = (requests, tasks)
     vectors = (
-        output.request_pool_indices,
+        request_pool_indices,
         output.tokens,
         output.valid,
         output.active,
@@ -627,7 +628,10 @@ def graph_decode_samples(
             continuation=continuation,
             tagged_tokens=sampling.tagged_token_values(output.tokens, continuation),
         )
-    return tuple(output.row(index) for index in range(count))
+    return tuple(
+        output.row(index, request_pool_index=request_pool_indices[index : index + 1])
+        for index in range(count)
+    )
 
 
 def prompt_logprob_details(
@@ -861,7 +865,7 @@ def resolve_decode_token(
 def publish_runtime_samples(
     operations: Sequence[ScheduledRequest],
     requests: Sequence[PendingOutput],
-    samples: Sequence[SamplerOutput],
+    samples: Sequence[SamplerRow],
     *,
     state: BatchState,
     completion_group: int,
@@ -906,7 +910,7 @@ def publish_runtime_samples(
 
 def publish_token_products(
     operations: tuple[ScheduledRequest, ...],
-    samples: tuple[SamplerOutput, ...],
+    samples: tuple[SamplerRow, ...],
     completion_group: int,
     *,
     state: BatchState,
@@ -914,30 +918,33 @@ def publish_token_products(
 ) -> None:
     """Publish numerical token and transition columns through their storage owner.
 
-    Samplers return contiguous row views. Reusing those views preserves a single
-    publication for each column without another sampling or synchronization pass.
+    Rows retain their numerical batches. Token publication reads their selected
+    spans directly; variable transition payloads retain their own tensor layouts.
     """
 
     for transitions in (True, False):
         writes: list[TensorRecord] = []
-        values: list[torch.Tensor] = []
+        selected: list[SamplerRow] = []
         for operation, sample in zip(operations, samples, strict=True):
             request = operation_geometry.request_row(
                 completion_group, operation.request_key.request_id, state=state
             )
             write = request.transition_write if transitions else request.token_write
-            if write is None:
-                continue
-            value = sample.transition if transitions else sample.tagged_tokens
-            if value is None:
-                raise RuntimeError("sampling result lost a declared device output")
-            writes.append(write)
-            values.append(value)
+            if write is not None:
+                writes.append(write)
+                selected.append(sample)
         if not writes:
             continue
-        packed = packed_tensor_views(tuple(values))
-        if packed is None:
-            packed = torch.cat(values, dim=0)
+        if transitions:
+            values = tuple(sample.transition for sample in selected)
+            if any(value is None for value in values):
+                raise RuntimeError("sampling result lost a declared transition output")
+            tensors = tuple(cast(torch.Tensor, value) for value in values)
+            packed = packed_tensor_views(tensors)
+            if packed is None:
+                packed = torch.cat(tensors, dim=0)
+        else:
+            (packed,) = sample_columns(selected, ("tagged_tokens",))
         tensor_store.publish_writes(tuple(writes), packed.reshape(-1))
 
 

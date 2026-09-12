@@ -225,12 +225,17 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind,
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("numerical_model", ["qwen"], indirect=True)
+@pytest.mark.parametrize("numerical_model", ["qwen", "sensenova"], indirect=True)
 @torch.inference_mode()
 def test_model_prefill_padding_preserves_live_outputs(numerical_model):
+    from uniserve_worker.backends.attention import resolve_attention_selection
     from uniserve_worker.execution.runners.prefill import stage_text
 
-    model, pool, selection, device = numerical_model
+    model, pool, _selection, device = numerical_model
+    selection = resolve_attention_selection(
+        "auto", tuning=FlashInferTuningConfig(workspace_size=64 << 20), block_size=64
+    )
+    model.bind_cache_pool(pool, selection)
     runner = ModelRunner(
         model,
         WorkerConfig(
@@ -267,19 +272,120 @@ def test_model_prefill_padding_preserves_live_outputs(numerical_model):
         runner.capture(tokenizer=None, latents=None)
         runner.complete_startup()
         with pool.startup_pages(3) as pages:
-            for lengths in ((3,), (3, 2), (4, 5), (1, 5, 4)):
+            for lengths in ((8,), (16,), (3,), (3, 2), (4, 5), (1, 5, 4)):
                 tokens = tuple(tuple(range(1, length + 1)) for length in lengths)
                 batch = stage_text(
                     buffers,
                     pool,
                     tokens,
                     tuple((page,) for page in pages[: len(lengths)]),
-                    packed=False,
+                    packed=model.tensorized_mixed,
                 )
                 expected = forward(batch).clone()
                 actual = runner.run_batch(entry, batch, forward, eligible=True)
                 for result, reference in zip(actual.values, expected.values, strict=True):
                     torch.testing.assert_close(result, reference, rtol=2e-2, atol=2e-2)
+    finally:
+        torch.cuda.synchronize(device)
+        runner.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_model_flow_replay_preserves_live_conditioning(numerical_model):
+    from uniserve_worker.backends.attention import resolve_attention_selection
+    from uniserve_worker.execution.attention import physical_columns
+    from uniserve_worker.execution.diffusion_runner import denoise_geometry
+    from uniserve_worker.execution.rows import ForwardRow
+    from uniserve_worker.protocol.batch import PipelineStage
+
+    model, pool, _selection, device = numerical_model
+    selection = resolve_attention_selection(
+        "auto", tuning=FlashInferTuningConfig(workspace_size=64 << 20), block_size=64
+    )
+    model.bind_cache_pool(pool, selection)
+    generation = model.generation
+    assert generation is not None
+    height = width = 16
+    image_tokens = generation.image_tokens(height, width)
+    # Canonical latent rows carry one image token's RGB patch each.
+    latent = torch.randn((image_tokens, 3 * height * width // image_tokens), device=device)
+    runner = ModelRunner(
+        model,
+        WorkerConfig(
+            device=str(device),
+            block_size=64,
+            graph_policy="full",
+            prefill_cuda_graph=True,
+            decode_graph_batch_sizes=(),
+            prefill_graph_token_sizes=(),
+        ),
+        attention=selection,
+    )
+    runner.configure_inputs(
+        geometry=InputGeometry(1, image_tokens, image_tokens, 4, 512),
+        kv_cache=pool,
+        latent_pool=None,
+        decode_predicates=torch.ones(2, dtype=torch.bool, device=device),
+        max_operations=1,
+        request_slots=1,
+        max_tokens=image_tokens,
+        latent_capacity_units=image_tokens,
+        decode_context_blocks=4,
+        variants=frozenset((PipelineStage.DENOISING,)),
+        max_inflight=1,
+    )
+    entry = next(iter(runner.entries.values()))
+    buffers = entry.input_buffers
+    assert buffers is not None
+
+    def stage(prefix, timestep):
+        positions, indexes, conditioning, query, local_text = denoise_geometry(
+            generation, latent, height, width, temporal=prefix, patch_size=2
+        )
+        attention = physical_columns(
+            pages=((1, 2, 3, 4),),
+            prefix_lens=(prefix,),
+            query_lens=(query,),
+            causal_rows=(False,),
+            write_rows=(False,),
+            positions=(indexes,),
+            token_rows=(False,),
+            text_local_indices=(local_text,),
+            width=4,
+            block_size=64,
+            packed=True,
+        )
+        row = ForwardRow(
+            forward_mode=PipelineStage.DENOISING,
+            positions=positions,
+            timestep=torch.tensor([timestep], device=device),
+            latent=latent,
+            flow_conditioning=conditioning,
+            image_tokens=query,
+            image_height=height,
+            image_width=width,
+            request_pool_idx=1,
+            seq_len=prefix,
+            causal=False,
+        )
+        return buffers.stage((row,), forward_mode=PipelineStage.DENOISING, attention=attention)
+
+    def forward(batch):
+        ids = buffers.input_ids[:0] if batch.input_ids is None else batch.input_ids
+        positions = buffers.positions[0, :0] if batch.positions is None else batch.positions
+        return model.project(model(ids, positions, batch), batch)
+
+    try:
+        runner.capture_batch(entry, stage(5, 0.7), forward)
+        runner.complete_startup()
+        for prefix, timestep in ((9, 0.4), (67, 0.1)):
+            latent.normal_()
+            batch = stage(prefix, timestep)
+            expected = forward(batch).clone()
+            actual = runner.run_batch(entry, batch, forward, eligible=True)
+            for result, reference in zip(actual.values, expected.values, strict=True):
+                torch.testing.assert_close(result, reference, rtol=2e-2, atol=2e-2)
     finally:
         torch.cuda.synchronize(device)
         runner.close()

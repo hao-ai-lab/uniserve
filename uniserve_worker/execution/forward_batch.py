@@ -39,6 +39,34 @@ class AttentionSelection:
         if len(set(names)) != len(names):
             raise ValueError("attention selection contains duplicate providers")
 
+    def select_provider(
+        self,
+        mode: AttentionMode,
+        *,
+        head_dim: int,
+        block_size: int,
+        device: torch.device,
+    ) -> AttentionBackend | None:
+        """Resolve the same geometry-bound provider for execution and graph preparation.
+
+        Packed attention prefers providers that consume live segmentation on
+        device. Other modes retain startup order; graph eligibility is checked
+        against this selected implementation rather than a different candidate.
+        """
+
+        graph_options = (True, False) if mode is AttentionMode.PACKED else (False,)
+        for cuda_graph in graph_options:
+            for provider in self.providers:
+                if provider.can_bind(
+                    mode,
+                    head_dim=head_dim,
+                    block_size=block_size,
+                    device=device,
+                    cuda_graph=cuda_graph,
+                ):
+                    return provider
+        return None
+
 
 class AttentionMode(StrEnum):
     """Selects dense, paged decode, paged prefill, or packed attention execution."""

@@ -43,7 +43,7 @@ from ..runtime.latent_pool import LatentStaging
 from ..runtime.request import RequestProgress, RequestState
 from ..runtime.tensor_store import TensorRead, TensorRecord
 from ..transfer.exports import ExportLocations
-from .sampling import LogprobValues, SamplerOutput
+from .sampling import LogprobValues, SamplerRow
 
 __all__ = [
     "PendingOutput",
@@ -747,7 +747,7 @@ def capture_logprobs(
 
 
 def capture_samples(
-    samples: Sequence[SamplerOutput],
+    samples: Sequence[SamplerRow],
     requests: Sequence[PendingOutput],
     output: OutputBuffer,
 ) -> None:
@@ -760,10 +760,10 @@ def capture_samples(
     spans: dict[int, tuple[int, int]] = {}
     details: dict[int, dict[int, tuple[int, int, int]]] = {}
     for sample, request in zip(samples, requests, strict=True):
-        metadata = sample.completion
+        metadata = sample.batch.completion
         count = int(metadata.numel()) // _SAMPLING_FIELDS_PER_OPERATION
         if metadata.numel() != count * _SAMPLING_FIELDS_PER_OPERATION or not (
-            0 <= sample.completion_index < count
+            0 <= sample.index < count
         ):
             raise RuntimeError("sampling completion vectors do not align")
         key = id(metadata)
@@ -772,12 +772,12 @@ def capture_samples(
             capture = output.capture(metadata)
             span = capture
             spans[key] = span
-        request.sampling_range = (*span, sample.completion_index)
-        if sample.logprobs is not None:
-            key = id(sample.logprobs)
+        request.sampling_range = (*span, sample.index)
+        if sample.batch.logprobs is not None:
+            key = id(sample.batch.logprobs)
             if key not in details:
-                details[key] = capture_logprobs(sample.logprobs, output)
-            request.logprob_range = details[key].get(sample.completion_index)
+                details[key] = capture_logprobs(sample.batch.logprobs, output)
+            request.logprob_range = details[key].get(sample.index)
 
 
 def sampled_tokens(record: PendingOutput) -> tuple[int, ...]:
@@ -944,7 +944,7 @@ class PendingOutput:
         self.transition_write: TensorRecord | None = None
         self.completion_write: TensorRecord | None = None
         self.producer_write: TensorRecord | None = None
-        self.sampled: SamplerOutput | None = None
+        self.sampled: SamplerRow | None = None
         self.runtime_logical_position: int | torch.Tensor = 0
         self.runtime_sampling_position: int | torch.Tensor = 0
         self.runtime_penalty_base: torch.Tensor | None = None

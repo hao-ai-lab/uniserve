@@ -51,7 +51,7 @@ from uniserve_worker.runtime.tensor_store import ImageRange
 from ..models.inputs import PatchTransform
 from .diffusion_state import DiffusionState
 from .output import capture_samples
-from .sampling import SamplerOutput, SamplingMetadata
+from .sampling import SamplerRow, SamplingMetadata
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -559,7 +559,7 @@ def _forward_values(
     tables: BlockTables | None,
     states: DecodeState | None,
     sampling_group: Communicator | None,
-) -> tuple[tuple[torch.Tensor, torch.Tensor, SamplerOutput | None] | None, ...]:
+) -> tuple[tuple[torch.Tensor, torch.Tensor, SamplerRow | None] | None, ...]:
     """Bind numerical outputs to their completion owners and attribute group statistics."""
 
     for row, _operation, completion_group in inputs:
@@ -572,9 +572,7 @@ def _forward_values(
         tables=tables,
         states=states,
     )
-    values: list[tuple[torch.Tensor, torch.Tensor, SamplerOutput | None] | None] = [None] * len(
-        inputs
-    )
+    values: list[tuple[torch.Tensor, torch.Tensor, SamplerRow | None] | None] = [None] * len(inputs)
     from .token import graph_decode_samples
 
     for indexes, output in outputs:
@@ -583,6 +581,8 @@ def _forward_values(
                 errors[inputs[index][2]] = output
             continue
         try:
+            if output.stats is None or output.request_pool_indices is None:
+                raise RuntimeError("numerical forward lost statistics or request slot views")
             selected = graph_decode_samples(
                 tuple(inputs[index][1] for index in indexes),
                 tuple(
@@ -594,12 +594,11 @@ def _forward_values(
                 if retain_sampling and output.greedy is not None
                 else output.greedy,
                 sampling_group=sampling_group,
+                request_pool_indices=output.request_pool_indices,
             )
             if selected is None:
                 output = output.materialize()
 
-            if output.stats is None or output.request_pool_indices is None:
-                raise RuntimeError("numerical forward lost statistics or request slot views")
             state.group_forward_stats[inputs[indexes[0]][2]].append(output.stats)
             for local, (index, value) in enumerate(zip(indexes, output.values, strict=True)):
                 values[index] = (
@@ -1011,9 +1010,7 @@ def _execute_operations(
             samples: dict[
                 int,
                 list[
-                    tuple[
-                        int, ForwardRow, torch.Tensor, SamplingMetadata | None, SamplerOutput | None
-                    ]
+                    tuple[int, ForwardRow, torch.Tensor, SamplingMetadata | None, SamplerRow | None]
                 ],
             ] = defaultdict(list)
             for (index, task), numerical_result in zip(forward, values, strict=True):

@@ -26,6 +26,7 @@ from uniserve_worker.transfer.exports import validate_exports
 from .batch_state import BatchState
 from .forward_batch import concatenate_views
 from .output import logprob_entries
+from .sampling import sample_columns
 
 if TYPE_CHECKING:
     from uniserve_worker.bootstrap.worker_info import WorkerInfo
@@ -227,18 +228,21 @@ def _commit_runtime_states(
     )
     if decode:
         samples = tuple(request.sampled for request in decode if request.sampled is not None)
-        if any(sample.request_pool_indices is None for sample in samples):
+        if any(sample.request_pool_index is None for sample in samples):
             raise RuntimeError("decode samples have no device request slots")
+        tokens, continuation, valid, active = sample_columns(
+            samples, ("tokens", "continuation", "valid", "active")
+        )
         states.apply_tokens(
             tuple(int(request.request.request_pool_idx) for request in decode),
             device_slots=concatenate_views(
-                tuple(cast(torch.Tensor, sample.request_pool_indices) for sample in samples)
+                tuple(cast(torch.Tensor, sample.request_pool_index) for sample in samples)
             ),
-            tokens=concatenate_views(tuple(sample.tokens for sample in samples)),
-            predicates=concatenate_views(tuple(sample.continuation for sample in samples)),
+            tokens=tokens,
+            predicates=continuation,
             penalty_bases=tuple(request.runtime_penalty_base for request in decode),
-            valid=concatenate_views(tuple(sample.valid for sample in samples)),
-            active=concatenate_views(tuple(sample.active for sample in samples)),
+            valid=valid,
+            active=active,
         )
     for request in requests:
         sampled = request.sampled

@@ -611,24 +611,18 @@ def _graph_provider(
 ):
     """Resolve the geometry-bound paged-attention backend for a graph mode."""
 
-    for provider in selection.providers:
-        if not provider.can_bind(
-            mode,
-            head_dim=head_dim,
-            block_size=block_size,
-            device=device,
-        ):
-            continue
-        if provider.can_bind(
-            mode,
-            head_dim=head_dim,
-            block_size=block_size,
-            device=device,
-            cuda_graph=True,
-        ):
-            return provider
-        break
-    raise _GraphMiss("no provisioned attention provider is graph-safe")
+    provider = selection.select_provider(
+        mode, head_dim=head_dim, block_size=block_size, device=device
+    )
+    if provider is not None and provider.can_bind(
+        mode,
+        head_dim=head_dim,
+        block_size=block_size,
+        device=device,
+        cuda_graph=True,
+    ):
+        return provider
+    raise _GraphMiss("the selected attention provider is not graph-safe")
 
 
 def _live_attention(static: AttentionMetadata, live: AttentionMetadata) -> AttentionMetadata:
@@ -785,7 +779,6 @@ def _greedy_decode_values(
     if clear_force_finish:
         force_finish.zero_()
     return SamplerOutput(
-        request_pool_indices=batch.request_pool_indices,
         tokens=tokens,
         valid=valid,
         active=active,
@@ -811,9 +804,6 @@ def _trim_greedy(
         tuple(output.completion[index * total : index * total + rows] for index in range(4))
     )
     return SamplerOutput(
-        request_pool_indices=(
-            None if output.request_pool_indices is None else output.request_pool_indices[:rows]
-        ),
         tokens=output.tokens[:rows],
         valid=output.valid[:rows],
         active=output.active[:rows],

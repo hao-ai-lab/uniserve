@@ -83,59 +83,68 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
     assert result.completions[0].committed_tokens == result.completions[1].committed_tokens
 
 
-def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
-    worker = execution_worker()
-    admissions = (ar_params(21, block_ids=(0,)), ar_params(22, block_ids=(1,)))
-    primed: list[tuple[ScheduledRequest, BatchOutput]] = []
-    for index, admission in enumerate(admissions):
-        extend = token_operation(
-            admission.request_key,
-            op_id=ComputationId(1 + index, 0),
-            predecessor=root_parent(admission),
-            mode=ForwardMode.PREFILL,
-            tokens=(3, 4),
+@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
+def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
+    with execution_worker(device=device) as worker:
+        # The middle request asks for scores. Compatible sampling rows therefore
+        # remain interleaved in operation order, with distinct tokens in every row.
+        admissions = (
+            ar_params(21, block_ids=(0,)),
+            ar_params(22, block_ids=(1,), sampling=SamplingParams(return_logprobs=True)),
+            ar_params(23, block_ids=(2,)),
         )
-        report = finalized_report(
+        prompt_ends = (4, 5, 6)
+        primed: list[tuple[ScheduledRequest, BatchOutput]] = []
+        for index, admission in enumerate(admissions):
+            extend = token_operation(
+                admission.request_key,
+                op_id=ComputationId(1 + index, 0),
+                predecessor=root_parent(admission),
+                mode=ForwardMode.PREFILL,
+                tokens=(3, prompt_ends[index]),
+                logprobs=index == 1,
+            )
+            report = finalized_report(
+                worker,
+                worker.submit(
+                    execution_run(
+                        run_id=1 + index,
+                        admissions=(admission,),
+                        operations=(extend,),
+                    )
+                ),
+            )
+            primed.append((extend, report))
+
+        decode_ops = []
+        commits = []
+        for index, (admission, (extend, report)) in enumerate(zip(admissions, primed, strict=True)):
+            observation = record_completion(extend, report)
+            operation = token_operation(
+                admission.request_key,
+                op_id=ComputationId(4, index),
+                predecessor=observation.op_id,
+                mode=ForwardMode.DECODE,
+                tokens=(_next_token(prompt_ends[index]),),
+                logprobs=index == 1,
+            )
+            decode_ops.append(operation)
+
+            commits.append(observation)
+        result = finalized_report(
             worker,
             worker.submit(
                 execution_run(
-                    run_id=1 + index,
-                    admissions=(admission,),
-                    operations=(extend,),
+                    run_id=9,
+                    admissions=(),
+                    operations=tuple(decode_ops),
+                    commands=tuple(commits),
                 )
             ),
         )
-        primed.append((extend, report))
 
-    decode_ops = []
-    commits = []
-    for index, (admission, (extend, report)) in enumerate(zip(admissions, primed, strict=True)):
-        observation = record_completion(extend, report)
-        operation = token_operation(
-            admission.request_key,
-            op_id=ComputationId(3, index),
-            predecessor=observation.op_id,
-            mode=ForwardMode.DECODE,
-            tokens=(_next_token(4),),
-        )
-        decode_ops.append(operation)
-
-        commits.append(observation)
-    result = finalized_report(
-        worker,
-        worker.submit(
-            execution_run(
-                run_id=9,
-                admissions=(),
-                operations=tuple(decode_ops),
-                commands=tuple(commits),
-            )
-        ),
-    )
-
-    expected = _next_token(_next_token(4))
-    assert result.completions[0].committed_tokens == (expected,)
-    assert result.completions[1].committed_tokens == (expected,)
+        for completion, prompt_end in zip(result.completions, prompt_ends, strict=True):
+            assert completion.committed_tokens == (_next_token(_next_token(prompt_end)),)
 
 
 def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> None:
