@@ -114,6 +114,12 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
                     )
                 ),
             )
+            completion = report.completions[0]
+            assert (completion.position, completion.kv_visible_len, completion.kv_computed_len) == (
+                2,
+                2,
+                2,
+            )
             primed.append((extend, report))
 
         decode_ops = []
@@ -145,6 +151,11 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
 
         for completion, prompt_end in zip(result.completions, prompt_ends, strict=True):
             assert completion.committed_tokens == (_next_token(_next_token(prompt_end)),)
+            assert (completion.position, completion.kv_visible_len, completion.kv_computed_len) == (
+                3,
+                3,
+                3,
+            )
 
 
 def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
@@ -288,16 +287,13 @@ def publish_sample(
             if operation.completion_output is not None
             else 1
         )
-        publish_runtime_samples(
-            (operation,),
-            (request,),
-            (sampled,),
-            completion_group=completion_group,
-            penalty_bases=(penalty_base,),
-            logical_positions=(logical_position,),
-            sampling_positions=(operation_geometry.require_progress(request).rng_counter,),
+        publish_runtime_sample(
+            request,
+            sampled,
+            penalty_base=penalty_base,
+            logical_position=logical_position,
+            sampling_position=operation_geometry.require_progress(request).rng_counter,
             decode_state=decode_state,
-            state=state,
         )
         return _finish_visual(
             operation,
@@ -306,70 +302,40 @@ def publish_sample(
             request_tables=request_tables,
             state=state,
         )
-    if mode is ForwardMode.PREFILL:
-        parameters = require_sampling(request)
-        if parameters.return_prompt_logprobs or int(parameters.n_prompt_logprobs) > 0:
-            request.prompt_logprob_ranges = prompt_logprob_details(
-                request,
-                start,
-                cast(torch.Tensor, task.token_ids),
-                logits,
-                completion_group,
-                decode_state=decode_state,
-                state=state,
-            )
-        request.projected_progress = replace(
-            operation_geometry.require_progress(request),
-            rng_counter=operation_geometry.require_progress(request).rng_counter + (1),
-        )
-        request.projected_progress = replace(
-            operation_geometry.require_progress(request),
-            logical_position=start + task.query_tokens,
-        )
-        publish_runtime_samples(
-            (operation,),
-            (request,),
-            (sampled,),
-            completion_group=completion_group,
-            penalty_bases=(penalty_base,),
-            logical_positions=(operation_geometry.require_progress(request).logical_position,),
-            sampling_positions=(operation_geometry.require_progress(request).rng_counter,),
+    if mode in (ForwardMode.PREFILL, ForwardMode.DECODE):
+        if mode is ForwardMode.PREFILL:
+            parameters = require_sampling(request)
+            if parameters.return_prompt_logprobs or int(parameters.n_prompt_logprobs) > 0:
+                request.prompt_logprob_ranges = prompt_logprob_details(
+                    request,
+                    start,
+                    cast(torch.Tensor, task.token_ids),
+                    logits,
+                    completion_group,
+                    decode_state=decode_state,
+                    state=state,
+                )
+        count = task.query_tokens if mode is ForwardMode.PREFILL else 1
+        progress = operation_geometry.require_progress(request)
+        logical_position = start + count
+        rng_counter = progress.rng_counter + 1
+        publish_runtime_sample(
+            request,
+            sampled,
+            penalty_base=penalty_base,
+            logical_position=logical_position,
+            sampling_position=rng_counter,
+            decode_increment=mode is ForwardMode.DECODE,
             decode_state=decode_state,
-            state=state,
-        )
-        return token_outcome(
-            operation,
-            completion_group,
-            tokens=task.query_tokens,
-            request_tables=request_tables,
-            state=state,
-        )
-    elif mode is ForwardMode.DECODE:
-        request.projected_progress = replace(
-            operation_geometry.require_progress(request),
-            rng_counter=operation_geometry.require_progress(request).rng_counter + (1),
-        )
-        request.projected_progress = replace(
-            operation_geometry.require_progress(request), logical_position=start + 1
-        )
-        publish_runtime_samples(
-            (operation,),
-            (request,),
-            (sampled,),
-            completion_group=completion_group,
-            penalty_bases=(penalty_base,),
-            logical_positions=(operation_geometry.require_progress(request).logical_position,),
-            sampling_positions=(operation_geometry.require_progress(request).rng_counter,),
-            decode_increment=True,
-            decode_state=decode_state,
-            state=state,
         )
         return token_outcome(
             operation,
             completion_group,
             request=request,
-            task=task,
-            tokens=1,
+            task=task if mode is ForwardMode.DECODE else None,
+            tokens=count,
+            logical_position=logical_position,
+            rng_counter=rng_counter,
             request_tables=request_tables,
             state=state,
         )
@@ -384,18 +350,15 @@ def publish_sample(
                 raise RuntimeError("speculative sampling lost its selected point")
             device_selected = accepted_device.to(dtype=torch.int32) + 1
         request.runtime_cache_length = device_selected + int(task.seq_len)
-        publish_runtime_samples(
-            (operation,),
-            (request,),
-            (sampled,),
-            completion_group=completion_group,
-            penalty_bases=(penalty_base,),
-            logical_positions=(device_selected + start,),
-            sampling_positions=(
-                device_selected + int(operation_geometry.require_progress(request).rng_counter),
+        publish_runtime_sample(
+            request,
+            sampled,
+            penalty_base=penalty_base,
+            logical_position=device_selected + start,
+            sampling_position=(
+                device_selected + int(operation_geometry.require_progress(request).rng_counter)
             ),
             decode_state=decode_state,
-            state=state,
         )
         request.draft_tokens = draft
         request.terminal_prefix = sample_work.terminal_draft_prefix
@@ -703,6 +666,8 @@ def token_outcome(
     request: PendingOutput | None = None,
     task: ForwardRow | None = None,
     tokens: int,
+    logical_position: int | None = None,
+    rng_counter: int | None = None,
     committed_tokens: tuple[int, ...] = (),
     request_tables: BlockTables | None,
 ) -> PendingOutput:
@@ -727,28 +692,23 @@ def token_outcome(
     else:
         visible_value = int(request.base_kv_visible)
         initialized = request.initialized_kv
-    runtime = operation_geometry.execution_runtime(
-        request,
-        (
-            cache[0],
-            cache[1],
-            cache[2] if request.draft_tokens is not None else int(visible_value),
-            cache[3],
-        ),
-        computed_len=initialized,
-    )
-    if runtime is None:
-        raise RuntimeError("token publication has no request progress")
-    request.status = OpStatus.OK
+    progress = operation_geometry.require_progress(request)
+    # Publish one complete projection. Device-selected verifier acceptance stays
+    # unresolved until host completion, with the initialized KV extent retained.
     request.projected_progress = replace(
-        runtime,
+        progress,
         logical_position=(
-            operation_geometry.require_progress(request).logical_position
-            if request.draft_tokens is None
-            else request.base_logical_position
+            request.base_logical_position
+            if request.draft_tokens is not None
+            else progress.logical_position
+            if logical_position is None
+            else logical_position
         ),
+        rng_counter=progress.rng_counter if rng_counter is None else rng_counter,
         kv_visible_len=visible_value,
+        kv_computed_len=initialized,
     )
+    request.status = OpStatus.OK
     request.finish_flags = FinishFlags()
     request.product_generations = operation_geometry.output_generations(operation)
     request.committed_tokens = committed_tokens
@@ -862,50 +822,25 @@ def resolve_decode_token(
     return int(tokens[0])
 
 
-def publish_runtime_samples(
-    operations: Sequence[ScheduledRequest],
-    requests: Sequence[PendingOutput],
-    samples: Sequence[SamplerRow],
+def publish_runtime_sample(
+    request: PendingOutput,
+    sample: SamplerRow,
     *,
-    state: BatchState,
-    completion_group: int,
-    penalty_bases: Sequence[torch.Tensor | None],
-    logical_positions: Sequence[int | torch.Tensor],
-    sampling_positions: Sequence[int | torch.Tensor],
+    penalty_base: torch.Tensor | None,
+    logical_position: int | torch.Tensor,
+    sampling_position: int | torch.Tensor,
     decode_increment: bool = False,
     decode_state: DecodeState | None,
 ) -> None:
-    """Publish accepted device token transitions into current request runtime storage."""
+    """Bind one operation's selection for the group's later device state update."""
 
-    states = decode_state
-    if states is None:
+    if decode_state is None:
         return
-    columns = (
-        operations,
-        requests,
-        samples,
-        penalty_bases,
-        logical_positions,
-        sampling_positions,
-    )
-    if len({len(values) for values in columns}) != 1:
-        raise RuntimeError("runtime sampling publication columns are not aligned")
-    for operation, request, sample, penalty_base, logical, sampling_position in zip(
-        operations,
-        requests,
-        samples,
-        penalty_bases,
-        logical_positions,
-        sampling_positions,
-        strict=True,
-    ):
-        if operation.request_key != request.request.request_key:
-            raise RuntimeError("runtime sampling publication crossed request rows")
-        request.sampled = sample
-        request.runtime_logical_position = logical
-        request.runtime_sampling_position = sampling_position
-        request.runtime_penalty_base = penalty_base
-        request.runtime_decode_increment = decode_increment
+    request.sampled = sample
+    request.runtime_logical_position = logical_position
+    request.runtime_sampling_position = sampling_position
+    request.runtime_penalty_base = penalty_base
+    request.runtime_decode_increment = decode_increment
 
 
 def publish_token_products(
