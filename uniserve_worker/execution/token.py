@@ -62,9 +62,7 @@ def prepare_forward(
 ) -> ForwardRow:
     """Pack autoregressive extension, decode, or verification work into model-forward rows."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     if request.request.sampling is None:
         raise invalid_descriptor("sequence operation has no admitted sampling state")
     mode = operation.kind if isinstance(operation.kind, ForwardMode) else None
@@ -99,9 +97,7 @@ def prepare_forward(
             tokens,
             tuple(range(start, start + len(tokens))),
             TokenSelection.ALL_LOGITS if scores_prompt else TokenSelection.LAST_LOGITS,
-            completion_group,
             request_tables=request_tables,
-            state=state,
         )
     elif mode is ForwardMode.DECODE:
         indexed = (
@@ -120,10 +116,8 @@ def prepare_forward(
             else (resolve_decode_token(operation, request, decode_state=decode_state),),
             None if indexed else (start,),
             TokenSelection.LAST_LOGITS,
-            completion_group,
             request_tables=request_tables,
             request_indexed_decode=indexed,
-            state=state,
         )
     else:
         if operation.predicate is not None:
@@ -144,9 +138,7 @@ def prepare_forward(
             tokens,
             tuple(range(start, start + len(tokens))),
             TokenSelection.ALL_LOGITS,
-            completion_group,
             request_tables=request_tables,
-            state=state,
         )
     return task
 
@@ -166,9 +158,7 @@ def prepare_sampling(
 ) -> SamplingMetadata | PendingOutput:
     """Convert token-model outputs into sampling work, prompt log probabilities, or direct outcomes."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     start = int(operation_geometry.require_progress(request).logical_position)
     mode = operation.kind
     if operation.vision_input is not None or operation.latent_feature_input is not None:
@@ -260,9 +250,7 @@ def publish_sample(
 ) -> PendingOutput:
     """Publish sampled tokens, speculative selections, and request runtime transitions."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     start = int(operation_geometry.require_progress(request).logical_position)
     mode = operation.kind
     if sample_work is None and mode is not ForwardMode.DECODE:
@@ -439,9 +427,7 @@ def _prepare_visual_sampling(
 ) -> SamplingMetadata | PendingOutput:
     """Publish encoded visual features and update the request feature reference."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
 
     value = output if operation.vision_input is not None else None
     commit_kv(
@@ -483,9 +469,7 @@ def _finish_visual(
 ) -> PendingOutput:
     """Finalize visual feature publication and advance the encode operation state."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     position = int(operation_geometry.require_progress(request).logical_position)
     if operation.completion_output is not None:
         flow = execution_model.generation
@@ -666,12 +650,8 @@ def token_outcome(
     """Stage request progress and pending payloads for one autoregressive completion."""
 
     if request is None:
-        request = operation_geometry.request_row(
-            completion_group, operation.request_key.request_id, state=state
-        )
-    cache = operation_geometry.cache_coordinates(
-        operation, completion_group, tables=request_tables, state=state
-    )
+        request = state.pending_output(completion_group, operation.request_key.request_id)
+    cache = operation_geometry.cache_coordinates(request, tables=request_tables)
     initialized = cache[2]
     if request.draft_tokens is None:
         published_length = request.runtime_cache_length
@@ -713,9 +693,7 @@ def token_task(
     token_ids: tuple[int | torch.Tensor, ...] | None,
     positions: tuple[int, ...] | torch.Tensor | None,
     selection: TokenSelection,
-    completion_group: int,
     *,
-    state: BatchState,
     seq_len: int | None = None,
     request_indexed_decode: bool = False,
     request_tables: BlockTables | None,
@@ -753,9 +731,7 @@ def token_task(
         )
     predicate_value = request.predicate
     sampling_state = operation.sampling_state or SamplingState()
-    cache = operation_geometry.cache_coordinates(
-        operation, completion_group, tables=request_tables, state=state
-    )
+    cache = operation_geometry.cache_coordinates(request, tables=request_tables)
     visible = cache[2] if seq_len is None else int(seq_len)
     if visible != cache[2]:
         raise invalid_descriptor("token row visibility disagrees with operation metadata")
@@ -866,9 +842,7 @@ def publish_token_products(
         writes: list[TensorRecord] = []
         selected: list[SamplerRow] = []
         for operation, sample in zip(operations, samples, strict=True):
-            request = operation_geometry.request_row(
-                completion_group, operation.request_key.request_id, state=state
-            )
+            request = state.pending_output(completion_group, operation.request_key.request_id)
             write = request.transition_write if transitions else request.token_write
             if write is not None:
                 writes.append(write)

@@ -128,9 +128,7 @@ def execute(
     if not isinstance(execution_model, VideoModel):
         raise invalid_descriptor("video execution requires a video model")
     model = execution_model
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     media = request.request.admission.diffusion
     if media is None:
         raise invalid_descriptor("video operation has no admitted media geometry")

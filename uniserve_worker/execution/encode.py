@@ -68,9 +68,7 @@ def text(
 ) -> PendingOutput:
     """Encode admitted conditioning tokens and publish their declared tensors."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     admission = request.request.admission
     if admission.diffusion is None or not admission.prompt_token_ids:
         raise invalid_descriptor("text conditioning requires admitted prompt tokens")
@@ -160,9 +158,7 @@ def publish_features(
 ) -> PendingOutput:
     """Split encoded features by request and prepare cache or product publication."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     feature_output = operation.encoder_output
     if feature_output is None:
         raise invalid_descriptor("encoder output has no feature reference")
@@ -208,9 +204,7 @@ def materialization_latent(
 ) -> torch.Tensor:
     """Gather the final latent trajectory and build its decoder batch."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     latent_input = operation.latent_input
     if latent_input is None:
         raise invalid_descriptor("latent materialization requires a latent input")
@@ -223,9 +217,7 @@ def materialization_latent(
     image_params = request.request.image
     if image_params is None:
         raise invalid_descriptor("image materialization has no admitted image parameters")
-    row = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
@@ -258,12 +250,8 @@ def publish_image(
 ) -> PendingOutput:
     """Decode final latents and schedule bounded image-output publication."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
-    row = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
+    row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
@@ -288,9 +276,7 @@ def publish_image(
                 value_range=image_range,
             ),
         )
-        request = operation_geometry.request_row(
-            completion_group, operation.request_key.request_id, state=state
-        )
+        request = state.pending_output(completion_group, operation.request_key.request_id)
         if request.producer_write is None:
             request.producer_write = write
     image_task = defer_image_encoding(
@@ -324,12 +310,8 @@ def state_outcome(
 ) -> PendingOutput:
     """Stage execution progress and defer successor publication until stateful tensors are ready."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
-    cache = operation_geometry.cache_coordinates(
-        operation, completion_group, tables=request_tables, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
+    cache = operation_geometry.cache_coordinates(request, tables=request_tables)
     selected = request.runtime_cache_length
     if selected is None:
         selected = cache[2]
@@ -355,9 +337,7 @@ def non_state_outcome(
 ) -> PendingOutput:
     """Record a stateless completion and its already materialized output products."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     request.status = OpStatus.OK
     request.projected_progress = operation_geometry.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
@@ -386,9 +366,7 @@ def encode_source(
             consumer_op_id=operation.op_id,
             device=model_runner.operation_devices(operation)[0],
         )
-        request = operation_geometry.request_row(
-            completion_group, operation.request_key.request_id, state=state
-        )
+        request = state.pending_output(completion_group, operation.request_key.request_id)
         request.device_reads.append(read)
         metadata = read.metadata
         if (
@@ -434,7 +412,8 @@ def vision_state_row(
     """Publish vision features and construct the request runtime that references their token span."""
 
     cache = operation_geometry.cache_coordinates(
-        operation, completion_group, tables=request_tables, state=state
+        state.pending_output(completion_group, operation.request_key.request_id),
+        tables=request_tables,
     )
     injection = model_runner.image_processor().feature_injection
     if injection is None:
@@ -580,7 +559,8 @@ def latent_state_row(
     temporal[-1] = conditioning_position + int(flow.rope_advance)
     indexes = torch.stack((temporal, torch.zeros_like(temporal), torch.zeros_like(temporal)))
     cache = operation_geometry.cache_coordinates(
-        operation, completion_group, tables=request_tables, state=state
+        state.pending_output(completion_group, operation.request_key.request_id),
+        tables=request_tables,
     )
     return ForwardRow(
         forward_mode=PipelineStage.DENOISING,
@@ -653,9 +633,7 @@ def defer_image_encoding(
     if int(quantized.numel()) > max_bytes:
         raise invalid_descriptor("image staging exceeds its registered completion byte bound")
     capture = state.group_buffers[completion_group].capture_bytes(quantized)
-    pending = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    pending = state.pending_output(completion_group, operation.request_key.request_id)
     if len(pending.completion_tasks) != 1:
         raise RuntimeError("materialization has no registered CPU task slot")
     reservation = pending.completion_tasks[0]
@@ -687,9 +665,7 @@ def bound_device_write(
 ) -> TensorRecord:
     """Return the staged device-product write matching a declared output reference."""
 
-    request = operation_geometry.request_row(
-        completion_group, reference.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, reference.request_key.request_id)
     matches = tuple(
         write for write in request.writes if write.reference == reference and not write.feature
     )
@@ -705,9 +681,7 @@ def bound_encoder_write(
 ) -> TensorRecord:
     """Return the staged encoder-cache write matching a declared output reference."""
 
-    request = operation_geometry.request_row(
-        completion_group, reference.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, reference.request_key.request_id)
     matches = tuple(
         write for write in request.writes if write.reference == reference and write.feature
     )

@@ -7,6 +7,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from functools import partial
 from threading import Lock
+from typing import cast
 
 import torch
 
@@ -143,7 +144,7 @@ class BatchState:
         values = tuple(self.outputs[index] for index in self.output_groups[group])
         if any(not isinstance(value, PendingOutput) for value in values):
             raise RuntimeError("completion group has no reserved pending outputs")
-        return tuple(value for value in values if isinstance(value, PendingOutput))
+        return cast(tuple[PendingOutput, ...], values)
 
     def pending_output(self, group: int, request_id: int) -> PendingOutput:
         location = self.request_locations.get(int(request_id))

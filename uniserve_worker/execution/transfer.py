@@ -72,10 +72,8 @@ def execute(
         output = operation.kv_output
         if output is None:
             raise invalid_descriptor("KV publication requires a cache output identity")
-        cache = operation_geometry.cache_coordinates(
-            operation, completion_group, tables=request_tables, state=state
-        )
-        request = operation_geometry.request_row(completion_group, request_id, state=state)
+        request = state.pending_output(completion_group, request_id)
+        cache = operation_geometry.cache_coordinates(request, tables=request_tables)
         expected_base = publications.destination_base(operation.request_key, "gen")
         snapshot = publications.publish(
             request_pool_idx=request.request.request_pool_idx,
@@ -105,10 +103,8 @@ def execute(
         output = operation.kv_output
         if source is None or output is None:
             raise invalid_descriptor("KV installation requires source and output identities")
-        cache = operation_geometry.cache_coordinates(
-            operation, completion_group, tables=request_tables, state=state
-        )
-        request = operation_geometry.request_row(completion_group, request_id, state=state)
+        request = state.pending_output(completion_group, request_id)
+        cache = operation_geometry.cache_coordinates(request, tables=request_tables)
         write = state.cache_imports.get(source)
         if write is None:
             raise invalid_descriptor("KV installation has no reserved physical input")
@@ -178,16 +174,12 @@ def _publish_current_latent(
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
 ) -> TensorPublication:
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     if operation_geometry.require_progress(request).latent_product != reference:
         raise invalid_descriptor("latent transfer does not name the committed trajectory")
     if product != operation.latent_output:
         raise invalid_descriptor("product transfer changes the physical product kind")
-    row = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
@@ -230,9 +222,7 @@ def publish_latent_source(
     params = row.input_latent_params
     if params is None:
         raise invalid_descriptor("latent publication has no staged parameters")
-    request = operation_geometry.request_row(
-        completion_group, product.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, product.request_key.request_id)
     transports = publication_transports
     if not transports:
         raise unsupported_setup("latent publication requires a configured transport")
@@ -277,9 +267,7 @@ def publish_tensors(
     outputs = operation.outputs
     if len(outputs) != len(values):
         raise invalid_descriptor("numerical results disagree with declared Tensor outputs")
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     owned = {write.reference for write in request.writes if not write.feature}
     return tuple(
         publish_product(
@@ -313,9 +301,7 @@ def publish_product(
     transports = publication_transports
     if not transports:
         raise unsupported_setup("product publication requires a configured transport")
-    request = operation_geometry.request_row(
-        completion_group, product.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, product.request_key.request_id)
     encoder_write = next(
         (write for write in request.writes if write.reference == product and write.feature), None
     )
@@ -411,9 +397,7 @@ def fetch_product(
 ) -> tuple[torch.Tensor, ImageMetadata | FeatureMetadata | None]:
     """Fetch a transfer handle and stage its typed value for the consuming operation."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     for reference in (operation.vision_input, operation.latent_feature_input):
         if reference is None:
             continue

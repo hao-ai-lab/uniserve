@@ -70,23 +70,14 @@ def execution_runtime(
     )
 
 
-def request_row(completion_group: int, request_id: int, *, state: BatchState) -> PendingOutput:
-    """Borrow the pending output assigned to this completion group."""
-
-    return state.pending_output(completion_group, request_id)
-
-
 def cache_coordinates(
-    operation: ScheduledRequest,
-    completion_group: int,
+    request: PendingOutput,
     *,
-    state: BatchState,
     tables: BlockTables | None,
     group_id: int = 0,
 ) -> tuple[int, int, int, int]:
     """Resolve the request slot, cache group, accepted prefix and physical token capacity."""
 
-    request = request_row(completion_group, operation.request_key.request_id, state=state)
     slot = int(request.request.request_pool_idx)
     # Scheduler columns may reserve the full unobserved verifier prefix.
     # The request state owns the accepted extent used by numerical consumers.
@@ -116,7 +107,7 @@ def _predicated_outcome(
 ) -> PendingOutput:
     """Construct an inactive outcome while preserving declared product generations."""
 
-    request = request_row(completion_group, operation.request_key.request_id, state=state)
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     request.status = OpStatus.PREDICATED
     request.projected_progress = execution_runtime(request, None)
     request.finish_flags = FinishFlags()

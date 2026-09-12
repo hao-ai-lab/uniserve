@@ -778,9 +778,7 @@ def _reserve_cpu_tasks(
             continue
         if video_model and config.rank != worker_info.output_rank(operation.entry):
             continue
-        pending = operation_geometry.request_row(
-            completion_group, operation.request_key.request_id, state=state
-        )
+        pending = state.pending_output(completion_group, operation.request_key.request_id)
         if pending.completion_tasks:
             raise invalid_descriptor("materialization repeats its CPU task identity")
         reservation = cpu_tasks.reserve()
@@ -858,9 +856,7 @@ def _reserve_outputs(
     }
     for operation in operations:
         device = model_runner.operation_devices(operation)[2]
-        request = operation_geometry.request_row(
-            completion_group, operation.request_key.request_id, state=state
-        )
+        request = state.pending_output(completion_group, operation.request_key.request_id)
         predicated = request.status is OpStatus.PREDICATED
         if not predicated:
             decode = next(
@@ -921,26 +917,20 @@ def _reserve_outputs(
     # Retain each successful reservation before the next store call can fail.
     for binding in bound_groups:
         for write in binding:
-            request = operation_geometry.request_row(
-                completion_group, write.reference.request_key.request_id, state=state
-            )
+            request = state.pending_output(completion_group, write.reference.request_key.request_id)
             request.writes.append(write)
     features = tensor_store.reserve_features(
         tuple(encoder_bindings), buffer_allocations=allocations
     )
     for write in features:
-        request = operation_geometry.request_row(
-            completion_group, write.reference.request_key.request_id, state=state
-        )
+        request = state.pending_output(completion_group, write.reference.request_key.request_id)
         request.writes.append(write)
     for write in (write for binding in bound_groups for write in binding):
         identity = (write.reference.request_key, write.reference.producer_op_id)
         producer = by_identity.get(identity)
         if producer is None:
             raise RuntimeError("device output binding has no computation in the execution batch")
-        request = operation_geometry.request_row(
-            completion_group, producer.request_key.request_id, state=state
-        )
+        request = state.pending_output(completion_group, producer.request_key.request_id)
         if write.reference == producer.token_output:
             request.token_write = write
         elif write.reference == producer.transition_output:
@@ -993,9 +983,7 @@ def _consume_predicates(
         for (operation, _request), read in zip(entries, reads, strict=True):
             predicate = cast(TensorRef, operation.predicate)
             tagged = predicate.dtype is DType.I64
-            request = operation_geometry.request_row(
-                completion_group, operation.request_key.request_id, state=state
-            )
+            request = state.pending_output(completion_group, operation.request_key.request_id)
             request.device_reads.append(read)
             request.predicate = (read.tensor, tagged)
 
@@ -1010,9 +998,7 @@ def _publish_predicated_outputs(
     """Publish inactive sentinel values for products of predicated operations."""
 
     for operation in operations:
-        request = operation_geometry.request_row(
-            completion_group, operation.request_key.request_id, state=state
-        )
+        request = state.pending_output(completion_group, operation.request_key.request_id)
         if request.status is OpStatus.PREDICATED:
             for write in (request.completion_write, request.transition_write):
                 if write is not None:
@@ -1041,9 +1027,7 @@ def _bind_latent_inputs(
     requests = {
         operation_geometry.operation_identity(operation): (
             operation,
-            operation_geometry.request_row(
-                completion_group, operation.request_key.request_id, state=state
-            ),
+            state.pending_output(completion_group, operation.request_key.request_id),
         )
         for operation in operations
     }
@@ -1144,9 +1128,7 @@ def _bind_latent_inputs(
         ),
     )
     for (identity, params, slot), value in zip(rows, staged, strict=True):
-        request = operation_geometry.request_row(
-            completion_group, identity[0].request_id, state=state
-        )
+        request = state.pending_output(completion_group, identity[0].request_id)
         request.input_latent_params = params
         request.latent_staging = value
 
@@ -1226,9 +1208,7 @@ def _bind_cache_tables(
         rows_by_operation[identity].append(row)
 
     for operation in operations:
-        request = operation_geometry.request_row(
-            completion_group, operation.request_key.request_id, state=state
-        )
+        request = state.pending_output(completion_group, operation.request_key.request_id)
         main_slot = int(request.request.request_pool_idx)
         parent_runtime = operation_geometry.input_progress(request)
         operation_rows = rows_by_operation.get(operation_geometry.operation_identity(operation), [])
@@ -1308,9 +1288,7 @@ def _stage_input_products(
             )
             if len(consumers) != 1:
                 raise invalid_descriptor("latent transfer must have one completion group consumer")
-            row = operation_geometry.request_row(
-                completion_group, consumers[0].request_key.request_id, state=state
-            )
+            row = state.pending_output(completion_group, consumers[0].request_key.request_id)
             params = row.input_latent_params
             staging = row.latent_staging
             if params is None or staging is None:
@@ -1322,9 +1300,7 @@ def _stage_input_products(
                 or value.step != int(params.start_step)
             ):
                 raise invalid_descriptor("latent transfer disagrees with its scheduler params")
-            request = operation_geometry.request_row(
-                completion_group, product.request_key.request_id, state=state
-            )
+            request = state.pending_output(completion_group, product.request_key.request_id)
             if (
                 operation_geometry.require_progress(request).latent_product is not None
                 or int(operation_geometry.require_progress(request).flow_step) != 0

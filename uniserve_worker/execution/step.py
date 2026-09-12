@@ -487,9 +487,7 @@ def _execute_groups(
         active = tuple(
             operation
             for operation in state.group_operations(completion_group)
-            if operation_geometry.request_row(
-                completion_group, operation.request_key.request_id, state=state
-            ).status
+            if state.pending_output(completion_group, operation.request_key.request_id).status
             is not OpStatus.PREDICATED
         )
         for device in dict.fromkeys(
@@ -505,9 +503,7 @@ def _execute_groups(
     for group_index, completion_group in enumerate(completion_groups):
         for operation_index, operation in enumerate(state.group_operations(completion_group)):
             if (
-                operation_geometry.request_row(
-                    completion_group, operation.request_key.request_id, state=state
-                ).status
+                state.pending_output(completion_group, operation.request_key.request_id).status
                 is OpStatus.PREDICATED
             ):
                 grouped[group_index][operation_index] = _predicated_outcome(
@@ -774,9 +770,7 @@ def _execute_operations(
         step_count = 1
         for index in trajectories:
             operation, completion_group = operations[index]
-            request = operation_geometry.request_row(
-                completion_group, operation.request_key.request_id, state=state
-            )
+            request = state.pending_output(completion_group, operation.request_key.request_id)
             params = request.input_latent_params
             if params is None:
                 raise invalid_descriptor("diffusion operation has no staged latent parameters")
@@ -790,9 +784,7 @@ def _execute_operations(
                 if not live(index):
                     continue
                 operation, completion_group = operations[index]
-                row = operation_geometry.request_row(
-                    completion_group, operation.request_key.request_id, state=state
-                )
+                row = state.pending_output(completion_group, operation.request_key.request_id)
                 params = row.input_latent_params
                 staging = row.latent_staging
                 if params is None or staging is None:
@@ -841,8 +833,8 @@ def _execute_operations(
                         token.commit_kv(
                             task,
                             task.query_tokens,
-                            operation_geometry.request_row(
-                                completion_group, operation.request_key.request_id, state=state
+                            state.pending_output(
+                                completion_group, operation.request_key.request_id
                             ),
                             publish_runtime=False,
                             request_tables=request_tables,
@@ -869,8 +861,8 @@ def _execute_operations(
                         if index not in step_inputs:
                             continue
                         guide, timestep, _next_timestep = step_inputs[index]
-                        row = operation_geometry.request_row(
-                            completion_group, operation.request_key.request_id, state=state
+                        row = state.pending_output(
+                            completion_group, operation.request_key.request_id
                         )
                         params = row.input_latent_params
                         staging = row.latent_staging
@@ -878,8 +870,8 @@ def _execute_operations(
                             raise invalid_descriptor(
                                 "trajectory operation has no staged latent inputs"
                             )
-                        request = operation_geometry.request_row(
-                            completion_group, operation.request_key.request_id, state=state
+                        request = state.pending_output(
+                            completion_group, operation.request_key.request_id
                         )
                         diffusion = model_runner.diffusion
                         if diffusion is None:
@@ -965,8 +957,8 @@ def _execute_operations(
                                 state=state,
                             )
                         else:
-                            row = operation_geometry.request_row(
-                                completion_group, operation.request_key.request_id, state=state
+                            row = state.pending_output(
+                                completion_group, operation.request_key.request_id
                             )
                             params = row.input_latent_params
                             staging = row.latent_staging
@@ -1103,10 +1095,8 @@ def _execute_operations(
                     capture_samples(
                         sampled,
                         tuple(
-                            operation_geometry.request_row(
-                                completion_group,
-                                operations[index][0].request_key.request_id,
-                                state=state,
+                            state.pending_output(
+                                completion_group, operations[index][0].request_key.request_id
                             )
                             for index, _task, _logits, _work, _selected in candidates
                         ),
@@ -1152,9 +1142,7 @@ def _execute_operations(
                 operation, completion_group = operations[index]
                 try:
                     guide, timestep, next_timestep = step_inputs[index]
-                    row = operation_geometry.request_row(
-                        completion_group, operation.request_key.request_id, state=state
-                    )
+                    row = state.pending_output(completion_group, operation.request_key.request_id)
                     params = row.input_latent_params
                     staging = row.latent_staging
                     if params is None or staging is None:

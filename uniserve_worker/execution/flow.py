@@ -71,10 +71,8 @@ def prepare_latent(
         raise invalid_descriptor(
             "media preparation requires one exact conditioning input and latent output"
         )
-    cache = operation_geometry.cache_coordinates(
-        operation, completion_group, tables=request_tables, state=state
-    )
-    request = operation_geometry.request_row(completion_group, request_id, state=state)
+    request = state.pending_output(completion_group, request_id)
+    cache = operation_geometry.cache_coordinates(request, tables=request_tables)
     publications = kv_cache
     if publications is None:
         raise invalid_descriptor("media preparation requires KV publication storage")
@@ -107,9 +105,7 @@ def prepare_latent(
 
     # Noise is generated directly into request-owned staging, then installed in
     # the pool before its generation becomes visible to downstream operations.
-    row = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
@@ -177,10 +173,8 @@ def initialize(
         raise invalid_descriptor(
             "flow operation requires exact conditioning and one latent input/output generation"
         )
-    cache = operation_geometry.cache_coordinates(
-        operation, completion_group, tables=request_tables, state=state
-    )
-    request = operation_geometry.request_row(completion_group, request_id, state=state)
+    request = state.pending_output(completion_group, request_id)
+    cache = operation_geometry.cache_coordinates(request, tables=request_tables)
     publications = kv_cache
     if publications is None:
         raise invalid_descriptor("flow conditioning requires cache publication storage")
@@ -206,9 +200,7 @@ def initialize(
         raise invalid_descriptor("flow latent generations are invalid")
     if operation_geometry.require_progress(request).latent_product != latent_input:
         raise invalid_descriptor("flow operation does not name the current latent generation")
-    row = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
@@ -258,16 +250,12 @@ def prepare_step(
 ) -> tuple[CfgPlan, torch.Tensor, torch.Tensor, tuple[tuple[Branch, ForwardRow], ...]]:
     """Gather current latent pages and construct one guided diffusion-step batch."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
     image = request.request.image
     if image is None:
         raise invalid_descriptor("flow step requires admitted image parameters")
     generation = model_runner.generation()
-    row = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
@@ -361,12 +349,8 @@ def finish(
 ) -> PendingOutput:
     """Integrate predicted velocity, write the next latent bank, and prepare publication."""
 
-    request = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
-    row = operation_geometry.request_row(
-        completion_group, operation.request_key.request_id, state=state
-    )
+    request = state.pending_output(completion_group, operation.request_key.request_id)
+    row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
