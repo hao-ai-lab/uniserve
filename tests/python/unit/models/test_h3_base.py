@@ -7,10 +7,12 @@ import pytest
 import torch
 
 from uniserve_worker.backends.attention.torch_sdpa import TorchSDPAAttentionBackend
+from uniserve_worker.bootstrap.catalog import resolve_catalog_entry
 from uniserve_worker.models.minimax_h3.base_contract import (
     BASE_H3_REVISION,
     resolve_base_h3_contract,
 )
+from uniserve_worker.models.minimax_h3.config import resolve_h3_contract
 from uniserve_worker.models.minimax_h3.packing import build_packed_layout, dense_key_mask
 from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
 
@@ -90,12 +92,27 @@ def base_root(tmp_path: Path):
 
 
 def test_base_contract_identifies_dense_49_forward_recipe(base_root):
-    contract = resolve_base_h3_contract(base_root)
+    contract = resolve_h3_contract(base_root)
+    schedule = resolve_catalog_entry(
+        ("MiniMaxH3Transformer3DModel",), root=base_root
+    ).create_schedule("cpu")
+    for shift, sigmas in zip((12.0, 3.0), schedule.sigmas, strict=True):
+        grid = torch.linspace(1.0, 0.0, 50, dtype=torch.float32)
+        torch.testing.assert_close(sigmas, shift * grid / (1 + (shift - 1) * grid), rtol=0, atol=0)
     assert contract["revision"] == BASE_H3_REVISION
     assert contract["attention"] == "dense"
     assert contract["num_inference_steps"] == 50
     assert contract["denoise_steps"] == 49
     assert contract["guidance_scale"] == 1.0
+
+
+def test_explicit_missing_contract_does_not_select_base_recipe(base_root, monkeypatch):
+    missing = base_root / "operator-contract.json"
+    with pytest.raises(ValueError, match="sidecar does not exist"):
+        resolve_h3_contract(base_root, missing)
+    monkeypatch.setenv("UNISERVE_H3_CONTRACT", str(missing))
+    with pytest.raises(ValueError, match="sidecar does not exist"):
+        resolve_catalog_entry(("MiniMaxH3Transformer3DModel",), root=base_root)
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,7 @@
 
 use base64::Engine as _;
 use serde::Deserialize;
+use validator::ValidateUrl;
 
 /// Largest encoded reference and aggregate bundle admitted by the HTTP contract.
 pub const MAX_REFERENCE_BYTES: usize = 32 * 1024 * 1024;
@@ -119,6 +120,7 @@ pub fn validate_references(references: &[VideoReference]) -> Result<(), &'static
                 // This is syntax admission only, not SSRF authorization. The fetcher must
                 // resolve and validate every destination and enforce streaming byte limits.
                 if url.len() > 8192
+                    || !url.validate_url()
                     || !(url.starts_with("https://") || url.starts_with("http://"))
                     || url.chars().any(char::is_whitespace)
                 {

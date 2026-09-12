@@ -92,7 +92,10 @@ fn invalid_reference_bundles_fail_before_media_admission() {
     invalid_role["task"] = json!("continue_shot");
     let mut local_url = image.clone();
     local_url["source"] = json!({"type": "url", "value": "file:///etc/passwd"});
+    let mut missing_host = image.clone();
+    missing_host["source"] = json!({"type": "url", "value": "https://"});
     for references in [
+        json!([missing_host]),
         json!([audio]),
         json!([video]),
         json!([invalid_encoding]),
