@@ -1318,27 +1318,20 @@ impl NewRequest {
         }
         if let Some(diffusion) = &self.diffusion {
             ensure_valid!(
-                diffusion.references.len() <= 12,
-                "too many reference sources"
-            );
-            for (kind, limit) in [("image", 9), ("video", 3), ("audio", 3)] {
-                ensure_valid!(
-                    diffusion
-                        .references
-                        .iter()
-                        .filter(|item| item.kind == kind)
-                        .count()
-                        <= limit,
-                    "reference modality count exceeded"
-                );
-            }
-            ensure_valid!(
-                diffusion.references.is_empty()
-                    || diffusion.references.iter().any(|item| item.kind != "audio"),
-                "references require visual media"
+                diffusion.references.len() <= 1,
+                "references permits at most 1 image"
             );
             for reference in &diffusion.references {
                 reference.validate(self.request_key)?;
+                ensure_valid!(
+                    reference.kind == "image" && reference.task == "reference" && reference.role == "reference",
+                    "references requires image with task=reference and role=reference"
+                );
+                let pixels = reference.pixels.as_ref().expect("validated image pixels");
+                ensure_valid!(
+                    pixels.shape_bound.dims[1..3].iter().all(|dim| matches!(dim, DimBound::Static(n) if n % 32 == 0)),
+                    "references image dimensions must be multiples of 32"
+                );
             }
             ensure_valid!(
                 !diffusion.prompt_token_ids.is_empty(),

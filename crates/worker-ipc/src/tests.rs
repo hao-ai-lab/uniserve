@@ -166,59 +166,22 @@ fn decoded_reference_admission_round_trip() {
         storage_class: StorageClass::DeviceTensor,
         dtype: DType::U8,
         shape_bound: ShapeBound {
-            dims: [1, 16, 24, 3].map(DimBound::Static).to_vec(),
+            dims: [1, 32, 64, 3].map(DimBound::Static).to_vec(),
         },
         ..output_product(OpId(0))
     };
     let image = DecodedReference {
         kind: "image".into(),
-        task: "first_last_frame".into(),
-        role: "last_frame".into(),
+        task: "reference".into(),
+        role: "reference".into(),
         include_audio: false,
         pixels: Some(pixels),
         audio: None,
         fps_num: 0,
         fps_den: 1,
     };
-    let audio = ProductRef {
-        output_index: 1,
-        dtype: DType::F32,
-        shape_bound: ShapeBound {
-            dims: [2, 32_000].map(DimBound::Static).to_vec(),
-        },
-        ..image.pixels.as_ref().unwrap().clone()
-    };
-    let video = DecodedReference {
-        kind: "video".into(),
-        task: "continue_scene".into(),
-        role: "preceding".into(),
-        include_audio: true,
-        pixels: Some(ProductRef {
-            output_index: 2,
-            shape_bound: ShapeBound {
-                dims: [24, 16, 24, 3].map(DimBound::Static).to_vec(),
-            },
-            ..image.pixels.as_ref().unwrap().clone()
-        }),
-        audio: Some(audio.clone()),
-        fps_num: 24_000,
-        fps_den: 1_001,
-    };
-    let standalone = DecodedReference {
-        kind: "audio".into(),
-        task: "reference".into(),
-        role: "reference".into(),
-        include_audio: false,
-        pixels: None,
-        audio: Some(ProductRef {
-            output_index: 3,
-            ..audio
-        }),
-        fps_num: 0,
-        fps_den: 1,
-    };
     let mut admission = media_admission(vec![1, 2]);
-    admission.diffusion.as_mut().unwrap().references = vec![image, video, standalone];
+    admission.diffusion.as_mut().unwrap().references = vec![image];
     admission.validate().unwrap();
     let run = Run::new(1, vec![admission.clone()], vec![]);
     assert_eq!(
@@ -1045,15 +1008,15 @@ fn admitted_image_pixels_reach_encoder_inputs() {
         storage_class: StorageClass::HostStaging,
         dtype: DType::U8,
         shape_bound: ShapeBound {
-            dims: [1, 2, 2, 3].map(DimBound::Static).to_vec(),
+            dims: [1, 32, 32, 3].map(DimBound::Static).to_vec(),
         },
         point_range: PointRange::default(),
     };
     let mut admission = media_admission(vec![7, 8, 9]);
     admission.diffusion.as_mut().unwrap().references = vec![DecodedReference {
         kind: "image".into(),
-        task: "first_frame".into(),
-        role: "first_frame".into(),
+        task: "reference".into(),
+        role: "reference".into(),
         include_audio: false,
         pixels: Some(pixels.clone()),
         audio: None,
@@ -1079,11 +1042,11 @@ fn admitted_image_pixels_reach_encoder_inputs() {
     let run = batch_with_operations(1, vec![admission], vec![operation]).with_input_products(vec![
         ProductPayload {
             product: pixels,
-            value: InlineValue::Bytes((0..12).collect()),
+            value: InlineValue::Bytes(vec![7; 32 * 32 * 3]),
         },
     ]);
     assert_eq!(execute_round_trip(run.clone()), run);
-    for length in [11, 13] {
+    for length in [32 * 32 * 3 - 1, 32 * 32 * 3 + 1] {
         let mut invalid = run.clone();
         invalid.input_products[0].value = InlineValue::Bytes(vec![0; length]);
         assert!(

@@ -60,11 +60,8 @@ fn empty_references_preserve_the_lowered_request() {
 }
 
 #[test]
-fn reference_order_and_soundtrack_selection_survive_lowering() {
+fn single_image_survives_lowering() {
     let references = json!([
-        {"type": "video", "task": "continue_scene", "role": "preceding",
-         "source": {"type": "url", "value": "https://example.org/clip.mp4"},
-         "include_audio": false},
         {"type": "image", "task": "reference", "role": "reference",
          "source": {"type": "base64", "value": "YWJj"}}
     ]);
@@ -112,6 +109,40 @@ fn invalid_reference_bundles_fail_before_media_admission() {
                 .is_err()
         );
     }
+}
+
+fn image_reference(format: image::ImageFormat, width: u32, height: u32) -> uniserve_server::serving::references::VideoReference {
+    use base64::Engine as _;
+    let image = image::RgbImage::from_pixel(width, height, image::Rgb([7, 13, 29]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut bytes, format).unwrap();
+    serde_json::from_value(json!({
+        "type": "image", "task": "reference", "role": "reference",
+        "source": {"type": "base64", "value": base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())}
+    })).unwrap()
+}
+
+#[test]
+fn reference_admission_is_capability_gated_and_decode_bounded() {
+    use uniserve_server::serving::references::admit_references;
+    for format in [image::ImageFormat::Png, image::ImageFormat::Jpeg] {
+        let reference = image_reference(format, 64, 32);
+        assert!(admit_references(&[reference.clone()], false).unwrap_err().contains("model contract"));
+        let image = admit_references(&[reference.clone()], true).unwrap().unwrap();
+        assert_eq!((image.width, image.height, image.pixels.len()), (64, 32, 64 * 32 * 3));
+        if format == image::ImageFormat::Png {
+            assert_eq!(image.pixels, [7, 13, 29].repeat(64 * 32));
+        }
+        assert!(admit_references(&[reference.clone(), reference], true).unwrap_err().contains("at most 1"));
+    }
+    for (width, height) in [(31, 32), (32, 33), (4128, 32)] {
+        assert!(admit_references(&[image_reference(image::ImageFormat::Png, width, height)], true)
+            .unwrap_err().contains("dimensions"));
+    }
+    assert!(admit_references(&[image_reference(image::ImageFormat::Bmp, 32, 32)], true)
+        .unwrap_err().contains("PNG or JPEG"));
+    assert_eq!(admit_references(&[], false).unwrap(), None);
+    assert_eq!(admit_references(&[], true).unwrap(), None);
 }
 
 #[test]

@@ -1,14 +1,13 @@
-//! Ordered reference-media request descriptors. Media bytes are decoded only at admission.
+//! Bounded inline image-reference admission. Payloads never enter diagnostics.
 
 use base64::Engine as _;
 use serde::Deserialize;
-use validator::ValidateUrl;
+use std::io::Cursor;
+use uniserve_core::ImageReference;
 
-/// Largest encoded reference and aggregate bundle admitted by the HTTP contract.
+/// Maximum compressed source size; decoded storage is bounded independently.
 pub const MAX_REFERENCE_BYTES: usize = 32 * 1024 * 1024;
-pub const MAX_REFERENCE_BUNDLE_BYTES: usize = 96 * 1024 * 1024;
 
-/// Semantic modality, independent of a container's optional soundtrack.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceKind {
@@ -17,7 +16,6 @@ pub enum ReferenceKind {
     Audio,
 }
 
-/// Task annotation; image references do not imply exact FL2VA endpoint anchors.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceTask {
@@ -28,7 +26,6 @@ pub enum ReferenceTask {
     ContinueShot,
 }
 
-/// Position of this source within the conditioning task.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceRole {
@@ -38,30 +35,20 @@ pub enum ReferenceRole {
     Preceding,
 }
 
-/// Exactly one source representation. Base64 is raw standard base64, not a data URI.
 #[derive(Clone, Deserialize, PartialEq, Eq)]
-#[serde(
-    tag = "type",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReferenceSource {
     Url(String),
     Base64(String),
 }
 
-// Reference URLs may include signed query strings; payloads and URLs must not enter logs.
 impl std::fmt::Debug for ReferenceSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Url(_) => "Url(<redacted>)",
-            Self::Base64(_) => "Base64(<redacted>)",
-        })
+        f.write_str("ReferenceSource(<redacted>)")
     }
 }
 
-/// One source in caller order. Video soundtrack selection is explicit.
+/// One ordered source. Only an inline image with reference task/role is supported.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VideoReference {
@@ -70,82 +57,71 @@ pub struct VideoReference {
     pub task: ReferenceTask,
     pub role: ReferenceRole,
     pub source: ReferenceSource,
-    /// Required for video, forbidden for other modalities.
     pub include_audio: Option<bool>,
 }
 
-/// Validate descriptor bounds and role consistency before fetching or decoding any media.
-/// Network address policy and decoded-media geometry remain admission obligations.
+/// Validate the supported descriptor before model admission or image decoding.
 pub fn validate_references(references: &[VideoReference]) -> Result<(), &'static str> {
-    if references.is_empty() {
-        return Ok(());
+    if references.len() > 1 {
+        return Err("references permits at most 1 image");
     }
-    if references.len() > 12 {
-        return Err("references permits at most 12 ordered sources");
-    }
-    let mut counts = [0usize; 3];
-    let mut bytes = 0usize;
     for reference in references {
-        let index = match reference.kind {
-            ReferenceKind::Image => 0,
-            ReferenceKind::Video => 1,
-            ReferenceKind::Audio => 2,
+        if reference.kind != ReferenceKind::Image {
+            return Err("references supports only image sources");
+        }
+        if reference.task != ReferenceTask::Reference || reference.role != ReferenceRole::Reference {
+            return Err("references requires task=reference and role=reference");
+        }
+        if reference.include_audio.is_some() {
+            return Err("references image forbids include_audio");
+        }
+        let ReferenceSource::Base64(encoded) = &reference.source else {
+            return Err("references requires inline base64 PNG/JPEG; URLs are forbidden");
         };
-        counts[index] += 1;
-        if (reference.kind == ReferenceKind::Video) != reference.include_audio.is_some() {
-            return Err("include_audio is required for video and forbidden for image/audio");
+        if encoded.is_empty() || encoded.len() > MAX_REFERENCE_BYTES.div_ceil(3) * 4 {
+            return Err("references base64 exceeds the 32 MiB source bound");
         }
-        let valid_role = match reference.task {
-            ReferenceTask::Reference => reference.role == ReferenceRole::Reference,
-            ReferenceTask::FirstFrame => {
-                reference.kind == ReferenceKind::Image
-                    && reference.role == ReferenceRole::FirstFrame
-            }
-            ReferenceTask::FirstLastFrame => {
-                reference.kind == ReferenceKind::Image
-                    && matches!(
-                        reference.role,
-                        ReferenceRole::FirstFrame | ReferenceRole::LastFrame
-                    )
-            }
-            ReferenceTask::ContinueScene | ReferenceTask::ContinueShot => {
-                reference.kind == ReferenceKind::Video && reference.role == ReferenceRole::Preceding
-            }
-        };
-        if !valid_role {
-            return Err("reference modality, task and role disagree");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)
+            .map_err(|_| "references requires valid standard base64")?;
+        if bytes.len() > MAX_REFERENCE_BYTES {
+            return Err("references exceeds the 32 MiB source bound");
         }
-        match &reference.source {
-            ReferenceSource::Url(url) => {
-                // This is syntax admission only, not SSRF authorization. The fetcher must
-                // resolve and validate every destination and enforce streaming byte limits.
-                if url.len() > 8192
-                    || !url.validate_url()
-                    || !(url.starts_with("https://") || url.starts_with("http://"))
-                    || url.chars().any(char::is_whitespace)
-                {
-                    return Err("reference URL must be bounded HTTP or HTTPS without whitespace");
-                }
-            }
-            ReferenceSource::Base64(encoded) => {
-                if encoded.is_empty() || encoded.len() > MAX_REFERENCE_BYTES.div_ceil(3) * 4 {
-                    return Err("reference base64 source exceeds its encoded byte bound");
-                }
-                let decoded = base64::engine::general_purpose::STANDARD
-                    .decode(encoded)
-                    .map_err(|_| "reference source contains invalid base64")?;
-                if decoded.len() > MAX_REFERENCE_BYTES {
-                    return Err("reference source exceeds its byte bound");
-                }
-                bytes += decoded.len();
-            }
-        }
-    }
-    if counts[0] > 9 || counts[1] > 3 || counts[2] > 3 || counts[0] + counts[1] == 0 {
-        return Err("references permits 9 images, 3 videos, 3 audio and requires a visual source");
-    }
-    if bytes > MAX_REFERENCE_BUNDLE_BYTES {
-        return Err("reference bundle exceeds its byte bound");
     }
     Ok(())
+}
+
+/// Decode only after capability admission, checking geometry before raster allocation.
+pub fn admit_references(
+    references: &[VideoReference],
+    capable: bool,
+) -> Result<Option<ImageReference>, &'static str> {
+    if references.is_empty() {
+        return Ok(None);
+    }
+    if !capable {
+        return Err("references requires a model contract declaring max=1, kinds=[image]");
+    }
+    validate_references(references)?;
+    let ReferenceSource::Base64(encoded) = &references[0].source else { unreachable!() };
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)
+        .map_err(|_| "references requires valid standard base64")?;
+    let format = image::guess_format(&bytes).map_err(|_| "references requires PNG or JPEG")?;
+    if !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg) {
+        return Err("references requires PNG or JPEG");
+    }
+    let (width, height) = image::ImageReader::with_format(Cursor::new(&bytes), format)
+        .into_dimensions().map_err(|_| "references image header is invalid")?;
+    if width == 0 || height == 0 || width > 4096 || height > 4096
+        || width % 32 != 0 || height % 32 != 0 {
+        return Err("references image dimensions must be multiples of 32 in 32..=4096");
+    }
+    let mut reader = image::ImageReader::with_format(Cursor::new(&bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    let pixels = reader.decode().map_err(|_| "references image is invalid or exceeds decode bounds")?
+        .to_rgb8().into_raw();
+    Ok(Some(ImageReference { width, height, pixels }))
 }

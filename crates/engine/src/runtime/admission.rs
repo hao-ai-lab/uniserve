@@ -351,8 +351,8 @@ impl EngineLoop {
                         .map(|image| {
                             vec![uniserve_worker_ipc::DecodedReference {
                                 kind: "image".into(),
-                                task: "first_frame".into(),
-                                role: "first_frame".into(),
+                                task: "reference".into(),
+                                role: "reference".into(),
                                 include_audio: false,
                                 pixels: Some(ProductRef {
                                     request_key,

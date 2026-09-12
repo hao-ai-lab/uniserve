@@ -424,27 +424,26 @@ impl ServingRuntime {
                 source: TokenizeError::Invalid("video prompt must not be empty".to_string()),
             });
         }
-        // Never silently discard conditioning on a text-to-video execution plan.
-        // Reference admission must be connected to a reference-capable model before
-        // a nonempty bundle can enter the engine.
-        if !request.references.is_empty() {
-            return Err(ServeError::UnsupportedFeature {
-                request_id: request.request_id,
-                feature: "reference_conditioning",
-            });
-        }
+        let image_reference = references::admit_references(
+            &request.references,
+            self.model.supports_image_references(),
+        ).map_err(|message| ServeError::Tokenize {
+            request_id: request.request_id.clone(),
+            source: TokenizeError::Invalid(message.to_owned()),
+        })?;
         let (geometry, prompt_token_ids) = self.model.resolve_video_request_geometry(
             &request.request_id,
             &request.prompt,
             request.seconds,
             request.steps,
         )?;
-        let submission = MediaSubmission::new(
+        let mut submission = MediaSubmission::new(
             request.request_id.to_string(),
             prompt_token_ids,
             request.seed,
             geometry,
         );
+        submission.image_reference = image_reference;
         Ok(submission)
     }
 

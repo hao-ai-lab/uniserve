@@ -213,6 +213,8 @@ pub enum ResolvedAssets {
         max_video_seconds: f64,
         /// Number of scheduled predictions in the validated checkpoint contract.
         denoise_steps: u32,
+        /// Whether the resolved contract admits one image reference.
+        image_references: bool,
     },
 }
 
@@ -292,6 +294,9 @@ impl ResolvedAssets {
                 tokenizer,
                 max_video_seconds: config.engine.max_video_seconds,
                 denoise_steps,
+                image_references: config.model_contract.as_ref()
+                    .and_then(|contract| contract.get("references"))
+                    == Some(&serde_json::json!({"max": 1, "kinds": ["image"]})),
             });
         }
 
@@ -387,6 +392,7 @@ impl ResolvedAssets {
                 tokenizer,
                 max_video_seconds: 15.0,
                 denoise_steps: 4,
+                image_references: false,
             },
         })
     }
@@ -503,6 +509,7 @@ pub struct MiniMaxH3Desc {
     max_prompt_tokens: u32,
     max_video_seconds: f64,
     denoise_steps: u32,
+    image_references: bool,
 }
 
 impl ResolvedModel {
@@ -600,12 +607,14 @@ impl ResolvedModel {
                 tokenizer,
                 max_video_seconds,
                 denoise_steps,
+                image_references,
             } => Ok(Self::Media(MiniMaxH3Desc {
                 identity: profile.identity,
                 tokenizer,
                 max_prompt_tokens: max_model_tokens,
                 max_video_seconds,
                 denoise_steps,
+                image_references,
             })),
         }
     }
@@ -649,6 +658,11 @@ impl ResolvedModel {
             }
             _ => serde_json::Value::Null,
         }
+    }
+
+    /// Capability comes from the resolved checkpoint, never its public alias.
+    pub fn supports_image_references(&self) -> bool {
+        matches!(self, Self::Media(description) if description.image_references)
     }
 
     /// Resolves and validates requested video dimensions and frame count.

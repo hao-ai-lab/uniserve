@@ -55,7 +55,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
             if pixels is None:
                 return text
             assert pixels.dtype is torch.uint8
-            assert tuple(pixels.shape) == (1, 2, 2, 3)
+            assert tuple(pixels.shape) == (1, 32, 32, 3)
             return text + pixels[..., 0].sum().float()
 
     model = StubModel()
@@ -97,10 +97,10 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
         ProductKind.TENSOR,
         StorageClass.HOST_STAGING,
         DType.U8,
-        ShapeBound((StaticDim(1), StaticDim(2), StaticDim(2), StaticDim(3))),
+        ShapeBound((StaticDim(1), StaticDim(32), StaticDim(32), StaticDim(3))),
         PointRange(),
     )
-    image = DecodedReference("image", "first_frame", "first_frame", False, pixels, None, 0, 1)
+    image = DecodedReference("image", "reference", "reference", False, pixels, None, 0, 1)
     operation = Operation.registered(
         request_key=key,
         op_id=1,
@@ -129,7 +129,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
                 )
             ),
         ),
-        input_products=(ProductPayload(pixels, bytes(range(12))),) if with_image else (),
+        input_products=(ProductPayload(pixels, bytes([1, 2, 3]) * (32 * 32)),) if with_image else (),
         buffer_allocations=(BufferAllocation(reference.buffer_id, 0, reference.max_bytes),),
     )
     try:
@@ -166,7 +166,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
             ticket.close()
         expected = torch.tensor(prompt).reshape(1, 3, 1) * 4 + torch.arange(4)
         if with_image:
-            expected = expected + 18  # Red-channel values 0 + 3 + 6 + 9.
+            expected = expected + 1024  # One per red-channel pixel.
         torch.testing.assert_close(destination, expected.float(), atol=0, rtol=0)
         from dataclasses import replace
 

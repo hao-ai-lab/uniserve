@@ -2914,13 +2914,16 @@ class DiffusionRequestParams:
     def __post_init__(self) -> None:
         """Validate latent geometry, integration steps, guidance, and noise coordinates."""
 
-        if len(self.references) > 12:
-            raise invalid_descriptor("too many reference sources")
-        for kind, limit in (("image", 9), ("video", 3), ("audio", 3)):
-            if sum(item.kind == kind for item in self.references) > limit:
-                raise invalid_descriptor("reference modality count exceeded")
-        if self.references and all(item.kind == "audio" for item in self.references):
-            raise invalid_descriptor("references require visual media")
+        if len(self.references) > 1:
+            raise invalid_descriptor("references permits at most 1 image")
+        for reference in self.references:
+            if (reference.kind, reference.task, reference.role) != (
+                "image", "reference", "reference"
+            ):
+                raise invalid_descriptor("references requires image with task=reference and role=reference")
+            assert reference.pixels is not None
+            if any(dim.extent % 32 for dim in reference.pixels.shape_bound.dims[1:3]):
+                raise invalid_descriptor("references image dimensions must be multiples of 32")
         if not self.prompt_token_ids:
             raise invalid_descriptor("diffusion prompt tokens must not be empty")
         _nonnegative(self.seed, "diffusion seed")

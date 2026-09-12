@@ -504,7 +504,23 @@ impl EngineLoop {
                 .and_then(uniserve_worker_ipc::MediaPlanStage::role);
             let inputs = match (input_role, quantum) {
                 (Some(uniserve_worker_ipc::MediaStageRole::Encode), _) => {
-                    vec![state.conditioning.clone()]
+                    let mut inputs = vec![state.conditioning.clone()];
+                    if state.request.image_reference.is_some() {
+                        let tags = &state.allocations.tensors[&(
+                            plan.stage_by_role(uniserve_worker_ipc::MediaStageRole::Encode)
+                                .expect("validated encode stage").entry.clone(), 1,
+                        )];
+                        inputs.push(ProductRef {
+                            output_index: 1,
+                            dtype: tags.dtype,
+                            shape_bound: tags.shape_bound.clone(),
+                            ..state.conditioning.clone()
+                        });
+                        inputs.push(state.admission.diffusion.as_ref()
+                            .expect("media parameters").references[0].pixels.clone()
+                            .expect("image pixels"));
+                    }
+                    inputs
                 }
                 (
                     Some(uniserve_worker_ipc::MediaStageRole::Denoise),
@@ -538,10 +554,11 @@ impl EngineLoop {
                 (None, _) => Vec::new(),
                 _ => unreachable!("validated media plan input disagrees with its stage role"),
             };
-            if quantum == MediaQuantum::Encode {
+            if quantum == MediaQuantum::Encode || input_role == Some(uniserve_worker_ipc::MediaStageRole::Encode) {
                 if let Some(image) = &state.request.image_reference {
+                    // Preparation may run on a separate input-stage owner.
                     inline.push(ProductPayload {
-                        product: inputs[0].clone(),
+                        product: inputs.last().expect("image input").clone(),
                         value: uniserve_worker_ipc::InlineValue::Bytes(image.pixels.clone()),
                     });
                 }
@@ -552,7 +569,9 @@ impl EngineLoop {
                 || last_step
                 || matches!(quantum, MediaQuantum::Decode { .. })
             {
-                let count = if last_step { 2 } else { 1 };
+                let count = if last_step
+                    || (quantum == MediaQuantum::Encode && state.request.image_reference.is_some())
+                { 2 } else { 1 };
                 for index in 0..count {
                     let reserved = &state.allocations.tensors[&(entry.to_owned(), index)];
                     let mut shape_bound = reserved.shape_bound.clone();

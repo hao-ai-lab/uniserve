@@ -2178,8 +2178,8 @@ mod tests {
             DiffusionRequestParams {
                 references: vec![uniserve_worker_ipc::DecodedReference {
                     kind: "image".into(),
-                    task: "first_frame".into(),
-                    role: "first_frame".into(),
+                    task: "reference".into(),
+                    role: "reference".into(),
                     include_audio: false,
                     pixels: Some(ProductRef {
                         request_key: media_key,
@@ -2190,7 +2190,7 @@ mod tests {
                         storage_class: StorageClass::HostStaging,
                         dtype: DType::U8,
                         shape_bound: ShapeBound {
-                            dims: [1, 16, 24, 3].map(DimBound::Static).to_vec(),
+                            dims: [1, 32, 64, 3].map(DimBound::Static).to_vec(),
                         },
                         point_range: PointRange::default(),
                     }),
@@ -2245,7 +2245,7 @@ mod tests {
             },
             ProductPayload {
                 product: pixels,
-                value: InlineValue::Bytes(vec![17; 16 * 24 * 3]),
+                value: InlineValue::Bytes(vec![17; 32 * 64 * 3]),
             },
         ]));
         request.set_call_id(Some(9));
@@ -2347,7 +2347,7 @@ mod tests {
                     .unwrap()
                     .extract::<String>()
                     .unwrap(),
-                "first_frame"
+                "reference"
             );
             let payload = native_run
                 .getattr("input_products")
@@ -2360,7 +2360,7 @@ mod tests {
                     .unwrap()
                     .extract::<Vec<u8>>()
                     .unwrap(),
-                vec![17; 16 * 24 * 3]
+                vec![17; 32 * 64 * 3]
             );
             assert!(
                 payload
