@@ -2110,9 +2110,13 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
     assert completion.product_generations[0] != 0
 
 
-@pytest.mark.parametrize("transfer_image", (False, True))
+@pytest.mark.parametrize(
+    ("transfer_image", "encoding_fails"), ((False, False), (True, False), (False, True))
+)
 def test_resident_image_materialization_preserves_the_decoded_artifact(
     transfer_image: bool,
+    encoding_fails: bool,
+    monkeypatch,
 ) -> None:
     worker = execution_worker(transfer_backends=("shm",))
     admission = umm_params(
@@ -2187,11 +2191,27 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             bounds=Bounds(max_completion_bytes=65_536),
             image_input=image,
         )
+        if encoding_fails:
+
+            def fail_encoding(*args, **kwargs):
+                raise OSError("image encoder could not write the artifact")
+
+            # Exercise a third-party codec failure through the actual CPU task
+            # and completion buffer rather than replacing the worker's owners.
+            monkeypatch.setattr(Image.Image, "save", fail_encoding)
         result = finalized_report(
             worker, worker.submit(execution_run(run_id=6, operations=(materialize,)))
         )
-        assert result.completions[0].status is OpStatus.OK
-        assert _media_bytes(result.completions[0]) == expected
+        completion = result.completions[0]
+        if encoding_fails:
+            assert completion.status is OpStatus.ERROR
+            assert completion.error_code is ErrorCode.COMPUTE_ERROR
+            assert completion.media_output is None
+            assert completion.committed_tokens == ()
+            assert completion.product_generations == ()
+        else:
+            assert completion.status is OpStatus.OK
+            assert _media_bytes(completion) == expected
     finally:
         worker.close()
 

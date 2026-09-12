@@ -1051,10 +1051,12 @@ class PendingOutput:
             accepted_parent = parent.accepted_progress
         else:
             accepted_parent = parent
-        predicated = self.status is OpStatus.PREDICATED
-        completion_error = False
-        invalid_sampling = False
-        if not predicated:
+        status = self.status
+        error_code = self.error_code
+        runtime = self.projected_progress
+        tokens = self.committed_tokens
+        suppressed = status is OpStatus.PREDICATED
+        if not suppressed:
             try:
                 for task in self.completion_tasks:
                     result = task.result()
@@ -1075,14 +1077,48 @@ class PendingOutput:
                     self._buffer.logprob_values(span)[1] for span in self.prompt_logprob_ranges
                 )
             except Exception:
-                completion_error = True
+                status = OpStatus.ERROR
+                error_code = ErrorCode.COMPUTE_ERROR
+                suppressed = True
             else:
                 try:
-                    _concrete_record(self)
+                    tokens = sampled_tokens(self)
                 except _PredicatedOperation:
-                    predicated = True
+                    status = OpStatus.PREDICATED
+                    suppressed = True
                 except _InvalidSamplingDistribution:
-                    invalid_sampling = True
+                    status = OpStatus.ERROR
+                    error_code = ErrorCode.INVALID_OPERATION
+                    suppressed = True
+                else:
+                    if self.sampling_range is not None:
+                        if runtime is None:
+                            raise RuntimeError("sampling output has no request progress")
+                        if self.draft_tokens is not None:
+                            accepted = len(tokens)
+                            visible = self.base_kv_visible + accepted
+                            if (
+                                accepted > len(self.draft_tokens) + 1
+                                or runtime.kv_computed_len != self.initialized_kv
+                                or visible > runtime.kv_computed_len
+                            ):
+                                raise RuntimeError(
+                                    "speculative acceptance exceeds initialized KV state"
+                                )
+                            # Rejected drafts remain initialized but invisible. Resolve
+                            # logical, RNG and visible KV coordinates together once.
+                            runtime = replace(
+                                runtime,
+                                logical_position=self.base_logical_position + accepted,
+                                rng_counter=self.base_rng_counter + accepted,
+                                kv_visible_len=visible,
+                            )
+        if status is OpStatus.PREDICATED:
+            runtime = accepted_parent
+            error_code = None
+        if suppressed:
+            tokens = ()
+        scores = None if suppressed or not self._reports_output else self.logprobs
         buffer = self._buffer
         if buffer is None:
             raise RuntimeError("completion lost its pinned output buffer")
@@ -1096,41 +1132,33 @@ class PendingOutput:
             copy_us=self._completion_timing[2],
             host_us=self._completion_timing[3],
         )
-        concrete = _concrete_record(
-            self,
-            timing=timing,
+        concrete = RequestOutput(
+            request_key=self.request_key,
+            op_id=self.op_id,
+            status=status,
+            product_generations=() if suppressed else self.product_generations,
+            error_code=error_code,
+            timing_counters=timing,
+            kind=self.kind,
+            position=0 if runtime is None else int(runtime.logical_position),
+            kv_visible_len=0 if runtime is None else int(runtime.kv_visible_len),
+            kv_computed_len=0 if runtime is None else int(runtime.kv_computed_len),
+            num_completed_steps=0 if runtime is None else int(runtime.flow_step),
+            committed_tokens=tokens,
+            sampled_logprob=None if scores is None else scores[0],
+            top_logprobs=() if scores is None else scores[1],
+            prompt_logprobs=(
+                () if suppressed or not self._reports_output else self.prompt_logprobs
+            ),
+            finish_flags=FinishFlags() if suppressed else self.finish_flags,
             media_output=self._media_output,
-            suppress_tokens=completion_error or invalid_sampling or predicated,
+            kv_output=None if suppressed else self.kv_output,
         )
-        if completion_error:
-            concrete = _completion_error_record(concrete)
-        elif invalid_sampling:
-            concrete = _invalid_sampling_record(concrete)
-        elif predicated:
-            concrete = _predicated_record(concrete, accepted_parent)
-        projected = self.projected_progress
-        if concrete.status in (OpStatus.PREDICATED, OpStatus.ERROR):
-            self.accepted_progress = accepted_parent
-        elif projected is not None:
-            rng_counter = projected.rng_counter
-            if self.draft_tokens is not None:
-                accepted = len(concrete.committed_tokens)
-                if (
-                    accepted > len(self.draft_tokens) + 1
-                    or concrete.kv_computed_len != self.initialized_kv
-                    or concrete.kv_visible_len != self.base_kv_visible + accepted
-                    or concrete.kv_visible_len > concrete.kv_computed_len
-                    or concrete.position != self.base_logical_position + accepted
-                ):
-                    raise RuntimeError("speculative acceptance exceeds initialized KV state")
-                rng_counter = self.base_rng_counter + accepted
-            self.accepted_progress = replace(
-                projected,
-                logical_position=concrete.position,
-                rng_counter=rng_counter,
-                kv_visible_len=concrete.kv_visible_len,
-                kv_computed_len=concrete.kv_computed_len,
-            )
+        # Ordinary successful operations accept the immutable projection itself;
+        # failures keep their predecessor and verification uses its resolved span.
+        self.accepted_progress = (
+            accepted_parent if status in (OpStatus.PREDICATED, OpStatus.ERROR) else runtime
+        )
         concrete.validate()
         self.value = concrete
         self.completion_tasks = ()
@@ -1151,110 +1179,3 @@ class PendingOutput:
             self._observed = True
             actions.append(partial(buffer.discard, self._row, self._generation))
         close_resources(*actions)
-
-
-def _concrete_record(
-    record: PendingOutput,
-    *,
-    timing: TimingCounters = TimingCounters(),
-    media_output: MediaOutput | None = None,
-    suppress_tokens: bool = False,
-) -> RequestOutput:
-    """Freeze a host-visible output record after resolving deferred sampling fields."""
-
-    runtime = record.projected_progress
-    tokens = () if suppress_tokens else record.committed_tokens
-    if not suppress_tokens and record.sampling_range is not None:
-        # Rejected draft positions remain initialized in KV but are invisible
-        # to the successor. Sampling determines the actual accepted prefix.
-        tokens = sampled_tokens(record)
-        accepted = len(tokens)
-        if runtime is None:
-            raise RuntimeError("sampling output has no request progress")
-        if record.draft_tokens is not None:
-            runtime = replace(
-                runtime,
-                logical_position=record.base_logical_position + accepted,
-                kv_visible_len=record.base_kv_visible + accepted,
-            )
-    scores = None if suppress_tokens or not record._reports_output else record.logprobs
-    return RequestOutput(
-        request_key=record.request_key,
-        op_id=record.op_id,
-        status=record.status,
-        product_generations=record.product_generations,
-        error_code=record.error_code,
-        timing_counters=timing,
-        kind=record.kind,
-        position=(0 if runtime is None else int(runtime.logical_position)),
-        kv_visible_len=(0 if runtime is None else int(runtime.kv_visible_len)),
-        kv_computed_len=(0 if runtime is None else int(runtime.kv_computed_len)),
-        num_completed_steps=(0 if runtime is None else int(runtime.flow_step)),
-        committed_tokens=tokens,
-        sampled_logprob=None if scores is None else scores[0],
-        top_logprobs=() if scores is None else scores[1],
-        prompt_logprobs=(
-            () if suppress_tokens or not record._reports_output else record.prompt_logprobs
-        ),
-        finish_flags=record.finish_flags,
-        media_output=media_output,
-        kv_output=record.kv_output,
-    )
-
-
-def _invalid_sampling_record(record: RequestOutput) -> RequestOutput:
-    """Return an output record representing a sampling-policy rejection."""
-
-    return replace(
-        record,
-        status=OpStatus.ERROR,
-        committed_tokens=(),
-        sampled_logprob=None,
-        top_logprobs=(),
-        prompt_logprobs=(),
-        finish_flags=FinishFlags(),
-        product_generations=(),
-        kv_output=None,
-        error_code=ErrorCode.INVALID_OPERATION,
-    )
-
-
-def _completion_error_record(record: RequestOutput) -> RequestOutput:
-    """Return an output record for a failed completion capture or host artifact."""
-
-    return replace(
-        record,
-        status=OpStatus.ERROR,
-        committed_tokens=(),
-        sampled_logprob=None,
-        top_logprobs=(),
-        prompt_logprobs=(),
-        finish_flags=FinishFlags(),
-        product_generations=(),
-        kv_output=None,
-        error_code=ErrorCode.COMPUTE_ERROR,
-    )
-
-
-def _predicated_record(
-    record: RequestOutput,
-    runtime: RequestProgress | None,
-) -> RequestOutput:
-    """Report the parent execution state for an operation suppressed by its predicate."""
-
-    return replace(
-        record,
-        status=OpStatus.PREDICATED,
-        position=(0 if runtime is None else int(runtime.logical_position)),
-        kv_visible_len=(0 if runtime is None else int(runtime.kv_visible_len)),
-        kv_computed_len=(0 if runtime is None else int(runtime.kv_computed_len)),
-        num_completed_steps=(0 if runtime is None else int(runtime.flow_step)),
-        committed_tokens=(),
-        sampled_logprob=None,
-        top_logprobs=(),
-        prompt_logprobs=(),
-        finish_flags=FinishFlags(),
-        product_generations=(),
-        kv_output=None,
-        error_code=None,
-    )
