@@ -136,7 +136,7 @@ def resolve_h3_contract(root: Path, contract_path: Path | None = None) -> H3Cont
 
         if not (root / "modular_model_index.json").is_file():
             raise ValueError(
-                "MiniMax H3 requires a pinned base root or an explicit "
+                "MiniMax H3 requires a pinned base H3 root or an explicit "
                 "UNISERVE_H3_CONTRACT sidecar for a full local export"
             )
         return resolve_base_h3_contract(root)
