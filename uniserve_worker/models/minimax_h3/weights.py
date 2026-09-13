@@ -37,7 +37,7 @@ from .transformer import (
     MiniMaxH3Transformer,
     build_conditioner,
 )
-from .video_vae import H3ImagePosterior, MiniMaxH3VideoDecoder, MiniMaxH3VideoVAE
+from .video_vae import H3VisualPosterior, MiniMaxH3VideoDecoder, MiniMaxH3VideoVAE
 
 
 @dataclass(slots=True)
@@ -443,7 +443,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
         # Decoder entry placement is independent; share weights only when colocated.
         image_posterior = video_decoder
         if image_posterior is None:
-            image_posterior = H3ImagePosterior(parameter_device="meta")
+            image_posterior = H3VisualPosterior(parameter_device="meta")
             components.append(
                 CheckpointComponent(
                     image_posterior,

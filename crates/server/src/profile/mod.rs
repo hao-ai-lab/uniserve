@@ -437,7 +437,11 @@ mod tests {
             &tokenizer,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("requires model_type"));
+        assert!(matches!(
+            error,
+            super::assets::Error::ModelTypeMismatch { expected: "neo_chat", ref actual }
+                if actual == "bagel"
+        ));
     }
 
     #[test]

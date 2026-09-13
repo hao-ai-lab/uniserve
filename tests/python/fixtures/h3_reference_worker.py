@@ -26,7 +26,7 @@ from uniserve_worker.models.minimax_h3.model import MiniMaxH3Model
 from uniserve_worker.models.minimax_h3.packing import audio_latent_frames
 from uniserve_worker.models.minimax_h3.transformer import MiniMaxH3Transformer
 from uniserve_worker.models.minimax_h3.video_vae import (
-    H3ImagePosterior,
+    H3VisualPosterior,
     MiniMaxH3VideoDecoder,
     MiniMaxH3VideoVAE,
 )
@@ -91,7 +91,7 @@ def main():
         torch.empty(1, 50, 3, 6 * 5376, device="meta"),
         torch.empty(1, 3, 2 * 5376, device="meta"),
     )
-    posterior = H3ImagePosterior(parameter_device="cpu")
+    posterior = H3VisualPosterior(parameter_device="cpu")
     for parameter in posterior.parameters():
         parameter.zero_()
     image_vae = MiniMaxH3VideoVAE(posterior, linear_precision="fp32")

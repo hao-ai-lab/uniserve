@@ -26,9 +26,9 @@ from ...ops.residual import (
     weighted_rms_norm_absmax,
 )
 from ...ops.rope import qk_rms_norm_partial_rope_
-from .image_vae import H3ImageEncoder
 from .layout import H3ComputeInputs, H3Layout, H3Tensors
 from .packing import unpatchify_video_into
+from .visual_vae import H3VisualEncoder
 
 __all__ = ["H3VideoAssembler", "MiniMaxH3VideoDecoder", "MiniMaxH3VideoVAE"]
 
@@ -245,8 +245,8 @@ class _VideoTransformer(nn.Module):
         self.rope = _RotaryEmbedding(device=buffer_device)
 
 
-class H3ImagePosterior(nn.Module):
-    """Causal image posterior weights and shared checkpoint spatial tiling."""
+class H3VisualPosterior(nn.Module):
+    """Causal visual posterior weights and shared checkpoint spatial tiling."""
 
     spatial_compression_ratio = 16
     temporal_compression_ratio = 4
@@ -265,11 +265,11 @@ class H3ImagePosterior(nn.Module):
         *,
         parameter_device: torch.device | str = "meta",
     ) -> None:
-        """Allocate only the FP32 weights consumed by image conditioning."""
+        """Allocate the FP32 weights consumed by visual conditioning."""
 
         super().__init__()
         with torch.device(parameter_device):
-            self.encoder = H3ImageEncoder()
+            self.encoder = H3VisualEncoder()
             self.quant_conv = nn.Conv3d(48, 48, kernel_size=1)
 
     @staticmethod
@@ -329,7 +329,7 @@ class H3ImagePosterior(nn.Module):
         return torch.cat(assembled_rows, dim=-2)
 
 
-class MiniMaxH3VideoDecoder(H3ImagePosterior):
+class MiniMaxH3VideoDecoder(H3VisualPosterior):
     """Checkpoint VAE weights: causal image encoder and 36-layer ViT decoder."""
 
     def __init__(
@@ -466,7 +466,7 @@ class MiniMaxH3VideoVAE(nn.Module):
     latents_mean: torch.Tensor
     latents_std: torch.Tensor
 
-    def __init__(self, vae: H3ImagePosterior, *, linear_precision: LinearPrecision) -> None:
+    def __init__(self, vae: H3VisualPosterior, *, linear_precision: LinearPrecision) -> None:
         """Prepare one resident video decoder with fixed precision and normalization buffers."""
 
         super().__init__()
@@ -565,6 +565,16 @@ class MiniMaxH3VideoVAE(nn.Module):
         mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
         std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
         pixels = (pixels - mean) / std
+        moments = self._encode_clip(pixels)
+        expected = (1, 48, 1, height // 16, width // 16)
+        if tuple(moments.shape) != expected or moments.dtype != torch.float32:
+            raise ValueError(f"image posterior must be FP32 with shape {expected}")
+        return self._sample_posterior(moments)
+
+    def _encode_clip(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Encode one normalized causal clip with checkpoint spatial blending."""
+
+        height, width = pixels.shape[-2:]
         with torch.autocast(device_type=self.device.type, enabled=False):
             if self.vae.use_tiling:
                 ys, hs, yo = self.vae._split_tiles(
@@ -585,15 +595,55 @@ class MiniMaxH3VideoVAE(nn.Module):
                 )
             else:
                 moments = self.vae.quant_conv(self.vae.encoder(pixels))
-        expected = (1, 48, 1, height // 16, width // 16)
-        if tuple(moments.shape) != expected or moments.dtype != torch.float32:
-            raise ValueError(f"image posterior must be FP32 with shape {expected}")
+        return moments
+
+    def _sample_posterior(self, moments: torch.Tensor) -> torch.Tensor:
+        """Sample the whole posterior once with the independent released CPU RNG."""
+
         mean, logvar = moments.chunk(2, dim=1)
         noise = torch.randn(
             mean.shape, generator=torch.Generator("cpu").manual_seed(42), dtype=mean.dtype
         ).to(mean.device)
         sampled = (mean + (0.5 * logvar.clamp(-30, 20)).exp() * noise).half().float()
         return (sampled - self.latents_mean) / self.latents_std
+
+    @torch.inference_mode()
+    def encode_video(self, frames: torch.Tensor) -> torch.Tensor:
+        """Encode CPU THWC uint8 video to normalized [1,24,T,H/16,W/16].
+
+        Complete 17n+5 input windows are split into 17-frame clips. The final
+        clip repeats its last frame before causal encoding; three posterior
+        tokens are dropped after concatenation. Sampling happens only after
+        concatenation, so chunk boundaries do not restart the posterior RNG.
+        """
+
+        if (
+            frames.ndim != 4
+            or frames.shape[-1] != 3
+            or frames.dtype != torch.uint8
+            or frames.device.type != "cpu"
+        ):
+            raise ValueError("H3 reference video must be CPU THWC uint8 RGB")
+        count, height, width, _ = frames.shape
+        if count < 22 or count % 17 != 5:
+            raise ValueError("H3 reference video requires a complete 17n+5 frame window")
+        if min(height, width) < 32 or height % 32 or width % 32:
+            raise ValueError("H3 reference video dimensions must be divisible by 32")
+        moments = []
+        for start in range(0, count, 17):
+            pixels = frames[start : start + 17].permute(3, 0, 1, 2)[None]
+            pixels = pixels.to(self.device, torch.float32) / 255.0
+            if pixels.shape[2] < 17:
+                padding = pixels[:, :, -1:].expand(-1, -1, 17 - pixels.shape[2], -1, -1)
+                pixels = torch.cat((pixels, padding), dim=2)
+            mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+            std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+            moments.append(self._encode_clip((pixels - mean) / std))
+        posterior = torch.cat(moments, dim=2)[:, :, :-3]
+        expected = (1, 48, (count - 5) // 17 * 5 + 2, height // 16, width // 16)
+        if tuple(posterior.shape) != expected or posterior.dtype != torch.float32:
+            raise ValueError(f"video posterior must be FP32 with shape {expected}")
+        return self._sample_posterior(posterior)
 
     def _decode_segment(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode one temporal latent segment and remove its prepended overlap frames."""

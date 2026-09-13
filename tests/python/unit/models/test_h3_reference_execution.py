@@ -23,7 +23,7 @@ from uniserve_worker.models.minimax_h3.layout import H3Layout
 from uniserve_worker.models.minimax_h3.model import MiniMaxH3Model
 from uniserve_worker.models.minimax_h3.packing import audio_latent_frames
 from uniserve_worker.models.minimax_h3.transformer import MiniMaxH3Transformer
-from uniserve_worker.models.minimax_h3.video_vae import H3ImagePosterior, MiniMaxH3VideoVAE
+from uniserve_worker.models.minimax_h3.video_vae import H3VisualPosterior, MiniMaxH3VideoVAE
 from uniserve_worker.models.minimax_h3.weights import H3Components
 from uniserve_worker.nn.diffusion.modulation import ModulationPlan
 from uniserve_worker.nn.mesh import Communicator, DeviceMesh, EntryBindings
@@ -70,7 +70,7 @@ def test_reference_request_reaches_transformer_without_colocated_decoder(encoder
         torch.empty(1, 50, 3, 6 * 5376, device="meta"),
         torch.empty(1, 3, 2 * 5376, device="meta"),
     )
-    posterior = H3ImagePosterior(parameter_device="cpu")
+    posterior = H3VisualPosterior(parameter_device="cpu")
     for parameter in posterior.parameters():
         parameter.zero_()
     image_vae = MiniMaxH3VideoVAE(posterior, linear_precision="fp32")

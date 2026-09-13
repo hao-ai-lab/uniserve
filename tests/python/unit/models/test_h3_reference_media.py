@@ -40,6 +40,10 @@ def video_source(*, count=39, fps=24, layout="stereo", audio_rate=32000):
         if audio is not None:
             channels = len(av.AudioLayout(layout).channels)
             waveform = np.full((channels, round(count / fps * audio_rate)), 0.25, np.float32)
+            if channels > 2:
+                # Only center/surround channels carry signal. Dropping all but
+                # the front pair would incorrectly turn this soundtrack silent.
+                waveform[:2] = 0
             frame = av.AudioFrame.from_ndarray(waveform, format="fltp", layout=layout)
             frame.sample_rate = audio_rate
             frame.pts = 0

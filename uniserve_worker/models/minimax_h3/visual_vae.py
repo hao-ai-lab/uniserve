@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Checkpoint causal CNN for H3 single-frame reference posteriors.
+"""Checkpoint causal CNN for H3 image and video reference posteriors.
 
 Parameter paths match the released video encoder. Temporal left padding remains
 zero even for T=1; repeating the image would produce a different posterior.
@@ -93,7 +93,7 @@ class DownBlock(nn.Module):
         return value
 
 
-class H3ImageEncoder(nn.Module):
+class H3VisualEncoder(nn.Module):
     """Released six-stage causal encoder producing 48 posterior channels."""
 
     def __init__(self):
@@ -112,8 +112,8 @@ class H3ImageEncoder(nn.Module):
         self.conv_out = CausalConv3d(widths[-1], 48)
 
     def forward(self, pixels):
-        if pixels.ndim != 5 or pixels.shape[:3] != (1, 3, 1):
-            raise ValueError("H3 image encoder requires [1, 3, 1, H, W]")
+        if pixels.ndim != 5 or pixels.shape[:2] != (1, 3) or not 1 <= pixels.shape[2] <= 17:
+            raise ValueError("H3 visual encoder requires [1, 3, T, H, W] with T in 1..17")
         value = self.conv_in(pixels)
         for block in self.down_blocks:
             value = block(value)
