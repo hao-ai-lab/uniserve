@@ -29,179 +29,185 @@ def _run_gather(rank: int, rendezvous: str) -> None:
         backend="nccl",
         init_method=rendezvous,
     )
+    try:
+        _gather_projection(environment, rank, device)
+    finally:
+        environment.close()
+
+
+def _gather_projection(environment, rank, device):
+    """Release numerical closures and borrowed peer views before group teardown."""
+
     parallel = ParallelConfig(sequence_parallel=SequenceParallel("ulysses", (2,)))
     meshes = initialize_model_parallel(
         environment,
         {"ordered": ((0, 1), parallel), "reversed": ((1, 0), parallel)},
     )
-    try:
-        for mesh in meshes.values():
-            group = mesh.get_group("sp")
-            for dtype in (torch.bfloat16, torch.uint8):
-                storage = TensorBuffers.allocate(
-                    {"rows": TensorSchema((8192,), dtype, memory="symmetric", group=group)},
-                    device,
-                )
-                gathered = storage.capacity["rows"]
-                local = (torch.arange(4096, device=device) % 31 + rank * 64).to(dtype)
-                expected = torch.cat(
-                    [
-                        (torch.arange(4096, device=device) % 31 + member * 64).to(dtype)
-                        for member in group.ranks
-                    ]
-                )
-                group.all_gather_into_tensor(gathered, local)
-                torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
-                torch.cuda.synchronize(device)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    group.all_gather_into_tensor(gathered, local)
-                local.add_(1)
-                graph.replay()
-                torch.testing.assert_close(gathered, expected + 1, rtol=0, atol=0)
-                graph.reset()
-                del gathered, storage
-            for local_rows, width in ((128, 512), (16392, 2048)):
-                storage = TensorBuffers.allocate(
-                    {
-                        "rows": TensorSchema(
-                            (local_rows * width * 4,),
-                            torch.uint8,
-                            memory="symmetric",
-                            group=group,
-                        )
-                    },
-                    device,
-                )
-                columns = (torch.arange(width, device=device) % 17).bfloat16() / 16
-                rows = columns.repeat(local_rows, 1).add_(rank)
-                rows.add_((torch.arange(local_rows, device=device) % 7).bfloat16()[:, None] / 16)
-                expected_rows = torch.cat([rows - rank + member for member in group.ranks])
-                for use_bias in (False, True):
-                    layer = LinearBase(
-                        width,
-                        256,
-                        layer_config=LayerConfig(Communicator(), None),
-                        bias=use_bias,
-                        sequence_group=group,
-                    ).to(device=device, dtype=torch.bfloat16)
-                    layer.weight.copy_(
-                        (torch.arange(256 * width, device=device).reshape(256, width) % 11) / 16
-                    )
-                    if local_rows > 128:
-                        # The transport-tail case selects columns exactly, so
-                        # GEMM reduction heuristics cannot alter its oracle.
-                        layer.weight.zero_()
-                        columns = torch.arange(256, device=device)
-                        layer.weight[columns, columns * 7 % width] = 1
-                    if layer.bias is not None:
-                        layer.bias.copy_(torch.arange(256, device=device) / 16)
-                    expected = torch.nn.functional.linear(expected_rows, layer.weight, layer.bias)
-                    actual = layer.forward_sequence_parallel(rows, storage.capacity["rows"])
-                    torch.testing.assert_close(
-                        actual,
-                        expected,
-                        rtol=0,
-                        atol=0,
-                        msg=f"ranks={group.ranks}, rows={local_rows}, bias={use_bias}",
-                    )
-                    torch.cuda.synchronize(device)
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        actual = layer.forward_sequence_parallel(rows, storage.capacity["rows"])
-                    rows.add_(1)
-                    expected_rows.add_(1)
-                    graph.replay()
-                    expected = torch.nn.functional.linear(expected_rows, layer.weight, layer.bias)
-                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                    graph.reset()
-                    actual = layer.forward_sequence_parallel(
-                        rows.view(8, local_rows // 8, width), storage.capacity["rows"]
-                    )
-                    torch.testing.assert_close(
-                        actual, expected.view(16, local_rows // 8, 256), rtol=0, atol=0
-                    )
-
-                    def produce(workspace=storage.capacity["rows"]):
-                        def consume(interval, projected):
-                            positions = torch.arange(interval.start, interval.stop, device=device)
-                            projected.add_(positions.remainder(3).to(projected.dtype)[:, None])
-
-                        projection = layer.stream_sequence_parallel(
-                            local_rows, workspace, row_consumer=consume
-                        )
-                        interval_rows = 3072 if local_rows > 128 else 48
-                        for start in range(0, local_rows, interval_rows):
-                            projection.append(start, rows[start : start + interval_rows])
-                        return projection.finish()
-
-                    actual = produce()
-                    positions = torch.arange(local_rows * 2, device=device)
-                    row_bias = positions.remainder(3).to(expected.dtype)[:, None]
-                    torch.testing.assert_close(actual, expected + row_bias, rtol=0, atol=0)
-                    torch.cuda.synchronize(device)
-                    with torch.cuda.graph(graph):
-                        actual = produce()
-                    rows.add_(1)
-                    expected_rows.add_(1)
-                    graph.replay()
-                    expected = torch.nn.functional.linear(expected_rows, layer.weight, layer.bias)
-                    torch.testing.assert_close(actual, expected + row_bias, rtol=0, atol=0)
-                    graph.reset()
-                del storage
-            rows = torch.arange(128 * 128, device=device).view(128, 128).remainder(7).bfloat16()
-            rows.add_(rank)
-            layers = [
-                LinearBase(
-                    128,
-                    128,
-                    layer_config=LayerConfig(Communicator(), None),
-                    bias=False,
-                    sequence_group=group,
-                ).to(device=device, dtype=torch.bfloat16)
-                for _ in range(3)
-            ]
-            for layer in layers:
-                layer.weight.copy_(torch.eye(128, device=device))
-            workspaces = [
-                torch.empty(2 * 2 * 128 * 128, device=device, dtype=torch.bfloat16) for _ in layers
-            ]
-
-            def bind_stage(index, layer):
-                def operation(hidden, *, prepared_projection, row_consumer):
-                    projected = (
-                        layer.forward_sequence_parallel(hidden, workspaces[index])
-                        if prepared_projection is None
-                        else prepared_projection.finish()[0]
-                    )
-                    result = projected.view(2, 128, 128).sum(dim=0)
-                    if row_consumer is not None:
-                        for start in range(0, 128, 48):
-                            interval = slice(start, min(start + 48, 128))
-                            row_consumer(interval, result[interval])
-                    return result
-
-                def prepare(hidden):
-                    return ProjectedRows(
-                        layer.stream_sequence_parallel(hidden.shape[0], workspaces[index]), 0
-                    )
-
-                return RowStage(operation, True, prepare)
-
-            stages = tuple(bind_stage(index, layer) for index, layer in enumerate(layers))
-            actual = run_row_pipeline(rows, stages)
-            expected = (rows - rank) * 8 + 4
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for mesh in meshes.values():
+        group = mesh.get_group("sp")
+        for dtype in (torch.bfloat16, torch.uint8):
+            storage = TensorBuffers.allocate(
+                {"rows": TensorSchema((8192,), dtype, memory="symmetric", group=group)},
+                device,
+            )
+            gathered = storage.capacity["rows"]
+            local = (torch.arange(4096, device=device) % 31 + rank * 64).to(dtype)
+            expected = torch.cat(
+                [
+                    (torch.arange(4096, device=device) % 31 + member * 64).to(dtype)
+                    for member in group.ranks
+                ]
+            )
+            group.all_gather_into_tensor(gathered, local)
+            torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
             torch.cuda.synchronize(device)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                actual = run_row_pipeline(rows, stages)
-            rows.add_(1)
+                group.all_gather_into_tensor(gathered, local)
+            local.add_(1)
             graph.replay()
-            torch.testing.assert_close(actual, expected + 8, rtol=0, atol=0)
+            torch.testing.assert_close(gathered, expected + 1, rtol=0, atol=0)
             graph.reset()
-    finally:
-        environment.close()
+            del gathered, storage
+        for local_rows, width in ((128, 512), (16392, 2048)):
+            storage = TensorBuffers.allocate(
+                {
+                    "rows": TensorSchema(
+                        (local_rows * width * 4,),
+                        torch.uint8,
+                        memory="symmetric",
+                        group=group,
+                    )
+                },
+                device,
+            )
+            columns = (torch.arange(width, device=device) % 17).bfloat16() / 16
+            rows = columns.repeat(local_rows, 1).add_(rank)
+            rows.add_((torch.arange(local_rows, device=device) % 7).bfloat16()[:, None] / 16)
+            expected_rows = torch.cat([rows - rank + member for member in group.ranks])
+            for use_bias in (False, True):
+                layer = LinearBase(
+                    width,
+                    256,
+                    layer_config=LayerConfig(Communicator(), None),
+                    bias=use_bias,
+                    sequence_group=group,
+                ).to(device=device, dtype=torch.bfloat16)
+                layer.weight.copy_(
+                    (torch.arange(256 * width, device=device).reshape(256, width) % 11) / 16
+                )
+                if local_rows > 128:
+                    # The transport-tail case selects columns exactly, so
+                    # GEMM reduction heuristics cannot alter its oracle.
+                    layer.weight.zero_()
+                    columns = torch.arange(256, device=device)
+                    layer.weight[columns, columns * 7 % width] = 1
+                if layer.bias is not None:
+                    layer.bias.copy_(torch.arange(256, device=device) / 16)
+                expected = torch.nn.functional.linear(expected_rows, layer.weight, layer.bias)
+                actual = layer.forward_sequence_parallel(rows, storage.capacity["rows"])
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    rtol=0,
+                    atol=0,
+                    msg=f"ranks={group.ranks}, rows={local_rows}, bias={use_bias}",
+                )
+                torch.cuda.synchronize(device)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual = layer.forward_sequence_parallel(rows, storage.capacity["rows"])
+                rows.add_(1)
+                expected_rows.add_(1)
+                graph.replay()
+                expected = torch.nn.functional.linear(expected_rows, layer.weight, layer.bias)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                graph.reset()
+                actual = layer.forward_sequence_parallel(
+                    rows.view(8, local_rows // 8, width), storage.capacity["rows"]
+                )
+                torch.testing.assert_close(
+                    actual, expected.view(16, local_rows // 8, 256), rtol=0, atol=0
+                )
+
+                def produce(workspace=storage.capacity["rows"]):
+                    def consume(interval, projected):
+                        positions = torch.arange(interval.start, interval.stop, device=device)
+                        projected.add_(positions.remainder(3).to(projected.dtype)[:, None])
+
+                    projection = layer.stream_sequence_parallel(
+                        local_rows, workspace, row_consumer=consume
+                    )
+                    interval_rows = 3072 if local_rows > 128 else 48
+                    for start in range(0, local_rows, interval_rows):
+                        projection.append(start, rows[start : start + interval_rows])
+                    return projection.finish()
+
+                actual = produce()
+                positions = torch.arange(local_rows * 2, device=device)
+                row_bias = positions.remainder(3).to(expected.dtype)[:, None]
+                torch.testing.assert_close(actual, expected + row_bias, rtol=0, atol=0)
+                torch.cuda.synchronize(device)
+                with torch.cuda.graph(graph):
+                    actual = produce()
+                rows.add_(1)
+                expected_rows.add_(1)
+                graph.replay()
+                expected = torch.nn.functional.linear(expected_rows, layer.weight, layer.bias)
+                torch.testing.assert_close(actual, expected + row_bias, rtol=0, atol=0)
+                graph.reset()
+            del storage
+        rows = torch.arange(128 * 128, device=device).view(128, 128).remainder(7).bfloat16()
+        rows.add_(rank)
+        layers = [
+            LinearBase(
+                128,
+                128,
+                layer_config=LayerConfig(Communicator(), None),
+                bias=False,
+                sequence_group=group,
+            ).to(device=device, dtype=torch.bfloat16)
+            for _ in range(3)
+        ]
+        for layer in layers:
+            layer.weight.copy_(torch.eye(128, device=device))
+        workspaces = [
+            torch.empty(2 * 2 * 128 * 128, device=device, dtype=torch.bfloat16) for _ in layers
+        ]
+
+        def bind_stage(index, layer):
+            def operation(hidden, *, prepared_projection, row_consumer):
+                projected = (
+                    layer.forward_sequence_parallel(hidden, workspaces[index])
+                    if prepared_projection is None
+                    else prepared_projection.finish()[0]
+                )
+                result = projected.view(2, 128, 128).sum(dim=0)
+                if row_consumer is not None:
+                    for start in range(0, 128, 48):
+                        interval = slice(start, min(start + 48, 128))
+                        row_consumer(interval, result[interval])
+                return result
+
+            def prepare(hidden):
+                return ProjectedRows(
+                    layer.stream_sequence_parallel(hidden.shape[0], workspaces[index]), 0
+                )
+
+            return RowStage(operation, True, prepare)
+
+        stages = tuple(bind_stage(index, layer) for index, layer in enumerate(layers))
+        actual = run_row_pipeline(rows, stages)
+        expected = (rows - rank) * 8 + 4
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run_row_pipeline(rows, stages)
+        rows.add_(1)
+        graph.replay()
+        torch.testing.assert_close(actual, expected + 8, rtol=0, atol=0)
+        graph.reset()
 
 
 def test_row_gather_and_projection_replay_updated_values_in_logical_rank_order(tmp_path):
@@ -285,7 +291,7 @@ def test_row_and_block_quantized_projection_preserves_scale_domains_under_replay
 
 @torch.inference_mode()
 def _run_routed_scales(rank: int, rendezvous: str) -> None:
-    from uniserve_worker.execution.forward_batch import ExpertRoute, RouteSpan
+    from uniserve_worker.modeling.tensors import ExpertRoute, RouteSpan
     from uniserve_worker.nn.expert_routing import RoutedTensor
     from uniserve_worker.nn.mlp import GatedMLP
     from uniserve_worker.nn.parallel_sequence import SequencePartition

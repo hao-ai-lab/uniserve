@@ -15,6 +15,9 @@ from typing import TYPE_CHECKING, Any, Self, cast
 
 import torch
 
+from uniserve_worker.backends.attention.selection import AttentionSelection
+from uniserve_worker.modeling.text import TextMixin
+from uniserve_worker.nn.attention import bind_attention_modules
 from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
 from uniserve_worker.nn.parallel import ComponentConfig
 from uniserve_worker.protocol.batch import Computation, ComputationId, PipelineStage
@@ -26,7 +29,7 @@ from ..bootstrap.capacity import (
     resolve_request_capacity,
 )
 from ..bootstrap.distributed import initialize_entries, initialize_process_groups
-from ..bootstrap.model_loader import load_worker_model
+from ..bootstrap.model_loader import load_worker_model, prepare_worker_model
 from ..bootstrap.worker_info import RequestKind, ResponseKind, WorkerInfo
 from ..bootstrap.worker_info_builder import build_worker_layout
 from ..config import (
@@ -35,7 +38,7 @@ from ..config import (
 )
 from ..execution.attention import supports_flow_attention
 from ..execution.batch_state import BatchState
-from ..execution.forward_batch import AttentionSelection
+from ..execution.model_entry import ModelEntry
 from ..execution.model_runner import ModelRunner
 from ..execution.output import OutputPool, PendingOutput
 from ..execution.prepare import capture_predicates, prepare_batch, prepare_inputs, validate_batch
@@ -48,7 +51,8 @@ from ..foundation.errors import (
 )
 from ..foundation.math import ceil_div
 from ..foundation.resources import close_resources
-from ..models.runtime import ExecutionModel
+from ..modeling.model import Model
+from ..modeling.video import VideoMixin
 from ..nn.mesh import Communicator
 from ..profiling import WorkerProfiler, profile_range, record_failure, worker_range_name
 from ..protocol.batch import (
@@ -108,7 +112,7 @@ def _input_producers(batch: ScheduleBatch) -> set[tuple[RequestKey, ComputationI
 class Worker:
     """Own a model, execution resources, and an optional single-use IPC service."""
 
-    model: ExecutionModel
+    model: Model
     worker_config: WorkerConfig
     runner: ModelRunner
     decode_state: DecodeState | None
@@ -147,7 +151,9 @@ class Worker:
         worker owns those resources until its context exits or the caller closes it.
         """
 
-        # Establish device and collective membership before loading rank-local weights.
+        source = prepare_worker_model(config)
+
+        # Mathematical constraints are checked before physical groups exist.
         distributed = initialize_process_groups(
             rank=config.execution.rank,
             local_rank=config.local_rank,
@@ -160,7 +166,7 @@ class Worker:
         try:
             bindings = initialize_entries(distributed, dict(config.components))
 
-            loaded = load_worker_model(config, bindings)
+            loaded = load_worker_model(config, bindings, source=source)
 
             # Sampling uses the language model's TP group, independently of other
             # components' parallel layouts. Backend selection belongs to the runner.
@@ -171,6 +177,7 @@ class Worker:
             # success the worker also takes responsibility for distributed.close().
             return cls(
                 loaded.model,
+                bindings=loaded.bindings,
                 sampling_group=sampling_group,
                 worker_config=loaded.worker_config,
                 tokenizer=loaded.tokenizer,
@@ -194,7 +201,7 @@ class Worker:
 
     def __init__(
         self,
-        model: ExecutionModel,
+        model: Model,
         *,
         worker_config: WorkerConfig,
         sampling_group: Communicator | None,
@@ -209,6 +216,7 @@ class Worker:
         schedule: DiffusionSchedule | None = None,
         components: tuple[tuple[str, ComponentConfig], ...] = (),
         process_groups: ProcessGroups | None = None,
+        bindings: Mapping[str, ModelEntry] | None = None,
     ) -> None:
         """Allocate execution resources for an already-loaded model.
 
@@ -227,7 +235,7 @@ class Worker:
         startup = ExitStack()
 
         try:
-            if not isinstance(model, ExecutionModel):
+            if not isinstance(model, Model):
                 raise unsupported_setup("worker model has no supported execution surface")
 
             if not isinstance(worker_config, WorkerConfig):
@@ -263,6 +271,7 @@ class Worker:
             runner = ModelRunner(
                 model,
                 worker_config,
+                bindings=bindings,
                 attention=attention,
                 schedule=schedule,
             )
@@ -280,7 +289,9 @@ class Worker:
             worker_config = resolve_request_capacity(
                 model,
                 worker_config,
+                state_schema=runner.tensor_resources.state,
                 pipeline_depth=pipeline_depth,
+                bindings=bindings,
                 capacity_group=(None if process_groups is None else process_groups.process_group),
             )
             self.worker_config = worker_config
@@ -289,7 +300,9 @@ class Worker:
             layout = build_worker_layout(
                 model,
                 worker_config,
+                state_schema=runner.tensor_resources.state,
                 endpoint=endpoint,
+                bindings=bindings,
                 queue_depth=int(pipeline_depth),
                 completion_payload_bytes=int(completion_payload_bytes),
                 allowed_work_variants=allowed_work_variants,
@@ -322,7 +335,7 @@ class Worker:
             info = layout.info
             arena = layout.arena
 
-            owns_kv = bool(model.resource_geometry.kv)
+            owns_kv = isinstance(model, TextMixin)
             cache = model.cache_geometry if owns_kv else None
 
             self.kv_cache = None
@@ -388,12 +401,12 @@ class Worker:
 
                 # Execution begins only after both physical pages and request
                 # mappings exist; the model borrows this worker's cache storage.
-                model.bind_cache_pool(self.kv_cache, attention)
+                bind_attention_modules(model, self.kv_cache, attention)
 
             # Admission, lineage, and persistent tensors share one slot owner.
             self.requests = RequestPool(
                 int(info.request_slots),
-                tensor_schema=model.resource_geometry.request_tensors or None,
+                tensor_schema=runner.tensor_resources.state or None,
                 device=worker_config.device,
             )
 
@@ -474,7 +487,7 @@ class Worker:
             self.tensor_store = TensorStore(
                 capacity=arena.tensor_store,
                 byte_capacity=arena.device_product_bytes,
-                entry_capacity=int(model.resource_geometry.encoder_cache_entries),
+                entry_capacity=int(layout.encoder_cache_entries),
                 max_entry_bytes=max(
                     1, int(layout.max_latent_feature_bytes), int(layout.max_vision_feature_bytes)
                 ),
@@ -493,7 +506,7 @@ class Worker:
             startup.callback(self.cpu_tasks.close)
 
             transfer_byte_capacity = int(arena.transfer_bytes)
-            if model.resource_geometry.request_tensors:
+            if isinstance(model, VideoMixin) or runner.tensor_resources.state:
                 # Each live request tensor reserves one credit per publication
                 # representation and one read credit on every possible remote rank.
                 # These credits bound ownership lifetimes; they allocate no storage.
@@ -536,18 +549,20 @@ class Worker:
 
             # Operation handlers borrow the resources owned by this rank.
             from ..execution.video import create_media_resources
-            from ..models.video import VideoModel
 
             self.media_mux, self.media_buffers = (
                 create_media_resources(
                     model,
                     rank=worker_config.rank,
-                    owns_output=model.owns_media_output
-                    and worker_config.rank == info.output_rank("output"),
+                    owns_output=(
+                        "output" in self.runner.bindings
+                        and self.runner.bindings["output"].owns
+                        and worker_config.rank == info.output_rank("output")
+                    ),
                     state_slots=info.request_slots,
                     unresolved_window=info.max_unresolved_ops,
                 )
-                if isinstance(model, VideoModel)
+                if isinstance(model, VideoMixin)
                 else (None, None)
             )
             if self.media_mux is not None:
@@ -609,9 +624,12 @@ class Worker:
         # Collective participants must observe the host's submission order even
         # when their local dependency chains become ready at different times.
         self._collective_submission_tail: ServiceRequest | None = None
-        self._preserve_collective_order = (
-            int(self.info.world_size) > 1 and self.model.ordered_collective_execution
-        )
+        self._preserve_collective_order = any(
+            group.world_size > 1
+            for entry in self.runner.bindings.values()
+            if entry.owns
+            for group in entry.groups
+        ) or (self.sampling_group is not None and self.sampling_group.world_size > 1)
 
     def _init_run_tracking(self) -> None:
         """Keep bounded in-flight work and a constant-size admission high-water mark."""
@@ -1645,6 +1663,7 @@ class Worker:
                 self.buffer_pool.close,
                 self.device_events.close,
                 self.runner.close,
+                self.requests.close,
             )
         )
         if self.process_groups is not None:

@@ -86,6 +86,7 @@ class RequestPool:
         if size < 1:
             raise ValueError("request-pool capacity must be positive")
         self.max_request_pool_size = size
+        self._closed = False
         self._rows: list[RequestState | None] = [None] * (size + 1)
         self._slots_by_request: dict[int, int] = {}
         self.tensor_slots = (
@@ -101,6 +102,26 @@ class RequestPool:
         if not self.tensor_slots:
             raise invalid_descriptor("request has no declared persistent tensor storage")
         return self.tensor_slots[slot - 1]
+
+    def close(self) -> None:
+        """Release drained request views before their communication owners retire.
+
+        The caller must first stop admissions and drain outputs and graphs.
+        Request records may remain borrowed by completion observers, so clear
+        their numerical references as well as this pool's backing allocations.
+        """
+
+        if self._closed:
+            return
+        self._closed = True
+        for row in self._rows:
+            if row is not None:
+                row.diffusion = None
+                row.tail = None
+                row.pending_operations.clear()
+        self._rows.clear()
+        self._slots_by_request.clear()
+        self.tensor_slots = ()
 
     def get(self, request_id: int) -> RequestState:
         row = self.peek(request_id)
@@ -265,6 +286,8 @@ class RequestPool:
         row.retired = True
 
     def _validate_slot(self, request_pool_idx: int) -> int:
+        if self._closed:
+            raise RuntimeError("request pool is closed")
         slot = int(request_pool_idx)
         if not 1 <= slot <= self.max_request_pool_size:
             raise invalid_descriptor(f"request-pool index {slot} exceeds capacity")

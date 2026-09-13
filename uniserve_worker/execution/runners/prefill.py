@@ -14,12 +14,13 @@ from collections.abc import Callable, Sequence
 
 import torch
 
+from uniserve_worker.modeling.tensors import TokenSelection
 from uniserve_worker.protocol.batch import ForwardMode
 
 from ...foundation.math import bucketed_length, ceil_div
 from ...runtime.kv_cache import KVCache
 from ..attention import physical_columns
-from ..forward_batch import ForwardBatch, ForwardOutput, TokenSelection
+from ..batch import ExecutionOutput, InputBatch
 from ..graph_inputs import PrefillShape
 from ..input_buffers import InputBuffers
 from ..rows import ForwardRow
@@ -36,7 +37,7 @@ def stage_text(
     decode: bool = False,
     selection: TokenSelection = TokenSelection.LAST_LOGITS,
     slots: tuple[int, ...] | None = None,
-) -> ForwardBatch:
+) -> InputBatch:
     """Use serving's staging and attention preparation with numerical inputs."""
 
     rows = len(tokens)
@@ -96,7 +97,7 @@ def prepare_prefill(
     runner: ModelRunner,
     entry: ModelEntry,
     buffers: InputBuffers,
-    forward: Callable[[ForwardBatch], ForwardOutput],
+    forward: Callable[[InputBatch], ExecutionOutput],
     shapes: tuple[PrefillShape, ...],
     *,
     packed: bool,

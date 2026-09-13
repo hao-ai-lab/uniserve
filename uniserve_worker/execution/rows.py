@@ -7,7 +7,7 @@ from typing import TypeAlias
 
 import torch
 
-from uniserve_worker.execution.forward_batch import FlowPatches, TokenSelection
+from uniserve_worker.modeling.tensors import FlowPatches, TokenSelection
 from uniserve_worker.protocol.batch import (
     ComputationId,
     ForwardMode,

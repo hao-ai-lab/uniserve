@@ -6,38 +6,47 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve_worker.backends.attention.video_sparse import (
-    VideoSparseAttentionBackend,
-    VideoSparseAttentionWorkspace,
-    build_video_sparse_metadata,
-    video_sparse_selected_tiles,
-)
+from uniserve_worker.backends.attention.context import sparse_attention_scope
+from uniserve_worker.backends.attention.video_sparse_provider import resolve_sparse_provider
 from uniserve_worker.bootstrap.distributed import (
     initialize_model_parallel,
     initialize_process_groups,
 )
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.nn.parallel_attention import (
-    AttentionContextGeometry,
     AttentionRowExchange,
     ParallelAttention,
+    context_scope,
+    output_scope,
 )
-from uniserve_worker.runtime.attention_storage import allocate_attention_context
-from uniserve_worker.runtime.peer_memory import allocate_symmetric_memory
+from uniserve_worker.nn.sparse_attention import (
+    SparseAttention,
+    VideoSparseAttentionWorkspace,
+    build_video_sparse_metadata,
+    video_sparse_selected_tiles,
+)
+from uniserve_worker.runtime.attention_storage import (
+    allocate_context_storage,
+    allocate_output_storage,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None:
     device = torch.device("cuda", rank)
-    environment = initialize_process_groups(
+    with initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=world_size,
         device=device,
         backend="nccl",
         init_method=rendezvous,
-    )
+    ) as environment:
+        _compute_context(environment, device, world_size, kind)
+
+
+def _compute_context(environment, device, world_size, kind):
     ranks = tuple(reversed(range(world_size)))
     if kind == "hybrid":
         sequence = SequenceParallel("hybrid", (2, world_size // 2))
@@ -78,7 +87,8 @@ def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None
         valid_sizes=valid,
         device=device,
     )
-    backend = VideoSparseAttentionBackend(metadata)
+    provider = resolve_sparse_provider(device)
+    sparse = SparseAttention()
     attention = ParallelAttention(mesh=mesh)
     fine_rows = context_rows
     fine_tiles = fine_rows // 64
@@ -107,32 +117,27 @@ def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None
             dtype=torch.int32,
         ),
     )
-    exchange = allocate_symmetric_memory(
-        mesh.get_group("ulysses"),
-        (local_rows, global_heads, width),
+    output_storage = allocate_output_storage(
+        (attention,),
+        rows=context_rows,
+        heads=heads,
+        head_dim=width,
         dtype=torch.bfloat16,
     )
-    outputs = exchange.peers
-    output = exchange.local
-    sync_input = torch.zeros(1, device=device, dtype=torch.int32)
-    sync_output = torch.empty(mesh.size("ulysses"), device=device, dtype=torch.int32)
-    key_group = mesh.get_group("cp_row" if kind == "attention2d" else "cp")
-    context_workspace = allocate_attention_context(
-        AttentionContextGeometry(
-            group=key_group,
-            rows=context_rows * (mesh.size("cp_col") if kind == "attention2d" else 1),
-            heads=heads,
-            mapped=kind != "allgather",
-            head_dim=width,
-            dtype=torch.bfloat16,
-            block_size=64,
-        ),
+    contexts = allocate_context_storage(
+        (attention,),
+        rows=context_rows,
+        heads=heads,
+        head_dim=width,
+        dtype=torch.bfloat16,
+        block_size=64,
     )
     prefix_indices = torch.arange(prefix, device=device, dtype=torch.int32)
     dense_indices = torch.arange(prefix + video_tiles, device=device, dtype=torch.int32)
     prefix_count = torch.tensor(prefix, device=device, dtype=torch.int32)
 
     def execute():
+        backend = sparse.prepare(metadata)
         local_query, local_key, local_value, local_gate = attention.exchange_heads(
             projected[begin:end]
         ).unbind(2)
@@ -147,14 +152,15 @@ def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None
             dense_indices,
             prefix_count,
             workspace,
-            outputs=outputs,
-            sync_input=sync_input,
-            sync_output=sync_output,
-            context_workspace=context_workspace,
         )
         return result.materialize() if isinstance(result, AttentionRowExchange) else result
 
-    with torch.inference_mode():
+    with (
+        torch.inference_mode(),
+        sparse_attention_scope(provider),
+        context_scope(contexts),
+        output_scope(output_storage.views),
+    ):
         actual = execute()
         # Explicit dense reference: valid-row tile means, globally selected
         # video blocks, exempt prefix queries, and a separate compression softmax.
@@ -195,13 +201,12 @@ def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None
         )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            execute()
+            captured = execute()
         graph.replay()
         torch.testing.assert_close(
-            output[live].double(), reference[begin:end][live], rtol=2e-2, atol=2e-2
+            captured[live].double(), reference[begin:end][live], rtol=2e-2, atol=2e-2
         )
         graph.reset()
-    environment.close()
 
 
 @pytest.mark.parametrize("world_size", [2, 4])

@@ -1,14 +1,15 @@
-"""Imperative cross-modal generation behavior owned by concrete models."""
+"""Shared image diffusion geometry, numerical transforms, and prompt framing."""
 
 from __future__ import annotations
 
 import math
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
-from ..execution.forward_batch import FlowPatches
+from uniserve_worker.modeling.tensors import FlowPatches, PositionLayout
+
 from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..nn.diffusion.cfg import Branch, CfgRecipe
 from ..nn.diffusion.schedule import (
@@ -17,7 +18,6 @@ from ..nn.diffusion.schedule import (
     flow_match_coordinate,
 )
 from ..nn.vision.patching import patchify_batch, unpatchify_batch
-from .runtime import PositionLayout
 
 
 class LatentLayout(StrEnum):
@@ -33,13 +33,6 @@ class BranchSource(StrEnum):
     CONDITIONING = "conditioning"
     NEGATIVE_OR_START = "negative_or_start"
     START = "start"
-
-
-class Materialization(StrEnum):
-    """Selects decoder-route or RGB-latent materialization of generated state."""
-
-    DECODE_ROUTE = "decode_route"
-    RGB_LATENT = "rgb_latent"
 
 
 class NoiseScaleMode(StrEnum):
@@ -101,27 +94,26 @@ class FlowPrompt:
         )
 
 
-class GenerationPipeline:
-    """Shared mechanics parameterized by one concrete model's generation math."""
+class ImageDiffusion:
+    """Image latent geometry, noise transforms, and analytical diffusion mathematics."""
 
     def __init__(
         self,
         *,
         latent_downsample: int,
-        prediction: str,
+        prediction: Literal["velocity", "sample"],
         prediction_dtype: str,
         schedule_direction: ScheduleDirection,
         schedule_shift_domain: ScheduleShiftDomain,
         max_latent_tokens: int,
         max_vae_grid_tokens: int,
-        commit_marker_tokens: int,
+        marker_tokens: int,
         rope_advance: int,
         max_cfg_branches: int,
         latent_layout: LatentLayout,
         latent_channels: int,
         latent_patch_size: int,
         positions: PositionLayout,
-        materialization: Materialization,
         text_unconditional: BranchSource,
         image_unconditional: BranchSource,
         cfg_recipe: CfgRecipe,
@@ -134,23 +126,22 @@ class GenerationPipeline:
     ) -> None:
         """Validate and freeze latent geometry, flow math, CFG, and prompt semantics."""
 
-        # Geometry and schedule fields define the scheduler-visible trajectory
-        # contract as well as the tensor shapes used by execution.
+        # These bounds describe one legal numerical image and its framing,
+        # independently of how many trajectories the caller admits or stores.
         self.latent_downsample = int(latent_downsample)
-        self.prediction = str(prediction)
+        self.prediction = prediction
         self.prediction_dtype = str(prediction_dtype)
         self.schedule_direction = schedule_direction
         self.schedule_shift_domain = schedule_shift_domain
         self.max_latent_tokens = int(max_latent_tokens)
         self.max_vae_grid_tokens = int(max_vae_grid_tokens)
-        self.commit_marker_tokens = int(commit_marker_tokens)
+        self.marker_tokens = int(marker_tokens)
         self.rope_advance = int(rope_advance)
         self.max_cfg_branches = int(max_cfg_branches)
         self.latent_layout = latent_layout
         self.latent_channels = int(latent_channels)
         self.latent_patch_size = int(latent_patch_size)
         self.positions = positions
-        self.materialization = materialization
         self.text_unconditional = text_unconditional
         self.image_unconditional = image_unconditional
         self.cfg_recipe = cfg_recipe
@@ -161,13 +152,15 @@ class GenerationPipeline:
         self.timestep_shift = None if timestep_shift is None else float(timestep_shift)
         self.prompt = prompt
 
-        # Reject configurations that cannot describe at least one latent unit,
-        # marker, or guidance branch before any request reaches the pipeline.
+        # Reject geometry that cannot describe a latent, framing marker, or
+        # mathematical guidance branch before it is consumed by public layers.
+        if self.prediction not in {"velocity", "sample"}:
+            raise ValueError("image diffusion prediction must be velocity or sample")
         if min(
             self.latent_downsample,
             self.max_latent_tokens,
             self.max_vae_grid_tokens,
-            self.commit_marker_tokens,
+            self.marker_tokens,
             self.rope_advance,
             self.max_cfg_branches,
             self.latent_channels,
@@ -209,49 +202,17 @@ class GenerationPipeline:
             return self.text_unconditional
         return self.image_unconditional
 
-    def prefix(
-        self,
-        source: BranchSource,
-        *,
-        image_prompt: str,
-        negative_prompt: str,
-        negative_token_ids: tuple[int, ...],
-        tokenizer: Any | None,
-    ) -> tuple[tuple[int, ...], bool]:
-        """Resolve a branch prefix and flag an empty positive prompt as start-state conditioning."""
-
-        if source is BranchSource.CONDITIONING and not image_prompt.strip():
-            return (), True
-        if source is BranchSource.NEGATIVE_OR_START and negative_token_ids:
-            return negative_token_ids, False
-        if self.prompt is None:
-            if source is BranchSource.CONDITIONING:
-                raise invalid_descriptor("this model does not accept a generation prompt override")
-            return (), False
-        if source is BranchSource.CONDITIONING:
-            text = image_prompt.strip()
-            conditioned = True
-        elif source is BranchSource.NEGATIVE_OR_START:
-            text = negative_prompt.strip()
-            conditioned = False
-        else:
-            text = ""
-            conditioned = False
-        return self.prompt.encode(tokenizer, text=text, conditioned=conditioned), False
-
     def image_tokens(self, height: int, width: int) -> int:
         """Count latent-grid tokens for an output image at the model downsample ratio."""
 
         return (int(height) // self.latent_downsample) * (int(width) // self.latent_downsample)
 
-    def physical_tokens(self, height: int, width: int) -> int:
-        """Include commit-marker rows in the scheduler-visible latent allocation."""
+    def sequence_length(self, height: int, width: int) -> int:
+        """Count one numerical sequence, including its model framing markers."""
 
         count = self.image_tokens(height, width)
         return (
-            count + self.commit_marker_tokens
-            if self.latent_layout is LatentLayout.PATCH_TOKENS
-            else count
+            count + self.marker_tokens if self.latent_layout is LatentLayout.PATCH_TOKENS else count
         )
 
     def latent_shape(self, height: int, width: int) -> tuple[int, ...]:
@@ -276,40 +237,28 @@ class GenerationPipeline:
             value = math.sqrt(value)
         return min(value, self.noise_scale_maximum)
 
-    def neural_latent(self, latent: torch.Tensor) -> torch.Tensor:
+    def patchify(self, latent: torch.Tensor) -> torch.Tensor:
         """Convert image-layout latent storage into patch rows consumed by the denoiser."""
 
         if self.latent_layout is LatentLayout.PATCH_TOKENS:
             return latent
         return patchify_batch(latent, self.latent_patch_size)
 
-    def stored_latent(self, latent: torch.Tensor, height: int, width: int) -> torch.Tensor:
-        """Convert denoiser patch rows back to the configured persistent latent layout."""
+    def unpatchify(self, latent: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        """Restore one image's canonical patch rows to its numerical latent layout.
+
+        Patch-token models retain their row representation. Image-space models
+        return [1, channels, height, width], preserving raster patch order.
+        """
 
         if self.latent_layout is LatentLayout.PATCH_TOKENS:
             return latent
         return unpatchify_batch(
-            latent,
+            latent.reshape(1, self.image_tokens(height, width), -1),
             self.latent_patch_size,
             height=int(height),
             width=int(width),
             channels=self.latent_channels,
-        )
-
-    def materialization_latent(
-        self,
-        latent: torch.Tensor,
-        height: int,
-        width: int,
-    ) -> torch.Tensor:
-        """Project canonical page rows into the model's materialization layout."""
-
-        if self.latent_layout is LatentLayout.PATCH_TOKENS:
-            return latent
-        return self.stored_latent(
-            latent.reshape(1, self.image_tokens(height, width), -1),
-            height,
-            width,
         )
 
     def conditioning(
@@ -345,8 +294,7 @@ class GenerationPipeline:
 __all__ = [
     "BranchSource",
     "FlowPrompt",
-    "GenerationPipeline",
+    "ImageDiffusion",
     "LatentLayout",
-    "Materialization",
     "NoiseScaleMode",
 ]

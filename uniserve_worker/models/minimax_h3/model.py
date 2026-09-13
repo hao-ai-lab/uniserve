@@ -1,128 +1,408 @@
-"""Concrete fixed-profile MiniMax H3 model and resident request state."""
+"""Concrete MiniMax H3 numerical composition and fixed-profile mathematics."""
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Mapping
-from functools import partial
-from typing import TYPE_CHECKING, Any
+from collections.abc import Mapping
+from dataclasses import fields
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
-from uniserve_worker.execution.model_entry import ModelEntry
-from uniserve_worker.protocol.batch import PipelineStage
-
-from ...execution.denoising import DenoisingStep
-from ...nn.diffusion.schedule import DiffusionSchedule
-from ...nn.parallel_attention import AttentionBuffers, AttentionContextGeometry
-from ...protocol.batch import DecodeRange, DiffusionSamplingParams, MediaTrack
-from ...runtime.tensor_buffers import TensorBuffers
-from ..runtime import ResourceGeometry, TensorOutputLayout
-from ..video import (
-    VideoModel,
-    VideoOutputGeometry,
+from uniserve_worker.modeling.geometry import (
+    DecodeWindow,
+    MediaShape,
+    Shape,
+    TensorOutputLayout,
+    TextShape,
+    VideoShape,
 )
-from .config import FASTH3_LADDER
+
+from ...modeling.batch import DecodeBatch, DiffusionBatch, TensorOutput
+from ...modeling.components import Call, CallSpec, ComponentSpec
+from ...modeling.context import BuildContext
+from ...modeling.decoder import DecodeKind, DecoderMixin
+from ...modeling.diffusion import DiffusionMixin
+from ...modeling.encoder import EncodeKind, EncoderMixin
+from ...modeling.model import Model
+from ...modeling.resources import TensorAlias, TensorNeeds, TensorSchema
+from ...modeling.tensors import TensorViews
+from ...modeling.video import VideoMixin
+from ...nn.diffusion.schedule import ScheduleDirection, ScheduleShiftDomain
+from ...nn.diffusion.spec import DiffusionSpec, ModalitySpec, ScheduleRule
+from ...nn.parallel import ParallelConfig
+from ...nn.parallel_pipeline import LayerPipeline
+from .config import FASTH3_LADDER, FASTH3_SHIFTS, FASTH3_TIME_SCALE, H3TransformerConfig
+from .encoder import H3TextEncoderConfig
 from .layout import (
+    MIN_H3_FRAMES,
     PROFILE_AUDIO_RATE,
     PROFILE_FPS,
     PROFILE_HEIGHT,
     PROFILE_WIDTH,
-    H3ComputeInputs,
     H3Layout,
-    H3Tensors,
-    bind_request_tensors,
-    entry_output_schema,
-    media_tensor_schema,
+    compute_specs,
     reconstruction_unit_frames,
-    request_tensor_schema,
-    scratch_tensor_schema,
+    state_specs,
     tensor_output_layout,
-    warmup_geometries,
 )
-from .packing import audio_latent_frames
-from .transformer import MiniMaxH3Transformer, build_transformer_metadata
-from .video_vae import H3VideoAssembler
-from .weights import H3Components, build_h3_checkpoint
+from .packing import (
+    audio_latent_frames,
+    build_packed_layout,
+    patchify_video,
+    unpatchify_video_into,
+    video_latent_frames,
+)
+from .transformer import MODALITIES, MiniMaxH3Transformer, build_transformer_metadata
+from .weights import build_components
 
 if TYPE_CHECKING:
-    from ...execution.model_runner import ModelRunner
-    from ...loader.component import ModelBuildContext, ModelConstruction
+    from ...loader.component import CheckpointComponent
+    from ...nn.video_attention import VideoAttention
+    from .audio_vae import MiniMaxH3AudioVAE
+    from .video_vae import MiniMaxH3VideoVAE
 
 __all__ = ["MiniMaxH3Model"]
 
 
-class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
-    """Fixed T2VA plan executed by the shared media scheduler.
+class MiniMaxH3Model(EncoderMixin, DiffusionMixin, DecoderMixin, VideoMixin, Model):
+    """Compose text conditioning, four denoiser evaluations, and video/audio recovery.
 
-    Encode text, prepare conditioning and seeded latents, then schedule one
-    prediction/solver step per ladder position. Video temporal units and audio
-    decode independently; the output entry joins both tracks into one MP4.
-    Components below bind those entries to caller-owned tensors. The shared
-    scheduler evaluates these dependencies while retaining admission and cancellation.
+    Logical components declare mathematical participation. Request progress,
+    physical placement, media encoding, and output publication belong to the
+    caller's execution infrastructure.
     """
 
     denoiser: MiniMaxH3Transformer | None
-    video_assembler: H3VideoAssembler | None
+    video_decoder: MiniMaxH3VideoVAE | None
+    audio_decoder: MiniMaxH3AudioVAE | None
 
-    pipeline_components = {
-        PipelineStage.TEXT_ENCODING: "text_encoder",
-        PipelineStage.LATENT_PREPARATION: "denoiser",
-        PipelineStage.DENOISING: "denoiser",
-        PipelineStage.VIDEO_DECODING: "video_decoder",
-        PipelineStage.AUDIO_DECODING: "audio_decoder",
-        PipelineStage.VIDEO_ENCODING: "output",
-        PipelineStage.AUDIO_ENCODING: "output",
-        PipelineStage.MUXING: "output",
-    }
     num_inference_steps = len(FASTH3_LADDER)
+    min_frames = MIN_H3_FRAMES
+    text_alignment = 64
     architecture = "MiniMaxH3Transformer3DModel"
-    serving_dtype = "bfloat16"
-    resource_geometry = ResourceGeometry(kv=False)
-    supported_work = frozenset(pipeline_components)
     generation = None
     image_processor = None
-    tensorized_mixed = False
     media_profile = "minimax_h3"
-    ordered_collective_execution = True
+    decoder_kinds: frozenset[DecodeKind] = frozenset({"video", "audio"})
+    encoder_kinds: frozenset[EncodeKind] = frozenset({"text", "conditioning"})
 
-    def denoising_signature(
-        self, tensors: H3Tensors, metadata: H3ComputeInputs
-    ) -> tuple[int, int, int]:
-        """Identify one packed H3 shape independently of its request slot."""
-
-        del tensors
-        return metadata.layout.shape_key
-
-    def bind_denoising_step(
-        self, tensors: H3Tensors, metadata: H3ComputeInputs, step: int, schedule: DiffusionSchedule
-    ) -> DenoisingStep:
-        """Compose the learned denoiser with the shared solver and pipeline feedback."""
-
-        if not 0 <= step < self.num_inference_steps:
-            raise ValueError("H3 denoise step is outside the four-evaluation ladder")
-        assert self.denoiser is not None and metadata.scratch is not None
-        assert metadata.transformer_metadata is not None
-        return DenoisingStep(
-            partial(self.denoiser, tensors, metadata.scratch, metadata.transformer_metadata, step),
-            (tensors.video_rows, tensors.audio_rows),
-            self.denoiser.pipeline.feedback,
-            schedule,
-            step,
+    @classmethod
+    def components(cls, config: Any) -> tuple[ComponentSpec, ...]:
+        return (
+            ComponentSpec("text_encoder", (CallSpec(Call.ENCODE_TEXT, groups=("tp",)),)),
+            ComponentSpec(
+                "denoiser",
+                (
+                    CallSpec(Call.ENCODE_CONDITIONING, stage="first", groups=("tp", "sp")),
+                    CallSpec(Call.DIFFUSION, groups=("tp", "sp", "pp", "cp", "ulysses")),
+                ),
+            ),
+            ComponentSpec("video_decoder", (CallSpec(Call.DECODE_VIDEO),)),
+            ComponentSpec("audio_decoder", (CallSpec(Call.DECODE_AUDIO),)),
+            ComponentSpec("output", (CallSpec(Call.POSTPROCESS_VIDEO),)),
         )
 
-    def __init__(
+    @classmethod
+    def validate_parallel(cls, config: Any, parallel: Mapping[str, ParallelConfig]) -> None:
+        """Validate head partitions and supported numerical parallel algorithms."""
+
+        super().validate_parallel(config, parallel)
+        if not parallel:
+            raise ValueError("H3 requires at least one numerical component")
+        for name, geometry in parallel.items():
+            if name in {"video_decoder", "audio_decoder", "output"}:
+                if geometry.world_size != 1:
+                    raise ValueError(f"H3 {name} requires a local numerical computation")
+            elif name == "text_encoder":
+                if geometry.pipeline_parallel_size != 1 or geometry.sequence_parallel_size != 1:
+                    raise ValueError("H3 text encoder supports direct tensor parallelism")
+                if any(width % geometry.tensor_parallel_size for width in (64, 25600)):
+                    raise ValueError("H3 encoder TP must divide query heads and MLP width")
+            elif name == "denoiser":
+                if geometry.pipeline_parallel_size > 50:
+                    raise ValueError("H3 pipeline stages cannot exceed its 50 transformer layers")
+                if geometry.sequence_parallel.kind not in {
+                    "local",
+                    "ulysses",
+                    "allgather",
+                    "ring",
+                    "hybrid",
+                    "attention2d",
+                }:
+                    raise ValueError("H3 sequence attention requires global sparse selection")
+                tensor = geometry.tensor_parallel_size
+                ulysses = dict(geometry.dimensions)["ulysses"]
+                if 56 % (tensor * ulysses) or 5376 % tensor or 14336 % tensor:
+                    raise ValueError(
+                        "H3 TP × Ulysses must divide heads; TP must divide hidden and MLP widths"
+                    )
+
+    def tensor_specs(self, call: Call, shape: Shape) -> TensorNeeds:
+        """Declare immutable diffusion metadata and native reconstruction tensors."""
+
+        if call in {Call.ENCODE_TEXT, Call.ENCODE_CONDITIONING}:
+            if not isinstance(shape, TextShape) or shape.rows != 1:
+                raise ValueError("H3 text encoding requires one numerical token sequence")
+            if not 1 <= shape.tokens <= self.text_max_tokens:
+                raise ValueError("H3 text encoding length lies outside its numerical token limits")
+            width = (
+                H3TextEncoderConfig().hidden_size
+                if call is Call.ENCODE_TEXT
+                else H3TransformerConfig().hidden_size
+            )
+            return TensorNeeds(
+                outputs={
+                    "conditioning": TensorSchema(
+                        (1, shape.tokens, width),
+                        torch.bfloat16,
+                        variable_axes=(1,),
+                    )
+                }
+            )
+        if not isinstance(shape, MediaShape):
+            raise ValueError("H3 media computation requires raster and temporal geometry")
+        if (shape.height, shape.width) != (PROFILE_HEIGHT, PROFILE_WIDTH):
+            raise ValueError("H3 reconstruction requires its checkpoint raster geometry")
+        reconstruction_unit_frames(shape.frames)
+        if call is Call.DIFFUSION:
+            layout = self._diffusion_layout(shape)
+            values = self._diffusion_metadata(layout)
+            constants = {
+                name: TensorSchema(
+                    tuple(value.shape),
+                    value.dtype,
+                    domain="host" if name in {"video_indices", "audio_indices"} else "device",
+                )
+                for name, value in values.items()
+            }
+            return TensorNeeds(
+                constants=constants,
+                outputs={
+                    "video": TensorSchema(
+                        (int(layout.packed.video_indices.numel()), 96),
+                        torch.float32,
+                        variable_axes=(0,),
+                    ),
+                    "audio": TensorSchema(
+                        (int(layout.packed.audio_indices.numel()), 32),
+                        torch.float32,
+                        variable_axes=(0,),
+                    ),
+                },
+                state=state_specs(layout),
+                scratch=compute_specs(
+                    layout,
+                    self.denoiser_mesh,
+                    block_params_shape=(
+                        (
+                            len(self.denoiser.pipeline.layers),
+                            2,
+                            MODALITIES * 6 * self.denoiser.config.hidden_size,
+                        )
+                        if self.denoiser is not None
+                        else (0,)
+                    ),
+                    final_params_shape=(
+                        (2, 2 * self.denoiser.config.hidden_size)
+                        if self.denoiser is not None and self.denoiser.pipeline.last
+                        else (0,)
+                    ),
+                    attention=(
+                        cast(
+                            "VideoAttention",
+                            next(iter(self.denoiser.transformer_blocks.values())).attn,
+                        )
+                        if self.denoiser is not None
+                        else None
+                    ),
+                ),
+            )
+        if call is Call.DECODE_VIDEO:
+            return TensorNeeds(
+                constants={
+                    "video_raster_order": TensorSchema(
+                        (video_latent_frames(shape.frames) * 24 * 42,), torch.int64
+                    )
+                },
+                scratch={
+                    "video_input": TensorSchema((1, 24, 7, 48, 84), torch.float32),
+                    "reconstruction_rows": TensorSchema((7 * 24 * 42, 96), torch.float32),
+                },
+                outputs={
+                    "video": TensorSchema(
+                        (shape.unit_count or 1, 1, 3, 25, shape.height, shape.width),
+                        torch.float16,
+                        variable_axes=(0,),
+                    )
+                },
+            )
+        if call is Call.DECODE_AUDIO:
+            return TensorNeeds(
+                scratch={
+                    "audio_latents": TensorSchema(
+                        (2, 32, audio_latent_frames(shape.frames)), torch.float32
+                    )
+                },
+                outputs={
+                    "audio": TensorSchema(
+                        (round(shape.frames * PROFILE_AUDIO_RATE / PROFILE_FPS), 2),
+                        torch.int16,
+                        variable_axes=(0,),
+                    )
+                },
+            )
+        if call is Call.POSTPROCESS_VIDEO:
+            return TensorNeeds(
+                constants={
+                    name: TensorSchema((1, 3, 1, 1, 1), torch.float32)
+                    for name in ("pixel_mean", "pixel_std")
+                },
+                state={
+                    "video_overlap": TensorSchema(
+                        (1, 3, 5, shape.height, shape.width), torch.float16
+                    )
+                },
+                scratch={
+                    "rgb_frames": TensorSchema(
+                        (shape.frames, shape.height, shape.width, 3), torch.uint8
+                    )
+                },
+                outputs={
+                    "video": TensorSchema(
+                        (shape.frames, shape.height, shape.width, 3),
+                        torch.uint8,
+                        variable_axes=(0,),
+                        alias=TensorAlias("scratch", "rgb_frames"),
+                    )
+                },
+            )
+        raise ValueError(f"H3 tensor requirements are not declared for {call.value}")
+
+    def _diffusion_layout(self, shape: MediaShape) -> H3Layout:
+        """Resolve one legal numerical shape within the model's logical partition."""
+
+        audio_frames = audio_latent_frames(shape.frames)
+        text_rows = ((shape.prompt_tokens + 63) // 64) * 64
+        if (
+            (shape.height, shape.width) != (PROFILE_HEIGHT, PROFILE_WIDTH)
+            or shape.frames > self.layout.frame_count
+            or not 0 < text_rows <= self.text_max_tokens
+            or shape.audio_frames not in {0, audio_frames}
+        ):
+            raise ValueError("H3 metadata requires supported raster, prompt, and audio geometry")
+        return H3Layout.build(
+            self.denoiser_parallel,
+            self.denoiser_mesh,
+            frames=shape.frames,
+            text_rows=text_rows,
+            audio_frames=audio_frames,
+            postprocess=self.layout.postprocess,
+        )
+
+    def _diffusion_metadata(self, layout: H3Layout) -> dict[str, torch.Tensor]:
+        """Derive immutable indices and base positions for a packed page geometry."""
+
+        packed = layout.packed
+        values = {
+            "video_indices": layout.local_video_raster_indices,
+            "audio_indices": layout.local_audio_raster_indices,
+            "tile_valid_sizes": packed.tile_valid_sizes,
+            "prefix_key_indices": torch.arange(
+                packed.prefix_tiles, dtype=torch.int32, device="cpu"
+            ),
+            "dense_key_indices": torch.arange(
+                packed.prefix_tiles + packed.video_tiles, dtype=torch.int32, device="cpu"
+            ),
+            "prefix_count": torch.tensor(packed.prefix_tiles, dtype=torch.int32, device="cpu"),
+        }
+        if self.denoiser is not None:
+            metadata = build_transformer_metadata(layout, torch.device("cpu"))
+            values.update({field.name: getattr(metadata, field.name) for field in fields(metadata)})
+        return values
+
+    @torch.inference_mode()
+    def prepare_metadata(self, call: Call, shape: Shape, *, out: TensorViews) -> None:
+        """Fill borrowed constants without retaining their backing or execution owner."""
+
+        if isinstance(shape, TextShape):
+            return super().prepare_metadata(call, shape, out=out)
+        if call is Call.DIFFUSION:
+            values = self._diffusion_metadata(self._diffusion_layout(shape))
+        elif call is Call.DECODE_VIDEO:
+            self.tensor_specs(call, shape)
+            packed = build_packed_layout(
+                text_rows=64,
+                num_frames=shape.frames,
+                audio_frames=audio_latent_frames(shape.frames),
+            )
+            values = {"video_raster_order": torch.argsort(packed.video_raster_indices)}
+        elif call is Call.POSTPROCESS_VIDEO:
+            values = {
+                "pixel_mean": torch.tensor(
+                    (0.485, 0.456, 0.406), dtype=torch.float32, device="cpu"
+                ).view(1, 3, 1, 1, 1),
+                "pixel_std": torch.tensor(
+                    (0.229, 0.224, 0.225), dtype=torch.float32, device="cpu"
+                ).view(1, 3, 1, 1, 1),
+            }
+        else:
+            return super().prepare_metadata(call, shape, out=out)
+        schemas = self.tensor_specs(call, shape).constants
+        if out.keys() != schemas.keys():
+            raise ValueError("H3 metadata views must cover the declared constants")
+        for name, schema in schemas.items():
+            target = out[name]
+            if tuple(target.shape) != schema.shape or target.dtype != schema.dtype:
+                raise ValueError(f"H3 metadata view {name!r} has an incompatible representation")
+            if name in {"video_indices", "audio_indices"} and target.device.type != "cpu":
+                raise ValueError("H3 native noise indices require CPU representation")
+        for name, source in values.items():
+            out[name].copy_(source)
+
+    @property
+    def diffusion_pipeline(self) -> LayerPipeline | None:
+        """Expose denoiser partitioning for the caller's numerical feedback."""
+
+        return None if self.denoiser is None else self.denoiser.pipeline
+
+    def forward_diffusion(
         self,
-        bindings: Mapping[str, ModelEntry],
-        components: H3Components,
-        layout: H3Layout,
-    ) -> None:
-        """Bind H3 model components to runtime-owned state, scratch, and device products."""
+        batch: DiffusionBatch,
+        *,
+        state: TensorViews,
+        constants: TensorViews,
+        scratch: TensorViews,
+    ) -> TensorOutput:
+        """Predict ordered video/audio velocities without updating latent state."""
 
-        super().__init__()
+        if batch.row_count != 1 or tuple(batch.latents) != ("video", "audio"):
+            raise ValueError("H3 diffusion requires one video/audio sequence")
+        step = batch.ladder_index
+        if step is None or not 0 <= step < self.num_inference_steps:
+            raise ValueError("H3 denoise step is outside the four-evaluation ladder")
+        if self.denoiser is None:
+            raise ValueError("H3 diffusion requires a resident denoiser")
+        predictions = self.denoiser(batch, state=state, constants=constants, scratch=scratch)
+        return TensorOutput(
+            {
+                name: (None if predictions is None else predictions[index],)
+                for index, name in enumerate(batch.latents)
+            }
+        )
 
-        self.bindings: Mapping[str, ModelEntry] = bindings
-        self.owns_media_output = "output" in bindings and bindings["output"].owns
-        self.device = next(entry.device for entry in bindings.values() if entry.owns)
+    def __init__(self, config: dict[str, Any], context: BuildContext) -> None:
+        """Compose local numerical modules before the caller loads their parameters."""
+
+        super().__init__(config)
+        components, layout, self._checkpoints = build_components(config, context)
+        schedule = context.schedule
+        assert schedule is not None
+        device = schedule.sigmas[0].device
+        parallel = context.parallel.get("denoiser", ParallelConfig())
+        mesh = context.meshes.get("denoiser")
+        self.device = device
+        self.denoiser_parallel = parallel
+        self.denoiser_mesh = mesh
         self.layout = layout
         self.denoiser = components.transformer
         self.conditioner = components.conditioner
@@ -132,52 +412,22 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             raise ValueError("conditioning modules must belong to the denoiser input stage")
         self.text_encoder = components.encoder
         self.text_max_tokens = int(layout.packed.text_indices.numel())
-        self.entry_outputs = entry_output_schema(layout)
+        maximum = MediaShape(
+            PROFILE_HEIGHT,
+            PROFILE_WIDTH,
+            frames=layout.frame_count,
+            prompt_tokens=self.text_max_tokens,
+            unit_count=layout.video_reconstruction_units,
+        )
+        self.output_shapes = {
+            "text_encoder": (Call.ENCODE_TEXT, TextShape(self.text_max_tokens)),
+            "denoiser": (Call.DIFFUSION, maximum),
+            "video_decoder": (Call.DECODE_VIDEO, maximum),
+            "audio_decoder": (Call.DECODE_AUDIO, maximum),
+        }
         self.video_decoder = components.video_vae
         self.audio_decoder = components.audio_vae
-        self.video_assembler = H3VideoAssembler(self.device) if self.owns_media_output else None
-        for name, module in (
-            ("denoiser", self.denoiser),
-            ("text_encoder", self.text_encoder),
-            ("video_decoder", self.video_decoder),
-            ("audio_decoder", self.audio_decoder),
-        ):
-            if (name in bindings and bindings[name].owns) != (module is not None):
-                raise ValueError(f"H3 {name} materialization disagrees with assigned membership")
-        self.scratch_schema = media_tensor_schema(layout, bindings)
-        self.context_geometry = None
-        if self.denoiser is not None:
-            denoiser_mesh = bindings["denoiser"].mesh
-            assert denoiser_mesh is not None
-            self.scratch_schema.update(
-                scratch_tensor_schema(
-                    layout,
-                    denoiser_mesh,
-                    block_params_shape=tuple(self.denoiser.modulation_plan.blocks.shape[1:]),
-                    final_params_shape=(
-                        tuple(self.denoiser.modulation_plan.final.shape[1:])
-                        if self.denoiser.modulation_plan.final is not None
-                        else (0,)
-                    ),
-                    attention_workspace_dtype=torch.bfloat16
-                    if self.denoiser.attention_linear_precision == "bf16"
-                    else torch.uint8,
-                )
-            )
-            if layout.sp_size > layout.ulysses_size:
-                self.context_geometry = AttentionContextGeometry(
-                    group=denoiser_mesh.get_group(
-                        "cp_row" if layout.sequence_kind == "attention2d" else "cp"
-                    ),
-                    rows=layout.attention_rows * layout.context_col_size,
-                    heads=56 // (layout.tp_size * layout.ulysses_size),
-                    mapped=layout.sequence_kind != "allgather",
-                    head_dim=128,
-                    dtype=torch.bfloat16,
-                    block_size=64,
-                )
-
-        self.output_capacity = VideoOutputGeometry(
+        self.output_capacity = VideoShape(
             frame_count=layout.frame_count,
             unit_frames=layout.reconstruction_unit_frames,
             width=PROFILE_WIDTH,
@@ -187,240 +437,252 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         )
         self.decode_frame_capacity = layout.frame_count
 
-        self.resource_geometry = ResourceGeometry(
-            kv=False, request_tensors=request_tensor_schema(layout)
-        )
+    def checkpoint_components(self) -> tuple[CheckpointComponent, ...]:
+        """Declare resident checkpoint namespaces and fixed-schedule precomputation."""
 
-    @classmethod
-    def build_checkpoint(
-        cls, config: dict[str, Any], context: ModelBuildContext
-    ) -> ModelConstruction:
-        """Declare H3 component construction and numerical checkpoint mappings."""
+        return self._checkpoints
 
-        return build_h3_checkpoint(config, context)
+    def diffusion_spec(self, shape: MediaShape, steps: int) -> DiffusionSpec:
+        """Declare full native normal draws before sequence sharding and packing."""
 
-    def execution_key(
-        self, geometry: DiffusionSamplingParams, num_prompt_tokens: int
-    ) -> tuple[int, int, int]:
-        """Validate admitted bounds and describe equivalent packed metadata."""
-
-        page_rows = ((num_prompt_tokens + 63) // 64) * 64
-        audio_frames = audio_latent_frames(geometry.num_frames)
-        if (
-            page_rows > int(self.layout.packed.text_indices.numel())
-            or geometry.num_frames > self.layout.frame_count
-            or audio_frames > self.layout.packed.audio_frames
+        if steps != len(FASTH3_LADDER):
+            raise ValueError("H3 requires its four-evaluation trained ladder")
+        if (shape.height, shape.width) != (PROFILE_HEIGHT, PROFILE_WIDTH):
+            raise ValueError("H3 diffusion requires its checkpoint raster geometry")
+        reconstruction_unit_frames(shape.frames)
+        video_frames = video_latent_frames(shape.frames)
+        audio_frames = audio_latent_frames(shape.frames)
+        modalities = []
+        for name, latent, noise, shift in (
+            (
+                "video",
+                (video_frames * 24 * 42, 96),
+                (1, 24, video_frames, 48, 84),
+                FASTH3_SHIFTS[0],
+            ),
+            ("audio", (2 * audio_frames, 32), (2 * audio_frames, 32), FASTH3_SHIFTS[1]),
         ):
-            raise ValueError("H3 media geometry exceeds the configured model capacity")
-        units = reconstruction_unit_frames(geometry.num_frames)
-        if (
-            geometry.num_decode_chunks != len(units)
-            or geometry.num_inference_steps != self.num_inference_steps
-        ):
-            raise ValueError("the H3 worker received invalid computation bounds")
-        return geometry.num_frames, page_rows, audio_frames
-
-    def build_execution(
-        self,
-        geometry: DiffusionSamplingParams,
-        num_prompt_tokens: int,
-        storage: TensorBuffers,
-        context: AttentionBuffers | None,
-    ) -> H3ComputeInputs:
-        """Build immutable packed metadata for a validated public geometry cache key."""
-
-        frames, text_rows, audio_frames = self.execution_key(geometry, num_prompt_tokens)
-        layout = H3Layout.build(
-            self.bindings,
-            frames=frames,
-            text_rows=text_rows,
-            audio_frames=audio_frames,
+            modalities.append(
+                ModalitySpec(
+                    name=name,
+                    latent_shape=latent,
+                    noise_shape=noise,
+                    schedule=ScheduleRule(
+                        ScheduleDirection.ASCENDING,
+                        ScheduleShiftDomain.SIGMA,
+                        shift,
+                        timestep="one_minus_sigma",
+                        ladder=FASTH3_LADDER,
+                        scale=FASTH3_TIME_SCALE,
+                    ),
+                    prediction="velocity",
+                    prediction_dtype=torch.float32,
+                )
+            )
+        return DiffusionSpec(
+            tuple(modalities), steps, None, 1, "clean_sample_euler", "cpu", "identity"
         )
-        return H3ComputeInputs.bind(
-            self.bindings,
-            layout,
-            storage,
-            context,
-            build_transformer_metadata(layout, self.device) if self.denoiser is not None else None,
-            self.device,
-        )
-
-    def request_tensors(self, storage: TensorBuffers, metadata: H3ComputeInputs) -> H3Tensors:
-        """Borrow mathematical inputs from the request's publicly owned tensor slot."""
-
-        return bind_request_tensors(storage, metadata.layout)
 
     @torch.inference_mode()
-    def prepare_tensors(
+    def prepare_latents(
         self,
-        slot: H3Tensors,
-        execution: H3ComputeInputs,
-        encoded: torch.Tensor | None,
-        text_rows: int,
+        batch: DiffusionBatch,
+        *,
+        noise: TensorViews,
+        state: TensorViews,
+        constants: TensorViews,
+        scratch: TensorViews,
     ) -> None:
-        """Install refined conditioning and shape metadata into the explicit request tensors."""
+        """Pack full CPU noise and select the declared logical sequence shard.
 
-        execution.prepare_tensors(slot, encoded, text_rows, self.denoiser)
+        Noise and state views have a leading logical batch row. Video normal
+        draws retain native NCTHW order; audio follows in channel-major row
+        order. Modality outputs are CPU shard views which the caller delivers
+        to device state. Prompt validity and RoPE are written directly into
+        the supplied device state, using borrowed preparation scratch.
+        """
 
-    @torch.inference_mode()
-    def initialize_tensors(
-        self, slot: H3Tensors, seed: int
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
-        """Initialize owned rows with the checkpoint's physical-layout-independent noise."""
-
-        return H3ComputeInputs.initialize_tensors(slot, seed)
+        if tuple(batch.latents) != ("video", "audio"):
+            raise ValueError("H3 preparation requires ordered video and audio modalities")
+        for row, shape in enumerate(batch.shapes):
+            spec = self.diffusion_spec(shape, self.num_inference_steps)
+            for modality in spec.modalities:
+                source, target = noise[modality.name], state[modality.name]
+                indices = constants[f"{modality.name}_indices"]
+                if (
+                    tuple(source.shape) != (batch.row_count, *modality.noise_shape)
+                    or tuple(target.shape)
+                    != (batch.row_count, indices.numel(), modality.latent_shape[-1])
+                    or source.device.type != "cpu"
+                    or target.device.type != "cpu"
+                    or source.dtype != torch.float32
+                    or target.dtype != torch.float32
+                    or indices.device.type != "cpu"
+                    or indices.dtype != torch.int64
+                ):
+                    raise ValueError("H3 initialization views disagree with native CPU geometry")
+            if self.denoiser is not None:
+                # Valid prompt rows and temporal offsets vary within one cached
+                # page layout. They belong to this request's numerical state.
+                text_rows = ((shape.prompt_tokens + 63) // 64) * 64
+                if shape.prompt_tokens < 1 or text_rows != state["text_condition"].shape[-2]:
+                    raise ValueError("H3 prompt length disagrees with its prepared text pages")
+                valid = state["tile_valid_sizes"][row]
+                valid.copy_(constants["tile_valid_sizes"])
+                valid[: text_rows // 64].zero_()
+                full, remaining = divmod(shape.prompt_tokens, 64)
+                valid[:full].fill_(64)
+                if remaining:
+                    valid[full].fill_(remaining)
+                positions = scratch["rotary_positions"]
+                positions.copy_(constants["positions"])
+                positions[text_rows:, 0].add_(shape.prompt_tokens - text_rows)
+                self.denoiser.rope.forward_into(
+                    positions,
+                    state["rotary_cosine"][row],
+                    state["rotary_sine"][row],
+                    scratch["rotary_frequencies"],
+                )
+            video = patchify_video(noise["video"][row])[0]
+            for name, source in (("video", video), ("audio", noise["audio"][row])):
+                torch.index_select(source, 0, constants[f"{name}_indices"], out=state[name][row])
 
     def output_layout(
         self,
         entry: str,
         output_index: int,
-        media: DiffusionSamplingParams | None,
-        decode: DecodeRange | None,
-        num_prompt_tokens: int,
+        *,
+        frames: int | None,
+        units: int | None,
+        prompt_tokens: int,
     ) -> TensorOutputLayout | None:
         """Describe unique logical modality rows and temporal decoder results."""
 
-        if media is None:
+        if frames is None:
             raise ValueError("H3 tensor results require media geometry")
-        frames, text_rows, audio_frames = self.execution_key(media, num_prompt_tokens)
+        self.output_geometry(frames)
+        layout = self.layout
+        if entry == "denoiser":
+            layout = self._diffusion_layout(
+                MediaShape(
+                    PROFILE_HEIGHT, PROFILE_WIDTH, frames=frames, prompt_tokens=prompt_tokens
+                )
+            )
         return tensor_output_layout(
-            self.bindings,
+            layout,
             entry,
             output_index,
-            decode,
             frames=frames,
-            text_rows=text_rows,
-            prompt_tokens=num_prompt_tokens,
-            audio_frames=audio_frames,
+            unit_count=units,
+            prompt_tokens=prompt_tokens,
         )
 
-    def decoder_input(
+    @torch.inference_mode()
+    def decode(
         self,
-        execution: H3ComputeInputs,
-        latents: torch.Tensor,
-        track: MediaTrack,
-        cursor: int,
-        max_units: int,
-    ) -> torch.Tensor:
-        """Pack the selected temporal window or stereo latent rows for its decoder."""
+        kind: DecodeKind,
+        batch: DecodeBatch,
+        *,
+        constants: TensorViews,
+        scratch: TensorViews,
+    ) -> TensorOutput:
+        """Reconstruct assigned windows or exact-duration interleaved stereo.
 
-        if track is MediaTrack.VIDEO:
+        Input rows use the denoiser's complete packed modality order. Numerical
+        packing precedes the ordinary native decoder call; the caller may bind
+        that public layer to a fixed capture. Physical rank selection and media
+        publication do not enter this computation.
+        """
+
+        if kind not in self.decoder_kinds:
+            raise ValueError(f"unsupported H3 decoder kind {kind!r}")
+        geometries = {(shape.height, shape.width, shape.frames) for shape in batch.shapes}
+        if len(geometries) != 1:
+            raise ValueError("H3 decoding requires one media geometry per numerical batch")
+        shape = batch.shapes[0]
+        video_shape = self.output_geometry(shape.frames)
+        if (shape.height, shape.width) != (video_shape.height, video_shape.width):
+            raise ValueError("H3 decoding requires its checkpoint raster geometry")
+        if kind == "video":
             if self.video_decoder is None:
-                raise RuntimeError("video decode was routed to a rank without the decoder")
-            rank = self.bindings["video_decoder"].config.ranks.index(
-                self.bindings["video_decoder"].process_group.rank
-            )
-            return self.video_decoder.prepare_input(execution, latents, cursor, max_units, rank)
-        if self.audio_decoder is None:
-            raise RuntimeError("audio decode was routed to a rank without the decoder")
-        return self.audio_decoder.prepare_input(execution, latents, cursor, max_units)
+                raise ValueError("this partition does not participate in video decoding")
+            legal = self.decode_windows(video_shape)
+            if len(batch.windows) != len(batch.latents) or any(
+                window not in legal for window in batch.windows
+            ):
+                raise ValueError("video decoding requires explicitly assigned legal windows")
+            rows = video_latent_frames(shape.frames) * 24 * 42
+            if any(tuple(value.shape) != (rows, 96) for value in batch.latents):
+                raise ValueError("video decoder requires complete final latent rows")
+            values = []
+            for latents, window in zip(batch.latents, batch.windows, strict=True):
+                start = window.latent_start * 24 * 42
+                indices = constants["video_raster_order"][start : start + 7 * 24 * 42]
+                torch.index_select(latents, 0, indices, out=scratch["reconstruction_rows"])
+                unpatchify_video_into(
+                    scratch["reconstruction_rows"],
+                    scratch["video_input"],
+                    frames=7,
+                    height=48,
+                    width=84,
+                )
+                decoded = self.video_decoder(scratch["video_input"])
+                value = decoded.unsqueeze(0)
+                # A native execution binding can reuse one captured output.
+                # Distinct rows of this numerical result must remain independent.
+                values.append(value.clone() if len(batch.latents) > 1 else value)
+        else:
+            if self.audio_decoder is None:
+                raise ValueError("this partition does not participate in audio decoding")
+            if batch.windows:
+                raise ValueError("audio decoding requires complete stereo without video windows")
+            frames = audio_latent_frames(shape.frames)
+            if any(tuple(value.shape) != (2 * frames, 32) for value in batch.latents):
+                raise ValueError("audio decoder requires one complete stereo latent")
+            samples = round(shape.frames * PROFILE_AUDIO_RATE / PROFILE_FPS)
+            values = []
+            for latents in batch.latents:
+                scratch["audio_latents"].copy_(latents.view(2, frames, 32).permute(0, 2, 1))
+                decoded = self.audio_decoder(scratch["audio_latents"])
+                if decoded.shape[0] < samples:
+                    raise RuntimeError("audio decoder returned less than the video duration")
+                value = decoded[:samples]
+                values.append(value.clone() if len(batch.latents) > 1 else value)
+        return TensorOutput(
+            {kind: tuple(values)},
+            {kind: tuple(TensorOutputLayout(tuple(value.shape)) for value in values)},
+        )
 
-    def decoder_output(
-        self, execution: H3ComputeInputs, value: torch.Tensor, track: MediaTrack
-    ) -> torch.Tensor:
-        """Expose decoded segments or the exact duration's interleaved PCM samples."""
-
-        if track is MediaTrack.VIDEO:
-            return value.unsqueeze(0)
-        if self.audio_decoder is None:
-            raise RuntimeError("audio decode was routed to a rank without the decoder")
-        return self.audio_decoder.logical_output(execution, value)
-
-    def assemble_video(
-        self,
-        slot: H3Tensors,
-        execution: H3ComputeInputs,
-        segments: torch.Tensor,
-        start_unit: int,
-        unit_count: int,
-    ) -> torch.Tensor:
-        """Blend overlapping decoded windows and apply the checkpoint pixel transform."""
-
-        if self.video_assembler is None:
-            raise RuntimeError("video assembly was routed to a rank without the output component")
-        return self.video_assembler.assemble(slot, execution, segments, start_unit, unit_count)
-
-    def output_geometry(self, geometry: DiffusionSamplingParams) -> VideoOutputGeometry:
+    def output_geometry(self, frames: int) -> VideoShape:
         """Describe the exact raster and sample timing required by the mathematics."""
 
-        if geometry.num_frames > self.layout.frame_count:
+        if frames > self.layout.frame_count:
             raise ValueError("H3 output exceeds configured frame capacity")
-        return VideoOutputGeometry(
-            frame_count=geometry.num_frames,
-            unit_frames=reconstruction_unit_frames(geometry.num_frames),
+        return VideoShape(
+            frame_count=frames,
+            unit_frames=reconstruction_unit_frames(frames),
             width=PROFILE_WIDTH,
             height=PROFILE_HEIGHT,
             frame_rate=PROFILE_FPS,
             audio_rate=PROFILE_AUDIO_RATE,
         )
 
-    def bind_execution(self, runner: ModelRunner) -> None:
-        """Assemble numerical owners with each component's actual collective mesh."""
+    def decode_windows(self, shape: VideoShape) -> tuple[DecodeWindow, ...]:
+        """Map each H3 unit to seven latent frames and its 17/22 RGB frames."""
 
-        from ...execution.diffusion_runner import DiffusionRunner
-
-        def groups(entry: str, axes: tuple[str, ...] = ("tp", "sp", "pp")):
-            mesh = self.bindings[entry].mesh
-            assert mesh is not None
-            return tuple(mesh.get_group(axis) for axis in axes if mesh.size(axis) > 1)
-
-        if self.video_decoder is not None:
-            runner.bind_module(
-                "video_decoder",
-                self.video_decoder,
-                inputs=(torch.zeros((1, 24, 7, 48, 84), dtype=torch.float32, device=self.device),),
+        if shape != self.output_geometry(shape.frame_count):
+            raise ValueError("H3 decode windows require the configured raster and frame rates")
+        return tuple(
+            DecodeWindow(
+                latent_start=unit * 5,
+                latent_stop=unit * 5 + 7,
+                frame_start=unit * 17,
+                frame_stop=unit * 17 + frames,
+                body_frames=17,
+                overlap_frames=5,
+                padding_frames=3,
+                crop=(3, 0),
+                final=unit + 1 == len(shape.unit_frames),
             )
-        if self.text_encoder is not None:
-            runner.bind_module("text_encoder", self.text_encoder, groups=groups("text_encoder"))
-        if self.conditioner is not None:
-            runner.bind_module(
-                "conditioner",
-                self.conditioner,
-                placement="denoiser",
-                groups=groups("denoiser", ("tp", "sp")),
-            )
-        if self.audio_decoder is not None:
-            runner.bind_module("audio_decoder", self.audio_decoder, groups=groups("audio_decoder"))
-        if self.denoiser is not None:
-            runner.diffusion = DiffusionRunner(
-                self.bind_denoising_step,
-                self.denoising_signature,
-                device=self.device,
-                capture_stream=runner.capture_stream(),
-                groups=groups("denoiser"),
-                capacity=runner.worker_config.max_request_pool_size,
-            )
-
-    @torch.inference_mode()
-    def warmup_execution(self, runner: ModelRunner, storage: tuple[TensorBuffers, ...]) -> None:
-        """Prepare representative denoising, pixel transform, and audio geometry."""
-
-        scratch = runner.scratch
-        assert scratch is not None
-        if not storage:
-            raise RuntimeError("H3 warmup requires declared request tensor storage")
-        if self.denoiser is not None:
-            if runner.schedule is None or runner.diffusion is None:
-                raise RuntimeError("denoiser warmup requires its execution owner and schedule")
-            prepared: set[Hashable] = set()
-            for geometry, num_prompt_tokens in warmup_geometries(
-                self.layout, self.num_inference_steps
-            ):
-                key = self.execution_key(geometry, num_prompt_tokens)
-                if key in prepared:
-                    continue
-                prepared.add(key)
-                execution = runner.diffusion.prepare_geometry(
-                    key,
-                    lambda: self.build_execution(
-                        geometry, num_prompt_tokens, scratch, runner.context_workspace
-                    ),
-                )
-                views = execution.prepare_warmup_slots(storage, self.denoiser)
-                runner.diffusion.warmup(views[0], execution, runner.schedule)
-        if "output" in self.bindings and self.bindings["output"].owns:
-            assert self.video_assembler is not None
-            self.video_assembler.warmup()
-        if self.audio_decoder is not None:
-            audio_latents = self.audio_decoder.warmup_input(self.layout.packed.audio_frames)
-            runner.warmup_module("audio_decoder", audio_latents)
+            for unit, frames in enumerate(shape.unit_frames)
+        )

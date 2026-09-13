@@ -19,7 +19,7 @@ from .linear import ColumnParallelLinear
 from .mesh import Communicator
 
 if TYPE_CHECKING:
-    from ..execution.forward_batch import VocabularyPartition
+    from uniserve_worker.modeling.tensors import VocabularyPartition
 
 __all__ = [
     "pad_vocab_size",
@@ -38,7 +38,7 @@ def vocabulary_partition(
 ) -> VocabularyPartition:
     """Describe vocabulary ownership independently of the resident projection weights."""
 
-    from ..execution.forward_batch import VocabularyPartition
+    from uniserve_worker.modeling.tensors import VocabularyPartition
 
     return VocabularyPartition(
         vocab_size=vocab_size,

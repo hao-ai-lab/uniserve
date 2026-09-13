@@ -2,16 +2,110 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 
 import torch
 
 from ..nn.attention import RadixAttention
 from ..nn.attention_storage import ExchangeBuffers
 from ..nn.mesh import Communicator
-from ..nn.parallel_attention import AttentionBuffers, AttentionContextGeometry
+from ..nn.parallel_attention import AttentionBuffers, OutputBuffers, ParallelAttention
 from ..runtime.tensor_buffers import TensorBuffers, TensorSchema
 from .peer_memory import allocate_peer_workspace
+
+
+@dataclass(frozen=True)
+class AttentionContextGeometry:
+    """Declare the key domain and physical communication used by context attention."""
+
+    group: Communicator
+    rows: int
+    heads: int
+    mapped: bool
+    head_dim: int
+    dtype: torch.dtype
+    block_size: int
+
+    def __post_init__(self) -> None:
+        if min(self.rows, self.heads, self.head_dim, self.block_size) < 1:
+            raise ValueError("attention context extents must be positive")
+        if self.rows % self.block_size:
+            raise ValueError("attention context rows must align to its validity blocks")
+
+
+@dataclass(frozen=True)
+class AttentionStorage:
+    """Retain exchange allocations while exposing only borrowed numerical views.
+
+    The caller keeps this owner alive until its streams, captured graphs, and
+    output readers finish. Scope-bound numerical layers only receive ``views``.
+    """
+
+    allocations: tuple[TensorBuffers, ...]
+    views: Mapping[Communicator, ExchangeBuffers]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "views", MappingProxyType(dict(self.views)))
+
+
+@dataclass(frozen=True)
+class OutputStorage:
+    """Keep symmetric attention destinations alive through their final reader."""
+
+    allocations: tuple[TensorBuffers, ...]
+    views: Mapping[ParallelAttention, OutputBuffers]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "views", MappingProxyType(dict(self.views)))
+
+
+def allocate_output_storage(
+    layers: Iterable[ParallelAttention],
+    *,
+    rows: int,
+    heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> OutputStorage:
+    """Allocate peer outputs shared only by one caller's serialized layers.
+
+    Geometry describes query rows and heads after Ulysses exchange. Each peer
+    receives its sequence rows with every head in that logical group. Runtime
+    owns registration, synchronization values, and allocation retirement.
+    """
+
+    if min(rows, heads, head_dim) < 1:
+        raise ValueError("attention output extents must be positive")
+    allocations = {}
+    bindings = {}
+    for layer in layers:
+        group = layer.ulysses_group
+        if rows % group.world_size:
+            raise ValueError("attention output rows must divide Ulysses membership")
+        if group not in allocations:
+            allocation = TensorBuffers.allocate(
+                {
+                    "output": TensorSchema(
+                        (rows // group.world_size, heads * group.world_size, head_dim),
+                        dtype,
+                        memory="symmetric",
+                        group=group,
+                    ),
+                    "sync_input": TensorSchema((1,), torch.int32, fill=group.rank_in_group),
+                    "sync_output": TensorSchema((group.world_size,), torch.int32),
+                },
+                group.device,
+            )
+            allocations[group] = allocation
+        allocation = allocations[group]
+        bindings[layer] = OutputBuffers(
+            allocation.peers("output"),
+            allocation.capacity["sync_input"],
+            allocation.capacity["sync_output"],
+        )
+    return OutputStorage(tuple(allocations.values()), bindings)
 
 
 def allocate_attention_exchange_storage(
@@ -19,7 +113,7 @@ def allocate_attention_exchange_storage(
     *,
     max_tokens: int,
     dtype: torch.dtype,
-) -> dict[Communicator, ExchangeBuffers]:
+) -> AttentionStorage:
     """Share each group's maximum payload capacity across serialized layers.
 
     Each scope must own an independent stream execution domain. The logical
@@ -39,6 +133,7 @@ def allocate_attention_exchange_storage(
             max(key, module.num_kv_heads * module.head_dim),
         )
     result = {}
+    allocations = []
     for group, (query, key) in widths.items():
         rows = (max_tokens + group.world_size - 1) // group.world_size * group.world_size
         symmetric = torch.distributed.get_backend(group._require()) == "nccl"
@@ -55,8 +150,9 @@ def allocate_attention_exchange_storage(
             )
         }
         allocation = TensorBuffers.allocate(schema, group.device)
-        result[group] = ExchangeBuffers(allocation)
-    return result
+        allocations.append(allocation)
+        result[group] = ExchangeBuffers(allocation.capacity)
+    return AttentionStorage(tuple(allocations), result)
 
 
 def allocate_attention_context(geometry: AttentionContextGeometry) -> AttentionBuffers:
@@ -95,3 +191,39 @@ def allocate_attention_context(geometry: AttentionContextGeometry) -> AttentionB
         torch.zeros(1, dtype=torch.int32, device=group.device),
         torch.empty(group.world_size, dtype=torch.int32, device=group.device),
     )
+
+
+def allocate_context_storage(
+    layers: Iterable[ParallelAttention],
+    *,
+    rows: int,
+    heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    block_size: int,
+) -> Mapping[ParallelAttention, AttentionBuffers]:
+    """Allocate context capacity shared by serialized layers of one caller.
+
+    Rows describe each context partition before any column gather. Mapped
+    allocation preserves page padding and peer offsets. Numerical layers only
+    borrow the resulting views when the caller enters ``context_scope``.
+    """
+
+    allocations: dict[AttentionContextGeometry, AttentionBuffers] = {}
+    bindings = {}
+    for layer in layers:
+        if layer.context_group.world_size == 1:
+            continue
+        geometry = AttentionContextGeometry(
+            group=layer.key_group,
+            rows=rows * (layer.col_group.world_size if layer.col_group is not None else 1),
+            heads=heads,
+            head_dim=head_dim,
+            mapped=layer.mapped,
+            dtype=dtype,
+            block_size=block_size,
+        )
+        if geometry not in allocations:
+            allocations[geometry] = allocate_attention_context(geometry)
+        bindings[layer] = allocations[geometry]
+    return MappingProxyType(bindings)

@@ -35,6 +35,24 @@ def _run_collectives(rank: int, rendezvous: str):
             "model"
         ]
         group = mesh.get_group("tp")
+        value = torch.full((4,), float(rank + 1), device=device)
+        with stream_collective_scope({}):
+            with pytest.raises(RuntimeError, match="stream scope has no binding"):
+                group.all_reduce(value)
+        torch.testing.assert_close(value, torch.full_like(value, float(rank + 1)), rtol=0, atol=0)
+        # An ordinary device-stream call explicitly selects native process-group
+        # communication, including when nested in another caller's strict scope.
+        with stream_collective_scope({}):
+            with stream_collective_scope(None):
+                torch.testing.assert_close(
+                    group.all_reduce(value), torch.full_like(value, 3), rtol=0, atol=0
+                )
+            with pytest.raises(RuntimeError, match="stream scope has no binding"):
+                group.all_reduce(value)
+        value.fill_(rank + 1)
+        torch.testing.assert_close(
+            group.all_reduce(value), torch.full_like(value, 3), rtol=0, atol=0
+        )
         greens = create_partitioned_streams(
             (
                 LaneConfig("decode", 64, (ForwardMode.DECODE, ForwardMode.VERIFY)),

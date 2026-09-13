@@ -8,7 +8,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from ...execution.forward_batch import ForwardBatch
+from ...modeling.tensors import AttentionMetadata
 from ..layer import LayerConfig
 from ..linear import LinearBase
 from .encoder import VisionEncoder, VisionEncoderConfig
@@ -80,7 +80,7 @@ class SiglipNavitEncoder(nn.Module):
         self,
         pixels: torch.Tensor,
         grid: Any,
-        context: ForwardBatch,
+        context: AttentionMetadata | None,
     ) -> torch.Tensor:
         """Pack variable image grids, add learned positions, and encode the patch sequences."""
 

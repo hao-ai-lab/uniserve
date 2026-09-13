@@ -10,17 +10,16 @@ from typing import cast
 
 import torch
 
+from uniserve_worker.backends.attention.selection import AttentionSelection
+from uniserve_worker.execution.batch import ExecutionOutput, InputBatch
 from uniserve_worker.execution.cuda_graph import GraphExecutionError
-from uniserve_worker.execution.forward_batch import (
+from uniserve_worker.foundation.math import bucketed_length
+from uniserve_worker.modeling.tensors import (
     AttentionMetadata,
     AttentionMode,
-    AttentionSelection,
-    ForwardBatch,
-    ForwardOutput,
     TokenSelection,
     packed_tensor_views,
 )
-from uniserve_worker.foundation.math import bucketed_length
 from uniserve_worker.protocol.batch import ForwardMode, PipelineStage
 
 from .model_entry import tensor_signature
@@ -45,21 +44,6 @@ class DiffusionShape:
     height: int
     width: int
     cfg_branches: int
-
-
-@dataclass(frozen=True, slots=True)
-class MixedShape:
-    """A compatible token-decode and denoise capture configuration."""
-
-    decode_rows: int
-    flow_rows: int
-    height: int
-    width: int
-    cfg_branches: int
-
-    def __post_init__(self) -> None:
-        if min(self.decode_rows, self.flow_rows, self.height, self.width, self.cfg_branches) < 1:
-            raise ValueError("mixed capture requires positive token, flow, and media extents")
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,19 +81,6 @@ def select_flow_captures(
     )
 
 
-def select_mixed_captures(
-    flow: Sequence[DiffusionShape], decode_rows: Sequence[int]
-) -> tuple[MixedShape, ...]:
-    """Enumerate the supported single-trajectory mixed execution shapes."""
-
-    return tuple(
-        MixedShape(rows, 1, item.height, item.width, item.cfg_branches)
-        for item in flow
-        if item.rows == 1
-        for rows in decode_rows
-    )
-
-
 def select_prefill_captures(
     token_sizes: Sequence[int],
     row_sizes: Sequence[int],
@@ -134,7 +105,7 @@ def select_prefill_captures(
 
 
 def _decode_geometry(
-    batch: ForwardBatch,
+    batch: InputBatch,
     batch_sizes: tuple[int, ...],
     block_size: int,
     context_blocks: int,
@@ -165,7 +136,7 @@ def _decode_geometry(
 
 
 def _prefill_geometry(
-    batch: ForwardBatch,
+    batch: InputBatch,
     token_sizes: tuple[int, ...],
     block_size: int,
     row_sizes: tuple[int, ...],
@@ -207,11 +178,11 @@ def _prefill_geometry(
 
 
 def _pad_decode_batch(
-    batch: ForwardBatch,
+    batch: InputBatch,
     bucket: int,
     width: int,
     block_size: int,
-) -> ForwardBatch:
+) -> InputBatch:
     """Copy a live decode batch into fixed-row graph buffers and synthesize padding rows."""
 
     padding = bucket - batch.row_count
@@ -259,8 +230,8 @@ def _pad_decode_batch(
 
 
 def _pad_prefill_batch(
-    batch: ForwardBatch, shape: PrefillShape, width: int, block_size: int
-) -> ForwardBatch:
+    batch: InputBatch, shape: PrefillShape, width: int, block_size: int
+) -> InputBatch:
     """Extend a paged-prefill batch into fixed graph buckets using inert rows and tokens."""
 
     live_rows = batch.row_count
@@ -354,7 +325,7 @@ def _pad_prefill_batch(
     )
 
 
-def _decode_signature(batch: ForwardBatch, bucket: int, width: int) -> tuple[object, ...]:
+def _decode_signature(batch: InputBatch, bucket: int, width: int) -> tuple[object, ...]:
     """Build a decode graph signature from padded geometry and tensor contracts."""
 
     return (
@@ -369,7 +340,7 @@ def _decode_signature(batch: ForwardBatch, bucket: int, width: int) -> tuple[obj
 
 
 def _prefill_signature(
-    batch: ForwardBatch, shape: PrefillShape, width: int, block_size: int
+    batch: InputBatch, shape: PrefillShape, width: int, block_size: int
 ) -> tuple[object, ...]:
     """Build a prefill graph signature from padded rows, tokens, and cache geometry."""
 
@@ -387,7 +358,7 @@ def _prefill_signature(
     )
 
 
-def _batch_tensor_signature(batch: ForwardBatch) -> tuple[object, ...]:
+def _batch_tensor_signature(batch: InputBatch) -> tuple[object, ...]:
     """Describe all batch tensor leaves by dtype, shape, stride, and device."""
 
     assert batch.input_ids is not None and batch.positions is not None
@@ -402,7 +373,7 @@ def _batch_tensor_signature(batch: ForwardBatch) -> tuple[object, ...]:
     )
 
 
-def _exact_signature(batch: ForwardBatch) -> tuple[object, ...]:
+def _exact_signature(batch: InputBatch) -> tuple[object, ...]:
     """Build a hashable signature for all graph-observable batch geometry."""
 
     # AR and denoising invoke the same model.forward entry. Row geometry and
@@ -436,14 +407,14 @@ def _exact_signature(batch: ForwardBatch) -> tuple[object, ...]:
 
 
 def _normalize_exact_batch(
-    batch: ForwardBatch,
+    batch: InputBatch,
     *,
     context_blocks: int,
     block_size: int,
-) -> ForwardBatch:
+) -> InputBatch:
     """Give exact packed graphs their startup-fixed KV table geometry.
 
-    Packed flow and mixed calls use request-variable KV prefix lengths, but the
+    Packed diffusion calls use request-variable KV prefix lengths, but the
     lane input buffer already owns a maximum-width, zero-scrubbed block
     table.  Capturing the active request-width view makes otherwise identical
     startup and serving calls different graph shapes.  Widening that view here
@@ -471,17 +442,18 @@ def _normalize_exact_batch(
 
 
 def _graph_batch(
-    batch: ForwardBatch,
+    batch: InputBatch,
     binding: int,
     *,
     own_inputs: bool,
-) -> ForwardBatch:
+) -> InputBatch:
     """Clone a batch into graph-owned inputs or bind its existing static tensors."""
 
     graph_batch = _clone_batch(batch) if own_inputs else batch
     return replace(
         graph_batch,
-        attention=replace(graph_batch.attention, binding=int(binding), cuda_graph_capture=True),
+        binding=int(binding),
+        cuda_graph_capture=True,
     )
 
 
@@ -489,7 +461,7 @@ def _clone_optional(tensor: torch.Tensor | None) -> torch.Tensor | None:
     return None if tensor is None else tensor.clone(memory_format=torch.preserve_format)
 
 
-def _clone_batch(batch: ForwardBatch) -> ForwardBatch:
+def _clone_batch(batch: InputBatch) -> InputBatch:
     """Own copies of the fixed model-input columns while borrowing immutable geometry."""
 
     attention = batch.attention
@@ -553,7 +525,7 @@ def _attention_tensors(attention: AttentionMetadata) -> Iterator[torch.Tensor]:
             yield value
 
 
-def _batch_tensors(batch: ForwardBatch) -> Iterator[torch.Tensor]:
+def _batch_tensors(batch: InputBatch) -> Iterator[torch.Tensor]:
     """Enumerate model inputs without traversing arbitrary Python objects."""
 
     yield from _attention_tensors(batch.attention)
@@ -640,7 +612,6 @@ def _live_attention(static: AttentionMetadata, live: AttentionMetadata) -> Atten
         output_indices=static.output_indices,
         attention_indexes=static.attention_indexes,
         visible_end=static.visible_end,
-        binding=static.binding,
         max_seqlen_q=static.max_seqlen_q,
         max_seqlen_k=static.max_seqlen_k,
     )
@@ -674,7 +645,7 @@ def _expand_token_axis(tensor: torch.Tensor, tokens: int) -> torch.Tensor:
     raise _GraphMiss("graph token positions have an invalid rank")
 
 
-def _cuda_batch(batch: ForwardBatch) -> bool:
+def _cuda_batch(batch: InputBatch) -> bool:
     """Check that every model-input tensor belongs to one CUDA device."""
 
     tensors = tuple(_batch_tensors(batch))
@@ -686,7 +657,7 @@ def _cuda_batch(batch: ForwardBatch) -> bool:
     )
 
 
-def _attention_inputs(batch: ForwardBatch) -> Iterator[torch.Tensor]:
+def _attention_inputs(batch: InputBatch) -> Iterator[torch.Tensor]:
     """Collect stable request and attention addresses retained by a graph."""
 
     yield batch.request_pool_indices
@@ -709,15 +680,17 @@ def _private_pool_bytes(device: torch.device, pools: set[tuple[int, int]]) -> in
     return total
 
 
-def _trim_output(output: ForwardOutput, rows: int) -> ForwardOutput:
+def _trim_output(output: ExecutionOutput, rows: int) -> ExecutionOutput:
     """Slice every forward-output row tensor to the live batch extent."""
 
-    return ForwardOutput(tuple(output.values[:rows]), output.vocabularies[:rows])
+    return ExecutionOutput(
+        tuple(output.values[:rows]), output.vocabularies[:rows], layouts=output.layouts[:rows]
+    )
 
 
 def _greedy_decode(
-    batch: ForwardBatch,
-    output: ForwardOutput,
+    batch: InputBatch,
+    output: ExecutionOutput,
     predicate_state: torch.Tensor | None,
 ) -> SamplerOutput | None:
     """Return graph-capturable greedy output for eligible decode logits."""
@@ -732,8 +705,8 @@ def _greedy_decode(
 
 
 def _greedy_decode_values(
-    batch: ForwardBatch,
-    output: ForwardOutput,
+    batch: InputBatch,
+    output: ExecutionOutput,
     predicate_state: torch.Tensor | None,
     force_finish: torch.Tensor | None,
     *,

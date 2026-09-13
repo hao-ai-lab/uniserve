@@ -11,8 +11,8 @@ from uniserve_worker.bootstrap.distributed import (
     initialize_model_parallel,
     initialize_process_groups,
 )
+from uniserve_worker.execution.batch import ExecutionOutput
 from uniserve_worker.execution.cuda_graph import CudaGraph
-from uniserve_worker.execution.forward_batch import ForwardOutput
 from uniserve_worker.loader.handles import TensorWeightHandle
 from uniserve_worker.loader.weight_loaders import load_parameter_weight
 from uniserve_worker.nn.layer import LayerConfig
@@ -52,12 +52,12 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
                     inputs = (torch.arange(24, device=device).reshape(6, 4) / 16).to(dtype)
                     local = head.forward_local(inputs)
                     partition = head.vocabulary_partition()
-                    projected = ForwardOutput((local[:2], local[2:]), (partition, partition))
+                    projected = ExecutionOutput((local[:2], local[2:]), (partition, partition))
                     expected = F.linear(inputs.float(), weight.float()).to(dtype)
                     actual = torch.cat(projected.materialize().values)
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     continuous = torch.arange(15, device=device, dtype=torch.float32).view(3, 5)
-                    mixed = ForwardOutput(
+                    mixed = ExecutionOutput(
                         (local[:2], continuous, local[2:]), (partition, None, partition)
                     )
                     retained_mixed = mixed.clone()

@@ -4,8 +4,10 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve_worker.execution.forward_batch import ExpertRoute, RouteSpan
+from uniserve_worker.modeling.tensors import ExpertRoute, RouteSpan
+from uniserve_worker.nn.branch import branch
 from uniserve_worker.nn.expert_routing import RoutedTensor
+from uniserve_worker.runtime.branches import bind_branches
 
 pytestmark = pytest.mark.unit
 
@@ -35,7 +37,8 @@ pytestmark = pytest.mark.unit
 )
 def test_expert_modules_preserve_route_values_and_packed_order(routes, flow_device):
     text = nn.Linear(2, 2)
-    flow = nn.Linear(2, 2, device=flow_device)
+    flow = branch(nn.Linear(2, 2, device=flow_device), ExpertRoute.FLOW)
+    bind_branches(flow, device="cpu", flow_device=flow_device)
     with torch.no_grad():
         text.weight.copy_(torch.eye(2) * 2)
         text.bias.fill_(1)
@@ -51,9 +54,7 @@ def test_expert_modules_preserve_route_values_and_packed_order(routes, flow_devi
         ]
     )
     routed = RoutedTensor.from_packed(values, spans)
-    actual = routed.apply(text=text, flow=flow, generation_device=torch.device(flow_device)).packed(
-        spans
-    )
+    actual = routed.apply(text=text, flow=flow).packed(spans)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -102,3 +103,30 @@ def test_routed_intervals_preserve_experts_and_packed_coordinates(start, stop):
     interval = slice(start, stop)
     actual = routed.narrow(interval, spans).packed(slice_route_spans(spans, interval))
     torch.testing.assert_close(actual, values[interval], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "flow_device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda:1",
+            marks=[
+                pytest.mark.gpu,
+                pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs"),
+            ],
+        ),
+    ],
+)
+def test_nested_branch_preserves_values_after_a_failed_call(flow_device):
+    device = "cpu" if flow_device == "cpu" else "cuda:0"
+    text = branch(nn.Linear(2, 2, device=device), ExpertRoute.TEXT)
+    with torch.no_grad():
+        text.weight.copy_(torch.eye(2, device=device) * 2)
+        text.bias.fill_(-1)
+    model = branch(nn.Sequential(text, nn.ReLU()), ExpertRoute.FLOW)
+    bind_branches(model, device=device, flow_device=flow_device)
+    with pytest.raises(RuntimeError):
+        model(torch.ones((2, 3), device=device))
+    values = torch.tensor([[0.0, 1.0], [2.0, 3.0]], device=device)
+    torch.testing.assert_close(model(values), (values * 2 - 1).clamp_min(0), rtol=0, atol=0)

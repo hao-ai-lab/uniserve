@@ -544,7 +544,6 @@ class ForwardMode(StrEnum):
     PREFILL = "prefill"
     DECODE = "decode"
     VERIFY = "verify"
-    MIXED = "mixed"
 
 
 class PipelineStage(StrEnum):

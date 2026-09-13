@@ -6,14 +6,38 @@ import torch
 from torch import nn
 
 import uniserve_worker.ops as ops
+from uniserve_worker.backends.attention.selection import AttentionSelection
+from uniserve_worker.modeling.tensors import AttentionMetadata, AttentionMode
 
 from ..backends.attention.base import AttentionBackend
-from ..execution.forward_batch import AttentionMetadata, AttentionMode, AttentionSelection
 from ..runtime.kv_cache import KVCache
 from .attention_storage import attention_exchange_storage
 from .mesh import Communicator
 from .parallel_attention import AttentionHeadRows, AttentionRowExchange, HeadRowExchange
 from .parallel_sequence import SequencePartition
+
+
+class CacheWrite(nn.Module):
+    """Write numerical K/V rows into a publicly bound cache layer.
+
+    Models supply locations from attention metadata and never receive the pool.
+    Runtime binding retains the cache through all writes and downstream readers.
+    """
+
+    def __init__(self, layer_id: int = 0) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self._pool: KVCache | None = None
+
+    def bind(self, pool: KVCache) -> None:
+        """Attach the runtime's backing before numerical execution begins."""
+
+        self._pool = pool
+
+    def forward(self, locations: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> None:
+        if self._pool is None:
+            raise RuntimeError("cache write layer has no bound physical storage")
+        self._pool.write_locations(self.layer_id, locations, key, value)
 
 
 class RadixAttention(nn.Module):
@@ -39,12 +63,20 @@ class RadixAttention(nn.Module):
         self.num_heads = self.exchange.head_region(int(num_heads))[0]
         self.num_kv_heads = self.exchange.head_region(int(num_kv_heads))[0]
         self.head_dim = int(head_dim)
-        self.layer_id = int(layer_id)
+        self.cache_write = CacheWrite(int(layer_id))
         self.scale = self.head_dim**-0.5
         self._cache_pool: KVCache | None = None
         self._selection: AttentionSelection | None = None
         self._providers: dict[AttentionMode, AttentionBackend] = {}
         self._varlen_provider: AttentionBackend | None = None
+
+    @property
+    def layer_id(self) -> int:
+        return self.cache_write.layer_id
+
+    @layer_id.setter
+    def layer_id(self, value: int) -> None:
+        self.cache_write.layer_id = value
 
     def bind_dense(self, selection: AttentionSelection) -> None:
         """Bind execution-owned providers for cache-free attention requests.
@@ -59,6 +91,7 @@ class RadixAttention(nn.Module):
         """Bind physical KV storage and select one compatible backend per attention mode."""
 
         self._cache_pool = kv_cache
+        self.cache_write.bind(kv_cache)
         self.bind_dense(selection)
         candidates = {
             AttentionMode.DENSE: selection.select_provider(
@@ -269,7 +302,7 @@ class RadixAttention(nn.Module):
         if context.seq_lens is None:
             raise ValueError("paged decode requires resulting KV lengths")
         if context.has_cache_writes:
-            pool.write_locations(self.layer_id, context.out_cache_loc, k, v)
+            self.cache_write(context.out_cache_loc, k, v)
         k_cache, v_cache = pool.layer_cache(self.layer_id, context.group_id)
         out = ops.attention(
             ops.PagedDecodeAttention(
@@ -309,7 +342,7 @@ class RadixAttention(nn.Module):
             raise ValueError("paged varlen query geometry is invalid")
         q_run, k_run, v_run = q[:raw_tokens], k[:raw_tokens], v[:raw_tokens]
         if context.has_cache_writes:
-            pool.write_locations(self.layer_id, context.out_cache_loc[:raw_tokens], k_run, v_run)
+            self.cache_write(context.out_cache_loc[:raw_tokens], k_run, v_run)
         k_cache, v_cache = pool.layer_cache(self.layer_id, context.group_id)
         out = ops.attention(
             ops.VarlenAttention(
@@ -347,7 +380,7 @@ class RadixAttention(nn.Module):
         if q.ndim != 3 or context.cu_seqlens_q is None or context.visible_end is None:
             raise ValueError("packed attention geometry is invalid")
         if context.has_cache_writes:
-            pool.write_locations(self.layer_id, context.out_cache_loc, k, v)
+            self.cache_write(context.out_cache_loc, k, v)
         k_cache, v_cache = pool.layer_cache(self.layer_id, context.group_id)
         return ops.attention(
             ops.VisibleEndAttention(
@@ -405,6 +438,8 @@ def bind_attention_modules(
     for module in model.modules():
         if isinstance(module, RadixAttention):
             module.bind(kv_cache, selection)
+        elif isinstance(module, CacheWrite):
+            module.bind(kv_cache)
 
 
-__all__ = ["RadixAttention", "bind_attention_modules", "bind_dense_attention_modules"]
+__all__ = ["CacheWrite", "RadixAttention", "bind_attention_modules", "bind_dense_attention_modules"]

@@ -391,7 +391,7 @@ fn decoder_requires_one_concrete_computation() {
             transfer: fbs::TransferMode::None,
         },
         fbs::ComputationT {
-            forward_mode: fbs::ForwardMode::Mixed,
+            forward_mode: fbs::ForwardMode(255),
             ..Default::default()
         },
         fbs::ComputationT {

@@ -87,8 +87,11 @@ def _temporal_grid(count: int, origin: float) -> torch.Tensor:
             for index in range(count)
         ],
         dtype=torch.float64,
+        device="cpu",
     )
-    return origin + torch.cat((torch.zeros(1, dtype=torch.float64), spans[:-1].cumsum(0)))
+    return origin + torch.cat(
+        (torch.zeros(1, dtype=torch.float64, device="cpu"), spans[:-1].cumsum(0))
+    )
 
 
 def build_packed_layout(
@@ -101,7 +104,10 @@ def build_packed_layout(
     row_multiple: int = 256,
     audio_frames: int | None = None,
 ) -> H3PackedLayout:
-    """Build the fixed-profile `[text | audio | tiled video | padding]` row layout."""
+    """Build CPU coordinates for `[text | audio | tiled video | padding]` rows.
+
+    These host metadata values remain concrete during deferred parameter
+    construction. Execution supplies device views for numerical kernels."""
 
     if text_rows < 1 or height != 768 or width != 1344:
         raise ValueError("the FastH3 profile requires 1344x768 output and nonempty text")
@@ -129,7 +135,9 @@ def build_packed_layout(
     grid_t = video_frames // patch_t
     grid_h = latent_height // patch_h
     grid_w = latent_width // patch_w
-    raster = torch.arange(video_rows, dtype=torch.long).reshape(grid_t, grid_h, grid_w)
+    raster = torch.arange(video_rows, dtype=torch.long, device="cpu").reshape(
+        grid_t, grid_h, grid_w
+    )
     tiled_raster: list[torch.Tensor] = []
     video_valid_sizes: list[int] = []
     for t in range(math.ceil(grid_t / tile_t)):
@@ -154,26 +162,28 @@ def build_packed_layout(
     semantic_rows = text_rows + audio_rows + video_rows
 
     # Map semantic video raster rows to their tile-major transport positions.
-    text_indices = torch.arange(text_rows, dtype=torch.long)
-    audio_indices = torch.arange(text_rows, text_rows + audio_rows, dtype=torch.long)
+    text_indices = torch.arange(text_rows, dtype=torch.long, device="cpu")
+    audio_indices = torch.arange(text_rows, text_rows + audio_rows, dtype=torch.long, device="cpu")
     video_indices_parts: list[torch.Tensor] = []
     video_raster_parts: list[torch.Tensor] = []
     for tile_index, block in enumerate(tiled_raster):
         start = video_start + tile_index * 64
-        video_indices_parts.append(torch.arange(start, start + block.numel(), dtype=torch.long))
+        video_indices_parts.append(
+            torch.arange(start, start + block.numel(), dtype=torch.long, device="cpu")
+        )
         video_raster_parts.append(block)
     video_indices = torch.cat(video_indices_parts)
     video_raster_indices = torch.cat(video_raster_parts)
-    raster_to_transport = torch.empty(video_rows, dtype=torch.long)
+    raster_to_transport = torch.empty(video_rows, dtype=torch.long, device="cpu")
     raster_to_transport[video_raster_indices] = video_indices
-    tags = torch.full((padded_rows,), VIDEO_TAG, dtype=torch.long)
+    tags = torch.full((padded_rows,), VIDEO_TAG, dtype=torch.long, device="cpu")
     tags[text_indices] = TEXT_TAG
     tags[text_rows:video_start] = AUDIO_TAG
 
     # Rotary coordinates share a temporal origin at the end of the text prefix;
     # video rows additionally carry normalized height and width coordinates.
-    positions = torch.zeros((padded_rows, 3), dtype=torch.float64)
-    positions[text_indices, 0] = torch.arange(text_rows, dtype=torch.float64)
+    positions = torch.zeros((padded_rows, 3), dtype=torch.float64, device="cpu")
+    positions[text_indices, 0] = torch.arange(text_rows, dtype=torch.float64, device="cpu")
     sqrt_area = math.sqrt(latent_height * latent_width)
     height_grid = _spatial_grid(latent_height, patch_h, sqrt_area)
     width_grid = _spatial_grid(latent_width, patch_w, sqrt_area)
@@ -181,30 +191,32 @@ def build_packed_layout(
         [grid.reshape(-1) for grid in torch.meshgrid(height_grid, width_grid, indexing="ij")],
         dim=-1,
     )
-    audio_time = float(text_rows) + torch.arange(audio_frames, dtype=torch.float64)
+    audio_time = float(text_rows) + torch.arange(audio_frames, dtype=torch.float64, device="cpu")
     positions[audio_indices, 0] = audio_time.repeat(AUDIO_CHANNELS)
     positions[audio_indices, 2] = torch.cat(
         (
-            torch.full((audio_frames,), float(width_grid[0]), dtype=torch.float64),
-            torch.full((audio_frames,), float(width_grid[-1]), dtype=torch.float64),
+            torch.full((audio_frames,), float(width_grid[0]), dtype=torch.float64, device="cpu"),
+            torch.full((audio_frames,), float(width_grid[-1]), dtype=torch.float64, device="cpu"),
         )
     )
     temporal = _temporal_grid(video_frames, float(text_rows))
-    video_positions = torch.empty((video_frames, rows_per_frame, 3), dtype=torch.float64)
+    video_positions = torch.empty(
+        (video_frames, rows_per_frame, 3), dtype=torch.float64, device="cpu"
+    )
     video_positions[:, :, 0] = temporal[:, None]
     video_positions[:, :, 1:] = spatial[None]
     positions[video_indices] = video_positions.reshape(-1, 3).index_select(0, video_raster_indices)
 
     # Per-tile valid counts let sparse attention ignore audio, video-boundary,
     # and pair-alignment padding without changing the fixed row allocation.
-    tile_valid_sizes = torch.zeros((padded_rows // 64,), dtype=torch.int32)
+    tile_valid_sizes = torch.zeros((padded_rows // 64,), dtype=torch.int32, device="cpu")
     tile_valid_sizes[: text_rows // 64] = 64
     audio_tile_start = text_rows // 64
     for offset in range(audio_block_rows // 64):
         tile_valid_sizes[audio_tile_start + offset] = max(0, min(64, audio_rows - offset * 64))
     video_tile_start = video_start // 64
     tile_valid_sizes[video_tile_start : video_tile_start + video_tiles] = torch.tensor(
-        video_valid_sizes, dtype=torch.int32
+        video_valid_sizes, dtype=torch.int32, device="cpu"
     )
     return H3PackedLayout(
         semantic_rows=semantic_rows,

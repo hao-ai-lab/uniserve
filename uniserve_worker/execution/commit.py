@@ -14,6 +14,7 @@ from uniserve_worker.execution.output import (
 )
 from uniserve_worker.execution.transfer import _release_locators
 from uniserve_worker.foundation.errors import invalid_descriptor
+from uniserve_worker.modeling.tensors import concatenate_views
 from uniserve_worker.profiling import _forward_stats, record_component
 from uniserve_worker.protocol.batch import (
     OpStatus,
@@ -24,7 +25,6 @@ from uniserve_worker.protocol.batch import (
 from uniserve_worker.transfer.exports import validate_exports
 
 from .batch_state import BatchState
-from .forward_batch import concatenate_views
 from .output import logprob_entries
 from .sampling import sample_columns
 

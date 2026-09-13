@@ -8,7 +8,8 @@ from typing import Generic, Protocol, TypeVar
 
 import torch
 
-from ..execution.forward_batch import AttentionMetadata
+from uniserve_worker.modeling.tensors import AttentionMetadata
+
 from .attention import RadixAttention
 from .attention_storage import attention_exchange_storage
 from .linear import GatheredLinear, LinearBase

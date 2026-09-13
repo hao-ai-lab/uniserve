@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -57,12 +58,18 @@ class GatheredLinear:
         self.transport: RowGather | None = None
         self.output: torch.Tensor | None = None
 
-    def _project(self, interval: slice, values: torch.Tensor) -> None:
-        assert self.output is not None
-        target = self.output[interval]
-        self.layer.project_into(values, target)
-        if self.row_consumer is not None:
-            self.row_consumer(interval, target)
+    @staticmethod
+    def _project(
+        layer: "LinearBase",
+        output: torch.Tensor,
+        row_consumer: Callable[[slice, torch.Tensor], None] | None,
+        interval: slice,
+        values: torch.Tensor,
+    ) -> None:
+        target = output[interval]
+        layer.project_into(values, target)
+        if row_consumer is not None:
+            row_consumer(interval, target)
 
     def append(self, start: int, values: torch.Tensor) -> None:
         """Publish the next local hidden interval on the current stream."""
@@ -71,8 +78,16 @@ class GatheredLinear:
             group = self.layer.sequence_group
             assert group is not None
             self.output = values.new_empty((self.rows * group.world_size, self.layer.output_size))
+            # Borrow the numerical operands directly. A bound self callback
+            # would form a transport/projection cycle and retain symmetric
+            # scratch beyond its communicator's explicit retirement.
             self.transport = RowGather(
-                group, self.rows, self.layer.input_size, values.dtype, self.workspace, self._project
+                group,
+                self.rows,
+                self.layer.input_size,
+                values.dtype,
+                self.workspace,
+                partial(self._project, self.layer, self.output, self.row_consumer),
             )
         self.transport.append(start, values)
 

@@ -6,7 +6,8 @@ from typing import Any, NamedTuple
 
 import torch
 
-from ...execution.forward_batch import AttentionMetadata
+from uniserve_worker.modeling.tensors import AttentionMetadata
+
 from .base import AttentionBackend
 from .flashinfer_kernels import _decode_effective_seqlens, _write_decode_token
 from .layout import QKVLayout, normalize_kv, normalize_to

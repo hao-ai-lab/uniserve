@@ -563,9 +563,6 @@ impl Scheduler {
                 | PipelineStage::AudioEncoding
                 | PipelineStage::Muxing,
             ) => {}
-            Computation::Forward(ForwardMode::Mixed) => {
-                return self.finish(id, FinishReason::Error);
-            }
             Computation::Pipeline(PipelineStage::ImageDecoding) => {
                 // Commit becomes visible before optional feedback state is prepared.
                 let image_id = self.running.get(&id).map_or(0, |st| st.image_id);

@@ -5,10 +5,33 @@ from __future__ import annotations
 import pytest
 import torch
 
+from uniserve_worker.modeling.batch import TensorOutput
+from uniserve_worker.modeling.components import Call
+from uniserve_worker.modeling.geometry import MediaShape
 from uniserve_worker.nn.vae import AutoEncoder, AutoEncoderParams
 from uniserve_worker.nn.vae.autoencoder import AttnBlock, DiagonalGaussian
+from uniserve_worker.nn.vae.patch import PatchAutoencoder
+from uniserve_worker.nn.vision.patching import unpatchify_batch
 
 pytestmark = pytest.mark.unit
+
+
+def test_latent_decoder_preserves_float32_normalization_and_scope_restoration():
+    from tests.python.fixtures.decoding import ChannelDecoder
+    from uniserve_worker.nn.vae.decoder import decoder_scope
+
+    decoder = ChannelDecoder()
+    source = torch.linspace(-1, 1, 12).reshape(1, 3, 4).bfloat16()
+    expected = source.float() * torch.tensor([0.5, 1.5, 2.5]).view(1, 3, 1)
+    expected += torch.tensor([0.1, 0.2, 0.3]).view(1, 3, 1)
+    expected *= torch.tensor([1.0, 2.0, 3.0, 4.0])
+    expected = expected.unsqueeze(-1).unsqueeze(-1)
+    torch.testing.assert_close(decoder(source), expected, rtol=0, atol=0)
+    with decoder_scope({}), pytest.raises(RuntimeError, match="missing"):
+        decoder(source)
+    torch.testing.assert_close(decoder(source), expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="shape"):
+        decoder(source[:, :, :3])
 
 
 def _tiny_params():
@@ -58,6 +81,34 @@ def test_encode_sampling_is_stochastic_but_seed_reproducible():
     torch.manual_seed(0)
     z_a2 = shared.encode(x)
     torch.testing.assert_close(z_a, z_a2)
+
+
+def test_patch_autoencoder_preserves_posterior_and_reconstruction():
+    """Patch representation preserves the seeded posterior and native VAE math."""
+
+    torch.manual_seed(8)
+    native = AutoEncoder(_tiny_params())
+    codec = PatchAutoencoder(
+        native, patch_size=2, downsample=4, channels=4, latent_dtype=torch.bfloat16
+    )
+    pixels = torch.randn(2, 3, 8, 12)
+    generator = torch.Generator().manual_seed(31)
+    posterior = native.encode(pixels, generator)
+    patches = codec.encode(pixels, torch.Generator().manual_seed(31))
+    TensorOutput({"latents": tuple(patches.unbind(0))}).validate(
+        codec.tensor_specs(Call.ENCODE_LATENT, MediaShape(8, 12)), state={}, scratch={}
+    )
+    restored = unpatchify_batch(patches, 2, height=4, width=6, channels=4)
+    torch.testing.assert_close(restored, posterior.to(torch.bfloat16), rtol=0, atol=0)
+
+    expected = (native.decode(restored.float()) * 0.5 + 0.5).clamp(0, 1)
+    actual = codec.decode(patches, 8, 12)
+    TensorOutput({"image": tuple(actual.unbind(0))}).validate(
+        codec.tensor_specs(Call.DECODE_IMAGE, MediaShape(8, 12, dtype=patches.dtype)),
+        state={},
+        scratch={},
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_diagonal_gaussian_disabled_returns_mean_and_halves_channels():

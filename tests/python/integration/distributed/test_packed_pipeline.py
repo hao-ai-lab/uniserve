@@ -7,36 +7,38 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
+from tests.python.fixtures.model_execution import model_context
 from uniserve_worker.backends.attention.fa4_cute import Fa4CuteAttentionBackend
 from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
+from uniserve_worker.backends.attention.selection import AttentionSelection
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
 from uniserve_worker.bootstrap.distributed import (
     initialize_model_parallel,
     initialize_process_groups,
 )
-from uniserve_worker.execution.forward_batch import (
-    AttentionMetadata,
-    AttentionMode,
-    AttentionSelection,
-    ExpertRoute,
-    FlowPatches,
-    ForwardBatch,
-    RouteSpan,
-    TokenSelection,
-)
 from uniserve_worker.loader.handles import TensorWeightHandle
 from uniserve_worker.loader.loader import assign_component
 from uniserve_worker.loader.weight_loaders import attach_parameter_loaders
+from uniserve_worker.modeling.batch import DiffusionBatch, TextBatch
+from uniserve_worker.modeling.components import Call
+from uniserve_worker.modeling.geometry import MediaShape, TextShape
+from uniserve_worker.modeling.tensors import (
+    AttentionMetadata,
+    AttentionMode,
+    ExpertRoute,
+    FlowPatches,
+    RouteSpan,
+    TokenSelection,
+)
 from uniserve_worker.models.bagel import BagelConfig, BagelForConditionalGeneration, LLMConfig
 from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
 from uniserve_worker.models.sensenova.config import NeoChatConfig
 from uniserve_worker.models.sensenova.model import NEOChatModel
-from uniserve_worker.nn.attention import RadixAttention
+from uniserve_worker.nn.attention import RadixAttention, bind_attention_modules
 from uniserve_worker.nn.attention_storage import attention_exchange_scope
 from uniserve_worker.nn.layer import LayerConfig
 from uniserve_worker.nn.mesh import Communicator
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
-from uniserve_worker.protocol.batch import ForwardMode
 from uniserve_worker.runtime.attention_storage import allocate_attention_exchange_storage
 from uniserve_worker.runtime.kv_cache import KVCache
 
@@ -60,7 +62,8 @@ def _pool(model, device):
     )
     pool.k.zero_()
     pool.v.zero_()
-    model.bind_cache_pool(
+    bind_attention_modules(
+        model,
         pool,
         AttentionSelection(
             "flashinfer",
@@ -71,7 +74,7 @@ def _pool(model, device):
 
 
 def _prefill(device):
-    return ForwardBatch(
+    return TextBatch(
         attention=AttentionMetadata(
             attention_mode=AttentionMode.PAGED_VARLEN,
             prefix_lens=torch.zeros(2, dtype=torch.int32, device=device),
@@ -88,13 +91,9 @@ def _prefill(device):
             causal_rows_cpu=(True, True),
             seq_lens_cpu=(3, 2),
         ),
-        forward_mode=ForwardMode.PREFILL,
-        row_count=2,
-        request_pool_indices=torch.tensor([1, 2], device=device),
-        token_row_indices=(0, 1),
         input_ids=torch.tensor([1, 3, 5, 7, 9], device=device),
         positions=torch.tensor([0, 1, 2, 0, 1], device=device),
-        token_selections=(TokenSelection.ALL_LOGITS, TokenSelection.HIDDEN),
+        selections=(TokenSelection.ALL_LOGITS, TokenSelection.HIDDEN),
     )
 
 
@@ -111,7 +110,7 @@ def _model(architecture, layer_config, tied=False):
     if architecture == "qwen":
         return Qwen3ForCausalLM(
             dict(common, head_dim=128, attention_bias=False, tie_word_embeddings=tied),
-            layer_config=layer_config,
+            context=model_context(layer_config),
         )
     if architecture == "sensenova":
         config = NeoChatConfig(
@@ -140,7 +139,7 @@ def _model(architecture, layer_config, tied=False):
             max_image_seq_len=16,
             fm_head_layers=2,
         )
-        return NEOChatModel(config, layer_config=layer_config)
+        return NEOChatModel(config, context=model_context(layer_config))
     return BagelForConditionalGeneration(
         BagelConfig(
             llm=LLMConfig(**common),
@@ -155,11 +154,11 @@ def _model(architecture, layer_config, tied=False):
             vit_image_size=224,
             vit_max_num_patch_per_side=16,
         ),
-        layer_config=layer_config,
+        context=model_context(layer_config),
     )
 
 
-def _mixed_batch(architecture, device):
+def _diffusion_batch(architecture, device):
     image_tokens = 1 if architecture == "sensenova" else 3
     latent_width = 48 if architecture == "sensenova" else 64
     side = 4 if architecture == "sensenova" else 16
@@ -172,46 +171,41 @@ def _mixed_batch(architecture, device):
             grid=torch.tensor([[2, 2]], device=device),
             noise_scale=torch.tensor(0.3, device=device),
         )
-    total = image_tokens + 2
-    return replace(
-        _prefill(device),
-        forward_mode=ForwardMode.MIXED,
+    spans = (RouteSpan(ExpertRoute.FLOW, 0, image_tokens),)
+    if architecture == "bagel":
+        spans = (
+            RouteSpan(ExpertRoute.TEXT, 0, 1),
+            RouteSpan(ExpertRoute.FLOW, 1, 1),
+            RouteSpan(ExpertRoute.TEXT, 2, 1),
+        )
+    attention = AttentionMetadata(
         attention_mode=AttentionMode.PACKED,
-        query_lens=torch.tensor([2, image_tokens], dtype=torch.int32, device=device),
-        out_cache_loc=torch.zeros(total, dtype=torch.int64, device=device),
+        prefix_lens=torch.zeros(1, dtype=torch.int32, device=device),
+        query_lens=torch.tensor([image_tokens], dtype=torch.int32, device=device),
+        out_cache_loc=torch.empty(0, dtype=torch.int64, device=device),
         has_cache_writes=False,
-        cu_seqlens_q=torch.tensor([0, 2, total], dtype=torch.int32, device=device),
-        cu_seqlens_k=torch.tensor([0, 2, total], dtype=torch.int32, device=device),
-        attention_indexes=torch.stack(
-            (
-                torch.arange(total, device=device),
-                torch.zeros(total, device=device, dtype=torch.long),
-                torch.zeros(total, device=device, dtype=torch.long),
-            )
-        ),
-        visible_end=torch.tensor([1, 2] + [total] * image_tokens, dtype=torch.int32, device=device),
-        route_spans=(
-            RouteSpan(ExpertRoute.TEXT, 0, 2),
-            RouteSpan(ExpertRoute.FLOW, 2, image_tokens),
-        ),
-        max_seqlen_q=max(2, image_tokens),
-        max_seqlen_k=max(2, image_tokens),
-        query_lens_cpu=(2, image_tokens),
-        seq_lens_cpu=(2, image_tokens),
-        causal_rows_cpu=(True, False),
-        binding=2,
-        input_ids=torch.tensor([1, 3], device=device),
-        positions=torch.tensor([0, 1], device=device),
-        token_row_indices=(0,),
-        token_selections=(TokenSelection.LAST_LOGITS,),
-        flow_row_indices=(1,),
-        flow_positions=(torch.zeros(1, dtype=torch.long, device=device),),
-        flow_timesteps=(torch.tensor(0.25, device=device),),
-        flow_latents=(latent,),
-        flow_conditioning=(patches,),
-        flow_image_tokens=(image_tokens,),
-        flow_heights=(side,),
-        flow_widths=(side,),
+        block_table=torch.zeros((1, 1), dtype=torch.int32, device=device),
+        cu_seqlens_q=torch.tensor([0, image_tokens], dtype=torch.int32, device=device),
+        attention_indexes=torch.zeros((3, image_tokens), dtype=torch.long, device=device),
+        visible_end=torch.full((1, image_tokens), image_tokens, dtype=torch.int32, device=device),
+        route_spans=spans,
+        max_seqlen_q=image_tokens,
+        max_seqlen_k=64,
+        query_lens_cpu=(image_tokens,),
+        prefix_lens_cpu=(0,),
+        seq_lens_cpu=(image_tokens,),
+        causal_rows_cpu=(False,),
+        causal=False,
+        fully_visible=True,
+    )
+    return DiffusionBatch(
+        latents={"image": (latent,)},
+        timesteps={"image": (torch.tensor(0.25, device=device),)},
+        positions=(torch.zeros(1, dtype=torch.long, device=device),),
+        conditioning={"image": (patches,)},
+        sequence_lengths=(image_tokens,),
+        shapes=(MediaShape(side, side),),
+        attention=attention,
     )
 
 
@@ -238,18 +232,22 @@ def _checkpoint_name(architecture: str, source: str, name: str) -> str:
         return "language_model.lm_head.weight"
     if name.startswith("lm."):
         return "language_model.model." + name.removeprefix("lm.")
-    if name.startswith("vit_model.encoder.post_layernorm."):
+    if name.startswith("vision.encoder.encoder.post_layernorm."):
         return "vit_model.vision_model.post_layernorm." + name.removeprefix(
-            "vit_model.encoder.post_layernorm."
+            "vision.encoder.encoder.post_layernorm."
         )
-    if name.startswith("vit_model.encoder."):
+    if name.startswith("vision.encoder.encoder."):
         return (
-            ("vit_model.vision_model.encoder." + name.removeprefix("vit_model.encoder."))
+            ("vit_model.vision_model.encoder." + name.removeprefix("vision.encoder.encoder."))
             .replace(".mlp.0.", ".mlp.fc1.")
             .replace(".mlp.2.", ".mlp.fc2.")
         )
-    if name.startswith("vit_model."):
-        return "vit_model.vision_model.embeddings." + name.removeprefix("vit_model.")
+    if name.startswith("vision.encoder."):
+        return "vit_model.vision_model.embeddings." + name.removeprefix("vision.encoder.")
+    if name.startswith("vision.projection."):
+        return "connector." + name.removeprefix("vision.projection.")
+    if name.startswith("vision.position_embed."):
+        return "vit_pos_embed." + name.removeprefix("vision.position_embed.")
     return name
 
 
@@ -339,25 +337,43 @@ def _run_pipeline(
                     if architecture != "qwen":
                         batch = replace(
                             batch,
-                            attention_mode=AttentionMode.PACKED,
-                            attention_indexes=torch.stack(
-                                (
-                                    batch.positions,
-                                    torch.zeros_like(batch.positions),
-                                    torch.zeros_like(batch.positions),
-                                )
+                            attention=replace(
+                                batch.attention,
+                                attention_mode=AttentionMode.PACKED,
+                                attention_indexes=torch.stack(
+                                    (
+                                        batch.positions,
+                                        torch.zeros_like(batch.positions),
+                                        torch.zeros_like(batch.positions),
+                                    )
+                                ),
+                                visible_end=torch.tensor(
+                                    [[1, 2, 3], [1, 2, 0]], dtype=torch.int32, device=device
+                                ),
+                                route_spans=(RouteSpan(ExpertRoute.TEXT, 0, 5),),
                             ),
-                            visible_end=torch.tensor(
-                                [1, 2, 3, 4, 5], dtype=torch.int32, device=device
-                            ),
-                            route_spans=(RouteSpan(ExpertRoute.TEXT, 0, 5),),
                         )
 
                     def execute(selected_model, selected_batch):
-                        hidden = selected_model(
-                            selected_batch.input_ids, selected_batch.positions, selected_batch
+                        hidden = selected_model(selected_batch, constants={}, scratch={})
+                        selected_model.tensor_specs(
+                            Call.TEXT,
+                            TextShape(selected_batch.input_ids.numel(), selected_batch.row_count),
+                        ).outputs["hidden_states"].validate(hidden, state={}, scratch={})
+                        output = selected_model.compute_logits(hidden, selected_batch)
+                        output.validate(
+                            tuple(
+                                selected_model.tensor_specs(
+                                    Call.TEXT, TextShape(count, selection=selection)
+                                )
+                                for count, selection in zip(
+                                    selected_batch.attention.query_lens_cpu,
+                                    selected_batch.selections,
+                                    strict=True,
+                                )
+                            )
                         )
-                        return selected_model.project(hidden, selected_batch)
+                        return output
 
                     expected = execute(reference, batch).materialize()
                     actual = execute(model, batch).materialize()
@@ -366,21 +382,22 @@ def _run_pipeline(
 
                     batch = replace(
                         batch,
-                        forward_mode=ForwardMode.DECODE,
-                        attention_mode=AttentionMode.PAGED_DECODE,
                         input_ids=torch.tensor([11, 13], device=device),
                         positions=torch.tensor([3, 2], device=device),
-                        prefix_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
-                        seq_lens=torch.tensor([4, 3], dtype=torch.int32, device=device),
-                        query_lens=torch.ones(2, dtype=torch.int32, device=device),
-                        out_cache_loc=torch.tensor([67, 130], device=device),
-                        cu_seqlens_q=None,
-                        cu_seqlens_k=None,
-                        prefix_lens_cpu=(3, 2),
-                        seq_lens_cpu=(4, 3),
-                        query_lens_cpu=(1, 1),
-                        token_selections=(TokenSelection.LAST_LOGITS,) * 2,
-                        binding=1,
+                        selections=(TokenSelection.LAST_LOGITS,) * 2,
+                        attention=replace(
+                            batch.attention,
+                            attention_mode=AttentionMode.PAGED_DECODE,
+                            prefix_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
+                            seq_lens=torch.tensor([4, 3], dtype=torch.int32, device=device),
+                            query_lens=torch.ones(2, dtype=torch.int32, device=device),
+                            out_cache_loc=torch.tensor([67, 130], device=device),
+                            cu_seqlens_q=None,
+                            cu_seqlens_k=None,
+                            prefix_lens_cpu=(3, 2),
+                            seq_lens_cpu=(4, 3),
+                            query_lens_cpu=(1, 1),
+                        ),
                     )
                     execute(model, batch)
                     torch.cuda.synchronize(device)
@@ -416,18 +433,35 @@ def _run_pipeline(
                     graph.reset()
                     graph = None
                     if architecture != "qwen":
-                        mixed = _mixed_batch(architecture, device)
-                        expected = execute(reference, mixed).materialize()
-                        actual = execute(model, mixed).materialize()
-                        for result, wanted in zip(actual.values, expected.values, strict=True):
-                            torch.testing.assert_close(
-                                result, wanted, rtol=tolerance, atol=tolerance
-                            )
+                        diffusion = _diffusion_batch(architecture, device)
+                        expected = reference.forward_diffusion(
+                            diffusion, state={}, constants={}, scratch={}
+                        ).values["image"]
+                        prediction = model.forward_diffusion(
+                            diffusion, state={}, constants={}, scratch={}
+                        )
+                        prediction.validate(
+                            tuple(
+                                model.tensor_specs(Call.DIFFUSION, shape)
+                                for shape in diffusion.shapes
+                            ),
+                            state={},
+                            scratch={},
+                        )
+                        actual = prediction.values["image"]
+                        # Non-output pipeline stages participate in communication
+                        # without fabricating a local prediction head.
+                        if model.diffusion_pipeline.last:
+                            for result, wanted in zip(actual, expected, strict=True):
+                                torch.testing.assert_close(
+                                    result, wanted, rtol=tolerance, atol=tolerance
+                                )
                     if long_rows:
                         # PACKED graph execution requires a graph-capable
                         # provider; FlashInfer's segmented forward plans on CPU.
                         for loaded, cache in ((reference, reference_pool), (model, pool)):
-                            loaded.bind_cache_pool(
+                            bind_attention_modules(
+                                loaded,
                                 cache,
                                 AttentionSelection("fa4_cute", (Fa4CuteAttentionBackend(),)),
                             )
@@ -440,7 +474,7 @@ def _run_pipeline(
                             max_tokens=131075,
                             dtype=torch.bfloat16,
                         )
-                        with attention_exchange_scope(storage):
+                        with attention_exchange_scope(storage.views):
                             _compare_long_packed_rows(model, reference, architecture, device)
                         del storage
                     del model, reference, pool, reference_pool
@@ -470,45 +504,44 @@ def _compare_long_packed_rows(model, reference, architecture, device):
         )
     batch = replace(
         _prefill(device),
-        row_count=len(lengths),
-        request_pool_indices=torch.arange(1, len(lengths) + 1, device=device),
-        attention_mode=AttentionMode.PACKED,
         input_ids=torch.ones(rows, device=device, dtype=torch.long),
         positions=positions,
-        prefix_lens=torch.zeros(len(lengths), dtype=torch.int32, device=device),
-        query_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
-        seq_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
-        out_cache_loc=torch.empty(0, dtype=torch.long, device=device),
-        has_cache_writes=False,
-        block_table=torch.zeros((len(lengths), 1), dtype=torch.int32, device=device),
-        cu_seqlens_q=boundaries,
-        cu_seqlens_k=boundaries,
-        visible_end=torch.tensor(lengths, device=device, dtype=torch.int32)
-        .unsqueeze(1)
-        .expand(-1, 128)
-        .contiguous(),
-        attention_indexes=torch.stack(
-            (positions, torch.zeros_like(positions), torch.zeros_like(positions))
+        selections=(TokenSelection.HIDDEN,) * len(lengths),
+        attention=replace(
+            _prefill(device).attention,
+            attention_mode=AttentionMode.PACKED,
+            prefix_lens=torch.zeros(len(lengths), dtype=torch.int32, device=device),
+            query_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
+            seq_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
+            out_cache_loc=torch.empty(0, dtype=torch.long, device=device),
+            has_cache_writes=False,
+            block_table=torch.zeros((len(lengths), 1), dtype=torch.int32, device=device),
+            cu_seqlens_q=boundaries,
+            cu_seqlens_k=boundaries,
+            visible_end=torch.tensor(lengths, device=device, dtype=torch.int32)
+            .unsqueeze(1)
+            .expand(-1, 128)
+            .contiguous(),
+            attention_indexes=torch.stack(
+                (positions, torch.zeros_like(positions), torch.zeros_like(positions))
+            ),
+            route_spans=spans,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+            prefix_lens_cpu=(0,) * len(lengths),
+            query_lens_cpu=lengths,
+            seq_lens_cpu=lengths,
+            causal_rows_cpu=(False,) * len(lengths),
         ),
-        route_spans=spans,
-        max_seqlen_q=128,
-        max_seqlen_k=128,
-        prefix_lens_cpu=(0,) * len(lengths),
-        query_lens_cpu=lengths,
-        seq_lens_cpu=lengths,
-        causal_rows_cpu=(False,) * len(lengths),
-        token_row_indices=tuple(range(len(lengths))),
-        token_selections=(TokenSelection.HIDDEN,) * len(lengths),
-        binding=3,
     )
 
     def execute(selected):
         if architecture == "qwen":
-            return selected.model(batch.input_ids, positions, batch, input_embeds=inputs.clone())
+            return selected.model(inputs.clone(), batch.attention, positions=positions)
         decoder = (
             selected.language_model.model if architecture == "sensenova" else selected.model.lm
         )
-        return decoder(inputs.clone(), batch)
+        return decoder(inputs.clone(), batch.attention, positions=positions)
 
     graph = torch.cuda.CUDAGraph()
     try:

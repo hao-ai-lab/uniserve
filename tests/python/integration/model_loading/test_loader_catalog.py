@@ -12,7 +12,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tests.python.fixtures.model_execution import tensor_parallel_bindings
+from tests.python.fixtures.model_execution import model_context, tensor_parallel_bindings
 from uniserve_worker.bootstrap.catalog import resolve_catalog_entry
 from uniserve_worker.bootstrap.worker_info_builder import (
     build_worker_layout,
@@ -102,7 +102,7 @@ def _sense_config() -> dict[str, object]:
 def _qwen_reference(config: dict[str, object]) -> Qwen3ForCausalLM:
     model = Qwen3ForCausalLM(
         config,
-        layer_config=LayerConfig(communicator=Communicator(), quantization=None),
+        context=model_context(LayerConfig(communicator=Communicator(), quantization=None)),
     )
     with torch.no_grad():
         for index, parameter in enumerate(model.parameters(), start=1):
@@ -280,7 +280,7 @@ def test_resolved_configuration_identity_distinguishes_loaded_precision(tmp_path
     for dtype in ("bfloat16", "float32", "bfloat16"):
         request = replace(_qwen_request(str(tmp_path)), execution=_execution(dtype))
         loaded = load_model(request)
-        layout = build_worker_layout(loaded.model, loaded.worker_config)
+        layout = build_worker_layout(loaded.model, loaded.worker_config, bindings=loaded.bindings)
         identities.append(
             configuration_identity(loaded.model, loaded.worker_config, layout, (), "torch_sdpa")
         )
@@ -455,7 +455,7 @@ def test_sensenova_checkpoint_component_materializes_selected_expert_parameters(
 
     config = NeoChatConfig.from_dict(_sense_config())
     layers = LayerConfig(Communicator(), None)
-    reference = NEOChatModel(config, layer_config=layers)
+    reference = NEOChatModel(config, context=model_context(layers))
     with torch.no_grad():
         for index, parameter in enumerate(reference.parameters(), start=1):
             parameter.fill_(index / 37)
@@ -471,9 +471,11 @@ def test_sensenova_checkpoint_component_materializes_selected_expert_parameters(
     expected = reference.state_dict()
     checkpoint = {}
     for name, value in expected.items():
-        if ".qkv_proj" in name:
-            packed = "qkv_proj_mot_gen" if "qkv_proj_mot_gen" in name else "qkv_proj"
-            suffix = "_mot_gen" if packed.endswith("_mot_gen") else ""
+        if ".text_qkv.projection." in name or ".flow_qkv.projection." in name:
+            packed = (
+                "flow_qkv.projection" if ".flow_qkv.projection." in name else "text_qkv.projection"
+            )
+            suffix = "_mot_gen" if packed == "flow_qkv.projection" else ""
             for part, tensor in zip(("q", "k", "v"), value.split((8, 4, 4), dim=0), strict=True):
                 checkpoint[name.replace(packed, f"{part}_proj{suffix}")] = tensor.contiguous()
         elif ".gate_up_proj." in name:
@@ -486,10 +488,11 @@ def test_sensenova_checkpoint_component_materializes_selected_expert_parameters(
     included = frozenset(
         name
         for name, _ in reference.named_parameters()
-        if (name.startswith("fm_modules.") or "_mot_gen." in name) == (branch == "flow")
+        if (name.startswith("fm_modules.") or "_mot_gen." in name or ".flow_qkv." in name)
+        == (branch == "flow")
     )
     with torch.device("meta"):
-        model = NEOChatModel(config, layer_config=layers)
+        model = NEOChatModel(config, context=model_context(layers))
     attach_parameter_loaders(model, device="cpu", dtype=torch.float32)
     component = replace(model.checkpoint_components()[0], included=included)
     request = LoadRequest(
@@ -539,7 +542,7 @@ def test_sensenova_checkpoint_layer_exclusions_preserve_projection_weights(
     if deep_head:
         config.update(fm_head_layers=3, fm_head_dim=8, fm_head_mlp_ratio=2.0)
     reference = NEOChatModel(
-        NeoChatConfig.from_dict(config), layer_config=LayerConfig(Communicator(), None)
+        NeoChatConfig.from_dict(config), context=model_context(LayerConfig(Communicator(), None))
     )
     with torch.no_grad():
         for index, parameter in enumerate(reference.parameters(), start=1):
@@ -577,18 +580,18 @@ def test_sensenova_checkpoint_layer_exclusions_preserve_projection_weights(
     exported = loaded.model.state_dict()
     for name in (
         "language_model.model.layers.0.self_attn.o_proj.weight",
-        "language_model.model.layers.0.self_attn.qkv_proj_mot_gen.weight",
+        "language_model.model.layers.0.self_attn.flow_qkv.projection.weight",
         "language_model.model.layers.0.mlp_mot_gen.gate_up_proj.weight",
         "language_model.model.layers.0.mlp_mot_gen.down_proj.weight",
         "language_model.lm_head.weight",
-        *(f"fm_modules.fm_head.{name}.weight" for name in dense_heads),
+        *(f"fm_modules.velocity.head.{name}.weight" for name in dense_heads),
     ):
         torch.testing.assert_close(exported[name].cpu(), state[name].bfloat16(), rtol=0, atol=0)
     for name in (
         "language_model.model.layers.0.self_attn.o_proj_mot_gen.weight",
-        "language_model.model.layers.0.self_attn.qkv_proj.weight",
+        "language_model.model.layers.0.self_attn.text_qkv.projection.weight",
         "language_model.model.layers.0.mlp.gate_up_proj.weight",
-        f"fm_modules.fm_head.{'net.input_proj' if deep_head else '0'}.weight",
+        f"fm_modules.velocity.head.{'net.input_proj' if deep_head else '0'}.weight",
     ):
         assert exported[name].dtype == torch.float8_e4m3fn
     device = torch.device(generation_device or "cpu")

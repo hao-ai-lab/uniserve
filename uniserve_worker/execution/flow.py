@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.models.generation import BranchSource
+from uniserve_worker.modeling.batch import DiffusionBatch
+from uniserve_worker.modeling.diffusion import DiffusionMixin
+from uniserve_worker.modeling.geometry import MediaShape
+from uniserve_worker.modeling.tensors import TokenSelection
 from uniserve_worker.nn.diffusion.cfg import Branch, CfgPlan, build_flow_cfg_plan
 from uniserve_worker.protocol.batch import (
     DrawLayout,
@@ -23,12 +26,11 @@ from uniserve_worker.protocol.batch import (
 )
 from uniserve_worker.runtime.request import RequestState
 
+from ..nn.rng import diffusion_noise
 from . import operations as operation_geometry
 from .batch_state import BatchState
-from .diffusion_state import DiffusionState
-from .forward_batch import TokenSelection
+from .diffusion_state import DiffusionState, resolve_prefix
 from .output import PendingOutput
-from .rng import flow_noise_seed, normal_noise
 from .rows import ForwardRow
 
 if TYPE_CHECKING:
@@ -114,7 +116,12 @@ def prepare_latent(
     staging.value.zero_()
     initial = staging.value[: int(params.latent_units)]
     initial_latent(
-        operation, int(params.height), int(params.width), initial, model_runner=model_runner
+        operation,
+        int(params.height),
+        int(params.width),
+        initial,
+        steps=int(image.steps),
+        model_runner=model_runner,
     )
     pool.initialize(
         row.request.request_pool_idx,
@@ -288,11 +295,12 @@ def prepare_step(
             continue
         source = generation.branch_source(branch)
         if source not in trajectory.prefixes:
-            trajectory.prefixes[source] = flow_prefix(
+            trajectory.prefixes[source] = resolve_prefix(
+                generation,
                 source,
-                image.image_prompts[0] if image.image_prompts else "",
-                request.request,
-                model_runner=model_runner,
+                image_prompt=image.image_prompts[0] if image.image_prompts else "",
+                negative_prompt=image.negative_prompt,
+                negative_token_ids=request.request.negative_token_ids,
                 tokenizer=tokenizer,
             )
         prefix, copy_conditioning = trajectory.prefixes[source]
@@ -462,44 +470,34 @@ def initial_latent(
     width: int,
     target: torch.Tensor,
     *,
+    steps: int,
     model_runner: ModelRunner,
 ) -> None:
     """Create deterministic bounded latent noise or reuse the request’s staged image latent."""
 
-    flow = model_runner.generation()
+    model = model_runner.model
+    if not isinstance(model, DiffusionMixin):
+        raise invalid_descriptor("latent preparation requires the diffusion capability")
     rng = operation.rng
     assert rng is not None and rng.draw_layout is DrawLayout.FLOW_NOISE
-    seed = flow_noise_seed(int(rng.seed), int(rng.semantic_index_base))
-    raw = target.reshape(flow.latent_shape(height, width))
-    normal_noise(
-        tuple(int(value) for value in raw.shape),
-        seed=seed,
+    shape = MediaShape(height, width)
+    spec = model.diffusion_spec(shape, steps)
+    raw = target.reshape(spec.modalities[0].noise_shape).unsqueeze(0)
+    noise = {"image": raw}
+    diffusion_noise(
+        spec,
+        seeds=(int(rng.seed),),
+        coordinates=(int(rng.semantic_index_base),),
         device=target.device,
         dtype=target.dtype,
-        out=raw,
+        out=noise,
     )
-    raw.mul_(flow.noise_scale(height, width))
-    neural = flow.neural_latent(raw)
-    if neural.data_ptr() != target.data_ptr() or tuple(neural.shape) != tuple(target.shape):
-        target.copy_(neural.reshape_as(target))
-
-
-def flow_prefix(
-    source: BranchSource,
-    image_prompt: str,
-    request: RequestState,
-    *,
-    model_runner: ModelRunner,
-    tokenizer: PreTrainedTokenizerBase | None,
-) -> tuple[tuple[int, ...], bool]:
-    """Tokenize and embed the prompt source used to construct diffusion conditioning."""
-
-    return model_runner.generation().prefix(
-        source,
-        image_prompt=image_prompt,
-        negative_prompt=require_image(request).negative_prompt,
-        negative_token_ids=request.negative_token_ids,
-        tokenizer=tokenizer,
+    model.prepare_latents(
+        DiffusionBatch(latents={"image": (target,)}, shapes=(shape,)),
+        noise=noise,
+        state={"image": target.unsqueeze(0)},
+        constants={},
+        scratch={},
     )
 
 

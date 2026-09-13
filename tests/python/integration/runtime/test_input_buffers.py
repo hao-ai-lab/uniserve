@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from uniserve_worker.execution.forward_batch import AttentionMetadata, AttentionMode, TokenSelection
 from uniserve_worker.execution.input_buffers import InputBuffers, InputGeometry
 from uniserve_worker.execution.rows import ForwardRow
+from uniserve_worker.modeling.tensors import AttentionMetadata, AttentionMode, TokenSelection
 from uniserve_worker.protocol.batch import ForwardMode
 from uniserve_worker.runtime.decode_state import DecodeState
 

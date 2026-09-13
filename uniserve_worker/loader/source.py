@@ -6,13 +6,20 @@ import fnmatch
 import json
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from safetensors.torch import safe_open
 
 from .config import LoadConfig, LoadFormat, LoadRequest
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from ..bootstrap.catalog import CatalogEntry
+    from ..nn.parallel import ComponentConfig
+
 __all__ = [
+    "ModelSource",
     "WeightSourceConfig",
     "WeightSourceSet",
     "read_model_config",
@@ -31,6 +38,42 @@ _TRAINING_FILES = frozenset(
 )
 _SAFETENSORS_INDEX = "*.safetensors.index.json"
 _PT_INDEX = "*.bin.index.json"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSource:
+    """Resolved checkpoint identity and metadata retained by loading infrastructure.
+
+    Bootstrap can validate numerical topology before creating process groups.
+    The same resolved root and repository identity then supply checkpoint loading,
+    including remote component discovery, without resolving a second snapshot.
+    """
+
+    root: Path
+    repository_id: str | None
+    config: dict[str, Any]
+    entry: CatalogEntry
+
+    @classmethod
+    def resolve(cls, model_path: str, load: LoadConfig) -> ModelSource:
+        from ..bootstrap.catalog import resolve_catalog_entry
+
+        root, repository_id = resolve_model_root(model_path, load)
+        config = read_model_config(root)
+        entry = resolve_catalog_entry(
+            tuple(str(value) for value in config.get("architectures") or ())
+        )
+        return cls(root, repository_id, config, entry)
+
+    def validate(self, components: Mapping[str, ComponentConfig]) -> None:
+        """Reject unsupported placement and numerical partitions before allocation."""
+
+        from ..bootstrap.components import validate_components
+
+        validate_components(self.entry.model_class, self.config, components)
+        self.entry.model_class.validate_parallel(
+            self.config, {name: value.parallel_config for name, value in components.items()}
+        )
 
 
 @dataclass(frozen=True, slots=True)

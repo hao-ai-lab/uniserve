@@ -1,6 +1,6 @@
 namespace uniserve.ipc;
 
-enum ForwardMode : ubyte { None, Prefill, Decode, Verify, Mixed }
+enum ForwardMode : ubyte { None, Prefill, Decode, Verify }
 enum PipelineStage : ubyte { None, VisionEncoding, LatentEncoding, TextEncoding, LatentPreparation, Denoising, ImageDecoding, VideoDecoding, AudioDecoding, VideoEncoding, AudioEncoding, Muxing }
 enum TransferMode : ubyte { None, Tensor, KvPublish, KvInstall }
 

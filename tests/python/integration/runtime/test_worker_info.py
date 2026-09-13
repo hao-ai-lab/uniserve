@@ -7,11 +7,13 @@ from dataclasses import replace
 import pytest
 
 from tests.python.fixtures.execution_worker import execution_worker
+from tests.python.fixtures.worker_config import stub_worker_config
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
 from uniserve_worker.config import LaneConfig, WorkerConfig
-from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry
-from uniserve_worker.models.stub import StubModel, stub_worker_config
-from uniserve_worker.protocol.batch import COMPUTATIONS, ForwardMode, PipelineStage
+from uniserve_worker.modeling.components import Call, CallSpec, ComponentSpec
+from uniserve_worker.modeling.model import Model
+from uniserve_worker.models.stub import StubModel
+from uniserve_worker.protocol.batch import COMPUTATIONS, ForwardMode
 from uniserve_worker.worker import Worker
 
 pytestmark = pytest.mark.integration
@@ -27,6 +29,19 @@ def test_worker_info_reports_schedulable_work_and_bounds(backends: tuple[str, ..
 
     assert info["device"] == "cpu"
     assert tuple(info["transfer_backends"]) == backends
+    assert set(info["supported_ops"]) == {
+        "prefill",
+        "decode",
+        "verify",
+        "vision_encoding",
+        "latent_encoding",
+        "latent_preparation",
+        "denoising",
+        "image_decoding",
+        "tensor",
+        "kv_publish",
+        "kv_install",
+    }
     assert info["kv_cache"]["num_layers"] > 0
     assert info["kv_cache"]["num_kv_heads"] > 0
     assert info["kv_cache"]["head_dim"] > 0
@@ -38,10 +53,13 @@ def test_worker_info_reports_schedulable_work_and_bounds(backends: tuple[str, ..
 
 
 def test_action_model_reports_zero_kv_geometry() -> None:
-    class ActionModel(ExecutionModel):
+    class ActionModel(Model):
         architecture = "ActionModel"
-        resource_geometry = ResourceGeometry(kv=False)
-        supported_work = frozenset({PipelineStage.VIDEO_DECODING})
+
+        @classmethod
+        def components(cls, config):
+            return (ComponentSpec("decoder", (CallSpec(Call.DECODE_VIDEO),)),)
+
         generation = None
 
     worker_config = WorkerConfig(

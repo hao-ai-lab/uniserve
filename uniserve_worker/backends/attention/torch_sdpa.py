@@ -7,7 +7,8 @@ from collections.abc import Callable, Sequence
 import torch
 import torch.nn.functional as F
 
-from ...execution.forward_batch import AttentionMetadata
+from uniserve_worker.modeling.tensors import AttentionMetadata
+
 from .base import AttentionBackend, merge_attention_states
 
 __all__ = [

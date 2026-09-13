@@ -1,8 +1,6 @@
 """Validated H3 component formats and fixed precision preset values."""
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Mapping
 
 from ...nn.quant.config import LinearPrecision
@@ -72,7 +70,7 @@ FASTH3_MODEL_ID = "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree"
 FASTH3_REVISION = "5ea076f35b84da4c3c82217112fa733d8eea2ae1"
 
 
-def resolve_h3_contract(root: Path) -> dict[str, object]:
+def h3_contract(manifest: Mapping[str, object]) -> dict[str, object]:
     """Validate the supported full VSA checkpoint before allocating components.
 
     The manifest's training indices do not select the inference schedule. The
@@ -80,13 +78,6 @@ def resolve_h3_contract(root: Path) -> dict[str, object]:
     its explicit DMD-index override is a different numerical protocol.
     """
 
-    path = root / "fastvideo_inference.json"
-    if not path.is_file():
-        raise ValueError(
-            "MiniMax H3 requires fastvideo_inference.json from the full FastH3 VSA "
-            "checkpoint; base partitions and adapter-only checkpoints are unsupported"
-        )
-    manifest = json.loads(path.read_text(encoding="utf-8"))
     expected = {
         "schema_version": "fasth3-inference-contract-v1",
         "model_id": FASTH3_MODEL_ID,
@@ -102,22 +93,16 @@ def resolve_h3_contract(root: Path) -> dict[str, object]:
         "vsa_tile_size": 64,
         "vsa_sparsity": 0.9,
     }
-    if not isinstance(manifest, dict):
-        raise ValueError("fastvideo_inference.json must contain an object")
     for name, value in expected.items():
         if type(manifest.get(name)) is not type(value) or manifest.get(name) != value:
             raise ValueError(
                 f"unsupported FastH3 checkpoint: {name} must be {value!r}, "
                 f"got {manifest.get(name)!r}; use {FASTH3_MODEL_ID}@{FASTH3_REVISION}"
             )
-    # A local copy has a declared content identity, not independently verified
-    # Hub revision provenance. Report the latter only for a snapshot directory.
-    revision = root.name if root.parent.name == "snapshots" else None
     return {
         "family": "minimax-h3",
         "variant": "fasth3",
         "model_id": manifest["model_id"],
-        "revision": revision,
         "checkpoint_content_sha256": manifest["checkpoint_content_sha256"],
         "attention": "vsa",
         "sparsity": 0.9,
@@ -153,3 +138,66 @@ class H3TransformerConfig:
     rope_theta: float = 10000.0
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
+
+
+def validate_h3_config(metadata: Mapping[str, dict[str, object]]) -> None:
+    """Validate parsed component dimensions and fixed diffusion mathematics."""
+
+    from .encoder import H3TextEncoderConfig
+
+    h3_contract(metadata["inference"])
+    transformer = metadata["transformer"]
+    transformer_config = H3TransformerConfig()
+    expected_transformer = {
+        "num_attention_heads": transformer_config.heads,
+        "attention_head_dim": transformer_config.head_dim,
+        "hidden_size": transformer_config.hidden_size,
+        "num_layers": transformer_config.layers,
+        "num_refiner_layers": transformer_config.refiner_layers,
+        "ffn_dim": transformer_config.ffn_dim,
+        "in_channels": transformer_config.video_channels,
+        "audio_in_channels": transformer_config.audio_channels,
+        "patch_size": [1, 2, 2],
+        "text_dim": transformer_config.text_dim,
+        "freq_dim": transformer_config.frequency_dim,
+        "time_embed_hidden_dim": transformer_config.time_hidden_dim,
+        "time_embed_dim": transformer_config.time_dim,
+        "rope_freq_dim": transformer_config.rope_frequency_dim,
+        "rope_theta": transformer_config.rope_theta,
+        "norm_eps": transformer_config.norm_eps,
+        "qk_norm_eps": transformer_config.qk_norm_eps,
+        "final_norm_eps": transformer_config.norm_eps,
+    }
+    for field, expected in expected_transformer.items():
+        if transformer.get(field) != expected:
+            raise ValueError(
+                f"FastH3 transformer {field} must be {expected!r}, got {transformer.get(field)!r}"
+            )
+
+    encoder = metadata["text_encoder"].get("text_config")
+    if not isinstance(encoder, dict):
+        raise ValueError("FastH3 text encoder has no Qwen3-VL text configuration")
+    encoder_config = H3TextEncoderConfig()
+    expected_encoder = {
+        "vocab_size": encoder_config.vocab_size,
+        "hidden_size": encoder_config.hidden_size,
+        "intermediate_size": encoder_config.intermediate_size,
+        "num_hidden_layers": encoder_config.checkpoint_layers,
+        "num_attention_heads": encoder_config.heads,
+        "num_key_value_heads": encoder_config.kv_heads,
+        "head_dim": encoder_config.head_dim,
+        "rope_theta": encoder_config.rope_theta,
+        "rms_norm_eps": encoder_config.norm_eps,
+    }
+    for field, expected in expected_encoder.items():
+        if encoder.get(field) != expected:
+            raise ValueError(
+                f"FastH3 text encoder {field} must be {expected!r}, got {encoder.get(field)!r}"
+            )
+
+    for component, expected_shift in (("scheduler", 12.0), ("audio_scheduler", 3.0)):
+        scheduler = metadata[component]
+        if scheduler.get("shift") != expected_shift:
+            raise ValueError(
+                f"FastH3 {component} shift must be {expected_shift:g}, got {scheduler.get('shift')!r}"
+            )

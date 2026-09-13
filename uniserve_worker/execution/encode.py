@@ -12,9 +12,9 @@ import torch
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.media.codec import quantize_image_hwc, uint8_image_to_png_base64_bytes
-from uniserve_worker.models.generation import LatentLayout, Materialization
-from uniserve_worker.models.inputs import FeatureInjection, FeatureLayout, PatchTransform
-from uniserve_worker.models.runtime import PositionLayout
+from uniserve_worker.modeling.image_diffusion import LatentLayout
+from uniserve_worker.modeling.inputs import FeatureInjection, FeatureLayout, PatchTransform
+from uniserve_worker.modeling.tensors import ImageRange, PositionLayout, TokenSelection
 from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
 from uniserve_worker.protocol.batch import (
     EncoderTransferValue,
@@ -28,18 +28,12 @@ from uniserve_worker.protocol.batch import (
     TensorTransfer,
 )
 from uniserve_worker.runtime.cpu import CpuTask
-from uniserve_worker.runtime.tensor_store import (
-    FeatureMetadata,
-    ImageMetadata,
-    ImageRange,
-    TensorRecord,
-)
+from uniserve_worker.runtime.tensor_store import FeatureMetadata, ImageMetadata, TensorRecord
 from uniserve_worker.transfer.tickets import publish_tensor
 
 from . import operations as operation_geometry
 from . import transfer
 from .batch_state import BatchState
-from .forward_batch import TokenSelection
 from .image_input import ImageInputs, patch_grid_shape, prepare_image, prepare_tensor_image
 from .rows import ForwardRow
 
@@ -75,8 +69,8 @@ def text(
     if not operation.outputs:
         raise invalid_descriptor("text encoder outputs must declare conditioning tensors")
     tokens = model_runner.stage_text_tokens(admission.prompt_token_ids)
-    result = model_runner.run_entry(
-        operation.entry,
+    result = model_runner.run_encoder(
+        "text",
         tokens,
     )
     if len(result.values) != len(operation.outputs):
@@ -213,7 +207,6 @@ def materialization_latent(
         or operation_geometry.require_progress(request).latent_product != latent_input
     ):
         raise invalid_descriptor("materialization does not name the current latent generation")
-    flow = model_runner.generation()
     image_params = request.request.image
     if image_params is None:
         raise invalid_descriptor("image materialization has no admitted image parameters")
@@ -233,10 +226,7 @@ def materialization_latent(
         height=int(params.height),
         width=int(params.width),
     )
-    latent = flow.materialization_latent(current, int(params.height), int(params.width))
-    if flow.materialization not in {Materialization.DECODE_ROUTE, Materialization.RGB_LATENT}:
-        raise invalid_descriptor("model declares an unknown image materialization kind")
-    return latent
+    return current
 
 
 def publish_image(
@@ -547,7 +537,7 @@ def latent_state_row(
     image_tokens = (height // int(flow.latent_downsample)) * (width // int(flow.latent_downsample))
     if int(latent.reshape(-1, latent.shape[-1]).shape[0]) != image_tokens:
         raise invalid_descriptor("state latent does not match the declared image geometry")
-    query = image_tokens + int(flow.commit_marker_tokens)
+    query = image_tokens + int(flow.marker_tokens)
     positions = get_flattened_position_ids_extrapolate(
         height,
         width,

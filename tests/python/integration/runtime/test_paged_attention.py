@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
-from uniserve_worker.execution.forward_batch import AttentionMetadata, AttentionMode
+from uniserve_worker.modeling.tensors import AttentionMetadata, AttentionMode
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

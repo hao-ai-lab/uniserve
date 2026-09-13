@@ -7,9 +7,8 @@ import pytest
 from tests.python.fixtures.model_execution import TEST_WORKER_CONFIG
 from uniserve_worker.bootstrap.capacity import derive_runtime_kv_capacity
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
-from uniserve_worker.models.runtime import CacheGeometry
+from uniserve_worker.modeling.geometry import CacheGeometry
 from uniserve_worker.models.stub import StubModel
-from uniserve_worker.protocol.batch import ForwardMode
 
 pytestmark = pytest.mark.unit
 
@@ -98,7 +97,6 @@ def test_automatic_capacity_charges_request_and_input_storage() -> None:
     model = _model()
     model.generation = None
     model.image_processor = None
-    model.supported_work = frozenset((ForwardMode.PREFILL, ForwardMode.DECODE))
     config = replace(
         _worker_config(token_capacity=None),
         pool_memory_bytes=32 * 1024**3,

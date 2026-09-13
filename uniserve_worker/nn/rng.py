@@ -10,9 +10,11 @@ depth, accepted proposal length, completion order, and replay.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping
 
 import torch
+
+from .diffusion.spec import DiffusionSpec
 
 _U64 = 0xFFFFFFFFFFFFFFFF
 _U32 = 0xFFFFFFFF
@@ -96,29 +98,49 @@ def flow_noise_seed(request_seed: int, semantic_image_index: int) -> int:
     return _splitmix_coordinate(request_seed, semantic_image_index)
 
 
-def normal_noise(
-    shape: Sequence[int],
+def diffusion_noise(
+    spec: DiffusionSpec,
     *,
-    seed: int,
+    seeds: tuple[int, ...],
+    coordinates: tuple[int, ...] = (),
     device: torch.device,
     dtype: torch.dtype,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Draw explicit normal noise from a generator local to one semantic seed."""
+    out: Mapping[str, torch.Tensor],
+) -> None:
+    """Fill ordered native normal draws in already allocated numerical views.
 
-    generator = torch.Generator(device=device)
-    generator.manual_seed(int(seed))
-    if out is not None:
-        expected = tuple(int(value) for value in shape)
-        if out.device != device or out.dtype != dtype or tuple(out.shape) != expected:
-            raise ValueError("normal-noise output disagrees with the requested tensor")
-        return out.normal_(generator=generator)
-    return torch.randn(
-        tuple(int(value) for value in shape),
-        device=device,
-        dtype=dtype,
-        generator=generator,
-    )
+    Each view starts with a logical-row dimension. All modality draws for a row
+    share its generator; logical sharding happens only after this complete draw.
+    No backing, transfer, or process-global RNG state is owned by this primitive.
+    """
+
+    if not seeds or tuple(out) != tuple(modality.name for modality in spec.modalities):
+        raise ValueError("diffusion noise requires ordered modality views and row seeds")
+    if spec.seed_transform == "splitmix_coordinate":
+        if len(coordinates) != len(seeds):
+            raise ValueError("semantic diffusion seeds require one coordinate per row")
+        seeds = tuple(
+            flow_noise_seed(seed, coordinate)
+            for seed, coordinate in zip(seeds, coordinates, strict=True)
+        )
+    elif coordinates:
+        raise ValueError("identity diffusion seeds do not consume semantic coordinates")
+    noise_device = torch.device("cpu") if spec.noise_device == "cpu" else device
+    for modality in spec.modalities:
+        value = out[modality.name]
+        state_dtype = dtype if modality.state_dtype == "input" else modality.state_dtype
+        noise_dtype = state_dtype if modality.noise_dtype == "state" else modality.noise_dtype
+        if (
+            value.device != noise_device
+            or value.dtype != noise_dtype
+            or tuple(value.shape) != (len(seeds), *modality.noise_shape)
+            or not value.is_contiguous()
+        ):
+            raise ValueError("diffusion noise view disagrees with its declared representation")
+    for index, seed in enumerate(seeds):
+        generator = torch.Generator(device=noise_device).manual_seed(int(seed))
+        for modality in spec.modalities:
+            out[modality.name][index].normal_(generator=generator)
 
 
 def _splitmix_coordinate(seed: int, coordinate: int) -> int:
@@ -137,7 +159,7 @@ __all__ = [
     "DRAW_LAYOUT_PROPOSAL",
     "DRAW_LAYOUT_TARGET",
     "flow_noise_seed",
-    "normal_noise",
+    "diffusion_noise",
     "philox4x32_10",
     "sampling_key",
     "sampling_uniform",

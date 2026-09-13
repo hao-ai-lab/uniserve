@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import ExitStack
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 import torch
@@ -11,9 +12,24 @@ from ..foundation.resources import close_resources
 from .cuda_stream import verify_graph_context
 
 if TYPE_CHECKING:
-    from .forward_batch import ForwardBatch
+    from .batch import InputBatch
 
 T = TypeVar("T")
+
+
+def capture_pools(devices: Iterable[torch.device]) -> dict[torch.device, torch.cuda.MemPool]:
+    """Own each additional capture device's allocator backing on that device.
+
+    MemPool's lifetime reference belongs to the CUDA device selected at its
+    construction. Allocation routing must use that same device to keep captured
+    intermediate addresses reserved after the routing scope exits.
+    """
+
+    pools = {}
+    for device in dict.fromkeys(devices):
+        with torch.cuda.device(device):
+            pools[device] = torch.cuda.MemPool()
+    return pools
 
 
 class GraphExecutionError(RuntimeError):
@@ -27,6 +43,8 @@ class CudaGraph(Generic[T]):
     every invocation, including failures. Replay uses the caller's stream.
     The owner must order output consumers before replay and drain GPU use before
     close. Shared pool identities belong to that owner's serial reuse domain.
+    Calls spanning GPUs require a pool for every additional device, constructed
+    by capture_pools. Concurrent calls must use distinct pools on every device.
     """
 
     def __init__(
@@ -36,15 +54,19 @@ class CudaGraph(Generic[T]):
         stream: torch.cuda.Stream,
         pool: Any = None,
         expected_context: int | None = None,
+        device_pools: Mapping[torch.device, torch.cuda.MemPool] | None = None,
     ) -> None:
         self.device = device
         self.stream = stream
         self.pool = pool
         self.expected_context = expected_context
+        self.device_pools = dict(device_pools or {})
+        if self.device in self.device_pools:
+            raise ValueError("the capture device already uses the graph's primary pool")
         self.graph: torch.cuda.CUDAGraph | None = None
         self.output: T | None = None
         self.keepalive: tuple[object, ...] = ()
-        self.inputs: ForwardBatch | tuple[torch.Tensor, ...] | None = None
+        self.inputs: InputBatch | tuple[torch.Tensor, ...] | None = None
         # Exact input copies and paged-attention replanning borrow these fixed
         # addresses until graph teardown. Empty input leaves denote input views
         # already staged in the owner's reusable InputBuffers.
@@ -71,7 +93,16 @@ class CudaGraph(Generic[T]):
         self.stream.wait_stream(current)
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         try:
-            with torch.cuda.device(self.device), torch.cuda.stream(self.stream):
+            with (
+                ExitStack() as allocations,
+                torch.cuda.device(self.device),
+                torch.cuda.stream(self.stream),
+            ):
+                # PyTorch's graph owns allocation backing on its capture device.
+                # Other devices retain explicit pools through the same executable
+                # lifetime, including intermediates freed during Python capture.
+                for device, pool in self.device_pools.items():
+                    allocations.enter_context(torch.cuda.use_mem_pool(pool, device))
                 for _ in range(2):
                     try:
                         forward()
@@ -99,6 +130,7 @@ class CudaGraph(Generic[T]):
         finally:
             current.wait_stream(self.stream)
         self.graph = graph
+        self.pool = graph.pool()
         self.output = output
         self.keepalive = (forward, *keepalive)
 
@@ -130,3 +162,4 @@ class CudaGraph(Generic[T]):
             self.attention_leaves = ()
             self.releases = ()
             self.pool = None
+            self.device_pools.clear()

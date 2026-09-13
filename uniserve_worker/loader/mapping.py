@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # Each rule maps an installed path segment, a checkpoint path segment, and a packed shard.
-WeightNameMap = tuple[tuple[str, str, str | int], ...]
+WeightNameMap = tuple[tuple[str, str, str | int | None], ...]
 
 __all__ = ["LoadReport", "WeightNameMap", "stacked_weight_name"]
 

@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 from collections.abc import Callable
 
-from ..forward_batch import ForwardBatch, ForwardOutput
+from ..batch import ExecutionOutput, InputBatch
 from ..input_buffers import InputBuffers
 from .prefill import stage_text
 
@@ -20,7 +20,7 @@ def prepare_decode(
     runner: ModelRunner,
     entry: ModelEntry,
     buffers: InputBuffers,
-    forward: Callable[[ForwardBatch], ForwardOutput],
+    forward: Callable[[InputBatch], ExecutionOutput],
     *,
     packed: bool,
 ) -> None:

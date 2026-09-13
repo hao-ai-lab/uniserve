@@ -8,7 +8,7 @@ from threading import RLock
 import torch
 
 from ..foundation.errors import resource_error
-from ..models.video import VideoOutputGeometry
+from ..modeling.geometry import VideoShape
 
 
 class MediaBuffers:
@@ -20,7 +20,7 @@ class MediaBuffers:
         state_slots: int,
         unresolved_window: int,
         max_video_frames_per_round: int,
-        max_geometry: VideoOutputGeometry,
+        max_geometry: VideoShape,
     ) -> None:
         """Allocate bounded video and audio tensors with independent free-slot queues."""
 

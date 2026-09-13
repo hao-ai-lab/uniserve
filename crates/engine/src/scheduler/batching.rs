@@ -401,9 +401,6 @@ impl Scheduler {
                 | PipelineStage::AudioEncoding
                 | PipelineStage::Muxing,
             )) => 2,
-            Some(Computation::Forward(ForwardMode::Mixed)) => {
-                unreachable!("scheduler selects individual forward computations")
-            }
             Some(
                 Computation::Pipeline(PipelineStage::LatentPreparation)
                 | Computation::Transfer(TransferMode::Tensor)

@@ -19,8 +19,8 @@ from .catalog import resolve_catalog_entry
 def inspect_model(model: str, *, download: bool = False, revision: str | None = None) -> dict:
     """Resolve catalog metadata and validate the H3 variant without GPU weights."""
 
-    from ..models.minimax_h3.config import FASTH3_MODEL_ID, FASTH3_REVISION, resolve_h3_contract
-    from ..models.minimax_h3.weights import require_h3_checkpoint
+    from ..models.minimax_h3.config import FASTH3_MODEL_ID, FASTH3_REVISION, h3_contract
+    from .metadata import h3_metadata
 
     if model == FASTH3_MODEL_ID and revision is None:
         revision = FASTH3_REVISION
@@ -46,8 +46,10 @@ def inspect_model(model: str, *, download: bool = False, revision: str | None = 
         )
     contract = None
     if entry.architecture == "MiniMaxH3Transformer3DModel":
-        require_h3_checkpoint(root)
-        contract = resolve_h3_contract(root)
+        contract = h3_contract(h3_metadata(root)["inference"])
+        # Only a hub snapshot directory establishes revision provenance. A
+        # local checkpoint retains its manifest's declared content identity.
+        contract["revision"] = root.name if root.parent.name == "snapshots" else None
         if repository and download:
             root = Path(snapshot_download(repository, revision=root.name))
     return {

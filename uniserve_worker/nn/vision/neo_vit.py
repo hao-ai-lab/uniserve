@@ -7,6 +7,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from ...modeling.components import Call
+from ...modeling.geometry import MediaShape
+from ...modeling.resources import TensorNeeds, TensorSchema
 from ..rope import RotaryEmbedding, apply_rotary_emb
 from .patching import build_abs_positions_from_grid_hw
 
@@ -62,6 +65,21 @@ class NeoVitEncoder(nn.Module):
         # Reuse the shared RotaryEmbedding so the inv_freq / cos-sin construction has a
         # single owner; dim is hidden//2 because the head is split into x/y halves.
         self.rope = RotaryEmbedding(dim=hidden // 2, theta=theta)
+
+    def tensor_specs(self, call: Call, shape: MediaShape) -> TensorNeeds:
+        """Declare language features after dense spatial downsampling."""
+
+        if call is not Call.ENCODE_VISION:
+            raise ValueError("NEO patch features require vision encoding")
+        stride = self.patch_size * self.downsample_factor
+        rows = shape.height // stride * (shape.width // stride)
+        return TensorNeeds(
+            outputs={
+                "features": TensorSchema(
+                    (rows, self.dense_embedding.out_channels), self.dense_embedding.weight.dtype
+                )
+            }
+        )
 
     def forward(
         self,

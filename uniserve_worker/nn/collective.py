@@ -33,14 +33,21 @@ class StreamCollectives(Protocol):
     def close(self) -> None: ...
 
 
-_STREAM_COLLECTIVES: ContextVar[Mapping[str, StreamCollectives]] = ContextVar(
-    "stream_collectives", default={}
+_STREAM_COLLECTIVES: ContextVar[Mapping[str, StreamCollectives] | None] = ContextVar(
+    "stream_collectives", default=None
 )
 
 
 @contextmanager
-def stream_collective_scope(bindings: Mapping[str, StreamCollectives]) -> Iterator[None]:
-    """Use the runner's communication resources for this numerical invocation."""
+def stream_collective_scope(
+    bindings: Mapping[str, StreamCollectives] | None,
+) -> Iterator[None]:
+    """Select communication resources for one numerical invocation.
+
+    ``None`` selects initialized process-group communication on an ordinary
+    device stream. A mapping selects explicit stream bindings and must cover
+    every used communicator, including when that mapping is empty.
+    """
 
     token = _STREAM_COLLECTIVES.set(bindings)
     try:
@@ -50,9 +57,20 @@ def stream_collective_scope(bindings: Mapping[str, StreamCollectives]) -> Iterat
 
 
 def stream_collectives(group_name: str) -> StreamCollectives | None:
-    """Return the explicitly bound provider, or the default process-group binding."""
+    """Resolve a stream provider, rejecting incomplete explicit execution bindings.
 
-    return _STREAM_COLLECTIVES.get().get(group_name)
+    An unscoped numerical caller may use the initialized process group. Once a
+    caller selects an explicit stream scope, every used group must belong to it;
+    falling back would enqueue communication on a different execution stream.
+    """
+
+    bindings = _STREAM_COLLECTIVES.get()
+    if bindings is None:
+        return None
+    try:
+        return bindings[group_name]
+    except KeyError:
+        raise RuntimeError(f"stream scope has no binding for communicator {group_name!r}") from None
 
 
 class SumReduction(Protocol):

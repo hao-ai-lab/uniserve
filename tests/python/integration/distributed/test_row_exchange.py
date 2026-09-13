@@ -9,6 +9,7 @@ from uniserve_worker.bootstrap.distributed import (
     initialize_process_groups,
 )
 from uniserve_worker.nn.attention import RadixAttention
+from uniserve_worker.nn.layer import LayerConfig
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.nn.parallel_attention import (
     AttentionRowExchange,
@@ -16,6 +17,7 @@ from uniserve_worker.nn.parallel_attention import (
     ParallelAttention,
 )
 from uniserve_worker.nn.parallel_sequence import SequencePartition
+from uniserve_worker.nn.video_attention import VideoAttention
 from uniserve_worker.runtime.attention_storage import allocate_attention_exchange_storage
 from uniserve_worker.runtime.tensor_buffers import TensorBuffers, TensorSchema
 
@@ -38,26 +40,38 @@ def _run_exchange(rank: int, rendezvous: str) -> None:
         {"ordered": ((0, 1), parallel), "reversed": ((1, 0), parallel)},
     )
     try:
-        for shape, mesh, mode in (
-            (shape, mesh, mode)
+        for shape, mesh, mode, precision in (
+            (shape, mesh, mode, precision)
             for shape in ((64, 4, 128), (32784, 16, 128))
             for mesh in meshes.values()
             for mode in ("whole", "chunked", "produced")
+            for precision in ("bf16", "fp8", "nvfp4")
         ):
             group = mesh.get_group("ulysses")
             attention = ParallelAttention(mesh=mesh)
-            storage = TensorBuffers.allocate(
-                {
-                    name: TensorSchema(
-                        (shape[0] * 2, *shape[1:]) if name == "incoming" else shape,
-                        torch.bfloat16,
-                        memory="symmetric",
-                        group=group,
-                    )
-                    for name in ("outgoing", "incoming", "staging")
-                },
-                device,
+            # Requirements are numerical declarations and do not need learned
+            # weights. The wider attention domain makes BF16 return rows larger
+            # than quantized input rows, exercising both uses of the backing.
+            layer = VideoAttention(
+                shape[1] * group.world_size * shape[2] * 3 // 4,
+                shape[1] * group.world_size,
+                shape[2],
+                mesh=mesh,
+                norm_eps=1e-5,
+                linear_precision=precision,
+                layer_config=LayerConfig(mesh.get_group("tp"), None, "attention"),
+                device="meta",
             )
+            requirement = layer.tensor_specs(shape[0], shape[0], dtype=torch.bfloat16)
+            incoming_spec = requirement.scratch["attention_workspace"]
+            schema = {
+                name: TensorSchema(shape, torch.bfloat16, memory="symmetric", group=group)
+                for name in ("outgoing", "staging")
+            }
+            schema["incoming"] = TensorSchema(
+                incoming_spec.shape, incoming_spec.dtype, memory="symmetric", group=group
+            )
+            storage = TensorBuffers.allocate(schema, device)
             outgoing, incoming = (storage.capacity[name] for name in ("outgoing", "incoming"))
             staging = storage.capacity["staging"]
             rows = (torch.arange(outgoing.numel(), device=device) % 13).view(shape)
@@ -102,7 +116,8 @@ def _run_exchange(rank: int, rendezvous: str) -> None:
                 rtol=0,
                 atol=0,
                 msg=lambda message: (
-                    f"rank={rank}, members={group.ranks}, shape={shape}, mode={mode}\n{message}"
+                    f"rank={rank}, members={group.ranks}, shape={shape}, mode={mode}, "
+                    f"precision={precision}\n{message}"
                 ),
             )
             graph.reset()
@@ -143,17 +158,19 @@ def _run_head_rows(rank, rendezvous):
                         .bfloat16()
                     )
                     local = partition.local(complete).clone()
-                    storage = allocate_attention_exchange_storage(
+                    storage_owner = allocate_attention_exchange_storage(
                         (RadixAttention(4, kv_heads, 128, sequence=partition.group),),
                         max_tokens=max(19, rows),
                         dtype=torch.bfloat16,
-                    )[partition.group]
+                    )
+                    storage = storage_owner.views[partition.group]
 
-                    independent_storage = allocate_attention_exchange_storage(
+                    independent_owner = allocate_attention_exchange_storage(
                         (RadixAttention(4, kv_heads, 128, sequence=partition.group),),
                         max_tokens=max(19, rows),
                         dtype=torch.bfloat16,
-                    )[partition.group]
+                    )
+                    independent_storage = independent_owner.views[partition.group]
 
                     def execute(storage=storage):
                         prepared = HeadRowPreparation(attention, partition, storage)

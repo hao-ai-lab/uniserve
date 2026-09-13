@@ -26,7 +26,7 @@ impl RequestKey {
     }
 }
 
-/// The numerical mode of an autoregressive or mixed model forward.
+/// The numerical mode of an autoregressive model forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -34,18 +34,16 @@ pub enum ForwardMode {
     Prefill,
     Decode,
     Verify,
-    Mixed,
 }
 
 impl ForwardMode {
-    pub const ALL: [Self; 4] = [Self::Prefill, Self::Decode, Self::Verify, Self::Mixed];
+    pub const ALL: [Self; 3] = [Self::Prefill, Self::Decode, Self::Verify];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Prefill => "prefill",
             Self::Decode => "decode",
             Self::Verify => "verify",
-            Self::Mixed => "mixed",
         }
     }
 }
@@ -508,10 +506,6 @@ impl ScheduledRequest {
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish operation identity, family, lineage, and declared capacity.
         ensure_valid!(self.op_id.batch_id > 0, "operation id must be positive");
-        ensure_valid!(
-            self.code != Computation::Forward(ForwardMode::Mixed),
-            "mixed forward mode requires a model batch, not an individual computation"
-        );
         ensure_valid!(!self.entry.is_empty(), "operation entry must not be empty");
 
         ensure_valid!(

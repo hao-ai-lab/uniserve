@@ -642,9 +642,6 @@ fn batch_kind(operation_variant: Computation) -> BatchKind {
         | Computation::Transfer(TransferMode::Tensor)
         | Computation::Transfer(TransferMode::KvPublish)
         | Computation::Transfer(TransferMode::KvInstall) => BatchKind::Media,
-        Computation::Forward(ForwardMode::Mixed) => {
-            unreachable!("scheduler selects individual forward computations")
-        }
     }
 }
 

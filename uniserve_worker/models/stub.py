@@ -7,24 +7,26 @@ request coordinates. Its fixed token cycle makes scheduler outcomes reproducible
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.protocol.batch import COMPUTATIONS
+from uniserve_worker.modeling.geometry import CacheGeometry, MediaShape, Shape
+from uniserve_worker.modeling.tensors import AttentionMode, PositionLayout, TokenSelection
 
-from ..bootstrap.capacity import (
-    DEFAULT_BLOCK_SIZE,
-    DEFAULT_MAX_BATCH_OPS,
-    DEFAULT_MAX_REQUEST_POOL_SIZE,
+from ..modeling.batch import (
+    DiffusionBatch,
+    EncodeBatch,
+    TensorOutput,
+    TextBatch,
+    TextOutput,
 )
-from ..execution.forward_batch import (
-    AttentionSelection,
-    ForwardBatch,
-    ForwardOutput,
-    TokenSelection,
-)
-from ..models.generation import BranchSource, GenerationPipeline, LatentLayout, Materialization
-from ..models.inputs import (
+from ..modeling.components import Call, CallSpec, ComponentSpec
+from ..modeling.decoder import DecoderMixin
+from ..modeling.diffusion import DiffusionMixin
+from ..modeling.encoder import EncodeKind, EncoderMixin
+from ..modeling.image_diffusion import BranchSource, ImageDiffusion, LatentLayout
+from ..modeling.inputs import (
     FeatureInjection,
     FeatureLayout,
     ImageProcessor,
@@ -32,19 +34,17 @@ from ..models.inputs import (
     StrideResize,
     TowerTransform,
 )
-from ..models.runtime import (
-    CacheGeometry,
-    ExecutionModel,
-    PositionLayout,
-    ResourceGeometry,
-)
+from ..modeling.model import Model
+from ..modeling.resources import TensorNeeds, TensorSchema
+from ..modeling.tensors import TensorViews, VocabularyPartition
+from ..modeling.text import TextMixin
+from ..nn.attention import CacheWrite
 from ..nn.diffusion.cfg import CfgRecipe
 from ..nn.diffusion.schedule import ScheduleDirection, ScheduleShiftDomain
-from ..runtime.kv_cache import KVCache
+from ..nn.vae.patch import RgbDecoder
 
 STUB_EOS_TOKEN_ID = 151645
 STUB_IMG_START_TOKEN_ID = 151670
-STUB_NUM_BLOCKS = 4096
 STUB_NUM_LAYERS = 1
 STUB_MAX_LATENT_SIZE = 1024
 STUB_LATENT_DOWNSAMPLE = 16
@@ -55,44 +55,52 @@ __all__ = [
     "STUB_EOS_TOKEN_ID",
     "STUB_IMG_START_TOKEN_ID",
     "StubModel",
-    "stub_worker_config",
 ]
 
 
-def stub_worker_config(
-    block_size: int = DEFAULT_BLOCK_SIZE,
-    *,
-    max_batch_operations: int = DEFAULT_MAX_BATCH_OPS,
-    max_batch_tokens: int,
-) -> WorkerConfig:
-    """Build the single-device worker_config geometry required by ``StubModel``."""
+@dataclass(frozen=True, slots=True)
+class StubConfig:
+    """Logical replicas of the deterministic numerical graph."""
 
-    return WorkerConfig(
-        device="cpu",
-        rank=0,
-        world_size=1,
-        block_size=int(block_size),
-        kv_token_capacity=int(block_size) * STUB_NUM_BLOCKS,
-        attention_backend="torch_sdpa",
-        model_dtype="bfloat16",
-        kv_cache_dtype=None,
-        kv_memory_fraction=1.0,
-        max_batch_operations=int(max_batch_operations),
-        max_batch_tokens=int(max_batch_tokens),
-        max_request_pool_size=DEFAULT_MAX_REQUEST_POOL_SIZE,
-        generation_device=None,
-    )
+    components: tuple[str, ...] = ("model",)
 
 
-class StubModel(ExecutionModel):
+class StubModel(TextMixin, EncoderMixin, DiffusionMixin, DecoderMixin, Model):
     """Implements every execution route with deterministic coordinate-derived output."""
 
     architectures = ("UniServeStubForUnifiedGeneration",)
+    dtype = torch.bfloat16
 
-    def __init__(self) -> None:
-        """Declare fixed feature, cache, diffusion, and scheduling capabilities."""
+    @property
+    def vocabulary(self) -> VocabularyPartition:
+        """Describe the complete unpadded deterministic vocabulary."""
 
-        super().__init__()
+        return VocabularyPartition(self.vocab_size, self.vocab_size, 0, (0,), None)
+
+    @classmethod
+    def components(cls, config: object) -> tuple[ComponentSpec, ...]:
+        """Declare the numerical calls sharing this model graph."""
+
+        if not isinstance(config, StubConfig):
+            raise TypeError("simulation components require numerical model configuration")
+        return tuple(
+            ComponentSpec(
+                name,
+                (
+                    CallSpec(Call.TEXT),
+                    CallSpec(Call.DIFFUSION),
+                    CallSpec(Call.ENCODE_VISION),
+                    CallSpec(Call.ENCODE_LATENT),
+                    CallSpec(Call.DECODE_IMAGE),
+                ),
+            )
+            for name in config.components
+        )
+
+    def __init__(self, config: StubConfig = StubConfig()) -> None:
+        """Declare fixed numerical feature, cache, and diffusion geometry."""
+
+        super().__init__(config)
         self.architecture = "UniServeStubForUnifiedGeneration"
 
         # Feature transforms match the shape contracts of vision and VAE routes.
@@ -132,7 +140,7 @@ class StubModel(ExecutionModel):
         )
 
         # Deterministic zero velocity keeps the diffusion route stable at every point.
-        self.generation = GenerationPipeline(
+        self.generation = ImageDiffusion(
             latent_downsample=STUB_LATENT_DOWNSAMPLE,
             prediction="velocity",
             prediction_dtype="bfloat16",
@@ -140,240 +148,164 @@ class StubModel(ExecutionModel):
             schedule_shift_domain=ScheduleShiftDomain.TIME,
             max_latent_tokens=STUB_MAX_LATENT_SIZE,
             max_vae_grid_tokens=STUB_MAX_LATENT_SIZE,
-            commit_marker_tokens=2,
+            marker_tokens=2,
             rope_advance=2,
             max_cfg_branches=3,
             latent_layout=LatentLayout.IMAGE_NCHW,
             latent_channels=3,
             latent_patch_size=STUB_LATENT_DOWNSAMPLE,
             positions=PositionLayout.TEMPORAL_SPATIAL,
-            materialization=Materialization.RGB_LATENT,
             text_unconditional=BranchSource.START,
             image_unconditional=BranchSource.START,
             cfg_recipe=CfgRecipe.ADDITIVE_DELTAS,
         )
-        self.resource_geometry = ResourceGeometry(
-            encoder_cache_entries=1024,
-            latent_downsample=STUB_LATENT_DOWNSAMPLE,
-        )
+        self.image_decoder = RgbDecoder(STUB_LATENT_DOWNSAMPLE)
         self.max_vit_grid_tokens = STUB_MAX_LATENT_SIZE
-        self.supported_work = frozenset(COMPUTATIONS)
         self.vocab_size = _STUB_VOCAB_SIZE
         self.hidden_size = _STUB_HIDDEN_SIZE
         self.text_max_tokens = STUB_MAX_LATENT_SIZE
         self.text_topology = ("tp",)
-        self.tensorized_mixed = True
-        self._cache_pool: KVCache | None = None
+        self.text_attention_mode = AttentionMode.PACKED
+        self.cache_write = CacheWrite()
 
-    def bind_cache_pool(
-        self,
-        kv_cache: KVCache,
-        selection: AttentionSelection,
-    ) -> None:
-        """Bind the physical cache that receives deterministic forward writes."""
+    @property
+    def text_pipeline(self) -> None:
+        return None
 
-        del selection
-        self._cache_pool = kv_cache
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed integer coordinates in the simulator's four-channel feature space."""
+
+        coordinates = input_ids.reshape(-1).to(torch.bfloat16)
+        return torch.stack(
+            (
+                coordinates,
+                coordinates.remainder(17),
+                coordinates.remainder(31),
+                torch.ones_like(coordinates),
+            ),
+            dim=-1,
+        )
 
     @torch.inference_mode()
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
+        self, batch: TextBatch, *, constants: TensorViews, scratch: TensorViews
     ) -> torch.Tensor:
-        """Build deterministic hidden rows and record one zero KV value per query."""
+        """Encode temporal coordinates while writing deterministic KV values."""
 
-        query_tokens = sum(forward_batch.attention.query_lens_cpu)
-        device = positions.device
-        if query_tokens < 1:
-            raise ValueError("stub text/denoise forward requires query tokens")
-        kv = torch.zeros((query_tokens, 1, 1), dtype=torch.bfloat16, device=device)
-        if self._cache_pool is None:
-            raise RuntimeError("stub model has no bound physical cache")
-        self._cache_pool.write_locations(0, forward_batch.attention.out_cache_loc, kv, kv)
-
-        # Token rows encode temporal position into four predictable hidden channels.
-        chunks: list[torch.Tensor | None] = [None] * forward_batch.row_count
-        token_offset = 0
-        for row_index, count in zip(
-            forward_batch.token_row_indices,
-            tuple(
-                forward_batch.attention.query_lens_cpu[index]
-                for index in forward_batch.token_row_indices
-            ),
-            strict=True,
-        ):
-            row_positions = positions[..., token_offset : token_offset + count]
-            temporal = row_positions.reshape(-1) if row_positions.ndim == 1 else row_positions[0]
-            temporal = temporal.to(torch.bfloat16)
-            chunks[row_index] = torch.stack(
-                (
-                    temporal,
-                    temporal.remainder(17),
-                    temporal.remainder(31),
-                    torch.ones_like(temporal),
-                ),
-                dim=-1,
+        query_tokens = sum(batch.attention.query_lens_cpu)
+        kv = torch.zeros((query_tokens, 1, 1), dtype=torch.bfloat16, device=batch.positions.device)
+        self.cache_write(batch.attention.out_cache_loc, kv, kv)
+        temporal = batch.positions if batch.positions.ndim == 1 else batch.positions[0]
+        hidden = self.embed_input_ids(temporal[:query_tokens])
+        if batch.inputs_embeds is not None:
+            assert batch.embedding_mask is not None
+            hidden = torch.where(
+                batch.embedding_mask[:query_tokens].reshape(-1, 1),
+                batch.inputs_embeds[:query_tokens].to(hidden.dtype),
+                hidden,
             )
-            token_offset += count
+        return hidden
 
-        # Flow rows share the packed forward boundary but deliberately carry zero state.
-        for flow_index, row_index in enumerate(forward_batch.flow_row_indices):
-            count = int(forward_batch.flow_image_tokens[flow_index])
-            chunks[row_index] = torch.zeros(
-                (count, _STUB_HIDDEN_SIZE),
-                dtype=torch.bfloat16,
-                device=device,
-            )
-        if any(chunk is None for chunk in chunks):
-            raise RuntimeError("stub forward batch contains an unbound row")
-        return torch.cat(tuple(chunk for chunk in chunks if chunk is not None), dim=0)
+    def compute_logits(self, hidden: torch.Tensor, batch: TextBatch) -> TextOutput:
+        """Select deterministic successor logits or the supplied hidden rows."""
 
-    def project(self, hidden: torch.Tensor, forward_batch: ForwardBatch) -> ForwardOutput:
-        """Project rows into deterministic logits, hidden states, or zero velocity."""
-
-        # Split the packed hidden matrix back into scheduler row order.
-        row_lengths = [0] * forward_batch.row_count
-        for row_index, count in zip(
-            forward_batch.token_row_indices,
-            tuple(
-                forward_batch.attention.query_lens_cpu[index]
-                for index in forward_batch.token_row_indices
-            ),
-            strict=True,
-        ):
-            row_lengths[row_index] = count
-        for row_index, count in zip(
-            forward_batch.flow_row_indices,
-            forward_batch.flow_image_tokens,
-            strict=True,
-        ):
-            row_lengths[row_index] = count
-        rows: list[torch.Tensor] = []
-        offset = 0
-        for count in row_lengths:
-            rows.append(hidden[offset : offset + count])
-            offset += count
-
-        # Input token slices determine the single high-logit successor in each row.
-        token_ids: dict[int, torch.Tensor] = {}
-        token_offset = 0
-        if forward_batch.input_ids is not None:
-            for row_index, count in zip(
-                forward_batch.token_row_indices,
-                tuple(
-                    forward_batch.attention.query_lens_cpu[index]
-                    for index in forward_batch.token_row_indices
-                ),
-                strict=True,
-            ):
-                token_ids[row_index] = forward_batch.input_ids[token_offset : token_offset + count]
-                token_offset += count
-        selections = dict(
-            zip(
-                forward_batch.token_row_indices,
-                forward_batch.token_selections,
-                strict=True,
-            )
-        )
-        flow_rows = set(forward_batch.flow_row_indices)
-
-        # Token rows share one projection allocation, matching the packed
-        # vocabulary contract used by graph-captured greedy selection.
+        lengths = batch.attention.query_lens_cpu
+        rows = hidden[: sum(lengths)].split(lengths)
+        token_rows = batch.input_ids[: sum(lengths)].split(lengths)
         logit_rows = sum(
-            1 if selection is TokenSelection.LAST_LOGITS else row_lengths[index]
-            for index, selection in selections.items()
+            1 if selection is TokenSelection.LAST_LOGITS else count
+            for selection, count in zip(batch.selections, lengths, strict=True)
             if selection is not TokenSelection.HIDDEN
         )
-        logits_storage = torch.full(
-            (logit_rows, _STUB_VOCAB_SIZE),
-            -16.0,
-            dtype=torch.bfloat16,
-            device=hidden.device,
+        storage = torch.full(
+            (logit_rows, _STUB_VOCAB_SIZE), -16.0, dtype=torch.bfloat16, device=hidden.device
         )
-        logit_offset = 0
-
-        # Preserve heterogeneous output order across token and diffusion rows.
-        outputs: list[torch.Tensor] = []
-        for row_index, row_hidden in enumerate(rows):
-            selection = selections.get(row_index)
+        offset = 0
+        outputs = []
+        for row, ids, selection in zip(rows, token_rows, batch.selections, strict=True):
             if selection is TokenSelection.HIDDEN:
-                outputs.append(row_hidden)
-            elif selection is not None:
-                ids = token_ids[row_index]
-                targets = _next_tokens(ids)
-                if selection is TokenSelection.LAST_LOGITS:
-                    targets = targets[-1:]
-                count = int(targets.numel())
-                logits = logits_storage[logit_offset : logit_offset + count]
-                logit_offset += count
-                logits.scatter_(1, targets.reshape(-1, 1), 16.0)
-                outputs.append(logits)
-            elif row_index in flow_rows:
-                flow_index = forward_batch.flow_row_indices.index(row_index)
-                outputs.append(
-                    torch.zeros_like(forward_batch.flow_latents[flow_index], dtype=torch.bfloat16)
+                outputs.append(row)
+                continue
+            targets = _next_tokens(ids)
+            if selection is TokenSelection.LAST_LOGITS:
+                targets = targets[-1:]
+            count = targets.numel()
+            logits = storage[offset : offset + count]
+            offset += count
+            logits.scatter_(1, targets.reshape(-1, 1), 16.0)
+            outputs.append(logits)
+        return TextOutput(tuple(outputs))
+
+    def forward_diffusion(
+        self,
+        batch: DiffusionBatch,
+        *,
+        state: TensorViews,
+        constants: TensorViews,
+        scratch: TensorViews,
+    ) -> TensorOutput:
+        """Return zero velocity for each independent latent row."""
+
+        return TensorOutput(
+            {
+                "image": tuple(
+                    torch.zeros_like(latent, dtype=torch.bfloat16)
+                    for latent in batch.latents["image"]
                 )
-            else:
-                raise RuntimeError("stub output row has no concrete phase")
-        return ForwardOutput(tuple(outputs))
+            }
+        )
+
+    encoder_kinds: frozenset[EncodeKind] = frozenset({"vision", "latent"})
+
+    def tensor_specs(self, call: Call, shape: Shape) -> TensorNeeds:
+        """Declare deterministic features and uncompressed BF16 image latents."""
+
+        if call not in {Call.ENCODE_VISION, Call.ENCODE_LATENT}:
+            return super().tensor_specs(call, shape)
+        if not isinstance(shape, MediaShape) or shape.frames != 1:
+            raise ValueError("simulation image encoding requires single-frame geometry")
+        if call is Call.ENCODE_LATENT:
+            return TensorNeeds(
+                outputs={"latents": TensorSchema((1, 3, shape.height, shape.width), torch.bfloat16)}
+            )
+        # A supplied patch grid produces per-patch features; a whole numerical
+        # image without a grid produces one pooled feature within this bound.
+        rows = max(1, shape.height // 16 * (shape.width // 16))
+        return TensorNeeds(
+            outputs={
+                "features": TensorSchema(
+                    (rows, self.hidden_size), torch.bfloat16, variable_axes=(0,)
+                )
+            }
+        )
 
     def encode(
-        self,
-        pixels: tuple[torch.Tensor, ...],
-        batch: ForwardBatch,
-    ) -> ForwardOutput:
-        """Reduce staged pixels into fixed-width deterministic feature rows."""
+        self, kind: EncodeKind, batch: EncodeBatch, *, constants: TensorViews, scratch: TensorViews
+    ) -> TensorOutput:
+        """Compute deterministic vision features or BF16 image latents."""
 
-        outputs: list[torch.Tensor] = []
-        for value, grid in zip(pixels, batch.encode_grids, strict=True):
+        if kind == "latent":
+            return TensorOutput(
+                {
+                    "latents": tuple(
+                        value.to(torch.bfloat16).unsqueeze(0)
+                        if value.ndim == 3
+                        else value.to(torch.bfloat16)
+                        for value in batch.values
+                    )
+                }
+            )
+        if kind != "vision":
+            raise ValueError(f"unsupported encoder kind {kind!r}")
+        outputs = []
+        for value, grid in zip(batch.values, batch.grids, strict=True):
             typed = value.to(torch.bfloat16)
             if grid is not None:
                 features = typed.mean(dim=-1, keepdim=True).repeat(1, _STUB_HIDDEN_SIZE)
             else:
                 features = typed.mean().reshape(1, 1).repeat(1, _STUB_HIDDEN_SIZE)
             outputs.append(features)
-        return ForwardOutput(tuple(outputs))
-
-    def encoder_latent(
-        self,
-        pixels: tuple[torch.Tensor, ...],
-        batch: ForwardBatch,
-    ) -> ForwardOutput:
-        """Cast image values into the latent route's batched BF16 contract."""
-
-        del batch
-        return ForwardOutput(
-            tuple(
-                value.to(torch.bfloat16).unsqueeze(0)
-                if value.ndim == 3
-                else value.to(torch.bfloat16)
-                for value in pixels
-            )
-        )
-
-    def decode_latent(
-        self,
-        latents: tuple[torch.Tensor, ...],
-        batch: ForwardBatch,
-    ) -> ForwardOutput:
-        """Materialize zero RGB images at each row's requested output geometry."""
-
-        outputs = tuple(
-            torch.zeros(
-                (3, height, width),
-                dtype=torch.bfloat16,
-                device=latent.device,
-            )
-            for latent, height, width in zip(
-                latents,
-                batch.decode_heights,
-                batch.decode_widths,
-                strict=True,
-            )
-        )
-        return ForwardOutput(outputs)
+        return TensorOutput({"features": tuple(outputs)})
 
 
 def _next_token(token: int) -> int:

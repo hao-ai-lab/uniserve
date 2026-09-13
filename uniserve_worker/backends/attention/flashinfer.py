@@ -6,12 +6,15 @@ from typing import Any, NamedTuple
 
 import torch
 
+from .context import attention_binding
+
 __all__ = [
     "WrapperKey",
     "FlashInferAttentionBackend",
 ]
 
-from ...execution.forward_batch import AttentionMetadata, AttentionMode
+from uniserve_worker.modeling.tensors import AttentionMetadata, AttentionMode
+
 from .base import AttentionBackend
 from .flashinfer_kernels import (
     _decode_effective_seqlens,
@@ -183,7 +186,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         inputs = self._prepare_paged_decode_inputs(q, k_cache, v_cache, block_table, cache_seqlens)
         q_bhd = inputs.q_bhd
         plan = context
-        binding = getattr(plan, "binding", None)
+        binding = attention_binding()
         current_tokens = self._maybe_write_decode_token(
             k_cache,
             v_cache,
@@ -381,9 +384,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         )
 
         plan = context
-        binding = getattr(plan, "binding", None)
-        # Binding-identity routing: a forward whose context carries a graph
-        # binding runs on that graph's exclusive wrapper (so the
+        binding = attention_binding()
+        # The execution scope selects the graph's exclusive wrapper (so the
         # capture warmup plans it and the capture bakes only its ``run``); all
         # other forwards keep the shared prefill wrapper.
         graph_wrapper = self._prefill_graph_wrapper_for_binding(binding)

@@ -109,7 +109,11 @@ class TensorBuffers:
         shape_key: Hashable,
         shapes: Mapping[str, tuple[int, ...]],
     ) -> Mapping[str, torch.Tensor]:
-        """Bind a shape key to validated views that share the storage’s fixed backing tensors."""
+        """Borrow a call's named subset of the storage's fixed backing tensors.
+
+        Different computations can share one request allocation while receiving
+        only their declared fields. Each key retains one exact view geometry.
+        """
 
         cached = self._views.get(shape_key)
         if cached is not None:
@@ -120,14 +124,12 @@ class TensorBuffers:
             if requested != resident:
                 raise ValueError("bounded shape key was rebound with different view geometry")
             return cached
-        if set(shapes) != set(self._tensors):
-            missing = sorted(set(self._tensors) - set(shapes))
-            extra = sorted(set(shapes) - set(self._tensors))
-            raise ValueError(
-                f"bounded view fields do not match storage (missing={missing}, extra={extra})"
-            )
+        extra = shapes.keys() - self._tensors.keys()
+        if extra:
+            raise ValueError(f"bounded views have no backing for {sorted(extra)}")
         views: dict[str, torch.Tensor] = {}
-        for name, storage in self._tensors.items():
+        for name in shapes:
+            storage = self._tensors[name]
             shape = tuple(int(value) for value in shapes[name])
             if len(shape) != storage.ndim or any(value < 0 for value in shape):
                 raise ValueError(f"bounded view {name!r} has an invalid rank or extent")

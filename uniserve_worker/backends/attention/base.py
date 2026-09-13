@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import torch
 
-from ...execution.forward_batch import AttentionMetadata, AttentionMode
+from uniserve_worker.modeling.tensors import AttentionMetadata, AttentionMode
+
 from ..triton import triton_available
+from .context import capturing_attention
 
 try:  # pragma: no cover - availability depends on the serving environment.
     import triton
@@ -273,10 +275,7 @@ class AttentionBackend:
             if req.prefix_k is not None:
                 return (
                     self.supports(AttentionMode.PACKED)
-                    and (
-                        not bool(getattr(req.ctx, "cuda_graph_capture", False))
-                        or self.packed_cuda_graph
-                    )
+                    and (not capturing_attention() or self.packed_cuda_graph)
                     and self._paged_storage_supported(req)
                 )
             return type(self).forward_visible_end is not AttentionBackend.forward_visible_end

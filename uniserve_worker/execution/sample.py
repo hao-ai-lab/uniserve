@@ -9,8 +9,8 @@ from typing import cast
 import torch
 
 from uniserve_worker.backends.triton import triton_available
-from uniserve_worker.execution.forward_batch import packed_tensor_views
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.modeling.tensors import packed_tensor_views
 from uniserve_worker.protocol.batch import SamplingParams
 
 from ..nn.mesh import Communicator

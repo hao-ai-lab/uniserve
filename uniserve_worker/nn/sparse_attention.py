@@ -1,24 +1,28 @@
-"""Native media-shaped video sparse attention backend."""
+"""Sparse video attention mathematics over borrowed numerical buffers."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 
-from ...nn.parallel_attention import (
-    AttentionBuffers,
+from ..backends.attention.context import sparse_attention_provider
+from ..ops import video_sparse as video_sparse_ops
+from ..ops.video_sparse_rows import SparseAttentionPattern, pack_sparse_input_rows
+from .parallel_attention import (
     AttentionOutputTargets,
     AttentionRowExchange,
     ParallelAttention,
 )
-from ...ops import video_sparse as video_sparse_ops
-from ...ops.video_sparse_rows import SparseAttentionPattern, pack_sparse_input_rows
-from .video_sparse_provider import resolve_sparse_provider
+
+if TYPE_CHECKING:
+    from ..backends.attention.video_sparse_provider import SparseAttentionProvider
 
 __all__ = [
-    "VideoSparseAttentionBackend",
+    "SparseAttention",
+    "VideoSparseAttention",
     "VideoSparseAttentionMetadata",
     "VideoSparseAttentionWorkspace",
     "PreparedVideoSparseInputs",
@@ -46,6 +50,21 @@ class VideoSparseAttentionMetadata:
     valid_tiles: int
     valid_sizes: torch.Tensor
 
+    def __post_init__(self) -> None:
+        """Validate host-known tensor geometry before sparse kernels consume it."""
+
+        if self.padded_rows % (TILE * 2):
+            raise ValueError("video sparse attention requires an even tile-64 count")
+        if min(self.padded_rows, self.prefix_tiles, self.video_tiles) < 0 or (
+            self.valid_tiles != self.prefix_tiles + self.video_tiles
+            or self.valid_tiles > self.padded_rows // TILE
+        ):
+            raise ValueError("video sparse attention segments exceed their tile geometry")
+        if self.valid_sizes.shape != (self.padded_rows // TILE,) or (
+            self.valid_sizes.dtype != torch.int32
+        ):
+            raise ValueError("video sparse attention requires one int32 validity value per tile")
+
     def pattern(self, query_tiles: int, query_tile_offset: int = 0) -> SparseAttentionPattern:
         """Declare checkpoint selection cardinalities independently of its provider."""
 
@@ -67,7 +86,7 @@ class VideoSparseAttentionMetadata:
 
 @dataclass(frozen=True, slots=True)
 class VideoSparseAttentionWorkspace:
-    """Owns fixed intermediate buffers for pooled scoring, sparse selection, compression, and local compute."""
+    """Borrows fixed intermediate buffers for pooled scoring, sparse selection, compression, and local compute."""
 
     attention_output: torch.Tensor
     tile_scores: torch.Tensor
@@ -180,14 +199,16 @@ def build_video_sparse_metadata(
     )
 
 
-class VideoSparseAttentionBackend:
+class VideoSparseAttention:
     """Checkpoint VSA: sparse top-k attention plus trained dense compression."""
 
-    def __init__(self, metadata: VideoSparseAttentionMetadata) -> None:
-        """Bind immutable tile metadata and resolve the sparse attention kernel."""
+    def __init__(
+        self, metadata: VideoSparseAttentionMetadata, provider: SparseAttentionProvider
+    ) -> None:
+        """Borrow immutable tile metadata and an execution-bound numerical provider."""
 
         self.metadata = metadata
-        self.provider = resolve_sparse_provider(metadata.valid_sizes.device)
+        self.provider = provider
         self._patterns: dict[tuple[int, int], SparseAttentionPattern] = {}
 
     def _pattern_for(self, query_tiles: int, query_tile_offset: int = 0) -> SparseAttentionPattern:
@@ -378,21 +399,15 @@ class VideoSparseAttentionBackend:
         prefix_count: torch.Tensor,
         workspace: VideoSparseAttentionWorkspace,
         *,
-        outputs: tuple[torch.Tensor, ...],
-        sync_input: torch.Tensor,
-        sync_output: torch.Tensor,
-        context_workspace: AttentionBuffers | None,
         consume_row_intervals: bool = False,
         prepared_inputs: PreparedVideoSparseInputs | None = None,
     ) -> torch.Tensor | AttentionRowExchange:
         """Compose global sparse selection with shared head and context exchanges."""
 
+        context_workspace = parallel.context_buffers
         context = parallel.context_group
         group = parallel.ulysses_group
-        if len(outputs) != group.world_size:
-            raise ValueError("attention output destinations disagree with Ulysses membership")
-        if context.world_size > 1 and context_workspace is None:
-            raise ValueError("context attention requires transport storage")
+        outputs = parallel.output_views(query)
         if parallel.mapped:
             transport = context_workspace
             assert transport is not None
@@ -417,7 +432,7 @@ class VideoSparseAttentionBackend:
             owner_rows = key.shape[0] * (
                 parallel.col_group.world_size if parallel.col_group is not None else 1
             )
-            context_key, context_value = parallel.distribute_key_value(key, value, transport)
+            context_key, context_value = parallel.distribute_key_value(key, value)
             self.select_from_pooled(
                 valid_sizes,
                 prefix_key_indices,
@@ -449,11 +464,11 @@ class VideoSparseAttentionBackend:
                 query_tile_offset=start,
                 targets=AttentionOutputTargets(outputs, group.rank_in_group),
             )
-            parallel.finish_context(transport)
-            return parallel.finish_output(outputs, sync_input, sync_output)
+            parallel.finish_context()
+            return parallel.finish_output(outputs)
 
         query_tile_offset = context.rank_in_group * (query.shape[0] // TILE)
-        key, value = parallel.distribute_key_value(key, value, context_workspace)
+        key, value = parallel.distribute_key_value(key, value)
         local_output = (
             outputs[group.rank_in_group].view_as(query)
             if context.world_size == 1 and group.world_size > 1
@@ -520,7 +535,7 @@ class VideoSparseAttentionBackend:
             # The epilogue has consumed the sparse provider's output; its
             # registered buffer can now receive the head-to-row exchange.
             return AttentionRowExchange(parallel, local_output, workspace.attention_output)
-        return parallel.finish_output(outputs, sync_input, sync_output)
+        return parallel.finish_output(outputs)
 
     def forward_local(
         self,
@@ -629,3 +644,21 @@ class VideoSparseAttentionBackend:
             attention_output=workspace.attention_output,
             targets=targets,
         )
+
+
+class SparseAttention(torch.nn.Module):
+    """Compose sparse video attention using the caller's execution binding.
+
+    Geometry and workspace remain call inputs. The layer owns neither provider
+    plans nor backing storage, so the same weights can execute in distinct scopes.
+    """
+
+    def prepare(self, metadata: VideoSparseAttentionMetadata) -> VideoSparseAttention:
+        """Bind one invocation's geometry for reuse by its transformer blocks.
+
+        The returned computation borrows the active provider. Its Python pattern
+        cache contains only immutable tile cardinalities, never device scratch.
+        The caller must enter a sparse attention scope before preparing a call.
+        """
+
+        return VideoSparseAttention(metadata, sparse_attention_provider())

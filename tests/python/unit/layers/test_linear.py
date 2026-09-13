@@ -150,12 +150,12 @@ def test_multimodal_layers_keep_excluded_checkpoint_projections_dense(component)
             ),
         )
         dense_names = (
-            "layers.0.qkv_proj_moe_gen.weight",
+            "layers.0.flow_qkv.projection.weight",
             "layers.0.o_proj_moe_gen.weight",
             "layers.0.mlp_moe_gen.gate_up_proj.weight",
             "layers.0.mlp_moe_gen.down_proj.weight",
         )
-        quantized_names = ("layers.0.qkv_proj.weight", "layers.0.mlp.down_proj.weight")
+        quantized_names = ("layers.0.text_qkv.projection.weight", "layers.0.mlp.down_proj.weight")
     else:
         prefix = "vit_model.vision_model.encoder"
         ignored = (f"{prefix}.layers.0.self_attn.v_proj", f"{prefix}.layers.0.mlp.fc1")

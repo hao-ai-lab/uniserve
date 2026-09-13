@@ -2202,7 +2202,6 @@ fn forward_mode_to_fb(value: ForwardMode) -> fbs::ForwardMode {
         ForwardMode::Prefill => fbs::ForwardMode::Prefill,
         ForwardMode::Decode => fbs::ForwardMode::Decode,
         ForwardMode::Verify => fbs::ForwardMode::Verify,
-        ForwardMode::Mixed => fbs::ForwardMode::Mixed,
     }
 }
 
@@ -2211,7 +2210,6 @@ fn forward_mode_from_fb(value: fbs::ForwardMode) -> CodecResult<ForwardMode> {
         fbs::ForwardMode::Prefill => ForwardMode::Prefill,
         fbs::ForwardMode::Decode => ForwardMode::Decode,
         fbs::ForwardMode::Verify => ForwardMode::Verify,
-        fbs::ForwardMode::Mixed => ForwardMode::Mixed,
         _ => codec_bail!("unknown forward_mode {}", value.0),
     })
 }

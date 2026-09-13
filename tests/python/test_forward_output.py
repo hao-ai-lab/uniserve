@@ -2,7 +2,7 @@
 
 import torch
 
-from uniserve_worker.execution.forward_batch import ForwardOutput
+from uniserve_worker.execution.batch import ExecutionOutput
 
 
 def test_forward_output_clone_preserves_ragged_shapes_dtypes_and_owned_values():
@@ -13,7 +13,7 @@ def test_forward_output_clone_preserves_ragged_shapes_dtypes_and_owned_values():
         torch.empty(0, 3, dtype=torch.float32),
         torch.tensor(5.0),
     )
-    output = ForwardOutput(values)
+    output = ExecutionOutput(values)
     expected = tuple(value.clone() for value in values)
     retained = []
     for _ in range(3):
@@ -29,4 +29,4 @@ def test_forward_output_clone_preserves_ragged_shapes_dtypes_and_owned_values():
 
 
 def test_forward_output_clone_preserves_empty_output():
-    assert ForwardOutput(()).clone().values == ()
+    assert ExecutionOutput(()).clone().values == ()

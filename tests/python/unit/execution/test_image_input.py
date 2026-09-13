@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 
 from uniserve_worker.execution.image_input import prepare_image
-from uniserve_worker.models.inputs import (
+from uniserve_worker.modeling.inputs import (
     ImageProcessor,
     PatchTransform,
     StrideResize,

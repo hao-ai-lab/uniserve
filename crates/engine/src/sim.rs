@@ -660,9 +660,6 @@ impl SimEngine {
                 | PipelineStage::AudioEncoding
                 | PipelineStage::Muxing,
             ) => {}
-            Computation::Forward(ForwardMode::Mixed) => {
-                anyhow::bail!("mixed forward mode requires a model batch")
-            }
             Computation::Pipeline(PipelineStage::ImageDecoding) => {
                 request.flow_step = 0;
                 if let Some(image) = request.image().cloned() {

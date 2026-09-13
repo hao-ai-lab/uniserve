@@ -9,9 +9,9 @@ from uniserve_worker.backends.attention import (
     video_sparse_flashinfer,
     video_sparse_triton,
 )
-from uniserve_worker.backends.attention.video_sparse import PreparedVideoSparseInputs
 from uniserve_worker.backends.attention.video_sparse_provider import resolve_sparse_provider
 from uniserve_worker.nn.parallel_attention import AttentionOutputTargets
+from uniserve_worker.nn.sparse_attention import PreparedVideoSparseInputs
 from uniserve_worker.ops.video_sparse import compose_to_head_shards
 from uniserve_worker.ops.video_sparse_rows import SparseAttentionPattern
 

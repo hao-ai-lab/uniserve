@@ -11,6 +11,7 @@ from uniserve_worker.execution.output import (
     PendingOutput,
 )
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.modeling.tensors import TokenSelection, packed_tensor_views
 from uniserve_worker.protocol.batch import (
     DrawLayout,
     FinishFlags,
@@ -25,13 +26,12 @@ from uniserve_worker.runtime.tensor_store import (
     TensorRecord,
 )
 
+from ..nn.rng import DRAW_LAYOUT_TARGET, sampling_key, sampling_uniform
 from . import encode
 from . import operations as operation_geometry
 from . import sample as sampling
 from .batch_state import BatchState
-from .forward_batch import TokenSelection, packed_tensor_views
 from .output import capture_logprobs
-from .rng import DRAW_LAYOUT_TARGET, sampling_key, sampling_uniform
 from .rows import (
     ForwardRow,
 )
@@ -41,7 +41,7 @@ from .sampling import SamplerOutput, SamplerRow, SamplingMetadata, sample_column
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
-    from ..models.runtime import ExecutionModel
+    from ..modeling.model import Model
     from ..nn.mesh import Communicator
     from ..runtime.block_tables import BlockTables
     from ..runtime.decode_state import DecodeState
@@ -152,7 +152,7 @@ def prepare_sampling(
     state: BatchState,
     request_pool_index: torch.Tensor,
     tensor_store: TensorStore,
-    execution_model: ExecutionModel,
+    execution_model: Model,
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> SamplingMetadata | PendingOutput:
@@ -244,7 +244,7 @@ def publish_sample(
     sampled: SamplerRow,
     *,
     state: BatchState,
-    execution_model: ExecutionModel,
+    execution_model: Model,
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> PendingOutput:
@@ -421,7 +421,7 @@ def _prepare_visual_sampling(
     *,
     state: BatchState,
     request_pool_index: torch.Tensor,
-    execution_model: ExecutionModel,
+    execution_model: Model,
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> SamplingMetadata | PendingOutput:
@@ -464,7 +464,7 @@ def _finish_visual(
     completion_group: int,
     *,
     state: BatchState,
-    execution_model: ExecutionModel,
+    execution_model: Model,
     request_tables: BlockTables | None,
 ) -> PendingOutput:
     """Finalize visual feature publication and advance the encode operation state."""

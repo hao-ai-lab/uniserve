@@ -8,13 +8,18 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve_worker.execution.forward_batch import AttentionMode, ExpertRoute, RouteSpan
+from uniserve_worker.backends.attention.selection import AttentionSelection
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.foundation.math import bucketed_length
+from uniserve_worker.modeling.geometry import CacheGeometry
+from uniserve_worker.modeling.tensors import (
+    AttentionMetadata,
+    AttentionMode,
+    ExpertRoute,
+    RouteSpan,
+)
 from uniserve_worker.protocol.batch import ForwardMode
 
-from ..models.runtime import CacheGeometry
-from .forward_batch import AttentionMetadata, AttentionSelection
 from .rows import ForwardRow
 
 if TYPE_CHECKING:
@@ -65,7 +70,6 @@ def columns(
     tables: BlockTables | None,
     cache: KVCache | None,
     packed: bool,
-    binding: int,
 ) -> AttentionMetadata:
     """Build packed attention mode, sequence, cache, position, and route tensors for forward rows."""
 
@@ -98,7 +102,6 @@ def columns(
         width=width,
         block_size=cache.block_size,
         group_id=group_id,
-        binding=binding,
         packed=packed,
         decode=pure_decode,
     )
@@ -117,7 +120,6 @@ def physical_columns(
     width: int,
     block_size: int,
     group_id: int = 0,
-    binding: int = 0,
     packed: bool = False,
     decode: bool = False,
 ) -> AttentionMetadata:
@@ -146,7 +148,6 @@ def physical_columns(
         causal_rows_cpu=causal_rows,
         causal=len(set(causal_rows)) == 1 and causal_rows[0],
         group_id=group_id,
-        binding=binding,
     )
     if packed and not decode:
         return _packed_columns(

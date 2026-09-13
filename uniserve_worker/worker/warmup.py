@@ -16,11 +16,12 @@ from uniserve_worker.protocol.batch import (
     TransferMode,
 )
 
+from ..execution.diffusion_state import resolve_prefix
 from ..execution.graph_inputs import DiffusionShape
 from ..execution.model_runner import capture_image_parameters
 from ..foundation.errors import invalid_descriptor
 from ..foundation.math import ceil_div
-from ..models.generation import GenerationPipeline
+from ..modeling.image_diffusion import ImageDiffusion
 from ..nn.diffusion.cfg import build_flow_cfg_plan
 from ..protocol.batch import (
     BatchCommand,
@@ -554,12 +555,13 @@ def _warmup_flow_tables(
         use_cfg=True,
     )
     runtime = request.accepted_progress
-    query = generation.physical_tokens(height, width)
+    query = generation.sequence_length(height, width)
     image_prompt = image.image_prompts[0] if image.image_prompts else ""
     # Branches either reuse the conditioned request slot or share one alternative prefix.
     branch_prefixes: list[tuple[tuple[int, ...], bool]] = []
     for branch in guide.branches:
-        prefix, copy_conditioning = generation.prefix(
+        prefix, copy_conditioning = resolve_prefix(
+            generation,
             generation.branch_source(branch),
             image_prompt=image_prompt,
             negative_prompt=image.negative_prompt,
@@ -652,12 +654,9 @@ def warmup_requests(worker: Worker) -> None:
         if ForwardMode.PREFILL in worker.info.supported_ops:
             _warmup_tokens(requests)
             logger.info("completed token runtime warmup")
-        if isinstance(worker.model.generation, GenerationPipeline):
+        if isinstance(worker.model.generation, ImageDiffusion):
             _warmup_flow(requests)
             logger.info("completed flow runtime warmup")
-    elif worker.runner.mixed_captures:
-        _warmup_flow(requests)
-        logger.info("completed mixed execution warmup")
 
 
 def _warmup_image_geometry(requests: _WarmupRequests) -> tuple[int, int]:
@@ -803,7 +802,6 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
     """Drive one denoise quantum through the real flow forward path."""
 
     from ..protocol.batch import (
-        ArRequestParams,
         Bounds,
         DeviceDim,
         DrawLayout,
@@ -811,7 +809,6 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         NewRequest,
         RequestKey,
         Rng,
-        SamplingParams,
         ScheduledRequest,
         ShapeBound,
         StaticDim,
@@ -823,9 +820,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
     if not {
         PipelineStage.LATENT_PREPARATION,
         PipelineStage.DENOISING,
-    }.issubset(requests.worker.info.supported_ops) or not isinstance(
-        generation, GenerationPipeline
-    ):
+    }.issubset(requests.worker.info.supported_ops) or not isinstance(generation, ImageDiffusion):
         return
     if requests.worker.requests.request_ids():
         return
@@ -852,17 +847,6 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         cfg_branches = bucket.cfg_branches
         if batch_size > int(requests.worker.info.request_slots):
             continue
-        mixed_text_sizes = tuple(
-            dict.fromkeys(
-                mixed.decode_rows
-                for mixed in requests.worker.runner.mixed_captures
-                if mixed.flow_rows == batch_size
-                and mixed.height == height
-                and mixed.width == width
-                and mixed.cfg_branches == cfg_branches
-            )
-        )[:1]
-        mixed_rounds = 1
         request_ids = tuple(range(next_request_id, next_request_id + batch_size))
         next_request_id += batch_size
         keys = tuple(RequestKey(0, request_id, 1) for request_id in request_ids)
@@ -873,7 +857,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                 umm=UmmRequestParams(
                     image=capture_image_parameters(
                         cfg_branches,
-                        steps=2 + mixed_rounds * len(mixed_text_sizes),
+                        steps=2,
                         height=height,
                         width=width,
                     )
@@ -881,21 +865,6 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
             )
             for index, key in enumerate(keys, start=1)
         )
-        text_request_count = max(mixed_text_sizes, default=0)
-        text_request_ids = tuple(range(next_request_id, next_request_id + text_request_count))
-        next_request_id += text_request_count
-        text_keys = {request_id: RequestKey(0, request_id, 1) for request_id in text_request_ids}
-        text_admissions = {
-            request_id: NewRequest(
-                text_keys[request_id],
-                request_pool_idx=batch_size + index,
-                ar=ArRequestParams(
-                    sampling=SamplingParams(temperature=0.0, ignore_eos=True),
-                    initial_position=0,
-                ),
-            )
-            for index, request_id in enumerate(text_request_ids, start=1)
-        }
         roots = tuple(ComputationId(0, 0) for key in keys)
         conditionings: list[BufferId] = []
         publications: list[ScheduledRequest] = []
@@ -928,37 +897,6 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                 image_geometry=(height, width),
             ),
         )
-        text_predecessors: dict[int, ScheduledRequest] = {}
-        if text_request_ids:
-            prompt_operations: list[ScheduledRequest] = []
-            for request_id in text_request_ids:
-                key = text_keys[request_id]
-                op_id = ComputationId(requests._run_id + 1, len(prompt_operations))
-                prompt_outputs = _warmup_token_output(key, op_id, next_generation)
-                next_generation += 1
-                operation = ScheduledRequest(
-                    request_key=key,
-                    op_id=op_id,
-                    predecessor=ComputationId(0, 0),
-                    kind=ForwardMode.PREFILL,
-                    bounds=Bounds(max_tokens=1),
-                    input_token_ids=(0,),
-                    token_output=prompt_outputs,
-                )
-                prompt_operations.append(operation)
-            _execute_warmup(
-                requests,
-                _build_warmup_batch(
-                    requests,
-                    admissions=tuple(
-                        text_admissions[request_id] for request_id in text_request_ids
-                    ),
-                    operations=tuple(prompt_operations),
-                    image_geometry=(height, width),
-                ),
-                retain_device_outputs=True,
-            )
-            text_predecessors.update(zip(text_request_ids, prompt_operations, strict=True))
         max_latent_elements = max(
             1,
             math.prod(generation.latent_shape(height, width)),
@@ -1061,89 +999,5 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
             requests.free_products(tuple(product.buffer_id for product in current_latents))
             current_latents = tuple(outputs)
             flow_predecessors.update(zip(request_ids, flows, strict=True))
-        for text_batch_size in mixed_text_sizes:
-            selected_text = text_request_ids[:text_batch_size]
-            for _ in range(mixed_rounds):
-                text_operations: list[ScheduledRequest] = []
-                for request_id in selected_text:
-                    predecessor = text_predecessors[request_id]
-                    token_output = predecessor.token_output
-                    assert token_output is not None
-                    op_id = ComputationId(requests._run_id + 1, len(text_operations))
-                    token_outputs = _warmup_token_output(
-                        text_keys[request_id], op_id, next_generation
-                    )
-                    next_generation += 1
-                    text_operations.append(
-                        ScheduledRequest(
-                            request_key=text_keys[request_id],
-                            op_id=op_id,
-                            predecessor=predecessor.op_id,
-                            kind=ForwardMode.DECODE,
-                            bounds=Bounds(max_tokens=1),
-                            token_output=token_outputs,
-                            predicate=token_output,
-                        )
-                    )
-
-                flow_outputs: list[TensorRef] = []
-                flow_operations: list[ScheduledRequest] = []
-                for request_id, key, conditioning, current in zip(
-                    request_ids,
-                    keys,
-                    conditionings,
-                    current_latents,
-                    strict=True,
-                ):
-                    op_id = ComputationId(
-                        requests._run_id + 1, len(text_operations) + len(flow_operations)
-                    )
-                    output = TensorRef(
-                        request_key=key,
-                        producer_op_id=op_id,
-                        output_index=0,
-                        generation=next_generation,
-                        dtype=DType.BF16,
-                        shape_bound=ShapeBound((DeviceDim(max_latent_elements),)),
-                    )
-                    next_generation += 1
-                    flow_outputs.append(output)
-                    flow_operations.append(
-                        ScheduledRequest(
-                            request_key=key,
-                            op_id=op_id,
-                            predecessor=flow_predecessors[request_id].op_id,
-                            kind=PipelineStage.DENOISING,
-                            bounds=Bounds(
-                                max_tokens=1,
-                                max_latent_bytes=max_latent_elements * 2,
-                            ),
-                            kv_input=conditioning,
-                            latent_input=current,
-                            latent_output=output,
-                        )
-                    )
-                _execute_warmup(
-                    requests,
-                    _build_warmup_batch(
-                        requests,
-                        admissions=(),
-                        operations=(*text_operations, *flow_operations),
-                        image_geometry=(height, width),
-                    ),
-                    retain_device_outputs=True,
-                )
-                requests.free_products(
-                    tuple(
-                        output.buffer_id
-                        for request_id in selected_text
-                        for output in text_predecessors[request_id].tensor_outputs()
-                    )
-                )
-                text_predecessors.update(zip(selected_text, text_operations, strict=True))
-                requests.free_products(tuple(product.buffer_id for product in current_latents))
-                current_latents = tuple(flow_outputs)
-                flow_predecessors.update(zip(request_ids, flow_operations, strict=True))
-
-        for request_id in (*request_ids, *text_request_ids):
+        for request_id in request_ids:
             requests.drop_request(request_id)

@@ -6,8 +6,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from uniserve_worker.backends.attention.selection import AttentionSelection
 from uniserve_worker.backends.attention.torch_sdpa import TorchSDPAAttentionBackend
-from uniserve_worker.execution.forward_batch import AttentionSelection
 from uniserve_worker.nn.attention import bind_dense_attention_modules
 from uniserve_worker.nn.decoder.qwen import Qwen3Config, Qwen3Model
 from uniserve_worker.nn.layer import LayerConfig
@@ -59,9 +59,9 @@ def test_full_sequence_decoder_preserves_causal_prefix_and_batch_independence(no
     tokens = torch.tensor([[1, 3, 5, 7, 9, 11], [1, 3, 5, 2, 4, 6]])
     positions = torch.arange(tokens.shape[1]).expand_as(tokens)
     with torch.inference_mode():
-        together = model(tokens, positions)
-        first = model(tokens[:1], positions[:1])
-        prefix = model(tokens[:1, :3], positions[:1, :3])
+        together = model(model.embed_tokens(tokens), positions=positions)
+        first = model(model.embed_tokens(tokens[:1]), positions=positions[:1])
+        prefix = model(model.embed_tokens(tokens[:1, :3]), positions=positions[:1, :3])
 
     torch.testing.assert_close(together[0], first[0])
     torch.testing.assert_close(together[0, :3], together[1, :3])
@@ -78,6 +78,6 @@ def test_full_sequence_decoder_returns_requested_residual_stream(normalize_outpu
                 parameter.zero_()
     inputs = torch.arange(1, 49, dtype=torch.float32).reshape(1, 3, 16) / 16
     with torch.inference_mode():
-        actual = model(torch.zeros((1, 3), dtype=torch.long), torch.arange(3), input_embeds=inputs)
+        actual = model(inputs, positions=torch.arange(3))
     expected = F.rms_norm(inputs, (16,), eps=1e-6) if normalize_output else inputs
     torch.testing.assert_close(actual, expected)

@@ -6,7 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
-from ..execution.forward_batch import RouteSpan
+from uniserve_worker.modeling.tensors import RouteSpan
+
 from .mesh import Communicator
 
 

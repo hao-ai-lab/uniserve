@@ -9,12 +9,13 @@ from typing import cast
 import torch
 from torch import nn
 
-from ...media.codec import blend_decoded_overlap, video_segment_rgb
 from ...nn.attention import RadixAttention
 from ...nn.layer import LayerConfig
 from ...nn.linear import LinearBase, project_with_deferred_bias
 from ...nn.mlp import GatedMLP
 from ...nn.quant.config import LinearPrecision
+from ...nn.vae.decoder import LatentDecoder
+from ...nn.vae.spatial import SpatialDecoder
 from ...ops.patch import unpatchify_video_tokens
 from ...ops.residual import (
     scaled_residual_,
@@ -26,10 +27,8 @@ from ...ops.residual import (
     weighted_rms_norm_absmax,
 )
 from ...ops.rope import qk_rms_norm_partial_rope_
-from .layout import PROFILE_HEIGHT, PROFILE_WIDTH, H3ComputeInputs, H3Tensors
-from .packing import unpatchify_video_into
 
-__all__ = ["H3VideoAssembler", "MiniMaxH3VideoDecoder", "MiniMaxH3VideoVAE"]
+__all__ = ["MiniMaxH3VideoDecoder", "MiniMaxH3VideoVAE"]
 
 
 class _RotaryEmbedding(nn.Module):
@@ -244,7 +243,7 @@ class _VideoTransformer(nn.Module):
         self.rope = _RotaryEmbedding(device=buffer_device)
 
 
-class MiniMaxH3VideoDecoder(nn.Module):
+class MiniMaxH3VideoDecoder(SpatialDecoder):
     """Checkpoint-defined 36-layer ViT decoder and latent-channel projection."""
 
     spatial_compression_ratio = 16
@@ -272,62 +271,6 @@ class MiniMaxH3VideoDecoder(nn.Module):
         with torch.device(parameter_device):
             self.post_quant_conv = nn.Conv3d(24, 24, kernel_size=1)
             self.decoder = _VideoTransformer(layer_config.child("decoder"), buffer_device)
-
-    @staticmethod
-    def _split_tiles(
-        length: int,
-        tile_size: int,
-        minimum_overlap: int,
-    ) -> tuple[list[int], list[int], list[int]]:
-        """Partition one spatial extent into aligned tiles with bounded pairwise overlap."""
-
-        if tile_size >= length:
-            return [0], [length], []
-        tile_count = math.ceil(length / tile_size)
-        while tile_size * tile_count - minimum_overlap * (tile_count - 1) < length:
-            tile_count += 1
-        overlaps = [minimum_overlap] * (tile_count - 1)
-        remaining = tile_size * tile_count - sum(overlaps) - length
-        for index in range(remaining // 16):
-            overlaps[index % (tile_count - 1)] += 16
-        starts = [0]
-        for overlap in overlaps:
-            starts.append(starts[-1] + tile_size - overlap)
-        return starts, [tile_size] * tile_count, overlaps
-
-    def _stitch_tiles(
-        self,
-        tiles: list[list[torch.Tensor]],
-        height_overlaps: list[int],
-        width_overlaps: list[int],
-    ) -> torch.Tensor:
-        """Blend a two-dimensional tile grid and concatenate it into one decoded frame tensor."""
-
-        assembled_rows: list[torch.Tensor] = []
-        for row_index, row in enumerate(tiles):
-            assembled: list[torch.Tensor] = []
-            for column_index, tile in enumerate(row):
-                if row_index:
-                    tile = blend_decoded_overlap(
-                        tiles[row_index - 1][column_index],
-                        tile,
-                        height_overlaps[row_index - 1],
-                        -2,
-                    )
-                if column_index:
-                    tile = blend_decoded_overlap(
-                        row[column_index - 1],
-                        tile,
-                        width_overlaps[column_index - 1],
-                        -1,
-                    )
-                if row_index + 1 < len(tiles):
-                    tile = tile[..., : -height_overlaps[row_index], :]
-                if column_index + 1 < len(row):
-                    tile = tile[..., :, : -width_overlaps[column_index]]
-                assembled.append(tile)
-            assembled_rows.append(torch.cat(assembled, dim=-1))
-        return torch.cat(assembled_rows, dim=-2)
 
     def forward(self, projected_latents: torch.Tensor) -> torch.Tensor:
         """Decode projected `[B, 24, T, H, W]` latents into full-resolution RGB tensors."""
@@ -445,9 +388,11 @@ class MiniMaxH3VideoDecoder(nn.Module):
         )
 
 
-class MiniMaxH3VideoVAE(nn.Module):
+class MiniMaxH3VideoVAE(LatentDecoder):
     """Own one resident checkpoint VAE and decode temporal segments."""
 
+    vae: MiniMaxH3VideoDecoder
+    latent_shape = (1, 24, 7, 48, 84)
     latents_mean: torch.Tensor
     latents_std: torch.Tensor
 
@@ -515,195 +460,33 @@ class MiniMaxH3VideoVAE(nn.Module):
         )
         if len(mean) != 24 or len(std) != 24:
             raise ValueError("MiniMax H3 video VAE must declare 24-channel latent statistics")
+        # Keep constant values when parameter storage is deferred. The public
+        # loader stages graph buffers after materializing the learned modules.
+        statistics_device = "cpu" if self.device.type == "meta" else self.device
         self.register_buffer(
             "latents_mean",
-            torch.tensor(mean, dtype=torch.float32, device=self.device).view(1, 24, 1, 1, 1),
+            torch.tensor(mean, dtype=torch.float32, device=statistics_device).view(1, 24, 1, 1, 1),
             persistent=False,
         )
         self.register_buffer(
             "latents_std",
-            torch.tensor(std, dtype=torch.float32, device=self.device).view(1, 24, 1, 1, 1),
+            torch.tensor(std, dtype=torch.float32, device=statistics_device).view(1, 24, 1, 1, 1),
             persistent=False,
         )
-
-    @property
-    def device(self) -> torch.device:
-        """Return the device that owns the decoder's learned parameters."""
-
-        return next(self.vae.parameters()).device
 
     def _decode_segment(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode one temporal latent segment and remove its prepended overlap frames."""
 
         span = int(self.vae.tokens_chunk_size) + int(self.vae.token_overlap)
-        clip = self._decode_spatial_tiles(latents[:, :, :span])
+        clip = self.vae.decode(latents[:, :, :span])
         return clip[:, :, int(self.vae.frame_pre_padding) :].contiguous()
 
-    def _decode_spatial_tiles(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode one latent clip directly or tile and blend it across spatial overlap regions."""
+    def _reconstruct(self, latents: torch.Tensor) -> torch.Tensor:
+        """Apply native decoder precision and temporal crop after denormalization."""
 
-        if not bool(self.vae.use_tiling):
-            return self.vae(self.vae.post_quant_conv(latents))
-
-        ratio = int(self.vae.spatial_compression_ratio)
-        height = int(latents.shape[-2]) * ratio
-        width = int(latents.shape[-1]) * ratio
-        y_indices, y_lengths, y_overlaps = self.vae._split_tiles(
-            height,
-            int(self.vae.tile_sample_min_height),
-            int(self.vae.tile_sample_min_overlap_height),
-        )
-        x_indices, x_lengths, x_overlaps = self.vae._split_tiles(
-            width,
-            int(self.vae.tile_sample_min_width),
-            int(self.vae.tile_sample_min_overlap_width),
-        )
-        # Decode all spatial tiles as one batch, then blend them back into the
-        # full-resolution temporal segment using the decoder's overlap contract.
-        tiles = torch.cat(
-            tuple(
-                latents[
-                    ...,
-                    y_pos // ratio : y_pos // ratio + y_length // ratio,
-                    x_pos // ratio : x_pos // ratio + x_length // ratio,
-                ]
-                for y_pos, y_length in zip(y_indices, y_lengths, strict=True)
-                for x_pos, x_length in zip(x_indices, x_lengths, strict=True)
-            ),
-            dim=0,
-        )
-        decoded = self.vae(self.vae.post_quant_conv(tiles))
-        flat_tiles = decoded.split(1, dim=0)
-        columns = len(x_indices)
-        rows = [
-            list(flat_tiles[start : start + columns])
-            for start in range(0, len(flat_tiles), columns)
-        ]
-        return self.vae._stitch_tiles(rows, y_overlaps, x_overlaps)
-
-    def forward(
-        self,
-        normalized_latents: torch.Tensor,
-    ) -> torch.Tensor:
-        """Denormalize one latent segment and decode it through the spatial tiling path."""
-
-        if normalized_latents.shape != (1, 24, 7, 48, 84):
-            raise ValueError("an H3 video decode unit must have shape [1, 24, 7, 48, 84]")
-        latents = normalized_latents.to(device=self.device, dtype=torch.float32)
-        latents = latents * self.latents_std + self.latents_mean
         with torch.autocast(
             device_type=self.device.type,
             dtype=self.autocast_dtype,
             enabled=self.device.type == "cuda",
         ):
             return self._decode_segment(latents).to(torch.float16)
-
-    def prepare_input(
-        self,
-        execution: H3ComputeInputs,
-        latents: torch.Tensor,
-        cursor: int,
-        max_units: int,
-        rank: int,
-    ) -> torch.Tensor:
-        """Pack this decoder rank's temporal latent window into VAE layout."""
-
-        layout, scratch = execution.layout, execution.media
-        if rank >= max_units or cursor + max_units > layout.video_reconstruction_units:
-            raise ValueError("video decode exceeds its temporal range")
-        if tuple(latents.shape) != (int(layout.packed.video_indices.numel()), 96):
-            raise ValueError("video decoder requires complete final latent rows")
-        start = (cursor + rank) * 5 * 24 * 42
-        selected = scratch.video_raster_order[start : start + 7 * 24 * 42]
-        torch.index_select(latents, 0, selected, out=scratch.reconstruction_rows)
-        unpatchify_video_into(
-            scratch.reconstruction_rows,
-            scratch.video_input,
-            frames=7,
-            height=48,
-            width=84,
-        )
-        return scratch.video_input
-
-
-class H3VideoAssembler(nn.Module):
-    """Own H3 overlap state transforms and checkpoint pixel normalization."""
-
-    def __init__(self, device: torch.device) -> None:
-        super().__init__()
-        for name, values in (
-            ("pixel_mean", (0.485, 0.456, 0.406)),
-            ("pixel_std", (0.229, 0.224, 0.225)),
-        ):
-            self.register_buffer(
-                name,
-                torch.tensor(values, dtype=torch.float32, device=device).view(1, 3, 1, 1, 1),
-                persistent=False,
-            )
-
-    def assemble(
-        self,
-        slot: H3Tensors,
-        execution: H3ComputeInputs,
-        segments: torch.Tensor,
-        start_unit: int,
-        unit_count: int,
-    ) -> torch.Tensor:
-        """Blend ordered decoder windows and convert them into RGB byte frames."""
-
-        layout, scratch = execution.layout, execution.media
-        expected = (unit_count, 1, 3, 25, PROFILE_HEIGHT, PROFILE_WIDTH)
-        if tuple(segments.shape) != expected:
-            raise ValueError("video assembly requires complete decoded segments")
-        if start_unit + unit_count > layout.video_reconstruction_units:
-            raise ValueError("video assembly exceeds its temporal extent")
-        overlap = None if start_unit == 0 else slot.video_overlap
-        frame_start = 0
-        for offset in range(unit_count):
-            unit = start_unit + offset
-            rgb, overlap = video_segment_rgb(
-                segments[offset],
-                overlap,
-                body_frames=(
-                    MiniMaxH3VideoDecoder.tokens_chunk_size
-                    * MiniMaxH3VideoDecoder.temporal_compression_ratio
-                    - MiniMaxH3VideoDecoder.frame_pre_padding
-                ),
-                overlap_frames=MiniMaxH3VideoDecoder.frame_overlap,
-                padding_frames=MiniMaxH3VideoDecoder.frame_pre_padding,
-                pixel_mean=self.pixel_mean,
-                pixel_std=self.pixel_std,
-                final_unit=unit + 1 == layout.video_reconstruction_units,
-            )
-            valid_frames = layout.reconstruction_unit_frames[unit]
-            if int(rgb.shape[0]) != valid_frames:
-                raise RuntimeError("H3 video decoder returned an unexpected frame count")
-            scratch.rgb_round[frame_start : frame_start + valid_frames].copy_(rgb)
-            frame_start += valid_frames
-        assert overlap is not None
-        slot.video_overlap.copy_(overlap)
-        return scratch.rgb_round[:frame_start]
-
-    @torch.inference_mode()
-    def warmup(self) -> None:
-        """Compile the output pixel transform without retaining request state."""
-
-        segment = torch.zeros(
-            (1, 3, 25, PROFILE_HEIGHT, PROFILE_WIDTH),
-            dtype=torch.float16,
-            device=self.pixel_mean.device,
-        )
-        video_segment_rgb(
-            segment,
-            None,
-            body_frames=(
-                MiniMaxH3VideoDecoder.tokens_chunk_size
-                * MiniMaxH3VideoDecoder.temporal_compression_ratio
-                - MiniMaxH3VideoDecoder.frame_pre_padding
-            ),
-            overlap_frames=MiniMaxH3VideoDecoder.frame_overlap,
-            padding_frames=MiniMaxH3VideoDecoder.frame_pre_padding,
-            pixel_mean=self.pixel_mean,
-            pixel_std=self.pixel_std,
-            final_unit=False,
-        )

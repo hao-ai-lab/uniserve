@@ -107,4 +107,4 @@ class MiniMaxH3TextEncoder(nn.Module):
                 f"H3 prompt token count must be between 1 and {self.config.max_text_rows}"
             )
         positions = torch.arange(token_ids.shape[1], dtype=torch.long, device=token_ids.device)
-        return self.language_model(token_ids, positions)
+        return self.language_model(self.language_model.embed_tokens(token_ids), positions=positions)

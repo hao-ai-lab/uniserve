@@ -7,14 +7,11 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from math import prod
-from typing import TYPE_CHECKING
+from types import MappingProxyType
 
 import torch
 
 from .mesh import Communicator
-
-if TYPE_CHECKING:
-    from ..runtime.tensor_buffers import TensorBuffers
 
 
 @dataclass(frozen=True)
@@ -26,7 +23,10 @@ class ExchangeBuffers:
     The runtime retains the backing allocations through all graph lifetimes.
     """
 
-    storage: TensorBuffers
+    tensors: Mapping[str, torch.Tensor]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tensors", MappingProxyType(dict(self.tensors)))
 
     def view(
         self,
@@ -38,7 +38,7 @@ class ExchangeBuffers:
     ) -> torch.Tensor:
         """Borrow a contiguous view; offset is measured in elements of like.dtype."""
 
-        storage = self.storage.capacity[name]
+        storage = self.tensors[name]
         elements = prod(shape)
         begin = offset * like.element_size()
         size = elements * like.element_size()

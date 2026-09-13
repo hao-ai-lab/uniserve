@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import torch
 
-from ...execution.forward_batch import AttentionMetadata, AttentionMode
+from uniserve_worker.modeling.tensors import AttentionMetadata, AttentionMode
+
 from .base import AttentionBackend
 from .layout import QKVLayout, normalize_kv, normalize_to
 

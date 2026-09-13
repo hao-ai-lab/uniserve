@@ -8,37 +8,29 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-import torch
+from uniserve_worker.modeling.geometry import CacheGeometry
+from uniserve_worker.modeling.tensors import AttentionMode
 
-from uniserve_worker.protocol.batch import ForwardMode
-
-from ..execution.forward_batch import (
-    ForwardBatch,
-    ForwardOutput,
-)
 from ..loader.handles import WeightHandle
 from ..loader.mapping import LoadReport, WeightNameMap, stacked_weight_name
 from ..loader.weight_loaders import load_parameter_weight
+from ..modeling.components import Call, CallSpec, ComponentSpec
+from ..modeling.context import BuildContext
+from ..modeling.model import Model
+from ..modeling.text import TextMixin
 from ..nn import (
-    LayerConfig,
     ParallelLMHead,
     local_attention_head_count,
     local_kv_head_count,
     local_kv_head_offset,
 )
 from ..nn.decoder import qwen
-from ..nn.logits import project_outputs
 from ..nn.vocab_parallel_embedding import vocabulary_partition
-from .runtime import (
-    CacheGeometry,
-    ExecutionModel,
-    ResourceGeometry,
-)
 
 if TYPE_CHECKING:
-    from ..loader.component import CheckpointComponent, ModelBuildContext, ModelConstruction
+    from ..loader.component import CheckpointComponent
 
 
 __all__ = ["Qwen3ForCausalLM"]
@@ -175,21 +167,14 @@ def _parse_qwen_config(config: Mapping[str, object]) -> qwen.Qwen3Config:
     return cfg
 
 
-class Qwen3ForCausalLM(ExecutionModel):
+class Qwen3ForCausalLM(TextMixin, Model):
     """Qwen3 serving model with a thin tensor-level text core."""
 
-    ordered_collective_execution = True
-
     @classmethod
-    def build_checkpoint(
-        cls, config: dict[str, Any], context: ModelBuildContext
-    ) -> ModelConstruction:
-        """Construct the Qwen graph and declare its checkpoint namespace."""
+    def components(cls, config: object) -> tuple[ComponentSpec, ...]:
+        """Declare the numerical calls sharing this model graph."""
 
-        from ..loader.component import ModelConstruction
-
-        model = cls(config, layer_config=context.packed_decoder_layers("model"))
-        return ModelConstruction(model.checkpoint_components(), lambda: model, config)
+        return (ComponentSpec("model", (CallSpec(Call.TEXT, groups=("tp", "sp", "pp")),)),)
 
     def checkpoint_components(self) -> tuple[CheckpointComponent, ...]:
         """Declare the complete language graph populated by checkpoint loading."""
@@ -241,13 +226,14 @@ class Qwen3ForCausalLM(ExecutionModel):
             report.loaded.add(target_name)
         return report
 
-    def __init__(self, config: Mapping[str, object], *, layer_config: LayerConfig) -> None:
+    def __init__(self, config: Mapping[str, object], context: BuildContext) -> None:
         """Construct the tensor-parallel decoder and publish its serving geometry."""
 
-        super().__init__()
         if not isinstance(config, Mapping):
             raise TypeError("Qwen3 config must be a mapping")
         cfg = _parse_qwen_config(config)
+        layer_config = context.layers["model"]
+        super().__init__(cfg)
         self._parallel = layer_config.communicator
         self.model = qwen.Qwen3Model(cfg, layer_config=layer_config.child("model"))
         self.lm_head = (
@@ -275,13 +261,7 @@ class Qwen3ForCausalLM(ExecutionModel):
         self.num_layers = cfg.num_hidden_layers
         self.head_dim = cfg.head_dim
         self.architecture = "Qwen3ForCausalLM"
-        self.supported_work = frozenset(
-            {
-                ForwardMode.PREFILL,
-                ForwardMode.DECODE,
-                ForwardMode.VERIFY,
-            }
-        )
+
         self.cache_geometry = CacheGeometry(
             num_layers=len(self.model.pipeline.layers),
             total_layers=int(self.num_layers),
@@ -305,48 +285,16 @@ class Qwen3ForCausalLM(ExecutionModel):
             head_dim=cfg.head_dim,
             dtype="bfloat16",
         )
-        self.resource_geometry = ResourceGeometry()
         self.vocab_size = int(cfg.vocab_size)
         self.hidden_size = int(cfg.hidden_size)
         self.text_max_tokens = int(cfg.max_position_embeddings)
         self.text_topology = ("tp",)
-        self.tensorized_mixed = False
+        self.text_attention_mode = AttentionMode.PAGED_VARLEN
 
-    @torch.inference_mode()
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        """Merge optional multimodal embeddings and execute the packed Qwen decoder."""
+    @property
+    def text_backbone(self):
+        return self.model
 
-        input_embeds: torch.Tensor | None = None
-        if forward_batch.input_embeddings is not None and self.model.pipeline.first:
-            assert self.model.embed_tokens is not None
-            embedded = self.model.embed_tokens(input_ids.reshape(-1))
-            mask = forward_batch.embedding_mask
-            if mask is None:
-                raise RuntimeError("Qwen3 embedding input lost its selection mask")
-            input_embeds = torch.where(
-                mask.reshape(-1, 1),
-                forward_batch.input_embeddings.to(dtype=embedded.dtype),
-                embedded,
-            )
-        return self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds=input_embeds,
-        )
-
-    def project(self, hidden: torch.Tensor, forward_batch: ForwardBatch) -> ForwardOutput:
-        """Select shared vocabulary or hidden outputs from packed decoder rows."""
-
-        return project_outputs(
-            hidden,
-            forward_batch,
-            self.lm_head,
-            pipeline=self.model.pipeline,
-            vocabulary=vocabulary_partition(self.vocab_size, self._parallel),
-        )
+    @property
+    def vocabulary(self):
+        return vocabulary_partition(self.vocab_size, self._parallel)

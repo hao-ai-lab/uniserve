@@ -5,20 +5,18 @@ from dataclasses import replace
 import pytest
 import torch
 
+from tests.python.fixtures.model_execution import model_context
 from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
+from uniserve_worker.backends.attention.selection import AttentionSelection
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.forward_batch import (
-    AttentionMetadata,
-    AttentionMode,
-    AttentionSelection,
-    ForwardBatch,
-    TokenSelection,
-)
+from uniserve_worker.execution.batch import InputBatch
 from uniserve_worker.execution.input_buffers import InputGeometry
 from uniserve_worker.execution.model_runner import ModelRunner
+from uniserve_worker.modeling.tensors import AttentionMetadata, AttentionMode, TokenSelection
 from uniserve_worker.models.sensenova.config import NeoChatConfig
 from uniserve_worker.models.sensenova.model import NEOChatModel
+from uniserve_worker.nn.attention import bind_attention_modules
 from uniserve_worker.nn.layer import LayerConfig
 from uniserve_worker.nn.mesh import Communicator
 from uniserve_worker.protocol.batch import ForwardMode
@@ -78,10 +76,10 @@ def numerical_model(request):
                 head_dim=128,
                 max_position_embeddings=256,
             ),
-            layer_config=LayerConfig(Communicator(), None),
+            context=model_context(LayerConfig(Communicator(), None)),
         )
     else:
-        model = NEOChatModel(config, layer_config=LayerConfig(Communicator(), None))
+        model = NEOChatModel(config, context=model_context(LayerConfig(Communicator(), None)))
     model.to(device=device, dtype=torch.bfloat16)
     for parameter in model.parameters():
         if parameter.ndim == 1:
@@ -101,7 +99,7 @@ def numerical_model(request):
     pool.v.normal_(std=0.1)
     backend = FlashInferAttentionBackend(tuning=FlashInferTuningConfig(workspace_size=64 << 20))
     selection = AttentionSelection("flashinfer", (backend,))
-    model.bind_cache_pool(pool, selection)
+    bind_attention_modules(model, pool, selection)
     yield model, pool, selection, device
     torch.cuda.synchronize(device)
     pool.close()
@@ -117,7 +115,7 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind,
     # Only the first four physical pages per request contain live KV tokens.
     tables = torch.zeros((rows, 4096), dtype=torch.int32, device=device)
     tables[:, :4].copy_(torch.arange(1, 13, dtype=torch.int32, device=device).view(rows, 4))
-    batch = ForwardBatch(
+    batch = InputBatch(
         attention=AttentionMetadata(
             attention_mode=AttentionMode.PAGED_DECODE,
             prefix_lens=torch.tensor([62, 61, 60], dtype=torch.int32, device=device),
@@ -168,7 +166,7 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind,
     entry = next(iter(runner.entries.values()))
 
     def forward(value):
-        return model.project(model(value.input_ids, value.positions, value), value)
+        return runner.batch_forward(entry, value)
 
     try:
         runner.capture_batch(entry, batch, forward)
@@ -189,9 +187,9 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind,
             # changes; Graph replay owns its persistent binding separately.
             batch = replace(
                 batch,
+                binding=batch.binding + 10000,
                 attention=replace(
                     batch.attention,
-                    binding=batch.attention.binding + 10000,
                     seq_lens_cpu=lengths,
                     prefix_lens_cpu=tuple(n - 1 for n in lengths),
                 ),
@@ -235,7 +233,7 @@ def test_model_prefill_padding_preserves_live_outputs(numerical_model):
     selection = resolve_attention_selection(
         "auto", tuning=FlashInferTuningConfig(workspace_size=64 << 20), block_size=64
     )
-    model.bind_cache_pool(pool, selection)
+    bind_attention_modules(model, pool, selection)
     runner = ModelRunner(
         model,
         WorkerConfig(
@@ -266,7 +264,7 @@ def test_model_prefill_padding_preserves_live_outputs(numerical_model):
     assert buffers is not None
 
     def forward(batch):
-        return model.project(model(batch.input_ids, batch.positions, batch), batch)
+        return runner.batch_forward(entry, batch)
 
     try:
         runner.capture(tokenizer=None, latents=None)
@@ -279,7 +277,7 @@ def test_model_prefill_padding_preserves_live_outputs(numerical_model):
                     pool,
                     tokens,
                     tuple((page,) for page in pages[: len(lengths)]),
-                    packed=model.tensorized_mixed,
+                    packed=model.text_attention_mode is AttentionMode.PACKED,
                 )
                 expected = forward(batch).clone()
                 actual = runner.run_batch(entry, batch, forward, eligible=True)
@@ -303,7 +301,7 @@ def test_model_flow_replay_preserves_live_conditioning(numerical_model):
     selection = resolve_attention_selection(
         "auto", tuning=FlashInferTuningConfig(workspace_size=64 << 20), block_size=64
     )
-    model.bind_cache_pool(pool, selection)
+    bind_attention_modules(model, pool, selection)
     generation = model.generation
     assert generation is not None
     height = width = 16
@@ -372,9 +370,7 @@ def test_model_flow_replay_preserves_live_conditioning(numerical_model):
         return buffers.stage((row,), forward_mode=PipelineStage.DENOISING, attention=attention)
 
     def forward(batch):
-        ids = buffers.input_ids[:0] if batch.input_ids is None else batch.input_ids
-        positions = buffers.positions[0, :0] if batch.positions is None else batch.positions
-        return model.project(model(ids, positions, batch), batch)
+        return runner.batch_forward(entry, batch)
 
     try:
         runner.capture_batch(entry, stage(5, 0.7), forward)

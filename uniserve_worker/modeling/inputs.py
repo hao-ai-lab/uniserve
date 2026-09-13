@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from uniserve_worker.modeling.tensors import PositionLayout
+
 from ..foundation.errors import invalid_descriptor
-from .runtime import PositionLayout
 
 
 class FeatureLayout(StrEnum):

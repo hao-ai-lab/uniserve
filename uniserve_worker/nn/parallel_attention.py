@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from math import prod
 
@@ -28,25 +30,6 @@ class AttentionOutputTargets:
 
 
 @dataclass(frozen=True)
-class AttentionContextGeometry:
-    """Declare the key domain and physical communication used by context attention."""
-
-    group: Communicator
-    rows: int
-    heads: int
-    mapped: bool
-    head_dim: int
-    dtype: torch.dtype
-    block_size: int
-
-    def __post_init__(self) -> None:
-        if min(self.rows, self.heads, self.head_dim, self.block_size) < 1:
-            raise ValueError("attention context extents must be positive")
-        if self.rows % self.block_size:
-            raise ValueError("attention context rows must align to its validity blocks")
-
-
-@dataclass(frozen=True)
 class AttentionBuffers:
     """Fixed-capacity K/V transport storage, separate from sparse compute.
 
@@ -63,6 +46,15 @@ class AttentionBuffers:
     local_key: torch.Tensor
     local_value: torch.Tensor
     valid_sizes: torch.Tensor
+    sync_input: torch.Tensor
+    sync_output: torch.Tensor
+
+
+@dataclass(frozen=True)
+class OutputBuffers:
+    """Borrowed peer destinations and fences for attention's row restoration."""
+
+    peers: tuple[torch.Tensor, ...]
     sync_input: torch.Tensor
     sync_output: torch.Tensor
 
@@ -382,7 +374,7 @@ class HeadRowExchange:
         return incoming.transpose(0, 1).reshape(rows, heads * group.world_size, *features)
 
 
-class ParallelAttention(HeadRowExchange):
+class ParallelAttention(torch.nn.Module, HeadRowExchange):
     """Exchange attention tensors independently of the numerical backend.
 
     Ulysses partitions heads over the complete sequence. Context bindings
@@ -396,7 +388,8 @@ class ParallelAttention(HeadRowExchange):
         *,
         mesh: DeviceMesh,
     ) -> None:
-        super().__init__(mesh.get_group("ulysses"))
+        torch.nn.Module.__init__(self)
+        HeadRowExchange.__init__(self, mesh.get_group("ulysses"))
         self.context_group = mesh.get_group("cp")
         strategy = mesh.parallel_config.sequence_parallel.kind
         self.mapped = self.context_group.world_size > 1 and strategy in {
@@ -409,11 +402,21 @@ class ParallelAttention(HeadRowExchange):
             mesh.get_group("cp_row") if strategy == "attention2d" else self.context_group
         )
 
+    @property
+    def context_buffers(self) -> AttentionBuffers | None:
+        """Borrow this invocation's context tensors from the caller's scope."""
+
+        if self.context_group.world_size == 1:
+            return None
+        buffers = _CONTEXT.get().get(self)
+        if buffers is None:
+            raise RuntimeError("context attention requires bound numerical buffers")
+        return buffers
+
     def distribute_key_value(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
-        workspace: AttentionBuffers | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Publish context K/V and return stream-consumable physical views.
 
@@ -425,8 +428,8 @@ class ParallelAttention(HeadRowExchange):
         context = self.context_group
         if context.world_size == 1:
             return key, value
-        if workspace is None:
-            raise ValueError("context attention requires transport storage")
+        workspace = self.context_buffers
+        assert workspace is not None
         owner_rows = key.shape[0] * (self.col_group.world_size if self.col_group is not None else 1)
         if (
             key.ndim != 3
@@ -458,24 +461,95 @@ class ParallelAttention(HeadRowExchange):
         context.all_gather_into_tensor(context_value, value.contiguous())
         return context_key, context_value
 
-    def finish_context(self, workspace: AttentionBuffers | None) -> None:
+    def finish_context(self) -> None:
         """Fence all mapped readers before the next K/V publication reuses storage."""
 
         if self.mapped:
-            if workspace is None:
-                raise ValueError("mapped attention requires its reader fence")
+            workspace = self.context_buffers
+            assert workspace is not None
             self.key_group.all_gather_into_tensor(workspace.sync_output, workspace.sync_input)
 
     def finish_output(
         self,
         outputs: tuple[torch.Tensor, ...],
-        sync_input: torch.Tensor,
-        sync_output: torch.Tensor,
     ) -> torch.Tensor:
         """Fence fused peer output writes and return this sequence owner's result."""
 
         group = self.ulysses_group
         if len(outputs) != group.world_size:
             raise ValueError("attention outputs disagree with Ulysses membership")
-        group.all_gather_into_tensor(sync_output, sync_input)
+        buffers = self.output_buffers
+        group.all_gather_into_tensor(buffers.sync_output, buffers.sync_input)
         return outputs[group.rank_in_group]
+
+    @property
+    def output_buffers(self) -> OutputBuffers:
+        """Borrow fused row-output destinations from the active caller."""
+
+        buffers = _OUTPUT.get().get(self)
+        if buffers is None:
+            raise RuntimeError("parallel attention requires bound output buffers")
+        return buffers
+
+    def output_views(self, query: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Return compact sequence-owner views for this call's query geometry."""
+
+        group = self.ulysses_group
+        if query.ndim != 3 or query.shape[0] % group.world_size:
+            raise ValueError("attention output rows must divide Ulysses membership")
+        shape = (
+            query.shape[0] // group.world_size,
+            query.shape[1] * group.world_size,
+            query.shape[2],
+        )
+        peers = self.output_buffers.peers
+        if len(peers) != group.world_size or any(
+            peer.ndim != 3
+            or peer.dtype != query.dtype
+            or peer.device != query.device
+            or not peer.is_contiguous()
+            or any(size > capacity for size, capacity in zip(shape, peer.shape, strict=True))
+            for peer in peers
+        ):
+            raise ValueError("attention output exceeds its bound tensor storage")
+        return tuple(peer.view(-1)[: query.numel()].view(shape) for peer in peers)
+
+
+_CONTEXT: ContextVar[Mapping[ParallelAttention, AttentionBuffers]] = ContextVar(
+    "parallel_attention_context", default={}
+)
+_OUTPUT: ContextVar[Mapping[ParallelAttention, OutputBuffers]] = ContextVar(
+    "parallel_attention_output", default={}
+)
+
+
+@contextmanager
+def output_scope(bindings: Mapping[ParallelAttention, OutputBuffers]) -> Iterator[None]:
+    """Bind caller-owned output views until its kernels and readers complete.
+
+    Nested scopes restore their enclosing bindings on normal and exceptional
+    exit. Physical backing and graph lifetime remain the caller's obligation.
+    """
+
+    token = _OUTPUT.set(bindings)
+    try:
+        yield
+    finally:
+        _OUTPUT.reset(token)
+
+
+@contextmanager
+def context_scope(bindings: Mapping[ParallelAttention, AttentionBuffers]) -> Iterator[None]:
+    """Borrow context buffers for one numerical execution domain.
+
+    The caller retains backing until all kernels, graphs, and readers finish.
+    Layers retain no bindings; nested scopes restore the enclosing buffers,
+    including when computation raises. Shared weights can use independent
+    allocations in separate runtime owners.
+    """
+
+    token = _CONTEXT.set(bindings)
+    try:
+        yield
+    finally:
+        _CONTEXT.reset(token)

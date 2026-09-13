@@ -16,7 +16,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as vision
 
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.models.inputs import (
+from uniserve_worker.modeling.inputs import (
     ImageProcessor,
     PatchTransform,
     StrideResize,

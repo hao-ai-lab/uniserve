@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeAlias
 
 import torch
 
+from ..modeling.components import CallSpec
 from ..nn.mesh import Communicator, DeviceMesh
 from ..nn.parallel import ComponentConfig
 from ..protocol.batch import Computation, TensorSpec
@@ -15,7 +16,7 @@ from ..runtime.collectives import NcclCommunicator
 from .cuda_stream import CudaStream
 
 if TYPE_CHECKING:
-    from .forward_batch import ForwardOutput
+    from .batch import ExecutionOutput
     from .input_buffers import InputBuffers
 from .cuda_graph import CudaGraph
 
@@ -54,13 +55,16 @@ class ModelEntry:
     process_group: Communicator
     mesh: DeviceMesh | None
     device: torch.device
-    forward: Callable[..., TensorOutput | ForwardOutput] | None = None
+    forward: Callable[..., TensorOutput | ExecutionOutput] | None = None
     groups: tuple[Communicator, ...] = ()
     output_schema: tuple[TensorSpec, ...] = ()
     computations: tuple[Computation, ...] = ()
+    calls: tuple[CallSpec, ...] = ()
     input_buffers: InputBuffers | None = None
     cuda_stream: CudaStream | None = None
-    collectives: dict[str, NcclCommunicator] = field(default_factory=dict)
+    # Native device streams use process groups and shared reduction workspaces;
+    # Green Context streams require a complete, explicit communicator mapping.
+    collectives: dict[str, NcclCommunicator] | None = None
     fixed_inputs: tuple[torch.Tensor, ...] | None = None
     signature: TensorSignature | None = None
     graph: CudaGraph[TensorOutput] | None = None
@@ -86,6 +90,22 @@ class ModelEntry:
     def owns(self) -> bool:
         """Whether this process executes the configured entry."""
         return self.process_group.rank in self.config.ranks
+
+    @property
+    def local_calls(self) -> tuple[CallSpec, ...]:
+        """Numerical calls whose declared pipeline stage participates locally."""
+
+        if not self.owns:
+            return ()
+        stage = 0 if self.mesh is None else self.mesh.coord("pp")
+        stages = 1 if self.mesh is None else self.mesh.size("pp")
+        return tuple(
+            call
+            for call in self.calls
+            if call.stage == "all"
+            or (call.stage == "first" and stage == 0)
+            or (call.stage == "last" and stage == stages - 1)
+        )
 
     @property
     def input_ranks(self) -> tuple[int, ...]:

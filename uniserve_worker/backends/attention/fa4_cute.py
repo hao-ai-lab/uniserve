@@ -13,7 +13,8 @@ from typing import Any
 
 import torch
 
-from ...execution.forward_batch import AttentionMetadata, AttentionMode
+from uniserve_worker.modeling.tensors import AttentionMetadata, AttentionMode
+
 from ..paged_kv_math import paged_kv_write, write_locations
 from .base import AttentionBackend, merge_attention_states
 from .layout import QKVLayout, normalize_kv, normalize_to

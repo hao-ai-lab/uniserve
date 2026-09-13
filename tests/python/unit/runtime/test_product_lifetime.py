@@ -859,7 +859,7 @@ def test_failed_latent_publication_retains_its_pages_without_poisoning_other_req
 @pytest.mark.gpu
 def test_media_capture_releases_capacity_after_its_completion_fence():
     from uniserve_worker.media.buffers import MediaBuffers
-    from uniserve_worker.models.video import VideoOutputGeometry
+    from uniserve_worker.modeling.geometry import VideoShape
 
     events = EventPool()
     outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
@@ -867,7 +867,7 @@ def test_media_capture_releases_capacity_after_its_completion_fence():
         state_slots=1,
         unresolved_window=1,
         max_video_frames_per_round=1,
-        max_geometry=VideoOutputGeometry(1, (1,), 2, 2, 1, 8),
+        max_geometry=VideoShape(1, (1,), 2, 2, 1, 8),
     )
     lease = ring.reserve("video")
     try:

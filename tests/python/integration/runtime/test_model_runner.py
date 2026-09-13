@@ -29,18 +29,14 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.config import LaneConfig, WorkerConfig
-from uniserve_worker.execution.forward_batch import (
-    ForwardBatch,
-    ForwardOutput,
-)
-from uniserve_worker.foundation.errors import WorkerError, WorkerErrorCode
+from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.modeling.batch import TextBatch, TextOutput
 from uniserve_worker.models.stub import StubModel, _next_token
 from uniserve_worker.protocol.batch import (
     COMPUTATIONS,
     ArRequestParams,
     BlockTable,
     Bounds,
-    BufferId,
     ComputationId,
     DeviceProductTransferValue,
     DType,
@@ -75,19 +71,13 @@ class _MisalignedOutputModel(StubModel):
         self.misaligned = False
         self.failure_delay_cycles = 0
 
-    def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
-        output = super().project(hidden, batch)
+    def compute_logits(self, hidden: torch.Tensor, batch: TextBatch) -> TextOutput:
+        output = super().compute_logits(hidden, batch)
         if self.misaligned:
             if self.failure_delay_cycles:
                 torch.cuda._sleep(self.failure_delay_cycles)
-            return ForwardOutput(output.values[:-1])
+            return TextOutput(output.values[:-1])
         return output
-
-
-class _SeparatePhaseModel(StubModel):
-    def __init__(self) -> None:
-        super().__init__()
-        self.tensorized_mixed = False
 
 
 def _publish_conditioning(
@@ -389,62 +379,6 @@ def test_decode_reuses_the_published_request_page_table() -> None:
     assert report.completions[0].kv_visible_len == 3
 
 
-class _CloseScoreModel(StubModel):
-    """Expose a token tie whose winner depends on small score variation."""
-
-    def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
-        output = super().project(hidden, batch)
-        for row in batch.token_row_indices:
-            scores = output.values[row]
-            scores.fill_(-1.0)
-            scores[..., 0] = 0.0
-            scores[..., 1] = 2e-6 if batch.flow_row_indices else -2e-6
-        return output
-
-
-def test_mixed_token_ties_preserve_numerically_close_outputs():
-
-    worker = execution_worker(_CloseScoreModel())
-    sequence_admission = ar_params(1, block_ids=(0,))
-    flow_admission = umm_params(2, ImageParams(steps=1, height=16, width=16, seed=29))
-    conditioning = _publish_conditioning(
-        worker, flow_admission, op_id=ComputationId(10, 0), run_id=1
-    )
-    latent, preparation = _prepare_media(
-        worker,
-        flow_admission,
-        conditioning,
-        op_id=ComputationId(11, 0),
-        predecessor=root_parent(flow_admission),
-        run_id=2,
-    )
-    flow, _ = diffusion_step_operation(
-        flow_admission.request_key,
-        op_id=ComputationId(12, 1),
-        predecessor=preparation.op_id,
-        conditioning=conditioning,
-        latent=latent,
-        steps=1,
-    )
-    sequence, sequence_control = _prepare_decode(
-        worker, sequence_admission, op_id=ComputationId(11, 0), run_id=3, tokens=(3, 4)
-    )
-    batch = execution_run(
-        run_id=4,
-        admissions=(),
-        operations=(sequence, flow),
-        commands=(),
-    )
-    result = finalized_report(
-        worker,
-        worker.submit(
-            batch,
-        ),
-    )
-    assert all(item.status is OpStatus.OK for item in result.completions)
-    assert result.completions[0].committed_tokens == (1,)
-
-
 @pytest.mark.parametrize(
     ("device", "binding", "graphs", "steps", "generation_device"),
     [
@@ -459,7 +393,7 @@ def test_mixed_token_ties_preserve_numerically_close_outputs():
         pytest.param("cuda:0", "default", True, 2, "cuda:1", marks=pytest.mark.gpu),
     ],
 )
-def test_mixed_token_and_flow_match_homogeneous_results(
+def test_independent_token_and_flow_match_homogeneous_results(
     device, binding, graphs, steps, generation_device
 ):
     lanes = {
@@ -492,8 +426,7 @@ def test_mixed_token_and_flow_match_homogeneous_results(
         execution_worker(device=device, execution=policy) as mixed,
         execution_worker(device=device) as split,
     ):
-        # Direct execution permits cold capture of configured mixed geometry;
-        # service warmup separately qualifies which mixed launches it advertises.
+        # Each numerical domain uses its own call while sharing request storage.
         sequence_admission = ar_params(1, block_ids=(0,))
         flow_admission = umm_params(2, ImageParams(steps=steps, height=16, width=16, seed=29))
         mixed_conditioning = _publish_conditioning(
@@ -697,42 +630,6 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> None
             assert image.size == (16, 16)
     finally:
         worker.close()
-
-
-def test_mixed_submission_requires_tensorized_model_support():
-    worker = execution_worker(_SeparatePhaseModel())
-    token_admission = ar_params(1, block_ids=(0,))
-    flow_admission = umm_params(2, ImageParams(steps=1, height=16, width=16, seed=29))
-    token = token_operation(
-        token_admission.request_key,
-        op_id=ComputationId(11, 0),
-        predecessor=root_parent(token_admission),
-        mode=ForwardMode.PREFILL,
-        tokens=(3, 4),
-    )
-    conditioning = BufferId(
-        owner=flow_admission.request_key,
-        producer_op_id=ComputationId(1, 0),
-        output_index=0,
-        generation=1,
-    )
-    preparation, _latent = diffusion_prepare_operation(
-        flow_admission.request_key,
-        op_id=ComputationId(11, 0),
-        predecessor=root_parent(flow_admission),
-        conditioning=conditioning,
-    )
-
-    with pytest.raises(WorkerError) as rejected:
-        worker.submit(
-            execution_run(
-                run_id=2,
-                admissions=(token_admission,),
-                operations=(token, preparation),
-            )
-        )
-
-    assert rejected.value.code is WorkerErrorCode.INVALID_DESCRIPTOR
 
 
 def test_computation_identity_preserves_homogeneous_decode():
@@ -2176,7 +2073,7 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             assert transferred.completions[0].status is OpStatus.OK
             descriptor = transferred.products[0].value
             assert isinstance(descriptor, DeviceProductTransferValue)
-            # The stub's RGB_LATENT materialization uses the signed [-1, 1] contract.
+            # RGB reconstruction preserves the signed [-1, 1] numerical contract.
             assert (descriptor.height, descriptor.width, descriptor.value_range) == (
                 16,
                 16,
@@ -2658,7 +2555,8 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
 
 
 @pytest.mark.gpu
-def test_direct_full_binding_captures_without_explicit_warmup():
+@pytest.mark.parametrize("warmup", [False, True])
+def test_full_binding_returns_current_decode_tokens(warmup):
     policy = WorkerConfig(
         graph_policy="full",
         prefill_cuda_graph=True,
@@ -2669,6 +2567,8 @@ def test_direct_full_binding_captures_without_explicit_warmup():
         lanes=(LaneConfig("compute", 152, COMPUTATIONS),),
     )
     with execution_worker(device="cuda:0", execution=policy) as worker:
+        if warmup:
+            worker.warmup()
         admission = ar_params(1, block_ids=(0,))
         decode, observation = _prepare_decode(
             worker, admission, op_id=ComputationId(1, 0), run_id=1, tokens=(3, 4)

@@ -7,20 +7,20 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from uniserve_worker.modeling.tensors import (
+    AttentionMetadata,
+    AttentionMode,
+    FlowPatches,
+    TokenSelection,
+    packed_tensor_views,
+)
 from uniserve_worker.ops.staging import gather_request_decode_inputs
 from uniserve_worker.protocol.batch import ForwardMode, PipelineStage
 from uniserve_worker.runtime.device import fill_cpu_bools, fill_cpu_ints
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
 from ..runtime.tensor_buffers import TensorBuffers, TensorSchema
-from .forward_batch import (
-    AttentionMetadata,
-    AttentionMode,
-    FlowPatches,
-    ForwardBatch,
-    TokenSelection,
-    packed_tensor_views,
-)
+from .batch import InputBatch
 from .rows import ForwardRow
 
 if TYPE_CHECKING:
@@ -146,7 +146,7 @@ class InputBuffers:
         states: DecodeState | None = None,
         packed: bool = False,
         binding: int = 0,
-    ) -> ForwardBatch:
+    ) -> InputBatch:
         """Stage numerical rows into fixed addresses, including attention and decode gather.
 
         Startup may supply physical attention geometry for its reserved scratch
@@ -156,6 +156,14 @@ class InputBuffers:
         from .attention import cache_pages, columns, dense_columns
 
         tasks = rows
+        if any(
+            task.forward_mode != forward_mode
+            and not (
+                isinstance(task.forward_mode, ForwardMode) and isinstance(forward_mode, ForwardMode)
+            )
+            for task in tasks
+        ):
+            raise ValueError("input staging requires homogeneous computations")
         row_count = len(tasks)
         if not 0 < row_count <= self.max_rows:
             raise ValueError("forward row count exceeds input-buffer capacity")
@@ -206,9 +214,8 @@ class InputBuffers:
                 )
         if indexed:
             assert states is not None
-            # Mixed forwards consume ordinary numerical views. Resolve only
-            # these rows here; pure decode already gathered the shared columns
-            # directly into fixed addresses without constructing row views.
+            # Resolve indexed rows when the attention representation requires
+            # ordinary numerical views instead of the direct decode gather.
             tasks = tuple(
                 replace(
                     task,
@@ -224,7 +231,7 @@ class InputBuffers:
             )
         if attention is None:
             attention = (
-                columns(tasks, cache=cache, tables=tables, packed=packed, binding=binding)
+                columns(tasks, cache=cache, tables=tables, packed=packed)
                 if textual
                 else dense_columns(len(tasks), tuple(task.query_tokens for task in tasks))
             )
@@ -397,8 +404,9 @@ class InputBuffers:
             else self.input_embeddings[:token_offset]
         )
         mask_view = None if embeddings_view is None else self.embedding_mask[:token_offset]
-        return ForwardBatch(
+        return InputBatch(
             forward_mode=forward_mode,
+            binding=int(binding),
             row_count=row_count,
             attention=staged_attention,
             request_pool_indices=self.request_pool_indices[:row_count],
@@ -442,7 +450,7 @@ class InputBuffers:
         states: DecodeState,
         table_width: int,
         binding: int,
-    ) -> ForwardBatch:
+    ) -> InputBatch:
         """Snapshot mutable request columns directly into graph-stable input addresses."""
 
         row_count = len(tasks)
@@ -508,7 +516,7 @@ class InputBuffers:
 
         # Cache write locations are flattened page-and-offset coordinates; the
         # returned batch retains the two-dimensional table for attention reads.
-        return ForwardBatch(
+        return InputBatch(
             attention=AttentionMetadata(
                 attention_mode=AttentionMode.PAGED_DECODE,
                 prefix_lens=self.cache_lengths[:row_count],
@@ -524,9 +532,9 @@ class InputBuffers:
                 query_lens_cpu=(1,) * row_count,
                 seq_lens_cpu=tuple(value + 1 for value in prefix_lens),
                 group_id=int(group_id),
-                binding=int(binding),
             ),
             forward_mode=forward_mode,
+            binding=int(binding),
             row_count=row_count,
             request_pool_indices=self.request_pool_indices[:row_count],
             decode_force_finish=staged_decode_force_finish,

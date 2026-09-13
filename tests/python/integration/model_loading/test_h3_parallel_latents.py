@@ -13,13 +13,19 @@ from transformers import AutoTokenizer
 
 from uniserve_eval.config import load_config
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
+from uniserve_worker.bootstrap.capacity import product_storage_bytes
 from uniserve_worker.bootstrap.distributed import (
     initialize_entries,
     initialize_process_groups,
 )
 from uniserve_worker.config import WorkerConfig
+from uniserve_worker.execution.denoising import DenoisingStep, denoising_batch
+from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.model_runner import ModelRunner
+from uniserve_worker.execution.video import initialize_latents, prepare_call
 from uniserve_worker.loader import LoadRequest, load_model
+from uniserve_worker.modeling.components import Call
+from uniserve_worker.modeling.geometry import MediaShape
 from uniserve_worker.models.minimax_h3.config import (
     PRECISION_PRESETS,
     PRECISION_SHORTHANDS,
@@ -34,12 +40,14 @@ from uniserve_worker.models.minimax_h3.packing import (
 from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig, SequenceParallel
 from uniserve_worker.nn.quant.config import resolve_component_precisions
 from uniserve_worker.protocol.batch import (
-    DiffusionSamplingParams,
     TensorTransfer,
     WorkerEndpoint,
 )
 from uniserve_worker.runtime.device_events import EventPool
 from uniserve_worker.runtime.tensor_buffers import TensorBuffers
+from uniserve_worker.runtime.tensors import (
+    stage_tensor,
+)
 from uniserve_worker.transfer.layout import fetch_tensor
 from uniserve_worker.transfer.tickets import make_transport
 
@@ -78,8 +86,21 @@ _LAYOUTS = {
 
 
 def _generate(
-    rank, rendezvous, checkpoint, kind, encoder_tp, component_precisions, requests, directory
+    rank,
+    rendezvous,
+    checkpoint,
+    kind,
+    encoder_tp,
+    component_precisions,
+    requests,
+    directory,
+    completed,
 ):
+    import faulthandler
+    import signal
+
+    # Spawned workers expose on-demand Python stacks for distributed stalls.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
@@ -88,6 +109,34 @@ def _generate(
         backend="nccl",
         init_method=rendezvous,
     )
+    _generate_requests(
+        environment,
+        rank,
+        checkpoint,
+        kind,
+        encoder_tp,
+        component_precisions,
+        requests,
+        directory,
+        completed,
+    )
+    # Successful workers release numerical views before collective teardown.
+    # On failure, mp.spawn must receive the exception and terminate peers that
+    # can still be waiting at the request barrier; teardown would block it.
+    environment.close()
+
+
+def _generate_requests(
+    environment,
+    rank,
+    checkpoint,
+    kind,
+    encoder_tp,
+    component_precisions,
+    requests,
+    directory,
+    completed,
+):
     ranks, parallel = _LAYOUTS[kind]
     components = {
         "denoiser": ComponentConfig(ranks, parallel),
@@ -123,19 +172,23 @@ def _generate(
     runner = loaded.model
     schedule = loaded.schedule
     assert schedule is not None
-    storage = TensorBuffers.allocate(runner.resource_geometry.request_tensors, runner.device)
     execution = ModelRunner(
         runner,
         loaded.worker_config,
+        bindings=loaded.bindings,
         schedule=schedule,
+    )
+    storage = (
+        TensorBuffers.allocate(execution.tensor_resources.state, runner.device)
+        if execution.tensor_resources.state
+        else None
     )
     scratch = execution.scratch
     assert scratch is not None
-    context_workspace = execution.context_workspace
     transfer_events = EventPool()
     transport = make_transport(
         "cuda_ipc",
-        byte_capacity=runner.product_storage_bytes,
+        byte_capacity=product_storage_bytes(execution.output_schema),
         ticket_capacity=4,
         event_pool=transfer_events,
         source=WorkerEndpoint.local("worker", rank=rank),
@@ -143,18 +196,20 @@ def _generate(
     with torch.inference_mode():
         for index, (frames, token_ids) in enumerate(requests):
             print(f"{kind} rank {rank} case {index}: encoding", flush=True)
-            media = DiffusionSamplingParams(
-                num_frames=frames,
-                num_decode_chunks=(frames - 5) // 17,
-                seed=0,
-                num_inference_steps=4,
-            )
-            metadata = runner.build_execution(media, len(token_ids), scratch, context_workspace)
-            slot = runner.request_tensors(storage, metadata)
+            numerical_shape = MediaShape(768, 1344, frames=frames, prompt_tokens=len(token_ids))
+            constants = {}
+            views_scratch = {}
+            slot = {}
+            trajectory = DiffusionState(geometry=numerical_shape)
+            if bindings["denoiser"].owns:
+                assert storage is not None
+                slot, constants, views_scratch = prepare_call(
+                    runner, execution, trajectory, Call.DIFFUSION, numerical_shape, storage
+                )
             encoded = None
             if runner.text_encoder is not None:
                 tokens = execution.stage_text_tokens(token_ids)
-                (encoded,) = execution.run_entry("text_encoder", tokens).values
+                (encoded,) = execution.run_encoder("text", tokens).values
             owner = bindings["text_encoder"].output_ranks[0]
             publication = transport.publish(encoded) if rank == owner else None
             descriptor = [publication]
@@ -179,33 +234,51 @@ def _generate(
                     ticket.result()
                 encoded = conditioning
 
-            def execute(name: str, value: torch.Tensor) -> torch.Tensor:
-                (result,) = execution.run_module(name, value).values
-                return result
-
-            with execution.preparing_inputs(runner.initialize_tensors(slot, 1000 + index)):
-                if runner.conditioner is not None:
+            initial_latents = (
+                initialize_latents(
+                    runner,
+                    numerical_shape,
+                    slot,
+                    constants,
+                    views_scratch,
+                    1000 + index,
+                )
+                if bindings["denoiser"].owns
+                else ()
+            )
+            with execution.preparing_inputs(initial_latents):
+                if "conditioning" in execution.encoder_kinds:
                     assert encoded is not None
-                    encoded = execute("conditioner", encoded)
-                runner.prepare_tensors(slot, metadata, encoded, len(token_ids))
+                    (encoded,) = execution.run_encoder("conditioning", encoded).values
+                    stage_tensor(encoded, slot["text_condition"])
             for ticket in tickets:
                 ticket.close()
             if "denoiser" in bindings and bindings["denoiser"].owns:
                 for step in range(4):
-                    samples = (slot.video_rows, slot.audio_rows)
+                    samples = (slot["video"], slot["audio"])
                     initial = tuple(value.clone() for value in samples)
-                    runner.bind_denoising_step(slot, metadata, step, schedule)()
+                    batch = denoising_batch(
+                        runner,
+                        numerical_shape,
+                        slot,
+                        schedule,
+                        step,
+                    )
+                    assert execution.diffusion is not None and views_scratch is not None
+                    with execution.diffusion.attention_scope(trajectory.geometry):
+                        DenoisingStep(runner, batch, slot, constants, views_scratch, schedule)()
                     eager = tuple(value.clone() for value in samples)
                     for destination, saved in zip(samples, initial, strict=True):
                         destination.copy_(saved)
                     execution.run_denoising(
-                        slot,
-                        metadata,
-                        step,
+                        batch,
                         1,
                         schedule,
+                        state=slot,
+                        constants=constants,
+                        scratch=views_scratch,
                         slot=1,
-                        geometry=runner.execution_key(media, len(token_ids)),
+                        geometry=trajectory.geometry,
                     )
                     for observed, expected in zip(samples, eager, strict=True):
                         torch.testing.assert_close(observed, expected, rtol=2e-2, atol=2e-2)
@@ -216,10 +289,13 @@ def _generate(
             if rank in bindings["denoiser"].output_ranks:
                 owner = bindings["denoiser"].output_ranks.index(rank)
                 torch.save(
-                    {"video": slot.video_rows.cpu(), "audio": slot.audio_rows.cpu()},
+                    {"video": slot["video"].cpu(), "audio": slot["audio"].cpu()},
                     Path(directory) / f"case-{index}-owner-{owner}.pt",
                 )
-            dist.barrier()
+            # Idle component owners can finish long before denoiser ranks. This
+            # test-only lifetime join must not enqueue a GPU collective whose
+            # watchdog runs while other ranks are still doing numerical work.
+            completed.wait()
             if publication is not None:
                 transport.release(publication)
             transfer_events.reap()
@@ -227,11 +303,11 @@ def _generate(
     transfer_events.close()
     execution.synchronize()
     execution.close()
-    environment.close()
 
 
 def _collect(checkpoint, requests, kind, directory, *, encoder_tp=1, component_precisions):
     directory.mkdir()
+    completed = mp.get_context("spawn").Barrier(4)
     mp.spawn(
         _generate,
         (
@@ -242,6 +318,7 @@ def _collect(checkpoint, requests, kind, directory, *, encoder_tp=1, component_p
             component_precisions,
             requests,
             str(directory),
+            completed,
         ),
         nprocs=4,
         join=True,

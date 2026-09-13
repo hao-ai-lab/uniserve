@@ -8,14 +8,13 @@ from typing import cast
 import torch
 import torch.nn as nn
 
-from ...execution.forward_batch import ForwardBatch
+from ...modeling.tensors import AttentionMetadata
 from ..attention import RadixAttention
 from ..layer import LayerConfig
 from ..linear import LinearBase, QKVParallelLinear, RowParallelLinear
 from ..mlp import GatedMLP
 from ..moe import FusedMoE
 from ..norm import RMSNorm
-from ..parallel_pipeline import LayerPipeline
 from ..parallel_sequence import SequencePartition
 from ..quant.base import PreparedLinearInput
 from ..quant.config import QuantizationConfig
@@ -27,9 +26,8 @@ from ..row_pipeline import (
     RowTensorSegments,
     independent_linear_rows,
     packed_row_stage,
-    run_row_pipeline,
 )
-from ..vocab_parallel_embedding import VocabParallelEmbedding
+from .base import Decoder
 
 __all__ = [
     "Qwen3Config",
@@ -116,7 +114,7 @@ class Qwen3Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        context: ForwardBatch | None,
+        context: AttentionMetadata | None,
         *,
         cos: torch.Tensor,
         sin: torch.Tensor,
@@ -138,7 +136,7 @@ class Qwen3Attention(nn.Module):
             q_attn,
             k_attn,
             v_attn,
-            None if context is None else context.attention,
+            None if context is None else context,
             causal=True,
             scale=self.scale,
             partition=partition,
@@ -298,7 +296,7 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-        context: ForwardBatch | None,
+        context: AttentionMetadata | None,
         *,
         cos: torch.Tensor,
         sin: torch.Tensor,
@@ -339,7 +337,7 @@ class Qwen3DecoderLayer(nn.Module):
 
     def row_stage(
         self,
-        context: ForwardBatch,
+        context: AttentionMetadata,
         cos: torch.Tensor,
         sin: torch.Tensor,
         partition: SequencePartition | None,
@@ -375,7 +373,7 @@ class Qwen3DecoderLayer(nn.Module):
             project,
             self.self_attn.attn,
             finish,
-            context=context.attention,
+            context=context,
             partition=partition,
             causal=True,
             scale=self.self_attn.scale,
@@ -384,7 +382,7 @@ class Qwen3DecoderLayer(nn.Module):
         )
 
 
-class Qwen3Model(nn.Module):
+class Qwen3Model(Decoder):
     """Stack of Qwen3 decoder layers with token embeddings and final RMSNorm."""
 
     def __init__(
@@ -398,19 +396,12 @@ class Qwen3Model(nn.Module):
     ) -> None:
         """Build sharded token embeddings, decoder layers, rotary tables, and final norm."""
 
-        super().__init__()
-        self.pipeline = LayerPipeline(layer_config.pipeline, cfg.num_hidden_layers)
-        self.sequence = layer_config.sequence
-        self.hidden_size = cfg.hidden_size
-        self.embed_tokens = (
-            VocabParallelEmbedding(
-                cfg.vocab_size,
-                cfg.hidden_size,
-                layer_config=layer_config,
-                init_weights=False,
-            )
-            if self.pipeline.first
-            else None
+        super().__init__(
+            cfg.hidden_size,
+            cfg.vocab_size,
+            cfg.num_hidden_layers,
+            layer_config=layer_config,
+            init_embeddings=False,
         )
         self.layers = nn.ModuleDict(
             {
@@ -436,46 +427,41 @@ class Qwen3Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        context: ForwardBatch | None = None,
+        inputs_embeds: torch.Tensor | None,
+        context: AttentionMetadata | None = None,
         *,
-        input_embeds: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Decode token or supplied embedding rows and return final normalized hidden states."""
+        """Decode numerical embeddings and return final normalized hidden states."""
 
+        if positions is None:
+            raise ValueError("Qwen decoder requires temporal positions")
+        token_count = positions.shape[-1]
         partition = None
         if self.sequence.world_size > 1:
-            if context is None or input_ids.ndim != 1:
-                raise ValueError("sequence decoding requires packed token inputs")
-            partition = SequencePartition(input_ids.numel(), self.sequence)
-            input_ids = partition.local(input_ids)
+            if context is None:
+                raise ValueError("sequence decoding requires numerical attention metadata")
+            partition = SequencePartition(token_count, self.sequence)
             positions = partition.local(positions)
-            if input_embeds is not None:
-                input_embeds = partition.local(input_embeds)
-        residual = None
-        if self.pipeline.first:
-            assert self.embed_tokens is not None
-            hidden_states = (
-                input_embeds if input_embeds is not None else self.embed_tokens(input_ids)
-            )
-        else:
-            first = cast(Qwen3DecoderLayer, next(iter(self.layers.values())))
-            hidden_states = first.input_layernorm.weight.new_empty(
-                (*input_ids.shape, self.hidden_size)
-            )
-            residual = torch.empty_like(hidden_states)
-            self.pipeline.receive_activation(hidden_states, residual)
+        first = cast(Qwen3DecoderLayer, next(iter(self.layers.values())))
+        values = self.receive(
+            inputs_embeds,
+            token_count,
+            reference=first.input_layernorm.weight,
+            partition=partition,
+            residual=True,
+        )
+        hidden_states = values[0]
+        residual = None if len(values) == 1 else values[1]
         cos, sin = self.rotary.cos_sin_1d(positions.reshape(-1))
         if context is not None and hidden_states.ndim == 2:
-            values: RowTensors = (hidden_states,) if residual is None else (hidden_states, residual)
-            hidden_states, residual = run_row_pipeline(
-                RowTensorSegments.complete(values),
+            hidden_states, residual = self.run_layers(
+                values,
                 tuple(
                     cast(Qwen3DecoderLayer, layer).row_stage(context, cos, sin, partition)
                     for layer in self.layers.values()
                 ),
-            ).materialize()
+            )
         else:
             for layer_module in self.layers.values():
                 layer = cast(Qwen3DecoderLayer, layer_module)
@@ -488,8 +474,9 @@ class Qwen3Model(nn.Module):
                     positions=positions,
                     partition=partition,
                 )
+            assert residual is not None
+            self.pipeline.send_activation(hidden_states, residual)
         assert residual is not None
-        self.pipeline.send_activation(hidden_states, residual)
         if not self.pipeline.last:
             return hidden_states
         if self.norm is None:

@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 
 import torch
 
+from tests.python.fixtures.worker_config import stub_worker_config
 from uniserve_worker.backends.attention import FlashInferTuningConfig, resolve_attention_selection
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.models.generation import LatentLayout
-from uniserve_worker.models.runtime import ExecutionModel
-from uniserve_worker.models.stub import StubModel, stub_worker_config
+from uniserve_worker.execution.model_entry import ModelEntry
+from uniserve_worker.modeling.image_diffusion import LatentLayout
+from uniserve_worker.modeling.model import Model
+from uniserve_worker.models.stub import StubModel
 from uniserve_worker.nn.mesh import Communicator
 from uniserve_worker.nn.parallel import ComponentConfig
 from uniserve_worker.worker import Worker
 
 
 def execution_worker(
-    model: ExecutionModel | None = None,
+    model: Model | None = None,
     *,
     block_size: int = 16,
     device: str = "cpu",
@@ -29,6 +32,7 @@ def execution_worker(
     max_request_pool_size: int = 128,
     max_batch_operations: int | None = None,
     components: tuple[tuple[str, ComponentConfig], ...] = (),
+    bindings: Mapping[str, ModelEntry] | None = None,
 ) -> Worker:
     ready = StubModel() if model is None else model
     worker_config = replace(
@@ -58,11 +62,13 @@ def execution_worker(
         kv_token_capacity=worker_config.kv_token_capacity,
         attention_backend=worker_config.attention_backend,
         max_request_pool_size=worker_config.max_request_pool_size,
+        encoder_cache_entries=worker_config.encoder_cache_entries,
         max_batch_operations=worker_config.max_batch_operations,
         max_batch_tokens=worker_config.max_batch_tokens,
     )
     worker = Worker(
         ready,
+        bindings=bindings,
         sampling_group=Communicator(device=torch.device(device)),
         worker_config=worker_config,
         attention=resolve_attention_selection(
@@ -71,7 +77,7 @@ def execution_worker(
             block_size=block_size,
         ),
         tokenizer=None,
-        allowed_work_variants=ready.supported_work,
+        allowed_work_variants=None,
         transfer_backends=transfer_backends,
         publication_backends=transfer_backends,
         worker_id=worker_id,
@@ -87,7 +93,7 @@ def execution_worker(
         request_pool_size=worker.info.request_slots,
         block_size=worker.kv_cache.block_size,
         commit_marker_tokens=(
-            int(flow.commit_marker_tokens)
+            int(flow.marker_tokens)
             if flow is not None and flow.latent_layout is LatentLayout.PATCH_TOKENS
             else 0
         ),

@@ -7,8 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ..execution.device_transfer import call_on_device
-from ..execution.forward_batch import ExpertRoute, RouteSpan
+from uniserve_worker.modeling.tensors import ExpertRoute, RouteSpan
 
 __all__ = ["RoutedTensor"]
 
@@ -158,15 +157,12 @@ class RoutedTensor:
         *,
         text: torch.nn.Module,
         flow: torch.nn.Module,
-        generation_device: torch.device | None = None,
     ) -> RoutedTensor:
-        """Apply each populated expert on the device declared for its loaded parameters."""
+        """Apply the bound numerical modules to each populated expert."""
 
         return RoutedTensor(
-            None if self.text is None else call_on_device(text, self.text, device=None),
-            None
-            if self.flow is None
-            else call_on_device(flow, self.flow, device=generation_device),
+            None if self.text is None else text(self.text),
+            None if self.flow is None else flow(self.flow),
         )
 
 

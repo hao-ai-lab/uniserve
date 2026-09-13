@@ -10,7 +10,7 @@ import torch.nn as nn
 
 import uniserve_worker.ops as ops
 
-from ...execution.forward_batch import ForwardBatch
+from ...modeling.tensors import AttentionMetadata
 from ..attention import RadixAttention
 from ..layer import LayerConfig
 from ..linear import LinearBase
@@ -64,7 +64,7 @@ class VisionSelfAttention(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        context: ForwardBatch,
+        context: AttentionMetadata | None,
         *,
         max_seqlen: int,
         seq_lens: Sequence[int],
@@ -86,7 +86,7 @@ class VisionSelfAttention(nn.Module):
             max_seqlen_k=max_seqlen,
             causal=False,
             scale=self.scale,
-            ctx=context.attention,
+            ctx=context,
         )
         provider = self.attn.varlen_provider
         if provider is not None and ops.can_run_attention(varlen, provider=provider):
@@ -146,7 +146,7 @@ class VisionEncoderLayer(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        context: ForwardBatch,
+        context: AttentionMetadata | None,
         *,
         max_seqlen: int,
         seq_lens: Sequence[int],
@@ -187,7 +187,7 @@ class VisionEncoder(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        context: ForwardBatch,
+        context: AttentionMetadata | None,
         cu_seqlens: torch.Tensor | None = None,
         *,
         seq_lens: Sequence[int] | None = None,

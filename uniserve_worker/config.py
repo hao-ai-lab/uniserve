@@ -262,6 +262,7 @@ class WorkerConfig:
     max_batch_operations: int = 1024
     max_batch_tokens: int = 8192
     max_request_pool_size: int = 128
+    encoder_cache_entries: int = 256
     generation_device: str | None = None
     min_request_pool_size: int = 1
     pool_memory_bytes: int | None = None
@@ -295,6 +296,7 @@ class WorkerConfig:
             or self.max_batch_operations < 1
             or self.max_batch_tokens < 1
             or self.max_request_pool_size < 1
+            or self.encoder_cache_entries < 1
         ):
             raise invalid_descriptor("worker configuration capacities must be positive")
         if not 0 < self.kv_memory_fraction <= 1:

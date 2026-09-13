@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 
 if TYPE_CHECKING:
-    from ..execution.forward_batch import ForwardBatch, ForwardOutput, VocabularyPartition
+    from uniserve_worker.modeling.tensors import VocabularyPartition
+
+    from ..modeling.batch import TextBatch, TextOutput
     from .parallel_pipeline import LayerPipeline
     from .vocab_parallel_embedding import ParallelLMHead
 
@@ -24,33 +25,23 @@ __all__ = [
 
 def project_outputs(
     hidden: torch.Tensor,
-    batch: ForwardBatch,
+    batch: TextBatch,
     head: ParallelLMHead | None,
     *,
-    project_flow: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
     pipeline: LayerPipeline | None = None,
     vocabulary: VocabularyPartition | None = None,
-    flow_dtype: torch.dtype | None = None,
-) -> ForwardOutput:
-    """Project packed text rows and preserve model-defined continuous outputs.
+) -> TextOutput:
+    """Project selected text rows with their logical vocabulary partition.
 
-    Text selections share one local vocabulary projection; each output records
-    its partition independently. ``project_flow`` receives a request's hidden
-    rows and its index within the flow columns. It owns only the mathematical
-    prediction, while this function owns row selection and output ordering.
-    Final-stage weights produce pipeline outputs, which are broadcast to the
-    other stages retaining request state. Nonresident heads supply vocabulary
-    geometry without allocating weights. Continuous outputs have the latent
-    shapes in ``batch`` and their declared prediction dtype.
+    Final-stage weights produce pipeline outputs, which are broadcast to other
+    mathematical participants. Nonresident heads supply vocabulary geometry.
     """
 
-    from ..execution.forward_batch import (
-        AttentionMode,
-        ForwardOutput,
-        TokenSelection,
-    )
+    from uniserve_worker.modeling.tensors import AttentionMode, TokenSelection
 
-    selections = dict(zip(batch.token_row_indices, batch.token_selections, strict=True))
+    from ..modeling.batch import TextOutput
+
+    selections = dict(enumerate(batch.selections))
     partition = head.vocabulary_partition() if head is not None else vocabulary
     if partition is None:
         raise ValueError("vocabulary projection requires explicit partition geometry")
@@ -58,7 +49,7 @@ def project_outputs(
     if owner and head is None:
         raise ValueError("the output pipeline stage must own its vocabulary projection")
 
-    def finish(output: ForwardOutput) -> ForwardOutput:
+    def finish(output: TextOutput) -> TextOutput:
         if pipeline is not None and pipeline.group.world_size > 1:
             for value in output.values:
                 pipeline.group.broadcast(value, src=pipeline.group.world_size - 1)
@@ -77,17 +68,13 @@ def project_outputs(
         else:
             selected_logits = hidden.new_empty((batch.row_count, partition.width))
         return finish(
-            ForwardOutput(
+            TextOutput(
                 tuple(selected_logits[index : index + 1] for index in range(batch.row_count)),
                 (partition,) * batch.row_count,
             )
         )
 
-    lengths = [0] * batch.row_count
-    for index in batch.token_row_indices:
-        lengths[index] = int(batch.attention.query_lens_cpu[index])
-    for index, count in zip(batch.flow_row_indices, batch.flow_image_tokens, strict=True):
-        lengths[index] = int(count)
+    lengths = list(batch.attention.query_lens_cpu)
     # Captured token buckets can include storage-only rows after the live spans.
     visible = hidden[: sum(lengths)]
     rows = (
@@ -134,16 +121,7 @@ def project_outputs(
         outputs[index] = projected[offset : offset + count]
         vocabularies[index] = partition
         offset += count
-    for flow_index, row_index in enumerate(batch.flow_row_indices):
-        if owner:
-            if project_flow is None:
-                raise ValueError("flow output requires its model's prediction function")
-            outputs[row_index] = project_flow(rows[row_index], flow_index)
-        else:
-            if flow_dtype is None:
-                raise ValueError("nonresident flow output requires its prediction dtype")
-            outputs[row_index] = torch.empty_like(batch.flow_latents[flow_index], dtype=flow_dtype)
-    return finish(ForwardOutput(tuple(outputs), tuple(vocabularies)))
+    return finish(TextOutput(tuple(outputs), tuple(vocabularies)))
 
 
 def _gather_partitions(

@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from ..execution.forward_batch import AttentionMetadata
+from uniserve_worker.modeling.tensors import AttentionMetadata
 
 
 @dataclass(frozen=True)

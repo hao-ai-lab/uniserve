@@ -29,8 +29,7 @@ from uniserve_worker.foundation.errors import (
     invalid_descriptor,
     should_capture_trace,
 )
-from uniserve_worker.models.generation import Materialization
-from uniserve_worker.models.video import VideoModel
+from uniserve_worker.modeling.video import VideoMixin
 from uniserve_worker.nn.diffusion.cfg import Branch, CfgPlan
 from uniserve_worker.profiling import _forward_stats, record_component
 from uniserve_worker.protocol.batch import (
@@ -46,9 +45,9 @@ from uniserve_worker.protocol.batch import (
     TimingCounters,
     TransferMode,
 )
-from uniserve_worker.runtime.tensor_store import ImageRange
 
-from ..models.inputs import PatchTransform
+from ..modeling.geometry import TensorOutputLayout
+from ..modeling.inputs import PatchTransform
 from .diffusion_state import DiffusionState
 from .output import capture_samples
 from .sampling import SamplerRow, SamplingMetadata
@@ -62,7 +61,7 @@ if TYPE_CHECKING:
     from uniserve_worker.execution.output import OutputPool
     from uniserve_worker.media.buffers import MediaBuffers
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.models.runtime import ExecutionModel
+    from uniserve_worker.modeling.model import Model
     from uniserve_worker.nn.mesh import Communicator
     from uniserve_worker.runtime.block_tables import BlockTables
     from uniserve_worker.runtime.cpu import CpuPool
@@ -104,7 +103,7 @@ def execute_batch(
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     media_buffers: MediaBuffers | None,
-    execution_model: ExecutionModel,
+    execution_model: Model,
     output_pool: OutputPool,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
@@ -471,7 +470,7 @@ def _execute_groups(
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
-    execution_model: ExecutionModel,
+    execution_model: Model,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
@@ -555,7 +554,9 @@ def _forward_values(
     tables: BlockTables | None,
     states: DecodeState | None,
     sampling_group: Communicator | None,
-) -> tuple[tuple[torch.Tensor, torch.Tensor, SamplerRow | None] | None, ...]:
+) -> tuple[
+    tuple[torch.Tensor, torch.Tensor, SamplerRow | None, TensorOutputLayout | None] | None, ...
+]:
     """Bind numerical outputs to their completion owners and attribute group statistics."""
 
     for row, _operation, completion_group in inputs:
@@ -568,7 +569,9 @@ def _forward_values(
         tables=tables,
         states=states,
     )
-    values: list[tuple[torch.Tensor, torch.Tensor, SamplerRow | None] | None] = [None] * len(inputs)
+    values: list[
+        tuple[torch.Tensor, torch.Tensor, SamplerRow | None, TensorOutputLayout | None] | None
+    ] = [None] * len(inputs)
     from .token import graph_decode_samples
 
     for indexes, output in outputs:
@@ -579,6 +582,8 @@ def _forward_values(
         try:
             if output.stats is None or output.request_pool_indices is None:
                 raise RuntimeError("numerical forward lost statistics or request slot views")
+            stats = output.stats
+            request_pool_indices = output.request_pool_indices
             selected = graph_decode_samples(
                 tuple(inputs[index][1] for index in indexes),
                 tuple(
@@ -595,12 +600,13 @@ def _forward_values(
             if selected is None:
                 output = output.materialize()
 
-            state.group_forward_stats[inputs[indexes[0]][2]].append(output.stats)
+            state.group_forward_stats[inputs[indexes[0]][2]].append(stats)
             for local, (index, value) in enumerate(zip(indexes, output.values, strict=True)):
                 values[index] = (
                     value,
-                    output.request_pool_indices[local : local + 1],
+                    request_pool_indices[local : local + 1],
                     None if selected is None else selected[local],
+                    output.layouts[local],
                 )
         except BaseException as error:
             if classify(error).fatal:
@@ -619,7 +625,7 @@ def _execute_operations(
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
-    execution_model: ExecutionModel,
+    execution_model: Model,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
@@ -730,7 +736,7 @@ def _execute_operations(
                             model_runner=model_runner,
                             state=state,
                         )
-                    elif isinstance(execution_model, VideoModel):
+                    elif isinstance(execution_model, VideoMixin):
                         result = video.execute(
                             operation,
                             completion_group,
@@ -828,7 +834,7 @@ def _execute_operations(
                     operation, completion_group = operations[index]
                     if not live(index) or numerical_result is None:
                         continue
-                    value, _sampling_index, _selection = numerical_result
+                    value, _sampling_index, _selection, _layout = numerical_result
                     try:
                         token.commit_kv(
                             task,
@@ -947,36 +953,26 @@ def _execute_operations(
                             model_runner=model_runner,
                             state=state,
                         )
-                        if model_runner.generation().materialization is Materialization.RGB_LATENT:
-                            outcomes[index] = encode.publish_image(
-                                operation,
-                                completion_group,
-                                latent.detach(),
-                                ImageRange.SIGNED_UNIT,
-                                tensor_store=tensor_store,
-                                state=state,
+                        row = state.pending_output(
+                            completion_group, operation.request_key.request_id
+                        )
+                        params = row.input_latent_params
+                        staging = row.latent_staging
+                        if params is None or staging is None:
+                            raise invalid_descriptor(
+                                "trajectory operation has no staged latent inputs"
                             )
-                        else:
-                            row = state.pending_output(
-                                completion_group, operation.request_key.request_id
+                        forward.append(
+                            (
+                                index,
+                                ForwardRow(
+                                    forward_mode=PipelineStage.IMAGE_DECODING,
+                                    latent=latent,
+                                    image_height=int(params.height),
+                                    image_width=int(params.width),
+                                ),
                             )
-                            params = row.input_latent_params
-                            staging = row.latent_staging
-                            if params is None or staging is None:
-                                raise invalid_descriptor(
-                                    "trajectory operation has no staged latent inputs"
-                                )
-                            forward.append(
-                                (
-                                    index,
-                                    ForwardRow(
-                                        forward_mode=PipelineStage.IMAGE_DECODING,
-                                        latent=latent,
-                                        image_height=int(params.height),
-                                        image_width=int(params.width),
-                                    ),
-                                )
-                            )
+                        )
                 except BaseException as error:
                     errors[completion_group] = error
             forward = [item for item in forward if live(item[0])]
@@ -1009,7 +1005,7 @@ def _execute_operations(
                 operation, completion_group = operations[index]
                 if not live(index) or numerical_result is None:
                     continue
-                value, sampling_index, graph_sample = numerical_result
+                value, sampling_index, graph_sample, layout = numerical_result
                 try:
                     if index in trajectories:
                         predictions[index].append(value)
@@ -1061,11 +1057,13 @@ def _execute_operations(
                             state=state,
                         )
                     else:
+                        if layout is None or layout.value_range is None:
+                            raise ValueError("image decoder must declare its numerical range")
                         outcomes[index] = encode.publish_image(
                             operation,
                             completion_group,
                             value.detach(),
-                            ImageRange.UNIT,
+                            layout.value_range,
                             tensor_store=tensor_store,
                             state=state,
                         )

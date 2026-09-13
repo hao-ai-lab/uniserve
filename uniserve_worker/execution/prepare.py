@@ -26,7 +26,8 @@ from uniserve_worker.foundation.errors import (
     unsupported_operation,
     unsupported_setup,
 )
-from uniserve_worker.models.video import VideoModel
+from uniserve_worker.modeling.tensors import ImageRange
+from uniserve_worker.modeling.video import VideoMixin
 from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.batch import (
     BufferId,
@@ -46,12 +47,7 @@ from uniserve_worker.protocol.batch import (
     TransferMode,
 )
 from uniserve_worker.runtime.latent_pool import LatentImport
-from uniserve_worker.runtime.tensor_store import (
-    FeatureMetadata,
-    ImageMetadata,
-    ImageRange,
-    TensorRead,
-)
+from uniserve_worker.runtime.tensor_store import FeatureMetadata, ImageMetadata, TensorRead
 
 if TYPE_CHECKING:
     from uniserve_worker.bootstrap.worker_info import WorkerInfo
@@ -60,7 +56,7 @@ if TYPE_CHECKING:
     from uniserve_worker.execution.output import OutputPool
     from uniserve_worker.media.buffers import MediaBuffers
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.models.runtime import ExecutionModel
+    from uniserve_worker.modeling.model import Model
     from uniserve_worker.runtime.block_tables import BlockTables
     from uniserve_worker.runtime.cpu import CpuPool
     from uniserve_worker.runtime.kv_cache import KVCache
@@ -582,7 +578,7 @@ def _open_group(
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     media_buffers: MediaBuffers | None,
-    execution_model: ExecutionModel,
+    execution_model: Model,
     output_pool: OutputPool,
     request_tables: BlockTables | None,
     request_pool: RequestPool,
@@ -762,12 +758,12 @@ def _reserve_cpu_tasks(
     cpu_tasks: CpuPool,
     worker_info: WorkerInfo,
     media_buffers: MediaBuffers | None,
-    execution_model: ExecutionModel,
+    execution_model: Model,
     config: WorkerConfig,
 ) -> None:
     """Reserve bounded CPU slots for active operations that schedule host-side work."""
 
-    video_model = isinstance(execution_model, VideoModel)
+    video_model = isinstance(execution_model, VideoMixin)
     for operation in operations:
         if operation.kind not in {
             PipelineStage.IMAGE_DECODING,
@@ -797,7 +793,7 @@ def validate_batch(
     batch: ScheduleBatch,
     *,
     worker_info: WorkerInfo,
-    execution_model: ExecutionModel,
+    execution_model: Model,
     config: WorkerConfig,
 ) -> None:
     """Validate run identity, completion group resources, routing, and operation support before staging."""
@@ -839,7 +835,7 @@ def _reserve_outputs(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    execution_model: ExecutionModel,
+    execution_model: Model,
     model_runner: ModelRunner,
 ) -> None:
     """Bind each declared device value to its concrete bounded owner."""
@@ -869,7 +865,7 @@ def _reserve_outputs(
                 None,
             )
             for output in operation.outputs:
-                layout = execution_model.output_layout(
+                layout = model_runner.output_layout(
                     operation.entry,
                     output.output_index,
                     request.request.admission.diffusion,

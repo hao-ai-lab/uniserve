@@ -6,31 +6,39 @@ import hashlib
 import json
 import logging
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 from urllib.request import urlopen
 
 import torch
 from torch import nn
 
+from ..bootstrap.components import validate_components
 from ..config import WorkerConfig
+from ..execution.model_entry import ModelEntry
 from ..foundation.errors import unsupported_setup
-from ..models.runtime import ExecutionModel
+from ..modeling.context import BuildContext
+from ..modeling.model import Model
+from ..modeling.video import VideoMixin
 from ..nn.diffusion.schedule import DiffusionSchedule
+from ..nn.layer import LayerConfig
 from ..nn.quant import QuantizationConfig
 from ..nn.quant.base import process_quantized_modules
+from ..runtime.branches import bind_branches, branch_device
+from ..runtime.results import resolve_outputs
+from ..runtime.tensors import media_calls, resolve_resources
 from .audit import audit_load_report
-from .component import CheckpointComponent, ModelBuildContext, ModelConstruction, construction_dtype
+from .component import CheckpointComponent, construction_dtype
 from .config import LoadFormat, LoadRequest
 from .handles import TensorWeightHandle, WeightHandle, weight_handle_materialization
 from .io import iter_weight_handles
 from .mapping import LoadReport, stacked_weight_name
 from .source import (
+    ModelSource,
     WeightSourceSet,
-    read_model_config,
-    resolve_model_root,
     resolve_weight_sources,
 )
 from .weight_loaders import (
@@ -53,12 +61,16 @@ __all__ = ["ModelLoader", "LoadedModel", "get_model_loader", "load_model"]
 class LoadedModel:
     """Materialized model, tokenizer, sources, and resolved execution metadata."""
 
-    model: ExecutionModel
+    model: Model
+    bindings: Mapping[str, ModelEntry]
     tokenizer: Any | None
     worker_config: WorkerConfig
     sources: tuple[WeightSourceSet, ...]
     architecture_config: dict[str, Any]
     schedule: DiffusionSchedule | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bindings", MappingProxyType(dict(self.bindings)))
 
 
 class ModelLoader:
@@ -80,11 +92,15 @@ class ModelLoader:
 
         if request.load.load_format is not self.load_format:
             raise ValueError("loader format disagrees with the load request")
-        unknown = set(request.bindings) - set(entry.components)
-        if unknown:
-            raise unsupported_setup(
-                f"{entry.architecture} has no computation entries {sorted(unknown)}"
-            )
+        components = validate_components(
+            entry.model_class,
+            config,
+            {name: value.config for name, value in request.bindings.items()},
+        )
+        entry.model_class.validate_parallel(
+            config,
+            {name: value.config.parallel_config for name, value in request.bindings.items()},
+        )
         device = torch.device(request.execution.device)
         capability = entry.minimum_cuda_capability
         if capability is not None and (
@@ -101,6 +117,13 @@ class ModelLoader:
             repository_id=repository_id,
         )
         verify_checksums(sources, request.load.checksum_manifest)
+        tokenizer = None
+        if entry.tokenizer:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                root, use_fast=False, trust_remote_code=False, local_files_only=True
+            )
         dtype = _serving_dtype(request.execution.model_dtype)
         quantization = QuantizationConfig.from_model_config(
             config,
@@ -109,12 +132,33 @@ class ModelLoader:
         if quantization is not None:
             quantization.validate_device(request.execution.device, dtype)
             config = {**config, "quantization_config": dict(quantization.raw)}
+        prepared = (
+            config if entry.prepare_config is None else entry.prepare_config(config, root, sources)
+        )
         schedule = None if entry.create_schedule is None else entry.create_schedule(device)
-        context = ModelBuildContext(
-            root=root,
-            sources=sources,
-            request=request,
-            quantization=quantization,
+        meshes = {
+            name: binding.mesh
+            for name, binding in request.bindings.items()
+            if binding.mesh is not None
+        }
+        context = BuildContext(
+            parallel={
+                name: binding.config.parallel_config for name, binding in request.bindings.items()
+            },
+            meshes=meshes,
+            layers={
+                name: LayerConfig(
+                    mesh.get_group("tp"),
+                    quantization,
+                    pipeline=mesh.get_group("pp"),
+                    sequence=mesh.get_group("ulysses"),
+                )
+                for name, mesh in meshes.items()
+            },
+            limits={
+                "text_tokens": request.max_text_rows,
+                "video_seconds": request.max_video_seconds,
+            },
             component_precisions=(
                 {}
                 if entry.component_precisions is None
@@ -128,16 +172,24 @@ class ModelLoader:
             "meta" if self.load_format is LoadFormat.LAYERED else request.execution.device
         )
         with construction_dtype(dtype), torch.device(construction_device):
-            construction = entry.model_class.build_checkpoint(config, context)
-        if not isinstance(construction, ModelConstruction):
-            raise TypeError("model checkpoint declaration must return ModelConstruction")
+            model = entry.model_class(prepared, context)
+        if not isinstance(model, Model):
+            raise unsupported_setup(f"{type(model).__name__} must implement Model")
+        checkpoints = model.checkpoint_components()
         by_name = {source.source_name: source for source in sources}
         destinations: dict[int, torch.device] = {}
-        for component in construction.components:
-            for path, _ in (*component.module_devices, *component.parameter_dtypes):
+        for component in checkpoints:
+            for path, _ in component.parameter_dtypes:
                 component.module.get_submodule(path)
-            for path, owner in component.module.named_modules():
-                device = component.device_for(path, request.execution.device)
+            # Aliased modules participate at every logical path. A shared
+            # parameter cannot be materialized on conflicting branch devices.
+            for path, owner in component.module.named_modules(remove_duplicate=False):
+                device = branch_device(
+                    component.module,
+                    path,
+                    device=request.execution.device,
+                    flow_device=request.execution.generation_device,
+                )
                 for parameter in owner.parameters(recurse=False):
                     assigned = destinations.setdefault(id(parameter), device)
                     if assigned != device:
@@ -161,22 +213,39 @@ class ModelLoader:
                 for name, buffer in owner.named_buffers(recurse=False):
                     if not buffer.is_meta and buffer.device != device:
                         owner._buffers[name] = buffer.to(device)
-        for component in construction.components:
+        for component in checkpoints:
             load_component(component, by_name[component.source], request)
-        model = construction.assemble()
-        if not isinstance(model, ExecutionModel):
-            raise unsupported_setup(f"{type(model).__name__} must implement ExecutionModel")
+        # Numerical buffers outside serialized component roots (for example
+        # decoder normalization statistics) follow the complete module graph.
+        for path, owner in model.named_modules():
+            destination = branch_device(
+                model,
+                path,
+                device=request.execution.device,
+                flow_device=request.execution.generation_device,
+            )
+            for name, buffer in owner.named_buffers(recurse=False):
+                if not buffer.is_meta and buffer.device != destination:
+                    owner._buffers[name] = buffer.to(destination)
+        bind_branches(
+            model,
+            device=request.execution.device,
+            flow_device=request.execution.generation_device,
+        )
         model.eval()
         # Loading and execution retain the same placement and local mesh objects.
-        model.bindings = dict(request.bindings)
-        for name, binding in model.bindings.items():
-            binding.output_schema = model.entry_outputs.get(name, ())
+        bindings = MappingProxyType(dict(request.bindings))
+        outputs = resolve_outputs(model)
+        for name, binding in bindings.items():
+            binding.output_schema = outputs.get(name, ())
+            binding.calls = components[name].calls
         return LoadedModel(
             model=model,
-            tokenizer=construction.tokenizer,
+            bindings=bindings,
+            tokenizer=tokenizer,
             worker_config=request.execution,
             sources=sources,
-            architecture_config=_canonical_architecture_config(construction.config),
+            architecture_config=_canonical_architecture_config(prepared),
             schedule=schedule,
         )
 
@@ -184,13 +253,18 @@ class ModelLoader:
 def load_model(request: LoadRequest) -> LoadedModel:
     """Discover and load a checkpoint, including its input-token declarations."""
 
-    from ..bootstrap.catalog import resolve_catalog_entry
+    return _load_model(request, ModelSource.resolve(request.model_path, request.load))
 
-    root, repository_id = resolve_model_root(request.model_path, request.load)
-    config = read_model_config(root)
-    entry = resolve_catalog_entry(tuple(str(value) for value in config.get("architectures") or ()))
+
+def _load_model(request: LoadRequest, source: ModelSource) -> LoadedModel:
+    """Load through one resolved metadata identity for serving and direct Python calls."""
+
     loaded = get_model_loader(request.load.load_format).load(
-        entry, config, request, root=root, repository_id=repository_id
+        source.entry,
+        source.config,
+        request,
+        root=source.root,
+        repository_id=source.repository_id,
     )
     loaded = replace(loaded, worker_config=_loaded_worker_config(loaded.model, request))
     _resolve_input_tokens(loaded.model, loaded.tokenizer)
@@ -201,11 +275,14 @@ def load_model(request: LoadRequest) -> LoadedModel:
     return loaded
 
 
-def _loaded_worker_config(model: ExecutionModel, request: LoadRequest) -> WorkerConfig:
+def _loaded_worker_config(model: Model, request: LoadRequest) -> WorkerConfig:
     """Close requested execution bounds over the materialized computation geometry."""
 
     config = request.execution
-    if model.resource_geometry.request_tensors:
+    if (
+        isinstance(model, VideoMixin)
+        or resolve_resources(model, media_calls(model, request.bindings)).state
+    ):
         if request.pipeline_depth is None:
             raise unsupported_setup("request tensor storage requires its physical pipeline depth")
         # Two unresolved outputs and one further physical position permit
@@ -228,7 +305,7 @@ def _loaded_worker_config(model: ExecutionModel, request: LoadRequest) -> Worker
     return config
 
 
-def _resolve_input_tokens(model: ExecutionModel, tokenizer: Any | None) -> None:
+def _resolve_input_tokens(model: Model, tokenizer: Any | None) -> None:
     """Resolve model-specific input token identities from tokenizer metadata."""
 
     processor = model.image_processor
@@ -279,8 +356,7 @@ def audit_component(component: CheckpointComponent, report: LoadReport) -> None:
     """Require all resident parameters and declared persistent buffers to be loaded."""
 
     included = component_parameter_names(component)
-    if component.buffer_pool:
-        included.update(_persistent_buffers(component.module))
+    included.update(_persistent_buffers(component.module))
     audit_load_report(
         component.module,
         report,
@@ -298,7 +374,11 @@ def load_component(
     if request.load.load_format is LoadFormat.DUMMY:
         if component.post_load is not None:
             raise ValueError("synthetic loading cannot supply checkpoint-dependent precomputation")
-        report = _load_dummy(component)
+        report = _load_dummy(
+            component,
+            device=request.execution.device,
+            flow_device=request.execution.generation_device,
+        )
     else:
         handles: Iterable[WeightHandle] = iter_weight_handles(
             source, request.load, durable=component.post_load is not None
@@ -311,13 +391,16 @@ def load_component(
             component,
             handles,
             device=request.execution.device,
+            flow_device=request.execution.generation_device,
             layered=request.load.load_format is LoadFormat.LAYERED,
         )
         if component.post_load is not None:
             assert retained is not None
             with torch.inference_mode(), weight_handle_materialization():
                 component.post_load(retained)
-    _materialize_scope_buffers(component, report.loaded, request.execution.device)
+    _materialize_scope_buffers(
+        component, report.loaded, request.execution.device, request.execution.generation_device
+    )
     _warn_skips(component.source, report)
     if request.load.load_format is not LoadFormat.LAYERED:
         _process_loaded_quantization(component.module, report.loaded)
@@ -329,13 +412,14 @@ def assign_component(
     handles: Iterable[WeightHandle],
     *,
     device: str,
+    flow_device: str | None = None,
     layered: bool = False,
 ) -> LoadReport:
     """Map and audit checkpoint values; layered mode materializes one owner at a time."""
 
     def assign() -> LoadReport:
         if component.map_weights is None:
-            return _load_declared_weights(component, handles, device)
+            return _load_declared_weights(component, handles, device, flow_device)
         return component.map_weights(handles)
 
     if layered:
@@ -360,10 +444,11 @@ def _load_declared_weights(
     component: CheckpointComponent,
     handles: Iterable[WeightHandle],
     device: str,
+    flow_device: str | None,
 ) -> LoadReport:
     parameters = dict(component.module.named_parameters())
     included = component_parameter_names(component)
-    buffers = _persistent_buffers(component.module) if component.buffer_pool else {}
+    buffers = _persistent_buffers(component.module)
     report = LoadReport()
     for handle in handles:
         name, shard = stacked_weight_name(handle.name, component.weight_name_map)
@@ -377,7 +462,15 @@ def _load_declared_weights(
             target = buffers[name]
             if target.shape != torch.Size(handle.shape):
                 raise ValueError(f"checkpoint buffer {name!r} has incompatible shape")
-            value = handle.full().to(device=component.device_for(name, device), dtype=target.dtype)
+            value = handle.full().to(
+                device=branch_device(
+                    component.module,
+                    name.rpartition(".")[0],
+                    device=device,
+                    flow_device=flow_device,
+                ),
+                dtype=target.dtype,
+            )
             path, _, field = name.rpartition(".")
             owner = component.module.get_submodule(path)
             owner.register_buffer(field, value, persistent=True)
@@ -385,13 +478,15 @@ def _load_declared_weights(
             report.skipped.append(handle.name)
             continue
         else:
-            (report.unexpected if component.strict else report.skipped).append(name)
+            report.unexpected.append(name)
             continue
         report.loaded.add(name)
     return report
 
 
-def _load_dummy(component: CheckpointComponent) -> LoadReport:
+def _load_dummy(
+    component: CheckpointComponent, *, device: str, flow_device: str | None
+) -> LoadReport:
     included = component_parameter_names(component)
     loaded: set[str] = set()
     with torch.no_grad():
@@ -406,6 +501,23 @@ def _load_dummy(component: CheckpointComponent) -> LoadReport:
             else:
                 value.zero_()
             default_weight_loader(current, TensorWeightHandle(name, value))
+            loaded.add(name)
+        for index, (name, buffer) in enumerate(
+            sorted(_persistent_buffers(component.module).items()), start=len(included) + 1
+        ):
+            generator = torch.Generator(device="cpu").manual_seed(index)
+            value = torch.empty(tuple(buffer.shape), dtype=buffer.dtype, device="cpu")
+            if buffer.is_floating_point():
+                value.normal_(mean=0.0, std=0.02, generator=generator)
+            else:
+                value.zero_()
+            path, _, field = name.rpartition(".")
+            destination = branch_device(
+                component.module, path, device=device, flow_device=flow_device
+            )
+            component.module.get_submodule(path).register_buffer(
+                field, value.to(destination), persistent=True
+            )
             loaded.add(name)
     _zero_dummy_vocab_padding(component.module, loaded)
     return LoadReport(loaded=loaded)
@@ -516,6 +628,7 @@ def _materialize_scope_buffers(
     component: CheckpointComponent,
     loaded: set[str],
     device: str,
+    flow_device: str | None,
 ) -> None:
     """Materialize load-dependent buffers for module branches activated by parameters."""
 
@@ -532,7 +645,13 @@ def _materialize_scope_buffers(
             continue
         materialize = getattr(module, "materialize_load_buffers", None)
         if callable(materialize):
-            materialize(str(component.device_for(module_name, device)))
+            materialize(
+                str(
+                    branch_device(
+                        component.module, module_name, device=device, flow_device=flow_device
+                    )
+                )
+            )
 
 
 def _zero_dummy_vocab_padding(model: nn.Module, loaded: set[str]) -> None:

@@ -2,35 +2,32 @@
 
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
 
-from ...execution.model_entry import ModelEntry
 from ...loader.component import (
     CheckpointComponent,
-    ModelBuildContext,
-    ModelConstruction,
+    construct_owned_module,
     construction_dtype,
 )
 from ...loader.handles import WeightHandle
 from ...loader.mapping import LoadReport, stacked_weight_name
 from ...loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
+from ...modeling.context import BuildContext
 from ...nn.diffusion.schedule import DiffusionSchedule
 from ...nn.layer import LayerConfig
 from ...nn.linear import LinearBase
 from ...nn.mesh import Communicator
+from ...nn.parallel import ParallelConfig
 from ...nn.quant.config import QuantizationConfig
 from .audio_vae import MiniMaxH3AudioVAE
-from .config import H3TransformerConfig, resolve_h3_contract
-from .encoder import H3TextEncoderConfig, MiniMaxH3TextEncoder
+from .encoder import MiniMaxH3TextEncoder
 from .layout import MIN_H3_FRAMES, H3Layout
 from .packing import audio_latent_frames
 from .transformer import (
@@ -43,121 +40,13 @@ from .video_vae import MiniMaxH3VideoDecoder, MiniMaxH3VideoVAE
 
 @dataclass(slots=True)
 class H3Components:
-    """Resident computation modules assembled after their public loader finalizes them."""
+    """Resident numerical modules composed before checkpoint materialization."""
 
     transformer: MiniMaxH3Transformer | None
     conditioner: nn.Sequential | None
     encoder: MiniMaxH3TextEncoder | None
     video_vae: MiniMaxH3VideoVAE | None
     audio_vae: MiniMaxH3AudioVAE | None
-
-
-def validate_h3_entries(bindings: Mapping[str, ModelEntry]) -> None:
-    """Validate component placement before constructing checkpoint modules."""
-
-    expected = {"denoiser", "text_encoder", "video_decoder", "audio_decoder", "output"}
-    if not bindings or not set(bindings) <= expected:
-        raise ValueError(f"H3 entries must belong to {sorted(expected)}")
-    for name, entry in bindings.items():
-        component = entry.config
-        config = component.parallel_config
-        if name == "video_decoder":
-            if component.distribution != "temporal_units" or component.units_per_rank != 1:
-                raise ValueError("H3 video decoder requires temporal_units with native batch one")
-            continue
-        if component.distribution is not None:
-            raise ValueError(f"H3 {name} requires model-parallel membership")
-        if name in {"audio_decoder", "output"}:
-            if len(component.ranks) != 1 or config.world_size != 1:
-                raise ValueError(f"H3 {name} requires one local owner")
-        elif name == "text_encoder":
-            if config.pipeline_parallel_size != 1 or config.sequence_parallel_size != 1:
-                raise ValueError("H3 text encoder supports direct tensor parallelism")
-            if any(width % config.tensor_parallel_size for width in (64, 25600)):
-                raise ValueError("H3 encoder TP must divide query heads and MLP width")
-        elif name == "denoiser":
-            if config.pipeline_parallel_size > 50:
-                raise ValueError("H3 pipeline stages cannot exceed its 50 transformer layers")
-            if config.sequence_parallel.kind not in {
-                "local",
-                "ulysses",
-                "allgather",
-                "ring",
-                "hybrid",
-                "attention2d",
-            }:
-                raise ValueError("H3 sequence attention requires global sparse selection")
-            tensor = config.tensor_parallel_size
-            ulysses = dict(config.dimensions)["ulysses"]
-            if 56 % (tensor * ulysses) or 5376 % tensor or 14336 % tensor:
-                raise ValueError(
-                    "H3 TP × Ulysses must divide heads; TP must divide hidden and MLP widths"
-                )
-
-
-def require_h3_checkpoint(root: Path) -> None:
-    """Validate checkpoint component files and tensor dimensions against the H3 architecture."""
-
-    resolve_h3_contract(root)
-    transformer = json.loads((root / "transformer" / "config.json").read_text(encoding="utf-8"))
-    transformer_config = H3TransformerConfig()
-    expected_transformer = {
-        "num_attention_heads": transformer_config.heads,
-        "attention_head_dim": transformer_config.head_dim,
-        "hidden_size": transformer_config.hidden_size,
-        "num_layers": transformer_config.layers,
-        "num_refiner_layers": transformer_config.refiner_layers,
-        "ffn_dim": transformer_config.ffn_dim,
-        "in_channels": transformer_config.video_channels,
-        "audio_in_channels": transformer_config.audio_channels,
-        "patch_size": [1, 2, 2],
-        "text_dim": transformer_config.text_dim,
-        "freq_dim": transformer_config.frequency_dim,
-        "time_embed_hidden_dim": transformer_config.time_hidden_dim,
-        "time_embed_dim": transformer_config.time_dim,
-        "rope_freq_dim": transformer_config.rope_frequency_dim,
-        "rope_theta": transformer_config.rope_theta,
-        "norm_eps": transformer_config.norm_eps,
-        "qk_norm_eps": transformer_config.qk_norm_eps,
-        "final_norm_eps": transformer_config.norm_eps,
-    }
-    for field, expected in expected_transformer.items():
-        if transformer.get(field) != expected:
-            raise ValueError(
-                f"FastH3 transformer {field} must be {expected!r}, got {transformer.get(field)!r}"
-            )
-
-    encoder = json.loads((root / "text_encoder" / "config.json").read_text(encoding="utf-8")).get(
-        "text_config"
-    )
-    if not isinstance(encoder, dict):
-        raise ValueError("FastH3 text encoder has no Qwen3-VL text configuration")
-    encoder_config = H3TextEncoderConfig()
-    expected_encoder = {
-        "vocab_size": encoder_config.vocab_size,
-        "hidden_size": encoder_config.hidden_size,
-        "intermediate_size": encoder_config.intermediate_size,
-        "num_hidden_layers": encoder_config.checkpoint_layers,
-        "num_attention_heads": encoder_config.heads,
-        "num_key_value_heads": encoder_config.kv_heads,
-        "head_dim": encoder_config.head_dim,
-        "rope_theta": encoder_config.rope_theta,
-        "rms_norm_eps": encoder_config.norm_eps,
-    }
-    for field, expected in expected_encoder.items():
-        if encoder.get(field) != expected:
-            raise ValueError(
-                f"FastH3 text encoder {field} must be {expected!r}, got {encoder.get(field)!r}"
-            )
-
-    for component, expected_shift in (("scheduler", 12.0), ("audio_scheduler", 3.0)):
-        scheduler = json.loads(
-            (root / component / "scheduler_config.json").read_text(encoding="utf-8")
-        )
-        if scheduler.get("shift") != expected_shift:
-            raise ValueError(
-                f"FastH3 {component} shift must be {expected_shift:g}, got {scheduler.get('shift')!r}"
-            )
 
 
 @torch.inference_mode()
@@ -200,7 +89,9 @@ def _prepare_modulation(
     )
 
 
-def _map_transformer(model: nn.Module, handles: Iterable[WeightHandle]) -> LoadReport:
+def _map_transformer(
+    model: nn.Module, handles: Iterable[WeightHandle], *, omitted: frozenset[str]
+) -> LoadReport:
     """Map checkpoint attention projections into the rank's packed resident layers."""
 
     mapping = tuple(
@@ -221,14 +112,19 @@ def _map_transformer(model: nn.Module, handles: Iterable[WeightHandle]) -> LoadR
         )
         parameter = parameters.get(name)
         if parameter is None:
-            report.skipped.append(handle.name)
+            if handle.name in omitted:
+                report.skipped.append(handle.name)
+            else:
+                report.unexpected.append(handle.name)
             continue
         load_parameter_weight(parameter, handle, shard)
         report.loaded.add(name)
     return report
 
 
-def _map_encoder(model: MiniMaxH3TextEncoder, handles: Iterable[WeightHandle]) -> LoadReport:
+def _map_encoder(
+    model: MiniMaxH3TextEncoder, handles: Iterable[WeightHandle], *, omitted: frozenset[str]
+) -> LoadReport:
     """Select retained Qwen text layers and express their packed checkpoint projection names."""
 
     mapping = (
@@ -244,14 +140,19 @@ def _map_encoder(model: MiniMaxH3TextEncoder, handles: Iterable[WeightHandle]) -
         name, shard = stacked_weight_name(handle.name.removeprefix("model."), mapping)
         parameter = parameters.get(name)
         if parameter is None:
-            report.skipped.append(handle.name)
+            if handle.name in omitted:
+                report.skipped.append(handle.name)
+            else:
+                report.unexpected.append(handle.name)
             continue
         load_parameter_weight(parameter, handle, shard)
         report.loaded.add(name)
     return report
 
 
-def _map_video_decoder(model: MiniMaxH3VideoDecoder, handles: Iterable[WeightHandle]) -> LoadReport:
+def _map_video_decoder(
+    model: MiniMaxH3VideoDecoder, handles: Iterable[WeightHandle], *, omitted: frozenset[str]
+) -> LoadReport:
     """Translate the checkpoint's value-first feed-forward projection names."""
 
     parameters = dict(model.named_parameters())
@@ -262,41 +163,122 @@ def _map_video_decoder(model: MiniMaxH3VideoDecoder, handles: Iterable[WeightHan
         )
         parameter = parameters.get(name)
         if parameter is None:
-            report.skipped.append(handle.name)
+            if handle.name in omitted:
+                report.skipped.append(handle.name)
+            else:
+                report.unexpected.append(handle.name)
             continue
         load_parameter_weight(parameter, handle)
         report.loaded.add(name)
     return report
 
 
-def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> ModelConstruction:
+def _transformer_omissions(
+    model: MiniMaxH3Transformer, config: dict[str, Any]
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Declare records used by other components, PP stages, or modulation.
+
+    The native architecture supplies exact checkpoint names through metadata-only
+    construction. A record is omitted only for a known mathematical role; unknown
+    names are never inferred to be nonresident merely because lookup failed.
+    """
+
+    from diffusers import MiniMaxH3Transformer3DModel
+
+    _, names = construct_owned_module(
+        lambda: MiniMaxH3Transformer3DModel.from_config(config), resident=False
+    )
+    # FastH3 adds one learned VSA compression gate to each native attention
+    # block. Diffusers' dense architecture does not enumerate those records.
+    names |= frozenset(
+        f"transformer_blocks.{index}.attn.to_gate_compress.weight"
+        for index in range(model.config.layers)
+    )
+    conditioning = frozenset(
+        name for name in names if name.startswith(("context_embedder.", "token_refiner."))
+    )
+    omitted = set(conditioning)
+    for name in names:
+        parts = name.split(".")
+        if name.startswith("time_embedder.") or name.startswith("norm_out.linear."):
+            omitted.add(name)
+        elif parts[0] == "transformer_blocks":
+            if int(parts[1]) not in model.pipeline.layers or parts[2] == "adaln_proj":
+                omitted.add(name)
+        elif not model.pipeline.first and parts[0] in {"proj_in", "audio_proj_in"}:
+            omitted.add(name)
+        elif not model.pipeline.last and parts[0] in {"norm_out", "proj_out", "audio_proj_out"}:
+            omitted.add(name)
+    return names - conditioning, frozenset(omitted)
+
+
+def _encoder_omissions(model: MiniMaxH3TextEncoder, config: dict[str, Any]) -> frozenset[str]:
+    """Describe the unused visual tower, vocabulary head, and later text layers."""
+
+    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+
+    native_config = Qwen3VLConfig(
+        **{
+            **config,
+            "text_config": {
+                "num_hidden_layers": model.config.checkpoint_layers,
+                **config.get("text_config", {}),
+            },
+        }
+    )
+    _, names = construct_owned_module(
+        lambda: Qwen3VLForConditionalGeneration(native_config), resident=False
+    )
+    return frozenset(
+        name
+        for name in names
+        if name.startswith("model.visual.")
+        or name in {"lm_head.weight", "model.language_model.norm.weight"}
+        or (
+            name.startswith("model.language_model.layers.")
+            and int(name.split(".")[3]) >= model.config.retained_layers
+        )
+    )
+
+
+def _video_omissions(config: dict[str, Any]) -> frozenset[str]:
+    """Declare the native encoder and posterior projection unused by decoding."""
+
+    from diffusers import AutoencoderKLMiniMaxH3
+
+    _, names = construct_owned_module(
+        lambda: AutoencoderKLMiniMaxH3.from_config(config), resident=False
+    )
+    return frozenset(name for name in names if name.startswith(("encoder.", "quant_conv.")))
+
+
+def build_components(
+    config: dict[str, Any], context: BuildContext
+) -> tuple[H3Components, H3Layout, tuple[CheckpointComponent, ...]]:
     """Declare resident H3 components; the shared loader owns their materialization."""
 
-    from .model import MiniMaxH3Model
-
-    request = context.request
-    bindings, schedule = request.bindings, context.schedule
+    meshes, schedule = context.meshes, context.schedule
     if schedule is None:
         raise ValueError("H3 construction requires its diffusion schedule")
-    validate_h3_entries(bindings)
-    require_h3_checkpoint(context.root)
-    device = torch.device(request.execution.device)
+    device = schedule.sigmas[0].device
     precisions = context.component_precisions
-    text_capacity = ((int(request.max_text_rows) + 63) // 64) * 64
-    raw_frames = math.floor(float(request.max_video_seconds) * 24.0 + 0.5)
+    text_capacity = ((int(context.limits["text_tokens"]) + 63) // 64) * 64
+    raw_frames = math.floor(float(context.limits["video_seconds"]) * 24.0 + 0.5)
     max_frames = int(raw_frames + (5 - raw_frames) % 17)
     if text_capacity < 64 or max_frames < MIN_H3_FRAMES:
-        raise ValueError("H3 worker_config capacity is smaller than a legal request")
+        raise ValueError("H3 numerical limits are smaller than a legal shape")
     layout = H3Layout.build(
-        bindings,
+        context.parallel.get("denoiser", ParallelConfig()),
+        meshes.get("denoiser"),
         frames=max_frames,
         text_rows=text_capacity,
         audio_frames=audio_latent_frames(max_frames),
+        postprocess="output" in meshes,
     )
     components = []
     transformer = encoder = video_decoder = audio_decoder = None
     conditioner = None
-    mesh = bindings["denoiser"].mesh if "denoiser" in bindings else None
+    mesh = meshes.get("denoiser")
     if mesh is not None:
         transformer = MiniMaxH3Transformer(
             mesh,
@@ -304,13 +286,18 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
             attention_linear_precision=precisions["transformer.attention"],
             mlp_linear_precision=precisions["transformer.mlp"],
         )
+        conditioning_omissions, transformer_omissions = _transformer_omissions(
+            transformer, config.get("transformer", {})
+        )
         if transformer.pipeline.first:
             conditioner = build_conditioner(mesh, "meta")
             components.append(
                 CheckpointComponent(
                     conditioner,
                     source="denoiser",
-                    map_weights=partial(_map_transformer, conditioner),
+                    map_weights=partial(
+                        _map_transformer, conditioner, omitted=conditioning_omissions
+                    ),
                     dtype=torch.bfloat16,
                 )
             )
@@ -318,7 +305,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
             CheckpointComponent(
                 transformer,
                 source="denoiser",
-                map_weights=partial(_map_transformer, transformer),
+                map_weights=partial(_map_transformer, transformer, omitted=transformer_omissions),
                 dtype=torch.bfloat16,
                 parameter_dtypes=tuple(
                     (name, torch.float32)
@@ -330,7 +317,7 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
                 ),
             )
         )
-    mesh = bindings["text_encoder"].mesh if "text_encoder" in bindings else None
+    mesh = meshes.get("text_encoder")
     if mesh is not None:
         encoder = MiniMaxH3TextEncoder(
             mesh,
@@ -342,11 +329,15 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
             CheckpointComponent(
                 encoder,
                 source="text_encoder",
-                map_weights=partial(_map_encoder, encoder),
+                map_weights=partial(
+                    _map_encoder,
+                    encoder,
+                    omitted=_encoder_omissions(encoder, config.get("text_encoder", {})),
+                ),
                 dtype=torch.bfloat16,
             )
         )
-    if "video_decoder" in bindings and bindings["video_decoder"].owns:
+    if "video_decoder" in meshes:
         precision = precisions["video_vae"]
         dense = precision in {"fp16", "bf16"}
         dtype = torch.float16 if precision == "fp16" else torch.bfloat16
@@ -365,7 +356,11 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
             CheckpointComponent(
                 video_decoder,
                 source="video_decoder",
-                map_weights=partial(_map_video_decoder, video_decoder),
+                map_weights=partial(
+                    _map_video_decoder,
+                    video_decoder,
+                    omitted=_video_omissions(config.get("video_vae", {})),
+                ),
                 dtype=torch.float32,
                 parameter_dtypes=tuple(
                     (name, dtype)
@@ -376,13 +371,12 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
                     )
                     or (dense and isinstance(module, torch.nn.Conv3d))
                 ),
-                strict=False,
             )
         )
-    if "audio_decoder" in bindings and bindings["audio_decoder"].owns:
+    if "audio_decoder" in meshes:
         from diffusers import AutoencoderKLMiniMaxH3Audio
 
-        audio_config = json.loads((context.root / "audio_vae" / "config.json").read_text())
+        audio_config = config["audio_vae"]
         with construction_dtype(torch.float32), torch.device("meta"):
             audio_decoder = AutoencoderKLMiniMaxH3Audio.from_config(audio_config)
         components.append(
@@ -390,23 +384,19 @@ def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> M
                 audio_decoder,
                 source="audio_decoder",
                 dtype=torch.float32,
-                buffer_pool=True,
             )
         )
 
-    def assemble() -> MiniMaxH3Model:
-        return MiniMaxH3Model(
-            bindings,
-            H3Components(
-                transformer=transformer,
-                conditioner=conditioner,
-                encoder=encoder,
-                video_vae=MiniMaxH3VideoVAE(video_decoder, linear_precision=precisions["video_vae"])
-                if video_decoder is not None
-                else None,
-                audio_vae=MiniMaxH3AudioVAE(audio_decoder) if audio_decoder is not None else None,
-            ),
-            layout,
-        )
-
-    return ModelConstruction(tuple(components), assemble, config)
+    return (
+        H3Components(
+            transformer=transformer,
+            conditioner=conditioner,
+            encoder=encoder,
+            video_vae=MiniMaxH3VideoVAE(video_decoder, linear_precision=precisions["video_vae"])
+            if video_decoder is not None
+            else None,
+            audio_vae=MiniMaxH3AudioVAE(audio_decoder) if audio_decoder is not None else None,
+        ),
+        layout,
+        tuple(components),
+    )

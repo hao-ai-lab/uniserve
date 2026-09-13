@@ -6,7 +6,6 @@ import math
 from collections.abc import Iterable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from enum import StrEnum
 from threading import RLock
 from typing import Final, cast
 
@@ -15,6 +14,7 @@ import torch
 from uniserve_worker.protocol.batch import ComputationId
 
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
+from ..modeling.tensors import ImageRange
 from ..protocol.batch import (
     BufferAllocation,
     BufferId,
@@ -141,13 +141,6 @@ class RelaySlot:
     shape: tuple[int, ...] | None = None
     dtype: torch.dtype | None = None
     relay_lane: tuple[str, int, RequestKey, ComputationId, int] | None = None
-
-
-class ImageRange(StrEnum):
-    """Defines whether image values use signed-unit or unit numeric range."""
-
-    SIGNED_UNIT = "signed_unit"
-    UNIT = "unit"
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from ...execution.forward_batch import AttentionMode, AttentionSelection
+from uniserve_worker.backends.attention.selection import AttentionSelection
+from uniserve_worker.modeling.tensors import AttentionMode
+
 from ...foundation.errors import unsupported_setup
 from .base import AttentionBackend
 from .tuning import FlashInferTuningConfig
