@@ -143,9 +143,10 @@ class MiniMaxH3TextEncoder(nn.Module):
 
         if not images:
             return self(token_ids)
-        if len(images) != 1 or images[0].ndim != 4 or images[0].shape[0] != 1:
-            raise ValueError("H3 requires one single-frame THWC reference")
-        return self.encode_presentation(token_ids, [images[0][0]])
+        if len(images) > 5 or any(image.ndim != 4 or image.shape[0] != 1 for image in images):
+            raise ValueError("H3 requires at most five single-frame THWC image references")
+        # Product order is semantic: Picture k names the kth admitted image.
+        return self.encode_presentation(token_ids, [image[0] for image in images])
 
     def prepare_images(self, images: list[torch.Tensor]):
         """Process decoded HWC uint8 RGB rasters with the checkpoint's Qwen processor."""

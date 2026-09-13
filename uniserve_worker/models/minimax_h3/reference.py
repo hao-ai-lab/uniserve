@@ -66,6 +66,46 @@ class H3ReferenceGeometry:
         return 2 * self.audio_frames
 
 
+def reference_packed_rows(
+    references: Sequence[H3ReferenceGeometry],
+    *,
+    presentation_rows: int,
+    target: H3ReferenceGeometry,
+    row_multiple: int = 256,
+    max_rows: int = 65_536,
+) -> int:
+    """Validate the complete resident row budget before allocating tensors.
+
+    Reference visual and soundtrack rows share a dense prefix. Target video
+    reserves complete 4x4x4 tiles even at spatial/temporal boundaries. The final
+    allocation includes sequence-parallel alignment and the tile-pair partner.
+    This is a storage budget, not the smaller semantic token count.
+    """
+
+    validate_reference_geometry(references)
+    if min(presentation_rows, row_multiple, max_rows) <= 0:
+        raise ValueError("reference row budgets must be positive")
+    if target.media_type != "video" or not target.audio_frames:
+        raise ValueError("reference budget requires a video/audio target")
+
+    def align(value: int, multiple: int) -> int:
+        return (value + multiple - 1) // multiple * multiple
+
+    dense = align(presentation_rows, 64)
+    dense += align(sum(item.video_rows + item.audio_rows for item in references), 64)
+    dense += align(target.audio_rows, 64)
+    video_tiles = (
+        (target.video_frames + 3)
+        // 4
+        * ((target.latent_height // 2 + 3) // 4)
+        * ((target.latent_width // 2 + 3) // 4)
+    )
+    rows = align(dense + video_tiles * 64, math.lcm(row_multiple, 128))
+    if rows > max_rows:
+        raise ValueError(f"reference packed sequence requires {rows} rows; budget is {max_rows}")
+    return rows
+
+
 def validate_reference_geometry(references: Sequence[H3ReferenceGeometry]) -> None:
     """Enforce the released ordered bundle limits without reordering media."""
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Hashable
 from dataclasses import replace
 from functools import partial
@@ -317,6 +318,21 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         capacity_shape = self.layout.packed.reference_shape
         if capacity_shape is None or shape[0] * shape[1] > capacity_shape[0] * capacity_shape[1]:
             raise ValueError("H3 reference geometry exceeds the configured model capacity")
+        from .packing import video_latent_frames
+        from .reference import H3ReferenceGeometry, reference_packed_rows
+
+        reference_packed_rows(
+            (H3ReferenceGeometry("image", 1, shape[0] // 16, shape[1] // 16),),
+            presentation_rows=len(tags),
+            target=H3ReferenceGeometry(
+                "video",
+                video_latent_frames(geometry.frame_count),
+                self.layout.height // 16,
+                self.layout.width // 16,
+                audio_frames,
+            ),
+            row_multiple=64 * math.lcm(4, self.layout.sp_size),
+        )
         return (*key, shape, tags)
 
     def build_execution(

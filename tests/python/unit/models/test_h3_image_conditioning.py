@@ -118,6 +118,38 @@ def test_image_presentation_and_processor_grid(encoder):
     assert not torch.equal(states, changed)
 
 
+@pytest.mark.parametrize("count", [2, 3, 5])
+@torch.no_grad()
+def test_ordered_image_products(encoder, count):
+    tokens = torch.tensor([[42, 87, 99]])
+    images = [torch.full((1, 32, 32, 3), index * 40, dtype=torch.uint8) for index in range(count)]
+    states, tags = encoder.numerical_entry(tokens, *images)
+    expected_tags = []
+    for index in range(count):
+        label = encoder.processor.tokenizer(f"<Picture {index + 1}>: ", add_special_tokens=False)[
+            "input_ids"
+        ]
+        # The checkpoint's 65536-pixel minimum expands the square to 256x256:
+        # 64 merged patches, bracketed by vision-start and vision-end tokens.
+        expected_tags.extend([TEXT_TAG] * len(label) + [VIDEO_TAG] * 66)
+    expected_tags.extend([TEXT_TAG] * 3)
+    assert tags.tolist() == expected_tags
+    assert states.shape == (1, len(expected_tags), 16)
+
+    first, first_tags = encoder.numerical_entry(tokens, images[0])
+    prefix_rows = len(first_tags) - tokens.shape[1]
+    torch.testing.assert_close(states[:, :prefix_rows], first[:, :prefix_rows])
+    reversed_states, reversed_tags = encoder.numerical_entry(tokens, *reversed(images))
+    assert torch.equal(tags, reversed_tags)
+    assert not torch.equal(states[:, :prefix_rows], reversed_states[:, :prefix_rows])
+
+
+def test_image_product_count_bound(encoder):
+    image = torch.zeros((1, 32, 32, 3), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="at most five"):
+        encoder.numerical_entry(torch.tensor([[42]]), *([image] * 6))
+
+
 def test_invalid_decoded_raster(encoder):
     with pytest.raises(ValueError, match="HWC uint8"):
         encoder(torch.tensor([[42]]), [torch.zeros(3, 32, 32)])
