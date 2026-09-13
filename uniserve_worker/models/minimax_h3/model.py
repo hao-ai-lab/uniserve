@@ -31,7 +31,13 @@ from ...nn.diffusion.schedule import ScheduleDirection, ScheduleShiftDomain
 from ...nn.diffusion.spec import DiffusionSpec, ModalitySpec, ScheduleRule
 from ...nn.parallel import ParallelConfig
 from ...nn.parallel_pipeline import LayerPipeline
-from .config import FASTH3_LADDER, FASTH3_SHIFTS, FASTH3_TIME_SCALE, H3TransformerConfig
+from .config import (
+    FASTH3_LADDER,
+    FASTH3_SHIFTS,
+    FASTH3_TIME_SCALE,
+    H3TransformerConfig,
+    h3_contract,
+)
 from .encoder import H3TextEncoderConfig
 from .layout import (
     MIN_H3_FRAMES,
@@ -65,7 +71,7 @@ __all__ = ["MiniMaxH3Model"]
 
 
 class MiniMaxH3Model(EncoderMixin, DiffusionMixin, DecoderMixin, VideoMixin, Model):
-    """Compose text conditioning, four denoiser evaluations, and video/audio recovery.
+    """Compose text conditioning, checkpoint denoiser evaluations, and video/audio recovery.
 
     Logical components declare mathematical participation. Request progress,
     physical placement, media encoding, and output publication belong to the
@@ -297,6 +303,7 @@ class MiniMaxH3Model(EncoderMixin, DiffusionMixin, DecoderMixin, VideoMixin, Mod
             text_rows=text_rows,
             audio_frames=audio_frames,
             postprocess=self.layout.postprocess,
+            sparsity=self.layout.sparsity,
         )
 
     def _diffusion_metadata(self, layout: H3Layout) -> dict[str, torch.Tensor]:
@@ -379,7 +386,7 @@ class MiniMaxH3Model(EncoderMixin, DiffusionMixin, DecoderMixin, VideoMixin, Mod
             raise ValueError("H3 diffusion requires one video/audio sequence")
         step = batch.ladder_index
         if step is None or not 0 <= step < self.num_inference_steps:
-            raise ValueError("H3 denoise step is outside the four-evaluation ladder")
+            raise ValueError("H3 denoise step is outside the checkpoint ladder")
         if self.denoiser is None:
             raise ValueError("H3 diffusion requires a resident denoiser")
         predictions = self.denoiser(batch, state=state, constants=constants, scratch=scratch)
@@ -394,6 +401,12 @@ class MiniMaxH3Model(EncoderMixin, DiffusionMixin, DecoderMixin, VideoMixin, Mod
         """Compose local numerical modules before the caller loads their parameters."""
 
         super().__init__(config)
+        # Direct numerical construction retains the standard four-step recipe.
+        # Checkpoint loading always supplies bootstrap-validated inference metadata.
+        recipe = h3_contract(config["inference"]) if "inference" in config else None
+        self.ladder = FASTH3_LADDER if recipe is None else tuple(recipe["ladder"])
+        self.sigma_shifts = FASTH3_SHIFTS if recipe is None else tuple(recipe["sigma_shifts"])
+        self.num_inference_steps = len(self.ladder)
         components, layout, self._checkpoints = build_components(config, context)
         schedule = context.schedule
         assert schedule is not None
@@ -445,8 +458,8 @@ class MiniMaxH3Model(EncoderMixin, DiffusionMixin, DecoderMixin, VideoMixin, Mod
     def diffusion_spec(self, shape: MediaShape, steps: int) -> DiffusionSpec:
         """Declare full native normal draws before sequence sharding and packing."""
 
-        if steps != len(FASTH3_LADDER):
-            raise ValueError("H3 requires its four-evaluation trained ladder")
+        if steps != self.num_inference_steps:
+            raise ValueError("H3 requires its checkpoint-trained ladder")
         if (shape.height, shape.width) != (PROFILE_HEIGHT, PROFILE_WIDTH):
             raise ValueError("H3 diffusion requires its checkpoint raster geometry")
         reconstruction_unit_frames(shape.frames)
@@ -458,9 +471,9 @@ class MiniMaxH3Model(EncoderMixin, DiffusionMixin, DecoderMixin, VideoMixin, Mod
                 "video",
                 (video_frames * 24 * 42, 96),
                 (1, 24, video_frames, 48, 84),
-                FASTH3_SHIFTS[0],
+                self.sigma_shifts[0],
             ),
-            ("audio", (2 * audio_frames, 32), (2 * audio_frames, 32), FASTH3_SHIFTS[1]),
+            ("audio", (2 * audio_frames, 32), (2 * audio_frames, 32), self.sigma_shifts[1]),
         ):
             modalities.append(
                 ModalitySpec(
@@ -472,7 +485,7 @@ class MiniMaxH3Model(EncoderMixin, DiffusionMixin, DecoderMixin, VideoMixin, Mod
                         ScheduleShiftDomain.SIGMA,
                         shift,
                         timestep="one_minus_sigma",
-                        ladder=FASTH3_LADDER,
+                        ladder=self.ladder,
                         scale=FASTH3_TIME_SCALE,
                     ),
                     prediction="velocity",

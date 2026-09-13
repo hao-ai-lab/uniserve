@@ -27,6 +27,7 @@ from ...nn.mesh import Communicator
 from ...nn.parallel import ParallelConfig
 from ...nn.quant.config import QuantizationConfig
 from .audio_vae import MiniMaxH3AudioVAE
+from .config import h3_contract
 from .encoder import MiniMaxH3TextEncoder
 from .layout import MIN_H3_FRAMES, H3Layout
 from .packing import audio_latent_frames
@@ -257,6 +258,8 @@ def build_components(
 ) -> tuple[H3Components, H3Layout, tuple[CheckpointComponent, ...]]:
     """Declare resident H3 components; the shared loader owns their materialization."""
 
+    contract = h3_contract(config["inference"]) if "inference" in config else None
+    sparsity = 0.9 if contract is None else float(contract["sparsity"])
     meshes, schedule = context.meshes, context.schedule
     if schedule is None:
         raise ValueError("H3 construction requires its diffusion schedule")
@@ -274,6 +277,7 @@ def build_components(
         text_rows=text_capacity,
         audio_frames=audio_latent_frames(max_frames),
         postprocess="output" in meshes,
+        sparsity=sparsity,
     )
     components = []
     transformer = encoder = video_decoder = audio_decoder = None
@@ -285,6 +289,7 @@ def build_components(
             parameter_device="meta",
             attention_linear_precision=precisions["transformer.attention"],
             mlp_linear_precision=precisions["transformer.mlp"],
+            sparsity=sparsity,
         )
         conditioning_omissions, transformer_omissions = _transformer_omissions(
             transformer, config.get("transformer", {})

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
 from ..foundation.errors import unsupported_setup
 from ..loader.source import WeightSourceSet
 from ..models.bagel import BagelConfig
-from ..models.minimax_h3.config import validate_h3_config
+from ..models.minimax_h3.config import h3_contract, validate_h3_config
 from ..models.sensenova.config import NeoChatConfig
 
 
@@ -56,18 +57,46 @@ def sensenova_config(
     return NeoChatConfig.from_dict(config)
 
 
-def h3_metadata(root: Path) -> dict[str, dict[str, Any]]:
-    """Read and validate the full FastH3 numerical contract without model weights."""
+def h3_manifest(root: Path, contract_path: Path | None = None) -> dict[str, Any]:
+    """Read an embedded recipe or a sidecar explicitly bound to this local export.
 
-    if not (root / "fastvideo_inference.json").is_file():
+    Sidecars cannot override embedded manifests. Digests are exporter identity
+    declarations, not independently recomputed checkpoint hashes.
+    """
+
+    selected = contract_path or os.environ.get("UNISERVE_H3_CONTRACT")
+    embedded = root / "fastvideo_inference.json"
+    path = Path(selected) if selected else embedded
+    if not path.is_file():
         raise ValueError(
-            "MiniMax H3 requires fastvideo_inference.json from the full FastH3 VSA "
-            "checkpoint; base partitions and adapter-only checkpoints are unsupported"
+            "MiniMax H3 requires fastvideo_inference.json or an explicit UNISERVE_H3_CONTRACT sidecar"
         )
+    manifest = read_config(path)
+    if selected:
+        if embedded.is_file():
+            if read_config(embedded) != manifest:
+                raise ValueError("sidecar contract disagrees with fastvideo_inference.json")
+        elif manifest.get("checkpoint_root") != str(root.resolve()):
+            raise ValueError("sidecar checkpoint_root must equal the resolved checkpoint root")
+    return manifest
+
+
+def resolve_h3_contract(root: Path, contract_path: Path | None = None) -> dict[str, Any]:
+    """Resolve numerical settings and separately report snapshot provenance."""
+
+    contract = h3_contract(h3_manifest(root, contract_path))
+    contract["revision"] = root.name if root.parent.name == "snapshots" else None
+    return contract
+
+
+def h3_metadata(root: Path) -> dict[str, dict[str, Any]]:
+    """Read and validate FastH3 numerical metadata without model weights."""
+
+    manifest = h3_manifest(root)
+    h3_contract(manifest)
     metadata = {
         name: read_config(root / path)
         for name, path in (
-            ("inference", "fastvideo_inference.json"),
             ("transformer", "transformer/config.json"),
             ("text_encoder", "text_encoder/config.json"),
             ("audio_vae", "audio_vae/config.json"),
@@ -76,6 +105,7 @@ def h3_metadata(root: Path) -> dict[str, dict[str, Any]]:
             ("audio_scheduler", "audio_scheduler/scheduler_config.json"),
         )
     }
+    metadata["inference"] = manifest
     validate_h3_config(metadata)
     return metadata
 

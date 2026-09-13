@@ -1,0 +1,33 @@
+{
+  "attention_backend": "VIDEO_SPARSE_ATTN_H3",
+  "audio_scheduler_shift": 3.0,
+  "checkpoint_content_sha256": "516323fa396fa5dff4e82669d4e9a08a5791692a3d3b98ff6bc3de3fc6a33d11",
+  "checkpoint_metadata_sha256": "ca9f2d609c05742ba465d24989981ec02cca26acb6ca2f163dc0f6dc8d11c27b",
+  "checkpoint_step": 1300,
+  "dmd_denoising_steps": [
+    999,
+    874,
+    749,
+    624,
+    500,
+    375,
+    250,
+    125
+  ],
+  "fastvideo_commit": "24bbe7fddd05ca6f2c34b3dbed06ac1c75b72086",
+  "guidance_scale": 1.0,
+  "model_id": "FastVideo/FastVideo-FastH3-8-step-Preview-v1-VSA80-DataFree-Shift10",
+  "num_gpus": 4,
+  "num_inference_steps": 9,
+  "schema_version": "fasth3-inference-contract-v1",
+  "sequence_parallel_size": 4,
+  "task": "t2av",
+  "torch_compile": false,
+  "training_parent_run_id": "20260829T210445Z-h3-v14-8step-datafree-vsa80-vshift10",
+  "transformer_forwards": 8,
+  "use_fsdp_inference": true,
+  "video_scheduler_shift": 10.0,
+  "vsa_kernel": "sm100a",
+  "vsa_sparsity": 0.8,
+  "vsa_tile_size": 64
+}

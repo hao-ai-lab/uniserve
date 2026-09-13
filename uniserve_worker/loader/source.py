@@ -63,6 +63,15 @@ class ModelSource:
         entry = resolve_catalog_entry(
             tuple(str(value) for value in config.get("architectures") or ())
         )
+        if entry.architecture == "MiniMaxH3Transformer3DModel":
+            if repository_id is not None:
+                _fetch_sidecars(
+                    entry.sidecars,
+                    available=_available_files(root, repository_id, load),
+                    repository_id=repository_id,
+                    load=load,
+                )
+            entry = resolve_catalog_entry(config["architectures"], root=root)
         return cls(root, repository_id, config, entry)
 
     def validate(self, components: Mapping[str, ComponentConfig]) -> None:

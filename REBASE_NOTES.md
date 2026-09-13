@@ -117,4 +117,26 @@ Every feature-source changed path is listed below. Destinations describe port ow
 
 ## Implementation review
 
-No upstream production file is modified at this mapping milestone. The full refactor patch is available locally at `/tmp/uniserve-upstream-refactor.patch`; detailed patch review is still in progress. This document is not a claim of a completed feature port.
+The distilled checkpoint recipe port is implemented. Base dense H3, reference H3, reference IPC, reference worker execution, reference HTTP admission and CPU HTTP-to-transformer evidence are not yet ported. Detailed review of the complete refactor patch is incomplete; the ownership map is not a claim that the full 117,725-line patch has been reviewed.
+
+### Modified upstream files
+
+| Path | Required change |
+| --- | --- |
+| `uniserve_worker/bootstrap/catalog.py` | Bind each validated distilled checkpoint ladder and shifts to its schedule factory. |
+| `uniserve_worker/bootstrap/metadata.py` | Read embedded or root-bound explicit manifests, enforce non-overriding sidecars, and validate scheduler shifts against the checkpoint recipe. Filesystem access remains outside numerical model modules. |
+| `uniserve_worker/loader/source.py` | Fetch remote architecture sidecars before selecting the checkpoint-specific catalog entry, so loading uses the validated recipe rather than the default four-step schedule. |
+| `uniserve_worker/models/minimax_h3/config.py` | Validate immutable eight-step release identity and explicit export recipes; expose normalized ladder, shifts and sparsity while retaining the four-step protocol. |
+| `uniserve_worker/models/minimax_h3/layout.py` | Size sparse-selection scratch using checkpoint sparsity. |
+| `uniserve_worker/models/minimax_h3/model.py` | Use checkpoint evaluation count and schedule in the numerical diffusion specification and worker-advertised step count. Direct numerical construction retains upstream's standard four-step defaults. |
+| `uniserve_worker/models/minimax_h3/transformer.py` | Pass checkpoint sparsity into the shared sparse attention metadata. |
+| `uniserve_worker/models/minimax_h3/weights.py` | Supply validated sparsity when constructing numerical layout and transformer components. CheckpointComponent ownership remains unchanged. |
+| `uniserve_worker/nn/sparse_attention.py` | Parameterize shared selection cardinality by validated sparsity for both planning and numerical selection. |
+
+No Rust runtime, IPC schema, upstream test, or deployment script is changed. Added behavioral tests cover four/eight-step schedules, independent Diffusers scheduler parity, immutable release identity, explicit sidecar binding, numerical diffusion specification, worker step advertisement and public sparse selection cardinality.
+
+### Validation evidence
+
+The isolated environment uses the locked Torch 2.13.0 CUDA-13 distribution and freshly built upstream IPC extension. Native compilation requires the read-only native toolchain directory on PATH, its shared libraries on LD_LIBRARY_PATH, LIBCLANG_PATH pointing at its LLVM-18 library directory, and a local unversioned linker name for the installed libpython3.12.so.1. Cargo targets are under `/tmp/uniserve-rebase-target` with 16 jobs.
+
+The focused H3/bootstrap/checkpoint suite passes all 43 tests. The complete unit directory reports 416 passed, 69 skipped and 11 failed; all 11 failures require a CUDA device or CUDA pinned-memory allocation and report the missing NVIDIA driver on the login node. No tests were disabled or weakened. The reference CPU e2e test has not been ported or executed. No GPU correctness or performance claim is made.

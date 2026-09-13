@@ -34,10 +34,12 @@ TILE = 64
 SPARSITY = 0.9
 
 
-def video_sparse_selected_tiles(video_tiles: int) -> int:
-    """Return the ten-percent sparse tile budget, rounded up and bounded to one tile."""
+def video_sparse_selected_tiles(video_tiles: int, sparsity: float = SPARSITY) -> int:
+    """Return the checkpoint's sparse tile budget, rounded up to at least one tile."""
 
-    return max(1, math.ceil((1.0 - SPARSITY) * int(video_tiles)))
+    if not math.isfinite(sparsity) or not 0 <= sparsity < 1:
+        raise ValueError("video sparsity must be finite and in [0, 1)")
+    return max(1, math.ceil((1.0 - sparsity) * int(video_tiles)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,10 +51,12 @@ class VideoSparseAttentionMetadata:
     video_tiles: int
     valid_tiles: int
     valid_sizes: torch.Tensor
+    sparsity: float = SPARSITY
 
     def __post_init__(self) -> None:
         """Validate host-known tensor geometry before sparse kernels consume it."""
 
+        video_sparse_selected_tiles(self.video_tiles, self.sparsity)
         if self.padded_rows % (TILE * 2):
             raise ValueError("video sparse attention requires an even tile-64 count")
         if min(self.padded_rows, self.prefix_tiles, self.video_tiles) < 0 or (
@@ -68,7 +72,7 @@ class VideoSparseAttentionMetadata:
     def pattern(self, query_tiles: int, query_tile_offset: int = 0) -> SparseAttentionPattern:
         """Declare checkpoint selection cardinalities independently of its provider."""
 
-        selected = video_sparse_selected_tiles(self.video_tiles)
+        selected = video_sparse_selected_tiles(self.video_tiles, self.sparsity)
         counts = tuple(
             self.valid_tiles
             if tile < self.prefix_tiles
@@ -319,7 +323,7 @@ class VideoSparseAttention:
             video_sparse_ops.threshold_topk_indices(video_scores, topk_indices_i32)
             selected = topk_indices_i32
         else:
-            keep_video_tiles = video_sparse_selected_tiles(video_tiles)
+            keep_video_tiles = video_sparse_selected_tiles(video_tiles, self.metadata.sparsity)
             selected = torch.topk(
                 video_scores,
                 keep_video_tiles,

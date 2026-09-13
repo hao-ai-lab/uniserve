@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -26,7 +26,7 @@ from ..models.qwen3 import Qwen3ForCausalLM
 from ..models.sensenova.model import NEOChatModel
 from ..nn.diffusion.schedule import DiffusionSchedule
 from ..nn.quant.config import LinearPrecision, resolve_component_precisions
-from .metadata import bagel_config, h3_config, sensenova_config
+from .metadata import bagel_config, h3_config, resolve_h3_contract, sensenova_config
 
 __all__ = ["CatalogEntry", "resolve_catalog_entry"]
 
@@ -129,7 +129,17 @@ MINIMAX_H3_ENTRY = CatalogEntry(
 )
 
 
-def resolve_catalog_entry(architectures: list[str] | tuple[str, ...]) -> CatalogEntry:
+def _checkpoint_schedule(
+    device: torch.device, *, ladder: tuple[int, ...], shifts: tuple[float, ...]
+) -> DiffusionSchedule:
+    """Allocate a checkpoint's validated schedule on the caller's device."""
+
+    return DiffusionSchedule.build(ladder, shifts, scale=FASTH3_TIME_SCALE, device=device)
+
+
+def resolve_catalog_entry(
+    architectures: list[str] | tuple[str, ...], *, root: Path | None = None
+) -> CatalogEntry:
     """Resolve one exact configured checkpoint architecture."""
 
     match tuple(str(architecture) for architecture in architectures):
@@ -140,7 +150,17 @@ def resolve_catalog_entry(architectures: list[str] | tuple[str, ...]) -> Catalog
         case ("NEOChatModel",):
             return SENSENOVA_ENTRY
         case ("MiniMaxH3Transformer3DModel",):
-            return MINIMAX_H3_ENTRY
+            if root is None:
+                return MINIMAX_H3_ENTRY
+            contract = resolve_h3_contract(root)
+            return replace(
+                MINIMAX_H3_ENTRY,
+                create_schedule=partial(
+                    _checkpoint_schedule,
+                    ladder=tuple(contract["ladder"]),
+                    shifts=tuple(contract["sigma_shifts"]),
+                ),
+            )
     raise unsupported_setup(
         "configured checkpoint must declare exactly one architecture from "
         "Qwen3ForCausalLM, BagelForConditionalGeneration, NEOChatModel, or "

@@ -508,6 +508,7 @@ class MiniMaxH3Transformer(nn.Module):
         mesh: DeviceMesh,
         *,
         parameter_device: torch.device | str = "meta",
+        sparsity: float = 0.9,
         attention_linear_precision: LinearPrecision,
         mlp_linear_precision: LinearPrecision,
     ) -> None:
@@ -521,6 +522,7 @@ class MiniMaxH3Transformer(nn.Module):
         self.mesh = mesh
         self.pipeline = LayerPipeline(mesh.get_group("pp"), config.layers)
         self.sparse_attention = SparseAttention()
+        self.sparsity = sparsity
         self.mlp_linear_precision = mlp_linear_precision
 
         layer_config = LayerConfig(
@@ -605,6 +607,7 @@ class MiniMaxH3Transformer(nn.Module):
                 video_tiles=valid_tiles - prefix,
                 valid_tiles=valid_tiles,
                 valid_sizes=state["tile_valid_sizes"],
+                sparsity=self.sparsity,
             )
         )
         hidden = scratch["packed_hidden"]

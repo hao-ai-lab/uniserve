@@ -61,6 +61,7 @@ class H3Layout:
     local_end: int
     frame_count: int
     reconstruction_unit_frames: tuple[int, ...]
+    sparsity: float = 0.9
     local_video_rows: int = field(init=False)
     local_audio_rows: int = field(init=False)
 
@@ -89,6 +90,7 @@ class H3Layout:
         text_rows: int,
         audio_frames: int,
         postprocess: bool = False,
+        sparsity: float = 0.9,
     ) -> "H3Layout":
         """Partition one packed request evenly across the mesh sequence ranks."""
 
@@ -118,6 +120,7 @@ class H3Layout:
             local_end=(rank + 1) * shard if mesh is not None else 0,
             frame_count=int(frames),
             reconstruction_unit_frames=reconstruction_unit_frames(int(frames)),
+            sparsity=sparsity,
         )
 
     @property
@@ -267,7 +270,7 @@ def compute_specs(
                 "topk_indices_i32": (
                     local_heads,
                     layout.attention_video_tiles,
-                    video_sparse_selected_tiles(layout.packed.video_tiles),
+                    video_sparse_selected_tiles(layout.packed.video_tiles, layout.sparsity),
                 ),
             }
         )
