@@ -20,6 +20,14 @@ Images use EXIF-corrected RGB and a 2048-short-edge, multiple-of-32 canvas with 
 - H3 preparation owns seeded visual posterior sampling and audio posterior modes through the resident VAEs, with fixed conditions separate from target solver state.
 - Semantic reference geometry already supports multiple visual/audio media. Resident packing, scratch capacity, input staging, and preparation currently specialize it to one image and must be generalized together.
 
+## Numerical interfaces
+
+`reference_media.prepare_reference_image(bytes)` returns an EXIF-corrected RGB uint8 raster on the released image canvas. `prepare_reference_video(bytes, num_frames=...)` returns CPU-owned THWC presentation frames and optional channels-first stereo float32 audio at 32 kHz; `vae_frames` selects the complete causal window, while `sample_reference_video_frames` returns the 2-fps Qwen samples and block timestamps. Sources are limited to 32 MiB, 8192 pixels per edge and 4096 squared source pixels; video decode accepts rates from 1 to 240 fps and target windows from 22 through 345 frames. Sub-chunk video is rejected, not padded into a reference. Mono samples are duplicated without attenuation, stereo channels are preserved, and FFmpeg's channel-layout-aware downmix retains center/surround signal for multichannel sources. Sample-rate conversion uses the same torchaudio or SciPy CPU paths as the numerical source.
+
+`MiniMaxH3VideoVAE.encode_video` accepts a complete CPU THWC uint8 17n+5 window. It encodes normalized 17-frame clips using shared causal visual weights and spatial tiling, repeats the final clip's last frame as required, drops three posterior tokens after concatenation, and samples the complete posterior with CPU seed 42 followed by the released FP16 round-trip and channel normalization. Image encoding uses the same clip and posterior-sampling operations without video temporal padding.
+
+`reference.reference_packed_rows` checks the complete resident storage budget, including reference visual and stereo audio rows, tile-64 dense blocks, full target 4x4x4 boundary tiles, sequence-parallel alignment and tile-pair padding. Its default ceiling is 65536 rows. The current H3 request geometry boundary calls it before execution metadata allocation; semantic row count alone cannot enforce this bound.
+
 ## Completion evidence
 
 Required evidence comprises observable role/count rejection, exact budget boundaries, deterministic CPU HTTP-to-transformer tests for two images, three storyboard images, and a video with audio, plus the workspace Rust tests and Python suite. CPU tests cannot establish GPU numerical parity or model quality; no such claim follows from fixture encoders.
