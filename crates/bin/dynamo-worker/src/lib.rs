@@ -1,0 +1,686 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Experimental in-process Dynamo worker for UniServe FastH3.
+//!
+//! This reference integration embeds UniServe's Rust scheduler and engine in
+//! the Dynamo worker process. The preferred production boundary remains the
+//! native HTTP sidecar, which does not couple either project's dependencies.
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use base64::Engine as _;
+use clap::Parser;
+use dynamo_backend_common::{
+    AsyncEngineContext, BackendError, CommonArgs, DisaggregationMode, DynamoError, EngineConfig,
+    ErrorType, GenerateContext, ModelInput, RawEngine, WorkerConfig as DynamoWorkerConfig,
+};
+use futures::StreamExt as _;
+use futures::stream::BoxStream;
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+use tokio::sync::OnceCell;
+use tokio_util::sync::CancellationToken;
+use uniserve_core::MediaKind;
+use uniserve_engine::{SchedulingPolicy, WorkerConfig, WorkerProcessArgs};
+use uniserve_server::{
+    AppState, Config, EngineSettings, HttpListenerMode,
+    openai::{VideoGenerationRequest, serve_error_to_api},
+    serving::{FinishStatus, RequestOutput, ServeRequestId},
+};
+
+const H3_FPS: u32 = 24;
+const H3_WIDTH: u32 = 1344;
+const H3_HEIGHT: u32 = 768;
+const H3_MIN_FRAMES: u32 = 22;
+const H3_DENOISE_STEPS: i32 = 4;
+const H3_AUDIO_SAMPLE_RATE: i32 = 32_000;
+/// Call batches kept in flight against each Worker, matching the serving
+/// command's media default.
+const MEDIA_QUEUE_DEPTH: usize = 6;
+
+#[derive(Clone, Parser)]
+#[command(
+    name = "uniserve-dynamo-worker",
+    about = "Experimental in-process Dynamo worker for UniServe FastH3."
+)]
+struct Args {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Complete local FastH3 VSA checkpoint root.
+    #[arg(long)]
+    model_path: String,
+
+    #[arg(long, default_value = "FastH3")]
+    served_model_name: String,
+
+    #[arg(long, default_value = "python3")]
+    worker_python: PathBuf,
+
+    /// JSON deployment configuration: the Worker instances, their node/device
+    /// ranks, and the FastH3 components placed on them, for example
+    /// `config/minimax-h3-four-devices.json`.
+    #[arg(long, value_name = "FILE", value_parser = read_workers)]
+    workers: Box<[WorkerConfig]>,
+
+    /// This process's host identity. The engine owns exactly the placed ranks
+    /// whose node names it.
+    #[arg(long, default_value = "localhost")]
+    host_identity: String,
+
+    #[arg(long, default_value_t = 16_384, value_parser = clap::value_parser!(u32).range(1..))]
+    max_model_len: u32,
+
+    #[arg(long, default_value_t = 15.0)]
+    max_video_seconds: f64,
+
+    #[arg(long, default_value_t = 2)]
+    max_running_requests: usize,
+
+    #[arg(long, default_value = r#"{"mode":"balanced"}"#, value_parser = parse_json_object)]
+    quantization_config: Value,
+
+    #[arg(long, default_value = "auto", value_parser = ["off", "auto", "full"])]
+    graph_policy: String,
+}
+
+/// Reads and validates a deployment configuration file.
+fn read_workers(path: &str) -> Result<Box<[WorkerConfig]>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read deployment configuration {path}: {error}"))?;
+    let workers: Vec<WorkerConfig> = serde_json::from_str(&text)
+        .map_err(|error| format!("invalid deployment configuration {path}: {error}"))?;
+    WorkerConfig::validate_all(&workers).map_err(|error| error.to_string())?;
+    Ok(workers.into_boxed_slice())
+}
+
+fn parse_json_object(raw: &str) -> Result<Value, String> {
+    let value: Value = serde_json::from_str(raw).map_err(|error| error.to_string())?;
+    value
+        .is_object()
+        .then_some(value)
+        .ok_or_else(|| "expected a JSON object".to_string())
+}
+
+pub struct DynamoFastH3Engine {
+    args: Args,
+    state: OnceCell<Arc<AppState>>,
+    cancel: CancellationToken,
+}
+
+impl DynamoFastH3Engine {
+    pub fn from_args() -> Result<(Self, DynamoWorkerConfig), DynamoError> {
+        Self::try_from_args(<Args as Parser>::parse())
+    }
+
+    fn try_from_args(args: Args) -> Result<(Self, DynamoWorkerConfig), DynamoError> {
+        if args.common.disaggregation_mode != DisaggregationMode::Aggregated {
+            return Err(invalid_argument(
+                "UniServe FastH3 supports only aggregated Dynamo workers",
+            ));
+        }
+        if args.common.route_to_encoder {
+            return Err(invalid_argument("route-to-encoder is not supported"));
+        }
+        if args.common.enable_rl {
+            return Err(invalid_argument("RL engine routes are not supported"));
+        }
+        if !args.max_video_seconds.is_finite() || args.max_video_seconds <= 0.0 {
+            return Err(invalid_argument(
+                "max-video-seconds must be finite and positive",
+            ));
+        }
+        if args.max_running_requests == 0 {
+            return Err(invalid_argument("max-running-requests must be positive"));
+        }
+
+        let config = DynamoWorkerConfig {
+            namespace: args.common.namespace.clone(),
+            component: args.common.component.clone(),
+            endpoint: args.common.endpoint.clone(),
+            endpoint_types: "videos".to_string(),
+            model_name: args.served_model_name.clone(),
+            served_model_name: Some(args.served_model_name.clone()),
+            model_input: ModelInput::Text,
+            custom_jinja_template: None,
+            tool_call_parser: None,
+            reasoning_parser: None,
+            exclude_tools_when_tool_choice_none: true,
+            enable_local_indexer: false,
+            enable_kv_routing: false,
+            disaggregation_mode: DisaggregationMode::Aggregated,
+            route_to_encoder: false,
+            enable_rl: false,
+            ..Default::default()
+        };
+        Ok((
+            Self {
+                args,
+                state: OnceCell::new(),
+                cancel: CancellationToken::new(),
+            },
+            config,
+        ))
+    }
+
+    async fn build_state(&self) -> Result<Arc<AppState>, DynamoError> {
+        // Video checkpoints publish a root manifest in place of config.json;
+        // refuse anything else before a rank starts.
+        if !uniserve_server::profile::assets::is_media_checkpoint(&self.args.model_path).await {
+            return Err(invalid_argument(
+                "model-path is not a FastH3 video-generation checkpoint",
+            ));
+        }
+        let worker_process = WorkerProcessArgs {
+            python: self.args.worker_python.clone(),
+            model: self.args.model_path.clone(),
+            host: self.args.host_identity.clone(),
+            queue_depth: MEDIA_QUEUE_DEPTH,
+            resp_slot_cap: EngineSettings::MEDIA_IPC_SLOT_CAP,
+            quantization_config: self.args.quantization_config.clone(),
+            graph_policy: self.args.graph_policy.clone(),
+            ..WorkerProcessArgs::default()
+        };
+
+        let config = Config {
+            engine: EngineSettings {
+                max_batch: 2,
+                max_num_batched_tokens: 2,
+                max_num_seqs: self.args.max_running_requests,
+                long_prefill_threshold: 1,
+                mixed_prefill_tokens: 0,
+                scheduler_policy: SchedulingPolicy::Fcfs,
+                max_model_len: Some(self.args.max_model_len),
+                max_video_seconds: self.args.max_video_seconds,
+                workers: self.args.workers.to_vec(),
+                transfer: Default::default(),
+                worker_process,
+            },
+            model: self.args.model_path.clone(),
+            served_model_name: Some(self.args.served_model_name.clone()),
+            listener_mode: HttpListenerMode::BindTcp {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            log_stats: true,
+            ..Config::default()
+        };
+        config
+            .validate()
+            .map_err(|error| invalid_argument(error.to_string()))?;
+        let state = uniserve_server::build_state(&config)
+            .await
+            .map_err(|error| engine_error(format!("failed to start UniServe: {error:#}")))?;
+
+        // The server identifies the model from its checkpoint. This worker's
+        // request contract is four-step MiniMax H3, so a different family or
+        // step count is refused after its ranks stop.
+        let refusal = if state.runtime().model().video_capabilities().is_null() {
+            Some("checkpoint is not MiniMax H3".to_string())
+        } else if state.engine().denoise_steps() != H3_DENOISE_STEPS as u32 {
+            Some(format!(
+                "checkpoint runs {} denoising steps; this worker requires {H3_DENOISE_STEPS}",
+                state.engine().denoise_steps()
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = refusal {
+            let _ = state.engine().shutdown().await;
+            return Err(invalid_argument(message));
+        }
+        Ok(state)
+    }
+}
+
+#[async_trait]
+impl RawEngine for DynamoFastH3Engine {
+    async fn start(&self, _worker_id: u64) -> Result<EngineConfig, DynamoError> {
+        if self.state.initialized() {
+            return Err(engine_error("UniServe engine already started"));
+        }
+        let state = self.build_state().await?;
+        self.state
+            .set(state)
+            .map_err(|_| engine_error("UniServe engine already started"))?;
+        Ok(EngineConfig {
+            model: self.args.served_model_name.clone(),
+            served_model_name: Some(self.args.served_model_name.clone()),
+            runtime_data: runtime_data(self.args.max_video_seconds),
+            llm: None,
+            ..Default::default()
+        })
+    }
+
+    async fn generate(
+        &self,
+        request: Value,
+        ctx: GenerateContext,
+    ) -> Result<BoxStream<'static, Result<Value, DynamoError>>, DynamoError> {
+        let state = Arc::clone(
+            self.state
+                .get()
+                .ok_or_else(|| engine_error("generate called before start"))?,
+        );
+        let prepared = prepare_request(
+            request,
+            &self.args.served_model_name,
+            self.args.max_video_seconds,
+        )?;
+        let request_id = ServeRequestId::new(ctx.id().to_string());
+        // The serving runtime owns the request lifecycle the HTTP video route
+        // uses: identity registration, prompt preprocessing, submission and
+        // terminal accounting.
+        let mut events = state
+            .runtime()
+            .generate_video(request_id.clone(), prepared.request)
+            .await
+            .map_err(api_error)?;
+        let cancel = self.cancel.clone();
+        let served_model_name = self.args.served_model_name.clone();
+        let response_format = prepared.response_format;
+
+        Ok(Box::pin(async_stream::stream! {
+            let started_at = Instant::now();
+            let mut artifact = None;
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    _ = ctx.stopped() => {
+                        let _ = state.runtime().abort(request_id.clone()).await;
+                        return;
+                    }
+                    _ = cancel.cancelled() => {
+                        let _ = state.runtime().abort(request_id.clone()).await;
+                        return;
+                    }
+                    event = events.next() => event,
+                };
+                match event {
+                    Some(Ok(RequestOutput::Artifact(value))) => {
+                        if artifact.replace(value).is_some() {
+                            yield Err(engine_error("UniServe produced multiple media artifacts"));
+                            return;
+                        }
+                    }
+                    Some(Ok(RequestOutput::Finished { reason: FinishStatus::Stop { .. }, .. })) => break,
+                    Some(Ok(RequestOutput::Finished { reason, .. })) => {
+                        yield Err(engine_error(format!("video generation ended without an artifact: {reason:?}")));
+                        return;
+                    }
+                    Some(Ok(RequestOutput::Rejected { message, .. })) => {
+                        yield Err(invalid_argument(message));
+                        return;
+                    }
+                    Some(Ok(RequestOutput::Failed { message, .. })) => {
+                        yield Err(engine_error(message));
+                        return;
+                    }
+                    Some(Ok(
+                        RequestOutput::Accepted { .. }
+                        | RequestOutput::Usage { .. }
+                        | RequestOutput::Scheduled { .. }
+                        | RequestOutput::MediaProgress { .. },
+                    )) => {}
+                    Some(Ok(_)) => {
+                        yield Err(engine_error("UniServe emitted an incompatible event"));
+                        return;
+                    }
+                    Some(Err(error)) => {
+                        yield Err(api_error(serve_error_to_api(error)));
+                        return;
+                    }
+                    None => {
+                        yield Err(engine_error("UniServe generation stream stopped"));
+                        return;
+                    }
+                }
+            }
+            let Some(artifact) = artifact else {
+                yield Err(engine_error("UniServe produced no media artifact"));
+                return;
+            };
+            if artifact.media_kind != MediaKind::Video || artifact.content_type != "video/mp4" {
+                yield Err(engine_error(format!(
+                    "UniServe produced {:?} with content type {:?}, expected video/mp4",
+                    artifact.media_kind, artifact.content_type
+                )));
+                return;
+            }
+            yield Ok(video_response(
+                &request_id,
+                &served_model_name,
+                response_format,
+                artifact.media.as_bytes(),
+                started_at.elapsed(),
+            ));
+        }))
+    }
+
+    async fn abort(&self, ctx: Arc<dyn AsyncEngineContext>) {
+        if let Some(state) = self.state.get() {
+            let _ = state
+                .runtime()
+                .abort(ServeRequestId::new(ctx.id().to_string()))
+                .await;
+        }
+    }
+
+    async fn cleanup(&self) -> Result<(), DynamoError> {
+        self.cancel.cancel();
+        if let Some(state) = self.state.get() {
+            state
+                .engine()
+                .shutdown()
+                .await
+                .map_err(|error| engine_error(format!("UniServe shutdown failed: {error}")))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DynamoVideoRequest {
+    model: String,
+    prompt: String,
+    #[serde(default)]
+    input_reference: Option<String>,
+    #[serde(default)]
+    seconds: Option<i32>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    response_format: Option<ResponseFormat>,
+    #[serde(default)]
+    output_format: Option<String>,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default)]
+    nvext: Option<VideoNvExt>,
+    #[serde(default)]
+    extra_args: Option<Map<String, Value>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResponseFormat {
+    #[default]
+    Url,
+    B64Json,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VideoNvExt {
+    #[serde(default)]
+    annotations: Option<Vec<String>>,
+    #[serde(default)]
+    fps: Option<i32>,
+    #[serde(default)]
+    num_frames: Option<i32>,
+    #[serde(default)]
+    negative_prompt: Option<String>,
+    #[serde(default)]
+    num_inference_steps: Option<i32>,
+    #[serde(default)]
+    guidance_scale: Option<f32>,
+    #[serde(default)]
+    seed: Option<i64>,
+    #[serde(default)]
+    boundary_ratio: Option<f32>,
+    #[serde(default)]
+    guidance_scale_2: Option<f32>,
+}
+
+#[derive(Debug)]
+struct PreparedRequest {
+    request: VideoGenerationRequest,
+    response_format: ResponseFormat,
+}
+
+fn prepare_request(
+    value: Value,
+    served_model_name: &str,
+    max_video_seconds: f64,
+) -> Result<PreparedRequest, DynamoError> {
+    let request: DynamoVideoRequest = serde_json::from_value(value)
+        .map_err(|error| invalid_argument(format!("invalid video request: {error}")))?;
+    if request.model != served_model_name {
+        return Err(invalid_argument(format!(
+            "model {:?} is not served; expected {:?}",
+            request.model, served_model_name
+        )));
+    }
+    if request.prompt.trim().is_empty() {
+        return Err(invalid_argument("prompt must not be empty"));
+    }
+    reject_present("input_reference", request.input_reference.as_ref())?;
+    reject_present("user", request.user.as_ref())?;
+    if request.stream == Some(true) {
+        return Err(invalid_argument("stream=true is not supported"));
+    }
+    let expected_size = format!("{H3_WIDTH}x{H3_HEIGHT}");
+    if request
+        .size
+        .as_deref()
+        .is_some_and(|size| size != expected_size)
+    {
+        return Err(invalid_argument(format!("size must be {expected_size}")));
+    }
+    if request
+        .output_format
+        .as_deref()
+        .is_some_and(|format| !format.eq_ignore_ascii_case("mp4"))
+    {
+        return Err(invalid_argument("output_format must be mp4"));
+    }
+    if request
+        .extra_args
+        .as_ref()
+        .is_some_and(|args| !args.is_empty())
+    {
+        return Err(invalid_argument("extra video fields are not supported"));
+    }
+
+    let seconds = request.seconds.map(f64::from).unwrap_or(5.0);
+    if seconds <= 0.0 || seconds > max_video_seconds {
+        return Err(invalid_argument(format!(
+            "seconds must be positive and at most {max_video_seconds}"
+        )));
+    }
+    let frames = aligned_frame_count(seconds)?;
+    let nvext = request.nvext.unwrap_or_default();
+    reject_present("nvext.annotations", nvext.annotations.as_ref())?;
+    reject_present("nvext.negative_prompt", nvext.negative_prompt.as_ref())?;
+    reject_present("nvext.guidance_scale", nvext.guidance_scale.as_ref())?;
+    reject_present("nvext.boundary_ratio", nvext.boundary_ratio.as_ref())?;
+    reject_present("nvext.guidance_scale_2", nvext.guidance_scale_2.as_ref())?;
+    if nvext.fps.is_some_and(|fps| fps != H3_FPS as i32) {
+        return Err(invalid_argument(format!("nvext.fps must be {H3_FPS}")));
+    }
+    if nvext.num_frames.is_some_and(|value| value != frames as i32) {
+        return Err(invalid_argument(format!(
+            "nvext.num_frames must be {frames} for {seconds} seconds"
+        )));
+    }
+    if nvext
+        .num_inference_steps
+        .is_some_and(|steps| steps != H3_DENOISE_STEPS)
+    {
+        return Err(invalid_argument(format!(
+            "nvext.num_inference_steps must be {H3_DENOISE_STEPS}"
+        )));
+    }
+    let seed = match nvext.seed {
+        Some(seed) if seed < 0 => return Err(invalid_argument("nvext.seed must not be negative")),
+        Some(seed) => seed as u64,
+        None => 0,
+    };
+    Ok(PreparedRequest {
+        request: VideoGenerationRequest {
+            model: request.model,
+            prompt: request.prompt,
+            seed,
+            seconds: Some(seconds),
+        },
+        response_format: request.response_format.unwrap_or_default(),
+    })
+}
+
+fn aligned_frame_count(seconds: f64) -> Result<u32, DynamoError> {
+    let raw = (seconds * f64::from(H3_FPS)).round();
+    if !raw.is_finite() || raw < 1.0 || raw > f64::from(u32::MAX - 16) {
+        return Err(invalid_argument(
+            "seconds cannot be represented as FastH3 frames",
+        ));
+    }
+    let raw = raw as u32;
+    let frames = raw + (H3_MIN_FRAMES - raw % 17) % 17;
+    if frames < H3_MIN_FRAMES {
+        return Err(invalid_argument(
+            "seconds is shorter than supported geometry",
+        ));
+    }
+    Ok(frames)
+}
+
+fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> {
+    match value {
+        Some(_) => Err(invalid_argument(format!(
+            "{field} is not supported by UniServe FastH3"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn video_response(
+    id: &str,
+    model: &str,
+    response_format: ResponseFormat,
+    media: &[u8],
+    elapsed: Duration,
+) -> Value {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(media);
+    let (url, b64_json) = match response_format {
+        ResponseFormat::Url => (Some(format!("data:video/mp4;base64,{encoded}")), None),
+        ResponseFormat::B64Json => (None, Some(encoded)),
+    };
+    json!({
+        "id": id,
+        "object": "video",
+        "model": model,
+        "status": "completed",
+        "progress": 100,
+        "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
+        "data": [{
+            "output_format": "mp4",
+            "url": url,
+            "b64_json": b64_json,
+            "fps": H3_FPS,
+            "audio_sample_rate": H3_AUDIO_SAMPLE_RATE,
+        }],
+        "inference_time_s": elapsed.as_secs_f64(),
+    })
+}
+
+fn runtime_data(max_video_seconds: f64) -> HashMap<String, Value> {
+    BTreeMap::from([
+        ("backend".to_string(), json!("uniserve-inprocess")),
+        ("task".to_string(), json!("t2va")),
+        ("fps".to_string(), json!(H3_FPS)),
+        ("width".to_string(), json!(H3_WIDTH)),
+        ("height".to_string(), json!(H3_HEIGHT)),
+        ("max_video_seconds".to_string(), json!(max_video_seconds)),
+    ])
+    .into_iter()
+    .collect()
+}
+
+fn api_error(error: uniserve_server::openai::ApiError) -> DynamoError {
+    let kind = if error.status_code().is_client_error() {
+        BackendError::InvalidArgument
+    } else {
+        BackendError::Unknown
+    };
+    dynamo_error(kind, error.to_error_response().error.message)
+}
+
+fn invalid_argument(message: impl Into<String>) -> DynamoError {
+    dynamo_error(BackendError::InvalidArgument, message)
+}
+
+fn engine_error(message: impl Into<String>) -> DynamoError {
+    dynamo_error(BackendError::Unknown, message)
+}
+
+fn dynamo_error(kind: BackendError, message: impl Into<String>) -> DynamoError {
+    DynamoError::builder()
+        .error_type(ErrorType::Backend(kind))
+        .message(message)
+        .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> Value {
+        json!({
+            "model": "FastH3",
+            "prompt": "A stream in a forest",
+            "seconds": 5,
+            "response_format": "b64_json",
+            "nvext": {"fps": 24, "num_frames": 124, "num_inference_steps": 4, "seed": 1000}
+        })
+    }
+
+    #[test]
+    fn request_maps_to_uniserve_contract() {
+        let prepared = match prepare_request(request(), "FastH3", 15.0) {
+            Ok(prepared) => prepared,
+            Err(error) => panic!("supported request was rejected: {error}"),
+        };
+        assert_eq!(prepared.request.seconds, Some(5.0));
+        assert_eq!(prepared.request.seed, 1000);
+        assert!(matches!(prepared.response_format, ResponseFormat::B64Json));
+    }
+
+    #[test]
+    fn unsupported_control_is_rejected() {
+        for request in [
+            json!({"model":"FastH3", "prompt":"x", "input_reference":"image"}),
+            json!({"model":"FastH3", "prompt":"x", "stream":true}),
+            json!({"model":"FastH3", "prompt":"x", "size":"832x480"}),
+            json!({"model":"FastH3", "prompt":"x", "nvext":{"seed":-1}}),
+            json!({"model":"FastH3", "prompt":"x", "nvext":{"num_frames":120}}),
+            json!({"model":"FastH3", "prompt":"x", "extra_args":{"media_passthrough":{"foo":1}}}),
+        ] {
+            assert!(prepare_request(request, "FastH3", 15.0).is_err());
+        }
+    }
+
+    #[test]
+    fn response_formats_embed_the_mp4() {
+        let response = video_response(
+            "id",
+            "FastH3",
+            ResponseFormat::B64Json,
+            b"mp4",
+            Duration::from_millis(1_500),
+        );
+        assert_eq!(response["data"][0]["b64_json"], "bXA0");
+        assert!(response["data"][0]["url"].is_null());
+        assert_eq!(response["inference_time_s"], 1.5);
+
+        let response = video_response("id", "FastH3", ResponseFormat::Url, b"mp4", Duration::ZERO);
+        assert_eq!(response["data"][0]["url"], "data:video/mp4;base64,bXA0");
+    }
+}
