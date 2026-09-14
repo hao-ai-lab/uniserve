@@ -31,7 +31,6 @@ __all__ = [
     "unsupported_control",
     "compute_error",
     "resource_error",
-    "distributed_setup_error",
 ]
 
 
@@ -269,16 +268,6 @@ def resource_error(message: str, **kw: Any) -> ResourceError:
     """Create a classified error for exhausted or unavailable runtime resources."""
 
     return ResourceError(message, **kw)
-
-
-def distributed_setup_error(message: str, **kw: Any) -> WorkerError:
-    """Classify unavailable or invalid distributed topology as unsupported setup.
-
-    The nonfatal classification rejects worker construction without attributing
-    the failure to an individual request operation.
-    """
-
-    return _make(WorkerErrorCode.UNSUPPORTED_SETUP, message, **kw)
 
 
 # Ordered exception -> code rules, evaluated top to bottom; the first matching

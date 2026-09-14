@@ -6,6 +6,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import torch
+
+from uniserve.runtime.tensor_buffers import TensorBuffers
+from uniserve.tensors import BufferConfig
+
 from ..foundation.errors import invalid_descriptor
 from ..protocol.batch import (
     BatchCommand,
@@ -20,11 +25,8 @@ from ..protocol.batch import (
     Start,
     TensorRef,
 )
-from .tensor_buffers import TensorBuffers, TensorSchema
 
 if TYPE_CHECKING:
-    import torch
-
     from ..execution.diffusion_state import DiffusionState
     from ..execution.output import OutputBuffer, PendingOutput
 
@@ -79,7 +81,7 @@ class RequestPool:
         self,
         max_request_pool_size: int,
         *,
-        tensor_schema: Mapping[str, TensorSchema] | None = None,
+        state_buffers: Mapping[str, BufferConfig] | None = None,
         device: torch.device | str = "cpu",
     ) -> None:
         size = int(max_request_pool_size)
@@ -90,8 +92,13 @@ class RequestPool:
         self._rows: list[RequestState | None] = [None] * (size + 1)
         self._slots_by_request: dict[int, int] = {}
         self.tensor_slots = (
-            tuple(TensorBuffers.allocate(tensor_schema, device) for _ in range(size))
-            if tensor_schema
+            tuple(
+                TensorBuffers.allocate(
+                    state_buffers, device, pin_memory=torch.device(device).type == "cuda"
+                )
+                for _ in range(size)
+            )
+            if state_buffers
             else ()
         )
 

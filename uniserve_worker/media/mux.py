@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
+from uniserve.model.media import VideoInfo
+
 from ..foundation.errors import invalid_descriptor
 from ..protocol.batch import ComputationId, MediaOutput, MediaTrack, PosixShmArtifact, RequestKey
 from .storage import publish_media_bytes
@@ -285,7 +287,9 @@ class MediaMux:
         self.rank = rank
         self._sessions: dict[RequestKey, MuxSession] = {}
 
-    def open(self, request_key: RequestKey, *, geometry) -> None:
+    def open(
+        self, request_key: RequestKey, *, video: VideoInfo, video_unit_frames: tuple[int, ...]
+    ) -> None:
         """Create the request-owned mux session for a validated output geometry."""
 
         if request_key in self._sessions:
@@ -293,12 +297,12 @@ class MediaMux:
         self._sessions[request_key] = MuxSession(
             AvMuxSession(
                 AvMuxConfig(
-                    width=int(geometry.width),
-                    height=int(geometry.height),
-                    frame_count=int(geometry.frame_count),
-                    frame_rate=int(geometry.frame_rate),
-                    audio_rate=int(geometry.audio_rate),
-                    video_unit_frames=tuple(int(value) for value in geometry.unit_frames),
+                    width=int(video.width),
+                    height=int(video.height),
+                    frame_count=int(video.frame_count),
+                    frame_rate=int(video.frame_rate),
+                    audio_rate=int(video.audio_rate),
+                    video_unit_frames=video_unit_frames,
                 )
             )
         )

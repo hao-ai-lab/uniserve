@@ -1,6 +1,6 @@
 # UniServe
 
-UniServe is an OpenAI-compatible inference server for configured text and omni models. Rust owns HTTP admission, tokenization, scheduling, generation state, cache accounting, and response assembly; Python workers own model forward execution and device tensors.
+UniServe provides a Python computation library and an OpenAI-compatible inference server for text and omni models. `uniserve` supplies numerical layers, loading and resource binding; `uniserve_models` composes the concrete models; `uniserve_worker` executes serving requests with those same numerical implementations. Rust owns HTTP admission, tokenization, scheduling, generation state, cache accounting and response assembly.
 
 The configured model descriptions are `qwen3`, `sensenova`, `bagel`, and `minimax-h3`. A server process loads exactly one description and exposes one served-model identity.
 
@@ -26,6 +26,8 @@ uv pip install -e .
 ```
 
 The installation builds the `uniserve` binary and the native worker IPC extension.
+
+The three Python packages are installed together. The [Python library guide](docs/python-library.md) shows checkpoint resolution, typed model configuration, explicit loading and direct tensor calls. Its runnable examples produce text logits and reconstruct H3 video through the public computation interfaces.
 
 The `gpu` extra includes FlashAttention-4 and the native `uniserve-kernel` package for CUDA IPC and peer-memory mappings. Install the source workspace with `uv sync --extra gpu`; building these mappings requires a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja.
 
@@ -183,7 +185,9 @@ crates/worker-ipc-py/                    Python worker IPC extension
 crates/engine/                           Scheduler, KV pool, executors, simulator, and engine process
 crates/server/                           Model profiles, serving funnel, OpenAI API, HTTP, and engine clients
 crates/bin/uniserve/                     `serve` and `engine` CLI entrypoints
-uniserve_worker/                          Forward-only Python model workers
+uniserve/                                 Numerical layers, loading, and resource binding
+uniserve_models/                          Concrete models, typed configs, and checkpoint catalog
+uniserve_worker/                          Serving execution, batching, and resource ownership
 uniserve_eval/                            Serving evaluator
 specs/                                    Builder-facing implementation notes
 docs/fast_h3/                             FastH3 deployment cheat sheet and container files

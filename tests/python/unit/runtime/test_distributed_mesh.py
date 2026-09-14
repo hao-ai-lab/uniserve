@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from uniserve_worker.bootstrap.distributed import initialize_process_groups
-from uniserve_worker.nn.mesh import DeviceMesh
-from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
+from uniserve.distributed.mesh import DeviceMesh
+from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
+from uniserve.distributed.process_groups import initialize_process_groups
 
 pytestmark = pytest.mark.unit
 

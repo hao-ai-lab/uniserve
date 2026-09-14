@@ -4,16 +4,14 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve_worker.bootstrap.distributed import (
-    initialize_model_parallel,
-    initialize_process_groups,
-)
-from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.linear import LinearBase
-from uniserve_worker.nn.mesh import Communicator
-from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
-from uniserve_worker.nn.row_pipeline import ProjectedRows, RowStage, run_row_pipeline
-from uniserve_worker.runtime.tensor_buffers import TensorBuffers, TensorSchema
+from uniserve.distributed.mesh import Communicator
+from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
+from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
+from uniserve.nn.layer import LayerConfig
+from uniserve.nn.linear import LinearBase
+from uniserve.nn.row_pipeline import ProjectedRows, RowStage, run_row_pipeline
+from uniserve.runtime.tensor_buffers import TensorBuffers
+from uniserve.tensors import BufferConfig
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -47,8 +45,9 @@ def _gather_projection(environment, rank, device):
         group = mesh.get_group("sp")
         for dtype in (torch.bfloat16, torch.uint8):
             storage = TensorBuffers.allocate(
-                {"rows": TensorSchema((8192,), dtype, memory="symmetric", group=group)},
+                {"rows": BufferConfig((8192,), dtype)},
                 device,
+                symmetric={"rows": group},
             )
             gathered = storage.capacity["rows"]
             local = (torch.arange(4096, device=device) % 31 + rank * 64).to(dtype)
@@ -71,15 +70,9 @@ def _gather_projection(environment, rank, device):
             del gathered, storage
         for local_rows, width in ((128, 512), (16392, 2048)):
             storage = TensorBuffers.allocate(
-                {
-                    "rows": TensorSchema(
-                        (local_rows * width * 4,),
-                        torch.uint8,
-                        memory="symmetric",
-                        group=group,
-                    )
-                },
+                {"rows": BufferConfig((local_rows * width * 4,), torch.uint8)},
                 device,
+                symmetric={"rows": group},
             )
             columns = (torch.arange(width, device=device) % 17).bfloat16() / 16
             rows = columns.repeat(local_rows, 1).add_(rank)
@@ -216,7 +209,7 @@ def test_row_gather_and_projection_replay_updated_values_in_logical_rank_order(t
 
 @torch.inference_mode()
 def _run_quantized_gather(rank: int, rendezvous: str) -> None:
-    from uniserve_worker.nn.quant import DynamicW8A8Fp8LinearMethod, DynamicW8A8MxFp8LinearMethod
+    from uniserve.nn.quant import DynamicW8A8Fp8LinearMethod, DynamicW8A8MxFp8LinearMethod
 
     device = torch.device("cuda", rank)
     environment = initialize_process_groups(
@@ -240,12 +233,9 @@ def _run_quantized_gather(rank: int, rendezvous: str) -> None:
         full.mul_(magnitudes[torch.arange(local_rows * 2, device=device) % 4, None])
         local = full.chunk(2)[group.rank_in_group].clone()
         storage = TensorBuffers.allocate(
-            {
-                "rows": TensorSchema(
-                    (4 * 128 * width,), torch.bfloat16, memory="symmetric", group=group
-                )
-            },
+            {"rows": BufferConfig((4 * 128 * width,), torch.bfloat16)},
             device,
+            symmetric={"rows": group},
         )
         for method in (DynamicW8A8Fp8LinearMethod(), DynamicW8A8MxFp8LinearMethod()):
             layer = LinearBase(
@@ -291,14 +281,14 @@ def test_row_and_block_quantized_projection_preserves_scale_domains_under_replay
 
 @torch.inference_mode()
 def _run_routed_scales(rank: int, rendezvous: str) -> None:
-    from uniserve_worker.modeling.tensors import ExpertRoute, RouteSpan
-    from uniserve_worker.nn.expert_routing import RoutedTensor
-    from uniserve_worker.nn.mlp import GatedMLP
-    from uniserve_worker.nn.parallel_sequence import SequencePartition
-    from uniserve_worker.nn.quant.base import process_quantized_modules
-    from uniserve_worker.nn.quant.fp8 import DynamicW8A8Fp8LinearMethod
-    from uniserve_worker.nn.quant.mxfp8 import DynamicW8A8MxFp8LinearMethod
-    from uniserve_worker.nn.quant.nvfp4 import DynamicW4A4NvFp4LinearMethod
+    from uniserve.attention.metadata import ExpertRoute, RouteSpan
+    from uniserve.nn.expert_routing import RoutedTensor
+    from uniserve.nn.mlp import GatedMLP
+    from uniserve.nn.parallel_sequence import SequencePartition
+    from uniserve.nn.quant.base import process_quantized_modules
+    from uniserve.nn.quant.fp8 import DynamicW8A8Fp8LinearMethod
+    from uniserve.nn.quant.mxfp8 import DynamicW8A8MxFp8LinearMethod
+    from uniserve.nn.quant.nvfp4 import DynamicW4A4NvFp4LinearMethod
 
     device = torch.device("cuda", rank)
     environment = initialize_process_groups(

@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+import torch
 
 from tests.python.fixtures.model_execution import TEST_WORKER_CONFIG
+from uniserve.runtime.kv_cache import KVCacheConfig
+from uniserve_models.stub import StubModel
 from uniserve_worker.bootstrap.capacity import derive_runtime_kv_capacity
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
-from uniserve_worker.modeling.geometry import CacheGeometry
-from uniserve_worker.models.stub import StubModel
 
 pytestmark = pytest.mark.unit
 
@@ -29,14 +30,14 @@ def fixed_device_total(monkeypatch):
 
 def _model() -> StubModel:
     model = StubModel()
-    model.cache_geometry = CacheGeometry(
+    model.text_backbone.cache_config = KVCacheConfig(
         num_layers=32,
-        num_attention_heads=8,
         num_kv_heads=8,
         total_kv_heads=8,
         kv_head_offset=0,
         head_dim=8,
-        dtype="bfloat16",
+        dtype=torch.bfloat16,
+        total_layers=32,
     )
     return model
 
@@ -96,7 +97,6 @@ def test_automatic_cuda_kv_capacity_requires_a_host_grant():
 def test_automatic_capacity_charges_request_and_input_storage() -> None:
     model = _model()
     model.generation = None
-    model.image_processor = None
     config = replace(
         _worker_config(token_capacity=None),
         pool_memory_bytes=32 * 1024**3,

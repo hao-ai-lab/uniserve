@@ -8,6 +8,10 @@ import pytest
 import torch
 
 from tests.python.fixtures.model_execution import TEST_MODEL, TEST_WORKER_CONFIG
+from uniserve.distributed.mesh import Communicator
+from uniserve.math import ceil_div
+from uniserve.tensors import BufferConfig
+from uniserve_models.processing import stub_processor
 from uniserve_worker.bootstrap.capacity import (
     latent_trajectory_bytes,
     model_arena_capacity,
@@ -15,20 +19,17 @@ from uniserve_worker.bootstrap.capacity import (
     tensor_slot_capacity,
 )
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
+from uniserve_worker.config import ComponentConfig
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.foundation.math import ceil_div
-from uniserve_worker.nn.mesh import Communicator
-from uniserve_worker.nn.parallel import ComponentConfig
 from uniserve_worker.protocol.batch import ForwardMode, PipelineStage
-from uniserve_worker.runtime.tensor_buffers import TensorSchema
 
 pytestmark = pytest.mark.unit
 
 
 def test_attention_output_bindings_isolate_callers_and_restore_after_errors():
-    from uniserve_worker.nn.mesh import DeviceMesh
-    from uniserve_worker.nn.parallel_attention import ParallelAttention, output_scope
-    from uniserve_worker.runtime.attention_storage import allocate_output_storage
+    from uniserve.distributed.mesh import DeviceMesh
+    from uniserve.nn.parallel_attention import ParallelAttention, output_scope
+    from uniserve.runtime.attention_storage import allocate_output_storage
 
     attention = ParallelAttention(mesh=DeviceMesh.trivial())
     callers = tuple(
@@ -62,24 +63,13 @@ def test_attention_output_bindings_isolate_callers_and_restore_after_errors():
 
 
 def test_call_state_borrows_its_fields_and_stages_zero_padded_values():
-    from uniserve_worker.modeling.components import Call
-    from uniserve_worker.modeling.geometry import MediaShape
-    from uniserve_worker.modeling.model import Model
-    from uniserve_worker.modeling.resources import TensorNeeds
-    from uniserve_worker.modeling.resources import TensorSchema as NumericalTensor
-    from uniserve_worker.runtime.tensor_buffers import TensorBuffers
-    from uniserve_worker.runtime.tensors import bind_state, stage_tensor
-
-    class ConditionedModel(Model):
-        def tensor_specs(self, call, shape):
-            return TensorNeeds(
-                state={"condition": NumericalTensor((shape.height, shape.width), torch.float32)}
-            )
+    from uniserve.runtime.tensor_buffers import TensorBuffers
+    from uniserve.runtime.tensors import bind_state, stage_tensor
 
     backing = torch.full((4, 3), -1.0)
     overlap = torch.full((2,), 7.0)
     storage = TensorBuffers({"condition": backing, "overlap": overlap})
-    state = bind_state(ConditionedModel(), Call.DIFFUSION, MediaShape(3, 3), storage)
+    state = bind_state({"condition": BufferConfig((3, 3), torch.float32)}, storage)
     source = torch.arange(6).float().reshape(2, 3)
     stage_tensor(source, state["condition"])
     expected = torch.cat((source, torch.zeros(1, 3), torch.full((1, 3), -1.0)))
@@ -94,75 +84,49 @@ def test_call_state_borrows_its_fields_and_stages_zero_padded_values():
 
 
 def test_declared_scratch_borrows_compact_views():
-    from uniserve_worker.modeling.components import Call
-    from uniserve_worker.modeling.geometry import MediaShape
-    from uniserve_worker.modeling.model import Model
-    from uniserve_worker.modeling.resources import TensorNeeds
-    from uniserve_worker.modeling.resources import TensorSchema as NumericalTensor
-    from uniserve_worker.runtime.tensor_buffers import TensorBuffers
-    from uniserve_worker.runtime.tensors import bind_scratch
-
-    class Projection(Model):
-        def tensor_specs(self, call, shape):
-            return TensorNeeds(
-                scratch={"rows": NumericalTensor((shape.height, shape.width), torch.float32)}
-            )
+    from uniserve.runtime.tensor_buffers import TensorBuffers
+    from uniserve.runtime.tensors import bind_scratch
 
     storage = TensorBuffers.allocate(
-        {"rows": TensorSchema((4, 6), torch.float32)},
+        {"rows": BufferConfig((2, 3), torch.float32, capacity_shape=(4, 6))},
         "cpu",
     )
     storage.capacity["rows"].copy_(torch.arange(24).reshape(4, 6))
-    model = Projection()
-    views = bind_scratch(model, Call.DIFFUSION, MediaShape(2, 3), storage)
+    views = bind_scratch({"rows": BufferConfig((2, 3), torch.float32)}, storage)
     torch.testing.assert_close(views["rows"], torch.arange(6).float().reshape(2, 3))
     views["rows"].add_(10)
     expected = torch.arange(24).float()
     expected[:6] += 10
     torch.testing.assert_close(storage.capacity["rows"], expected.reshape(4, 6))
-    larger = bind_scratch(model, Call.DIFFUSION, MediaShape(4, 6), storage)
+    larger = bind_scratch({"rows": BufferConfig((4, 6), torch.float32)}, storage)
     torch.testing.assert_close(larger["rows"], expected.reshape(4, 6))
     with pytest.raises(ValueError, match="capacity"):
-        bind_scratch(model, Call.DIFFUSION, MediaShape(5, 6), storage)
+        bind_scratch({"rows": BufferConfig((5, 6), torch.float32)}, storage)
     incompatible = TensorBuffers({"rows": torch.empty((4, 6), dtype=torch.int32)})
     with pytest.raises(ValueError, match="dtype"):
-        bind_scratch(model, Call.DIFFUSION, MediaShape(2, 3), incompatible)
+        bind_scratch({"rows": BufferConfig((2, 3), torch.float32)}, incompatible)
 
 
 @pytest.mark.parametrize("kind", ["state", "scratch"])
 def test_tensor_capacity_covers_packed_selections_that_move_between_ranks(kind):
-    from uniserve_worker.modeling.components import Call
-    from uniserve_worker.modeling.geometry import MediaShape
-    from uniserve_worker.modeling.model import Model
-    from uniserve_worker.modeling.resources import PackedAxis, TensorNeeds
-    from uniserve_worker.modeling.resources import TensorSchema as NumericalTensor
-    from uniserve_worker.runtime.tensor_buffers import TensorBuffers
-    from uniserve_worker.runtime.tensors import bind_scratch, bind_state, resolve_resources
+    from uniserve.runtime.tensor_buffers import TensorBuffers
+    from uniserve.runtime.tensors import bind_scratch, bind_state, merge_buffers
 
-    class PackedFeatures(Model):
-        def tensor_specs(self, call, shape):
-            # Six feature rows follow a variable prompt in a two-way sequence
-            # partition. This caller owns the first half of that sequence.
-            rows = shape.prompt_tokens + 6
-            count = max(0, rows // 2 - shape.prompt_tokens)
-            return TensorNeeds(
-                **{
-                    kind: {
-                        "features": NumericalTensor(
-                            (count, 2), torch.float32, partition=PackedAxis(0, 6, rows, 2)
-                        )
-                    }
-                }
+    def fields(prompt):
+        # Six feature rows follow the prompt in a two-way sequence partition.
+        # Changing the prompt moves the feature boundary across rank zero.
+        rows = prompt + 6
+        count = max(0, rows // 2 - prompt)
+        return {
+            "features": BufferConfig(
+                (count, 2), torch.float32, capacity_shape=(min(6, rows // 2), 2)
             )
+        }
 
-    model = PackedFeatures()
-    maximum = MediaShape(1, 1, prompt_tokens=16)
-    resources = resolve_resources(model, ((Call.DIFFUSION, maximum),))
-    storage = TensorBuffers.allocate(getattr(resources, kind), "cpu")
+    storage = TensorBuffers.allocate(merge_buffers((fields(16),)), "cpu")
     bind = bind_state if kind == "state" else bind_scratch
     for prompt, expected in ((16, []), (0, [[0, 1], [2, 3], [4, 5]]), (2, [[0, 1], [2, 3]])):
-        shape = MediaShape(1, 1, prompt_tokens=prompt)
-        features = bind(model, Call.DIFFUSION, shape, storage)["features"]
+        features = bind(fields(prompt), storage)["features"]
         features.copy_(torch.arange(features.numel()).reshape_as(features))
         torch.testing.assert_close(
             features, torch.tensor(expected, dtype=torch.float32).reshape(-1, 2)
@@ -174,7 +138,7 @@ def test_closed_request_storage_rejects_admission_and_borrowing():
     from uniserve_worker.runtime.request import RequestPool
 
     admission = replace(ar_params(71, block_ids=(0,)), request_pool_idx=1)
-    pool = RequestPool(2, tensor_schema={"state": TensorSchema((4,), torch.float32)}, device="cpu")
+    pool = RequestPool(2, state_buffers={"state": BufferConfig((4,), torch.float32)}, device="cpu")
     pool.start(admission)
     pool.close()
     pool.close()
@@ -186,8 +150,8 @@ def test_closed_request_storage_rejects_admission_and_borrowing():
 
 def test_request_capacity_charges_only_device_storage_against_device_budget():
     schema = {
-        "state": TensorSchema((128,), torch.float32),
-        "initial_values": TensorSchema((1024,), torch.float32, memory="pinned"),
+        "state": BufferConfig((128,), torch.float32),
+        "initial_values": BufferConfig((1024,), torch.float32, host=True),
     }
     assert (
         tensor_slot_capacity(
@@ -212,7 +176,7 @@ def test_request_capacity_charges_only_device_storage_against_device_budget():
 
 
 def test_request_capacity_accounts_for_the_candidate_output_horizon():
-    schema = {"state": TensorSchema((128,), torch.float32)}
+    schema = {"state": BufferConfig((128,), torch.float32)}
     # At depth 12, two, three, and four requests retain 10, 9, and 8
     # output batches respectively. Smaller counts need more product storage.
     count = tensor_slot_capacity(
@@ -244,6 +208,7 @@ def test_worker_info_projects_model_behavior_and_resource_geometry():
     layout = build_worker_layout(
         TEST_MODEL,
         TEST_WORKER_CONFIG,
+        image_processor=stub_processor(),
         model_name="test-model",
     )
     info = layout.info
@@ -251,10 +216,10 @@ def test_worker_info_projects_model_behavior_and_resource_geometry():
     assert ForwardMode.PREFILL in info.supported_ops
     assert PipelineStage.DENOISING in info.supported_ops
     assert layout.max_vision_feature_bytes == (
-        int(TEST_MODEL.max_vit_grid_tokens) * int(TEST_MODEL.hidden_size) * 2
+        int(TEST_MODEL.max_vit_grid_tokens) * int(TEST_MODEL.text_backbone.hidden_size) * 2
     )
     assert info.kv_cache is not None
-    assert info.kv_cache.num_layers == TEST_MODEL.cache_geometry.num_layers
+    assert info.kv_cache.num_layers == TEST_MODEL.text_backbone.cache_config.num_layers
     assert info.model_name == "test-model"
 
 
@@ -266,7 +231,7 @@ def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:
         kv_token_capacity=int(flow.max_latent_tokens) + 1,
     )
 
-    layout = build_worker_layout(TEST_MODEL, worker_config)
+    layout = build_worker_layout(TEST_MODEL, worker_config, image_processor=stub_processor())
 
     expected_pages = ceil_div(
         int(flow.max_latent_tokens) + 1,
@@ -277,7 +242,7 @@ def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:
 
 
 def test_persistent_buffer_capacity_includes_active_encoder_output() -> None:
-    layout = build_worker_layout(TEST_MODEL, TEST_WORKER_CONFIG)
+    layout = build_worker_layout(TEST_MODEL, TEST_WORKER_CONFIG, image_processor=stub_processor())
     feature_bytes = max(
         layout.max_latent_feature_bytes,
         layout.max_vision_feature_bytes,
@@ -290,7 +255,7 @@ def test_persistent_buffer_capacity_includes_active_encoder_output() -> None:
 
 def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() -> None:
     worker_config = replace(TEST_WORKER_CONFIG, model_dtype="float32")
-    layout = build_worker_layout(TEST_MODEL, worker_config)
+    layout = build_worker_layout(TEST_MODEL, worker_config, image_processor=stub_processor())
     flow = TEST_MODEL.generation
     assert flow is not None
     assert layout.max_latent_feature_bytes == latent_trajectory_bytes(
@@ -335,20 +300,23 @@ def test_worker_worker_config_rejects_invalid_runtime_geometry(worker_config):
     [(torch.float64, (), "dtype"), (torch.float32, (0, 1), "dynamic axes")],
 )
 def test_result_publication_rejects_unrepresentable_numerical_outputs(dtype, axes, message):
-    from uniserve_worker.modeling.components import Call
-    from uniserve_worker.modeling.geometry import MediaShape
-    from uniserve_worker.modeling.model import Model
-    from uniserve_worker.modeling.resources import TensorNeeds
-    from uniserve_worker.modeling.resources import TensorSchema as NumericalTensor
+    from uniserve.model.components import ComponentCall
+    from uniserve.model.model import Model
+    from uniserve.tensors import OutputLayout as NumericalTensor
     from uniserve_worker.runtime.results import resolve_outputs
 
-    class Features(Model):
-        output_shapes = {"encoder": (Call.ENCODE_VISION, MediaShape(2, 3))}
+    class FeatureEncoder(torch.nn.Module):
+        def output_layout(self):
+            return {"features": NumericalTensor((2, 3), dtype, variable_axes=axes)}
 
-        def tensor_specs(self, call, shape):
-            return TensorNeeds(
-                outputs={"features": NumericalTensor((2, 3), dtype, variable_axes=axes)}
-            )
+    class Features(Model):
+        def __init__(self):
+            super().__init__()
+            self.encoder = FeatureEncoder()
+
+        @classmethod
+        def component_calls(cls, config):
+            return (ComponentCall("encoder", "encode:vision"),)
 
     with pytest.raises(ValueError, match=message):
         resolve_outputs(Features())
@@ -357,14 +325,11 @@ def test_result_publication_rejects_unrepresentable_numerical_outputs(dtype, axe
 def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     import torch
 
+    from uniserve.model.components import ComponentCall
+    from uniserve.model.model import Model
+    from uniserve.tensors import BufferConfig
+    from uniserve.tensors import OutputLayout as NumericalTensor
     from uniserve_worker.config import WorkerConfig
-    from uniserve_worker.modeling.components import Call, CallSpec, ComponentSpec
-    from uniserve_worker.modeling.geometry import MediaShape, TextShape
-    from uniserve_worker.modeling.model import (
-        Model,
-    )
-    from uniserve_worker.modeling.resources import TensorNeeds
-    from uniserve_worker.modeling.resources import TensorSchema as NumericalTensor
     from uniserve_worker.protocol.batch import (
         BufferAllocation,
         RequestKey,
@@ -372,28 +337,28 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
         TensorRef,
     )
     from uniserve_worker.runtime.buffer_pool import BufferPool
-    from uniserve_worker.runtime.tensor_buffers import TensorSchema
+
+    class Conditioning(torch.nn.Module):
+        max_tokens = 3
+
+        def output_layout(self, size):
+            return {"conditioning": NumericalTensor((3, 7), torch.float32, variable_axes=(0,))}
+
+    class Latents(torch.nn.Module):
+        def output_layout(self):
+            return {"latent": NumericalTensor((5, 11), torch.float32)}
 
     class TensorModel(Model):
-        output_shapes = {
-            "text_encoder": (Call.ENCODE_TEXT, TextShape(1)),
-            "denoiser": (Call.DIFFUSION, MediaShape(1, 1)),
-        }
-
-        def tensor_specs(self, call, shape):
-            return TensorNeeds(
-                outputs=(
-                    {"conditioning": NumericalTensor((3, 7), torch.float32, variable_axes=(0,))}
-                    if call is Call.ENCODE_TEXT
-                    else {"latent": NumericalTensor((5, 11), torch.float32)}
-                )
-            )
+        def __init__(self):
+            super().__init__()
+            self.text_encoder = Conditioning()
+            self.denoiser = Latents()
 
         @classmethod
-        def components(cls, config):
+        def component_calls(cls, config):
             return (
-                ComponentSpec("text_encoder", (CallSpec(Call.ENCODE_TEXT),)),
-                ComponentSpec("denoiser", (CallSpec(Call.DIFFUSION),)),
+                ComponentCall("text_encoder", "encode:text"),
+                ComponentCall("denoiser", "forward_diffusion"),
             )
 
     model = TensorModel()
@@ -404,7 +369,7 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
         config,
         queue_depth=8,
         completion_payload_bytes=1024,
-        state_schema={"state": TensorSchema((4,), torch.float32)},
+        state_buffers={"state": BufferConfig((4,), torch.float32)},
         components=(
             ("text_encoder", ComponentConfig((0,))),
             ("denoiser", ComponentConfig((0,))),
@@ -480,17 +445,17 @@ def test_cuda_capacity_query_failure_is_not_an_empty_budget(monkeypatch) -> None
 def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
     rank, worker_entries, streamed_width, window_bytes, full_bytes, import_bytes
 ):
+    from uniserve.distributed.mesh import DeviceMesh
     from uniserve_worker.bootstrap.capacity import local_product_storage_bytes
+    from uniserve_worker.config import ComponentConfig
     from uniserve_worker.execution.model_entry import ModelEntry
-    from uniserve_worker.nn.mesh import DeviceMesh
-    from uniserve_worker.nn.parallel import ComponentConfig
     from uniserve_worker.protocol.batch import (
         DeviceDim,
         DType,
+        OutputInfo,
         PipelineStage,
         ShapeBound,
         StaticDim,
-        TensorSpec,
     )
 
     entries = {
@@ -514,10 +479,10 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
         if name in worker_entries
     }
     outputs = {
-        "encode": (TensorSpec("embedding", DType.F32, ShapeBound((StaticDim(128),))),),
-        "predict": (TensorSpec("latents", DType.F32, ShapeBound((StaticDim(256),))),),
+        "encode": (OutputInfo("embedding", DType.F32, ShapeBound((StaticDim(128),))),),
+        "predict": (OutputInfo("latents", DType.F32, ShapeBound((StaticDim(256),))),),
         "decode": (
-            TensorSpec("frames", DType.F32, ShapeBound((DeviceDim(20), StaticDim(streamed_width)))),
+            OutputInfo("frames", DType.F32, ShapeBound((DeviceDim(20), StaticDim(streamed_width)))),
         ),
     }
     components = {

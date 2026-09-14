@@ -84,7 +84,7 @@ table KvGroup {
   sink:uint;
 }
 
-table KvCacheConfig {
+table KVCacheInfo {
   block_size:uint;
   num_blocks:uint;
   num_layers:uint;
@@ -121,7 +121,7 @@ table ParallelConfig {
 }
 enum ComponentDistribution:ubyte { Local, TemporalUnits }
 
-table TensorSpec {
+table OutputInfo {
   name:string;
   dtype:DType;
   extents:[uint];
@@ -134,7 +134,7 @@ table EntryInfo {
   parallel_config:ParallelConfig;
   distribution:ComponentDistribution;
   units_per_rank:uint = 1;
-  outputs:[TensorSpec];
+  outputs:[OutputInfo];
 }
 
 table PipelineComponent { stage:PipelineStage; component:string; }
@@ -152,7 +152,7 @@ table WorkerInfo {
   max_batch_ops:uint;
   max_batch_tokens:uint;
   request_slots:uint;
-  kv_cache:KvCacheConfig;
+  kv_cache:KVCacheInfo;
   latent_page_units:uint;
   latent_pages:uint;
   buffer_pool_bytes:ulong;

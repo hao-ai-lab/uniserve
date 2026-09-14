@@ -28,10 +28,10 @@ from tests.python.fixtures.depth_one import (
     visual_state_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
+from uniserve.model.batch import TextBatch, TextOutput
+from uniserve_models.stub import StubModel, _next_token
 from uniserve_worker.config import LaneConfig, WorkerConfig
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.modeling.batch import TextBatch, TextOutput
-from uniserve_worker.models.stub import StubModel, _next_token
 from uniserve_worker.protocol.batch import (
     COMPUTATIONS,
     ArRequestParams,
@@ -1102,7 +1102,7 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
 @pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
 def test_non_power_of_two_context_capacity_accepts_prefill_and_decode(device: str) -> None:
     model = StubModel()
-    model.text_max_tokens = 20
+    model.text_backbone.max_tokens = 20
     worker = execution_worker(model, block_size=4, device=device)
     admission = ar_params(1, block_ids=(0, 1, 2, 3, 4))
     predecessor = root_parent(admission)

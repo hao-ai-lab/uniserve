@@ -4,9 +4,9 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
+from uniserve.distributed.process_groups import initialize_process_groups
+from uniserve.tensors import BufferConfig
 from uniserve_worker.bootstrap.capacity import tensor_slot_capacity
-from uniserve_worker.bootstrap.distributed import initialize_process_groups
-from uniserve_worker.runtime.tensor_buffers import TensorSchema
 
 pytestmark = pytest.mark.integration
 
@@ -20,7 +20,7 @@ def _agree_capacity(rank, rendezvous):
         backend="gloo",
         init_method=rendezvous,
     ) as environment:
-        schema = {} if rank == 0 else {"state": TensorSchema((4,), torch.float32)}
+        schema = {} if rank == 0 else {"state": BufferConfig((4,), torch.float32)}
         # The stateless owner fits three 100-byte product/arena reservations;
         # the stateful owner fits four complete 112-byte reservations.
         capacity = tensor_slot_capacity(

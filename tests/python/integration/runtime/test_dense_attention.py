@@ -4,9 +4,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve_worker.backends.attention import resolve_attention_selection
-from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
-from uniserve_worker.nn.attention import RadixAttention
+from uniserve.attention import resolve_attention_selection
+from uniserve.attention.tuning import FlashInferTuningConfig
+from uniserve.nn.attention import RadixAttention
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

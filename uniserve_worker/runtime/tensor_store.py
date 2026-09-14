@@ -11,10 +11,11 @@ from typing import Final, cast
 
 import torch
 
+from uniserve.runtime.device import canonical_device
+from uniserve.tensors import ImageRange, TensorRegion
 from uniserve_worker.protocol.batch import ComputationId
 
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
-from ..modeling.tensors import ImageRange
 from ..protocol.batch import (
     BufferAllocation,
     BufferId,
@@ -26,10 +27,9 @@ from ..protocol.batch import (
     WorkerEndpoint,
 )
 from ..transfer.exports import ExportLocations, release_exports
-from ..transfer.layout import TensorRegion, fetch_tensor
+from ..transfer.layout import fetch_tensor
 from ..transfer.tickets import TransferTicket, Transport
 from .buffer_pool import BufferBinding, BufferPool
-from .device import canonical_device
 from .device_events import EventPool
 
 _MAX_GENERATION: Final[int] = (1 << 32) - 1

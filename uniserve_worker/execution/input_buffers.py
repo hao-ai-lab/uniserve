@@ -7,30 +7,26 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from uniserve_worker.modeling.tensors import (
-    AttentionMetadata,
-    AttentionMode,
-    FlowPatches,
-    TokenSelection,
-    packed_tensor_views,
-)
+from uniserve.attention.metadata import AttentionMetadata, AttentionMode
+from uniserve.model.tensors import FlowPatches, TokenSelection, packed_tensor_views
+from uniserve.runtime.device import fill_cpu_bools, fill_cpu_ints
+from uniserve.runtime.tensor_buffers import TensorBuffers
+from uniserve.tensors import BufferConfig
 from uniserve_worker.ops.staging import gather_request_decode_inputs
 from uniserve_worker.protocol.batch import ForwardMode, PipelineStage
-from uniserve_worker.runtime.device import fill_cpu_bools, fill_cpu_ints
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
-from ..runtime.tensor_buffers import TensorBuffers, TensorSchema
 from .batch import InputBatch
 from .rows import ForwardRow
 
 if TYPE_CHECKING:
     from ..runtime.block_tables import BlockTables
+    from ..runtime.cache_manager import CacheManager
     from ..runtime.decode_state import DecodeState
-    from ..runtime.kv_cache import KVCache
 
 
 @dataclass(frozen=True, slots=True)
-class InputGeometry:
+class InputBufferConfig:
     """Fixed row, token and embedding bounds shared by sizing and allocation."""
 
     max_rows: int
@@ -47,37 +43,35 @@ class InputGeometry:
         if not 1 <= self.max_text_tokens <= self.max_tokens:
             raise ValueError("input-buffer text-token capacity is invalid")
 
-    def tensor_schema(self) -> dict[str, TensorSchema]:
+    def buffers(self) -> dict[str, BufferConfig]:
         """Describe every resident device field, excluding pinned CPU copy sources."""
 
         rows, tokens, text = self.max_rows, self.max_tokens, self.max_text_tokens
         schema = {
-            "input_ids": TensorSchema((text,), torch.int64, fill=1),
-            "positions": TensorSchema((3, tokens), torch.int64, fill=0),
-            "embedding_mask": TensorSchema((text,), torch.bool, fill=0),
-            "request_pool_indices": TensorSchema((rows,), torch.int64, fill=0),
-            "decode_force_finish": TensorSchema((rows,), torch.bool, fill=0),
-            "block_tables": TensorSchema((rows, self.max_blocks_per_row), torch.int32, fill=0),
-            "cache_lengths": TensorSchema((rows,), torch.int32, fill=0),
-            "kv_lengths": TensorSchema((rows,), torch.int32, fill=1),
-            "query_lengths": TensorSchema((rows,), torch.int32, fill=1),
-            "cumulative_query_lengths": TensorSchema((rows + 1,), torch.int32, fill=0),
-            "cumulative_kv_lengths": TensorSchema((rows + 1,), torch.int32, fill=0),
-            "output_indices": TensorSchema((rows,), torch.int64, fill=0),
-            "decode_page_ids": TensorSchema((tokens,), torch.int64, fill=0),
-            "decode_page_offsets": TensorSchema((tokens,), torch.int64, fill=0),
-            "attention_indexes": TensorSchema((3, tokens), torch.int64, fill=0),
-            "visible_end": TensorSchema((rows, tokens), torch.int64, fill=0),
-            "seqused_k": TensorSchema((rows,), torch.int32, fill=0),
-            "write_page_ids": TensorSchema((tokens,), torch.int64, fill=0),
-            "write_page_offsets": TensorSchema((tokens,), torch.int64, fill=0),
-            "write_token_indices": TensorSchema((tokens,), torch.int64, fill=0),
-            "flow_timesteps": TensorSchema((rows,), torch.float32, fill=0),
+            "input_ids": BufferConfig((text,), torch.int64),
+            "positions": BufferConfig((3, tokens), torch.int64),
+            "embedding_mask": BufferConfig((text,), torch.bool),
+            "request_pool_indices": BufferConfig((rows,), torch.int64),
+            "decode_force_finish": BufferConfig((rows,), torch.bool),
+            "block_tables": BufferConfig((rows, self.max_blocks_per_row), torch.int32),
+            "cache_lengths": BufferConfig((rows,), torch.int32),
+            "kv_lengths": BufferConfig((rows,), torch.int32),
+            "query_lengths": BufferConfig((rows,), torch.int32),
+            "cumulative_query_lengths": BufferConfig((rows + 1,), torch.int32),
+            "cumulative_kv_lengths": BufferConfig((rows + 1,), torch.int32),
+            "output_indices": BufferConfig((rows,), torch.int64),
+            "decode_page_ids": BufferConfig((tokens,), torch.int64),
+            "decode_page_offsets": BufferConfig((tokens,), torch.int64),
+            "attention_indexes": BufferConfig((3, tokens), torch.int64),
+            "visible_end": BufferConfig((rows, tokens), torch.int64),
+            "seqused_k": BufferConfig((rows,), torch.int32),
+            "write_page_ids": BufferConfig((tokens,), torch.int64),
+            "write_page_offsets": BufferConfig((tokens,), torch.int64),
+            "write_token_indices": BufferConfig((tokens,), torch.int64),
+            "flow_timesteps": BufferConfig((rows,), torch.float32),
         }
         if self.hidden_size:
-            schema["input_embeddings"] = TensorSchema(
-                (text, self.hidden_size), torch.bfloat16, fill=0
-            )
+            schema["input_embeddings"] = BufferConfig((text, self.hidden_size), torch.bfloat16)
         return schema
 
 
@@ -87,19 +81,22 @@ class InputBuffers:
     def __init__(
         self,
         *,
-        geometry: InputGeometry,
+        config: InputBufferConfig,
         device: torch.device | str,
         max_inflight: int = 1,
     ) -> None:
         """Allocate fixed-address row, token, attention, and host-staging buffers."""
 
-        self.max_rows = geometry.max_rows
-        self.max_tokens = geometry.max_tokens
-        self.max_text_tokens = geometry.max_text_tokens
-        self.max_blocks_per_row = geometry.max_blocks_per_row
-        self.hidden_size = geometry.hidden_size
+        self.max_rows = config.max_rows
+        self.max_tokens = config.max_tokens
+        self.max_text_tokens = config.max_text_tokens
+        self.max_blocks_per_row = config.max_blocks_per_row
+        self.hidden_size = config.hidden_size
         self.device = torch.device(device)
-        tensors = TensorBuffers.allocate(geometry.tensor_schema(), self.device).capacity
+        fields = config.buffers()
+        fill = dict.fromkeys(fields, 0)
+        fill.update(input_ids=1, kv_lengths=1, query_lengths=1)
+        tensors = TensorBuffers.allocate(fields, self.device, fill=fill).capacity
         self.input_ids = tensors["input_ids"]
         self.positions = tensors["positions"]
         self.embedding_mask = tensors["embedding_mask"]
@@ -141,7 +138,7 @@ class InputBuffers:
         *,
         forward_mode: ForwardMode | PipelineStage,
         attention: AttentionMetadata | None = None,
-        cache: KVCache | None = None,
+        cache: CacheManager | None = None,
         tables: BlockTables | None = None,
         states: DecodeState | None = None,
         packed: bool = False,
@@ -153,7 +150,9 @@ class InputBuffers:
         pages. Serving derives it from the actual cache and request tables.
         """
 
-        from .attention import cache_pages, columns, dense_columns
+        from uniserve.attention.inputs import dense_columns
+
+        from .attention import cache_pages, columns
 
         tasks = rows
         if any(
@@ -445,7 +444,7 @@ class InputBuffers:
         tasks: tuple[ForwardRow, ...],
         *,
         forward_mode: ForwardMode | PipelineStage,
-        cache: KVCache,
+        cache: CacheManager,
         tables: BlockTables,
         states: DecodeState,
         table_width: int,
@@ -507,11 +506,11 @@ class InputBuffers:
             decode_page_offsets=self.decode_page_offsets,
             rows=row_count,
             group_id=int(group_id),
-            page_size=int(cache.block_size),
+            page_size=int(cache.cache.page_size),
         )
         output_locations = self.write_page_ids[:row_count]
         output_locations.copy_(self.decode_page_ids[:row_count])
-        output_locations.mul_(int(cache.block_size))
+        output_locations.mul_(int(cache.cache.page_size))
         output_locations.add_(self.decode_page_offsets[:row_count])
 
         # Cache write locations are flattened page-and-offset coordinates; the
@@ -525,13 +524,12 @@ class InputBuffers:
                 has_cache_writes=True,
                 block_table=self.block_tables[:row_count, :width],
                 seq_lens=self.kv_lengths[:row_count],
-                max_seqlen_k=width * int(cache.block_size),
+                max_seqlen_k=width * int(cache.cache.page_size),
                 causal=bool(len(set(causal_rows)) == 1 and causal_rows[0]),
                 causal_rows_cpu=causal_rows,
                 prefix_lens_cpu=prefix_lens,
                 query_lens_cpu=(1,) * row_count,
                 seq_lens_cpu=tuple(value + 1 for value in prefix_lens),
-                group_id=int(group_id),
             ),
             forward_mode=forward_mode,
             binding=int(binding),

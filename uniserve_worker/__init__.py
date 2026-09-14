@@ -1,1 +1,1 @@
-"""GPU worker execution, model, and resource-management package."""
+"""Request execution, serving configuration and worker resource ownership."""

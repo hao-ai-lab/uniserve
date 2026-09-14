@@ -5,12 +5,10 @@ from typing import Literal
 import torch
 from torch import nn
 
-from uniserve_worker.modeling.batch import DiffusionBatch, TensorOutput
-from uniserve_worker.modeling.diffusion import DiffusionMixin
-from uniserve_worker.modeling.geometry import MediaShape
-from uniserve_worker.modeling.tensors import TensorViews
-from uniserve_worker.nn.diffusion.schedule import ScheduleDirection, ScheduleShiftDomain
-from uniserve_worker.nn.diffusion.spec import DiffusionSpec, ModalitySpec, ScheduleRule
+from uniserve.model.batch import DiffusionBatch, TensorOutput
+from uniserve.model.diffusion import DiffusionMixin
+from uniserve.model.tensors import TensorViews
+from uniserve.nn.diffusion.integrator import CleanSampleEulerSolver, EulerSolver
 
 
 class LinearDenoiser(DiffusionMixin, nn.Module):
@@ -24,36 +22,10 @@ class LinearDenoiser(DiffusionMixin, nn.Module):
     ) -> None:
         super().__init__()
         self.modalities = modalities
-        self.solver = solver
+        self.solver = CleanSampleEulerSolver() if solver == "clean_sample_euler" else EulerSolver()
         self.projection = nn.Linear(1, 1, bias=False)
         with torch.no_grad():
             self.projection.weight.fill_(0.25)
-
-    def diffusion_spec(self, shape: MediaShape, steps: int) -> DiffusionSpec:
-        return DiffusionSpec(
-            tuple(
-                ModalitySpec(
-                    name,
-                    (shape.width,),
-                    (shape.width,),
-                    ScheduleRule(
-                        ScheduleDirection.ASCENDING,
-                        ScheduleShiftDomain.SIGMA,
-                        1.0,
-                        timestep="one_minus_sigma",
-                    ),
-                    "velocity",
-                    torch.float32,
-                )
-                for name in self.modalities
-            ),
-            steps,
-            None,
-            1,
-            self.solver,
-            "input",
-            "identity",
-        )
 
     def forward_diffusion(
         self,

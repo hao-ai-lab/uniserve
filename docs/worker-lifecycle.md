@@ -22,7 +22,7 @@ Context managers enter from left to right and exit in reverse order. The endpoin
 
 ## Construction and ownership
 
-`Worker.from_config(config)` loads the model and constructs execution resources, physical storage, lanes, and data-plane transports. It performs no numerical warmup or graph capture. Construction owns rollback until it successfully returns a Worker; failed construction releases acquired resources while preserving the original exception.
+`Worker.from_config(config)` resolves the checkpoint through `uniserve_models`, loads its typed numerical composition through `uniserve.loading`, and constructs execution resources, physical storage, lanes and data-plane transports. Tokenizer, image processing and flow prompt assets remain with the worker's input consumers. It performs no numerical warmup or graph capture. Construction owns rollback until it successfully returns a Worker; failed construction releases acquired resources while preserving the original exception.
 
 `Worker(model, ...)` accepts an already-loaded model and constructs the same execution resources without requiring IPC. ModelRunner resolves attention selection and binds persistent model inputs and workspaces before Worker measures the remaining memory grant. Request capacity is then resolved against that grant and shared by Worker and ModelRunner; sizing before those allocations would overestimate available storage.
 

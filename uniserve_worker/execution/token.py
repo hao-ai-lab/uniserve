@@ -7,11 +7,13 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from uniserve.model.diffusion import DiffusionMixin
+from uniserve.model.tensors import TokenSelection, packed_tensor_views
+from uniserve.nn.rng import DRAW_LAYOUT_TARGET, sampling_key, sampling_uniform
 from uniserve_worker.execution.output import (
     PendingOutput,
 )
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.modeling.tensors import TokenSelection, packed_tensor_views
 from uniserve_worker.protocol.batch import (
     DrawLayout,
     FinishFlags,
@@ -26,9 +28,7 @@ from uniserve_worker.runtime.tensor_store import (
     TensorRecord,
 )
 
-from ..nn.rng import DRAW_LAYOUT_TARGET, sampling_key, sampling_uniform
-from . import encode
-from . import operations as operation_geometry
+from . import encode, operations
 from . import sample as sampling
 from .batch_state import BatchState
 from .output import capture_logprobs
@@ -39,10 +39,9 @@ from .sample import broadcast_selection
 from .sampling import SamplerOutput, SamplerRow, SamplingMetadata, sample_columns
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizerBase
+    from uniserve.distributed.mesh import Communicator
+    from uniserve.model.model import Model
 
-    from ..modeling.model import Model
-    from ..nn.mesh import Communicator
     from ..runtime.block_tables import BlockTables
     from ..runtime.decode_state import DecodeState
     from ..runtime.tensor_store import TensorStore
@@ -58,7 +57,6 @@ def prepare_forward(
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
     decode_state: DecodeState | None,
-    tokenizer: PreTrainedTokenizerBase | None,
 ) -> ForwardRow:
     """Pack autoregressive extension, decode, or verification work into model-forward rows."""
 
@@ -76,10 +74,9 @@ def prepare_forward(
             tensor_store=tensor_store,
             request_tables=request_tables,
             model_runner=model_runner,
-            tokenizer=tokenizer,
             state=state,
         )
-    start = int(operation_geometry.require_progress(request).logical_position)
+    start = int(operations.require_progress(request).logical_position)
     tokens: tuple[int | torch.Tensor, ...]
     current: int | torch.Tensor
     if mode is ForwardMode.PREFILL:
@@ -159,7 +156,7 @@ def prepare_sampling(
     """Convert token-model outputs into sampling work, prompt log probabilities, or direct outcomes."""
 
     request = state.pending_output(completion_group, operation.request_key.request_id)
-    start = int(operation_geometry.require_progress(request).logical_position)
+    start = int(operations.require_progress(request).logical_position)
     mode = operation.kind
     if operation.vision_input is not None or operation.latent_feature_input is not None:
         return _prepare_visual_sampling(
@@ -251,17 +248,17 @@ def publish_sample(
     """Publish sampled tokens, speculative selections, and request runtime transitions."""
 
     request = state.pending_output(completion_group, operation.request_key.request_id)
-    start = int(operation_geometry.require_progress(request).logical_position)
+    start = int(operations.require_progress(request).logical_position)
     mode = operation.kind
     if sample_work is None and mode is not ForwardMode.DECODE:
         raise RuntimeError("only captured decode may omit sampling inputs")
     penalty_base = None if sample_work is None else sample_work.penalty_base
     if operation.vision_input is not None or operation.latent_feature_input is not None:
         request.projected_progress = replace(
-            operation_geometry.require_progress(request),
-            rng_counter=operation_geometry.require_progress(request).rng_counter + (1),
+            operations.require_progress(request),
+            rng_counter=operations.require_progress(request).rng_counter + (1),
         )
-        flow = execution_model.generation
+        flow = execution_model.generation if isinstance(execution_model, DiffusionMixin) else None
         logical_position = start + (
             max(1, 1 if flow is None else int(flow.rope_advance))
             if operation.completion_output is not None
@@ -272,7 +269,7 @@ def publish_sample(
             sampled,
             penalty_base=penalty_base,
             logical_position=logical_position,
-            sampling_position=operation_geometry.require_progress(request).rng_counter,
+            sampling_position=operations.require_progress(request).rng_counter,
             decode_state=decode_state,
         )
         return _finish_visual(
@@ -296,7 +293,7 @@ def publish_sample(
                     state=state,
                 )
         count = task.query_tokens if mode is ForwardMode.PREFILL else 1
-        progress = operation_geometry.require_progress(request)
+        progress = operations.require_progress(request)
         logical_position = start + count
         rng_counter = progress.rng_counter + 1
         publish_runtime_sample(
@@ -336,14 +333,14 @@ def publish_sample(
             penalty_base=penalty_base,
             logical_position=device_selected + start,
             sampling_position=(
-                device_selected + int(operation_geometry.require_progress(request).rng_counter)
+                device_selected + int(operations.require_progress(request).rng_counter)
             ),
             decode_state=decode_state,
         )
         request.draft_tokens = draft
         request.terminal_prefix = sample_work.terminal_draft_prefix
         request.base_logical_position = start
-        request.base_rng_counter = operation_geometry.require_progress(request).rng_counter
+        request.base_rng_counter = operations.require_progress(request).rng_counter
         request.base_kv_visible = initialized - task.query_tokens
         request.initialized_kv = initialized
         return token_outcome(
@@ -360,7 +357,6 @@ def _prepare_visual(
     tensor_store: TensorStore,
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
-    tokenizer: PreTrainedTokenizerBase | None,
 ) -> ForwardRow:
     """Resolve image features and interleave them with prompt tokens for model execution."""
 
@@ -378,7 +374,7 @@ def _prepare_visual(
     metadata = read.metadata
     if not isinstance(metadata, FeatureMetadata):
         raise invalid_descriptor("visual input requires encoder feature metadata")
-    position = int(operation_geometry.require_progress(request).logical_position)
+    position = int(operations.require_progress(request).logical_position)
     close_image = operation.completion_output is not None
     sample_token = operation.token_output is not None
     if operation.vision_input is not None:
@@ -393,7 +389,6 @@ def _prepare_visual(
             logits=sample_token,
             request_tables=request_tables,
             model_runner=model_runner,
-            tokenizer=tokenizer,
             state=state,
         )
     else:
@@ -435,14 +430,16 @@ def _prepare_visual_sampling(
     )
     if operation.token_output is not None:
         assert value is not None
-        generation = execution_model.generation
+        generation = (
+            execution_model.generation if isinstance(execution_model, DiffusionMixin) else None
+        )
         sample = build_sampling_metadata(
             operation,
             value[-1],
             request,
             completion_group,
             positions=(
-                int(operation_geometry.require_progress(request).logical_position)
+                int(operations.require_progress(request).logical_position)
                 + max(1, 1 if generation is None else int(generation.rope_advance)),
             ),
             request_pool_index=request_pool_index,
@@ -470,16 +467,16 @@ def _finish_visual(
     """Finalize visual feature publication and advance the encode operation state."""
 
     request = state.pending_output(completion_group, operation.request_key.request_id)
-    position = int(operation_geometry.require_progress(request).logical_position)
+    position = int(operations.require_progress(request).logical_position)
     if operation.completion_output is not None:
-        flow = execution_model.generation
+        flow = execution_model.generation if isinstance(execution_model, DiffusionMixin) else None
         request.projected_progress = replace(
-            operation_geometry.require_progress(request),
+            operations.require_progress(request),
             logical_position=position + max(1, 1 if flow is None else int(flow.rope_advance)),
         )
     elif operation.vision_input is not None:
         request.projected_progress = replace(
-            operation_geometry.require_progress(request), logical_position=position + 1
+            operations.require_progress(request), logical_position=position + 1
         )
     return encode.state_outcome(
         operation, completion_group, request_tables=request_tables, state=state
@@ -596,7 +593,7 @@ def prompt_logprob_details(
         score_logits = logits[:-1]
         targets = tokens[1:]
     else:
-        if not operation_geometry.require_progress(request).prompt_logits_ready:
+        if not operations.require_progress(request).prompt_logits_ready:
             raise invalid_descriptor("continued prompt scoring has no preceding logits")
         pending = request.runtime_prompt_logits
         if pending is None:
@@ -609,7 +606,7 @@ def prompt_logprob_details(
         targets = tokens
     request.runtime_prompt_logits = logits[-1].detach()
     request.projected_progress = replace(
-        operation_geometry.require_progress(request), prompt_logits_ready=True
+        operations.require_progress(request), prompt_logits_ready=True
     )
     if int(targets.numel()) == 0:
         return ()
@@ -651,7 +648,7 @@ def token_outcome(
 
     if request is None:
         request = state.pending_output(completion_group, operation.request_key.request_id)
-    cache = operation_geometry.cache_coordinates(request, tables=request_tables)
+    cache = operations.cache_coordinates(request, tables=request_tables)
     initialized = cache[2]
     if request.draft_tokens is None:
         published_length = request.runtime_cache_length
@@ -664,7 +661,7 @@ def token_outcome(
     else:
         visible_value = int(request.base_kv_visible)
         initialized = request.initialized_kv
-    progress = operation_geometry.require_progress(request)
+    progress = operations.require_progress(request)
     # Publish one complete projection. Device-selected verifier acceptance stays
     # unresolved until host completion, with the initialized KV extent retained.
     request.projected_progress = replace(
@@ -682,7 +679,7 @@ def token_outcome(
     )
     request.status = OpStatus.OK
     request.finish_flags = FinishFlags()
-    request.product_generations = operation_geometry.output_generations(operation)
+    request.product_generations = operations.output_generations(operation)
     request.committed_tokens = committed_tokens
     return request
 
@@ -731,7 +728,7 @@ def token_task(
         )
     predicate_value = request.predicate
     sampling_state = operation.sampling_state or SamplingState()
-    cache = operation_geometry.cache_coordinates(request, tables=request_tables)
+    cache = operations.cache_coordinates(request, tables=request_tables)
     visible = cache[2] if seq_len is None else int(seq_len)
     if visible != cache[2]:
         raise invalid_descriptor("token row visibility disagrees with operation metadata")

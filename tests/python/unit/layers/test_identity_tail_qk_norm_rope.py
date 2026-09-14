@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker import ops
+from uniserve import ops
 
 DIM = 128
 ROPE_DIM = 64

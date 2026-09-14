@@ -7,18 +7,15 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from uniserve_worker.bootstrap.distributed import (
-    initialize_model_parallel,
-    initialize_process_groups,
-)
+from uniserve.distributed.parallel import ParallelConfig
+from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
+from uniserve.loading.handles import TensorWeightHandle
+from uniserve.loading.weight_loaders import load_parameter_weight
+from uniserve.nn.layer import LayerConfig
+from uniserve.nn.logits import greedy_vocabulary
+from uniserve.nn.vocab_parallel_embedding import ParallelLMHead
+from uniserve.runtime.cuda_graph import CudaGraph
 from uniserve_worker.execution.batch import ExecutionOutput
-from uniserve_worker.execution.cuda_graph import CudaGraph
-from uniserve_worker.loader.handles import TensorWeightHandle
-from uniserve_worker.loader.weight_loaders import load_parameter_weight
-from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.logits import greedy_vocabulary
-from uniserve_worker.nn.parallel import ParallelConfig
-from uniserve_worker.nn.vocab_parallel_embedding import ParallelLMHead
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

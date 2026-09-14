@@ -15,12 +15,8 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as vision
 
+from uniserve_models.processing import ImageProcessor, PatchTransform, StrideResize
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.modeling.inputs import (
-    ImageProcessor,
-    PatchTransform,
-    StrideResize,
-)
 from uniserve_worker.protocol.batch import PipelineStage
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)

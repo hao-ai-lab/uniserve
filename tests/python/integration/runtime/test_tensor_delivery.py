@@ -10,6 +10,7 @@ import threading
 import pytest
 import torch
 
+from uniserve.tensors import TensorRegion
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import (
     BufferAllocation,
@@ -26,7 +27,7 @@ from uniserve_worker.protocol.batch import (
 from uniserve_worker.runtime.buffer_pool import BufferPool
 from uniserve_worker.runtime.device_events import EventPool
 from uniserve_worker.runtime.tensor_store import FeatureMetadata, TensorStore
-from uniserve_worker.transfer.layout import TensorRegion, fetch_tensor
+from uniserve_worker.transfer.layout import fetch_tensor
 from uniserve_worker.transfer.tickets import make_transport, make_transports
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]

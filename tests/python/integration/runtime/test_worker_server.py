@@ -429,7 +429,7 @@ def test_scope_retains_model_after_run_and_releases_it_on_exit() -> None:
     import gc
     import weakref
 
-    from uniserve_worker.models.stub import StubModel
+    from uniserve_models.stub import StubModel
 
     model = StubModel()
     reference = weakref.ref(model)

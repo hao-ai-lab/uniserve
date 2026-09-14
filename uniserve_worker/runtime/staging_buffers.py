@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .device import canonical_device
+from uniserve.runtime.device import canonical_device
 
 
 class StagingBuffers:

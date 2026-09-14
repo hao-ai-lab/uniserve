@@ -23,7 +23,7 @@ from tests.python.fixtures.depth_one import (
     token_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.models.stub import STUB_IMG_START_TOKEN_ID, _next_token
+from uniserve_models.stub import STUB_IMG_START_TOKEN_ID, _next_token
 from uniserve_worker.protocol.batch import (
     ArRequestParams,
     BatchOutput,

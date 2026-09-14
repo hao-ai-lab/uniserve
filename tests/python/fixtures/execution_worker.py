@@ -8,14 +8,14 @@ from dataclasses import replace
 import torch
 
 from tests.python.fixtures.worker_config import stub_worker_config
-from uniserve_worker.backends.attention import FlashInferTuningConfig, resolve_attention_selection
-from uniserve_worker.config import WorkerConfig
+from uniserve.attention import FlashInferTuningConfig, resolve_attention_selection
+from uniserve.distributed.mesh import Communicator
+from uniserve.model.image_diffusion import LatentLayout
+from uniserve.model.model import Model
+from uniserve_models.processing import stub_processor
+from uniserve_models.stub import StubModel
+from uniserve_worker.config import ComponentConfig, WorkerConfig
 from uniserve_worker.execution.model_entry import ModelEntry
-from uniserve_worker.modeling.image_diffusion import LatentLayout
-from uniserve_worker.modeling.model import Model
-from uniserve_worker.models.stub import StubModel
-from uniserve_worker.nn.mesh import Communicator
-from uniserve_worker.nn.parallel import ComponentConfig
 from uniserve_worker.worker import Worker
 
 
@@ -68,6 +68,7 @@ def execution_worker(
     )
     worker = Worker(
         ready,
+        image_processor=stub_processor() if isinstance(ready, StubModel) else None,
         bindings=bindings,
         sampling_group=Communicator(device=torch.device(device)),
         worker_config=worker_config,
@@ -89,9 +90,9 @@ def execution_worker(
 
     flow = worker.model.generation
     configure_physical_pool(
-        cache_pages=worker.kv_cache.num_pages,
+        cache_pages=worker.kv_cache.cache.num_pages,
         request_pool_size=worker.info.request_slots,
-        block_size=worker.kv_cache.block_size,
+        block_size=worker.kv_cache.cache.page_size,
         commit_marker_tokens=(
             int(flow.marker_tokens)
             if flow is not None and flow.latent_layout is LatentLayout.PATCH_TOKENS

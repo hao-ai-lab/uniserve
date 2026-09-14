@@ -10,16 +10,12 @@ from typing import cast
 
 import torch
 
-from uniserve_worker.backends.attention.selection import AttentionSelection
+from uniserve.attention.metadata import AttentionMetadata, AttentionMode
+from uniserve.attention.selection import AttentionSelection
+from uniserve.math import bucketed_length
+from uniserve.model.tensors import TokenSelection, packed_tensor_views
+from uniserve.runtime.cuda_graph import CudaGraph, GraphExecutionError
 from uniserve_worker.execution.batch import ExecutionOutput, InputBatch
-from uniserve_worker.execution.cuda_graph import GraphExecutionError
-from uniserve_worker.foundation.math import bucketed_length
-from uniserve_worker.modeling.tensors import (
-    AttentionMetadata,
-    AttentionMode,
-    TokenSelection,
-    packed_tensor_views,
-)
 from uniserve_worker.protocol.batch import ForwardMode, PipelineStage
 
 from .model_entry import tensor_signature
@@ -28,6 +24,16 @@ from .sampling import SamplerOutput
 logger = logging.getLogger(__name__)
 TOKEN_CONTINUATION_BIT = 1 << 31
 _GRAPH_BINDINGS = itertools.count(1)
+
+
+@dataclass(frozen=True, slots=True)
+class BatchGraph:
+    """A worker batch's captured inputs and the numerical executable using them."""
+
+    graph: CudaGraph[tuple[ExecutionOutput, SamplerOutput | None]]
+    inputs: InputBatch
+    input_leaves: tuple[torch.Tensor, ...]
+    attention_leaves: tuple[torch.Tensor, ...]
 
 
 class _GraphMiss(RuntimeError):
@@ -104,7 +110,7 @@ def select_prefill_captures(
     return tuple(buckets)
 
 
-def _decode_geometry(
+def _decode_shape(
     batch: InputBatch,
     batch_sizes: tuple[int, ...],
     block_size: int,
@@ -135,7 +141,7 @@ def _decode_geometry(
     return int(bucket), max(live_width, int(context_blocks), reserved_width)
 
 
-def _prefill_geometry(
+def _prefill_shape(
     batch: InputBatch,
     token_sizes: tuple[int, ...],
     block_size: int,
@@ -729,7 +735,7 @@ def _greedy_decode_values(
     if logits is None:
         raise _GraphMiss("decode logits are not one contiguous graph output")
     logits = logits.reshape(batch.row_count, -1)
-    from ..nn.logits import greedy_vocabulary
+    from uniserve.nn.logits import greedy_vocabulary
 
     partitions = output.vocabularies
     if any(partition != partitions[0] for partition in partitions):

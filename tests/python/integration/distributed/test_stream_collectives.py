@@ -6,17 +6,14 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve_worker.bootstrap.distributed import (
-    initialize_model_parallel,
-    initialize_process_groups,
-)
+from uniserve.distributed.collectives import allocate_stream_collectives
+from uniserve.distributed.parallel import ParallelConfig
+from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
+from uniserve.nn.collective import stream_collective_scope
+from uniserve.runtime.cuda_graph import CudaGraph
 from uniserve_worker.config import LaneConfig
-from uniserve_worker.execution.cuda_graph import CudaGraph
 from uniserve_worker.execution.cuda_stream import create_partitioned_streams
-from uniserve_worker.nn.collective import stream_collective_scope
-from uniserve_worker.nn.parallel import ParallelConfig
 from uniserve_worker.protocol.batch import COMPUTATIONS, ForwardMode
-from uniserve_worker.runtime.collectives import allocate_stream_collectives
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

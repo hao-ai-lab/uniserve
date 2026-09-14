@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "uniserve"
 version = "0.1.0"
-description = "UniServe Python worker runtime with internal BAGEL and SenseNova backends. The Rust host/server is built with cargo."
+description = "UniServe computation library, numerical models, and Python worker runtime."
 readme = "README.md"
 requires-python = ">=3.11"
 # Keep the CUDA-13 PyTorch and torchvision release lines aligned. The locked
@@ -86,7 +86,7 @@ uniserve-eval = "uniserve_eval.cli:main"
 # Optional UniServe kernels are packaged independently
 # (`uniserve_kernel/pyproject.toml`) so the root worker distribution cannot mask
 # a missing kernel install.
-include = ["uniserve_worker*", "uniserve_eval*"]
+include = ["uniserve", "uniserve.*", "uniserve_models*", "uniserve_worker*", "uniserve_eval*"]
 
 [tool.setuptools.package-data]
 uniserve_eval = ["profiles.toml"]
@@ -131,11 +131,11 @@ select = ["E", "F", "I"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.11"
+# Use the invoking Python version so installed dependency stubs match CI's runtime.
 # Source of truth for the type-check scope. Must match the explicit paths
 # passed by CI (.github/workflows/ci.yml) and the justfile `lint` target
-# (`mypy uniserve_worker uniserve_eval`) so bare/editor invocations agree with CI.
-files = ["uniserve_worker", "uniserve_eval"]
+# (`mypy uniserve uniserve_models uniserve_worker uniserve_eval`) so bare/editor invocations agree with CI.
+files = ["uniserve", "uniserve_models", "uniserve_worker", "uniserve_eval"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -147,13 +147,13 @@ ignore_missing_imports = true
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Keep aligned with [tool.mypy].files and the CI/justfile type-check scope.
-include = ["uniserve_worker", "uniserve_eval"]
+include = ["uniserve", "uniserve_models", "uniserve_worker", "uniserve_eval"]
 exclude = ["refs", "target", ".venv"]
 reportMissingImports = "warning"
 
 [tool.coverage.run]
 branch = true
-source = ["uniserve_worker", "uniserve_eval"]
+source = ["uniserve", "uniserve_models", "uniserve_worker", "uniserve_eval"]
 
 [tool.coverage.report]
 show_missing = true

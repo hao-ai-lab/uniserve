@@ -6,13 +6,10 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve_worker.bootstrap.distributed import (
-    initialize_model_parallel,
-    initialize_process_groups,
-)
-from uniserve_worker.nn.collective import collective_scope
-from uniserve_worker.nn.parallel import ParallelConfig
-from uniserve_worker.runtime.collectives import allocate_peer_reductions
+from uniserve.distributed.collectives import allocate_peer_reductions
+from uniserve.distributed.parallel import ParallelConfig
+from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
+from uniserve.nn.collective import collective_scope
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

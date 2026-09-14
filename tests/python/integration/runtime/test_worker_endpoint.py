@@ -128,18 +128,24 @@ def _stub_config(service, *, rank=0, world_size=1, init_method=None):
     return parse_worker_args(args)
 
 
-@pytest.mark.parametrize("loading_fails", (False, True))
-def test_worker_preserves_a_caller_owned_process_group(tmp_path, loading_fails):
+@pytest.mark.parametrize("failure", (None, "model_loading", "process_world"))
+def test_worker_preserves_a_caller_owned_process_group(tmp_path, failure):
     import torch
     import torch.distributed as dist
 
+    from uniserve_worker.foundation.errors import WorkerError, WorkerErrorCode
     from uniserve_worker.worker import Worker
 
     dist.init_process_group("gloo", init_method=f"file://{tmp_path}/world", rank=0, world_size=1)
     try:
-        if loading_fails:
+        if failure == "model_loading":
             with pytest.raises(FileNotFoundError, match="config.json"):
                 Worker.from_config(_model_config("borrowed-world", tmp_path))
+        elif failure == "process_world":
+            with pytest.raises(WorkerError, match="rank/world_size") as raised:
+                Worker.from_config(_stub_config("borrowed-world", world_size=2))
+            assert raised.value.code is WorkerErrorCode.UNSUPPORTED_SETUP
+            assert not raised.value.fatal
         else:
             with Worker.from_config(_stub_config("borrowed-world")):
                 pass

@@ -156,15 +156,15 @@ impl Scheduler {
     }
 
     /// Resolve storage from loaded numerical result contracts before admission.
-    fn media_tensor_specs(
+    fn media_outputs(
         &self,
-        geometry: uniserve_core::DiffusionSamplingParams,
+        sampling: uniserve_core::DiffusionSamplingParams,
         num_prompt_tokens: u32,
     ) -> Option<Vec<(String, u32, DType, ShapeBound)>> {
         use uniserve_worker_ipc::PipelineStage;
 
-        let mut specs = Vec::new();
-        for (role, outputs) in [
+        let mut outputs = Vec::new();
+        for (role, output_count) in [
             (PipelineStage::TextEncoding, 1),
             (PipelineStage::Denoising, 2),
             (PipelineStage::VideoDecoding, 1),
@@ -178,7 +178,7 @@ impl Scheduler {
                 .components
                 .iter()
                 .find(|component| component.name == bound)?;
-            if component.outputs.len() != outputs {
+            if component.outputs.len() != output_count {
                 return None;
             }
             for (index, output) in component.outputs.iter().enumerate() {
@@ -201,15 +201,15 @@ impl Scheduler {
                     let Some(DimBound::Device { max }) = shape.dims.first().copied() else {
                         return None;
                     };
-                    if geometry.num_decode_chunks == 0 || geometry.num_decode_chunks > max {
+                    if sampling.num_decode_chunks == 0 || sampling.num_decode_chunks > max {
                         return None;
                     }
-                    shape.dims[0] = DimBound::Static(geometry.num_decode_chunks);
+                    shape.dims[0] = DimBound::Static(sampling.num_decode_chunks);
                 }
-                specs.push((entry.clone(), index as u32, output.dtype, shape));
+                outputs.push((entry.clone(), index as u32, output.dtype, shape));
             }
         }
-        Some(specs)
+        Some(outputs)
     }
 
     /// Validates and queues one terminal media-generation request.
@@ -234,12 +234,11 @@ impl Scheduler {
             return;
         }
         if self
-            .media_tensor_specs(request.sampling, request.prompt_token_ids.len() as u32)
+            .media_outputs(request.sampling, request.prompt_token_ids.len() as u32)
             .is_none()
         {
             let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
-                message: "loaded media entries cannot represent the requested tensor geometry"
-                    .into(),
+                message: "loaded media entries cannot represent the requested output bounds".into(),
             });
             return;
         }
@@ -274,7 +273,7 @@ impl Scheduler {
                 .expect("scheduler media order names runtime state");
             let request_epoch = self.next_request_epoch;
             let request_key = RequestKey::new(self.engine_id, id, request_epoch);
-            let geometry = submission.request.sampling;
+            let sampling = submission.request.sampling;
             if self.info.pipeline_components.iter().any(|(stage, entry)| {
                 !self
                     .entry_candidates(Computation::Pipeline(*stage), entry)
@@ -289,12 +288,12 @@ impl Scheduler {
                 self.waiting_media_order.push_front(id);
                 break;
             };
-            let specs = self
-                .media_tensor_specs(geometry, submission.request.prompt_token_ids.len() as u32)
-                .expect("queued media has valid result geometry");
+            let outputs = self
+                .media_outputs(sampling, submission.request.prompt_token_ids.len() as u32)
+                .expect("queued media has valid output bounds");
             let mut tensors = HashMap::new();
             let mut reserved = true;
-            for (entry, index, dtype, shape_bound) in specs {
+            for (entry, index, dtype, shape_bound) in outputs {
                 let bytes = shape_bound
                     .max_elements()
                     .saturating_mul(dtype.element_bytes());

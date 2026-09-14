@@ -7,9 +7,10 @@ from types import MappingProxyType
 
 import torch
 
-from ..modeling.components import Call
-from ..modeling.model import Model
-from ..protocol.batch import DeviceDim, DType, ShapeBound, StaticDim, TensorSpec
+from uniserve.model.model import Model
+
+from ..execution.resources import output_layouts
+from ..protocol.batch import DeviceDim, DType, OutputInfo, ShapeBound, StaticDim
 
 _DTYPES = {
     torch.uint8: DType.U8,
@@ -24,13 +25,13 @@ _DTYPES = {
 # The media protocol names persistent products by their downstream use. The
 # numerical capabilities name modalities, independently of publication/storage.
 _PRODUCT_NAMES = {
-    Call.DIFFUSION: {"video": "video_latents", "audio": "audio_latents"},
-    Call.DECODE_VIDEO: {"video": "video_segments"},
-    Call.DECODE_AUDIO: {"audio": "audio_samples"},
+    "forward_diffusion": {"video": "video_latents", "audio": "audio_latents"},
+    "decode:video": {"video": "video_segments"},
+    "decode:audio": {"audio": "audio_samples"},
 }
 
 
-def resolve_outputs(model: Model) -> Mapping[str, tuple[TensorSpec, ...]]:
+def resolve_outputs(model: Model) -> Mapping[str, tuple[OutputInfo, ...]]:
     """Resolve complete logical result bounds before placement and allocation.
 
     Models declare maximum numerical input shapes and the resulting tensor
@@ -40,28 +41,40 @@ def resolve_outputs(model: Model) -> Mapping[str, tuple[TensorSpec, ...]]:
     Unsupported wire representations fail before any product is allocated.
     """
 
+    from uniserve_models.catalog import entry_paths
+
     result = {}
-    for entry, (call, shape) in model.output_shapes.items():
+    calls = model.component_calls(model.config)
+    for entry, path in entry_paths(type(model), model.config).items():
         outputs = []
-        for name, schema in model.tensor_specs(call, shape).outputs.items():
-            dtype = _DTYPES.get(schema.dtype)
+        try:
+            component = model.get_submodule(path)
+        except AttributeError:
+            continue
+        numerical = [
+            (call.method, name, layout)
+            for call in calls
+            if call.component == path
+            for name, layout in output_layouts(model, call.method, component).items()
+        ]
+        for call, name, layout in numerical:
+            dtype = _DTYPES.get(layout.dtype)
             if dtype is None:
                 raise ValueError(f"result {entry}.{name} has no protocol dtype")
-            if len(schema.variable_axes) > 1:
+            if len(layout.variable_axes) > 1:
                 raise ValueError(f"result {entry}.{name} exceeds the protocol's dynamic axes")
             outputs.append(
-                TensorSpec(
+                OutputInfo(
                     _PRODUCT_NAMES.get(call, {}).get(name, name),
                     dtype,
                     ShapeBound(
                         tuple(
-                            DeviceDim(extent) if axis in schema.variable_axes else StaticDim(extent)
-                            for axis, extent in enumerate(schema.shape)
+                            DeviceDim(extent) if axis in layout.variable_axes else StaticDim(extent)
+                            for axis, extent in enumerate(layout.shape)
                         )
                     ),
                 )
             )
-        if not outputs:
-            raise ValueError(f"result entry {entry!r} declares no numerical outputs")
-        result[entry] = tuple(outputs)
+        if outputs:
+            result[entry] = tuple(outputs)
     return MappingProxyType(result)

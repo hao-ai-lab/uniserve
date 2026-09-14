@@ -6,23 +6,27 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve_worker.bootstrap.distributed import initialize_entries, initialize_process_groups
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.diffusion_state import DiffusionState
-from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.execution.video import prepare_call
-from uniserve_worker.loader import LoadRequest, load_model
-from uniserve_worker.modeling.batch import DecodeBatch
-from uniserve_worker.modeling.components import Call
-from uniserve_worker.modeling.geometry import MediaShape
-from uniserve_worker.models.minimax_h3.packing import (
+from uniserve.distributed.process_groups import initialize_process_groups
+from uniserve.loading import load_model
+from uniserve.model.batch import DecodeBatch
+from uniserve.model.limits import ModelLimits
+from uniserve.model.media import VideoSize
+from uniserve.nn.layer import LayerConfig
+from uniserve.runtime.tensor_buffers import TensorBuffers
+from uniserve.runtime.tensors import bind_scratch, bind_state, prepare_constants
+from uniserve_models import resolve_model
+from uniserve_models.minimax_h3.packing import (
     audio_latent_frames,
     build_packed_layout,
     video_latent_frames,
 )
-from uniserve_worker.nn.parallel import ComponentConfig
-from uniserve_worker.runtime.tensor_buffers import TensorBuffers
-from uniserve_worker.runtime.tensors import bind_scratch, bind_state, prepare_constants
+from uniserve_worker.bootstrap.components import bind_components
+from uniserve_worker.bootstrap.distributed import initialize_entries
+from uniserve_worker.bootstrap.model_loader import loaded_worker_config
+from uniserve_worker.config import ComponentConfig, WorkerConfig
+from uniserve_worker.execution.diffusion_state import DiffusionState
+from uniserve_worker.execution.model_runner import ModelRunner
+from uniserve_worker.execution.video import prepare_call
 
 pytestmark = [
     pytest.mark.integration,
@@ -54,33 +58,52 @@ def _decode_requests(checkpoint, environment, postprocess):
     if postprocess:
         components["output"] = ComponentConfig((0,))
     bindings = initialize_entries(environment, components)
+    worker_config = WorkerConfig(device="cuda:0", model_dtype="bfloat16")
+    source = resolve_model(
+        checkpoint,
+        components=frozenset(name for name, value in bindings.items() if value.owns),
+        quantization={"mode": "quality"},
+    )
+    paths = dict(source.entry.component_paths)
+    meshes = {paths[name]: value.mesh for name, value in bindings.items() if value.mesh is not None}
+    parallel = {paths[name]: value.config.parallel_config for name, value in bindings.items()}
+    layers = source.configure_layers(
+        {
+            name: LayerConfig(
+                mesh.get_group("tp"),
+                None,
+                pipeline=mesh.get_group("pp"),
+                sequence=mesh.get_group("ulysses"),
+            )
+            for name, mesh in meshes.items()
+        }
+    )
     loaded = load_model(
-        LoadRequest(
-            model_path=checkpoint,
-            execution=WorkerConfig(device="cuda:0", model_dtype="bfloat16"),
-            bindings=bindings,
-            max_text_rows=64,
-            pipeline_depth=8,
-            max_video_seconds=39 / 24,
-            quantization_config={"mode": "quality"},
-        )
+        source.model_class,
+        source.config,
+        sources=source.weights,
+        device=environment.local_device,
+        dtype=torch.bfloat16,
+        parallel=parallel,
+        meshes=meshes,
+        layers=layers,
+        limits=ModelLimits(text_tokens=64, video_frames=39),
     )
     model = loaded.model
-    runner = ModelRunner(
-        model, loaded.worker_config, bindings=loaded.bindings, schedule=loaded.schedule
-    )
+    bind_components(model, bindings)
+    worker_config = loaded_worker_config(model, worker_config, bindings, 8)
+    schedule = None
+    runner = ModelRunner(model, worker_config, bindings=bindings, schedule=schedule)
     storage = (
-        TensorBuffers.allocate(runner.tensor_resources.state, "cuda:0")
-        if runner.tensor_resources.state
-        else None
+        TensorBuffers.allocate(runner.state_buffers, "cuda:0") if runner.state_buffers else None
     )
     try:
         runner.prepare_fixed_modules()
         assert runner.scratch is not None
         generator = torch.Generator(device="cuda:0").manual_seed(47)
         for frames in (39, 22):
-            shape = MediaShape(768, 1344, frames=frames)
-            trajectory = DiffusionState(geometry=shape)
+            shape = VideoSize(frames)
+            trajectory = DiffusionState(size=shape)
             video_frames = video_latent_frames(frames)
             native = (
                 torch.randn((1, 24, video_frames, 48, 84), device="cuda:0", generator=generator)
@@ -99,9 +122,9 @@ def _decode_requests(checkpoint, environment, postprocess):
             latents = raster.index_select(0, packed.video_raster_indices.to("cuda:0"))
             original = latents.clone()
             _, constants, scratch = prepare_call(
-                model, runner, trajectory, Call.DECODE_VIDEO, shape, storage
+                model, runner, trajectory, "decode:video", shape, storage
             )
-            for window in reversed(model.decode_windows(model.output_geometry(frames))):
+            for window in reversed(model.decode_windows(model.video_info(frames))):
                 reference = (
                     runner.run_module(
                         "video_decoder", native[:, :, window.latent_start : window.latent_stop]
@@ -128,11 +151,11 @@ def _decode_requests(checkpoint, environment, postprocess):
             audio_rows = native_audio.transpose(1, 2).reshape(-1, 32)
             reference = runner.run_module("audio_decoder", native_audio).values[0].clone()
             _, constants, scratch = prepare_call(
-                model, runner, trajectory, Call.DECODE_AUDIO, shape, storage
+                model, runner, trajectory, "decode:audio", shape, storage
             )
             result = runner.run_decoder(
                 "audio",
-                DecodeBatch((audio_rows,), (shape,)),
+                DecodeBatch((audio_rows,), (round(frames * 32000 / 24),)),
                 constants=constants,
                 scratch=scratch,
             )
@@ -143,14 +166,18 @@ def _decode_requests(checkpoint, environment, postprocess):
 
             if not postprocess:
                 continue
-            constants = prepare_constants(model, Call.POSTPROCESS_VIDEO, shape, device="cuda:0")
-            state = bind_state(model, Call.POSTPROCESS_VIDEO, shape, storage)
-            scratch = bind_scratch(model, Call.POSTPROCESS_VIDEO, shape, runner.scratch)
+            constants = prepare_constants(
+                model.video_output, VideoSize(shape.frames), device="cuda:0"
+            )
+            state = bind_state(model.video_output.state_buffers(VideoSize(shape.frames)), storage)
+            scratch = bind_scratch(
+                model.video_output.workspace_buffers(VideoSize(shape.frames)), runner.scratch
+            )
             # Zero normalized pixels map to checkpoint channel means. The
             # first window must ignore overlap left by the preceding request.
             state["video_overlap"].fill_(1)
             expected_pixel = torch.tensor([124, 116, 104], dtype=torch.uint8, device="cuda:0")
-            for window in model.decode_windows(model.output_geometry(frames)):
+            for window in model.decode_windows(model.video_info(frames)):
                 segment = torch.zeros(
                     (1, 3, window.segment_frames, 768, 1344),
                     dtype=torch.float16,
@@ -158,9 +185,6 @@ def _decode_requests(checkpoint, environment, postprocess):
                 )
                 processed = model.postprocess_video(
                     (segment,), (window,), state=state, constants=constants, scratch=scratch
-                )
-                processed.validate(
-                    model.tensor_specs(Call.POSTPROCESS_VIDEO, shape), state=state, scratch=scratch
                 )
                 pixels = processed.values["video"][0]
                 assert pixels.shape == (window.frame_stop - window.frame_start, 768, 1344, 3)

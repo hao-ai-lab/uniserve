@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from uniserve_worker.nn.sparse_attention import (
+from uniserve.nn.sparse_attention import (
     SparseAttention,
     VideoSparseAttentionMetadata,
     build_video_sparse_metadata,

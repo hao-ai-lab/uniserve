@@ -4,26 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import replace
 
 import pytest
 import torch
 from safetensors.torch import save_file
 from torch import nn
 
-from tests.python.fixtures.model_execution import tensor_parallel_bindings
-from uniserve_worker.bootstrap.catalog import CatalogEntry
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.loader import LoadConfig, LoadFormat, LoadRequest, get_model_loader
-from uniserve_worker.loader.component import CheckpointComponent
-from uniserve_worker.loader.source import WeightSourceConfig
-from uniserve_worker.modeling.batch import EncodeBatch, TensorOutput
-from uniserve_worker.modeling.components import Call, CallSpec, ComponentSpec
-from uniserve_worker.modeling.encoder import EncoderMixin
-from uniserve_worker.modeling.model import Model
-from uniserve_worker.modeling.tensors import ExpertRoute
-from uniserve_worker.nn.branch import branch
-from uniserve_worker.nn.mesh import Communicator
+from tests.python.fixtures.model_execution import model_arguments
+from uniserve.attention.metadata import ExpertRoute
+from uniserve.distributed.mesh import Communicator
+from uniserve.loading import LoadConfig, LoadFormat, load_model
+from uniserve.loading.component import CheckpointComponent
+from uniserve.loading.source import WeightSourceConfig, resolve_weight_sources
+from uniserve.model.batch import EncodeBatch, TensorOutput
+from uniserve.model.components import ComponentCall
+from uniserve.model.encoder import EncoderMixin
+from uniserve.model.model import Model
+from uniserve.nn.branch import branch
+from uniserve.nn.layer import LayerConfig
+from uniserve.nn.quant import QuantizationConfig
 
 pytestmark = pytest.mark.integration
 
@@ -43,11 +42,11 @@ class ProjectionPair(EncoderMixin, Model):
     encoder_kinds = frozenset({"conditioning"})
 
     @classmethod
-    def components(cls, config):
-        return (ComponentSpec("model", (CallSpec(Call.ENCODE_CONDITIONING),)),)
+    def component_calls(cls, config):
+        return (ComponentCall("", "encode:conditioning"),)
 
-    def __init__(self, config, context):
-        super().__init__(config, context)
+    def __init__(self, config, *, parallel, meshes, layers, limits):
+        super().__init__(config)
         self.encoder = nn.Linear(2, 2, bias=False)
         self.decoder = branch(NormalizedProjection(), ExpertRoute.FLOW)
 
@@ -74,11 +73,6 @@ class ProjectionPair(EncoderMixin, Model):
 
 @pytest.fixture
 def component_checkpoint(tmp_path):
-    entry = CatalogEntry(
-        "ProjectionPair",
-        ProjectionPair,
-        sources=(WeightSourceConfig("encode", "encoder"), WeightSourceConfig("decode", "decoder")),
-    )
     weights = {
         "encoder": {"weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]])},
         "decoder": {
@@ -102,13 +96,44 @@ def component_checkpoint(tmp_path):
         manifest[f"{directory}/{path.name}"] = hashlib.sha256(path.read_bytes()).hexdigest()
     checksum = tmp_path / "sha256.json"
     checksum.write_text(json.dumps({"files": manifest}))
-    request = LoadRequest(
-        model_path=str(tmp_path),
-        execution=WorkerConfig(model_dtype="float32"),
-        bindings=tensor_parallel_bindings(),
-        load=LoadConfig(checksum_manifest=str(checksum)),
+    return LoadConfig(checksum_manifest=str(checksum)), tmp_path
+
+
+def _load_projection(
+    root,
+    load=LoadConfig(),
+    *,
+    model_class=ProjectionPair,
+    device="cpu",
+    flow_device=None,
+    layer=None,
+):
+    sources = (
+        (
+            WeightSourceConfig("encode", "encoder", component="encoder"),
+            WeightSourceConfig("decode", "decoder", component="decoder"),
+        )
+        if model_class is ProjectionPair
+        else (WeightSourceConfig(),)
     )
-    return entry, request, tmp_path
+    weights = resolve_weight_sources(
+        str(root),
+        load,
+        sources=sources,
+        sidecars=(),
+        root=root,
+        repository_id=None,
+    )
+    return load_model(
+        model_class,
+        None,
+        sources=weights,
+        load=load,
+        device=device,
+        dtype=torch.float32 if layer is None else layer.dense_dtype,
+        flow_device=flow_device,
+        **model_arguments(LayerConfig(Communicator(), None) if layer is None else layer),
+    )
 
 
 @pytest.mark.parametrize(
@@ -117,15 +142,9 @@ def component_checkpoint(tmp_path):
 def test_component_directories_preserve_namespaces_and_persistent_buffers(
     component_checkpoint, load_format
 ):
-    entry, request, root = component_checkpoint
-    request = replace(
-        request,
-        load=LoadConfig(
-            load_format=load_format,
-            checksum_manifest=request.load.checksum_manifest,
-        ),
-    )
-    loaded = get_model_loader(load_format).load(entry, {}, request, root=root, repository_id=None)
+    load, root = component_checkpoint
+    load = LoadConfig(load_format=load_format, checksum_manifest=load.checksum_manifest)
+    loaded = _load_projection(root, load)
     # [1, 2] -> [5, 11] -> [10, 33] -> [5, 66].
     torch.testing.assert_close(
         loaded.model.encode(
@@ -136,31 +155,20 @@ def test_component_directories_preserve_namespaces_and_persistent_buffers(
 
 
 def test_checksum_covers_each_component_source(component_checkpoint):
-    entry, request, root = component_checkpoint
+    load, root = component_checkpoint
     path = root / "decoder" / "diffusion_pytorch_model.safetensors"
     save_file({"weight": torch.eye(2), "scale": torch.ones(2)}, path)
     with pytest.raises(ValueError, match="checksum mismatch.*decoder/"):
-        get_model_loader(request.load.load_format).load(
-            entry, {}, request, root=root, repository_id=None
-        )
+        _load_projection(root, load)
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two CUDA devices are required")
 @pytest.mark.parametrize("load_format", [LoadFormat.AUTO, LoadFormat.LAYERED])
 def test_components_execute_on_their_declared_devices(component_checkpoint, load_format):
-    entry, request, root = component_checkpoint
-    request = replace(
-        request,
-        execution=replace(request.execution, device="cuda:0", generation_device="cuda:1"),
-        load=LoadConfig(load_format=load_format),
-    )
-    loaded = get_model_loader(load_format).load(
-        entry,
-        {},
-        request,
-        root=root,
-        repository_id=None,
+    load, root = component_checkpoint
+    loaded = _load_projection(
+        root, LoadConfig(load_format=load_format), device="cuda:0", flow_device="cuda:1"
     )
     inputs = torch.tensor([[1.0, 2.0]], device="cuda:0")
     result = loaded.model.encode("conditioning", EncodeBatch((inputs,)), constants={}, scratch={})
@@ -180,41 +188,27 @@ def test_components_execute_on_their_declared_devices(component_checkpoint, load
 
 
 def test_missing_serialized_buffer_rejects_incomplete_component(component_checkpoint):
-    entry, request, root = component_checkpoint
+    load, root = component_checkpoint
     path = root / "decoder" / "diffusion_pytorch_model.safetensors"
     save_file({"weight": torch.eye(2)}, path)
-    request = replace(request, load=LoadConfig())
+    load = LoadConfig()
     with pytest.raises(RuntimeError, match="missing=1.*scale"):
-        get_model_loader(request.load.load_format).load(
-            entry, {}, request, root=root, repository_id=None
-        )
+        _load_projection(root, load)
 
 
 def test_component_resolution_requires_only_resident_sources(component_checkpoint):
-    from uniserve_worker.execution.model_entry import ModelEntry
-    from uniserve_worker.loader.source import resolve_weight_sources
-    from uniserve_worker.nn.mesh import DeviceMesh
-    from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig
-
-    entry, request, root = component_checkpoint
-    group = Communicator(ranks=(0, 1), rank=0)
-    bindings = {
-        "encode": ModelEntry(
-            "encode",
-            ComponentConfig((0,)),
-            group,
-            DeviceMesh((0,), 0, ParallelConfig(), group.device),
-            group.device,
-        ),
-        "decode": ModelEntry("decode", ComponentConfig((1,)), group, None, group.device),
-    }
-    request = replace(request, bindings=bindings)
+    load, root = component_checkpoint
     # A rank need not have the checkpoint bytes for another rank's component.
     (root / "decoder" / "diffusion_pytorch_model.safetensors").unlink()
     sources = resolve_weight_sources(
-        request,
-        sources=tuple(replace(source, entry=source.name) for source in entry.sources),
-        sidecars=entry.sidecars,
+        str(root),
+        load,
+        sources=(
+            WeightSourceConfig("encode", "encoder", component="encoder"),
+            WeightSourceConfig("decode", "decoder", component="decoder"),
+        ),
+        components=frozenset({"encoder"}),
+        sidecars=(),
         root=root,
         repository_id=None,
     )
@@ -229,16 +223,14 @@ class PackedProjection(EncoderMixin, Model):
     encoder_kinds = frozenset({"conditioning"})
 
     @classmethod
-    def components(cls, config):
-        return (ComponentSpec("model", (CallSpec(Call.ENCODE_CONDITIONING, groups=("tp",)),)),)
+    def component_calls(cls, config):
+        return (ComponentCall("", "encode:conditioning", groups=("tp",)),)
 
-    def __init__(self, config, context):
+    def __init__(self, config, *, parallel, meshes, layers, limits):
         super().__init__()
-        from uniserve_worker.nn.linear import MergedColumnParallelLinear
+        from uniserve.nn.linear import MergedColumnParallelLinear
 
-        self.projection = MergedColumnParallelLinear(
-            2, (4, 4), layer_config=context.layers["model"], bias=False
-        )
+        self.projection = MergedColumnParallelLinear(2, (4, 4), layer_config=layers[""], bias=False)
 
     def checkpoint_components(self):
         return (CheckpointComponent(self),)
@@ -274,18 +266,10 @@ def test_fp8_merged_checkpoint_preserves_each_rank_branch_and_scale(
     if checkpoint_layout == "rank_local":
         state = {name: tensor[output_rows] for name, tensor in state.items()}
     save_file(state, tmp_path / "model.safetensors")
-    request = LoadRequest(
-        model_path=str(tmp_path),
-        execution=WorkerConfig(model_dtype="bfloat16"),
-        bindings=tensor_parallel_bindings(Communicator(ranks=(0, 1), rank=rank)),
-        quantization_config={"quant_method": "fp8"},
-    )
-    loaded = get_model_loader(LoadFormat.AUTO).load(
-        CatalogEntry("PackedProjection", PackedProjection),
-        {},
-        request,
-        root=tmp_path,
-        repository_id=None,
+    loaded = _load_projection(
+        tmp_path,
+        model_class=PackedProjection,
+        layer=LayerConfig(Communicator(ranks=(0, 1), rank=rank), QuantizationConfig(method="fp8")),
     )
     with torch.inference_mode():
         actual = loaded.model.encode(
@@ -300,8 +284,8 @@ def test_fp8_merged_checkpoint_preserves_each_rank_branch_and_scale(
 class SharedBranches(ProjectionPair):
     """Two mathematical paths sharing one learned linear transformation."""
 
-    def __init__(self, config, context):
-        Model.__init__(self, config, context)
+    def __init__(self, config, *, parallel, meshes, layers, limits):
+        Model.__init__(self, config)
         shared = nn.Linear(2, 2, bias=False)
         self.encoder = branch(nn.Sequential(shared), ExpertRoute.TEXT)
         self.decoder = branch(nn.Sequential(shared), ExpertRoute.FLOW)
@@ -314,30 +298,22 @@ class SharedBranches(ProjectionPair):
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
 def test_shared_branch_parameter_rejects_conflicting_placement(tmp_path):
     save_file({"encoder.0.weight": torch.eye(2)}, tmp_path / "model.safetensors")
-    request = LoadRequest(
-        model_path=str(tmp_path),
-        execution=WorkerConfig(device="cuda:0", generation_device="cuda:1", model_dtype="float32"),
-        bindings=tensor_parallel_bindings(),
-        load=LoadConfig(load_format=LoadFormat.LAYERED),
-    )
     with pytest.raises(ValueError, match="shared parameter cannot belong to different devices"):
-        get_model_loader(request.load.load_format).load(
-            CatalogEntry("SharedBranches", SharedBranches),
-            {},
-            request,
-            root=tmp_path,
-            repository_id=None,
+        _load_projection(
+            tmp_path,
+            LoadConfig(load_format=LoadFormat.LAYERED),
+            model_class=SharedBranches,
+            device="cuda:0",
+            flow_device="cuda:1",
         )
 
 
 def test_synthetic_loading_initializes_serialized_buffers(component_checkpoint):
-    entry, request, root = component_checkpoint
-    request = replace(request, load=LoadConfig(load_format=LoadFormat.DUMMY))
+    load, root = component_checkpoint
+    load = LoadConfig(load_format=LoadFormat.DUMMY)
     results = []
     for _ in range(2):
-        loaded = get_model_loader(request.load.load_format).load(
-            entry, {}, request, root=root, repository_id=None
-        )
+        loaded = _load_projection(root, load)
         result = loaded.model.encode(
             "conditioning", EncodeBatch((torch.tensor([[1.0, 2.0]]),)), constants={}, scratch={}
         ).values["conditioning"][0]

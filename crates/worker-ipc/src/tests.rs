@@ -1081,7 +1081,7 @@ fn worker_info_round_trips() {
         let info = WorkerInfo {
             world_size: count as u32,
             configuration_id: "a".repeat(64),
-            kv_cache: Some(KvCacheConfig {
+            kv_cache: Some(KvCacheInfo {
                 num_layers: 9,
                 total_layers: 28,
                 layer_offset: 11,
@@ -1090,7 +1090,7 @@ fn worker_info_round_trips() {
             components: vec![EntryInfo {
                 name: "denoiser".into(),
                 config: ComponentConfig::parallel((0..count).rev().collect(), config),
-                outputs: vec![TensorSpec {
+                outputs: vec![OutputInfo {
                     name: "conditioning".into(),
                     dtype: DType::BF16,
                     shape_bound: ShapeBound {
@@ -1359,7 +1359,7 @@ fn full_caps() -> WorkerInfo {
         pipeline_components: video_components(),
         num_inference_steps: 4,
         supported_ops: Computation::ALL.to_vec(),
-        kv_cache: Some(KvCacheConfig {
+        kv_cache: Some(KvCacheInfo {
             groups: vec![
                 KvCacheGroup {
                     num_blocks: 2048,

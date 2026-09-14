@@ -1160,7 +1160,7 @@ def _dim_to_mapping(dim: DimBound) -> dict[str, object]:
 
 
 @dataclass(frozen=True, slots=True)
-class TensorSpec:
+class OutputInfo:
     """Name and bounded representation of an entry result before request binding."""
 
     name: str
@@ -1178,7 +1178,7 @@ class TensorSpec:
         return self.shape_bound.max_elements * self.dtype.element_bytes
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "tensor_spec") -> TensorSpec:
+    def from_mapping(cls, value: object, where: str = "output_info") -> OutputInfo:
         data = _map(value, where)
         return cls(
             name=_str(data.get("name"), f"{where}.name"),

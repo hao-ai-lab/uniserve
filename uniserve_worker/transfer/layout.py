@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from itertools import product
 from typing import TYPE_CHECKING
+
+from uniserve.tensors import TensorRegion
 
 from ..foundation.errors import invalid_descriptor
 from ..protocol.batch import (
@@ -18,83 +19,6 @@ if TYPE_CHECKING:
     import torch
 
     from .tickets import TransferTicket, Transport
-
-
-@dataclass(frozen=True, slots=True)
-class TensorRegion:
-    """A nonempty rectangular region, measured in logical tensor elements."""
-
-    offset: tuple[int, ...]
-    shape: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        if (
-            not self.shape
-            or len(self.offset) != len(self.shape)
-            or any(start < 0 for start in self.offset)
-            or any(extent < 1 for extent in self.shape)
-        ):
-            raise invalid_descriptor("tensor region has invalid bounds")
-
-    def within(self, shape: tuple[int, ...]) -> bool:
-        return len(shape) == len(self.shape) and all(
-            start + extent <= bound
-            for start, extent, bound in zip(self.offset, self.shape, shape, strict=True)
-        )
-
-    def intersection(self, other: TensorRegion) -> TensorRegion | None:
-        if len(self.shape) != len(other.shape):
-            raise invalid_descriptor("tensor regions have different dimensions")
-        start = tuple(max(a, b) for a, b in zip(self.offset, other.offset, strict=True))
-        end = tuple(
-            min(a + n, b + m)
-            for a, n, b, m in zip(self.offset, self.shape, other.offset, other.shape, strict=True)
-        )
-        if any(a >= b for a, b in zip(start, end, strict=True)):
-            return None
-        return TensorRegion(start, tuple(b - a for a, b in zip(start, end, strict=True)))
-
-    def subtract(self, covered: TensorRegion) -> tuple[TensorRegion, ...]:
-        """Partition the remainder without duplicating overlapping replica reads."""
-
-        intersection = self.intersection(covered)
-        if intersection is None:
-            return (self,)
-        start = list(self.offset)
-        end = [a + n for a, n in zip(self.offset, self.shape, strict=True)]
-        remaining = []
-        for axis, (low, extent) in enumerate(
-            zip(intersection.offset, intersection.shape, strict=True)
-        ):
-            high = low + extent
-            if start[axis] < low:
-                piece_end = end.copy()
-                piece_end[axis] = low
-                remaining.append(
-                    TensorRegion(
-                        tuple(start), tuple(b - a for a, b in zip(start, piece_end, strict=True))
-                    )
-                )
-                start[axis] = low
-            if high < end[axis]:
-                piece_start = start.copy()
-                piece_start[axis] = high
-                remaining.append(
-                    TensorRegion(
-                        tuple(piece_start),
-                        tuple(b - a for a, b in zip(piece_start, end, strict=True)),
-                    )
-                )
-                end[axis] = high
-        return tuple(remaining)
-
-    def relative_to(self, origin: tuple[int, ...]) -> TensorRegion:
-        return TensorRegion(
-            tuple(a - b for a, b in zip(self.offset, origin, strict=True)), self.shape
-        )
-
-    def slices(self) -> tuple[slice, ...]:
-        return tuple(slice(a, a + n) for a, n in zip(self.offset, self.shape, strict=True))
 
 
 def validate_destination(

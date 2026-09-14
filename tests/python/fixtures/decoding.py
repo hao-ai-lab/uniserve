@@ -2,12 +2,11 @@
 
 import torch
 
-from uniserve_worker.modeling.batch import TensorOutput
-from uniserve_worker.modeling.components import Call, CallSpec, ComponentSpec
-from uniserve_worker.modeling.decoder import DecoderMixin
-from uniserve_worker.modeling.geometry import TensorOutputLayout
-from uniserve_worker.modeling.model import Model
-from uniserve_worker.nn.vae.decoder import LatentDecoder
+from uniserve.model.batch import TensorOutput
+from uniserve.model.components import ComponentCall
+from uniserve.model.model import Model
+from uniserve.nn.vae.decoder import LatentDecoder
+from uniserve.tensors import OutputLayout
 
 
 class ChannelDecoder(LatentDecoder):
@@ -27,25 +26,29 @@ class ChannelDecoder(LatentDecoder):
         return self.vae(latents).unsqueeze(-1).unsqueeze(-1)
 
 
-class DecodedModel(DecoderMixin, Model):
+class VideoDecoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.native = ChannelDecoder()
+
+    def decode(self, latents, size, windows, *, constants, scratch):
+        values = tuple(self.native(value.T.unsqueeze(0).float()) for value in latents)
+        return TensorOutput(
+            {"video": values},
+            {"video": tuple(OutputLayout(tuple(value.shape), value.dtype) for value in values)},
+        )
+
+
+class DecodedModel(Model):
     """Decode four RGB latent rows without text or diffusion capability."""
 
     decoder_kinds = frozenset({"video"})
 
     def __init__(self):
         super().__init__()
-        self.video_decoder = ChannelDecoder()
+        self.reconstruction = VideoDecoder()
         self.audio_decoder = None
 
     @classmethod
-    def components(cls, config):
-        return (ComponentSpec("reconstruction", (CallSpec(Call.DECODE_VIDEO),)),)
-
-    def decode(self, kind, batch, *, constants, scratch):
-        if kind != "video":
-            raise ValueError("this decoder reconstructs video")
-        values = tuple(self.video_decoder(value.T.unsqueeze(0).float()) for value in batch.latents)
-        return TensorOutput(
-            {"video": values},
-            {"video": tuple(TensorOutputLayout(tuple(value.shape)) for value in values)},
-        )
+    def component_calls(cls, config):
+        return (ComponentCall("reconstruction", "decode:video"),)

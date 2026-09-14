@@ -5,20 +5,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.modeling.batch import TensorOutput
-from uniserve_worker.modeling.components import Call
-from uniserve_worker.modeling.geometry import MediaShape
-from uniserve_worker.nn.vae import AutoEncoder, AutoEncoderParams
-from uniserve_worker.nn.vae.autoencoder import AttnBlock, DiagonalGaussian
-from uniserve_worker.nn.vae.patch import PatchAutoencoder
-from uniserve_worker.nn.vision.patching import unpatchify_batch
+from uniserve.nn.vae import AutoEncoder, AutoEncoderConfig
+from uniserve.nn.vae.autoencoder import AttnBlock, DiagonalGaussian
+from uniserve.nn.vae.patch import PatchAutoencoder
+from uniserve.nn.vision.patching import unpatchify_batch
 
 pytestmark = pytest.mark.unit
 
 
 def test_latent_decoder_preserves_float32_normalization_and_scope_restoration():
     from tests.python.fixtures.decoding import ChannelDecoder
-    from uniserve_worker.nn.vae.decoder import decoder_scope
+    from uniserve.nn.vae.decoder import decoder_scope
 
     decoder = ChannelDecoder()
     source = torch.linspace(-1, 1, 12).reshape(1, 3, 4).bfloat16()
@@ -35,13 +32,13 @@ def test_latent_decoder_preserves_float32_normalization_and_scope_restoration():
 
 
 def _tiny_params():
-    return AutoEncoderParams(
+    return AutoEncoderConfig(
         resolution=8,
         in_channels=3,
-        downsample=4,
+        downsample=2,
         ch=32,
         out_ch=3,
-        ch_mult=[1, 1],
+        ch_mult=(1, 1),
         num_res_blocks=1,
         z_channels=4,
         scale_factor=0.5,
@@ -95,19 +92,11 @@ def test_patch_autoencoder_preserves_posterior_and_reconstruction():
     generator = torch.Generator().manual_seed(31)
     posterior = native.encode(pixels, generator)
     patches = codec.encode(pixels, torch.Generator().manual_seed(31))
-    TensorOutput({"latents": tuple(patches.unbind(0))}).validate(
-        codec.tensor_specs(Call.ENCODE_LATENT, MediaShape(8, 12)), state={}, scratch={}
-    )
     restored = unpatchify_batch(patches, 2, height=4, width=6, channels=4)
     torch.testing.assert_close(restored, posterior.to(torch.bfloat16), rtol=0, atol=0)
 
     expected = (native.decode(restored.float()) * 0.5 + 0.5).clamp(0, 1)
     actual = codec.decode(patches, 8, 12)
-    TensorOutput({"image": tuple(actual.unbind(0))}).validate(
-        codec.tensor_specs(Call.DECODE_IMAGE, MediaShape(8, 12, dtype=patches.dtype)),
-        state={},
-        scratch={},
-    )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 

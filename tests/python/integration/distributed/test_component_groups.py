@@ -7,20 +7,22 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from uniserve_worker.bootstrap.distributed import initialize_entries, initialize_process_groups
-from uniserve_worker.loader.handles import TensorWeightHandle
-from uniserve_worker.loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
-from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.linear import (
+from uniserve.distributed.mesh import DeviceMesh
+from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
+from uniserve.distributed.peer_memory import allocate_symmetric_memory
+from uniserve.distributed.process_groups import initialize_process_groups
+from uniserve.loading.handles import TensorWeightHandle
+from uniserve.loading.weight_loaders import attach_parameter_loaders, load_parameter_weight
+from uniserve.nn.layer import LayerConfig
+from uniserve.nn.linear import (
     ColumnParallelLinear,
     LinearBase,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from uniserve_worker.nn.mesh import DeviceMesh
-from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig, SequenceParallel
-from uniserve_worker.nn.vocab_parallel_embedding import VocabParallelEmbedding
-from uniserve_worker.runtime.peer_memory import allocate_symmetric_memory
+from uniserve.nn.vocab_parallel_embedding import VocabParallelEmbedding
+from uniserve_worker.bootstrap.distributed import initialize_entries
+from uniserve_worker.config import ComponentConfig
 
 pytestmark = pytest.mark.integration
 
@@ -101,8 +103,8 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
             )
 
     if backend == "nccl":
-        from uniserve_worker.nn.parallel_attention import ParallelAttention
-        from uniserve_worker.ops.video_sparse import compose_to_head_shards
+        from uniserve.nn.parallel_attention import ParallelAttention
+        from uniserve.ops.video_sparse import compose_to_head_shards
 
         for component, dimension in (("denoiser", "ulysses"), ("encoder", "tp"), ("output", "tp")):
             if component not in meshes:

@@ -11,16 +11,21 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ..loader.config import LoadConfig
-from ..loader.source import read_model_config, resolve_model_root
-from .catalog import resolve_catalog_entry
+from uniserve.loading.config import LoadConfig
+from uniserve.loading.source import resolve_model_root
+from uniserve_models.catalog import resolve_catalog_entry
+from uniserve_models.source import read_model_config
 
 
 def inspect_model(model: str, *, download: bool = False, revision: str | None = None) -> dict:
     """Resolve catalog metadata and validate the H3 variant without GPU weights."""
 
-    from ..models.minimax_h3.config import FASTH3_MODEL_ID, FASTH3_REVISION, h3_contract
-    from .metadata import h3_metadata
+    from uniserve_models.metadata import h3_metadata
+    from uniserve_models.minimax_h3.config import (
+        FASTH3_MODEL_ID,
+        FASTH3_REVISION,
+        PRECISION_PRESETS,
+    )
 
     if model == FASTH3_MODEL_ID and revision is None:
         revision = FASTH3_REVISION
@@ -46,7 +51,28 @@ def inspect_model(model: str, *, download: bool = False, revision: str | None = 
         )
     contract = None
     if entry.architecture == "MiniMaxH3Transformer3DModel":
-        contract = h3_contract(h3_metadata(root)["inference"])
+        model_config = h3_metadata(root)
+        diffusion = model_config.diffusion
+        video = model_config.video_decoder
+        manifest = json.loads((root / "fastvideo_inference.json").read_text())
+        # This JSON is the inspection command's external result, not model configuration.
+        contract = {
+            "family": "minimax-h3",
+            "variant": "fasth3",
+            "model_id": manifest["model_id"],
+            "checkpoint_content_sha256": manifest["checkpoint_content_sha256"],
+            "attention": "vsa",
+            "sparsity": 0.9,
+            "tasks": ["t2va"],
+            "inference_grid": [*(step / diffusion.time_scale for step in diffusion.ladder), 0.0],
+            "sigma_shifts": [diffusion.video_shift, diffusion.audio_shift],
+            "denoise_steps": len(diffusion.ladder),
+            "width": video.width,
+            "height": video.height,
+            "fps": video.fps,
+            "audio_rate": model_config.audio_decoder.sampling_rate,
+            "precision_presets": list(PRECISION_PRESETS),
+        }
         # Only a hub snapshot directory establishes revision provenance. A
         # local checkpoint retains its manifest's declared content identity.
         contract["revision"] = root.name if root.parent.name == "snapshots" else None
@@ -66,9 +92,10 @@ def doctor(model: dict, ranks: int) -> dict:
 
     import torch
 
-    from ..backends.attention.video_sparse_provider import resolve_sparse_provider
+    from uniserve.attention.video_sparse_provider import resolve_sparse_provider
+    from uniserve_models.minimax_h3.config import PRECISION_PRESETS
+
     from ..media.mux import require_media_codecs
-    from ..models.minimax_h3.config import PRECISION_PRESETS
 
     if sys.version_info[:2] != (3, 12):
         raise RuntimeError("H3 requires the locked Python 3.12 environment; run uv sync --extra h3")
@@ -115,18 +142,18 @@ def doctor(model: dict, ranks: int) -> dict:
         for name in component_bytes:
             sizes = [
                 file.size
-                for file in metadata.siblings
+                for file in metadata.siblings or ()
                 if file.rfilename.startswith(name + "/") and file.rfilename.endswith(".safetensors")
             ]
             if sizes and all(size is not None for size in sizes):
-                component_bytes[name] = sum(sizes)
-    complete_sizes = all(value is not None for value in component_bytes.values())
+                component_bytes[name] = sum(size for size in sizes if size is not None)
+    known_sizes = {name: size for name, size in component_bytes.items() if size is not None}
     weight_ceiling = (
-        component_bytes["transformer"]
-        + component_bytes["text_encoder"] // ranks
-        + component_bytes["vae"]
-        + component_bytes["audio_vae"]
-        if complete_sizes
+        known_sizes["transformer"]
+        + known_sizes["text_encoder"] // ranks
+        + known_sizes["vae"]
+        + known_sizes["audio_vae"]
+        if len(known_sizes) == len(component_bytes)
         else None
     )
     return {

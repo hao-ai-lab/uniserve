@@ -6,11 +6,9 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve_worker.modeling.batch import TensorOutput
-from uniserve_worker.modeling.geometry import DecodeWindow
-from uniserve_worker.modeling.resources import TensorAlias, TensorNeeds, TensorSchema
-from uniserve_worker.modeling.video import VideoMixin
-from uniserve_worker.nn.vae.spatial import SpatialDecoder
+from uniserve.model.media import DecodeWindow
+from uniserve.model.video import VideoMixin
+from uniserve.nn.vae.spatial import SpatialDecoder
 
 pytestmark = pytest.mark.unit
 
@@ -49,17 +47,6 @@ def test_video_windows_preserve_pixels_across_separate_calls():
     }
     state = {"video_overlap": torch.full((1, 3, 2, 2, 3), 10, dtype=torch.float16)}
     scratch = {"rgb_frames": torch.empty((11, 2, 3, 3), dtype=torch.uint8)}
-    needs = TensorNeeds(
-        scratch={"rgb_frames": TensorSchema((11, 2, 3, 3), torch.uint8)},
-        outputs={
-            "video": TensorSchema(
-                (11, 2, 3, 3),
-                torch.uint8,
-                variable_axes=(0,),
-                alias=TensorAlias("scratch", "rgb_frames"),
-            )
-        },
-    )
     # The first interval resets overlap numerically; later intervals consume
     # the exact successor state left by the previous independent call.
     parts = []
@@ -67,7 +54,6 @@ def test_video_windows_preserve_pixels_across_separate_calls():
         result = model.postprocess_video(
             (segment,), (window,), state=state, constants=constants, scratch=scratch
         )
-        result.validate(needs, state=state, scratch=scratch)
         value = result.values["video"][0]
         assert value is not None
         assert result.layouts["video"][0].shape == tuple(value.shape)
@@ -99,16 +85,6 @@ def test_video_windows_preserve_pixels_across_separate_calls():
     torch.testing.assert_close(state["video_overlap"], previous_state, rtol=0, atol=0)
     torch.testing.assert_close(scratch["rgb_frames"], previous_output, rtol=0, atol=0)
 
-    # The numerical contract identifies a borrowed result. Replacing it with
-    # independent storage or a different raster/representation violates that
-    # contract even when the visible pixel values happen to agree.
-    for invalid in (
-        scratch["rgb_frames"].clone(),
-        scratch["rgb_frames"][:, :, :2],
-        scratch["rgb_frames"].view(torch.int8),
-    ):
-        with pytest.raises(ValueError):
-            TensorOutput({"video": (invalid,)}).validate(needs, state=state, scratch=scratch)
     scratch["rgb_frames"][0].zero_()
     assert torch.count_nonzero(together.values["video"][0][0]) == 0
 

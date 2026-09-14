@@ -3,11 +3,10 @@
 import pytest
 import torch
 
-from uniserve_worker.execution.cuda_graph import CudaGraph
-from uniserve_worker.modeling.batch import TensorOutput
-from uniserve_worker.modeling.geometry import DecodeWindow
-from uniserve_worker.modeling.resources import TensorAlias, TensorNeeds, TensorSchema
-from uniserve_worker.modeling.video import VideoMixin
+from uniserve.model.batch import TensorOutput
+from uniserve.model.media import DecodeWindow
+from uniserve.model.video import VideoMixin
+from uniserve.runtime.cuda_graph import CudaGraph
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -25,14 +24,6 @@ def test_video_postprocess_replay_uses_current_overlap_and_pixels():
         "pixel_mean": torch.zeros((1, 3, 1, 1, 1), device=device),
         "pixel_std": torch.ones((1, 3, 1, 1, 1), device=device),
     }
-    needs = TensorNeeds(
-        scratch={"rgb_frames": TensorSchema((5, 2, 3, 3), torch.uint8)},
-        outputs={
-            "video": TensorSchema(
-                (5, 2, 3, 3), torch.uint8, alias=TensorAlias("scratch", "rgb_frames")
-            )
-        },
-    )
 
     def forward():
         result = model.postprocess_video(
@@ -42,7 +33,6 @@ def test_video_postprocess_replay_uses_current_overlap_and_pixels():
             constants=constants,
             scratch={"rgb_frames": pixels},
         )
-        result.validate(needs, state={"video_overlap": overlap}, scratch={"rgb_frames": pixels})
         return result
 
     graph = CudaGraph[TensorOutput](device=device, stream=torch.cuda.Stream(device=device))

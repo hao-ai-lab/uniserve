@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from uniserve_worker.execution import operations as operation_geometry
+from uniserve.model.video import VideoMixin
+from uniserve.nn.diffusion.cfg import Branch, CfgPlan
+from uniserve.tensors import OutputLayout
+from uniserve_models.processing import PatchTransform
+from uniserve_worker.execution import operations as operations
 from uniserve_worker.execution.batch_state import BatchState
 from uniserve_worker.execution.commit import _commit_group, _discard_group
 from uniserve_worker.execution.image_input import ImageInputs
@@ -29,8 +33,6 @@ from uniserve_worker.foundation.errors import (
     invalid_descriptor,
     should_capture_trace,
 )
-from uniserve_worker.modeling.video import VideoMixin
-from uniserve_worker.nn.diffusion.cfg import Branch, CfgPlan
 from uniserve_worker.profiling import _forward_stats, record_component
 from uniserve_worker.protocol.batch import (
     DType,
@@ -46,8 +48,6 @@ from uniserve_worker.protocol.batch import (
     TransferMode,
 )
 
-from ..modeling.geometry import TensorOutputLayout
-from ..modeling.inputs import PatchTransform
 from .diffusion_state import DiffusionState
 from .output import capture_samples
 from .sampling import SamplerRow, SamplingMetadata
@@ -55,18 +55,18 @@ from .sampling import SamplerRow, SamplingMetadata
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
+    from uniserve.distributed.mesh import Communicator
+    from uniserve.model.model import Model
     from uniserve_worker.bootstrap.worker_info import WorkerInfo
     from uniserve_worker.config import WorkerConfig
     from uniserve_worker.execution.model_runner import ModelRunner
     from uniserve_worker.execution.output import OutputPool
     from uniserve_worker.media.buffers import MediaBuffers
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.modeling.model import Model
-    from uniserve_worker.nn.mesh import Communicator
     from uniserve_worker.runtime.block_tables import BlockTables
+    from uniserve_worker.runtime.cache_manager import CacheManager
     from uniserve_worker.runtime.cpu import CpuPool
     from uniserve_worker.runtime.decode_state import DecodeState
-    from uniserve_worker.runtime.kv_cache import KVCache
     from uniserve_worker.runtime.latent_pool import LatentPool
     from uniserve_worker.runtime.request import RequestPool
     from uniserve_worker.runtime.tensor_store import TensorStore
@@ -96,7 +96,7 @@ def execute_batch(
     state: BatchState,
     *,
     propagate_errors: bool = False,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     cpu_tasks: CpuPool,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
@@ -128,7 +128,7 @@ def execute_batch(
     started = time.perf_counter_ns()
 
     required_predicates = {
-        operation_geometry.operation_identity(operation)
+        operations.operation_identity(operation)
         for operation in batch.operations
         if operation.predicate is not None and operation.predicate.dtype is DType.U8
     }
@@ -373,7 +373,7 @@ def _classify_group_failure(
 ) -> WorkerError:
     """Classify a pre-publication completion group failure with complete operation and route context."""
 
-    operations = tuple(
+    scheduled = tuple(
         (
             int(operation.request_key.engine_id),
             int(operation.request_key.request_id),
@@ -391,7 +391,7 @@ def _classify_group_failure(
         error,
         context=phase,
         phase=phase,
-        operations=operations,
+        operations=scheduled,
         req_id=None if sole is None else int(sole.request_key.request_id),
         op_id=None if sole is None else sole.op_id,
         op_kind=None if sole is None else sole.kind.value,
@@ -409,7 +409,7 @@ def _published_group_failure(
 ) -> WorkerError:
     """Classify a post-visibility publication failure as a fatal invariant violation."""
 
-    operations = tuple(
+    scheduled = tuple(
         (
             int(operation.request_key.engine_id),
             int(operation.request_key.request_id),
@@ -424,7 +424,7 @@ def _published_group_failure(
         fatal=True,
         phase="completion group publication",
         route=str(0),
-        operations=operations,
+        operations=scheduled,
     )
     _log_group_failure(completion_group, classified, cause=error)
     return classified
@@ -465,7 +465,7 @@ def _execute_groups(
     completion_groups: tuple[int, ...],
     *,
     state: BatchState,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
@@ -497,7 +497,7 @@ def _execute_groups(
         [None] * len(state.group_operations(completion_group))
         for completion_group in completion_groups
     ]
-    operations: list[tuple[ScheduledRequest, int]] = []
+    scheduled: list[tuple[ScheduledRequest, int]] = []
     locations: list[tuple[int, int]] = []
     for group_index, completion_group in enumerate(completion_groups):
         for operation_index, operation in enumerate(state.group_operations(completion_group)):
@@ -510,9 +510,9 @@ def _execute_groups(
                 )
                 continue
             locations.append((group_index, operation_index))
-            operations.append((operation, completion_group))
+            scheduled.append((operation, completion_group))
     completed, errors = _execute_operations(
-        tuple(operations),
+        tuple(scheduled),
         kv_cache=kv_cache,
         tensor_store=tensor_store,
         worker_info=worker_info,
@@ -550,13 +550,11 @@ def _forward_values(
     state: BatchState,
     errors: dict[int, BaseException],
     retain_sampling: bool = False,
-    cache: KVCache | None,
+    cache: CacheManager | None,
     tables: BlockTables | None,
     states: DecodeState | None,
     sampling_group: Communicator | None,
-) -> tuple[
-    tuple[torch.Tensor, torch.Tensor, SamplerRow | None, TensorOutputLayout | None] | None, ...
-]:
+) -> tuple[tuple[torch.Tensor, torch.Tensor, SamplerRow | None, OutputLayout | None] | None, ...]:
     """Bind numerical outputs to their completion owners and attribute group statistics."""
 
     for row, _operation, completion_group in inputs:
@@ -570,7 +568,7 @@ def _forward_values(
         states=states,
     )
     values: list[
-        tuple[torch.Tensor, torch.Tensor, SamplerRow | None, TensorOutputLayout | None] | None
+        tuple[torch.Tensor, torch.Tensor, SamplerRow | None, OutputLayout | None] | None
     ] = [None] * len(inputs)
     from .token import graph_decode_samples
 
@@ -617,10 +615,10 @@ def _forward_values(
 
 
 def _execute_operations(
-    operations: tuple[tuple[ScheduledRequest, int], ...],
+    scheduled: tuple[tuple[ScheduledRequest, int], ...],
     *,
     state: BatchState,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
@@ -646,7 +644,7 @@ def _execute_operations(
 
     producers = {
         buffer: index
-        for index, (operation, _scope) in enumerate(operations)
+        for index, (operation, _scope) in enumerate(scheduled)
         for buffer in (
             *(output.buffer_id for output in operation.tensor_outputs()),
             *((operation.kv_output,) if operation.kv_output is not None else ()),
@@ -656,10 +654,10 @@ def _execute_operations(
     errors: dict[int, BaseException] = {}
 
     def live(index: int) -> bool:
-        return index not in outcomes and operations[index][1] not in errors
+        return index not in outcomes and scheduled[index][1] not in errors
 
     def ready(index: int) -> bool:
-        operation = operations[index][0]
+        operation = scheduled[index][0]
         return all(
             producer in outcomes
             for buffer in (
@@ -669,24 +667,24 @@ def _execute_operations(
             if (producer := producers.get(buffer)) is not None
         )
 
-    while any(live(index) for index in range(len(operations))):
-        frontier = tuple(index for index in range(len(operations)) if live(index) and ready(index))
+    while any(live(index) for index in range(len(scheduled))):
+        frontier = tuple(index for index in range(len(scheduled)) if live(index) and ready(index))
         if not frontier:
             blocked = tuple(
-                operation_geometry.operation_identity(operation)
-                for index, (operation, _scope) in enumerate(operations)
+                operations.operation_identity(operation)
+                for index, (operation, _scope) in enumerate(scheduled)
                 if live(index)
             )
             raise RuntimeError(f"operation products contain an unresolved dependency: {blocked!r}")
         numerical = tuple(
             index
             for index in frontier
-            if isinstance(operations[index][0].kind, ForwardMode)
-            or operations[index][0].kind
+            if isinstance(scheduled[index][0].kind, ForwardMode)
+            or scheduled[index][0].kind
             in {PipelineStage.VISION_ENCODING, PipelineStage.LATENT_ENCODING}
             or (
                 latent_pool is not None
-                and operations[index][0].kind
+                and scheduled[index][0].kind
                 in {
                     PipelineStage.DENOISING,
                     PipelineStage.IMAGE_DECODING,
@@ -695,7 +693,7 @@ def _execute_operations(
         )
         if not numerical:
             for index in frontier:
-                operation, completion_group = operations[index]
+                operation, completion_group = scheduled[index]
                 if not live(index):
                     continue
                 try:
@@ -757,7 +755,7 @@ def _execute_operations(
 
         trajectories: dict[int, DiffusionState] = {}
         for index in numerical:
-            operation, completion_group = operations[index]
+            operation, completion_group = scheduled[index]
             if operation.kind is not PipelineStage.DENOISING or not live(index):
                 continue
             try:
@@ -775,7 +773,7 @@ def _execute_operations(
                 errors[completion_group] = error
         step_count = 1
         for index in trajectories:
-            operation, completion_group = operations[index]
+            operation, completion_group = scheduled[index]
             request = state.pending_output(completion_group, operation.request_key.request_id)
             params = request.input_latent_params
             if params is None:
@@ -789,7 +787,7 @@ def _execute_operations(
             for index, trajectory in trajectories.items():
                 if not live(index):
                     continue
-                operation, completion_group = operations[index]
+                operation, completion_group = scheduled[index]
                 row = state.pending_output(completion_group, operation.request_key.request_id)
                 params = row.input_latent_params
                 staging = row.latent_staging
@@ -820,7 +818,7 @@ def _execute_operations(
                 values = _forward_values(
                     model_runner,
                     tuple(
-                        (task, operations[index][0], operations[index][1])
+                        (task, scheduled[index][0], scheduled[index][1])
                         for index, _branch, task in prefixes
                     ),
                     cache=kv_cache,
@@ -831,7 +829,7 @@ def _execute_operations(
                     errors=errors,
                 )
                 for (index, branch, task), numerical_result in zip(prefixes, values, strict=True):
-                    operation, completion_group = operations[index]
+                    operation, completion_group = scheduled[index]
                     if not live(index) or numerical_result is None:
                         continue
                     value, _sampling_index, _selection, _layout = numerical_result
@@ -859,7 +857,7 @@ def _execute_operations(
             forward: list[tuple[int, ForwardRow]] = []
             images: dict[int, ImageInputs] = {}
             for index in numerical:
-                operation, completion_group = operations[index]
+                operation, completion_group = scheduled[index]
                 if not live(index) or (offset > 0 and index not in step_inputs):
                     continue
                 try:
@@ -882,7 +880,7 @@ def _execute_operations(
                         diffusion = model_runner.diffusion
                         if diffusion is None:
                             raise RuntimeError("flow execution lost its diffusion owner")
-                        processor = model_runner.model.image_processor
+                        processor = model_runner.processor
                         transform = None if processor is None else processor.vit
                         rows = diffusion.flow_rows(
                             trajectories[index],
@@ -890,7 +888,7 @@ def _execute_operations(
                             guide,
                             timestep,
                             conditioning_position=int(
-                                operation_geometry.require_progress(request).logical_position
+                                operations.require_progress(request).logical_position
                             ),
                             height=int(params.height),
                             width=int(params.width),
@@ -909,7 +907,6 @@ def _execute_operations(
                             request_tables=request_tables,
                             model_runner=model_runner,
                             decode_state=decode_state,
-                            tokenizer=tokenizer,
                             state=state,
                         )
                         record_component(
@@ -980,8 +977,7 @@ def _execute_operations(
                 _forward_values(
                     model_runner,
                     tuple(
-                        (task, operations[index][0], operations[index][1])
-                        for index, task in forward
+                        (task, scheduled[index][0], scheduled[index][1]) for index, task in forward
                     ),
                     cache=kv_cache,
                     tables=request_tables,
@@ -1002,7 +998,7 @@ def _execute_operations(
                 ],
             ] = defaultdict(list)
             for (index, task), numerical_result in zip(forward, values, strict=True):
-                operation, completion_group = operations[index]
+                operation, completion_group = scheduled[index]
                 if not live(index) or numerical_result is None:
                     continue
                 value, sampling_index, graph_sample, layout = numerical_result
@@ -1072,7 +1068,7 @@ def _execute_operations(
             for group_id, candidates in samples.items():
                 if group_id in errors:
                     continue
-                completion_group = operations[candidates[0][0]][1]
+                completion_group = scheduled[candidates[0][0]][1]
                 try:
                     sample_started = time.perf_counter_ns()
                     sampling_inputs = tuple(
@@ -1094,7 +1090,7 @@ def _execute_operations(
                         sampled,
                         tuple(
                             state.pending_output(
-                                completion_group, operations[index][0].request_key.request_id
+                                completion_group, scheduled[index][0].request_key.request_id
                             )
                             for index, _task, _logits, _work, _selected in candidates
                         ),
@@ -1106,7 +1102,7 @@ def _execute_operations(
                     finalize_started = time.perf_counter_ns()
                     token.publish_token_products(
                         tuple(
-                            operations[index][0]
+                            scheduled[index][0]
                             for index, _task, _logits, _work, _selected in candidates
                         ),
                         sampled,
@@ -1118,7 +1114,7 @@ def _execute_operations(
                         candidates, sampled, strict=True
                     ):
                         outcomes[index] = token.publish_sample(
-                            operations[index][0],
+                            scheduled[index][0],
                             completion_group,
                             task,
                             logits,
@@ -1137,7 +1133,7 @@ def _execute_operations(
             for index, outputs in predictions.items():
                 if not live(index):
                     continue
-                operation, completion_group = operations[index]
+                operation, completion_group = scheduled[index]
                 try:
                     guide, timestep, next_timestep = step_inputs[index]
                     row = state.pending_output(completion_group, operation.request_key.request_id)

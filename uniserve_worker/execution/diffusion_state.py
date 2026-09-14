@@ -2,23 +2,25 @@
 
 from __future__ import annotations
 
-from collections.abc import Hashable
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 
+from uniserve.model.image_diffusion import BranchSource
+from uniserve.model.media import ImageSize, VideoSize
+from uniserve.model.tensors import TensorViews
+from uniserve.nn.diffusion.cfg import Branch
+from uniserve.nn.diffusion.config import DiffusionConfig
+from uniserve.nn.diffusion.schedule import DiffusionSchedule
+from uniserve_models.processing import FlowPrompt
+
 from ..foundation.errors import invalid_descriptor
-from ..modeling.components import Call
-from ..modeling.image_diffusion import BranchSource, ImageDiffusion
-from ..modeling.tensors import TensorViews
-from ..nn.diffusion.cfg import Branch
-from ..nn.diffusion.schedule import DiffusionSchedule
 
 
 @dataclass(slots=True)
 class DiffusionState:
-    """Reuse schedules, conditioning prefixes, geometry, and request tensor views.
+    """Reuse schedules, conditioning prefixes, numerical sizes, and request tensor views.
 
     Image latent workspaces belong to the current pending operation and are never
     retained here. Video tensor views borrow the request slot through retirement.
@@ -26,12 +28,12 @@ class DiffusionState:
     Cache coordinates are refreshed from each operation's physical descriptors.
     """
 
-    geometry: Hashable
-    timesteps: tuple[tuple[float, float], ...] = ()
+    size: ImageSize | VideoSize
+    config: DiffusionConfig | None = None
     schedule: DiffusionSchedule | None = None
-    tensors: dict[Call, TensorViews] = field(default_factory=dict)
-    constants: dict[Call, TensorViews] = field(default_factory=dict)
-    scratch: dict[Call, TensorViews] = field(default_factory=dict)
+    tensors: dict[str, TensorViews] = field(default_factory=dict)
+    constants: dict[str, TensorViews] = field(default_factory=dict)
+    scratch: dict[str, TensorViews] = field(default_factory=dict)
     prefixes: dict[BranchSource, tuple[tuple[int, ...], bool]] = field(default_factory=dict)
     positions: dict[int, tuple[torch.Tensor, torch.Tensor, int, tuple[int, ...]]] = field(
         default_factory=dict
@@ -41,7 +43,7 @@ class DiffusionState:
 
 
 def resolve_prefix(
-    generation: ImageDiffusion,
+    prompt: FlowPrompt | None,
     source: BranchSource,
     *,
     image_prompt: str,
@@ -55,7 +57,7 @@ def resolve_prefix(
         return (), True
     if source is BranchSource.NEGATIVE_OR_START and negative_token_ids:
         return negative_token_ids, False
-    if generation.prompt is None:
+    if prompt is None:
         if source is BranchSource.CONDITIONING:
             raise invalid_descriptor("this model does not accept a generation prompt override")
         return (), False
@@ -68,4 +70,4 @@ def resolve_prefix(
     else:
         text = ""
         conditioned = False
-    return generation.prompt.encode(tokenizer, text=text, conditioned=conditioned), False
+    return prompt.encode(tokenizer, text=text, conditioned=conditioned), False

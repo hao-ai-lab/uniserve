@@ -5,22 +5,24 @@ from dataclasses import replace
 import pytest
 import torch
 
-from tests.python.fixtures.model_execution import model_context
-from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
-from uniserve_worker.backends.attention.selection import AttentionSelection
-from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
+from tests.python.fixtures.model_execution import model_arguments
+from uniserve.attention.flashinfer import FlashInferAttentionBackend
+from uniserve.attention.metadata import AttentionMetadata, AttentionMode
+from uniserve.attention.selection import AttentionSelection
+from uniserve.attention.tuning import FlashInferTuningConfig
+from uniserve.distributed.mesh import Communicator
+from uniserve.model.tensors import TokenSelection
+from uniserve.nn.attention import bind_attention_modules
+from uniserve.nn.layer import LayerConfig
+from uniserve.runtime.kv_cache import KVCache, KVCacheConfig
+from uniserve_models.sensenova.config import read_config as read_neo_config
+from uniserve_models.sensenova.model import NEOChatModel
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.batch import InputBatch
-from uniserve_worker.execution.input_buffers import InputGeometry
+from uniserve_worker.execution.input_buffers import InputBufferConfig
 from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.modeling.tensors import AttentionMetadata, AttentionMode, TokenSelection
-from uniserve_worker.models.sensenova.config import NeoChatConfig
-from uniserve_worker.models.sensenova.model import NEOChatModel
-from uniserve_worker.nn.attention import bind_attention_modules
-from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.mesh import Communicator
 from uniserve_worker.protocol.batch import ForwardMode
-from uniserve_worker.runtime.kv_cache import KVCache
+from uniserve_worker.runtime.cache_manager import CacheManager
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -30,76 +32,87 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 def numerical_model(request):
     torch.manual_seed(619)
     device = torch.device("cuda", 0)
-    config = NeoChatConfig(
-        vision_config={
-            "hidden_size": 8,
-            "llm_hidden_size": 512,
-            "downsample_ratio": 0.5,
-            "patch_size": 2,
-            "num_channels": 3,
-            "rope_theta_vision": 10000.0,
-            "max_position_embeddings_vision": 128,
-        },
-        llm_config={
-            "vocab_size": 64,
-            "hidden_size": 512,
-            "intermediate_size": 1024,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 128,
-            "attention_bias": False,
-            "rms_norm_eps": 1e-6,
-            "rope_theta": 10000.0,
-            "max_position_embeddings": 256,
-            "rope_theta_hw": 10000.0,
-            "max_position_embeddings_hw": 128,
-            "pad_token_id": 0,
-            "bos_token_id": 1,
-            "eos_token_id": 2,
-        },
-        downsample_ratio=0.5,
-        max_image_seq_len=16,
-        fm_head_layers=2,
+    config = read_neo_config(
+        dict(
+            vision_config={
+                "hidden_size": 8,
+                "llm_hidden_size": 512,
+                "downsample_ratio": 0.5,
+                "patch_size": 2,
+                "num_channels": 3,
+                "rope_theta_vision": 10000.0,
+                "max_position_embeddings_vision": 128,
+            },
+            llm_config={
+                "vocab_size": 64,
+                "hidden_size": 512,
+                "intermediate_size": 1024,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 128,
+                "attention_bias": False,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 10000.0,
+                "max_position_embeddings": 256,
+                "rope_theta_hw": 10000.0,
+                "max_position_embeddings_hw": 128,
+                "pad_token_id": 0,
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+            },
+            downsample_ratio=0.5,
+            max_image_seq_len=16,
+            fm_head_layers=2,
+        )
     )
     if getattr(request, "param", "sensenova") == "qwen":
-        from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
+        from uniserve_models.qwen3 import Qwen3ForCausalLM
+        from uniserve_models.qwen3 import read_config as read_qwen_config
 
         model = Qwen3ForCausalLM(
-            dict(
-                vocab_size=64,
-                hidden_size=512,
-                intermediate_size=1024,
-                num_hidden_layers=2,
-                num_attention_heads=4,
-                num_key_value_heads=2,
-                head_dim=128,
-                max_position_embeddings=256,
+            read_qwen_config(
+                dict(
+                    vocab_size=64,
+                    hidden_size=512,
+                    intermediate_size=1024,
+                    num_hidden_layers=2,
+                    num_attention_heads=4,
+                    num_key_value_heads=2,
+                    head_dim=128,
+                    max_position_embeddings=256,
+                )
             ),
-            context=model_context(LayerConfig(Communicator(), None)),
+            **model_arguments(LayerConfig(Communicator(), None)),
         )
     else:
-        model = NEOChatModel(config, context=model_context(LayerConfig(Communicator(), None)))
+        model = NEOChatModel(config, **model_arguments(LayerConfig(Communicator(), None)))
     model.to(device=device, dtype=torch.bfloat16)
     for parameter in model.parameters():
         if parameter.ndim == 1:
             parameter.fill_(1)
         else:
             parameter.normal_(std=0.05)
-    pool = KVCache(
-        num_layers=2,
-        num_pages=16,
-        page_size=64,
-        num_kv_heads=2,
-        head_dim=128,
-        device=device,
-        dtype=torch.bfloat16,
+    pool = CacheManager(
+        KVCache(
+            KVCacheConfig(
+                num_layers=2,
+                num_kv_heads=2,
+                head_dim=128,
+                dtype=torch.bfloat16,
+                total_layers=2,
+                total_kv_heads=2,
+            ),
+            num_pages=16,
+            page_size=64,
+            device=device,
+        )
     )
-    pool.k.normal_(std=0.1)
-    pool.v.normal_(std=0.1)
+    pool.cache.k.normal_(std=0.1)
+    pool.cache.v.normal_(std=0.1)
     backend = FlashInferAttentionBackend(tuning=FlashInferTuningConfig(workspace_size=64 << 20))
     selection = AttentionSelection("flashinfer", (backend,))
-    bind_attention_modules(model, pool, selection)
+    bind_attention_modules(model, pool.cache, selection)
     yield model, pool, selection, device
     torch.cuda.synchronize(device)
     pool.close()
@@ -151,7 +164,7 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind,
     )
     predicates = torch.ones(rows + 1, dtype=torch.bool, device=device)
     runner.configure_inputs(
-        geometry=InputGeometry(rows, rows, rows, 1319, 512),
+        input_config=InputBufferConfig(rows, rows, rows, 1319, 512),
         kv_cache=pool,
         latent_pool=None,
         decode_predicates=predicates,
@@ -226,14 +239,14 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind,
 @pytest.mark.parametrize("numerical_model", ["qwen", "sensenova"], indirect=True)
 @torch.inference_mode()
 def test_model_prefill_padding_preserves_live_outputs(numerical_model):
-    from uniserve_worker.backends.attention import resolve_attention_selection
+    from uniserve.attention import resolve_attention_selection
     from uniserve_worker.execution.runners.prefill import stage_text
 
     model, pool, _selection, device = numerical_model
     selection = resolve_attention_selection(
         "auto", tuning=FlashInferTuningConfig(workspace_size=64 << 20), block_size=64
     )
-    bind_attention_modules(model, pool, selection)
+    bind_attention_modules(model, pool.cache, selection)
     runner = ModelRunner(
         model,
         WorkerConfig(
@@ -247,7 +260,7 @@ def test_model_prefill_padding_preserves_live_outputs(numerical_model):
         attention=selection,
     )
     runner.configure_inputs(
-        geometry=InputGeometry(8, 16, 16, 4, 512),
+        input_config=InputBufferConfig(8, 16, 16, 4, 512),
         kv_cache=pool,
         latent_pool=None,
         decode_predicates=torch.ones(4, dtype=torch.bool, device=device),
@@ -277,7 +290,7 @@ def test_model_prefill_padding_preserves_live_outputs(numerical_model):
                     pool,
                     tokens,
                     tuple((page,) for page in pages[: len(lengths)]),
-                    packed=model.text_attention_mode is AttentionMode.PACKED,
+                    packed=model.text_backbone.attention_mode is AttentionMode.PACKED,
                 )
                 expected = forward(batch).clone()
                 actual = runner.run_batch(entry, batch, forward, eligible=True)
@@ -291,9 +304,9 @@ def test_model_prefill_padding_preserves_live_outputs(numerical_model):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
 def test_model_flow_replay_preserves_live_conditioning(numerical_model):
-    from uniserve_worker.backends.attention import resolve_attention_selection
-    from uniserve_worker.execution.attention import physical_columns
-    from uniserve_worker.execution.diffusion_runner import denoise_geometry
+    from uniserve.attention import resolve_attention_selection
+    from uniserve.attention.inputs import physical_columns
+    from uniserve_worker.execution.diffusion_runner import prepare_denoise_inputs
     from uniserve_worker.execution.rows import ForwardRow
     from uniserve_worker.protocol.batch import PipelineStage
 
@@ -301,7 +314,7 @@ def test_model_flow_replay_preserves_live_conditioning(numerical_model):
     selection = resolve_attention_selection(
         "auto", tuning=FlashInferTuningConfig(workspace_size=64 << 20), block_size=64
     )
-    bind_attention_modules(model, pool, selection)
+    bind_attention_modules(model, pool.cache, selection)
     generation = model.generation
     assert generation is not None
     height = width = 16
@@ -321,7 +334,7 @@ def test_model_flow_replay_preserves_live_conditioning(numerical_model):
         attention=selection,
     )
     runner.configure_inputs(
-        geometry=InputGeometry(1, image_tokens, image_tokens, 4, 512),
+        input_config=InputBufferConfig(1, image_tokens, image_tokens, 4, 512),
         kv_cache=pool,
         latent_pool=None,
         decode_predicates=torch.ones(2, dtype=torch.bool, device=device),
@@ -338,7 +351,7 @@ def test_model_flow_replay_preserves_live_conditioning(numerical_model):
     assert buffers is not None
 
     def stage(prefix, timestep):
-        positions, indexes, conditioning, query, local_text = denoise_geometry(
+        positions, indexes, conditioning, query, local_text = prepare_denoise_inputs(
             generation, latent, height, width, temporal=prefix, patch_size=2
         )
         attention = physical_columns(

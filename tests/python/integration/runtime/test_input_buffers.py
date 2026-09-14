@@ -3,9 +3,10 @@
 import pytest
 import torch
 
-from uniserve_worker.execution.input_buffers import InputBuffers, InputGeometry
+from uniserve.attention.metadata import AttentionMetadata, AttentionMode
+from uniserve.model.tensors import TokenSelection
+from uniserve_worker.execution.input_buffers import InputBufferConfig, InputBuffers
 from uniserve_worker.execution.rows import ForwardRow
-from uniserve_worker.modeling.tensors import AttentionMetadata, AttentionMode, TokenSelection
 from uniserve_worker.protocol.batch import ForwardMode
 from uniserve_worker.runtime.decode_state import DecodeState
 
@@ -40,7 +41,7 @@ def test_token_positions_preserve_row_order_across_source_devices(devices, posit
         seq_lens_cpu=(1, 1),
     )
     buffers = InputBuffers(
-        geometry=InputGeometry(2, 2, 2, 1, 0),
+        config=InputBufferConfig(2, 2, 2, 1, 0),
         device="cuda:0",
     )
     try:
@@ -87,7 +88,7 @@ def test_mixed_forward_reads_current_continuation_in_row_order(continuation_firs
         query_lens_cpu=query_lens,
         seq_lens_cpu=query_lens,
     )
-    buffers = InputBuffers(geometry=InputGeometry(2, 3, 3, 1, 0), device="cuda:0")
+    buffers = InputBuffers(config=InputBufferConfig(2, 3, 3, 1, 0), device="cuda:0")
     enabled = torch.ones(1, dtype=torch.bool, device="cuda:0")
     try:
         # Reusing the same row must read the latest committed continuation,

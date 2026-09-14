@@ -4,15 +4,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve_worker.execution.cuda_graph import CudaGraph, capture_pools
-from uniserve_worker.modeling.tensors import ExpertRoute
-from uniserve_worker.nn.branch import branch
-from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.linear import QKVParallelLinear
-from uniserve_worker.nn.mesh import Communicator
-from uniserve_worker.nn.norm import RMSNorm
-from uniserve_worker.nn.qkv import RotaryQKV
-from uniserve_worker.runtime.branches import bind_branches
+from uniserve.attention.metadata import ExpertRoute
+from uniserve.distributed.mesh import Communicator
+from uniserve.nn.branch import branch
+from uniserve.nn.layer import LayerConfig
+from uniserve.nn.linear import QKVParallelLinear
+from uniserve.nn.norm import RMSNorm
+from uniserve.nn.qkv import RotaryQKV
+from uniserve.runtime.branches import bind_branches
+from uniserve.runtime.cuda_graph import CudaGraph, capture_pools
 
 pytestmark = pytest.mark.unit
 

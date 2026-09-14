@@ -4,16 +4,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve_worker.backends.attention import (
-    video_sparse_cute,
-    video_sparse_flashinfer,
-    video_sparse_triton,
-)
-from uniserve_worker.backends.attention.video_sparse_provider import resolve_sparse_provider
-from uniserve_worker.nn.parallel_attention import AttentionOutputTargets
-from uniserve_worker.nn.sparse_attention import PreparedVideoSparseInputs
-from uniserve_worker.ops.video_sparse import compose_to_head_shards
-from uniserve_worker.ops.video_sparse_rows import SparseAttentionPattern
+from uniserve.attention import video_sparse_cute, video_sparse_flashinfer, video_sparse_triton
+from uniserve.attention.video_sparse_provider import resolve_sparse_provider
+from uniserve.nn.parallel_attention import AttentionOutputTargets
+from uniserve.nn.sparse_attention import PreparedVideoSparseInputs
+from uniserve.ops.video_sparse import compose_to_head_shards
+from uniserve.ops.video_sparse_rows import SparseAttentionPattern
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -76,8 +72,8 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
 def _sparse_provider(provider_name):
     from functools import partial
 
-    from uniserve_worker.backends.attention.video_sparse_provider import SparseAttentionProvider
-    from uniserve_worker.ops.video_sparse_rows import SparseRowExecution
+    from uniserve.attention.video_sparse_provider import SparseAttentionProvider
+    from uniserve.ops.video_sparse_rows import SparseRowExecution
 
     if provider_name == "native":
         provider = resolve_sparse_provider(torch.device("cuda"))
@@ -330,8 +326,8 @@ def test_fused_composition_restores_each_rows_head_interval(members):
 
 
 def test_distinct_query_key_extents_and_empty_partition_merge():
-    from uniserve_worker.backends.attention.base import merge_attention_states
-    from uniserve_worker.backends.attention.video_sparse_cute import block_sparse_attention
+    from uniserve.attention.base import merge_attention_states
+    from uniserve.attention.video_sparse_cute import block_sparse_attention
 
     torch.manual_seed(891)
     heads, query_rows, key_rows, width = 7, 128, 256, 128
@@ -393,8 +389,8 @@ def test_distinct_query_key_extents_and_empty_partition_merge():
 
 
 def test_partial_attention_preserves_cancellation_until_all_keys_are_merged():
-    from uniserve_worker.backends.attention.base import merge_attention_states
-    from uniserve_worker.backends.attention.video_sparse_cute import block_sparse_attention
+    from uniserve.attention.base import merge_attention_states
+    from uniserve.attention.video_sparse_cute import block_sparse_attention
 
     query = torch.zeros(128, 7, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.zeros_like(query)
@@ -428,7 +424,7 @@ def test_partial_attention_preserves_cancellation_until_all_keys_are_merged():
 
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 def test_sparse_softmax_underflow_and_empty_key_partitions(output_dtype):
-    from uniserve_worker.backends.attention.video_sparse_cute import block_sparse_attention
+    from uniserve.attention.video_sparse_cute import block_sparse_attention
 
     torch.manual_seed(772)
     rows, heads, width = 4096, 7, 128

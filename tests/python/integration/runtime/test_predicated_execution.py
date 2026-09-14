@@ -15,7 +15,7 @@ from tests.python.fixtures.depth_one import (
     umm_params,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.models.stub import _next_token
+from uniserve_models.stub import _next_token
 from uniserve_worker.protocol.batch import (
     ComputationId,
     DType,

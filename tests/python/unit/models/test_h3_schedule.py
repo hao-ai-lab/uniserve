@@ -3,10 +3,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.models.minimax_h3.config import FASTH3_LADDER, FASTH3_TIME_SCALE
-from uniserve_worker.models.minimax_h3.packing import audio_latent_frames
-from uniserve_worker.nn.diffusion.integrator import clean_sample_euler_step_
-from uniserve_worker.nn.diffusion.schedule import shifted_sigmas
+from uniserve.nn.diffusion.integrator import clean_sample_euler_step_
+from uniserve.nn.diffusion.schedule import shifted_sigmas
+from uniserve_models.minimax_h3.config import FASTH3_LADDER, FASTH3_TIME_SCALE
+from uniserve_models.minimax_h3.packing import audio_latent_frames
 
 pytestmark = pytest.mark.unit
 

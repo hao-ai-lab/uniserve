@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from ..backends.triton import triton_available
+from uniserve.runtime.triton import triton_available
 
 try:
     import triton

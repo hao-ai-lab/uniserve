@@ -13,12 +13,14 @@ import inspect
 import logging
 import os
 import time
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-from .foundation.env import flag_from_value, int_from_value
+from uniserve.env import flag_from_value, int_from_value
+from uniserve.profiling import profile_range
+
 from .foundation.errors import WorkerError, should_capture_trace
 
 torch: Any | None
@@ -32,7 +34,6 @@ else:  # pragma: no cover
 __all__ = [
     "WorkerProfiler",
     "WorkerProfileConfig",
-    "profile_range",
     "timing_events_enabled",
 ]
 
@@ -206,15 +207,6 @@ class WorkerProfiler:
             self._finished = True
 
 
-def profile_range(debug_name: str):
-    """Emit a torch-profiler span and/or NVTX range when profiling is active."""
-    record = _torch_profiler_enabled()
-    nvtx = _nvtx_ranges_enabled()
-    if not record and not nvtx:
-        return _NULL_CONTEXT
-    return _profile_range_impl(debug_name, record=record, nvtx=nvtx)
-
-
 def timing_events_enabled() -> bool:
     """Return whether optional CUDA interval timing is configured."""
 
@@ -222,38 +214,6 @@ def timing_events_enabled() -> bool:
     return bool(env.get(_TORCH_PROFILE_DIR_ENV)) or bool(
         flag_from_value(env.get(_NVTX_ENV)) or flag_from_value(env.get(_CUDA_PROFILER_ENV))
     )
-
-
-@contextmanager
-def _profile_range_impl(debug_name: str, *, record: bool, nvtx: bool) -> Iterator[None]:
-    """Enter configured record-function and NVTX ranges around one code region."""
-
-    with ExitStack() as stack:
-        if record and torch is not None:
-            stack.enter_context(torch.profiler.record_function(debug_name))
-        if nvtx and torch is not None:
-            torch.cuda.nvtx.range_push(debug_name)
-            stack.callback(torch.cuda.nvtx.range_pop)
-        yield
-
-
-def _torch_profiler_enabled() -> bool:
-    """Return whether PyTorch autograd profiling is currently active."""
-
-    if torch is None:
-        return False
-    enabled = getattr(torch.autograd, "_profiler_enabled", None)
-    return bool(enabled()) if callable(enabled) else False
-
-
-def _nvtx_ranges_enabled() -> bool:
-    """Return whether environment policy enables NVTX range emission."""
-
-    if torch is None:
-        return False
-    if not torch.cuda.is_available():
-        return False
-    return flag_from_value(os.environ.get(_NVTX_ENV))
 
 
 def _parse_activities(raw: str | None) -> tuple[str, ...]:

@@ -5,13 +5,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker import ops
-from uniserve_worker.nn.diffusion.cfg import (
-    CfgParams,
-    RenormKind,
-    combine_cfg,
-)
-from uniserve_worker.nn.norm import RMSNorm
+from uniserve import ops
+from uniserve.nn.diffusion.cfg import CfgParams, RenormKind, combine_cfg
+from uniserve.nn.norm import RMSNorm
 
 pytestmark = pytest.mark.unit
 

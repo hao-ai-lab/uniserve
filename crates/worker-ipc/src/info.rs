@@ -4,7 +4,7 @@ use super::*;
 
 /// Fixed physical KV-cache geometry exposed by a worker that executes AR work.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct KvCacheConfig {
+pub struct KvCacheInfo {
     /// Tokens stored in each physical KV page.
     pub block_size: u32,
     /// Total physical pages in the request KV pool.
@@ -31,7 +31,7 @@ pub struct KvCacheConfig {
     pub dtype: KvCacheDtype,
 }
 
-impl KvCacheConfig {
+impl KvCacheInfo {
     /// Bound one token's logical publication independently of the producing TP size.
     /// A partial-page suffix may carry a complete scale for every head group.
     pub fn publication_bytes_per_token(&self) -> u64 {
@@ -93,18 +93,18 @@ pub struct EntryInfo {
     pub config: uniserve_core::ComponentConfig,
     /// Named tensor results declared by the loaded computation. Their order
     /// defines product output indices independently of Worker grouping.
-    pub outputs: Vec<TensorSpec>,
+    pub outputs: Vec<OutputInfo>,
 }
 
 /// A computation's bounded tensor result, before request and storage binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TensorSpec {
+pub struct OutputInfo {
     pub name: String,
     pub dtype: DType,
     pub shape_bound: ShapeBound,
 }
 
-impl TensorSpec {
+impl OutputInfo {
     /// Validate the logical representation advertised to allocation and routing.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(!self.name.is_empty(), "tensor result must have a name");
@@ -153,7 +153,6 @@ pub struct WorkerInfo {
     pub pipeline_components: std::collections::BTreeMap<PipelineStage, String>,
     /// Effective number of diffusion predictions advertised by the loaded model.
     pub num_inference_steps: u32,
-    /// Model-weight revision used to reject cross-version products.
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
     /// Rank-local primary compute device used to bind physical transfer edges.
@@ -179,7 +178,7 @@ pub struct WorkerInfo {
     /// Number of resident request slots.
     pub request_slots: u32,
     /// Paged KV geometry when autoregressive work is supported.
-    pub kv_cache: Option<KvCacheConfig>,
+    pub kv_cache: Option<KvCacheInfo>,
     /// Model-defined units stored in one latent page.
     pub latent_page_units: u32,
     /// Physical latent pages including the reserved sentinel page.
@@ -373,7 +372,7 @@ impl Default for WorkerInfo {
             max_batch_ops: 1,
             max_batch_tokens: 8192,
             request_slots: 128,
-            kv_cache: Some(KvCacheConfig {
+            kv_cache: Some(KvCacheInfo {
                 block_size: 64,
                 num_blocks: 4096,
                 num_layers: 28,

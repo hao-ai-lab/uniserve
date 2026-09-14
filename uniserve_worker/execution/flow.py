@@ -7,12 +7,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from uniserve.model.batch import DiffusionBatch
+from uniserve.model.diffusion import DiffusionMixin
+from uniserve.model.media import ImageSize
+from uniserve.model.tensors import TokenSelection
+from uniserve.nn.diffusion.cfg import Branch, CfgPlan, RenormKind
+from uniserve.nn.diffusion.config import DiffusionConfig
+from uniserve.nn.rng import flow_noise_seed, normal_noise
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.modeling.batch import DiffusionBatch
-from uniserve_worker.modeling.diffusion import DiffusionMixin
-from uniserve_worker.modeling.geometry import MediaShape
-from uniserve_worker.modeling.tensors import TokenSelection
-from uniserve_worker.nn.diffusion.cfg import Branch, CfgPlan, build_flow_cfg_plan
 from uniserve_worker.protocol.batch import (
     DrawLayout,
     FinishFlags,
@@ -26,8 +28,7 @@ from uniserve_worker.protocol.batch import (
 )
 from uniserve_worker.runtime.request import RequestState
 
-from ..nn.rng import diffusion_noise
-from . import operations as operation_geometry
+from . import operations
 from .batch_state import BatchState
 from .diffusion_state import DiffusionState, resolve_prefix
 from .output import PendingOutput
@@ -41,10 +42,25 @@ if TYPE_CHECKING:
     from ..bootstrap.worker_info import WorkerInfo
     from ..config import WorkerConfig
     from ..runtime.block_tables import BlockTables
-    from ..runtime.kv_cache import KVCache
+    from ..runtime.cache_manager import CacheManager
     from ..runtime.latent_pool import LatentPool
     from ..transfer.tickets import Transport
     from .model_runner import ModelRunner
+
+
+def diffusion_config(image: ImageParams) -> DiffusionConfig:
+    """Normalize admitted wire options at the numerical execution boundary."""
+
+    return DiffusionConfig(
+        steps=image.steps,
+        timestep_shift=image.timestep_shift if image.timestep_shift > 0 else None,
+        cfg_text_scale=image.cfg_text_scale,
+        cfg_img_scale=image.cfg_img_scale,
+        cfg_interval=image.cfg_interval,
+        cfg_renorm=RenormKind(image.cfg_renorm_type),
+        cfg_renorm_min=image.cfg_renorm_min,
+        seed=image.seed or 0,
+    )
 
 
 def prepare_latent(
@@ -52,7 +68,7 @@ def prepare_latent(
     completion_group: int,
     *,
     state: BatchState,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     worker_info: WorkerInfo,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
@@ -74,7 +90,7 @@ def prepare_latent(
             "media preparation requires one exact conditioning input and latent output"
         )
     request = state.pending_output(completion_group, request_id)
-    cache = operation_geometry.cache_coordinates(request, tables=request_tables)
+    cache = operations.cache_coordinates(request, tables=request_tables)
     publications = kv_cache
     if publications is None:
         raise invalid_descriptor("media preparation requires KV publication storage")
@@ -91,8 +107,8 @@ def prepare_latent(
     if image is None:
         raise invalid_descriptor("media preparation has no admitted image parameters")
     if (
-        operation_geometry.require_progress(request).latent_product is not None
-        or operation_geometry.require_progress(request).flow_step != 0
+        operations.require_progress(request).latent_product is not None
+        or operations.require_progress(request).flow_step != 0
     ):
         raise invalid_descriptor("media preparation repeats an active latent trajectory")
     rng = operation.rng
@@ -115,12 +131,20 @@ def prepare_latent(
     pool = latent_pool
     staging.value.zero_()
     initial = staging.value[: int(params.latent_units)]
+    diffusion = model_runner.diffusion
+    if diffusion is None:
+        raise invalid_descriptor("image initialization requires a diffusion execution owner")
+    numerical_config = diffusion_config(image)
+    trajectory = diffusion.initialize(
+        ImageSize(int(params.height), int(params.width)), numerical_config
+    )
+    row.request.diffusion = trajectory
     initial_latent(
         operation,
         int(params.height),
         int(params.width),
         initial,
-        steps=int(image.steps),
+        seed=numerical_config.seed,
         model_runner=model_runner,
     )
     pool.initialize(
@@ -137,7 +161,7 @@ def prepare_latent(
     request.latent_generation = int(output.generation)
     request.latent_step = 0
     request.projected_progress = replace(
-        operation_geometry.require_progress(request), latent_product=output
+        operations.require_progress(request), latent_product=output
     )
     products = publish_latent_transfer(
         operation,
@@ -152,9 +176,9 @@ def prepare_latent(
         state=state,
     )
     request.status = OpStatus.OK
-    request.projected_progress = operation_geometry.execution_runtime(request, cache, flow_step=0)
+    request.projected_progress = operations.execution_runtime(request, cache, flow_step=0)
     request.finish_flags = FinishFlags()
-    request.product_generations = operation_geometry.output_generations(operation)
+    request.product_generations = operations.output_generations(operation)
     request.products = products
     return request
 
@@ -164,7 +188,7 @@ def initialize(
     completion_group: int,
     *,
     state: BatchState,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     latent_pool: LatentPool,
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
@@ -181,7 +205,7 @@ def initialize(
             "flow operation requires exact conditioning and one latent input/output generation"
         )
     request = state.pending_output(completion_group, request_id)
-    cache = operation_geometry.cache_coordinates(request, tables=request_tables)
+    cache = operations.cache_coordinates(request, tables=request_tables)
     publications = kv_cache
     if publications is None:
         raise invalid_descriptor("flow conditioning requires cache publication storage")
@@ -205,7 +229,7 @@ def initialize(
         or latent_input == latent_output
     ):
         raise invalid_descriptor("flow latent generations are invalid")
-    if operation_geometry.require_progress(request).latent_product != latent_input:
+    if operations.require_progress(request).latent_product != latent_input:
         raise invalid_descriptor("flow operation does not name the current latent generation")
     row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
@@ -226,15 +250,10 @@ def initialize(
     diffusion = model_runner.diffusion
     if diffusion is None:
         raise invalid_descriptor("flow operation has no diffusion execution owner")
-    geometry = (
-        int(params.height),
-        int(params.width),
-        int(image.steps),
-        float(image.timestep_shift),
-    )
+    size = ImageSize(int(params.height), int(params.width))
     trajectory = row.request.diffusion
-    if trajectory is None or trajectory.geometry != geometry:
-        trajectory = diffusion.initialize(*geometry)
+    if trajectory is None or trajectory.size != size:
+        trajectory = diffusion.initialize(size, diffusion_config(image))
         row.request.diffusion = trajectory
     # Prefix initialization follows this submission's descriptors, including
     # retries after a failed operation; retained metadata is not accepted state.
@@ -267,25 +286,21 @@ def prepare_step(
     staging = row.latent_staging
     if params is None or staging is None:
         raise invalid_descriptor("trajectory operation has no staged latent inputs")
-    if not 0 <= step_index < len(trajectory.timesteps):
+    schedule, config = trajectory.schedule, trajectory.config
+    if schedule is None or config is None:
+        raise invalid_descriptor("image trajectory requires numerical configuration and schedule")
+    if not 0 <= step_index < config.steps:
         raise IndexError(step_index)
-    host_t, host_t_next = trajectory.timesteps[step_index]
-    t, t_next = latent_pool.stage_timestep(row.request.request_pool_idx, host_t, host_t_next)
-    guide = build_flow_cfg_plan(
-        cfg_text_scale=float(image.cfg_text_scale),
-        cfg_img_scale=float(image.cfg_img_scale),
-        recipe=generation.cfg_recipe,
-        renorm=image.cfg_renorm_type,
-        renorm_min=float(image.cfg_renorm_min),
-        use_cfg=float(image.cfg_interval[0]) <= host_t <= float(image.cfg_interval[1]),
+    times = schedule.timesteps[0]
+    t, t_next = latent_pool.stage_timestep(
+        row.request.request_pool_idx, float(times[step_index]), float(times[step_index + 1])
     )
-    if len(guide.branches) > int(generation.max_cfg_branches):
-        raise invalid_descriptor("flow CFG plan exceeds the model branch bound")
+    guide = generation.guidance(config, step_index)
     prefix_rows = []
     prefix_branches = []
     entries = trajectory.entries
     descriptors = state.group_forward_indices[completion_group].get(
-        operation_geometry.operation_identity(operation), ()
+        operations.operation_identity(operation), ()
     )
     if len(descriptors) < len(guide.branches):
         raise invalid_descriptor("media denoise has incomplete forward-row metadata")
@@ -296,7 +311,7 @@ def prepare_step(
         source = generation.branch_source(branch)
         if source not in trajectory.prefixes:
             trajectory.prefixes[source] = resolve_prefix(
-                generation,
+                model_runner.flow_prompt,
                 source,
                 image_prompt=image.image_prompts[0] if image.image_prompts else "",
                 negative_prompt=image.negative_prompt,
@@ -383,7 +398,7 @@ def finish(
     request.latent_generation = int(latent_output.generation)
     request.latent_step = final_step
     request.projected_progress = replace(
-        operation_geometry.require_progress(request), latent_product=latent_output
+        operations.require_progress(request), latent_product=latent_output
     )
     products = publish_latent_transfer(
         operation,
@@ -398,13 +413,13 @@ def finish(
         state=state,
     )
     request.status = OpStatus.OK
-    request.projected_progress = operation_geometry.execution_runtime(
+    request.projected_progress = operations.execution_runtime(
         request,
         trajectory.cache,
         flow_step=final_step,
     )
     request.finish_flags = FinishFlags()
-    request.product_generations = operation_geometry.output_generations(operation)
+    request.product_generations = operations.output_generations(operation)
     request.products = products
     main_slot = int(request.request.request_pool_idx)
     alternative_slots = {
@@ -470,7 +485,7 @@ def initial_latent(
     width: int,
     target: torch.Tensor,
     *,
-    steps: int,
+    seed: int,
     model_runner: ModelRunner,
 ) -> None:
     """Create deterministic bounded latent noise or reuse the request’s staged image latent."""
@@ -480,20 +495,15 @@ def initial_latent(
         raise invalid_descriptor("latent preparation requires the diffusion capability")
     rng = operation.rng
     assert rng is not None and rng.draw_layout is DrawLayout.FLOW_NOISE
-    shape = MediaShape(height, width)
-    spec = model.diffusion_spec(shape, steps)
-    raw = target.reshape(spec.modalities[0].noise_shape).unsqueeze(0)
+    shape = ImageSize(height, width)
+    raw = target.reshape(model.noise_shape("image", shape)).unsqueeze(0)
     noise = {"image": raw}
-    diffusion_noise(
-        spec,
-        seeds=(int(rng.seed),),
-        coordinates=(int(rng.semantic_index_base),),
-        device=target.device,
-        dtype=target.dtype,
-        out=noise,
+    normal_noise(
+        (flow_noise_seed(seed, int(rng.semantic_index_base)),),
+        tuple(noise.values()),
     )
     model.prepare_latents(
-        DiffusionBatch(latents={"image": (target,)}, shapes=(shape,)),
+        DiffusionBatch(latents={"image": (target,)}, sizes=(shape,)),
         noise=noise,
         state={"image": target.unsqueeze(0)},
         constants={},

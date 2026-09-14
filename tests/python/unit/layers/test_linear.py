@@ -5,15 +5,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.linear import (
-    LinearBase,
-    MergedColumnParallelLinear,
-)
-from uniserve_worker.nn.mesh import Communicator
-from uniserve_worker.nn.mlp import GatedMLP
-from uniserve_worker.nn.quant.base import PreparedLinearInput
-from uniserve_worker.nn.quant.fp8 import DynamicW8A8Fp8LinearMethod
+from uniserve.distributed.mesh import Communicator
+from uniserve.nn.layer import LayerConfig
+from uniserve.nn.linear import LinearBase, MergedColumnParallelLinear
+from uniserve.nn.mlp import GatedMLP
+from uniserve.nn.quant.base import PreparedLinearInput
+from uniserve.nn.quant.fp8 import DynamicW8A8Fp8LinearMethod
 
 pytestmark = pytest.mark.unit
 
@@ -122,10 +119,10 @@ def test_deferred_gated_mlp_preserves_dense_projection_bias():
 
 @pytest.mark.parametrize("component", ["mot", "vision"])
 def test_multimodal_layers_keep_excluded_checkpoint_projections_dense(component):
-    from uniserve_worker.nn.decoder.mot import MoTConfig, MoTModel
-    from uniserve_worker.nn.quant.base import process_quantized_modules
-    from uniserve_worker.nn.quant.config import QuantizationConfig
-    from uniserve_worker.nn.vision.encoder import VisionEncoder, VisionEncoderConfig
+    from uniserve.nn.decoder.mot import MoTConfig, MoTModel
+    from uniserve.nn.quant.base import process_quantized_modules
+    from uniserve.nn.quant.config import QuantizationConfig
+    from uniserve.nn.vision.encoder import VisionEncoder, VisionEncoderConfig
 
     if component == "mot":
         prefix = "language_model.model"
@@ -205,12 +202,9 @@ def test_packed_projection_branches_preserve_logical_weights_and_bias(quantized,
 
 @pytest.mark.parametrize("heads,kv_heads", [(4, 2), (4, 1), (8, 8)])
 def test_query_owners_load_their_corresponding_grouped_key_value_heads(heads, kv_heads):
-    from uniserve_worker.loader.handles import TensorWeightHandle
-    from uniserve_worker.loader.weight_loaders import (
-        attach_parameter_loaders,
-        load_parameter_weight,
-    )
-    from uniserve_worker.nn.linear import QKVParallelLinear
+    from uniserve.loading.handles import TensorWeightHandle
+    from uniserve.loading.weight_loaders import attach_parameter_loaders, load_parameter_weight
+    from uniserve.nn.linear import QKVParallelLinear
 
     head_dim, width = 4, 8
     weights = tuple(

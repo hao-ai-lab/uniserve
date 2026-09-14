@@ -15,13 +15,13 @@ if TYPE_CHECKING:
 
 import torch
 
+from uniserve.runtime.device import fill_cpu_ints
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
 from ..foundation.errors import invalid_descriptor, resource_error
 from ..protocol.batch import BufferId, RequestKey, TensorRef
 from ..transfer.exports import ExportLocations, release_exports
 from ..transfer.tickets import TransferTicket
-from .device import fill_cpu_ints
 
 
 @dataclass(frozen=True, slots=True)

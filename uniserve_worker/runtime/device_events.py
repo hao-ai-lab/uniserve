@@ -9,8 +9,9 @@ from threading import RLock
 
 import torch
 
+from uniserve.runtime.device import canonical_device
+
 from ..foundation.errors import WorkerError, WorkerErrorCode
-from .device import canonical_device
 
 
 def _invariant(message: str) -> WorkerError:

@@ -1,51 +1,50 @@
-"""Startup rejects component declarations that cannot supply their numerical calls."""
-
-from pathlib import Path
+"""Component startup preserves callable and participation constraints."""
 
 import pytest
+import torch
 
-from uniserve_worker.bootstrap.catalog import CatalogEntry
+from uniserve.distributed.mesh import Communicator, DeviceMesh
+from uniserve.distributed.parallel import ParallelConfig
+from uniserve.model.components import ComponentCall
+from uniserve.model.model import Model
+from uniserve_worker.bootstrap.components import bind_components, validate_components
+from uniserve_worker.config import ComponentConfig
+from uniserve_worker.execution.model_entry import ModelEntry
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.loader.source import ModelSource
-from uniserve_worker.modeling.components import Call, CallSpec, ComponentSpec
-from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
-from uniserve_worker.models.stub import StubModel
 
 pytestmark = pytest.mark.unit
 
 
-@pytest.mark.parametrize(
-    ("base", "call"),
-    [(Qwen3ForCausalLM, call) for call in Call if call is not Call.TEXT]
-    + [
-        (StubModel, Call.ENCODE_TEXT),
-        (StubModel, Call.ENCODE_CONDITIONING),
-        (StubModel, Call.DECODE_VIDEO),
-        (StubModel, Call.DECODE_AUDIO),
-    ],
-)
-def test_source_validation_rejects_unsupported_calls_even_without_local_components(base, call):
-    class DeclaredModel(base):
+def test_binding_rejects_a_missing_numerical_method():
+    class DeclaredModel(Model):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Identity()
+
         @classmethod
-        def components(cls, config):
-            return (ComponentSpec("encoder", (CallSpec(call),)),)
+        def component_calls(cls, config):
+            return (ComponentCall("encoder", "encode:text"),)
 
-    source = ModelSource(Path("."), None, {}, CatalogEntry("DeclaredModel", DeclaredModel))
+    group = Communicator(device=torch.device("cpu"))
+    binding = ModelEntry(
+        "encoder",
+        ComponentConfig((0,)),
+        group,
+        DeviceMesh((0,), 0, ParallelConfig(), group.device),
+        group.device,
+    )
+    with pytest.raises(WorkerError, match="no callable 'encode'"):
+        bind_components(DeclaredModel(), {"encoder": binding})
 
-    with pytest.raises(WorkerError, match=f"unsupported {call.value} computation"):
-        source.validate({})
 
-
-def test_source_validation_rejects_duplicate_component_roles():
-    class DeclaredModel(Qwen3ForCausalLM):
+def test_source_validation_rejects_conflicting_stage_declarations():
+    class DeclaredModel(Model):
         @classmethod
-        def components(cls, config):
+        def component_calls(cls, config):
             return (
-                ComponentSpec("model", (CallSpec(Call.TEXT),)),
-                ComponentSpec("model", (CallSpec(Call.TEXT, stage="last"),)),
+                ComponentCall("", "forward"),
+                ComponentCall("", "forward", stage="last"),
             )
 
-    source = ModelSource(Path("."), None, {}, CatalogEntry("DeclaredModel", DeclaredModel))
-
-    with pytest.raises(WorkerError, match="repeats component role"):
-        source.validate({})
+    with pytest.raises(WorkerError, match="repeats numerical method"):
+        validate_components(DeclaredModel, {}, {})

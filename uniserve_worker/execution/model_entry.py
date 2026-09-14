@@ -3,22 +3,22 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeAlias
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
 
-from ..modeling.components import CallSpec
-from ..nn.mesh import Communicator, DeviceMesh
-from ..nn.parallel import ComponentConfig
-from ..protocol.batch import Computation, TensorSpec
-from ..runtime.collectives import NcclCommunicator
+from uniserve.distributed.collectives import NcclCommunicator
+from uniserve.distributed.mesh import Communicator, DeviceMesh
+from uniserve_worker.config import ComponentConfig
+
+from ..protocol.batch import Computation, OutputInfo
 from .cuda_stream import CudaStream
 
 if TYPE_CHECKING:
     from .batch import ExecutionOutput
     from .input_buffers import InputBuffers
-from .cuda_graph import CudaGraph
+from uniserve.runtime.cuda_graph import CudaGraph
 
 TensorOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
 TensorSignature: TypeAlias = tuple[tuple[tuple[int, ...], torch.dtype, tuple[int, ...]], ...]
@@ -57,9 +57,12 @@ class ModelEntry:
     device: torch.device
     forward: Callable[..., TensorOutput | ExecutionOutput] | None = None
     groups: tuple[Communicator, ...] = ()
-    output_schema: tuple[TensorSpec, ...] = ()
+    outputs: tuple[OutputInfo, ...] = ()
     computations: tuple[Computation, ...] = ()
-    calls: tuple[CallSpec, ...] = ()
+    component: str = ""
+    methods: dict[str, tuple[Callable[..., Any], tuple[Communicator, ...]]] = field(
+        default_factory=dict
+    )
     input_buffers: InputBuffers | None = None
     cuda_stream: CudaStream | None = None
     # Native device streams use process groups and shared reduction workspaces;
@@ -68,6 +71,7 @@ class ModelEntry:
     fixed_inputs: tuple[torch.Tensor, ...] | None = None
     signature: TensorSignature | None = None
     graph: CudaGraph[TensorOutput] | None = None
+    capture_inputs: tuple[torch.Tensor, ...] | None = None
 
     def __post_init__(self) -> None:
         if any(rank not in self.process_group.ranks for rank in self.config.ranks):
@@ -90,22 +94,6 @@ class ModelEntry:
     def owns(self) -> bool:
         """Whether this process executes the configured entry."""
         return self.process_group.rank in self.config.ranks
-
-    @property
-    def local_calls(self) -> tuple[CallSpec, ...]:
-        """Numerical calls whose declared pipeline stage participates locally."""
-
-        if not self.owns:
-            return ()
-        stage = 0 if self.mesh is None else self.mesh.coord("pp")
-        stages = 1 if self.mesh is None else self.mesh.size("pp")
-        return tuple(
-            call
-            for call in self.calls
-            if call.stage == "all"
-            or (call.stage == "first" and stage == 0)
-            or (call.stage == "last" and stage == stages - 1)
-        )
 
     @property
     def input_ranks(self) -> tuple[int, ...]:

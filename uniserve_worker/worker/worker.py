@@ -8,18 +8,32 @@ from bisect import insort
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
+from dataclasses import replace
 from functools import partial
 from queue import SimpleQueue
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self
 
 import torch
 
-from uniserve_worker.backends.attention.selection import AttentionSelection
-from uniserve_worker.modeling.text import TextMixin
-from uniserve_worker.nn.attention import bind_attention_modules
-from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
-from uniserve_worker.nn.parallel import ComponentConfig
+from uniserve.attention.selection import AttentionSelection
+from uniserve.distributed.mesh import Communicator
+from uniserve.distributed.process_groups import ProcessGroups, initialize_process_groups
+from uniserve.math import ceil_div
+from uniserve.model.diffusion import DiffusionMixin
+from uniserve.model.model import Model
+from uniserve.model.text import TextMixin
+from uniserve.model.video import VideoMixin
+from uniserve.nn.attention import bind_attention_modules
+from uniserve.nn.diffusion.schedule import DiffusionSchedule
+from uniserve.nn.quant.kv_cache import resolve_kv_store_dtype
+from uniserve.profiling import profile_range
+from uniserve.runtime.device import canonical_device, device_memory_budget
+from uniserve.runtime.kv_cache import KVCache
+from uniserve.runtime.resources import close_resources
+from uniserve_models.processing import FlowPrompt, ImageProcessor
+from uniserve_worker.config import ComponentConfig
+from uniserve_worker.profiling import WorkerProfiler, record_failure, worker_range_name
 from uniserve_worker.protocol.batch import Computation, ComputationId, PipelineStage
 
 from ..bootstrap.capacity import (
@@ -28,7 +42,7 @@ from ..bootstrap.capacity import (
     device_total_bytes,
     resolve_request_capacity,
 )
-from ..bootstrap.distributed import initialize_entries, initialize_process_groups
+from ..bootstrap.distributed import initialize_entries
 from ..bootstrap.model_loader import load_worker_model, prepare_worker_model
 from ..bootstrap.worker_info import RequestKind, ResponseKind, WorkerInfo
 from ..bootstrap.worker_info_builder import build_worker_layout
@@ -49,12 +63,6 @@ from ..foundation.errors import (
     invalid_descriptor,
     unsupported_setup,
 )
-from ..foundation.math import ceil_div
-from ..foundation.resources import close_resources
-from ..modeling.model import Model
-from ..modeling.video import VideoMixin
-from ..nn.mesh import Communicator
-from ..profiling import WorkerProfiler, profile_range, record_failure, worker_range_name
 from ..protocol.batch import (
     BatchOutput,
     BufferId,
@@ -66,13 +74,11 @@ from ..protocol.batch import (
 )
 from ..runtime.block_tables import BlockTables
 from ..runtime.buffer_pool import BufferPool
+from ..runtime.cache_manager import CacheManager
 from ..runtime.cpu import CpuPool
 from ..runtime.decode_state import DecodeState
-from ..runtime.device import canonical_device, device_memory_budget
 from ..runtime.device_events import EventPool
-from ..runtime.kv_cache import KVCache
 from ..runtime.latent_pool import LatentPool
-from ..runtime.process_groups import ProcessGroups
 from ..runtime.request import RequestPool
 from ..runtime.tensor_store import TensorStore
 from ..transfer.exports import forget_exports, release_exports, retiring_exports
@@ -116,7 +122,7 @@ class Worker:
     worker_config: WorkerConfig
     runner: ModelRunner
     decode_state: DecodeState | None
-    kv_cache: KVCache | None
+    kv_cache: CacheManager | None
     block_tables: BlockTables | None
     latent_pool: LatentPool | None
     _completion_wake: Callable[[], None] | None = None
@@ -154,17 +160,25 @@ class Worker:
         source = prepare_worker_model(config)
 
         # Mathematical constraints are checked before physical groups exist.
-        distributed = initialize_process_groups(
-            rank=config.execution.rank,
-            local_rank=config.local_rank,
-            world_size=config.execution.world_size,
-            device=config.execution.device,
-            backend=config.distributed_backend,
-            init_method=config.distributed_init_method,
-        )
+        try:
+            distributed = initialize_process_groups(
+                rank=config.execution.rank,
+                local_rank=config.local_rank,
+                world_size=config.execution.world_size,
+                device=config.execution.device,
+                backend=config.distributed_backend,
+                init_method=config.distributed_init_method,
+            )
+        except ValueError as error:
+            # Public numerical resources report ordinary argument errors;
+            # the serving boundary assigns the worker's configuration code.
+            raise unsupported_setup(str(error)) from error
 
         try:
-            bindings = initialize_entries(distributed, dict(config.components))
+            try:
+                bindings = initialize_entries(distributed, dict(config.components))
+            except ValueError as error:
+                raise unsupported_setup(str(error)) from error
 
             loaded = load_worker_model(config, bindings, source=source)
 
@@ -177,10 +191,12 @@ class Worker:
             # success the worker also takes responsibility for distributed.close().
             return cls(
                 loaded.model,
-                bindings=loaded.bindings,
+                bindings=bindings,
                 sampling_group=sampling_group,
-                worker_config=loaded.worker_config,
+                worker_config=loaded.config,
                 tokenizer=loaded.tokenizer,
+                image_processor=loaded.image_processor,
+                flow_prompt=loaded.flow_prompt,
                 allowed_work_variants=config.supported_ops,
                 transfer_backends=config.data_plane.backends,
                 publication_backends=config.data_plane.publication_backends,
@@ -214,6 +230,8 @@ class Worker:
         publication_backends: tuple[str, ...] = ("local",),
         worker_id: str = "worker",
         schedule: DiffusionSchedule | None = None,
+        image_processor: ImageProcessor | None = None,
+        flow_prompt: FlowPrompt | None = None,
         components: tuple[tuple[str, ComponentConfig], ...] = (),
         process_groups: ProcessGroups | None = None,
         bindings: Mapping[str, ModelEntry] | None = None,
@@ -274,6 +292,8 @@ class Worker:
                 bindings=bindings,
                 attention=attention,
                 schedule=schedule,
+                image_processor=image_processor,
+                flow_prompt=flow_prompt,
             )
             self.runner = runner
             startup.callback(runner.close)
@@ -289,7 +309,7 @@ class Worker:
             worker_config = resolve_request_capacity(
                 model,
                 worker_config,
-                state_schema=runner.tensor_resources.state,
+                state_buffers=runner.state_buffers,
                 pipeline_depth=pipeline_depth,
                 bindings=bindings,
                 capacity_group=(None if process_groups is None else process_groups.process_group),
@@ -300,7 +320,8 @@ class Worker:
             layout = build_worker_layout(
                 model,
                 worker_config,
-                state_schema=runner.tensor_resources.state,
+                image_processor=image_processor,
+                state_buffers=runner.state_buffers,
                 endpoint=endpoint,
                 bindings=bindings,
                 queue_depth=int(pipeline_depth),
@@ -336,7 +357,7 @@ class Worker:
             arena = layout.arena
 
             owns_kv = isinstance(model, TextMixin)
-            cache = model.cache_geometry if owns_kv else None
+            cache = model.text_backbone.cache_config if isinstance(model, TextMixin) else None
 
             self.kv_cache = None
             self.block_tables = None
@@ -345,17 +366,14 @@ class Worker:
             # KV pages and request-to-token tables share group geometry; bind them to
             # the model only after attention compatibility has been established.
             if cache is not None:
+                assert isinstance(model, TextMixin)
                 kv_cache = info.kv_cache
                 if kv_cache is None:
                     raise unsupported_setup("KV model worker has no KV-cache configuration")
 
-                cache_dtype = getattr(torch, str(cache.dtype).removeprefix("torch."), None)
-                if not isinstance(cache_dtype, torch.dtype):
-                    raise unsupported_setup(f"unsupported cache dtype {cache.dtype!r}")
-
                 max_blocks_per_row = max(
                     1,
-                    ceil_div(int(model.text_max_tokens), int(worker_config.block_size)),
+                    ceil_div(int(model.text_backbone.max_tokens), int(worker_config.block_size)),
                 )
 
                 # Cache groups occupy consecutive ranges in the shared page pool.
@@ -365,19 +383,21 @@ class Worker:
                     group_ranges.append((group_offset, int(group.num_blocks)))
                     group_offset += int(group.num_blocks)
 
-                self.kv_cache = KVCache(
-                    num_layers=int(cache.num_layers),
-                    num_pages=int(kv_cache.num_blocks),
-                    page_size=int(kv_cache.block_size),
-                    num_kv_heads=int(cache.num_kv_heads),
-                    total_kv_heads=int(cache.total_kv_heads),
-                    kv_head_offset=int(cache.kv_head_offset),
-                    total_layers=cast(int, cache.total_layers),
-                    layer_offset=int(cache.layer_offset),
-                    head_dim=int(cache.head_dim),
-                    device=worker_config.device,
-                    dtype=cache_dtype,
-                    store_dtype=cache.store_dtype,
+                cache_config = cache
+                if worker_config.kv_cache_dtype is not None:
+                    cache_config = replace(
+                        cache_config,
+                        store_dtype=resolve_kv_store_dtype(
+                            cache.dtype, worker_config.kv_cache_dtype
+                        ),
+                    )
+                self.kv_cache = CacheManager(
+                    KVCache(
+                        cache_config,
+                        num_pages=int(kv_cache.num_blocks),
+                        page_size=int(kv_cache.block_size),
+                        device=worker_config.device,
+                    ),
                     group_ranges=tuple(group_ranges) if group_ranges else None,
                     import_capacity=int(info.max_unresolved_ops),
                     request_pool_size=int(info.request_slots),
@@ -401,12 +421,12 @@ class Worker:
 
                 # Execution begins only after both physical pages and request
                 # mappings exist; the model borrows this worker's cache storage.
-                bind_attention_modules(model, self.kv_cache, attention)
+                bind_attention_modules(model, self.kv_cache.cache, attention)
 
             # Admission, lineage, and persistent tensors share one slot owner.
             self.requests = RequestPool(
                 int(info.request_slots),
-                tensor_schema=runner.tensor_resources.state or None,
+                state_buffers=runner.state_buffers or None,
                 device=worker_config.device,
             )
 
@@ -419,9 +439,10 @@ class Worker:
                 raise unsupported_setup(f"unsupported model dtype {worker_config.model_dtype!r}")
 
             if self.block_tables is not None:
+                assert isinstance(model, TextMixin)
                 self.decode_state = DecodeState(
                     request_pool_size=int(info.request_slots),
-                    vocab_size=int(model.vocab_size),
+                    vocab_size=int(model.vocabulary.vocab_size),
                     continuation_width=1,
                     device=worker_config.device,
                     logits_dtype=torch_dtype,
@@ -431,7 +452,7 @@ class Worker:
                 self.decode_state = None
 
             # Generation state has its own page pool and may live on another device.
-            flow = model.generation
+            flow = model.generation if isinstance(model, DiffusionMixin) else None
             latent_dtype = getattr(torch, str(layout.latent_dtype).removeprefix("torch."), None)
             if flow is not None and not isinstance(latent_dtype, torch.dtype):
                 raise unsupported_setup(f"unsupported latent dtype {layout.latent_dtype!r}")
@@ -506,7 +527,7 @@ class Worker:
             startup.callback(self.cpu_tasks.close)
 
             transfer_byte_capacity = int(arena.transfer_bytes)
-            if isinstance(model, VideoMixin) or runner.tensor_resources.state:
+            if isinstance(model, VideoMixin) or runner.state_buffers:
                 # Each live request tensor reserves one credit per publication
                 # representation and one read credit on every possible remote rank.
                 # These credits bound ownership lifetimes; they allocate no storage.
@@ -529,10 +550,10 @@ class Worker:
             }
 
             if owns_kv:
-                assert layout.input_geometry is not None and self.decode_state is not None
+                assert layout.input_config is not None and self.decode_state is not None
 
                 runner.configure_inputs(
-                    geometry=layout.input_geometry,
+                    input_config=layout.input_config,
                     kv_cache=self.kv_cache,
                     latent_pool=self.latent_pool,
                     decode_predicates=self.decode_state.predicates,

@@ -6,10 +6,11 @@ from collections.abc import Sequence
 
 import torch
 
-from uniserve_worker.backends.triton import triton_available
+from uniserve.runtime.tensor_buffers import TensorBuffers
+from uniserve.runtime.triton import triton_available
+from uniserve.tensors import BufferConfig
 
 from ..ops import decode_state as kernels
-from ..runtime.tensor_buffers import TensorBuffers, TensorSchema
 
 
 class DecodeState:
@@ -55,13 +56,22 @@ class DecodeState:
                 raise ValueError("runtime cache-length storage is incompatible")
             self.valid_cache_lengths = valid_cache_lengths
         tensors = TensorBuffers.allocate(
-            self.tensor_schema(
+            self.buffers(
                 request_pool_size=self.request_pool_size,
                 vocab_size=self.vocab_size,
                 continuation_width=self.continuation_width,
                 logits_dtype=self.logits_dtype,
             ),
             self.device,
+            fill={
+                "logical_lengths": 0,
+                "sampling_positions": 0,
+                "future_input_tokens": 1,
+                "penalty_counts": 0,
+                "predicates": 0,
+                "_ones_int32": 1,
+                "_ones_int64": 1,
+            },
         ).capacity
         self.logical_lengths = tensors["logical_lengths"]
         self.sampling_positions = tensors["sampling_positions"]
@@ -95,13 +105,13 @@ class DecodeState:
             )
 
     @staticmethod
-    def tensor_schema(
+    def buffers(
         *,
         request_pool_size: int,
         vocab_size: int,
         continuation_width: int,
         logits_dtype: torch.dtype,
-    ) -> dict[str, TensorSchema]:
+    ) -> dict[str, BufferConfig]:
         """Describe continuation storage; verified lengths belong to the page-table owner."""
 
         if min(request_pool_size, vocab_size, continuation_width) < 1:
@@ -110,14 +120,14 @@ class DecodeState:
             raise ValueError("runtime prompt-logit dtype must be floating point")
         rows = request_pool_size + 1
         return {
-            "logical_lengths": TensorSchema((rows,), torch.int32, fill=0),
-            "sampling_positions": TensorSchema((rows,), torch.int64, fill=0),
-            "future_input_tokens": TensorSchema((rows, continuation_width), torch.int64, fill=1),
-            "penalty_counts": TensorSchema((rows, vocab_size), torch.int32, fill=0),
-            "prompt_logits": TensorSchema((rows, vocab_size), logits_dtype),
-            "predicates": TensorSchema((rows,), torch.bool, fill=0),
-            "_ones_int32": TensorSchema((request_pool_size,), torch.int32, fill=1),
-            "_ones_int64": TensorSchema((request_pool_size,), torch.int64, fill=1),
+            "logical_lengths": BufferConfig((rows,), torch.int32),
+            "sampling_positions": BufferConfig((rows,), torch.int64),
+            "future_input_tokens": BufferConfig((rows, continuation_width), torch.int64),
+            "penalty_counts": BufferConfig((rows, vocab_size), torch.int32),
+            "prompt_logits": BufferConfig((rows, vocab_size), logits_dtype),
+            "predicates": BufferConfig((rows,), torch.bool),
+            "_ones_int32": BufferConfig((request_pool_size,), torch.int32),
+            "_ones_int64": BufferConfig((request_pool_size,), torch.int64),
         }
 
     def reset(

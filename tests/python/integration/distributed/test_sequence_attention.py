@@ -5,15 +5,10 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from uniserve_worker.bootstrap.distributed import (
-    initialize_model_parallel,
-    initialize_process_groups,
-)
-from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
-from uniserve_worker.nn.parallel_attention import ParallelAttention, context_scope
-from uniserve_worker.runtime.attention_storage import (
-    allocate_context_storage,
-)
+from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
+from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
+from uniserve.nn.parallel_attention import ParallelAttention, context_scope
+from uniserve.runtime.attention_storage import allocate_context_storage
 
 pytestmark = pytest.mark.integration
 

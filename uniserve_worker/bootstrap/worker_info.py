@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from uniserve_worker.nn.parallel import ComponentConfig
+from uniserve_worker.config import ComponentConfig
 from uniserve_worker.protocol.batch import (
     VIDEO_STAGES,
     Computation,
@@ -17,7 +17,7 @@ from uniserve_worker.protocol.batch import (
 )
 
 from ..foundation.errors import invalid_descriptor, unsupported_setup
-from ..protocol.batch import TensorSpec, WorkerEndpoint
+from ..protocol.batch import OutputInfo, WorkerEndpoint
 
 
 class RequestKind(StrEnum):
@@ -80,7 +80,7 @@ class KvGroup:
 
 
 @dataclass(frozen=True, slots=True)
-class KvCacheConfig:
+class KVCacheInfo:
     """Publishes KV block size, dtype, token capacity, and group geometry to the scheduler."""
 
     block_size: int
@@ -123,7 +123,7 @@ class KvCacheConfig:
             raise invalid_descriptor("worker info KV groups must cover the physical page pool")
 
     @classmethod
-    def from_mapping(cls, value: object, where: str) -> KvCacheConfig:
+    def from_mapping(cls, value: object, where: str) -> KVCacheInfo:
         """Decode and validate complete physical KV geometry from the wire mapping."""
 
         data = _map(value, where)
@@ -170,7 +170,7 @@ class EntryInfo:
 
     name: str
     config: ComponentConfig
-    outputs: tuple[TensorSpec, ...] = ()
+    outputs: tuple[OutputInfo, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -187,7 +187,7 @@ class EntryInfo:
                 {key: value for key, value in data.items() if key not in {"name", "outputs"}}
             ),
             outputs=tuple(
-                TensorSpec.from_mapping(output, f"{where}.outputs[{index}]")
+                OutputInfo.from_mapping(output, f"{where}.outputs[{index}]")
                 for index, output in enumerate(_seq(data.get("outputs", ()), f"{where}.outputs"))
             ),
         )
@@ -212,7 +212,7 @@ class WorkerInfo:
     max_batch_ops: int
     max_batch_tokens: int
     request_slots: int
-    kv_cache: KvCacheConfig | None
+    kv_cache: KVCacheInfo | None
     latent_page_units: int
     latent_pages: int
     buffer_pool_bytes: int
@@ -349,7 +349,7 @@ class WorkerInfo:
             kv_cache=(
                 None
                 if data.get("kv_cache") is None
-                else KvCacheConfig.from_mapping(data.get("kv_cache"), f"{where}.kv_cache")
+                else KVCacheInfo.from_mapping(data.get("kv_cache"), f"{where}.kv_cache")
             ),
             latent_page_units=_uint(data.get("latent_page_units"), f"{where}.latent_page_units"),
             latent_pages=_uint(data.get("latent_pages"), f"{where}.latent_pages"),
@@ -446,7 +446,7 @@ def _str(value: object, where: str) -> str:
 
 
 __all__ = [
-    "KvCacheConfig",
+    "KVCacheInfo",
     "KvGroup",
     "KvGroupKind",
     "RequestKind",

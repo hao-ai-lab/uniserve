@@ -11,12 +11,12 @@ from typing import cast
 
 import torch
 
+from uniserve.runtime.resources import close_resources
 from uniserve_worker.execution.output import OutputBuffer, PendingOutput
 from uniserve_worker.execution.rows import (
     OperationIdentity,
 )
 from uniserve_worker.foundation.errors import WorkerError, invalid_descriptor
-from uniserve_worker.foundation.resources import close_resources
 from uniserve_worker.protocol.batch import (
     BatchOutput,
     BufferId,
@@ -33,7 +33,7 @@ from uniserve_worker.protocol.batch import (
     TensorPublication,
 )
 from uniserve_worker.runtime.cache_imports import CacheImport
-from uniserve_worker.runtime.kv_cache import KVCache
+from uniserve_worker.runtime.cache_manager import CacheManager
 from uniserve_worker.runtime.latent_pool import LatentImport, LatentPool
 from uniserve_worker.runtime.tensor_store import TensorRead, TensorStore
 from uniserve_worker.transfer.tickets import TransferTicket
@@ -274,7 +274,10 @@ class BatchState:
         return False
 
     def close_inputs(
-        self, tensor_store: TensorStore, latent_pool: LatentPool | None, kv_cache: KVCache | None
+        self,
+        tensor_store: TensorStore,
+        latent_pool: LatentPool | None,
+        kv_cache: CacheManager | None,
     ) -> None:
         """Release this submission's readers and unadopted physical destinations.
 
@@ -448,7 +451,10 @@ class BatchState:
         return not self.terminal_sent
 
     def close(
-        self, tensor_store: TensorStore, latent_pool: LatentPool | None, kv_cache: KVCache | None
+        self,
+        tensor_store: TensorStore,
+        latent_pool: LatentPool | None,
+        kv_cache: CacheManager | None,
     ) -> None:
         """Abandon delivery while physical readers retain their own resource leases."""
 

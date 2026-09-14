@@ -1,10 +1,12 @@
 """Canonical model and worker_config for execution-boundary tests."""
 
 from tests.python.fixtures.worker_config import stub_worker_config
+from uniserve.distributed.mesh import Communicator, DeviceMesh
+from uniserve.distributed.parallel import ParallelConfig
+from uniserve.model.limits import ModelLimits
+from uniserve_models.stub import StubModel
+from uniserve_worker.config import ComponentConfig
 from uniserve_worker.execution.model_entry import ModelEntry
-from uniserve_worker.models.stub import StubModel
-from uniserve_worker.nn.mesh import Communicator, DeviceMesh
-from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig
 
 TEST_MODEL = StubModel()
 TEST_WORKER_CONFIG = stub_worker_config(64, max_batch_tokens=8192)
@@ -24,26 +26,47 @@ def tensor_parallel_bindings(group: Communicator = Communicator()) -> dict[str, 
     }
 
 
-def model_context(layers):
-    """Supply numerical layer geometry for direct model composition tests."""
-    from uniserve_worker.modeling.context import BuildContext
-    from uniserve_worker.nn.parallel import SequenceParallel
+def model_arguments(layer):
+    """Supply explicit numerical construction arguments for text/image models."""
 
-    return BuildContext(
+    from uniserve.distributed.parallel import SequenceParallel
+
+    return dict(
         parallel={
-            "model": ParallelConfig(
-                tensor_parallel_size=layers.communicator.world_size,
-                pipeline_parallel_size=layers.pipeline.world_size,
+            "": ParallelConfig(
+                tensor_parallel_size=layer.communicator.world_size,
+                pipeline_parallel_size=layer.pipeline.world_size,
                 sequence_parallel=(
-                    SequenceParallel("ulysses", (layers.sequence.world_size,))
-                    if layers.sequence.world_size > 1
+                    SequenceParallel("ulysses", (layer.sequence.world_size,))
+                    if layer.sequence.world_size > 1
                     else SequenceParallel()
                 ),
             )
         },
         meshes={},
-        layers={"model": layers},
-        limits={},
-        component_precisions={},
-        schedule=None,
+        layers={"": layer},
+        limits=ModelLimits(text_tokens=1, video_frames=1),
+    )
+
+
+def h3_arguments(*, parallel, meshes, limits, precisions):
+    """Bind H3's actual projection formats to borrowed numerical layer inputs."""
+
+    from uniserve.nn.layer import LayerConfig
+    from uniserve_models.minimax_h3.weights import configure_layers
+
+    layers = {
+        name: LayerConfig(
+            mesh.get_group("tp"),
+            None,
+            pipeline=mesh.get_group("pp"),
+            sequence=mesh.get_group("ulysses"),
+        )
+        for name, mesh in meshes.items()
+    }
+    return dict(
+        parallel=parallel,
+        meshes=meshes,
+        layers=configure_layers(layers, precisions),
+        limits=limits,
     )

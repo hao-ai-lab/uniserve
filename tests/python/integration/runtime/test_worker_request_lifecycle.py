@@ -20,8 +20,8 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
+from uniserve_models.stub import _next_token
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.models.stub import _next_token
 from uniserve_worker.protocol.batch import (
     ComputationId,
     ErrorCode,

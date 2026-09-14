@@ -1,1 +1,1 @@
-"""Worker error taxonomy, environment parsers, and integer math."""
+"""Worker error classification and shared-memory IPC support."""

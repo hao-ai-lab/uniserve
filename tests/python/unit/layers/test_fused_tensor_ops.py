@@ -3,14 +3,14 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.ops import value_first_swiglu_absmax
-from uniserve_worker.ops.patch import unpatchify_video_tokens
-from uniserve_worker.ops.residual import (
+from uniserve.ops import value_first_swiglu_absmax
+from uniserve.ops.patch import unpatchify_video_tokens
+from uniserve.ops.residual import (
     scaled_residual_layer_norm_absmax,
     scaled_residual_rms_norm_absmax_,
     weighted_rms_norm_absmax,
 )
-from uniserve_worker.ops.rope import qk_rms_norm_partial_rope_
+from uniserve.ops.rope import qk_rms_norm_partial_rope_
 
 pytestmark = pytest.mark.unit
 
@@ -267,7 +267,7 @@ def test_video_patch_geometry_preserves_logical_channel_coordinates(device, patc
 @pytest.mark.parametrize("axis_dims", ((6, 2, 2), (96, 48, 48), (128, 64, 64), (512, 256, 256)))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 def test_multi_axis_qk_norm_rope_preserves_shared_normalization_groups(device, dtype, axis_dims):
-    from uniserve_worker import ops
+    from uniserve import ops
 
     generator = torch.Generator(device=device).manual_seed(73)
     width = sum(axis_dims)
@@ -319,7 +319,7 @@ def test_multi_axis_qk_norm_rope_preserves_shared_normalization_groups(device, d
 )
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16, torch.float32))
 def test_full_width_qk_norm_rope_preserves_strided_heads_and_tail_rows(device, dtype, shape):
-    from uniserve_worker import ops
+    from uniserve import ops
 
     tokens, query_heads, key_heads, width = shape
     generator = torch.Generator(device=device).manual_seed(83)

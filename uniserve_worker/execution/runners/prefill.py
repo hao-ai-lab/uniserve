@@ -14,12 +14,12 @@ from collections.abc import Callable, Sequence
 
 import torch
 
-from uniserve_worker.modeling.tensors import TokenSelection
+from uniserve.attention.inputs import physical_columns
+from uniserve.math import bucketed_length, ceil_div
+from uniserve.model.tensors import TokenSelection
 from uniserve_worker.protocol.batch import ForwardMode
 
-from ...foundation.math import bucketed_length, ceil_div
-from ...runtime.kv_cache import KVCache
-from ..attention import physical_columns
+from ...runtime.cache_manager import CacheManager
 from ..batch import ExecutionOutput, InputBatch
 from ..graph_inputs import PrefillShape
 from ..input_buffers import InputBuffers
@@ -28,7 +28,7 @@ from ..rows import ForwardRow
 
 def stage_text(
     buffers: InputBuffers,
-    cache: KVCache,
+    cache: CacheManager,
     tokens: tuple[tuple[int, ...], ...],
     pages: Sequence[Sequence[int]],
     *,
@@ -61,7 +61,7 @@ def stage_text(
         token_rows=(True,) * rows,
         text_local_indices=((),) * rows,
         width=min(buffers.max_blocks_per_row, bucketed_length(max(1, max(map(len, pages))))),
-        block_size=cache.block_size,
+        block_size=cache.cache.page_size,
         packed=packed,
         decode=decode,
     )

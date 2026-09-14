@@ -3,11 +3,14 @@
 import pytest
 import torch
 
-from tests.python.fixtures.model_execution import model_context
-from uniserve_worker.loader.handles import TensorWeightHandle
-from uniserve_worker.models.bagel import BagelConfig, BagelForConditionalGeneration, LLMConfig
-from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.mesh import Communicator
+from tests.python.fixtures.model_execution import model_arguments
+from uniserve.distributed.mesh import Communicator
+from uniserve.loading.handles import TensorWeightHandle
+from uniserve.model.limits import ModelLimits
+from uniserve.nn.decoder.mot import MoTConfig
+from uniserve.nn.layer import LayerConfig
+from uniserve_models.bagel import BagelConfig, BagelForConditionalGeneration
+from uniserve_models.minimax_h3.config import H3Config
 
 
 @pytest.mark.parametrize(
@@ -20,8 +23,8 @@ from uniserve_worker.nn.mesh import Communicator
 def test_bagel_loading_reports_unknown_records_on_each_pipeline_stage(rank, nonresident):
     with torch.device("meta"):
         model = BagelForConditionalGeneration(
-            BagelConfig(llm=LLMConfig(num_hidden_layers=3)),
-            context=model_context(
+            BagelConfig(text=MoTConfig(num_hidden_layers=3)),
+            **model_arguments(
                 LayerConfig(Communicator(), None, pipeline=Communicator(ranks=(0, 1), rank=rank))
             ),
         )
@@ -37,11 +40,11 @@ def test_bagel_loading_reports_unknown_records_on_each_pipeline_stage(rank, nonr
 
 @pytest.mark.parametrize("rank", [0, 1])
 def test_h3_checkpoint_reports_reject_unknown_records_on_each_pipeline_stage(rank):
-    from uniserve_worker.bootstrap.catalog import MINIMAX_H3_ENTRY
-    from uniserve_worker.modeling.context import BuildContext
-    from uniserve_worker.models.minimax_h3.model import MiniMaxH3Model
-    from uniserve_worker.nn.mesh import DeviceMesh
-    from uniserve_worker.nn.parallel import ParallelConfig
+    from tests.python.fixtures.model_execution import h3_arguments
+    from uniserve.distributed.mesh import DeviceMesh
+    from uniserve.distributed.parallel import ParallelConfig
+    from uniserve_models.catalog import MINIMAX_H3_ENTRY
+    from uniserve_models.minimax_h3.model import MiniMaxH3Model
 
     parallel = ParallelConfig(pipeline_parallel_size=2)
     denoiser = DeviceMesh(
@@ -51,16 +54,14 @@ def test_h3_checkpoint_reports_reject_unknown_records_on_each_pipeline_stage(ran
         groups={"pp": Communicator(ranks=(0, 1), rank=rank, name="pp")},
     )
     local = DeviceMesh((rank,), rank, ParallelConfig(), groups={})
-    context = BuildContext(
+    arguments = h3_arguments(
         parallel={"denoiser": parallel},
         meshes={"denoiser": denoiser, "text_encoder": local, "video_decoder": local},
-        layers={},
-        limits={"text_tokens": 64, "video_seconds": 22 / 24},
-        component_precisions=MINIMAX_H3_ENTRY.component_precisions({"mode": "quality"}),
-        schedule=MINIMAX_H3_ENTRY.create_schedule(torch.device("cpu")),
+        limits=ModelLimits(text_tokens=64, video_frames=22),
+        precisions=MINIMAX_H3_ENTRY.component_precisions({"mode": "quality"}),
     )
     with torch.device("meta"):
-        model = MiniMaxH3Model({}, context)
+        model = MiniMaxH3Model(H3Config(), **arguments)
     unknown = {
         "denoiser": (
             "time_embedder.unknown.weight",

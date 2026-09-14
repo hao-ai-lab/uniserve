@@ -3,12 +3,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.nn.diffusion.schedule import ScheduleDirection, ScheduleShiftDomain
-from uniserve_worker.nn.diffusion.spec import DiffusionSpec, ModalitySpec, ScheduleRule
-from uniserve_worker.nn.rng import (
+from uniserve.nn.rng import (
     DRAW_LAYOUT_PROPOSAL,
     DRAW_LAYOUT_TARGET,
-    diffusion_noise,
+    normal_noise,
     sampling_key,
     sampling_uniform,
 )
@@ -17,25 +15,11 @@ pytestmark = pytest.mark.unit
 
 
 def test_multimodal_noise_uses_one_cpu_generator_in_declared_order():
-    schedule = ScheduleRule(ScheduleDirection.DESCENDING, ScheduleShiftDomain.SIGMA, 1.0)
-    spec = DiffusionSpec(
-        modalities=tuple(
-            ModalitySpec(name, shape, shape, schedule, "velocity", torch.float32)
-            for name, shape in (("video", (1, 3, 7, 2, 4)), ("audio", (16, 2)))
-        ),
-        steps=4,
-        cfg=None,
-        max_cfg_branches=1,
-        solver="clean_sample_euler",
-        noise_device="cpu",
-        seed_transform="identity",
-    )
     outputs = {
-        modality.name: torch.empty((2, *modality.noise_shape)) for modality in spec.modalities
+        "video": torch.empty((2, 1, 3, 7, 2, 4)),
+        "audio": torch.empty((2, 16, 2)),
     }
-    diffusion_noise(
-        spec, seeds=(17, 29), device=torch.device("cuda", 0), dtype=torch.float32, out=outputs
-    )
+    normal_noise((17, 29), tuple(outputs.values()))
     for row, seed in enumerate((17, 29)):
         generator = torch.Generator(device="cpu").manual_seed(seed)
         video = torch.empty((1, 3, 7, 2, 4)).normal_(generator=generator)

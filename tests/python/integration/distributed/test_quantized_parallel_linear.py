@@ -7,25 +7,20 @@ import torch
 import torch.multiprocessing as mp
 from safetensors.torch import save_file
 
-from uniserve_worker.bootstrap.distributed import (
-    initialize_model_parallel,
-    initialize_process_groups,
-)
-from uniserve_worker.loader.handles import SafetensorFileWeightHandle
-from uniserve_worker.loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
-from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.linear import (
+from uniserve.distributed.mesh import Communicator
+from uniserve.distributed.parallel import ParallelConfig
+from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
+from uniserve.loading.handles import SafetensorFileWeightHandle
+from uniserve.loading.weight_loaders import attach_parameter_loaders, load_parameter_weight
+from uniserve.nn.layer import LayerConfig
+from uniserve.nn.linear import (
     InterleavedMergedColumnParallelLinear,
     LinearBase,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from uniserve_worker.nn.mesh import Communicator
-from uniserve_worker.nn.parallel import ParallelConfig
-from uniserve_worker.nn.quant import (
-    DynamicW8A8Fp8LinearMethod,
-)
-from uniserve_worker.nn.quant.config import QuantizationConfig
+from uniserve.nn.quant import DynamicW8A8Fp8LinearMethod
+from uniserve.nn.quant.config import QuantizationConfig
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -211,8 +206,8 @@ def test_checkpoint_quantization_preserves_logical_domains_across_tp(tmp_path):
 
 @torch.inference_mode()
 def _run_sequence_scale(rank, rendezvous):
-    from uniserve_worker.nn.parallel import SequenceParallel
-    from uniserve_worker.nn.quant.nvfp4 import DynamicW4A4NvFp4LinearMethod
+    from uniserve.distributed.parallel import SequenceParallel
+    from uniserve.nn.quant.nvfp4 import DynamicW4A4NvFp4LinearMethod
 
     device = torch.device("cuda", rank)
     environment = initialize_process_groups(

@@ -14,7 +14,9 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from uniserve_worker.execution import operations as operation_geometry
+from uniserve.model.video import VideoMixin
+from uniserve.tensors import ImageRange
+from uniserve_worker.execution import operations as operations
 from uniserve_worker.execution.batch_state import BatchState
 from uniserve_worker.execution.commit import _discard_group
 from uniserve_worker.execution.output import OutputBuffer, PendingOutput
@@ -26,8 +28,6 @@ from uniserve_worker.foundation.errors import (
     unsupported_operation,
     unsupported_setup,
 )
-from uniserve_worker.modeling.tensors import ImageRange
-from uniserve_worker.modeling.video import VideoMixin
 from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.batch import (
     BufferId,
@@ -50,16 +50,16 @@ from uniserve_worker.runtime.latent_pool import LatentImport
 from uniserve_worker.runtime.tensor_store import FeatureMetadata, ImageMetadata, TensorRead
 
 if TYPE_CHECKING:
+    from uniserve.model.model import Model
     from uniserve_worker.bootstrap.worker_info import WorkerInfo
     from uniserve_worker.config import WorkerConfig
     from uniserve_worker.execution.model_runner import ModelRunner
     from uniserve_worker.execution.output import OutputPool
     from uniserve_worker.media.buffers import MediaBuffers
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.modeling.model import Model
     from uniserve_worker.runtime.block_tables import BlockTables
+    from uniserve_worker.runtime.cache_manager import CacheManager
     from uniserve_worker.runtime.cpu import CpuPool
-    from uniserve_worker.runtime.kv_cache import KVCache
     from uniserve_worker.runtime.latent_pool import LatentPool
     from uniserve_worker.runtime.request import RequestPool
     from uniserve_worker.runtime.tensor_store import TensorStore
@@ -76,7 +76,7 @@ TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 def prepare_batch(
     prepared: BatchState,
     *,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     latent_pool: LatentPool | None,
     request_tables: BlockTables | None,
     request_pool: RequestPool,
@@ -90,11 +90,11 @@ def prepare_batch(
         admissions = {
             admission.request_key: admission.request_pool_idx for admission in batch.admissions
         }
-        operations = {
+        scheduled = {
             (operation.request_key, operation.op_id): operation for operation in batch.operations
         }
         for latent_params in batch.latent_params:
-            operation = operations[(latent_params.request_key, latent_params.op_id)]
+            operation = scheduled[(latent_params.request_key, latent_params.op_id)]
             if operation.kind not in {PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING}:
                 continue
             request = request_pool.peek(latent_params.request_key.request_id)
@@ -144,7 +144,7 @@ def prepare_batch(
                     allocation.page_ids,
                     group=allocation.group_id,
                     start=0,
-                    length=len(allocation.page_ids) * cache.block_size,
+                    length=len(allocation.page_ids) * cache.cache.page_size,
                 )
             )
         for row, write_kv in enumerate(batch.write_kv):
@@ -190,7 +190,7 @@ def prepare_batch(
 def prepare_inputs(
     state: BatchState,
     *,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
     output_pool: OutputPool,
@@ -474,17 +474,17 @@ def _prepare_predicates(
 
     # Predicate rows occupy one compact completion buffer regardless of whether
     # their source is already local or will arrive through a prepared transfer.
-    operations = tuple(
+    scheduled = tuple(
         operation
         for operation in state.batch.operations
         if operation.predicate is not None and operation.predicate.dtype is DType.U8
     )
-    if not operations:
+    if not scheduled:
         return
     buffer = output_pool.acquire(
-        len(operations),
-        token_capacity=len(operations),
-        devices=tuple(model_runner.operation_devices(operation)[0] for operation in operations),
+        len(scheduled),
+        token_capacity=len(scheduled),
+        devices=tuple(model_runner.operation_devices(operation)[0] for operation in scheduled),
     )
     captures: list[tuple[OperationIdentity, tuple[int, int], int]] = []
     pending: list[tuple[OperationIdentity, BufferId, int]] = []
@@ -494,19 +494,18 @@ def _prepare_predicates(
         # transferred sources retain their target row for later completion.
         grouped: dict[torch.device, list[ScheduledRequest]] = defaultdict(list)
         rows = {
-            operation_geometry.operation_identity(operation): row
-            for row, operation in enumerate(operations)
+            operations.operation_identity(operation): row for row, operation in enumerate(scheduled)
         }
-        for operation in operations:
+        for operation in scheduled:
             source = cast(TensorRef, operation.predicate).buffer_id
             if source not in state.tensor_reads:
                 grouped[model_runner.operation_devices(operation)[0]].append(operation)
             else:
                 pending.append(
                     (
-                        operation_geometry.operation_identity(operation),
+                        operations.operation_identity(operation),
                         source,
-                        rows[operation_geometry.operation_identity(operation)],
+                        rows[operations.operation_identity(operation)],
                     )
                 )
         for device, device_operations in grouped.items():
@@ -523,7 +522,7 @@ def _prepare_predicates(
             )
             recorded.extend(reads)
             for operation, read in zip(device_operations, reads, strict=True):
-                identity = operation_geometry.operation_identity(operation)
+                identity = operations.operation_identity(operation)
                 captures.append((identity, buffer.capture(read.tensor), rows[identity]))
             tensor_store.complete_reads(reads, device=device)
 
@@ -571,7 +570,7 @@ def _open_group(
     predicate_values: Mapping[OperationIdentity, bool],
     *,
     state: BatchState,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     cpu_tasks: CpuPool,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
@@ -588,35 +587,35 @@ def _open_group(
 ) -> int:
     """Stage one completion group's speculative state, resources, inputs, and completion storage."""
 
-    operations = state.group_operations(completion_group)
+    scheduled = state.group_operations(completion_group)
 
     # Predicated rows remain in aligned output/state tables but do not reserve
     # execution-only inputs, CPU tasks, or model resources.
     predicated = frozenset(
         identity
-        for operation in operations
-        if (identity := operation_geometry.operation_identity(operation)) in predicate_values
+        for operation in scheduled
+        if (identity := operations.operation_identity(operation)) in predicate_values
         and not predicate_values[identity]
     )
     active_operations = (
-        operations
+        scheduled
         if not predicated
         else tuple(
             operation
-            for operation in operations
-            if operation_geometry.operation_identity(operation) not in predicated
+            for operation in scheduled
+            if operations.operation_identity(operation) not in predicated
         )
     )
     # Restrict input payloads to identities declared by this completion group.
     started = time.perf_counter_ns()
     declared_inputs = {
-        reference.buffer_id for operation in operations for reference in operation.tensor_inputs()
+        reference.buffer_id for operation in scheduled for reference in operation.tensor_inputs()
     }
     declared_inputs.update(
-        operation.kv_input for operation in operations if operation.kv_input is not None
+        operation.kv_input for operation in scheduled if operation.kv_input is not None
     )
     declared_inputs.update(
-        operation.predicate.buffer_id for operation in operations if operation.predicate is not None
+        operation.predicate.buffer_id for operation in scheduled if operation.predicate is not None
     )
     input_products = tuple(
         payload for payload in batch.input_products if payload.product.buffer_id in declared_inputs
@@ -627,27 +626,27 @@ def _open_group(
         # either all later completion group resources bind successfully or both are discarded.
         request_pool_indices = tuple(
             int(request_pool.get(operation.request_key.request_id).request_pool_idx)
-            for operation in operations
+            for operation in scheduled
         )
         completion = output_pool.acquire(
-            len(operations),
-            token_capacity=_completion_words(operations),
+            len(scheduled),
+            token_capacity=_completion_words(scheduled),
             devices=tuple(
                 dict.fromkeys(
                     device
-                    for operation in operations
+                    for operation in scheduled
                     for device in model_runner.operation_devices(operation)
                 )
             ),
         )
-        candidates = request_pool.create_outputs(operations, request_pool_indices, completion)
+        candidates = request_pool.create_outputs(scheduled, request_pool_indices, completion)
     except BaseException:
         if completion is not None:
             completion.abandon()
         raise
     assert completion is not None
     for request in candidates:
-        if operation_geometry.operation_identity(request.operation) in predicated:
+        if operations.operation_identity(request.operation) in predicated:
             request.status = OpStatus.PREDICATED
     state.bind_outputs(completion_group, candidates, completion, started)
     try:
@@ -663,9 +662,9 @@ def _open_group(
             state=state,
         )
         if active_operations:
-            identities = {operation_geometry.operation_identity(op) for op in active_operations}
+            identities = {operations.operation_identity(op) for op in active_operations}
             has_forward = any(
-                operation_geometry.operation_identity(batch.operations[index]) in identities
+                operations.operation_identity(batch.operations[index]) in identities
                 for index in batch.forward_operation_indices
             )
             if kv_cache is None or request_tables is None:
@@ -687,7 +686,7 @@ def _open_group(
                 state=state,
             )
         _reserve_outputs(
-            operations,
+            scheduled,
             completion_group,
             tensor_store=tensor_store,
             execution_model=execution_model,
@@ -722,7 +721,7 @@ def _open_group(
             state=state,
         )
         _publish_predicated_outputs(
-            operations, completion_group, tensor_store=tensor_store, state=state
+            scheduled, completion_group, tensor_store=tensor_store, state=state
         )
         state.group_registered[completion_group] = True
         record_component(state.group_component_us[completion_group], "open_lane", started)
@@ -740,18 +739,18 @@ def _open_group(
         raise
 
 
-def _completion_words(operations: tuple[ScheduledRequest, ...]) -> int:
+def _completion_words(scheduled: tuple[ScheduledRequest, ...]) -> int:
     """Compute fixed completion-word capacity for all operations in a completion group."""
 
     return max(
         1,
-        SAMPLING_COMPLETION_FIELDS * len(operations)
-        + sum((int(operation.bounds.max_completion_bytes) + 3) // 4 for operation in operations),
+        SAMPLING_COMPLETION_FIELDS * len(scheduled)
+        + sum((int(operation.bounds.max_completion_bytes) + 3) // 4 for operation in scheduled),
     )
 
 
 def _reserve_cpu_tasks(
-    operations: tuple[ScheduledRequest, ...],
+    scheduled: tuple[ScheduledRequest, ...],
     completion_group: int,
     *,
     state: BatchState,
@@ -764,7 +763,7 @@ def _reserve_cpu_tasks(
     """Reserve bounded CPU slots for active operations that schedule host-side work."""
 
     video_model = isinstance(execution_model, VideoMixin)
-    for operation in operations:
+    for operation in scheduled:
         if operation.kind not in {
             PipelineStage.IMAGE_DECODING,
             PipelineStage.VIDEO_ENCODING,
@@ -830,7 +829,7 @@ def validate_batch(
 
 
 def _reserve_outputs(
-    operations: tuple[ScheduledRequest, ...],
+    scheduled: tuple[ScheduledRequest, ...],
     completion_group: int,
     *,
     state: BatchState,
@@ -847,10 +846,8 @@ def _reserve_outputs(
     ] = {}
     persistent_bindings: list[tuple[TensorRef, torch.device | str]] = []
     encoder_bindings: list[tuple[TensorRef, torch.device | str]] = []
-    by_identity = {
-        operation_geometry.operation_identity(operation): operation for operation in operations
-    }
-    for operation in operations:
+    by_identity = {operations.operation_identity(operation): operation for operation in scheduled}
+    for operation in scheduled:
         device = model_runner.operation_devices(operation)[2]
         request = state.pending_output(completion_group, operation.request_key.request_id)
         predicated = request.status is OpStatus.PREDICATED
@@ -865,6 +862,11 @@ def _reserve_outputs(
                 None,
             )
             for output in operation.outputs:
+                if operation.kind is TransferMode.TENSOR:
+                    # Transfers publish the delivered input's representation;
+                    # their destination entry does not execute model mathematics.
+                    persistent_bindings.append((output, device))
+                    continue
                 layout = model_runner.output_layout(
                     operation.entry,
                     output.output_index,
@@ -874,8 +876,7 @@ def _reserve_outputs(
                 )
                 if layout is None:
                     continue
-                if layout.shape is not None:
-                    shapes[output] = layout.shape
+                shapes[output] = layout.shape
                 if layout.region is not None:
                     regions[output] = layout.region
                 persistent_bindings.append((output, device))
@@ -938,7 +939,7 @@ def _reserve_outputs(
 
 
 def _consume_predicates(
-    operations: tuple[ScheduledRequest, ...],
+    scheduled: tuple[ScheduledRequest, ...],
     completion_group: int,
     *,
     state: BatchState,
@@ -956,7 +957,7 @@ def _consume_predicates(
             ]
         ],
     ] = {}
-    for operation in operations:
+    for operation in scheduled:
         predicate = operation.predicate
         if predicate is None:
             continue
@@ -985,7 +986,7 @@ def _consume_predicates(
 
 
 def _publish_predicated_outputs(
-    operations: tuple[ScheduledRequest, ...],
+    scheduled: tuple[ScheduledRequest, ...],
     completion_group: int,
     *,
     state: BatchState,
@@ -993,7 +994,7 @@ def _publish_predicated_outputs(
 ) -> None:
     """Publish inactive sentinel values for products of predicated operations."""
 
-    for operation in operations:
+    for operation in scheduled:
         request = state.pending_output(completion_group, operation.request_key.request_id)
         if request.status is OpStatus.PREDICATED:
             for write in (request.completion_write, request.transition_write):
@@ -1002,7 +1003,7 @@ def _publish_predicated_outputs(
 
 
 def _bind_latent_inputs(
-    operations: tuple[ScheduledRequest, ...],
+    scheduled: tuple[ScheduledRequest, ...],
     completion_group: int,
     *,
     state: BatchState,
@@ -1011,7 +1012,7 @@ def _bind_latent_inputs(
 ) -> None:
     """Validate trajectory parameters and bind rank-local latent staging views."""
 
-    identities = {operation_geometry.operation_identity(op) for op in operations}
+    identities = {operations.operation_identity(op) for op in scheduled}
     parameters = tuple(
         params
         for params in state.batch.latent_params
@@ -1021,11 +1022,11 @@ def _bind_latent_inputs(
         return
     pool = latent_pool
     requests = {
-        operation_geometry.operation_identity(operation): (
+        operations.operation_identity(operation): (
             operation,
             state.pending_output(completion_group, operation.request_key.request_id),
         )
-        for operation in operations
+        for operation in scheduled
     }
     if pool is None:
         # Fixed request tensors own the trajectory directly. Solver progress
@@ -1044,14 +1045,12 @@ def _bind_latent_inputs(
                 valid = int(params.start_step) == 0 and int(params.step_count) == 0
             elif operation.kind is PipelineStage.DENOISING:
                 valid = (
-                    int(params.start_step)
-                    == int(operation_geometry.require_progress(request).flow_step)
+                    int(params.start_step) == int(operations.require_progress(request).flow_step)
                     and int(params.step_count) == 1
                 )
             else:
                 valid = (
-                    int(params.start_step)
-                    == int(operation_geometry.require_progress(request).flow_step)
+                    int(params.start_step) == int(operations.require_progress(request).flow_step)
                     and int(params.step_count) == 0
                 )
             if not valid:
@@ -1091,7 +1090,7 @@ def _bind_latent_inputs(
             None,
         )
         committed_step = (
-            int(operation_geometry.require_progress(request).flow_step)
+            int(operations.require_progress(request).flow_step)
             if transferred is None
             else transferred.step
         )
@@ -1130,11 +1129,11 @@ def _bind_latent_inputs(
 
 
 def _bind_cache_tables(
-    operations: tuple[ScheduledRequest, ...],
+    scheduled: tuple[ScheduledRequest, ...],
     completion_group: int,
     *,
     state: BatchState,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     request_tables: BlockTables | None,
 ) -> None:
     """Install scheduler tables and retain row-aligned forward coordinates."""
@@ -1145,18 +1144,18 @@ def _bind_cache_tables(
         raise invalid_descriptor("cache tables require physical KV storage")
     started = time.perf_counter_ns()
     inputs = state.batch
-    identities = {operation_geometry.operation_identity(op) for op in operations}
+    identities = {operations.operation_identity(op) for op in scheduled}
     slots = {
         state.pending_output(
             completion_group, operation.request_key.request_id
         ).request.request_pool_idx
-        for operation in operations
+        for operation in scheduled
     }
     slots.update(
         {
             inputs.request_pool_indices[row]
             for row, index in enumerate(inputs.forward_operation_indices)
-            if operation_geometry.operation_identity(inputs.operations[index]) in identities
+            if operations.operation_identity(inputs.operations[index]) in identities
         }
     )
     tables = []
@@ -1164,7 +1163,7 @@ def _bind_cache_tables(
         if table.request_pool_idx not in slots:
             continue
         pages = cache.validate_pages(table.page_ids, group=table.group_id)
-        if int(table.allocated_tokens) > len(pages) * cache.block_size:
+        if int(table.allocated_tokens) > len(pages) * cache.cache.page_size:
             raise invalid_descriptor("block-table allocation exceeds physical capacity")
         tables.append(
             (
@@ -1200,17 +1199,17 @@ def _bind_cache_tables(
     # computations were filtered from the cache-registration view.
     rows_by_operation: dict[OperationIdentity, list[int]] = defaultdict(list)
     for row, index in enumerate(inputs.forward_operation_indices):
-        identity = operation_geometry.operation_identity(inputs.operations[index])
+        identity = operations.operation_identity(inputs.operations[index])
         rows_by_operation[identity].append(row)
 
-    for operation in operations:
+    for operation in scheduled:
         request = state.pending_output(completion_group, operation.request_key.request_id)
         main_slot = int(request.request.request_pool_idx)
-        parent_runtime = operation_geometry.input_progress(request)
-        operation_rows = rows_by_operation.get(operation_geometry.operation_identity(operation), [])
-        state.group_forward_indices[completion_group][
-            operation_geometry.operation_identity(operation)
-        ] = tuple(operation_rows)
+        parent_runtime = operations.input_progress(request)
+        operation_rows = rows_by_operation.get(operations.operation_identity(operation), [])
+        state.group_forward_indices[completion_group][operations.operation_identity(operation)] = (
+            tuple(operation_rows)
+        )
         main_descriptor = next(
             (row for row in operation_rows if inputs.request_pool_indices[row] == main_slot),
             None,
@@ -1251,7 +1250,7 @@ def _stage_input_products(
     completion_group: int,
     *,
     state: BatchState,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
     model_runner: ModelRunner,
@@ -1298,8 +1297,8 @@ def _stage_input_products(
                 raise invalid_descriptor("latent transfer disagrees with its scheduler params")
             request = state.pending_output(completion_group, product.request_key.request_id)
             if (
-                operation_geometry.require_progress(request).latent_product is not None
-                or int(operation_geometry.require_progress(request).flow_step) != 0
+                operations.require_progress(request).latent_product is not None
+                or int(operations.require_progress(request).flow_step) != 0
             ):
                 raise invalid_descriptor("latent transfer destination already owns a trajectory")
             binding = state.latent_imports.get(product.buffer_id)
@@ -1320,10 +1319,10 @@ def _stage_input_products(
             )
             row.latent_imported = True
             request.projected_progress = replace(
-                operation_geometry.require_progress(request), latent_product=product
+                operations.require_progress(request), latent_product=product
             )
             request.projected_progress = replace(
-                operation_geometry.require_progress(request), flow_step=value.step
+                operations.require_progress(request), flow_step=value.step
             )
             continue
         consumers = tuple(

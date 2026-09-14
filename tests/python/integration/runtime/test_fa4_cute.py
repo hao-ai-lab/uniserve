@@ -4,8 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from uniserve.attention.fa4_cute import Fa4CuteAttentionBackend
 from uniserve_kernel import flash_attn_jagged
-from uniserve_worker.backends.attention.fa4_cute import Fa4CuteAttentionBackend
 
 
 @torch.inference_mode()

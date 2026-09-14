@@ -7,6 +7,9 @@ from threading import Event
 import pytest
 import torch
 
+from uniserve.nn.quant.kv_cache import resolve_kv_store_dtype
+from uniserve.runtime.kv_cache import KVCache, KVCacheConfig
+from uniserve.tensors import TensorRegion
 from uniserve_worker.execution.output import OutputBuffer, OutputPool
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import (
@@ -27,13 +30,12 @@ from uniserve_worker.protocol.batch import (
     UmmRequestParams,
 )
 from uniserve_worker.runtime.buffer_pool import BufferPool
+from uniserve_worker.runtime.cache_manager import CacheManager
 from uniserve_worker.runtime.cpu import CpuPool
 from uniserve_worker.runtime.device_events import EventPool
-from uniserve_worker.runtime.kv_cache import KVCache
 from uniserve_worker.runtime.latent_pool import LatentPool
 from uniserve_worker.runtime.request import RequestPool
 from uniserve_worker.runtime.tensor_store import FeatureMetadata, TensorStore
-from uniserve_worker.transfer.layout import TensorRegion
 from uniserve_worker.transfer.tickets import make_transport
 
 
@@ -128,14 +130,20 @@ def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
 def test_kv_computation_retains_pages_through_output_completion_and_reuse(
     device: str, abandoned: bool
 ) -> None:
-    cache = KVCache(
-        num_layers=1,
-        num_pages=3,
-        page_size=4,
-        num_kv_heads=1,
-        head_dim=1,
-        dtype=torch.float32,
-        device=device,
+    cache = CacheManager(
+        KVCache(
+            KVCacheConfig(
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=1,
+                dtype=torch.float32,
+                total_layers=1,
+                total_kv_heads=1,
+            ),
+            num_pages=3,
+            page_size=4,
+            device=device,
+        )
     )
     events = EventPool()
     outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
@@ -144,22 +152,22 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
     independent = torch.full_like(values, 9)
     stream = torch.cuda.Stream(device=device) if device.startswith("cuda") else None
     try:
-        cache.write(0, (1,), start=0, k=values, v=-values)
-        cache.write(0, (2,), start=0, k=independent, v=independent)
+        cache.cache.layer(0).write((1,), start=0, k=values, v=-values)
+        cache.cache.layer(0).write((2,), start=0, k=independent, v=independent)
         output = outputs.acquire(1, token_capacity=8, devices=(device,))
         completion = output.completion_future()
         cache.retain_execution(request, (1,), group=0, length=3, completion=completion)
         with pytest.raises(WorkerError, match="executing producer or consumer"):
             cache.zero_pages(0, (1,))
         cache.require_reusable((1,), group=0, start=3, length=1)
-        for actual in cache.read(0, (2,), start=0, length=4):
+        for actual in cache.cache.layer(0).read((2,), start=0, length=4):
             torch.testing.assert_close(actual, independent, rtol=0, atol=0)
         assert not cache.retirement_ready(requests=(request,))
         # Releasing another product of this request does not retire its KV
         # computation. The execution fence still protects page reuse above.
         assert cache.retirement_ready(buffers=(BufferId(request, ComputationId(2, 0), 0, 2),))
 
-        source = cache.transfer_views((1,), group=0, start=0, length=3)[0][0]
+        source = cache.cache.transfer_views((1,), start=0, length=3)[0][0]
         if stream is not None:
             # First-use reduction initialization can finish prior device work
             # while the host is still submitting it. Initialize before the delay.
@@ -190,7 +198,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
         assert completion.done()
         assert cache.retirement_ready(requests=(request,))
         cache.zero_pages(0, (1,))
-        for actual in cache.read(0, (1,), start=0, length=4):
+        for actual in cache.cache.layer(0).read((1,), start=0, length=4):
             assert torch.count_nonzero(actual).item() == 0
 
         # A subsequent lease over the same bounded output storage must retain
@@ -213,15 +221,21 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
 
 @pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
 def test_fp8_kv_append_preserves_page_scales_until_page_reuse(device: str) -> None:
-    pool = KVCache(
-        num_layers=2,
-        num_pages=4,
-        page_size=4,
-        num_kv_heads=1,
-        head_dim=1,
-        dtype=torch.float32,
-        store_dtype=torch.float8_e4m3fn,
-        device=device,
+    pool = CacheManager(
+        KVCache(
+            KVCacheConfig(
+                num_layers=2,
+                num_kv_heads=1,
+                head_dim=1,
+                dtype=torch.float32,
+                store_dtype=resolve_kv_store_dtype(torch.float32, torch.float8_e4m3fn),
+                total_layers=2,
+                total_kv_heads=1,
+            ),
+            num_pages=4,
+            page_size=4,
+            device=device,
+        )
     )
     pages = (3, 1)
     prefix = torch.tensor((112.0, 224.0, 448.0), device=device).view(3, 1, 1)
@@ -229,9 +243,9 @@ def test_fp8_kv_append_preserves_page_scales_until_page_reuse(device: str) -> No
     try:
         for layer in range(2):
             factor = 2**layer
-            pool.write(layer, pages, start=0, k=prefix * factor, v=-prefix * factor / 2)
-            pool.write(layer, pages, start=3, k=suffix * factor, v=-suffix * factor / 2)
-            keys, values = pool.read(layer, pages, start=0, length=5)
+            pool.cache.layer(layer).write(pages, start=0, k=prefix * factor, v=-prefix * factor / 2)
+            pool.cache.layer(layer).write(pages, start=3, k=suffix * factor, v=-suffix * factor / 2)
+            keys, values = pool.cache.layer(layer).read(pages, start=0, length=5)
             # E4M3's maximum magnitude is 448. The first page keeps its scale,
             # while the second page derives its own scale from its first write.
             expected = torch.tensor((112.0, 224.0, 448.0, 448.0, -896.0), device=device)
@@ -242,11 +256,11 @@ def test_fp8_kv_append_preserves_page_scales_until_page_reuse(device: str) -> No
         pool.zero_pages(0, (3,))
         for layer in range(2):
             replacement = prefix * 8 * 2**layer
-            pool.write(layer, (3,), start=0, k=replacement, v=-replacement)
-            keys, values = pool.read(layer, (3,), start=0, length=3)
+            pool.cache.layer(layer).write((3,), start=0, k=replacement, v=-replacement)
+            keys, values = pool.cache.layer(layer).read((3,), start=0, length=3)
             torch.testing.assert_close(keys, replacement, rtol=0, atol=0)
             torch.testing.assert_close(values, -replacement, rtol=0, atol=0)
-            keys, values = pool.read(layer, pages, start=4, length=1)
+            keys, values = pool.cache.layer(layer).read(pages, start=4, length=1)
             torch.testing.assert_close(keys, suffix[1:] * 2**layer, rtol=0, atol=0)
             torch.testing.assert_close(values, -suffix[1:] * 2**layer / 2, rtol=0, atol=0)
     finally:
@@ -257,14 +271,20 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
     events = EventPool()
     outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
     transport = make_transport("local", byte_capacity=4096, ticket_capacity=2, event_pool=events)
-    pool = KVCache(
-        num_layers=1,
-        num_pages=5,
-        page_size=4,
-        num_kv_heads=1,
-        head_dim=4,
-        dtype=torch.float32,
-        device="cpu",
+    pool = CacheManager(
+        KVCache(
+            KVCacheConfig(
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=4,
+                dtype=torch.float32,
+                total_layers=1,
+                total_kv_heads=1,
+            ),
+            num_pages=5,
+            page_size=4,
+            device="cpu",
+        )
     )
     buffer = BufferId(
         owner=RequestKey(1, 1, 1),
@@ -277,9 +297,9 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
     locations = []
     readers = []
     try:
-        pool.write(0, pages, start=0, k=prefix, v=-prefix)
+        pool.cache.layer(0).write(pages, start=0, k=prefix, v=-prefix)
         source = pool.reserve_publication(buffer, pages, group=0, start=0, length=3)
-        for tensor in pool.read(0, pages, start=0, length=3):
+        for tensor in pool.cache.layer(0).read(pages, start=0, length=3):
             assert tensor is not None
             location = transport.publish(tensor)
             locations.append(location)
@@ -289,12 +309,13 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         # Appending touches the remaining token of the same page and the next
         # page. Neither operation changes the retained prefix's logical value.
         suffix = torch.full((5, 1, 4), 7.0)
-        pool.write(0, pages, start=3, k=suffix, v=-suffix)
+        pool.require_writable(pages, group=0, start=3, length=suffix.shape[0])
+        pool.cache.layer(0).write(pages, start=3, k=suffix, v=-suffix)
         torch.testing.assert_close(readers[0].result(), prefix, rtol=0, atol=0)
         torch.testing.assert_close(readers[1].result(), -prefix, rtol=0, atol=0)
         pool.zero_pages(0, (2,))
         with pytest.raises(WorkerError, match="published version"):
-            pool.write(0, pages, start=2, k=suffix[:1], v=-suffix[:1])
+            pool.require_writable(pages, group=0, start=2, length=1)
 
         pool.release_buffers((buffer,))
         for location in locations:
@@ -323,7 +344,7 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         output.seal()
         output.abandon()
         pool.zero_pages(0, (3,))
-        keys, values = pool.read(0, pages, start=0, length=3)
+        keys, values = pool.cache.layer(0).read(pages, start=0, length=3)
         torch.testing.assert_close(keys, torch.zeros_like(prefix), rtol=0, atol=0)
         torch.testing.assert_close(values, torch.zeros_like(prefix), rtol=0, atol=0)
     finally:
@@ -858,8 +879,8 @@ def test_failed_latent_publication_retains_its_pages_without_poisoning_other_req
 
 @pytest.mark.gpu
 def test_media_capture_releases_capacity_after_its_completion_fence():
+    from uniserve.model.media import VideoInfo
     from uniserve_worker.media.buffers import MediaBuffers
-    from uniserve_worker.modeling.geometry import VideoShape
 
     events = EventPool()
     outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
@@ -867,7 +888,7 @@ def test_media_capture_releases_capacity_after_its_completion_fence():
         state_slots=1,
         unresolved_window=1,
         max_video_frames_per_round=1,
-        max_geometry=VideoShape(1, (1,), 2, 2, 1, 8),
+        video=VideoInfo(1, 2, 2, 1, 8),
     )
     lease = ring.reserve("video")
     try:

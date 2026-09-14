@@ -5,16 +5,13 @@ import os
 
 import torch
 import torch.distributed as dist
-
-from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
-from uniserve_worker.ops.video_sparse import (
-    compose_to_head_shards,
-    unpack_add_compression,
-)
 from uniserve_worker.runtime.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+
+from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
+from uniserve.ops.video_sparse import compose_to_head_shards, unpack_add_compression
 
 
 def main() -> None:

@@ -9,6 +9,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from uniserve.math import ceil_div
+from uniserve.model.diffusion import DiffusionMixin
+from uniserve.model.image_diffusion import ImageDiffusion
+from uniserve.nn.diffusion.cfg import build_flow_cfg_plan
 from uniserve_worker.protocol.batch import (
     ComputationId,
     ForwardMode,
@@ -20,9 +24,6 @@ from ..execution.diffusion_state import resolve_prefix
 from ..execution.graph_inputs import DiffusionShape
 from ..execution.model_runner import capture_image_parameters
 from ..foundation.errors import invalid_descriptor
-from ..foundation.math import ceil_div
-from ..modeling.image_diffusion import ImageDiffusion
-from ..nn.diffusion.cfg import build_flow_cfg_plan
 from ..protocol.batch import (
     BatchCommand,
     BatchOutput,
@@ -336,7 +337,7 @@ def _build_warmup_batch(
     admissions: tuple[NewRequest, ...],
     operations: tuple[ScheduledRequest, ...],
     input_products: tuple[TensorPublication, ...] = (),
-    image_geometry: tuple[int, int] | None = None,
+    image_size: tuple[int, int] | None = None,
 ) -> ScheduleBatch:
     """Derive cache, latent, buffer, and row allocations for a warmup submission."""
 
@@ -408,7 +409,7 @@ def _build_warmup_batch(
             block_table = requests._kv_pages.setdefault(lease_key, [])
             target_pages = ceil_div(
                 visible + input_length,
-                int(requests.worker.kv_cache.block_size),
+                int(requests.worker.kv_cache.cache.page_size),
             )
             missing = target_pages - len(block_table)
             if missing < 0:
@@ -433,7 +434,7 @@ def _build_warmup_batch(
                     request_pool_idx=request_pool_indices[operation.request_key],
                     group_id=group_id,
                     page_ids=tuple(block_table),
-                    allocated_tokens=len(block_table) * requests.worker.kv_cache.block_size,
+                    allocated_tokens=len(block_table) * requests.worker.kv_cache.cache.page_size,
                 )
             )
             if allocated:
@@ -454,7 +455,7 @@ def _build_warmup_batch(
                 (input_length,),
                 (True,),
             )
-    height, width = image_geometry or _warmup_image_geometry(requests)
+    height, width = image_size or _warmup_image_size(requests)
     latent_units = max(
         1,
         (height // max(1, int(requests.worker._layout.latent_downsample)))
@@ -543,7 +544,11 @@ def _warmup_flow_tables(
 
     request = requests.worker.requests.get(operation.request_key.request_id)
     image = request.image
-    generation = requests.worker.model.generation
+    generation = (
+        requests.worker.model.generation
+        if isinstance(requests.worker.model, DiffusionMixin)
+        else None
+    )
     if image is None or generation is None:
         raise invalid_descriptor("generation warmup has no admitted image runtime")
     guide = build_flow_cfg_plan(
@@ -561,7 +566,7 @@ def _warmup_flow_tables(
     branch_prefixes: list[tuple[tuple[int, ...], bool]] = []
     for branch in guide.branches:
         prefix, copy_conditioning = resolve_prefix(
-            generation,
+            requests.worker.runner.flow_prompt,
             generation.branch_source(branch),
             image_prompt=image_prompt,
             negative_prompt=image.negative_prompt,
@@ -577,7 +582,7 @@ def _warmup_flow_tables(
     alternative = next(iter(alternatives), ())
     if requests.worker.kv_cache is None:
         raise invalid_descriptor("warmup flow requires KV cache storage")
-    required = ceil_div(len(alternative), requests.worker.kv_cache.block_size)
+    required = ceil_div(len(alternative), requests.worker.kv_cache.cache.page_size)
     lease = requests._prefix_pages.setdefault(operation.request_key, [])
     missing = required - len(lease)
     occupied = {
@@ -613,7 +618,7 @@ def _warmup_flow_tables(
                 request_pool_idx=alternative_slot,
                 group_id=0,
                 page_ids=tuple(lease),
-                allocated_tokens=len(lease) * requests.worker.kv_cache.block_size,
+                allocated_tokens=len(lease) * requests.worker.kv_cache.cache.page_size,
             ),
         )
         if allocated:
@@ -654,12 +659,15 @@ def warmup_requests(worker: Worker) -> None:
         if ForwardMode.PREFILL in worker.info.supported_ops:
             _warmup_tokens(requests)
             logger.info("completed token runtime warmup")
-        if isinstance(worker.model.generation, ImageDiffusion):
+        if isinstance(
+            (worker.model.generation if isinstance(worker.model, DiffusionMixin) else None),
+            ImageDiffusion,
+        ):
             _warmup_flow(requests)
             logger.info("completed flow runtime warmup")
 
 
-def _warmup_image_geometry(requests: _WarmupRequests) -> tuple[int, int]:
+def _warmup_image_size(requests: _WarmupRequests) -> tuple[int, int]:
     """Derive the largest square image whose latent grid fits the declared capacity."""
 
     downsample = max(1, int(requests.worker._layout.latent_downsample))
@@ -816,7 +824,11 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         UmmRequestParams,
     )
 
-    generation = requests.worker.model.generation
+    generation = (
+        requests.worker.model.generation
+        if isinstance(requests.worker.model, DiffusionMixin)
+        else None
+    )
     if not {
         PipelineStage.LATENT_PREPARATION,
         PipelineStage.DENOISING,
@@ -833,7 +845,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                 for shape in reversed(requests.worker.runner.flow_captures)
                 if shape.cfg_branches == branches
             ),
-            DiffusionShape(1, *_warmup_image_geometry(requests), branches),
+            DiffusionShape(1, *_warmup_image_size(requests), branches),
         )
         for branches in requests.worker.runner.flow_cfg_branches
     )
@@ -894,7 +906,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                 requests,
                 admissions=admissions,
                 operations=tuple(publications),
-                image_geometry=(height, width),
+                image_size=(height, width),
             ),
         )
         max_latent_elements = max(
@@ -950,7 +962,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                 requests,
                 admissions=(),
                 operations=tuple(transitions),
-                image_geometry=(height, width),
+                image_size=(height, width),
             ),
         )
         current_latents = tuple(initial_latents)
@@ -993,7 +1005,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                     requests,
                     admissions=(),
                     operations=tuple(flows),
-                    image_geometry=(height, width),
+                    image_size=(height, width),
                 ),
             )
             requests.free_products(tuple(product.buffer_id for product in current_latents))

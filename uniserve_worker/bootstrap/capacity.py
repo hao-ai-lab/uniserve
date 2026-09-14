@@ -8,25 +8,27 @@ from typing import Any
 
 import torch
 
-from uniserve_worker.modeling.text import TextMixin
+from uniserve.distributed.mesh import Communicator
+from uniserve.math import ceil_div
+from uniserve.model.diffusion import DiffusionMixin
+from uniserve.model.encoder import EncoderMixin
+from uniserve.model.image_diffusion import ImageDiffusion
+from uniserve.model.model import Model
+from uniserve.model.text import TextMixin
+from uniserve.model.video import VideoMixin
+from uniserve.runtime.device import canonical_device, device_memory_budget
+from uniserve.tensors import BufferConfig
+from uniserve_models.processing import FeatureLayout, ImageProcessor
 
 from ..config import WorkerConfig
-from ..execution.input_buffers import InputGeometry
+from ..execution.input_buffers import InputBufferConfig
 from ..execution.model_entry import ModelEntry
+from ..execution.resources import media_state_buffers
 from ..foundation.errors import unsupported_setup
-from ..foundation.math import ceil_div
-from ..modeling.image_diffusion import ImageDiffusion
-from ..modeling.inputs import FeatureLayout
-from ..modeling.model import Model
-from ..modeling.video import VideoMixin
-from ..nn.mesh import Communicator
-from ..protocol.batch import DeviceDim, PipelineStage, TensorSpec
-from ..runtime.device import canonical_device, device_memory_budget
-from ..runtime.kv_cache import KVCache
+from ..protocol.batch import DeviceDim, OutputInfo, PipelineStage
+from ..runtime.cache_manager import CacheManager
 from ..runtime.results import resolve_outputs
-from ..runtime.tensor_buffers import TensorSchema
 from ..runtime.tensor_store import TensorStore, device_product_capacity_bytes
-from ..runtime.tensors import media_calls, resolve_resources
 from .components import media_components
 
 _DEVICE_PRODUCTS_PER_OPERATION = 6
@@ -42,8 +44,13 @@ DEFAULT_MAX_REQUEST_POOL_SIZE = 128
 DEFAULT_BLOCK_SIZE = 64
 
 
-def packed_input_geometry(model: Model, config: WorkerConfig) -> InputGeometry:
+def input_buffer_config(
+    model: Model, config: WorkerConfig, *, processor: ImageProcessor | None = None
+) -> InputBufferConfig:
     """Size staging for the admitted text span plus one atomic image or CFG operation."""
+
+    if not isinstance(model, TextMixin):
+        raise ValueError("text input staging requires a text backbone")
 
     max_rows = min(
         config.max_request_pool_size,
@@ -58,15 +65,15 @@ def packed_input_geometry(model: Model, config: WorkerConfig) -> InputGeometry:
         if config.lanes
         else config.max_batch_tokens
     )
-    flow = model.generation
+    flow = model.generation if isinstance(model, DiffusionMixin) else None
     branches = 1 if flow is None else int(flow.max_cfg_branches)
-    processor = model.image_processor
     injection = None if processor is None else processor.feature_injection
     image_span = (
         0
         if injection is None
         else max(
-            int(model.max_vit_grid_tokens), 0 if flow is None else int(flow.max_vae_grid_tokens)
+            (int(model.max_vit_grid_tokens) if isinstance(model, EncoderMixin) else 0),
+            0 if flow is None else int(flow.max_vae_grid_tokens),
         )
         + (2 if injection.layout is FeatureLayout.FRAMED else 0)
     )
@@ -85,17 +92,17 @@ def packed_input_geometry(model: Model, config: WorkerConfig) -> InputGeometry:
             )
         )
     )
-    return InputGeometry(
+    return InputBufferConfig(
         max_rows=max_rows * branches,
         max_tokens=text_tokens + flow_tokens,
         max_text_tokens=text_tokens,
-        max_blocks_per_row=max(1, ceil_div(model.text_max_tokens, config.block_size)),
-        hidden_size=model.hidden_size,
+        max_blocks_per_row=max(1, ceil_div(model.text_backbone.max_tokens, config.block_size)),
+        hidden_size=model.text_backbone.hidden_size,
     )
 
 
 def tensor_slot_capacity(
-    schema: Mapping[str, TensorSchema],
+    schema: Mapping[str, BufferConfig],
     group: Communicator,
     *,
     maximum: int,
@@ -110,7 +117,7 @@ def tensor_slot_capacity(
     so ranks agree on feasible counts rather than reducing local maxima.
     """
 
-    bytes_per_slot = sum(field.nbytes for field in schema.values() if field.memory != "pinned")
+    bytes_per_slot = sum(field.nbytes for field in schema.values() if not field.host)
     if minimum < 1 or maximum < minimum:
         raise ValueError("request tensor capacity requires valid slot bounds")
     candidates = range(minimum, maximum + 1)
@@ -139,7 +146,7 @@ def request_tensor_window(pipeline_depth: int, request_slots: int) -> int:
     return pipeline_depth // request_slots - 1
 
 
-def product_storage_bytes(entry_outputs: Mapping[str, tuple[TensorSpec, ...]]) -> int:
+def product_storage_bytes(entry_outputs: Mapping[str, tuple[OutputInfo, ...]]) -> int:
     """Size one logical product set using the runtime's 256-byte allocation alignment."""
 
     return sum(
@@ -163,7 +170,7 @@ def active_latent_capacity_tokens(
 
 
 def local_product_storage_bytes(
-    entry_outputs: Mapping[str, tuple[TensorSpec, ...]],
+    entry_outputs: Mapping[str, tuple[OutputInfo, ...]],
     *,
     bindings: Mapping[str, ModelEntry],
     pipeline_components: Mapping[PipelineStage, str],
@@ -355,7 +362,7 @@ def model_arena_capacity(
     max_vision_feature_bytes: int,
     bytes_per_token: int,
     bindings: Mapping[str, ModelEntry] | None = None,
-    state_schema: Mapping[str, TensorSchema] | None = None,
+    state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> ArenaCapacity:
     """Derive device-product, transfer, latent, and CPU arena bounds from worker_config geometry."""
 
@@ -366,9 +373,9 @@ def model_arena_capacity(
         raise ValueError("model arena sizing requires positive runtime bounds")
 
     slots = depth * max_operations
-    if state_schema is None:
-        state_schema = resolve_resources(model, media_calls(model, bindings or {})).state
-    if isinstance(model, VideoMixin) or state_schema:
+    if state_buffers is None:
+        state_buffers = media_state_buffers(model, bindings or {})
+    if isinstance(model, VideoMixin) or state_buffers:
         return request_tensor_arena_capacity(
             worker_config,
             pipeline_depth=depth,
@@ -381,7 +388,7 @@ def model_arena_capacity(
         )
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
     block_size = int(worker_config.block_size)
-    flow = model.generation
+    flow = model.generation if isinstance(model, DiffusionMixin) else None
     if flow is not None and not isinstance(flow, ImageDiffusion):
         raise ValueError("model generation behavior has an invalid type")
     latent_pool_bytes = 0
@@ -553,7 +560,7 @@ def resolve_request_capacity(
     pipeline_depth: int,
     capacity_group: Communicator | None,
     bindings: Mapping[str, ModelEntry] | None = None,
-    state_schema: Mapping[str, TensorSchema] | None = None,
+    state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> WorkerConfig:
     """Fit request tensors and their product arenas within the rank's fixed memory grant."""
 
@@ -563,9 +570,7 @@ def resolve_request_capacity(
         )
         worker_config = replace(worker_config, pool_memory_bytes=available)
         schema = (
-            resolve_resources(model, media_calls(model, bindings or {})).state
-            if state_schema is None
-            else state_schema
+            media_state_buffers(model, bindings or {}) if state_buffers is None else state_buffers
         )
         if isinstance(model, VideoMixin) or schema:
             if capacity_group is None:
@@ -608,18 +613,20 @@ def resolve_request_capacity(
     return worker_config
 
 
-def decode_context_blocks(model: Model, worker_config: WorkerConfig, pool: KVCache | None) -> int:
+def decode_context_blocks(
+    model: Model, worker_config: WorkerConfig, pool: CacheManager | None
+) -> int:
     """Return the maximum paged-decode context blocks supported by this worker."""
 
     if not isinstance(model, TextMixin):
         return 0
-    max_tokens = int(model.text_max_tokens)
+    max_tokens = int(model.text_backbone.max_tokens)
     if max_tokens < 1:
         return 0
     blocks = (max_tokens + int(worker_config.block_size) - 1) // int(worker_config.block_size)
     if pool is None:
         return 0
-    return min(blocks, max(0, int(pool.num_pages) - 1))
+    return min(blocks, max(0, int(pool.cache.num_pages) - 1))
 
 
 def check_startup_memory(

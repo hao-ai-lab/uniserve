@@ -8,11 +8,12 @@ import pytest
 
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_config import stub_worker_config
+from uniserve.model.components import ComponentCall
+from uniserve.model.model import Model
+from uniserve_models.processing import stub_processor
+from uniserve_models.stub import StubModel
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
 from uniserve_worker.config import LaneConfig, WorkerConfig
-from uniserve_worker.modeling.components import Call, CallSpec, ComponentSpec
-from uniserve_worker.modeling.model import Model
-from uniserve_worker.models.stub import StubModel
 from uniserve_worker.protocol.batch import COMPUTATIONS, ForwardMode
 from uniserve_worker.worker import Worker
 
@@ -57,10 +58,8 @@ def test_action_model_reports_zero_kv_geometry() -> None:
         architecture = "ActionModel"
 
         @classmethod
-        def components(cls, config):
-            return (ComponentSpec("decoder", (CallSpec(Call.DECODE_VIDEO),)),)
-
-        generation = None
+        def component_calls(cls, config):
+            return (ComponentCall("decoder", "decode:video"),)
 
     worker_config = WorkerConfig(
         device="cpu",
@@ -139,7 +138,7 @@ def test_worker_info_reports_limits_safe_for_all_bound_lanes(with_lane_limits) -
 
     # The scheduler receives one shared bound even when lanes constrain different
     # dimensions. Unspecified lane limits inherit the configured model capacity.
-    info = build_worker_info(StubModel(), config)
+    info = build_worker_info(StubModel(), config, image_processor=stub_processor())
 
     assert info.max_batch_ops == (2 if with_lane_limits else 4)
     assert info.max_batch_tokens == (128 if with_lane_limits else 256)
@@ -154,6 +153,7 @@ def test_worker_identity_and_capabilities_reflect_enabled_operations() -> None:
     ):
         with Worker(
             StubModel(),
+            image_processor=stub_processor(),
             worker_config=config,
             sampling_group=None,
             tokenizer=None,

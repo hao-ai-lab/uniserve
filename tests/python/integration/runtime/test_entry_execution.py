@@ -7,20 +7,21 @@ import torch
 
 from tests.python.fixtures.depth_one import finalized_report
 from tests.python.fixtures.execution_worker import execution_worker
+from uniserve.distributed.mesh import Communicator, DeviceMesh
+from uniserve.distributed.parallel import ParallelConfig
+from uniserve.model.batch import TensorOutput
+from uniserve.model.components import ComponentCall
+from uniserve.model.encoder import EncodeKind, EncoderMixin
+from uniserve.model.media import VideoSize
+from uniserve.model.model import Model
+from uniserve.nn.vae.decoder import LatentDecoder
+from uniserve.tensors import OutputLayout
+from uniserve_models.stub import StubModel
 from uniserve_worker.bootstrap.worker_info import WorkerInfo
-from uniserve_worker.config import WorkerConfig
+from uniserve_worker.config import ComponentConfig, WorkerConfig
 from uniserve_worker.execution.model_entry import ModelEntry
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.foundation.errors import ComputeError, InputError
-from uniserve_worker.modeling.batch import TensorOutput
-from uniserve_worker.modeling.components import Call, CallSpec, ComponentSpec
-from uniserve_worker.modeling.encoder import EncodeKind, EncoderMixin
-from uniserve_worker.modeling.geometry import MediaShape, TensorOutputLayout, TextShape
-from uniserve_worker.modeling.model import Model
-from uniserve_worker.modeling.resources import TensorNeeds, TensorSchema
-from uniserve_worker.models.stub import StubModel
-from uniserve_worker.nn.mesh import Communicator, DeviceMesh
-from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig
 from uniserve_worker.protocol.batch import (
     Bounds,
     BufferAllocation,
@@ -31,6 +32,7 @@ from uniserve_worker.protocol.batch import (
     DType,
     NewRequest,
     OpStatus,
+    OutputInfo,
     PipelineStage,
     RequestKey,
     ScheduleBatch,
@@ -40,7 +42,6 @@ from uniserve_worker.protocol.batch import (
     StaticDim,
     TensorPublication,
     TensorRef,
-    TensorSpec,
     TransferMode,
 )
 from uniserve_worker.runtime.results import resolve_outputs
@@ -49,11 +50,46 @@ from uniserve_worker.transfer.layout import fetch_tensor
 pytestmark = pytest.mark.integration
 
 
+class SegmentDecoder(LatentDecoder):
+    latent_shape = (1, 3, 25, 8, 12)
+
+    def __init__(self):
+        super().__init__()
+        self.vae = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            self.vae.weight.fill_(1)
+        self.register_buffer("latents_mean", torch.tensor(0.0))
+        self.register_buffer("latents_std", torch.tensor(1.0))
+
+    def _reconstruct(self, latents):
+        return (latents * self.vae.weight[0, 0]).half()
+
+
+class Segments(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.native = SegmentDecoder()
+
+    def decode(self, latents, size, windows, *, constants, scratch):
+        values = tuple(self.native(value) for value in latents)
+        return TensorOutput({"video": values})
+
+    def output_layout(self, *, units=None):
+        return {
+            "video": OutputLayout((2 if units is None else units, 1, 3, 25, 8, 12), torch.float16)
+        }
+
+
 class VideoSegments(Model):
     """A numerical segment result with a complete logical unit dimension."""
 
-    def output_layout(self, entry, output_index, *, frames, units, prompt_tokens):
-        return TensorOutputLayout((units, 1, 3, 25, 8, 12))
+    def __init__(self):
+        super().__init__()
+        self.video_decoder = Segments()
+
+    @classmethod
+    def component_calls(cls, config):
+        return (ComponentCall("video_decoder", "decode:video"),)
 
 
 @pytest.mark.parametrize("rank", [0, 1, 3])
@@ -86,6 +122,21 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
         runner.close()
 
 
+class Embedding(EncoderMixin, torch.nn.Embedding):
+    encoder_kinds = frozenset({"text"})
+    max_tokens = 16
+
+    def output_layout(self, size):
+        return {
+            "conditioning": OutputLayout((1, size.tokens, 4), torch.float32, variable_axes=(1,))
+        }
+
+    def encode(self, kind, batch, *, constants, scratch):
+        if kind != "text":
+            raise ValueError("embedding encodes text")
+        return TensorOutput({"conditioning": tuple(self(value) for value in batch.values)})
+
+
 class EncodedModel(StubModel):
     """Numerical embedding composition used by public encoder execution tests."""
 
@@ -93,31 +144,13 @@ class EncodedModel(StubModel):
 
     def __init__(self, device="cpu"):
         super().__init__()
-        self.text_encoder = torch.nn.Embedding(32, 4, device=device)
-        self.text_max_tokens = 16
-        self.output_shapes = {
-            "text_encoder": (Call.ENCODE_TEXT, TextShape(16)),
-        }
+        self.text_encoder = Embedding(32, 4, device=device)
         with torch.no_grad():
             self.text_encoder.weight.copy_(torch.arange(128, device=device).reshape(32, 4))
 
-    def tensor_specs(self, call, shape):
-        if call is Call.ENCODE_TEXT:
-            return TensorNeeds(
-                outputs={
-                    "conditioning": TensorSchema(
-                        (1, shape.tokens, 4), torch.float32, variable_axes=(1,)
-                    )
-                }
-            )
-        return super().tensor_specs(call, shape)
-
     @classmethod
-    def components(cls, config):
-        return (
-            *super().components(config),
-            ComponentSpec("text_encoder", (CallSpec(Call.ENCODE_TEXT),)),
-        )
+    def component_calls(cls, config):
+        return (*super().component_calls(config), ComponentCall("text_encoder", "encode:text"))
 
     def encode(self, kind: EncodeKind, batch, *, constants, scratch):
         if kind == "text":
@@ -128,7 +161,6 @@ class EncodedModel(StubModel):
 
 
 def _encoder_bindings(model, components, device="cpu"):
-    specs = {component.name: component for component in model.components(model.config)}
     group = Communicator(device=torch.device(device))
     return {
         name: ModelEntry(
@@ -137,8 +169,7 @@ def _encoder_bindings(model, components, device="cpu"):
             group,
             DeviceMesh(config.ranks, 0, config.parallel_config, group.device),
             group.device,
-            calls=specs[name].calls if name in specs else (),
-            output_schema=resolve_outputs(model).get(name, ()),
+            outputs=resolve_outputs(model).get(name, ()),
         )
         for name, config in components
     }
@@ -147,8 +178,7 @@ def _encoder_bindings(model, components, device="cpu"):
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)])
 def test_decoder_call_preserves_values_across_independent_execution_owners(device):
     from tests.python.fixtures.decoding import DecodedModel
-    from uniserve_worker.modeling.batch import DecodeBatch
-    from uniserve_worker.modeling.geometry import MediaShape
+    from uniserve.model.batch import DecodeBatch
 
     model = DecodedModel().to(device)
     components = (("reconstruction", ComponentConfig((0,))),)
@@ -164,7 +194,7 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(devic
         for runner in runners:
             runner.prepare_fixed_modules()
         source = torch.arange(12, dtype=torch.float32, device=device).reshape(4, 3) / 10
-        shape = MediaShape(1, 1, frames=4)
+        shape = VideoSize(4)
 
         def expected(value):
             normalized = value.T.unsqueeze(0) * torch.tensor([0.5, 1.5, 2.5], device=device).view(
@@ -199,9 +229,7 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(devic
             runner.close()
 
 
-class Conditioner(EncoderMixin, Model):
-    """A conditioning projection required only at a pipeline's input stage."""
-
+class Conditioning(EncoderMixin, torch.nn.Module):
     encoder_kinds = frozenset({"conditioning"})
 
     def __init__(self):
@@ -210,16 +238,24 @@ class Conditioner(EncoderMixin, Model):
         with torch.no_grad():
             self.projection.weight.copy_(torch.eye(4)[:2])
 
-    @classmethod
-    def components(cls, config):
-        return (ComponentSpec("denoiser", (CallSpec(Call.ENCODE_CONDITIONING, stage="first"),)),)
-
     def encode(self, kind, batch, *, constants, scratch):
         if kind != "conditioning":
             raise ValueError("conditioner requires encoded features")
         return TensorOutput(
             {"conditioning": tuple(self.projection(value) for value in batch.values)}
         )
+
+
+class Conditioner(Model):
+    """A component projection required only at its pipeline's input stage."""
+
+    def __init__(self):
+        super().__init__()
+        self.denoiser = Conditioning()
+
+    @classmethod
+    def component_calls(cls, config):
+        return (ComponentCall("denoiser", "encode:conditioning", stage="first"),)
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -233,7 +269,6 @@ def test_conditioning_executes_only_on_its_declared_pipeline_stage(rank):
         group,
         DeviceMesh(config.ranks, rank, config.parallel_config),
         group.device,
-        calls=model.components(model.config)[0].calls,
     )
     runner = ModelRunner(
         model, WorkerConfig(rank=rank, world_size=2), bindings={"denoiser": binding}
@@ -423,7 +458,7 @@ def test_entry_rejects_outputs_outside_the_loaded_contract(shape, dtype, message
     runner.bind_module(
         "projection",
         model.projection,
-        outputs=(TensorSpec("values", DType.F32, ShapeBound((DeviceDim(2), StaticDim(4)))),),
+        outputs=(OutputInfo("values", DType.F32, ShapeBound((DeviceDim(2), StaticDim(4)))),),
     )
     try:
         with pytest.raises(ComputeError, match=message):
@@ -435,16 +470,24 @@ def test_entry_rejects_outputs_outside_the_loaded_contract(shape, dtype, message
 
 
 def test_worker_reports_entry_result_bounds_with_its_static_membership():
-    class Features(StubModel):
-        output_shapes = {"projection": (Call.ENCODE_VISION, MediaShape(1, 1))}
+    class Projection(EncoderMixin, torch.nn.Identity):
+        encoder_kinds = frozenset({"vision"})
 
-        def tensor_specs(self, call, shape):
-            return TensorNeeds(
-                outputs={"features": TensorSchema((128, 512), torch.bfloat16, variable_axes=(0,))}
-            )
+        def encode(self, kind, batch, *, constants, scratch):
+            if kind != "vision":
+                raise ValueError("projection encodes vision features")
+            return TensorOutput({"features": tuple(self(value) for value in batch.values)})
+
+        def output_layout(self):
+            return {"features": OutputLayout((128, 512), torch.bfloat16, variable_axes=(0,))}
+
+    class Features(StubModel):
+        @classmethod
+        def component_calls(cls, config):
+            return (ComponentCall("projection", "encode:vision"),)
 
     model = Features()
-    model.projection = torch.nn.Identity()
+    model.projection = Projection()
     worker = execution_worker(model, components=(("projection", ComponentConfig((0,))),))
     try:
         info = worker.info.to_mapping()
@@ -452,17 +495,19 @@ def test_worker_reports_entry_result_bounds_with_its_static_membership():
         assert entry.name == "projection"
         assert entry.config.ranks == (0,)
         assert entry.outputs == (
-            TensorSpec("features", DType.BF16, ShapeBound((DeviceDim(128), StaticDim(512)))),
+            OutputInfo("features", DType.BF16, ShapeBound((DeviceDim(128), StaticDim(512)))),
         )
     finally:
         worker.close()
 
 
 def test_worker_binds_dense_attention_without_requesting_kv_storage():
-    from uniserve_worker.nn.attention import RadixAttention
+    from uniserve.nn.attention import RadixAttention
     from uniserve_worker.worker import Worker
 
-    class DenseEntry(torch.nn.Module):
+    class DenseEntry(EncoderMixin, torch.nn.Module):
+        encoder_kinds = frozenset({"conditioning"})
+
         def __init__(self):
             super().__init__()
             self.attention = RadixAttention(2, 2, 8)
@@ -470,17 +515,15 @@ def test_worker_binds_dense_attention_without_requesting_kv_storage():
         def forward(self, value):
             return self.attention(value, value, value, None, causal=False)
 
+        def encode(self, kind, batch, *, constants, scratch):
+            if kind != "conditioning":
+                raise ValueError("dense attention encodes conditioning")
+            return TensorOutput({"conditioning": tuple(self(value) for value in batch.values)})
+
     class DenseModel(Model):
-        output_shapes = {"decoder": (Call.DECODE_VIDEO, MediaShape(1, 1))}
-
-        def tensor_specs(self, call, shape):
-            return TensorNeeds(
-                outputs={"values": TensorSchema((1, 2, 16, 8), torch.float32, variable_axes=(2,))}
-            )
-
         @classmethod
-        def components(cls, config):
-            return (ComponentSpec("decoder", (CallSpec(Call.DECODE_VIDEO),)),)
+        def component_calls(cls, config):
+            return (ComponentCall("decoder", "encode:conditioning"),)
 
     model = DenseModel()
     model.architecture = "DenseAttention"
@@ -497,7 +540,7 @@ def test_worker_binds_dense_attention_without_requesting_kv_storage():
         ),
         attention=None,
         tokenizer=None,
-        allowed_work_variants=frozenset({PipelineStage.VIDEO_DECODING}),
+        allowed_work_variants=frozenset({PipelineStage.LATENT_PREPARATION}),
         transfer_backends=("local",),
         publication_backends=("local",),
         worker_id="decoder",

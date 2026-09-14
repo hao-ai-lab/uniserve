@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from uniserve.model.tensors import concatenate_views
 from uniserve_worker.execution.output import (
     PendingOutput,
 )
 from uniserve_worker.execution.transfer import _release_locators
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.modeling.tensors import concatenate_views
 from uniserve_worker.profiling import _forward_stats, record_component
 from uniserve_worker.protocol.batch import (
     OpStatus,
@@ -32,8 +32,8 @@ if TYPE_CHECKING:
     from uniserve_worker.bootstrap.worker_info import WorkerInfo
     from uniserve_worker.config import WorkerConfig
     from uniserve_worker.media.mux import MediaMux
+    from uniserve_worker.runtime.cache_manager import CacheManager
     from uniserve_worker.runtime.decode_state import DecodeState
-    from uniserve_worker.runtime.kv_cache import KVCache
     from uniserve_worker.runtime.latent_pool import LatentPool
     from uniserve_worker.runtime.request import RequestPool
     from uniserve_worker.runtime.tensor_store import TensorStore
@@ -54,7 +54,7 @@ def _commit_group(
     started: int,
     *,
     state: BatchState,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
@@ -269,7 +269,7 @@ def _discard_group(
     error: BaseException | None = None,
     *,
     state: BatchState,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,

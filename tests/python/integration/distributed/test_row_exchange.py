@@ -4,22 +4,20 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve_worker.bootstrap.distributed import (
-    initialize_model_parallel,
-    initialize_process_groups,
-)
-from uniserve_worker.nn.attention import RadixAttention
-from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
-from uniserve_worker.nn.parallel_attention import (
+from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
+from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
+from uniserve.nn.attention import RadixAttention
+from uniserve.nn.layer import LayerConfig
+from uniserve.nn.parallel_attention import (
     AttentionRowExchange,
     HeadRowPreparation,
     ParallelAttention,
 )
-from uniserve_worker.nn.parallel_sequence import SequencePartition
-from uniserve_worker.nn.video_attention import VideoAttention
-from uniserve_worker.runtime.attention_storage import allocate_attention_exchange_storage
-from uniserve_worker.runtime.tensor_buffers import TensorBuffers, TensorSchema
+from uniserve.nn.parallel_sequence import SequencePartition
+from uniserve.nn.video_attention import VideoAttention
+from uniserve.runtime.attention_storage import allocate_attention_exchange_storage
+from uniserve.runtime.tensor_buffers import TensorBuffers
+from uniserve.tensors import BufferConfig
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -62,16 +60,13 @@ def _run_exchange(rank: int, rendezvous: str) -> None:
                 layer_config=LayerConfig(mesh.get_group("tp"), None, "attention"),
                 device="meta",
             )
-            requirement = layer.tensor_specs(shape[0], shape[0], dtype=torch.bfloat16)
-            incoming_spec = requirement.scratch["attention_workspace"]
-            schema = {
-                name: TensorSchema(shape, torch.bfloat16, memory="symmetric", group=group)
-                for name in ("outgoing", "staging")
-            }
-            schema["incoming"] = TensorSchema(
-                incoming_spec.shape, incoming_spec.dtype, memory="symmetric", group=group
+            requirement = layer.workspace_buffers(shape[0], shape[0], dtype=torch.bfloat16)
+            incoming_spec = requirement["attention_workspace"]
+            schema = {name: BufferConfig(shape, torch.bfloat16) for name in ("outgoing", "staging")}
+            schema["incoming"] = BufferConfig(incoming_spec.shape, incoming_spec.dtype)
+            storage = TensorBuffers.allocate(
+                schema, device, symmetric={name: group for name in schema}
             )
-            storage = TensorBuffers.allocate(schema, device)
             outgoing, incoming = (storage.capacity[name] for name in ("outgoing", "incoming"))
             staging = storage.capacity["staging"]
             rows = (torch.arange(outgoing.numel(), device=device) % 13).view(shape)

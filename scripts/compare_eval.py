@@ -49,31 +49,54 @@ def compare_pair(
             "candidate": cand_value,
             "raw_change_percent": raw_change_percent,
         }
+        if direction not in {"higher", "lower"}:
+            failures.append(f"metric_direction_invalid:{path}")
         if max_regression is not None:
-            normalized_ratio = None
+            slowdown = None
             passed = False
-            if ref_value is not None and cand_value is not None and ref_value > 0 and cand_value > 0:
-                normalized_ratio = (
-                    cand_value / ref_value if direction == "higher" else ref_value / cand_value
+            if (
+                ref_value is not None
+                and cand_value is not None
+                and ref_value > 0
+                and cand_value > 0
+            ):
+                slowdown = (
+                    ref_value / cand_value if direction == "higher" else cand_value / ref_value
                 )
-                passed = normalized_ratio >= 1.0 - max_regression
+                passed = slowdown <= 1.0 + max_regression
             metric.update(
                 {
-                    "normalized_ratio": normalized_ratio,
-                    "minimum_ratio": 1.0 - max_regression,
+                    "slowdown": slowdown,
+                    "maximum_slowdown": 1.0 + max_regression,
                     "passed": passed,
                 }
             )
-        elif max_latency_regression_ms is not None and _is_latency_metric(path, direction):
-            regression_ms = None
+        elif max_latency_regression_ms is not None and (
+            _is_latency_metric(path, direction)
+            or (path == "videos_per_second" and direction == "higher")
+        ):
+            ref_seconds = cand_seconds = regression_seconds = None
             passed = False
-            if ref_value is not None and cand_value is not None:
-                regression_ms = cand_value - ref_value
-                passed = regression_ms <= max_latency_regression_ms
+            limit_seconds = max_latency_regression_ms / 1000.0
+            if (
+                ref_value is not None
+                and cand_value is not None
+                and ref_value > 0
+                and cand_value > 0
+            ):
+                reciprocal = path == "videos_per_second"
+                ref_seconds = 1.0 / ref_value if reciprocal else ref_value / 1000.0
+                cand_seconds = 1.0 / cand_value if reciprocal else cand_value / 1000.0
+                regression_seconds = cand_seconds - ref_seconds
+                # Compare endpoints to avoid cancellation at the exact boundary;
+                # this is the same absolute budget, without a numerical tolerance.
+                passed = cand_seconds <= ref_seconds + limit_seconds
             metric.update(
                 {
-                    "regression_ms": regression_ms,
-                    "maximum_regression_ms": max_latency_regression_ms,
+                    "reference_seconds": ref_seconds,
+                    "candidate_seconds": cand_seconds,
+                    "regression_seconds": regression_seconds,
+                    "maximum_regression_seconds": limit_seconds,
                     "passed": passed,
                 }
             )
@@ -91,8 +114,10 @@ def compare_pair(
     }
     if max_regression is not None or max_latency_regression_ms is not None:
         screened_metrics = [metric for metric in metrics if "passed" in metric]
-        result["passed"] = comparable and bool(screened_metrics) and all(
-            metric["passed"] for metric in screened_metrics
+        result["passed"] = (
+            comparable
+            and bool(screened_metrics)
+            and all(metric["passed"] for metric in screened_metrics)
         )
     return result
 
@@ -149,14 +174,12 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"Overall: {'pass' if report.get('passed') else 'fail'}",
         "",
-        "| Benchmark | Metric | Reference | Candidate | Change | Ratio | Result |",
+        "| Benchmark | Metric | Reference | Candidate | Change | Slowdown | Result |",
         "| --- | --- | ---: | ---: | ---: | ---: | --- |",
     ]
     for comparison in report.get("comparisons", []):
         if not comparison.get("metrics"):
-            lines.append(
-                f"| {comparison.get('benchmark')} | n/a | n/a | n/a | n/a | n/a | fail |"
-            )
+            lines.append(f"| {comparison.get('benchmark')} | n/a | n/a | n/a | n/a | n/a | fail |")
         for metric in comparison.get("metrics", []):
             lines.append(
                 "| {benchmark} | `{path}` | {reference} | {candidate} | {change} | {ratio} | {result} |".format(
@@ -165,7 +188,7 @@ def render_markdown(report: dict[str, Any]) -> str:
                     reference=_number(metric.get("reference")),
                     candidate=_number(metric.get("candidate")),
                     change=_percent(metric.get("raw_change_percent")),
-                    ratio=_number(metric.get("normalized_ratio")),
+                    ratio=_number(metric.get("slowdown")),
                     result="pass" if metric.get("passed") else "fail",
                 )
             )
@@ -178,26 +201,24 @@ def _render_latency_screen_markdown(report: dict[str, Any]) -> str:
         "",
         f"Overall: {'pass' if report.get('passed') else 'fail'}",
         "",
-        "| Benchmark | Latency metric | Reference | Candidate | Regression | Limit | Result |",
+        "| Benchmark | Duration metric | Reference | Candidate | Regression | Limit | Result |",
         "| --- | --- | ---: | ---: | ---: | ---: | --- |",
     ]
     for comparison in report.get("comparisons", []):
         screened_metrics = [
-            metric for metric in comparison.get("metrics", []) if "regression_ms" in metric
+            metric for metric in comparison.get("metrics", []) if "regression_seconds" in metric
         ]
         if not screened_metrics:
-            lines.append(
-                f"| {comparison.get('benchmark')} | n/a | n/a | n/a | n/a | n/a | fail |"
-            )
+            lines.append(f"| {comparison.get('benchmark')} | n/a | n/a | n/a | n/a | n/a | fail |")
         for metric in screened_metrics:
             lines.append(
-                "| {benchmark} | `{path}` | {reference} ms | {candidate} ms | {regression} ms | {limit} ms | {result} |".format(
+                "| {benchmark} | `{path}` | {reference} s | {candidate} s | {regression} s | {limit} s | {result} |".format(
                     benchmark=comparison.get("benchmark"),
                     path=metric.get("path"),
-                    reference=_number(metric.get("reference")),
-                    candidate=_number(metric.get("candidate")),
-                    regression=_signed_number(metric.get("regression_ms")),
-                    limit=_number(metric.get("maximum_regression_ms")),
+                    reference=_number(metric.get("reference_seconds")),
+                    candidate=_number(metric.get("candidate_seconds")),
+                    regression=_signed_number(metric.get("regression_seconds")),
+                    limit=_number(metric.get("maximum_regression_seconds")),
                     result="pass" if metric.get("passed") else "fail",
                 )
             )
@@ -215,9 +236,7 @@ def _render_unscreened_markdown(report: dict[str, Any]) -> str:
     ]
     for comparison in report.get("comparisons", []):
         if not comparison.get("metrics"):
-            lines.append(
-                f"| {comparison.get('benchmark')} | n/a | n/a | n/a | n/a | n/a |"
-            )
+            lines.append(f"| {comparison.get('benchmark')} | n/a | n/a | n/a | n/a | n/a |")
         for metric in comparison.get("metrics", []):
             lines.append(
                 "| {benchmark} | `{path}` | {direction} | {reference} | {candidate} | {change} |".format(
@@ -275,8 +294,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--reference-root", type=Path, required=True)
     parser.add_argument("--candidate-root", type=Path, required=True)
     regression_group = parser.add_mutually_exclusive_group()
-    regression_group.add_argument("--max-regression", type=float)
-    regression_group.add_argument("--max-latency-regression-ms", type=float)
+    regression_group.add_argument(
+        "--max-regression", type=float, help="Maximum slowdown minus one for every declared metric"
+    )
+    regression_group.add_argument(
+        "--max-latency-regression-ms",
+        type=float,
+        help="Absolute budget for latency and seconds per video (reciprocal throughput)",
+    )
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args(argv)
 

@@ -6,12 +6,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve_worker.backends.attention.selection import AttentionSelection
-from uniserve_worker.backends.attention.torch_sdpa import TorchSDPAAttentionBackend
-from uniserve_worker.nn.attention import bind_dense_attention_modules
-from uniserve_worker.nn.decoder.qwen import Qwen3Config, Qwen3Model
-from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.mesh import Communicator
+from uniserve.attention.selection import AttentionSelection
+from uniserve.attention.torch_sdpa import TorchSDPAAttentionBackend
+from uniserve.distributed.mesh import Communicator
+from uniserve.nn.attention import bind_dense_attention_modules
+from uniserve.nn.decoder.qwen import Qwen3Config, Qwen3Model
+from uniserve.nn.layer import LayerConfig
 
 pytestmark = pytest.mark.unit
 
@@ -81,3 +81,27 @@ def test_full_sequence_decoder_returns_requested_residual_stream(normalize_outpu
         actual = model(inputs, positions=torch.arange(3))
     expected = F.rms_norm(inputs, (16,), eps=1e-6) if normalize_output else inputs
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("factor", [None, 2.0])
+@pytest.mark.parametrize("dim", [16, 32])
+def test_axis_rotary_preserves_full_frequency_range(dim, factor):
+    from uniserve.nn.rope import RopeScaling, get_rope
+
+    theta = 10000.0
+    rotary = get_rope(
+        dim,
+        theta=theta,
+        keep_freq_range=True,
+        scaling=None if factor is None else RopeScaling("linear", factor=factor),
+    )
+    positions = torch.tensor([0, 3, 17, 256])
+    cosine, sine = rotary.cos_sin_1d(positions)
+    # Keeping alternate frequencies of a doubled-width rotary embedding gives
+    # each spatial/temporal axis the full frequency range of its source head.
+    frequencies = theta ** (-torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+    if factor is not None:
+        frequencies = frequencies / factor
+    phase = positions.float()[:, None] * frequencies
+    torch.testing.assert_close(cosine, phase.cos())
+    torch.testing.assert_close(sine, phase.sin())

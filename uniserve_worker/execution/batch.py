@@ -8,15 +8,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from uniserve.attention.metadata import AttentionMetadata
+from uniserve.model.batch import TextOutput
+from uniserve.model.tensors import FlowPatches, TokenSelection
+from uniserve.tensors import OutputLayout
 from uniserve_worker.protocol.batch import ForwardMode, ForwardStats, PipelineStage
-
-from ..modeling.batch import TextOutput
-from ..modeling.geometry import TensorOutputLayout
-from ..modeling.tensors import (
-    AttentionMetadata,
-    FlowPatches,
-    TokenSelection,
-)
 
 if TYPE_CHECKING:
     from .sampling import SamplerOutput
@@ -132,7 +128,7 @@ class ExecutionOutput(TextOutput):
     stats: ForwardStats | None = None
     greedy: SamplerOutput | None = None
 
-    layouts: tuple[TensorOutputLayout | None, ...] = ()
+    layouts: tuple[OutputLayout | None, ...] = ()
 
     def __post_init__(self) -> None:
         TextOutput.__post_init__(self)

@@ -13,10 +13,11 @@ from typing import Final
 
 import torch
 
+from uniserve.runtime.device import canonical_device
+from uniserve.runtime.resources import close_resources
 from uniserve_worker.protocol.batch import Computation, ComputationId
 
 from ..foundation.errors import WorkerError, WorkerErrorCode, resource_error
-from ..foundation.resources import close_resources
 from ..media.buffers import MediaLease
 from ..media.storage import publish_media_bytes
 from ..profiling import timing_events_enabled
@@ -37,7 +38,6 @@ from ..protocol.batch import (
     TimingCounters,
 )
 from ..runtime.cpu import CpuTask
-from ..runtime.device import canonical_device
 from ..runtime.device_events import EventPool
 from ..runtime.latent_pool import LatentStaging
 from ..runtime.request import RequestProgress, RequestState

@@ -7,64 +7,62 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from tests.python.fixtures.model_execution import model_context
-from uniserve_worker.backends.attention.fa4_cute import Fa4CuteAttentionBackend
-from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
-from uniserve_worker.backends.attention.selection import AttentionSelection
-from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
-from uniserve_worker.bootstrap.distributed import (
-    initialize_model_parallel,
-    initialize_process_groups,
-)
-from uniserve_worker.loader.handles import TensorWeightHandle
-from uniserve_worker.loader.loader import assign_component
-from uniserve_worker.loader.weight_loaders import attach_parameter_loaders
-from uniserve_worker.modeling.batch import DiffusionBatch, TextBatch
-from uniserve_worker.modeling.components import Call
-from uniserve_worker.modeling.geometry import MediaShape, TextShape
-from uniserve_worker.modeling.tensors import (
-    AttentionMetadata,
-    AttentionMode,
-    ExpertRoute,
-    FlowPatches,
-    RouteSpan,
-    TokenSelection,
-)
-from uniserve_worker.models.bagel import BagelConfig, BagelForConditionalGeneration, LLMConfig
-from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
-from uniserve_worker.models.sensenova.config import NeoChatConfig
-from uniserve_worker.models.sensenova.model import NEOChatModel
-from uniserve_worker.nn.attention import RadixAttention, bind_attention_modules
-from uniserve_worker.nn.attention_storage import attention_exchange_scope
-from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.mesh import Communicator
-from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
-from uniserve_worker.runtime.attention_storage import allocate_attention_exchange_storage
-from uniserve_worker.runtime.kv_cache import KVCache
+from tests.python.fixtures.model_execution import model_arguments
+from uniserve.attention.fa4_cute import Fa4CuteAttentionBackend
+from uniserve.attention.flashinfer import FlashInferAttentionBackend
+from uniserve.attention.metadata import AttentionMetadata, AttentionMode, ExpertRoute, RouteSpan
+from uniserve.attention.selection import AttentionSelection
+from uniserve.attention.tuning import FlashInferTuningConfig
+from uniserve.distributed.mesh import Communicator
+from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
+from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
+from uniserve.loading.handles import TensorWeightHandle
+from uniserve.loading.loader import assign_component
+from uniserve.loading.weight_loaders import attach_parameter_loaders
+from uniserve.model.batch import DiffusionBatch, TextBatch
+from uniserve.model.media import ImageSize
+from uniserve.model.tensors import FlowPatches, TokenSelection
+from uniserve.nn.attention import RadixAttention, bind_attention_modules
+from uniserve.nn.attention_storage import attention_exchange_scope
+from uniserve.nn.decoder.mot import MoTConfig
+from uniserve.nn.layer import LayerConfig
+from uniserve.nn.vision.siglip_navit import SiglipNavitConfig
+from uniserve.runtime.attention_storage import allocate_attention_exchange_storage
+from uniserve.runtime.kv_cache import KVCache, KVCacheConfig
+from uniserve_models.bagel import BagelConfig, BagelForConditionalGeneration
+from uniserve_models.qwen3 import Qwen3ForCausalLM
+from uniserve_models.qwen3 import read_config as read_qwen_config
+from uniserve_models.sensenova.config import read_config as read_neo_config
+from uniserve_models.sensenova.model import NEOChatModel
+from uniserve_worker.runtime.cache_manager import CacheManager
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 def _pool(model, device):
-    geometry = model.cache_geometry
-    pool = KVCache(
-        num_layers=geometry.num_layers,
-        total_layers=geometry.total_layers,
-        layer_offset=geometry.layer_offset,
-        num_pages=8,
-        page_size=64,
-        num_kv_heads=geometry.num_kv_heads,
-        total_kv_heads=geometry.total_kv_heads,
-        kv_head_offset=geometry.kv_head_offset,
-        head_dim=geometry.head_dim,
-        device=device,
-        dtype=torch.bfloat16,
+    geometry = model.text_backbone.cache_config
+    pool = CacheManager(
+        KVCache(
+            KVCacheConfig(
+                num_layers=geometry.num_layers,
+                total_layers=geometry.total_layers,
+                layer_offset=geometry.layer_offset,
+                num_kv_heads=geometry.num_kv_heads,
+                total_kv_heads=geometry.total_kv_heads,
+                kv_head_offset=geometry.kv_head_offset,
+                head_dim=geometry.head_dim,
+                dtype=torch.bfloat16,
+            ),
+            num_pages=8,
+            page_size=64,
+            device=device,
+        )
     )
-    pool.k.zero_()
-    pool.v.zero_()
+    pool.cache.k.zero_()
+    pool.cache.v.zero_()
     bind_attention_modules(
         model,
-        pool,
+        pool.cache,
         AttentionSelection(
             "flashinfer",
             (FlashInferAttentionBackend(tuning=FlashInferTuningConfig(workspace_size=64 << 20)),),
@@ -109,52 +107,58 @@ def _model(architecture, layer_config, tied=False):
     )
     if architecture == "qwen":
         return Qwen3ForCausalLM(
-            dict(common, head_dim=128, attention_bias=False, tie_word_embeddings=tied),
-            context=model_context(layer_config),
+            read_qwen_config(
+                dict(common, head_dim=128, attention_bias=False, tie_word_embeddings=tied)
+            ),
+            **model_arguments(layer_config),
         )
     if architecture == "sensenova":
-        config = NeoChatConfig(
-            vision_config=dict(
-                hidden_size=8,
-                llm_hidden_size=512,
+        config = read_neo_config(
+            dict(
+                vision_config=dict(
+                    hidden_size=8,
+                    llm_hidden_size=512,
+                    downsample_ratio=0.5,
+                    patch_size=2,
+                    num_channels=3,
+                    rope_theta_vision=10000.0,
+                    max_position_embeddings_vision=128,
+                ),
+                llm_config=dict(
+                    common,
+                    head_dim=128,
+                    attention_bias=False,
+                    rms_norm_eps=1e-6,
+                    rope_theta=10000.0,
+                    rope_theta_hw=10000.0,
+                    max_position_embeddings_hw=128,
+                    pad_token_id=0,
+                    bos_token_id=1,
+                    eos_token_id=2,
+                ),
                 downsample_ratio=0.5,
-                patch_size=2,
-                num_channels=3,
-                rope_theta_vision=10000.0,
-                max_position_embeddings_vision=128,
-            ),
-            llm_config=dict(
-                common,
-                head_dim=128,
-                attention_bias=False,
-                rms_norm_eps=1e-6,
-                rope_theta=10000.0,
-                rope_theta_hw=10000.0,
-                max_position_embeddings_hw=128,
-                pad_token_id=0,
-                bos_token_id=1,
-                eos_token_id=2,
-            ),
-            downsample_ratio=0.5,
-            max_image_seq_len=16,
-            fm_head_layers=2,
+                max_image_seq_len=16,
+                fm_head_layers=2,
+            )
         )
-        return NEOChatModel(config, context=model_context(layer_config))
+        return NEOChatModel(config, **model_arguments(layer_config))
     return BagelForConditionalGeneration(
         BagelConfig(
-            llm=LLMConfig(**common),
+            text=MoTConfig(**common, head_dim=128),
             start_of_image_id=61,
             end_of_image_id=62,
             max_latent_size=2,
-            vit_hidden_size=8,
-            vit_intermediate_size=16,
-            vit_num_hidden_layers=1,
-            vit_num_attention_heads=2,
-            vit_patch_size=14,
-            vit_image_size=224,
+            vision=SiglipNavitConfig(
+                hidden_size=8,
+                intermediate_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=14,
+                image_size=224,
+            ),
             vit_max_num_patch_per_side=16,
         ),
-        context=model_context(layer_config),
+        **model_arguments(layer_config),
     )
 
 
@@ -204,7 +208,7 @@ def _diffusion_batch(architecture, device):
         positions=(torch.zeros(1, dtype=torch.long, device=device),),
         conditioning={"image": (patches,)},
         sequence_lengths=(image_tokens,),
-        shapes=(MediaShape(side, side),),
+        sizes=(ImageSize(side, side),),
         attention=attention,
     )
 
@@ -356,23 +360,7 @@ def _run_pipeline(
 
                     def execute(selected_model, selected_batch):
                         hidden = selected_model(selected_batch, constants={}, scratch={})
-                        selected_model.tensor_specs(
-                            Call.TEXT,
-                            TextShape(selected_batch.input_ids.numel(), selected_batch.row_count),
-                        ).outputs["hidden_states"].validate(hidden, state={}, scratch={})
                         output = selected_model.compute_logits(hidden, selected_batch)
-                        output.validate(
-                            tuple(
-                                selected_model.tensor_specs(
-                                    Call.TEXT, TextShape(count, selection=selection)
-                                )
-                                for count, selection in zip(
-                                    selected_batch.attention.query_lens_cpu,
-                                    selected_batch.selections,
-                                    strict=True,
-                                )
-                            )
-                        )
                         return output
 
                     expected = execute(reference, batch).materialize()
@@ -418,14 +406,26 @@ def _run_pipeline(
                             torch.testing.assert_close(
                                 result, wanted, rtol=tolerance, atol=tolerance
                             )
-                    for local_layer in range(pool.num_layers):
+                    for local_layer in range(pool.cache.config.num_layers):
                         for actual_cache, expected_cache in zip(
-                            pool.layer_cache(local_layer, 0),
-                            reference_pool.layer_cache(pool.layer_offset + local_layer, 0),
+                            (pool.cache.layer(local_layer).k, pool.cache.layer(local_layer).v),
+                            (
+                                reference_pool.cache.layer(
+                                    pool.cache.config.layer_offset + local_layer
+                                ).k,
+                                reference_pool.cache.layer(
+                                    pool.cache.config.layer_offset + local_layer
+                                ).v,
+                            ),
                             strict=True,
                         ):
-                            start = pool.kv_head_offset - reference_pool.kv_head_offset
-                            expected_cache = expected_cache.narrow(2, start, pool.n_kv)
+                            start = (
+                                pool.cache.config.kv_head_offset
+                                - reference_pool.cache.config.kv_head_offset
+                            )
+                            expected_cache = expected_cache.narrow(
+                                2, start, pool.cache.config.num_kv_heads
+                            )
                             torch.testing.assert_close(
                                 actual_cache, expected_cache, rtol=tolerance, atol=tolerance
                             )
@@ -439,14 +439,6 @@ def _run_pipeline(
                         ).values["image"]
                         prediction = model.forward_diffusion(
                             diffusion, state={}, constants={}, scratch={}
-                        )
-                        prediction.validate(
-                            tuple(
-                                model.tensor_specs(Call.DIFFUSION, shape)
-                                for shape in diffusion.shapes
-                            ),
-                            state={},
-                            scratch={},
                         )
                         actual = prediction.values["image"]
                         # Non-output pipeline stages participate in communication
@@ -462,7 +454,7 @@ def _run_pipeline(
                         for loaded, cache in ((reference, reference_pool), (model, pool)):
                             bind_attention_modules(
                                 loaded,
-                                cache,
+                                cache.cache,
                                 AttentionSelection("fa4_cute", (Fa4CuteAttentionBackend(),)),
                             )
                         storage = allocate_attention_exchange_storage(

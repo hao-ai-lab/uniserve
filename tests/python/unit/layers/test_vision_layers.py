@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.nn.vision import (
+from uniserve.nn.vision import (
     PatchEmbed,
     PositionEmbedding,
     get_2d_sincos_pos_embed,

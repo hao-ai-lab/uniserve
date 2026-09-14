@@ -1,8 +1,24 @@
 # Python computation library
 
-UniServe's Python loader constructs the same numerical model used by serving. `load_model(LoadRequest(...))` returns its model, tokenizer, resolved execution configuration, schedule, and component bindings. The caller supplies physical placement and owns execution resources; the model receives numerical configuration, borrowed mesh/layer interfaces, and tensor views.
+UniServe's Python loader constructs the same numerical model used by serving. `resolve_model` normalizes checkpoint metadata into the concrete typed config and resolves weight files, tokenizer, image transforms and diffusion prompt assets. `load_model` receives that model class, config, sources and explicit numerical resource parameters. It returns the materialized model, loaded sources and validated weight reports. The caller owns placement, input processing, schedules and execution resources.
 
-Models compose ordinary `torch.nn.Module` layers with `TextMixin`, `EncoderMixin`, `DiffusionMixin`, `DecoderMixin`, and `VideoMixin`. Text uses `forward`, `compute_logits`, and `embed_input_ids`; diffusion uses `diffusion_spec`, `prepare_latents`, and `forward_diffusion`; encoders and decoders use `encode` and `decode`. A numerical call accepts one homogeneous computation batch. Independent text and diffusion calls use separate execution resources when they run concurrently.
+```python
+from uniserve_models import resolve_model
+from uniserve.loading import load_model
+
+source = resolve_model(path, load=load_config)
+layers = source.configure_layers(layers)
+loaded = load_model(
+    source.model_class, source.config, sources=source.weights, load=load_config,
+    device=device, dtype=dtype, parallel=parallel, meshes=meshes, layers=layers,
+    limits=limits,
+)
+model = loaded.model
+```
+
+`parallel` maps actual module paths to mathematical partitions. `meshes` and `layers` bind resident numerical resources; the empty path denotes the root module. `ModelLimits(text_tokens, video_frames)` states numerical input bounds. For component-only loading, `resolve_model(..., components=frozenset(module_paths))` selects the required checkpoint sources while still validating all architecture sidecars. `flow_device` optionally places explicitly declared flow branches on a second device; their calls return results to the input device.
+
+Models compose ordinary `torch.nn.Module` layers with `TextMixin`, `EncoderMixin`, `DiffusionMixin`, `DecoderMixin`, and `VideoMixin`. Text uses `forward`, `compute_logits`, and `embed_input_ids`; diffusion uses `prepare_latents` and `forward_diffusion`, with component-owned latent/noise sizes and a numerical solver; encoders and decoders use `encode` and `decode`. A numerical call accepts one homogeneous computation batch. Independent text and diffusion calls use separate execution resources when they run concurrently.
 
 ## Compute text logits
 
@@ -16,7 +32,7 @@ python examples/text_logits.py \
   --output /path/to/logits.pt
 ```
 
-The saved dictionary contains CPU `input_ids` shaped `[tokens]` and BF16 `logits` shaped `[tokens, vocabulary]`. Each row predicts the token following that prompt position using causal attention. The input is raw text, without chat-template framing or sampling. The example validates numerical result schemas before joining vocabulary shards and removing padding. Its complete CPU copy precedes KV and process-group retirement.
+The saved dictionary contains CPU `input_ids` shaped `[tokens]` and BF16 `logits` shaped `[tokens, vocabulary]`. Each row predicts the token following that prompt position using causal attention. The input is raw text, without chat-template framing or sampling. The example joins vocabulary shards and removes padding from the numerical output. Its complete CPU copy precedes KV and process-group retirement.
 
 ## Decode H3 video latents
 
@@ -39,7 +55,7 @@ The saved result is a CPU `torch.uint8` tensor shaped `[frames, 768, 1344, 3]` i
 
 ## Image diffusion mathematics
 
-`ImageDiffusion` describes per-image latent bounds, framing markers, patch conversion, noise scaling, CFG semantics, and analytical schedule coordinates. The standard `DiffusionMixin` uses it to produce a `DiffusionSpec` and initialize caller-owned latent state from supplied noise. BAGEL retains patch-token latent rows; SenseNova restores image-space RGB latents through `unpatchify`. Prediction kinds are `velocity` and `sample`.
+`ImageDiffusion` describes per-image latent bounds, framing markers, patch conversion, noise scaling, CFG semantics, and analytical schedule coordinates. The standard `DiffusionMixin` uses it to compute `latent_shape` and `noise_shape` and initialize caller-owned latent state from supplied noise. `normal_noise` fills ordered, caller-allocated views from explicit seeds without changing global RNG state. `EulerSolver` and `CleanSampleEulerSolver` preserve their respective prediction conversion and update arithmetic. BAGEL retains patch-token latent rows; SenseNova restores image-space RGB latents through `unpatchify`. Prediction kinds are `velocity` and `sample`.
 
 The execution caller resolves prompt overrides and negative conditioning, generates noise according to the declared RNG contract, owns schedule tensors, and advances the solver. Sequence length includes numerical framing markers; it does not specify how many concurrent trajectories to allocate.
 
@@ -47,22 +63,32 @@ The execution caller resolves prompt overrides and negative conditioning, genera
 
 `EncoderMixin.encode` consumes already preprocessed tensors in `EncodeBatch.values` and preserves their row order. Text and conditioning modules process each variable-length row independently and return `conditioning`. VAE encoding stacks images and calls the autoencoder's `encode`, returning `latents` with its posterior sampling semantics intact.
 
-Vision returns `features`. An `ImageProcessor` with `TowerTransform` uses uniform CHW image rows; its `vision_encoder` consumes the stacked NCHW batch. A `PatchTransform` uses packed patch rows plus aligned device `grids` and host-known `grid_shapes`; the shared implementation concatenates patches and splits the result using the declared spatial downsampling ratio. BAGEL composes `nn.vision.PatchEncoder` for patch packing, isolated attention, projection, and learned output positions. SenseNova composes its NEO patch encoder. All inputs must already reside on the participating component device, and shared attention layers require their public backend binding.
+Vision returns `features`. Uniform CHW image rows are stacked into an NCHW batch for the vision encoder. Packed patch rows include aligned device `grids` and host-known `grid_shapes`; the shared implementation concatenates patches and splits results using the encoder's actual spatial downsampling factor. BAGEL composes `nn.vision.PatchEncoder` for patch packing, isolated attention, projection, and learned output positions. SenseNova composes its NEO patch encoder. All inputs must already reside on the participating component device, and shared attention layers require their public backend binding.
+
+`source.image_processor` provides immutable resize, normalization, patch and feature-token settings for the input caller. The resolver binds declared token names to the checkpoint tokenizer and rejects undefined markers. `source.flow_prompt` supplies immutable classifier-free-guidance text framing where the architecture requires it; its `encode(source.tokenizer, text=..., conditioned=...)` method produces prefix tokens. Numerical models consume the prepared tensors and retain neither asset. Worker construction receives these assets separately from the loaded model.
 
 ## Resource lifetime
 
-`initialize_process_groups` owns process groups, while `initialize_entries` binds logical components to their local meshes. The loading result retains these physical bindings outside the model. `ModelRunner` supplies attention and native decoder execution resources and closes its graphs after outstanding work completes.
+`initialize_process_groups` owns process groups; `initialize_model_parallel` creates numerical meshes from explicit rank sets and `ParallelConfig` values. Direct callers bind KV attention with `bind_attention_modules` and dense attention with `bind_dense_attention_modules`. Attention modules identify their local cache slice at construction; binding attaches that borrowed slice before the first numerical call, and the caller retains its backing through all computation and graph readers. The video example allocates decoder and RGB storage itself and invokes the numerical components directly. Serving separately creates entries, schedules, pools and graphs around the same model.
 
-`model.tensor_specs(call, shape)` returns numerical requirements for constants, state, scratch, and outputs. `prepare_constants` allocates constants and asks the model to fill borrowed views. `resolve_resources` derives runtime state and scratch backing from the caller's chosen shapes; `TensorBuffers.allocate` creates that backing. `bind_state` and `bind_scratch` lend exact views to a numerical call. A stateless call can use `None` for state backing; a stateful call must receive allocated storage.
+Components that require caller-owned storage expose `state_buffers(size)`, `workspace_buffers(size)` and `constant_buffers(size)` as separate queries. Each returns `BufferConfig` values with exact shape, dtype, optional backing capacity and required host representation. `TensorBuffers.allocate` creates the backing; `bind_state(configs, storage)` and `bind_scratch(configs, storage)` lend exact views. `prepare_constants(component, size, device=...)` allocates the component’s constants and asks it to fill borrowed views. Ordinary text, vision and image VAE calls need no resource declaration.
 
-`TextShape(tokens, rows=1, selection=None)` describes backbone activation extent. Supply a `TokenSelection` to declare selected hidden or vocabulary rows; selected inactive rows can have zero query tokens. `TextOutput.validate` takes one requirement per sequence before vocabulary materialization. Non-final pipeline activations declare their local sequence region; projected logits declare padded vocabulary storage and its local shard. Text arithmetic dtype comes from the composed decoder's activation representation. H3 encoding and conditioning use positive unselected token extents and preserve unpadded sequence lengths.
+The text backbone owns its activation width, attention mode, input token limit and numerical KV configuration. Vocabulary size comes from the actual vocabulary partition. Independent text encoders expose their own token limits. These quantities are not required fields on every `Model`.
 
-`MediaShape` describes spatial and temporal geometry; supply its `dtype` when a computation preserves its input representation, as RGB patch decoding does. Learned VAE reconstruction declares its parameter dtype, and image diffusion declares its prediction dtype independently of solver storage. Vision and latent encoders declare their feature width, spatial downsampling, and output representation through their composed numerical modules. Calls without a numerical declaration raise an error instead of supplying an empty resource contract.
+`TextSize(tokens, rows=1, selection=None)` describes a numerical token extent. `TextBatch` supplies actual query lengths and selected rows; inactive selected rows can have zero queries. Shared text projection checks activation width, dtype and live-row coverage while accepting trailing capture padding. `TextOutput` retains the actual vocabulary partition, and `materialize()` gathers complete vocabulary results when needed.
 
-`VideoAttention.tensor_specs(rows, query_rows, dtype=...)` declares projection exchange and attention output scratch. The shared backing accommodates both encoded projection inputs and activation-format return rows; callers allocate and retain the declared capacity regardless of weight precision. H3 consumes this same public layer declaration.
+Image decoding reads dtype from the supplied numerical input or learned decoder. H3 components use `VideoSize(frames, prompt_tokens)` for resource queries and `VideoInfo` for raster and sample timing. `video_output.decode_windows(video)` gives the temporal reconstruction intervals. Audio reconstruction receives its target PCM sample count directly.
 
-`TensorOutput.validate(needs, state=state, scratch=scratch)` checks names, dtypes, shapes, local regions, and declared storage borrowing without reading device values. Supply one `TensorNeeds` for a common shape or an aligned sequence for different row shapes. An output with `TensorAlias("scratch", "rgb_frames")` borrows that explicit scratch tensor's storage; H3 postprocessing uses this contract for each returned RGB prefix. Validation does not extend the backing lifetime or synchronize readers.
+`VideoAttention.workspace_buffers(rows, query_rows, dtype=...)` declares projection exchange and attention output scratch. The shared backing accommodates both encoded projection inputs and activation-format return rows; callers allocate and retain the declared capacity regardless of weight precision. H3 consumes this same public layer declaration.
+
+`TensorOutput` contains the actual tensors and their optional `OutputLayout`. Layouts retain global shape, dtype, local region and pixel range where consumers need that information. H3 RGB reconstruction returns a prefix of supplied pixel scratch; the caller must retain that backing through every reader.
 
 Each independent request or trajectory needs its own mutable state. Scratch can be reused only after its final reader completes. Decoder graph outputs and pixel scratch can be overwritten by the next call, so the example completes a CPU copy of each window before reusing them. Constants and all captured tensor addresses remain alive until the corresponding graphs retire. Numerical objects and borrowed views leave scope before the process-group owner closes.
 
-`Model.output_shapes` declares maximum numerical input shapes for named result components. Runtime derives bounded wire products from the corresponding `TensorNeeds.outputs`, preserving global output extent independently of local shard regions. Applications performing only numerical computation can consume `TensorOutput` directly and choose their own serialization.
+Output-producing components expose `output_layout` using their numerical input size. Worker startup translates these global layouts into persistent wire product bounds; local shard regions do not reduce assembly capacity on remote consumers. Direct Python callers can consume `TensorOutput` and choose their own serialization.
+
+`ImageSize(height, width)` defines an image raster. `VideoSize(frames, prompt_tokens)` defines a video and its conditioning extent; the reconstruction modules retain their fixed raster and sample rates. Numerical `DiffusionBatch.sizes` and `DecodeBatch.sizes` follow latent row order. Audio decoding uses the requested PCM sample count directly, and video decoding receives its explicit `DecodeWindow` values. Tensor and layer dtypes determine the result representation.
+
+`uniserve.model.denoising.DenoisingStep` composes the numerical prediction, solver step and pipeline feedback. Its tensors and schedule are borrowed; capture policy, request slots and accepted progress remain outside that computation. `DiffusionSchedule` stores complete sigma and timestep endpoints, including the terminal endpoint. H3 learned modulation uses the four evaluation timesteps before that terminal endpoint.
+
+`DiffusionConfig` contains numerical request options: evaluation count, optional timestep shift, CFG scales/interval/renormalization and seed. Image dimensions use `ImageSize` separately. `ImageDiffusion.create_schedule(config, device=...)` materializes complete FP32 endpoints; `guidance(config, index)` selects and combines CFG branches using the analytical host coordinate before rounding. Omitting the shift selects the model's mathematical default.

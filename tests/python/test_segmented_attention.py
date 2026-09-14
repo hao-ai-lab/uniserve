@@ -3,10 +3,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from uniserve_worker.backends.attention.base import merge_attention_states
-from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
-from uniserve_worker.backends.attention.torch_sdpa import TorchSDPAAttentionBackend
-from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
+from uniserve.attention.base import merge_attention_states
+from uniserve.attention.flashinfer import FlashInferAttentionBackend
+from uniserve.attention.torch_sdpa import TorchSDPAAttentionBackend
+from uniserve.attention.tuning import FlashInferTuningConfig
 
 
 @pytest.mark.parametrize("write_current", [False, True])

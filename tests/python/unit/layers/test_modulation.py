@@ -4,8 +4,8 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from uniserve_worker import ops
-from uniserve_worker.ops import (
+from uniserve import ops
+from uniserve.ops import (
     gated_residual,
     gated_residual_rms_norm,
     gated_residual_rms_norm_fp8,

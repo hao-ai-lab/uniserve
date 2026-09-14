@@ -5,16 +5,16 @@ from contextlib import nullcontext
 import pytest
 import torch
 
+from uniserve.attention.metadata import ExpertRoute
+from uniserve.model.model import Model
+from uniserve.nn.branch import branch
+from uniserve.runtime.branches import bind_branches
+from uniserve.runtime.cuda_graph import CudaGraph, GraphExecutionError, capture_pools
+from uniserve.tensors import BufferConfig
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.batch import ExecutionOutput
-from uniserve_worker.execution.cuda_graph import CudaGraph, GraphExecutionError, capture_pools
 from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.modeling.model import Model
-from uniserve_worker.modeling.tensors import ExpertRoute
-from uniserve_worker.nn.branch import branch
-from uniserve_worker.protocol.batch import DType, ShapeBound, StaticDim, TensorSpec
-from uniserve_worker.runtime.branches import bind_branches
-from uniserve_worker.runtime.tensor_buffers import TensorSchema
+from uniserve_worker.protocol.batch import DType, OutputInfo, ShapeBound, StaticDim
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -140,8 +140,8 @@ def test_model_modules_replay_with_independent_outputs_and_retire(branch_device)
         projection.bias.fill_(7)
     model.add_module("projection", branch(projection, ExpertRoute.FLOW))
     bind_branches(model, device=device, flow_device=branch_device)
-    schema = TensorSchema((4, 32), torch.float32)
-    result = TensorSpec("values", DType.F32, ShapeBound((StaticDim(4), StaticDim(32))))
+    schema = BufferConfig((4, 32), torch.float32)
+    result = OutputInfo("values", DType.F32, ShapeBound((StaticDim(4), StaticDim(32))))
     runner = ModelRunner(model, WorkerConfig(device=str(device), generation_device=branch_device))
     try:
         inputs = tuple(
@@ -238,10 +238,10 @@ def test_capture_restores_state_and_failed_capture_preserves_other_computations(
 @torch.inference_mode()
 def test_denoising_first_use_and_slot_geometry_changes_advance_one_step(graphs, branch_device):
     from tests.python.fixtures.diffusion import LinearDenoiser
+    from uniserve.model.media import ImageSize
+    from uniserve.nn.diffusion.schedule import DiffusionSchedule
     from uniserve_worker.execution.denoising import denoising_batch
     from uniserve_worker.execution.diffusion_runner import DiffusionRunner
-    from uniserve_worker.modeling.geometry import MediaShape
-    from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
 
     device = torch.device("cuda", 0)
     model = LinearDenoiser().to(branch_device)
@@ -258,23 +258,29 @@ def test_denoising_first_use_and_slot_geometry_changes_advance_one_step(graphs, 
         additional_devices=(torch.device(branch_device),) if branch_device != str(device) else (),
     )
     try:
-        for slot, width, geometry in ((1, 32, 2), (1, 64, 3), (2, 32, 2), (1, 32, 2)):
+        for index, (slot, width, geometry) in enumerate(
+            ((1, 32, 2), (1, 64, 3), (2, 32, 2), (1, 32, 2))
+        ):
             sample = torch.full((width,), 7.0, device=device)
             reference = sample.clone()
-            constants = {"offset": torch.tensor(float(geometry), device=device)}
-            shape = MediaShape(1, width)
+            # Reusing a released input key must consume the replacement constants.
+            offset = float(geometry + index)
+            constants = runner.prepare_inputs(
+                geometry, lambda: {"offset": torch.tensor(offset, device=device)}
+            )
+            shape = ImageSize(1, width)
             runner.warmup(
                 denoising_batch(model, shape, {"image": sample}, schedule, 0),
                 schedule,
                 state={},
                 constants=constants,
                 scratch={},
-                geometry=geometry,
+                input_key=geometry,
             )
             torch.testing.assert_close(sample, reference, rtol=0, atol=0)
             for step in (0, 1):
                 # The two declared sigma intervals are both exactly one half.
-                reference.add_(0.5 * (reference * 0.25 + geometry))
+                reference.add_(0.5 * (reference * 0.25 + offset))
                 (actual,), _ = runner.step(
                     denoising_batch(model, shape, {"image": sample}, schedule, step),
                     schedule,
@@ -282,11 +288,11 @@ def test_denoising_first_use_and_slot_geometry_changes_advance_one_step(graphs, 
                     constants=constants,
                     scratch={},
                     slot=slot,
-                    geometry=geometry,
+                    input_key=geometry,
                 )
                 torch.testing.assert_close(actual, reference, rtol=1e-6, atol=1e-6)
             torch.cuda.current_stream(device).synchronize()
-            runner.release_slot(slot)
+            runner.release_inputs(geometry)
     finally:
         torch.cuda.current_stream(device).synchronize()
         runner.close()

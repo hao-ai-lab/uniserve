@@ -11,43 +11,44 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
+from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
+from uniserve.distributed.process_groups import initialize_process_groups
+from uniserve.loading import load_model
+from uniserve.model.denoising import DenoisingStep
+from uniserve.model.limits import ModelLimits
+from uniserve.model.media import VideoSize
+from uniserve.nn.layer import LayerConfig
+from uniserve.nn.quant.config import resolve_component_precisions
+from uniserve.runtime.tensor_buffers import TensorBuffers
+from uniserve.runtime.tensors import stage_tensor
 from uniserve_eval.config import load_config
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
-from uniserve_worker.bootstrap.capacity import product_storage_bytes
-from uniserve_worker.bootstrap.distributed import (
-    initialize_entries,
-    initialize_process_groups,
-)
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.denoising import DenoisingStep, denoising_batch
-from uniserve_worker.execution.diffusion_state import DiffusionState
-from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.execution.video import initialize_latents, prepare_call
-from uniserve_worker.loader import LoadRequest, load_model
-from uniserve_worker.modeling.components import Call
-from uniserve_worker.modeling.geometry import MediaShape
-from uniserve_worker.models.minimax_h3.config import (
+from uniserve_models import resolve_model
+from uniserve_models.minimax_h3.config import (
     PRECISION_PRESETS,
     PRECISION_SHORTHANDS,
     SUPPORTED_PRECISIONS,
 )
-from uniserve_worker.models.minimax_h3.packing import (
+from uniserve_models.minimax_h3.packing import (
     audio_latent_frames,
     build_packed_layout,
     unpatchify_video,
     video_latent_frames,
 )
-from uniserve_worker.nn.parallel import ComponentConfig, ParallelConfig, SequenceParallel
-from uniserve_worker.nn.quant.config import resolve_component_precisions
+from uniserve_worker.bootstrap.capacity import product_storage_bytes
+from uniserve_worker.bootstrap.components import bind_components
+from uniserve_worker.bootstrap.distributed import initialize_entries
+from uniserve_worker.bootstrap.model_loader import loaded_worker_config
+from uniserve_worker.config import ComponentConfig, WorkerConfig
+from uniserve_worker.execution.denoising import denoising_batch
+from uniserve_worker.execution.diffusion_state import DiffusionState
+from uniserve_worker.execution.model_runner import ModelRunner
+from uniserve_worker.execution.video import initialize_latents, metadata_shape, prepare_call
 from uniserve_worker.protocol.batch import (
     TensorTransfer,
     WorkerEndpoint,
 )
 from uniserve_worker.runtime.device_events import EventPool
-from uniserve_worker.runtime.tensor_buffers import TensorBuffers
-from uniserve_worker.runtime.tensors import (
-    stage_tensor,
-)
 from uniserve_worker.transfer.layout import fetch_tensor
 from uniserve_worker.transfer.tickets import make_transport
 
@@ -148,39 +149,55 @@ def _generate_requests(
         "output": ComponentConfig((2,)),
     }
     bindings = initialize_entries(environment, components)
+    worker_config = replace(
+        WorkerConfig(model_dtype="bfloat16"),
+        attention_backend=None,
+        block_size=256,
+        device=str(environment.local_device),
+        kv_token_capacity=None,
+        max_batch_operations=2,
+        max_batch_tokens=2,
+        rank=rank,
+        world_size=4,
+    )
+    source = resolve_model(
+        checkpoint,
+        components=frozenset(name for name, value in bindings.items() if value.owns),
+        quantization={"components": component_precisions},
+    )
+    paths = dict(source.entry.component_paths)
+    meshes = {paths[name]: value.mesh for name, value in bindings.items() if value.mesh is not None}
+    parallel = {paths[name]: value.config.parallel_config for name, value in bindings.items()}
+    layers = source.configure_layers(
+        {
+            name: LayerConfig(
+                mesh.get_group("tp"),
+                None,
+                pipeline=mesh.get_group("pp"),
+                sequence=mesh.get_group("ulysses"),
+            )
+            for name, mesh in meshes.items()
+        }
+    )
     loaded = load_model(
-        LoadRequest(
-            model_path=checkpoint,
-            execution=replace(
-                WorkerConfig(model_dtype="bfloat16"),
-                attention_backend=None,
-                block_size=256,
-                device=str(environment.local_device),
-                kv_token_capacity=None,
-                max_batch_operations=2,
-                max_batch_tokens=2,
-                rank=rank,
-                world_size=4,
-            ),
-            bindings=bindings,
-            max_text_rows=16384,
-            max_video_seconds=15,
-            quantization_config={"components": component_precisions},
-            pipeline_depth=8,
-        ),
+        source.model_class,
+        source.config,
+        sources=source.weights,
+        device=environment.local_device,
+        dtype=torch.bfloat16,
+        parallel=parallel,
+        meshes=meshes,
+        layers=layers,
+        limits=ModelLimits(text_tokens=16384, video_frames=360),
     )
     runner = loaded.model
-    schedule = loaded.schedule
-    assert schedule is not None
-    execution = ModelRunner(
-        runner,
-        loaded.worker_config,
-        bindings=loaded.bindings,
-        schedule=schedule,
-    )
+    bind_components(runner, bindings)
+    worker_config = loaded_worker_config(runner, worker_config, bindings, 8)
+    schedule = source.entry.create_schedule(source.config, environment.local_device)
+    execution = ModelRunner(runner, worker_config, bindings=bindings, schedule=schedule)
     storage = (
-        TensorBuffers.allocate(execution.tensor_resources.state, runner.device)
-        if execution.tensor_resources.state
+        TensorBuffers.allocate(execution.state_buffers, runner.device)
+        if execution.state_buffers
         else None
     )
     scratch = execution.scratch
@@ -188,7 +205,7 @@ def _generate_requests(
     transfer_events = EventPool()
     transport = make_transport(
         "cuda_ipc",
-        byte_capacity=product_storage_bytes(execution.output_schema),
+        byte_capacity=product_storage_bytes(execution.outputs),
         ticket_capacity=4,
         event_pool=transfer_events,
         source=WorkerEndpoint.local("worker", rank=rank),
@@ -196,18 +213,18 @@ def _generate_requests(
     with torch.inference_mode():
         for index, (frames, token_ids) in enumerate(requests):
             print(f"{kind} rank {rank} case {index}: encoding", flush=True)
-            numerical_shape = MediaShape(768, 1344, frames=frames, prompt_tokens=len(token_ids))
+            numerical_shape = VideoSize(frames, prompt_tokens=len(token_ids))
             constants = {}
             views_scratch = {}
             slot = {}
-            trajectory = DiffusionState(geometry=numerical_shape)
+            trajectory = DiffusionState(size=numerical_shape)
             if bindings["denoiser"].owns:
                 assert storage is not None
                 slot, constants, views_scratch = prepare_call(
-                    runner, execution, trajectory, Call.DIFFUSION, numerical_shape, storage
+                    runner, execution, trajectory, "forward_diffusion", numerical_shape, storage
                 )
             encoded = None
-            if runner.text_encoder is not None:
+            if bindings["text_encoder"].owns:
                 tokens = execution.stage_text_tokens(token_ids)
                 (encoded,) = execution.run_encoder("text", tokens).values
             owner = bindings["text_encoder"].output_ranks[0]
@@ -236,7 +253,7 @@ def _generate_requests(
 
             initial_latents = (
                 initialize_latents(
-                    runner,
+                    runner.denoiser,
                     numerical_shape,
                     slot,
                     constants,
@@ -265,7 +282,9 @@ def _generate_requests(
                         step,
                     )
                     assert execution.diffusion is not None and views_scratch is not None
-                    with execution.diffusion.attention_scope(trajectory.geometry):
+                    with execution.diffusion.attention_scope(
+                        metadata_shape(runner, numerical_shape)
+                    ):
                         DenoisingStep(runner, batch, slot, constants, views_scratch, schedule)()
                     eager = tuple(value.clone() for value in samples)
                     for destination, saved in zip(samples, initial, strict=True):
@@ -278,7 +297,7 @@ def _generate_requests(
                         constants=constants,
                         scratch=views_scratch,
                         slot=1,
-                        geometry=trajectory.geometry,
+                        input_key=metadata_shape(runner, numerical_shape),
                     )
                     for observed, expected in zip(samples, eager, strict=True):
                         torch.testing.assert_close(observed, expected, rtol=2e-2, atol=2e-2)
@@ -380,12 +399,16 @@ def generation_requests():
     ("precision_name", "kind", "encoder_tp"),
     [("bf16", kind, 1) for kind in _LAYOUTS]
     + [("bf16", "u4", 2), ("bf16", "u4", 4)]
-    + [
-        (precision, kind, 1)
-        for precision in ("fp8", "mxfp8", "nvfp4", "maximum")
-        for kind in ("t2", "t4", "u2")
-    ]
-    + [(precision, "u4", degree) for precision in ("nvfp4", "maximum") for degree in (2, 4)],
+    # Full-model coverage composes the numerical mechanisms. Quantized linear
+    # tests compare TP1/2/4 against an unpartitioned reference; repeating every
+    # degree here adds no distinct checkpoint-to-linear contract.
+    + [(precision, "t4", 1) for precision in ("fp8", "mxfp8", "nvfp4", "maximum")]
+    # FP8 attention has its own transported representation. MXFP8 changes only
+    # the MLP, so its attention transport is covered by the BF16 layouts.
+    + [("fp8", "u2", 1)]
+    # NVFP4 attention transport is exercised with both quantized text encoders:
+    # NVFP4 in the shorthand and FP8 in the mixed maximum preset.
+    + [(precision, "u4", 4) for precision in ("nvfp4", "maximum")],
 )
 def test_parallel_layout_generates_finite_latents(
     generation_requests, tmp_path, precision_name, kind, encoder_tp

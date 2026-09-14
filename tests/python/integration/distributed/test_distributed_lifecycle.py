@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from uniserve_worker.bootstrap.distributed import initialize_process_groups
+from uniserve.distributed.process_groups import initialize_process_groups
 
 pytestmark = pytest.mark.integration
 

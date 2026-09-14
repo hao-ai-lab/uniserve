@@ -2,12 +2,12 @@
 
 import pytest
 
-from uniserve_worker.models.minimax_h3.config import (
+from uniserve.nn.quant.config import resolve_component_precisions
+from uniserve_models.minimax_h3.config import (
     PRECISION_PRESETS,
     PRECISION_SHORTHANDS,
     SUPPORTED_PRECISIONS,
 )
-from uniserve_worker.nn.quant.config import resolve_component_precisions
 
 pytestmark = pytest.mark.unit
 

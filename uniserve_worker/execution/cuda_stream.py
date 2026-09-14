@@ -8,13 +8,11 @@ from typing import Any
 
 import torch
 
+from uniserve.runtime.cuda import CudaError, cuda_status, cuda_value, driver
+from uniserve.runtime.resources import close_resources
+
 from ..config import LaneConfig
-from ..foundation.resources import close_resources
 from ..protocol.batch import Computation
-
-
-class CudaStreamError(RuntimeError):
-    """A configured CUDA stream or SM partition could not be realized exactly."""
 
 
 class CudaStream:
@@ -66,16 +64,16 @@ class CudaStream:
 
         if self.green is None:
             return
-        cu = _driver()
-        associated = _cuda_value(cu.cuStreamGetGreenCtx(self.raw_stream), "query stream context")
+        cu = driver()
+        associated = cuda_value(cu.cuStreamGetGreenCtx(self.raw_stream), "query stream context")
         if int(associated) != int(self.green):
-            raise CudaStreamError("stream is detached from its Green Context")
-        resource = _cuda_value(
+            raise CudaError("stream is detached from its Green Context")
+        resource = cuda_value(
             cu.cuGreenCtxGetDevResource(self.green, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM),
             "query Green Context SM resource",
         )
         if int(resource.sm.smCount) != self.sm_count:
-            raise CudaStreamError("Green Context SM resource changed after startup")
+            raise CudaError("Green Context SM resource changed after startup")
 
     def wait(self, producer: torch.cuda.Stream) -> None:
         """Order this stream after a producer without allocating per-operation events."""
@@ -122,11 +120,11 @@ class CudaStream:
 
 
 def _destroy_stream(stream: Any) -> None:
-    _cuda_status(_driver().cuStreamDestroy(stream), "destroy CUDA stream")
+    cuda_status(driver().cuStreamDestroy(stream), "destroy CUDA stream")
 
 
 def _destroy_context(context: Any) -> None:
-    _cuda_status(_driver().cuGreenCtxDestroy(context), "destroy Green Context")
+    cuda_status(driver().cuGreenCtxDestroy(context), "destroy Green Context")
 
 
 def create_partitioned_streams(
@@ -140,30 +138,30 @@ def create_partitioned_streams(
     if not lanes:
         return ()
     if device.type != "cuda":
-        raise CudaStreamError("execution lanes require a CUDA device")
+        raise CudaError("execution lanes require a CUDA device")
     if len({lane.lane_id for lane in lanes}) != len(lanes):
-        raise CudaStreamError("lane ids must be unique")
+        raise CudaError("lane ids must be unique")
     bound_computations: set[Computation] = set()
     for lane in lanes:
         overlap = bound_computations.intersection(lane.computations)
         if overlap:
             names = ", ".join(sorted(value.value for value in overlap))
-            raise CudaStreamError(f"computations have multiple execution lane bindings: {names}")
+            raise CudaError(f"computations have multiple execution lane bindings: {names}")
         bound_computations.update(lane.computations)
 
     torch.cuda.init()
     index = device.index if device.index is not None else torch.cuda.current_device()
-    cu = _driver()
-    _cuda_status(cu.cuInit(0), "initialize CUDA driver")
-    cuda_device = _cuda_value(cu.cuDeviceGet(index), "resolve CUDA device")
-    full = _cuda_value(
+    cu = driver()
+    cuda_status(cu.cuInit(0), "initialize CUDA driver")
+    cuda_device = cuda_value(cu.cuDeviceGet(index), "resolve CUDA device")
+    full = cuda_value(
         cu.cuDeviceGetDevResource(cuda_device, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM),
         "query device SM resource",
     )
     requested = sum(int(lane.sm_budget) for lane in lanes)
     available = int(full.sm.smCount)
     if requested > available:
-        raise CudaStreamError(
+        raise CudaError(
             f"lane SM budgets require {requested} SMs but the device exposes {available}"
         )
 
@@ -183,8 +181,8 @@ def create_partitioned_streams(
                 lane_resource, remainder = _split_one(cu, current_resource, int(lane.sm_budget))
             lane_green = _green_from_resources(cu, cuda_device, (lane_resource,))
             acquisition.callback(_destroy_context, lane_green)
-            context = _cuda_value(cu.cuCtxFromGreenCtx(lane_green), "resolve lane context")
-            raw_stream = _cuda_value(
+            context = cuda_value(cu.cuCtxFromGreenCtx(lane_green), "resolve lane context")
+            raw_stream = cuda_value(
                 cu.cuGreenCtxStreamCreate(
                     lane_green, int(cu.CUstream_flags.CU_STREAM_NON_BLOCKING), 0
                 ),
@@ -194,12 +192,12 @@ def create_partitioned_streams(
             resolved = _green_resource(cu, lane_green)
             sm_count = int(resolved.sm.smCount)
             if sm_count != int(lane.sm_budget):
-                raise CudaStreamError(
+                raise CudaError(
                     f"lane {lane.lane_id!r} resolved {sm_count} SMs, expected {lane.sm_budget}"
                 )
-            associated = _cuda_value(cu.cuStreamGetGreenCtx(raw_stream), "query lane origin stream")
+            associated = cuda_value(cu.cuStreamGetGreenCtx(raw_stream), "query lane origin stream")
             if int(associated) != int(lane_green):
-                raise CudaStreamError("lane origin stream has the wrong Green Context")
+                raise CudaError("lane origin stream has the wrong Green Context")
             realized.append(
                 CudaStream(
                     config=lane,
@@ -217,7 +215,7 @@ def create_partitioned_streams(
                 partitions.callback(_destroy_context, remainder_green)
                 current_resource = _green_resource(cu, remainder_green)
         if sum(item.sm_count for item in realized) != requested:
-            raise CudaStreamError("lane SM resources do not form the configured disjoint total")
+            raise CudaError("lane SM resources do not form the configured disjoint total")
         partitions.close()
     except BaseException as error:
         try:
@@ -230,64 +228,28 @@ def create_partitioned_streams(
     return tuple(realized)
 
 
-def verify_graph_context(graph: torch.cuda.CUDAGraph, expected_context: int | None) -> int:
-    """Prove every kernel node in a captured graph belongs to its lane."""
-
-    if expected_context is None:
-        return 0
-    cu = _driver()
-    raw_graph = graph.raw_cuda_graph()
-    nodes_result = cu.cuGraphGetNodes(cu.CUgraph(raw_graph), 1 << 20)
-    _cuda_status(nodes_result, "enumerate CUDA graph nodes")
-    nodes = nodes_result[1]
-    count = int(nodes_result[2])
-    kernels = 0
-    for node in nodes[:count]:
-        node_type = _cuda_value(cu.cuGraphNodeGetType(node), "query CUDA graph node type")
-        if node_type != cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
-            continue
-        params = _cuda_value(cu.cuGraphKernelNodeGetParams(node), "query kernel node context")
-        if int(params.ctx) != int(expected_context):
-            name_result = (
-                cu.cuFuncGetName(params.func)
-                if int(params.func)
-                else cu.cuKernelGetName(params.kern)
-            )
-            name = name_result[1] if name_result[0] == cu.CUresult.CUDA_SUCCESS else "unknown"
-            raise CudaStreamError(
-                f"captured compute node {name!r} escaped its owning context: "
-                f"actual={int(params.ctx):#x}, expected={int(expected_context):#x}"
-            )
-        kernels += 1
-    if kernels == 0:
-        raise CudaStreamError("captured CUDA graph contains no compute node")
-    return kernels
-
-
 def _split_one(cu: Any, resource: Any, count: int) -> tuple[Any, Any]:
     """Split one resource between green and default execution lanes."""
 
     result = cu.cuDevSmResourceSplitByCount(1, resource, 0, int(count))
-    _cuda_status(result, "split SM resource")
+    cuda_status(result, "split SM resource")
     groups, group_count, remainder = result[1], int(result[2]), result[3]
     if group_count != 1 or not groups:
-        raise CudaStreamError("CUDA could not realize the requested SM resource")
+        raise CudaError("CUDA could not realize the requested SM resource")
     group = groups[0]
     if int(group.sm.smCount) != int(count):
-        raise CudaStreamError(
-            f"CUDA rounded an exact SM request from {count} to {int(group.sm.smCount)}"
-        )
+        raise CudaError(f"CUDA rounded an exact SM request from {count} to {int(group.sm.smCount)}")
     return group, remainder
 
 
 def _green_from_resources(cu: Any, device: Any, resources: tuple[Any, ...]) -> Any:
     """Construct a green context from split device resources when supported."""
 
-    descriptor = _cuda_value(
+    descriptor = cuda_value(
         cu.cuDevResourceGenerateDesc(list(resources), len(resources)),
         "generate Green Context resource descriptor",
     )
-    return _cuda_value(
+    return cuda_value(
         cu.cuGreenCtxCreate(
             descriptor,
             device,
@@ -300,44 +262,14 @@ def _green_from_resources(cu: Any, device: Any, resources: tuple[Any, ...]) -> A
 def _green_resource(cu: Any, green: Any) -> Any:
     """Extract the green-partition handle returned by a CUDA split operation."""
 
-    return _cuda_value(
+    return cuda_value(
         cu.cuGreenCtxGetDevResource(green, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM),
         "query Green Context SM resource",
     )
 
 
-def _driver() -> Any:
-    """Import and return the CUDA driver bindings required for green contexts."""
-
-    try:
-        from cuda.bindings import driver  # pyright: ignore[reportAttributeAccessIssue]
-    except ImportError as error:  # pragma: no cover - CUDA configurations install cuda-python.
-        raise CudaStreamError("CUDA execution lanes require cuda-python") from error
-    return driver
-
-
-def _cuda_status(result: tuple[Any, ...], operation: str) -> None:
-    """Validate a CUDA driver result and return its remaining values."""
-
-    cu = _driver()
-    if result[0] == cu.CUresult.CUDA_SUCCESS:
-        return
-    name_result = cu.cuGetErrorName(result[0])
-    name = str(name_result[1]) if name_result[0] == cu.CUresult.CUDA_SUCCESS else str(result[0])
-    raise CudaStreamError(f"{operation} failed: {name}")
-
-
-def _cuda_value(result: tuple[Any, ...], operation: str) -> Any:
-    """Extract the sole value from a successful CUDA driver result."""
-
-    _cuda_status(result, operation)
-    return result[1]
-
-
 __all__ = [
-    "CudaStreamError",
     "CudaStream",
     "LaneConfig",
     "create_partitioned_streams",
-    "verify_graph_context",
 ]

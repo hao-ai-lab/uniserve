@@ -7,19 +7,22 @@ from pathlib import Path
 
 import torch
 
-from uniserve_worker.bootstrap.distributed import initialize_entries, initialize_process_groups
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.loader import LoadRequest, load_model
-from uniserve_worker.modeling.batch import DecodeBatch
-from uniserve_worker.modeling.components import Call
-from uniserve_worker.modeling.decoder import DecoderMixin
-from uniserve_worker.modeling.geometry import MediaShape
-from uniserve_worker.modeling.video import VideoMixin
-from uniserve_worker.nn.parallel import ComponentConfig
-from uniserve_worker.runtime.process_groups import ProcessGroups
-from uniserve_worker.runtime.tensor_buffers import TensorBuffers
-from uniserve_worker.runtime.tensors import bind_scratch, bind_state, prepare_constants
+from uniserve.attention import FlashInferTuningConfig, resolve_attention_selection
+from uniserve.distributed.parallel import ParallelConfig
+from uniserve.distributed.process_groups import (
+    ProcessGroups,
+    initialize_model_parallel,
+    initialize_process_groups,
+)
+from uniserve.loading import load_model
+from uniserve.model.limits import ModelLimits
+from uniserve.model.media import VideoSize
+from uniserve.nn.attention import bind_dense_attention_modules
+from uniserve.nn.layer import LayerConfig
+from uniserve.runtime.tensor_buffers import TensorBuffers
+from uniserve.runtime.tensors import bind_scratch, bind_state, merge_buffers, prepare_constants
+from uniserve_models import resolve_model
+from uniserve_models.minimax_h3 import MiniMaxH3Model
 
 
 @torch.inference_mode()
@@ -49,52 +52,71 @@ def decode_video(
 def _decode(
     groups: ProcessGroups, checkpoint: str, latents: torch.Tensor, frames: int
 ) -> torch.Tensor:
-    bindings = initialize_entries(
-        groups,
-        {
-            "video_decoder": ComponentConfig((0,), distribution="temporal_units"),
-            "output": ComponentConfig((0,)),
-        },
-    )
     device = groups.local_device
+    parallel = {"video_decoder": ParallelConfig(), "video_output": ParallelConfig()}
+    meshes = initialize_model_parallel(
+        groups, {name: ((0,), value) for name, value in parallel.items()}
+    )
+    source = resolve_model(
+        checkpoint, components=frozenset(parallel), quantization={"mode": "quality"}
+    )
+    layers = source.configure_layers(
+        {name: LayerConfig(mesh.get_group("tp"), None) for name, mesh in meshes.items()}
+    )
     loaded = load_model(
-        LoadRequest(
-            model_path=checkpoint,
-            execution=WorkerConfig(device=str(device), model_dtype="bfloat16"),
-            bindings=bindings,
-            max_text_rows=64,
-            max_video_seconds=frames / 24,
-            pipeline_depth=8,
-            quantization_config={"mode": "quality"},
-        )
+        source.model_class,
+        source.config,
+        sources=source.weights,
+        device=device,
+        dtype=torch.bfloat16,
+        parallel=parallel,
+        meshes=meshes,
+        layers=layers,
+        limits=ModelLimits(text_tokens=64, video_frames=frames),
     )
     model = loaded.model
-    if not isinstance(model, DecoderMixin) or not isinstance(model, VideoMixin):
-        raise TypeError("video decoding requires decoder and video capabilities")
-    shape = MediaShape(768, 1344, frames=frames)
-    runner = ModelRunner(
-        model, loaded.worker_config, bindings=loaded.bindings, schedule=loaded.schedule
+    if not isinstance(model, MiniMaxH3Model):
+        raise TypeError("this example decodes the FastH3 video layout")
+    bind_dense_attention_modules(
+        model, resolve_attention_selection("auto", tuning=FlashInferTuningConfig(), block_size=256)
+    )
+    shape = VideoSize(frames)
+    backing = TensorBuffers.allocate(model.video_output.state_buffers(shape), device)
+    scratch = TensorBuffers.allocate(
+        merge_buffers(
+            (
+                model.video_decoder.workspace_buffers(shape),
+                model.video_output.workspace_buffers(shape),
+            )
+        ),
+        device,
     )
     try:
-        runner.prepare_fixed_modules()
-        backing = TensorBuffers.allocate(runner.tensor_resources.state, device)
-        scratch = runner.scratch
-        if scratch is None:
-            raise RuntimeError("video decoding requires declared numerical scratch")
-        decoder_constants = prepare_constants(model, Call.DECODE_VIDEO, shape, device=device)
-        decoder_scratch = bind_scratch(model, Call.DECODE_VIDEO, shape, scratch)
-        pixel_constants = prepare_constants(model, Call.POSTPROCESS_VIDEO, shape, device=device)
-        pixel_state = bind_state(model, Call.POSTPROCESS_VIDEO, shape, backing)
-        pixel_scratch = bind_scratch(model, Call.POSTPROCESS_VIDEO, shape, scratch)
+        decoder_constants = prepare_constants(
+            model.video_decoder, VideoSize(shape.frames), device=device
+        )
+        decoder_scratch = bind_scratch(
+            model.video_decoder.workspace_buffers(VideoSize(shape.frames)), scratch
+        )
+        pixel_constants = prepare_constants(
+            model.video_output, VideoSize(shape.frames), device=device
+        )
+        pixel_state = bind_state(model.video_output.state_buffers(VideoSize(shape.frames)), backing)
+        pixel_scratch = bind_scratch(
+            model.video_output.workspace_buffers(VideoSize(shape.frames)), scratch
+        )
         source = latents.to(device)
         pixels = []
-        for window in model.decode_windows(model.output_geometry(frames)):
-            decoded = runner.run_decoder(
-                "video",
-                DecodeBatch((source,), (shape,), (window,)),
+        for window in model.decode_windows(model.video_info(frames)):
+            decoded = model.video_decoder.decode(
+                (source,),
+                shape,
+                (window,),
                 constants=decoder_constants,
                 scratch=decoder_scratch,
-            ).values[0]
+            ).values["video"][0]
+            if decoded is None:
+                raise RuntimeError("local video decoder did not produce a tensor")
             # The numerical decoder already applies its native temporal crop.
             # Remove only the leading result-unit dimension for postprocessing.
             segment = decoded[0]
@@ -112,7 +134,8 @@ def _decode(
             pixels.append(output.cpu())
         return torch.cat(pixels)
     finally:
-        runner.close()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
 
 
 def main() -> None:

@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from uniserve_worker.nn.video import blend_decoded_overlap, video_segment_rgb
+from uniserve.nn.video import blend_decoded_overlap, video_segment_rgb
 
 
 @pytest.mark.parametrize("final_unit", [False, True])

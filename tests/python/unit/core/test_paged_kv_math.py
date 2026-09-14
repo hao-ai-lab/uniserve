@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.backends import paged_kv_math
+from uniserve.runtime import paged_kv_math
 
 
 @pytest.mark.parametrize("encoded", (False, True))

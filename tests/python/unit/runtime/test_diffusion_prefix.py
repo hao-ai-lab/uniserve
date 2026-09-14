@@ -6,10 +6,10 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
+from uniserve.model.image_diffusion import BranchSource
+from uniserve_models.processing import FlowPrompt
 from uniserve_worker.execution.diffusion_state import resolve_prefix
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.modeling.image_diffusion import BranchSource, FlowPrompt
-from uniserve_worker.models.stub import StubModel
 
 pytestmark = pytest.mark.unit
 
@@ -39,8 +39,7 @@ def test_prefix_selection_preserves_framing_and_explicit_negative_tokens(
     backend = Tokenizer(WordLevel(vocabulary, unk_token="[UNK]"))
     backend.pre_tokenizer = Whitespace()
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
-    generation = StubModel().generation
-    generation.prompt = FlowPrompt(
+    prompt = FlowPrompt(
         user_prefix="user ",
         user_suffix=" assistant ",
         assistant_suffix="",
@@ -49,7 +48,7 @@ def test_prefix_selection_preserves_framing_and_explicit_negative_tokens(
     )
     assert (
         resolve_prefix(
-            generation,
+            prompt,
             source,
             image_prompt=positive,
             negative_prompt=negative,
@@ -61,9 +60,9 @@ def test_prefix_selection_preserves_framing_and_explicit_negative_tokens(
 
 
 def test_unframed_model_reuses_conditioning_and_rejects_positive_prompt_overrides():
-    generation = StubModel().generation
+    prompt = None
     assert resolve_prefix(
-        generation,
+        prompt,
         BranchSource.CONDITIONING,
         image_prompt="",
         negative_prompt="",
@@ -71,7 +70,7 @@ def test_unframed_model_reuses_conditioning_and_rejects_positive_prompt_override
         tokenizer=None,
     ) == ((), True)
     assert resolve_prefix(
-        generation,
+        prompt,
         BranchSource.START,
         image_prompt="",
         negative_prompt="",
@@ -80,7 +79,7 @@ def test_unframed_model_reuses_conditioning_and_rejects_positive_prompt_override
     ) == ((), False)
     with pytest.raises(WorkerError, match="prompt override"):
         resolve_prefix(
-            generation,
+            prompt,
             BranchSource.CONDITIONING,
             image_prompt="positive",
             negative_prompt="",

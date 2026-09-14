@@ -7,8 +7,9 @@ from threading import RLock
 
 import torch
 
+from uniserve.model.media import VideoInfo
+
 from ..foundation.errors import resource_error
-from ..modeling.geometry import VideoShape
 
 
 class MediaBuffers:
@@ -20,7 +21,7 @@ class MediaBuffers:
         state_slots: int,
         unresolved_window: int,
         max_video_frames_per_round: int,
-        max_geometry: VideoShape,
+        video: VideoInfo,
     ) -> None:
         """Allocate bounded video and audio tensors with independent free-slot queues."""
 
@@ -28,17 +29,9 @@ class MediaBuffers:
         self.audio_capacity = int(state_slots)
         if min(self.video_capacity, self.audio_capacity) < 1:
             raise ValueError("video output-ring capacities must be positive")
-        video_bytes = (
-            int(max_video_frames_per_round) * int(max_geometry.height) * int(max_geometry.width) * 3
-        )
+        video_bytes = int(max_video_frames_per_round) * int(video.height) * int(video.width) * 3
         audio_bytes = (
-            round(
-                int(max_geometry.frame_count)
-                * int(max_geometry.audio_rate)
-                / int(max_geometry.frame_rate)
-            )
-            * 2
-            * 2
+            round(int(video.frame_count) * int(video.audio_rate) / int(video.frame_rate)) * 2 * 2
         )
         if min(video_bytes, audio_bytes) < 1:
             raise ValueError("video output-ring media capacities must be positive")

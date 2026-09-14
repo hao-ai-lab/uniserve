@@ -6,29 +6,23 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve_worker.backends.attention.context import sparse_attention_scope
-from uniserve_worker.backends.attention.video_sparse_provider import resolve_sparse_provider
-from uniserve_worker.bootstrap.distributed import (
-    initialize_model_parallel,
-    initialize_process_groups,
-)
-from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
-from uniserve_worker.nn.parallel_attention import (
+from uniserve.attention.context import sparse_attention_scope
+from uniserve.attention.video_sparse_provider import resolve_sparse_provider
+from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
+from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
+from uniserve.nn.parallel_attention import (
     AttentionRowExchange,
     ParallelAttention,
     context_scope,
     output_scope,
 )
-from uniserve_worker.nn.sparse_attention import (
+from uniserve.nn.sparse_attention import (
     SparseAttention,
     VideoSparseAttentionWorkspace,
     build_video_sparse_metadata,
     video_sparse_selected_tiles,
 )
-from uniserve_worker.runtime.attention_storage import (
-    allocate_context_storage,
-    allocate_output_storage,
-)
+from uniserve.runtime.attention_storage import allocate_context_storage, allocate_output_storage
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

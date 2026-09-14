@@ -6,12 +6,9 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve_worker.bootstrap.distributed import (
-    initialize_model_parallel,
-    initialize_process_groups,
-)
-from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
-from uniserve_worker.nn.parallel_pipeline import LayerPipeline
+from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
+from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
+from uniserve.nn.parallel_pipeline import LayerPipeline
 
 pytestmark = pytest.mark.integration
 

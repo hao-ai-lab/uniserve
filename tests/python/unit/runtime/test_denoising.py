@@ -4,10 +4,11 @@ import pytest
 import torch
 
 from tests.python.fixtures.diffusion import LinearDenoiser
-from uniserve_worker.execution.denoising import DenoisingStep
-from uniserve_worker.modeling.batch import DiffusionBatch
-from uniserve_worker.modeling.geometry import MediaShape
-from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
+from uniserve.model.batch import DiffusionBatch
+from uniserve.model.denoising import DenoisingStep
+from uniserve.model.media import ImageSize
+from uniserve.nn.diffusion.integrator import EulerSolver
+from uniserve.nn.diffusion.schedule import DiffusionSchedule
 
 pytestmark = pytest.mark.unit
 
@@ -26,7 +27,7 @@ def test_named_denoising_updates_each_sequence_with_its_modality_schedule(solver
     for step in range(2):
         batch = DiffusionBatch(
             samples,
-            (MediaShape(1, 2),) * 2,
+            (ImageSize(1, 2),) * 2,
             timesteps={
                 name: (schedule.timesteps[index][step],) * 2 for index, name in enumerate(samples)
             },
@@ -45,3 +46,12 @@ def test_named_denoising_updates_each_sequence_with_its_modality_schedule(solver
             output, (row for rows in reference.values() for row in rows), strict=True
         ):
             torch.testing.assert_close(observed.double(), expected, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_clean_prediction_reaches_its_terminal_sample(dtype):
+    sample = torch.tensor([1.0, 2.0, 3.0], dtype=dtype)
+    clean = torch.tensor([4.0, 5.0, 6.0], dtype=dtype)
+    EulerSolver("sample").step(clean, sample, torch.tensor(0.25), torch.tensor(1.0))
+    torch.testing.assert_close(sample, clean, rtol=0, atol=0)

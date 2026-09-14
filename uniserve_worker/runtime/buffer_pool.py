@@ -8,9 +8,10 @@ from threading import RLock
 
 import torch
 
+from uniserve.runtime.device import canonical_device
+
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor
 from ..protocol.batch import BufferAllocation, BufferId, TensorRef
-from .device import canonical_device
 
 
 def _invariant(message: str) -> WorkerError:

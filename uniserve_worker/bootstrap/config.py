@@ -7,11 +7,11 @@ import math
 import os
 from dataclasses import dataclass
 
-from uniserve_worker.nn.parallel import ComponentConfig, parse_entries
+from uniserve.loading.config import LoadConfig
+from uniserve_worker.config import ComponentConfig, parse_entries
 from uniserve_worker.protocol.batch import Computation, ForwardMode, PipelineStage, TransferMode
 
 from ..config import WorkerConfig, worker_config_from_namespace
-from ..loader.config import LoadConfig
 
 # These launch selectors assign capabilities to a worker pool. A media selector
 # includes both tracks; submitted computations still identify the concrete stage.

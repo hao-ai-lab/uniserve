@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve_worker.execution import operations as operation_geometry
+from uniserve_worker.execution import operations as operations
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.protocol.batch import (
@@ -38,7 +38,7 @@ from .batch_state import BatchState
 if TYPE_CHECKING:
     from uniserve_worker.execution.model_runner import ModelRunner
     from uniserve_worker.runtime.block_tables import BlockTables
-    from uniserve_worker.runtime.kv_cache import KVCache
+    from uniserve_worker.runtime.cache_manager import CacheManager
     from uniserve_worker.runtime.latent_pool import LatentPool
     from uniserve_worker.runtime.tensor_store import TensorStore
     from uniserve_worker.transfer.tickets import Transport
@@ -49,7 +49,7 @@ def execute(
     completion_group: int,
     *,
     state: BatchState,
-    kv_cache: KVCache | None,
+    kv_cache: CacheManager | None,
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
     publication_transports: Mapping[str, Transport],
@@ -73,7 +73,7 @@ def execute(
         if output is None:
             raise invalid_descriptor("KV publication requires a cache output identity")
         request = state.pending_output(completion_group, request_id)
-        cache = operation_geometry.cache_coordinates(request, tables=request_tables)
+        cache = operations.cache_coordinates(request, tables=request_tables)
         expected_base = publications.destination_base(operation.request_key, "gen")
         snapshot = publications.publish(
             request_pool_idx=request.request.request_pool_idx,
@@ -104,7 +104,7 @@ def execute(
         if source is None or output is None:
             raise invalid_descriptor("KV installation requires source and output identities")
         request = state.pending_output(completion_group, request_id)
-        cache = operation_geometry.cache_coordinates(request, tables=request_tables)
+        cache = operations.cache_coordinates(request, tables=request_tables)
         write = state.cache_imports.get(source)
         if write is None:
             raise invalid_descriptor("KV installation has no reserved physical input")
@@ -175,7 +175,7 @@ def _publish_current_latent(
     publication_transports: Mapping[str, Transport],
 ) -> TensorPublication:
     request = state.pending_output(completion_group, operation.request_key.request_id)
-    if operation_geometry.require_progress(request).latent_product != reference:
+    if operations.require_progress(request).latent_product != reference:
         raise invalid_descriptor("latent transfer does not name the committed trajectory")
     if product != operation.latent_output:
         raise invalid_descriptor("product transfer changes the physical product kind")
@@ -231,7 +231,7 @@ def publish_latent_source(
     assert shape is not None
     if not _representation_matches_product(
         shape,
-        str(pool.dtype).removeprefix("torch."),
+        str(pool.storage.dtype).removeprefix("torch."),
         math.prod(shape) * pool.storage.element_size(),
         product,
     ):

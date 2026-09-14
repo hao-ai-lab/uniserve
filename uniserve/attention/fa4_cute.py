@@ -1,0 +1,438 @@
+"""FlashAttention-4 CUTE backend.
+
+The FA4 reference kernel is an attention-only kernel: unlike FA2's
+``flash_attn_with_kvcache`` it does not append current K/V into the cache.
+This backend keeps that layout explicit by writing the current K/V span into
+the worker-owned paged cache before calling the FA4 paged forward.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+import torch
+
+from uniserve.attention.base import AttentionBackend, merge_attention_states
+from uniserve.attention.layout import QKVLayout, normalize_kv, normalize_to
+from uniserve.attention.metadata import AttentionMetadata, AttentionMode
+from uniserve.runtime.paged_kv_math import paged_kv_write, write_locations
+
+__all__ = [
+    "Fa4CuteAttentionBackend",
+]
+
+_IMPORT_ERROR: BaseException | None = None
+_SUPPORTED_TRUNK_GEOMETRIES: frozenset[tuple[int, int, int]] = frozenset(
+    {
+        (64, 64, 64),
+        (96, 96, 96),
+        (128, 128, 128),
+        (192, 192, 128),
+    }
+)
+# Paged and hybrid attention bind the query-tile width to their mask metadata.
+# Dense attention uses the kernel's device- and geometry-specific launch policy.
+_FA4_TILE_MN = (128, 128)
+_FA4_NUM_THREADS = 384
+_fa4_flash_attn_fwd: Callable[..., Any] | None
+_hybrid_multimodal_mask: Any | None
+try:  # pragma: no cover - optional CUDA package.
+    import uniserve_kernel.flash_attn_jagged as _jagged
+
+    _fa4_flash_attn_fwd = _jagged.flash_attn_fwd
+    _hybrid_multimodal_mask = _jagged.hybrid_multimodal_mask
+    _IMPORT_ERROR = _jagged.import_error()
+except Exception as exc:  # pragma: no cover
+    _IMPORT_ERROR = exc
+    _fa4_flash_attn_fwd = None
+    _hybrid_multimodal_mask = None
+
+
+class Fa4CuteAttentionBackend(AttentionBackend):
+    """FlashAttention-4 CUTE backend with explicit paged KV writes before forward."""
+
+    name = "fa4_cute"
+    available = _fa4_flash_attn_fwd is not None
+    packed_cuda_graph = available
+    supported_head_dims = _SUPPORTED_TRUNK_GEOMETRIES
+    cuda_only = True
+    dense_dtypes = frozenset({torch.float16, torch.bfloat16})
+    min_compute_version = (8, 0)
+    max_compute_version = (12, 9)
+    dense_ranks = frozenset({4})
+
+    def can_bind(self, mode: AttentionMode, *, device: torch.device, **geometry) -> bool:
+        """Bind cache storage only on architectures with a paged CuTe kernel."""
+
+        if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] in (8, 12):
+            if mode is not AttentionMode.DENSE:
+                return False
+        return super().can_bind(mode, device=device, **geometry)
+
+    def can_run(self, req: object) -> bool:
+        """Apply paged-kernel architecture constraints to direct requests too."""
+
+        q = getattr(req, "q", None)
+        paged = any(
+            getattr(req, name, None) is not None
+            for name in ("block_table", "page_table", "prefix_k")
+        )
+        if (
+            paged
+            and isinstance(q, torch.Tensor)
+            and q.is_cuda
+            and torch.cuda.get_device_capability(q.device)[0] in (8, 12)
+        ):
+            return False
+        return super().can_run(req)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        causal: bool,
+        scale: float,
+        attn_mask: torch.Tensor | None = None,
+        context: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        """Compute dense causal or noncausal attention through FlashAttention-4 CuTe kernels."""
+
+        del context
+        if attn_mask is not None:
+            raise RuntimeError("fa4_cute backend does not accept explicit dense masks")
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+            raise ValueError("fa4_cute backend expects q/k/v in [B, H, L, D] layout")
+        _validate_unified_trunk_geometry(q.shape[-1], k.shape[-1], v.shape[-1], scale=scale)
+        forward = _require_fa4()
+        # The upstream entry owns pointer/stride alignment. Preserve aligned
+        # interleaved projections and let it materialize only unsupported views.
+        out = _fa4_output(
+            forward(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                softmax_scale=scale,
+                causal=causal,
+            )
+        )
+        return out.transpose(1, 2)
+
+    def forward_paged(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        k: torch.Tensor | None = None,
+        v: torch.Tensor | None = None,
+        causal: bool,
+        scale: float,
+        context: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        """Write current K/V into paged storage and run FlashAttention-4 decode over the visible prefix."""
+
+        q_blh, restore = normalize_to(q, QKVLayout.BLHD)
+        _validate_unified_trunk_geometry(
+            q_blh.shape[-1],
+            k_cache.shape[-1],
+            v_cache.shape[-1],
+            scale=scale,
+        )
+        forward = _require_fa4()
+        cache_seqlens = cache_seqlens.to(device=q_blh.device, dtype=torch.int32).contiguous()
+        block_table = block_table.to(device=q_blh.device, dtype=torch.int32).contiguous()
+        live_seqlens = cache_seqlens.clone()
+        if k is not None or v is not None:
+            if k is None or v is None:
+                raise ValueError("fa4_cute paged update requires both k and v")
+            k_blh = normalize_kv(k, QKVLayout.BLHD)
+            v_blh = normalize_kv(v, QKVLayout.BLHD)
+            if k_blh.shape[:3] != v_blh.shape[:3] or k_blh.shape[0] != q_blh.shape[0]:
+                raise ValueError("current paged K/V must match q batch and each other")
+            _write_paged_kv_cache(k_cache, v_cache, block_table, cache_seqlens, k_blh, v_blh)
+            live_seqlens += int(k_blh.shape[1])
+        max_seqlen_k = _metadata_context_len(context)
+        if max_seqlen_k <= 0:
+            raise ValueError(
+                "fa4_cute paged forward requires a positive host-known maximum KV length"
+            )
+
+        out = _fa4_output(
+            forward(
+                q_blh,
+                k_cache,
+                v_cache,
+                page_table=block_table,
+                seqused_k=live_seqlens,
+                max_seqlen_q=int(q_blh.shape[1]),
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=scale,
+                causal=causal,
+                tile_mn=_FA4_TILE_MN,
+                num_threads=_FA4_NUM_THREADS,
+            )
+        )
+        return restore.apply(out)
+
+    def forward_visible_end(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        visible_end: torch.Tensor,
+        cu_seqlens_q: torch.Tensor | None = None,
+        cu_seqlens_k: torch.Tensor | None = None,
+        page_table: torch.Tensor | None = None,
+        seqused_k: torch.Tensor | None = None,
+        max_seqlen_q: int | None = None,
+        max_seqlen_k: int | None = None,
+        scale: float | None = None,
+        use_prefix_bounds: bool = False,
+        fully_visible: bool = False,
+        context: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        """Run the hybrid ``visible_end`` mask path.
+
+        ``q`` may be fixed [B,L,H,D] or varlen [total,H,D].  ``visible_end`` is
+        always padded [B,max_q] and indexed locally per sequence.
+        """
+
+        del context
+        _validate_unified_trunk_geometry(q.shape[-1], k.shape[-1], v.shape[-1], scale=scale)
+        forward = _require_fa4()
+        visible_end = visible_end.to(device=q.device, dtype=torch.int32).contiguous()
+        setattr(visible_end, "__leading_dim__", 1)
+        setattr(visible_end, "__assumed_align__", 4)
+        kwargs: dict[str, Any] = {
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "page_table": page_table,
+            "seqused_k": seqused_k,
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_k": max_seqlen_k,
+            "softmax_scale": scale,
+        }
+        if fully_visible:
+            return _fa4_output(forward(q, k, v, **kwargs))
+        kwargs["aux_tensors"] = [visible_end]
+        kwargs["mask_mod"] = _hybrid_multimodal_mask
+        architecture = torch.cuda.get_device_capability(q.device)[0]
+        if use_prefix_bounds and architecture in (9, 10, 11):
+            from uniserve_kernel.flash_attn_jagged.prefix_bounds import prefix_block_sparsity
+
+            query_lengths = (
+                cu_seqlens_q.diff()
+                if cu_seqlens_q is not None
+                else torch.full((q.shape[0],), q.shape[1], dtype=torch.int32, device=q.device)
+            )
+            key_lengths = (
+                seqused_k
+                if seqused_k is not None
+                else cu_seqlens_k.diff()
+                if cu_seqlens_k is not None
+                else torch.full_like(query_lengths, k.shape[1])
+            )
+            key_bound = max_seqlen_k if max_seqlen_k is not None else k.shape[1]
+            query_tile = 256 if architecture in (10, 11) else 128
+            # Sparse metadata refers to logical query rows, independently of
+            # grouped heads. The kernel schedules each head over these rows.
+            kwargs["pack_gqa"] = False
+            kwargs["tile_mn"] = _FA4_TILE_MN
+            kwargs["num_threads"] = _FA4_NUM_THREADS
+            kwargs["block_sparse_tensors"] = prefix_block_sparsity(
+                visible_end,
+                query_lengths=query_lengths,
+                key_lengths=key_lengths,
+                max_key_length=key_bound,
+                query_tile=query_tile,
+                key_tile=128,
+                variable_length=cu_seqlens_q is not None,
+            )
+        return _fa4_output(forward(q, k, v, **kwargs))
+
+    def forward_segmented(
+        self,
+        q: torch.Tensor,
+        current_k: torch.Tensor,
+        current_v: torch.Tensor,
+        prefix_k: torch.Tensor,
+        prefix_v: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        visible_current_end: torch.Tensor,
+        scale: float,
+        fully_visible_current: bool,
+        context: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        """Merge FlashAttention-4 states from the live segment and each cached KV segment."""
+
+        del context
+        forward = _require_fa4()
+        if q.ndim != 3 or current_k.shape != current_v.shape or current_k.ndim != 3:
+            raise ValueError("FA4 segmented attention expects packed current Q/K/V")
+        _validate_unified_trunk_geometry(
+            q.shape[-1], current_k.shape[-1], current_v.shape[-1], scale=scale
+        )
+        cu_q = cu_seqlens_q.to(device=q.device, dtype=torch.int32).contiguous()
+        pages = page_table.to(device=q.device, dtype=torch.int32).contiguous()
+        prefix_lengths = prefix_lens.to(device=q.device, dtype=torch.int32).contiguous()
+        max_query = int(visible_current_end.shape[1])
+        current_kwargs: dict[str, Any] = {
+            "cu_seqlens_q": cu_q,
+            "cu_seqlens_k": cu_q,
+            "max_seqlen_q": max_query,
+            "max_seqlen_k": max_query,
+            "softmax_scale": scale,
+            "tile_mn": _FA4_TILE_MN,
+            "num_threads": _FA4_NUM_THREADS,
+            "return_lse": True,
+        }
+        if not fully_visible_current:
+            visible = visible_current_end.to(device=q.device, dtype=torch.int32).contiguous()
+            setattr(visible, "__leading_dim__", 1)
+            setattr(visible, "__assumed_align__", 4)
+            current_kwargs["aux_tensors"] = [visible]
+            current_kwargs["mask_mod"] = _hybrid_multimodal_mask
+        current_output, current_lse = _fa4_state(forward(q, current_k, current_v, **current_kwargs))
+        prefix_output, prefix_lse = _fa4_state(
+            forward(
+                q,
+                prefix_k,
+                prefix_v,
+                cu_seqlens_q=cu_q,
+                page_table=pages,
+                seqused_k=prefix_lengths,
+                max_seqlen_q=max_query,
+                max_seqlen_k=int(pages.shape[1]) * int(prefix_k.shape[1]),
+                softmax_scale=scale,
+                tile_mn=_FA4_TILE_MN,
+                num_threads=_FA4_NUM_THREADS,
+                return_lse=True,
+            )
+        )
+        output, _ = merge_attention_states(
+            current_output,
+            current_lse,
+            prefix_output,
+            prefix_lse,
+        )
+        return output
+
+
+def _require_fa4() -> Callable[..., Any]:
+    """Return the loaded FlashAttention-4 module or raise its import failure."""
+
+    if _fa4_flash_attn_fwd is None:
+        detail = f": {_IMPORT_ERROR}" if _IMPORT_ERROR is not None else ""
+        raise RuntimeError(
+            "fa4_cute backend is not available. Install "
+            "uniserve-kernel[flash_attn_jagged] with its CUTE runtime dependencies"
+            f"{detail}"
+        )
+    return _fa4_flash_attn_fwd
+
+
+def _fa4_output(result: Any) -> torch.Tensor:
+    """Extract the attention output tensor from a FlashAttention-4 result."""
+
+    if isinstance(result, tuple):
+        return result[0]
+    return result
+
+
+def _fa4_state(result: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract output and log-sum-exp tensors from a FlashAttention-4 state result."""
+
+    if not isinstance(result, tuple) or len(result) < 2 or result[1] is None:
+        raise RuntimeError("FA4 segmented attention did not return log-sum-exp state")
+    output, lse = result[0], result[1]
+    if lse.ndim == 2 and tuple(lse.shape) == (int(output.shape[1]), int(output.shape[0])):
+        lse = lse.transpose(0, 1).contiguous()
+    if tuple(lse.shape) != tuple(output.shape[:2]):
+        raise RuntimeError("FA4 segmented attention returned an unexpected LSE layout")
+    return output, lse
+
+
+def _validate_unified_trunk_geometry(
+    q_head_dim: int,
+    k_head_dim: int,
+    v_head_dim: int,
+    *,
+    scale: float | None = None,
+) -> None:
+    """Validate head dimensions and scale against the unified FlashAttention trunk contract."""
+
+    geometry = (int(q_head_dim), int(k_head_dim), int(v_head_dim))
+    if geometry not in _SUPPORTED_TRUNK_GEOMETRIES:
+        raise RuntimeError(
+            "fa4_cute unified trunk path only supports head geometries "
+            f"{sorted(_SUPPORTED_TRUNK_GEOMETRIES)}, got {geometry}. "
+            "Vision/VAE attention must use a separate backend."
+        )
+    if scale is not None:
+        expected = float(int(q_head_dim) ** -0.5)
+        if abs(float(scale) - expected) > 1e-6:
+            raise RuntimeError(
+                "fa4_cute unified trunk path received an incompatible softmax scale "
+                f"{float(scale)} for q head dim {int(q_head_dim)}"
+            )
+
+
+def _write_paged_kv_cache(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    k_current: torch.Tensor,
+    v_current: torch.Tensor,
+) -> None:
+    """Append current key and value rows to their logical locations in the paged cache."""
+
+    if k_cache.shape != v_cache.shape:
+        raise ValueError("paged K/V cache tensors must have identical shapes")
+    if k_current.shape != v_current.shape:
+        raise ValueError("current K/V tensors must have identical shapes")
+    if k_cache.ndim != 4 or k_current.ndim != 4:
+        raise ValueError("paged cache must be [pages,page,heads,dim] and current K/V [B,L,H,D]")
+    batch, tokens, heads, head_dim = k_current.shape
+    if k_cache.shape[2:] != (heads, head_dim):
+        raise ValueError("current K/V head geometry does not match paged cache")
+    if block_table.shape[0] != batch or cache_seqlens.shape[0] != batch:
+        raise ValueError("block table and cache lengths must have one row per batch")
+    if tokens == 0 or batch == 0:
+        return
+    page_size = int(k_cache.shape[1])
+    device = k_cache.device
+
+    # Vectorized cache append: compute the destination slot for every
+    # (batch, token) pair on-device and scatter in a single index_copy_, so the
+    # decode hot path incurs no per-row Python loop and no ``.item()`` syncs.
+    cache_seqlens = cache_seqlens.to(device=device, dtype=torch.int64)
+    block_table = block_table.to(device=device, dtype=torch.int64)
+    # Absolute positions per (batch, token): [batch, tokens].
+    token_offsets = torch.arange(tokens, device=device, dtype=torch.int64)
+    positions = cache_seqlens.unsqueeze(1) + token_offsets.unsqueeze(0)
+    # A page slot overflowing ``block_table`` or an out-of-range physical page id
+    # is left to surface as a CUDA index error from gather/index_copy_. Validating
+    # those on-device here would require ``.item()`` syncs every decode step; the
+    # engine sizes block tables so those indices stay in range.
+    page_ids, offsets = write_locations(block_table, positions, page_size)
+    paged_kv_write(k_cache, v_cache, page_ids, offsets, k_current, v_current)
+
+
+def _metadata_context_len(plan: object | None) -> int:
+    """Read the maximum cached context length carried by an optional plan."""
+
+    value = getattr(plan, "max_seqlen_k", 0)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0

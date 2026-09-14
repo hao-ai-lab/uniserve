@@ -10,7 +10,7 @@ use crate::{
     ArRequestParams, ArtifactHandle, BatchCommand, BatchOutput, BlockTable, Bounds,
     BufferAllocation, BufferId, CachePageAllocation, Computation, ComputationId, DType,
     DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, ErrorOperationIdentity,
-    FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats, KvCacheConfig, KvTransfer,
+    FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats, KvCacheInfo, KvTransfer,
     LatentParams, Locator, MediaOutput, NewRequest, OpStatus, PipelineStage, RegistrationAck,
     RequestKey, RequestKind, RequestOutput, ResponseKind, Rng, SamplingState, ScheduleBatch,
     ScheduledRequest, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
@@ -944,7 +944,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
                                 .context("entry requires tensor result declarations")?
                                 .iter()
                                 .map(|output| {
-                                    Ok(crate::TensorSpec {
+                                    Ok(crate::OutputInfo {
                                         name: required_str(output.name(), "tensor result.name")?,
                                         dtype: dtype_from_fb(output.dtype())?,
                                         shape_bound: shape_bound_from_parts(
@@ -1778,8 +1778,8 @@ fn error_operation_to_fb(operation: &ErrorOperationIdentity) -> fbs::ErrorOperat
 }
 
 /// Decodes worker KV-cache capabilities from a verified table.
-fn kv_cache_from_table(config: fbs::KvCacheConfig<'_>) -> CodecResult<KvCacheConfig> {
-    Ok(KvCacheConfig {
+fn kv_cache_from_table(config: fbs::KVCacheInfo<'_>) -> CodecResult<KvCacheInfo> {
+    Ok(KvCacheInfo {
         block_size: config.block_size(),
         num_blocks: config.num_blocks(),
         num_layers: config.num_layers(),
@@ -1805,8 +1805,8 @@ fn kv_cache_from_table(config: fbs::KvCacheConfig<'_>) -> CodecResult<KvCacheCon
 }
 
 /// Converts KV-cache capacity and group geometry into their wire table.
-fn kv_cache_to_fb(config: &KvCacheConfig) -> fbs::KvCacheConfigT {
-    fbs::KvCacheConfigT {
+fn kv_cache_to_fb(config: &KvCacheInfo) -> fbs::KVCacheInfoT {
+    fbs::KVCacheInfoT {
         block_size: config.block_size,
         num_blocks: config.num_blocks,
         num_layers: config.num_layers,
@@ -1976,7 +1976,7 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
                                 .map(|output| {
                                     let (extents, dynamic_axis) =
                                         shape_bound_to_parts(&output.shape_bound);
-                                    fbs::TensorSpecT {
+                                    fbs::OutputInfoT {
                                         name: Some(output.name.clone()),
                                         dtype: dtype_to_fb(output.dtype),
                                         extents: Some(extents),

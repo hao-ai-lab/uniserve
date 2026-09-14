@@ -14,11 +14,7 @@ import json
 import struct
 from pathlib import Path
 
-from uniserve_worker.nn.rng import (
-    philox4x32_10,
-    sampling_key,
-    sampling_uniform,
-)
+from uniserve.nn.rng import philox4x32_10, sampling_key, sampling_uniform
 
 _FIXTURE = Path(__file__).resolve().parents[2] / "generated" / "sampling_rng_parity.json"
 

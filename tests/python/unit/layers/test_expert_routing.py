@@ -4,10 +4,10 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve_worker.modeling.tensors import ExpertRoute, RouteSpan
-from uniserve_worker.nn.branch import branch
-from uniserve_worker.nn.expert_routing import RoutedTensor
-from uniserve_worker.runtime.branches import bind_branches
+from uniserve.attention.metadata import ExpertRoute, RouteSpan
+from uniserve.nn.branch import branch
+from uniserve.nn.expert_routing import RoutedTensor
+from uniserve.runtime.branches import bind_branches
 
 pytestmark = pytest.mark.unit
 
@@ -60,8 +60,8 @@ def test_expert_modules_preserve_route_values_and_packed_order(routes, flow_devi
 
 @pytest.mark.parametrize("rows", [1, 5])
 def test_sequence_owned_routes_preserve_empty_experts_and_original_order(rows):
-    from uniserve_worker.nn.mesh import Communicator
-    from uniserve_worker.nn.parallel_sequence import SequencePartition
+    from uniserve.distributed.mesh import Communicator
+    from uniserve.nn.parallel_sequence import SequencePartition
 
     values = torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2)
     spans = (RouteSpan(ExpertRoute.TEXT, 0, 1),)
@@ -90,7 +90,7 @@ def test_sequence_owned_routes_preserve_empty_experts_and_original_order(rows):
 
 @pytest.mark.parametrize("start,stop", [(0, 8), (1, 7), (2, 5), (4, 4), (8, 8)])
 def test_routed_intervals_preserve_experts_and_packed_coordinates(start, stop):
-    from uniserve_worker.nn.expert_routing import slice_route_spans
+    from uniserve.nn.expert_routing import slice_route_spans
 
     spans = tuple(
         RouteSpan(route, index * 2, 2)

@@ -23,6 +23,8 @@ from enum import StrEnum
 from itertools import groupby, repeat
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from uniserve.tensors import TensorRegion
+
 from ..foundation.errors import invalid_descriptor, resource_error, unsupported_setup
 from ..foundation.shared_memory import allocate_shared_memory
 from ..protocol.batch import (
@@ -34,7 +36,7 @@ from ..protocol.batch import (
 )
 from ..runtime.device_events import EventPool
 from .endpoint import PublicationEndpoint, finish_reader, open_reader
-from .layout import TensorRegion, region_view, validate_destination
+from .layout import region_view, validate_destination
 
 if TYPE_CHECKING:
     import torch

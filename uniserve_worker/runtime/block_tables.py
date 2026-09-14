@@ -6,13 +6,14 @@ from collections.abc import Sequence
 
 import torch
 
+from uniserve.runtime.device import fill_cpu_ints
+from uniserve.runtime.resources import close_resources
+from uniserve.runtime.tensor_buffers import TensorBuffers
+from uniserve.tensors import BufferConfig
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
 from ..foundation.errors import invalid_descriptor
-from ..foundation.resources import close_resources
 from ..protocol.batch import RequestKey
-from ..runtime.tensor_buffers import TensorBuffers, TensorSchema
-from .device import fill_cpu_ints
 
 __all__ = ["BlockTables"]
 
@@ -57,12 +58,13 @@ class BlockTables:
 
         self._table_capacity = self.request_pool_size * self.group_count
         tensors = TensorBuffers.allocate(
-            self.tensor_schema(
+            self.buffers(
                 group_count=self.group_count,
                 request_pool_size=self.request_pool_size,
                 max_blocks_per_request=self.max_blocks_per_request,
             ),
             device,
+            fill={"page_tables": 0, "verified_lengths": 0, "alloced_lens": 0},
         ).capacity
         self.page_tables = tensors["page_tables"]
         self.verified_lengths = tensors["verified_lengths"]
@@ -102,24 +104,22 @@ class BlockTables:
         )
 
     @staticmethod
-    def tensor_schema(
+    def buffers(
         *, group_count: int, request_pool_size: int, max_blocks_per_request: int
-    ) -> dict[str, TensorSchema]:
+    ) -> dict[str, BufferConfig]:
         """Describe page tables and the full request/group installation workspace."""
 
         if min(group_count, request_pool_size, max_blocks_per_request) < 1:
             raise invalid_descriptor("request-to-token pool geometry is invalid")
         rows, tables = request_pool_size + 1, request_pool_size * group_count
         return {
-            "page_tables": TensorSchema(
-                (group_count, rows, max_blocks_per_request), torch.int32, fill=0
-            ),
-            "verified_lengths": TensorSchema((rows,), torch.int32, fill=0),
-            "alloced_lens": TensorSchema((rows,), torch.int32, fill=0),
-            "_page_staging": TensorSchema((tables, max_blocks_per_request), torch.int32),
-            "_slot_staging": TensorSchema((2, tables), torch.int64),
-            "_group_staging": TensorSchema((tables,), torch.int64),
-            "_allocated_staging": TensorSchema((tables,), torch.int32),
+            "page_tables": BufferConfig((group_count, rows, max_blocks_per_request), torch.int32),
+            "verified_lengths": BufferConfig((rows,), torch.int32),
+            "alloced_lens": BufferConfig((rows,), torch.int32),
+            "_page_staging": BufferConfig((tables, max_blocks_per_request), torch.int32),
+            "_slot_staging": BufferConfig((2, tables), torch.int64),
+            "_group_staging": BufferConfig((tables,), torch.int64),
+            "_allocated_staging": BufferConfig((tables,), torch.int32),
         }
 
     def install(

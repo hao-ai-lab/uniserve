@@ -216,9 +216,11 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     assert report.completions[0].status is OpStatus.OK
                     assert report.completions[0].kv_visible_len == 2
                     serving.result(timeout=5)
-                    for layer in range(worker.kv_cache.num_layers):
-                        expected = producer.kv_cache.read(layer, (1,), start=0, length=2)
-                        actual = worker.kv_cache.read(layer, (1,), start=0, length=2)
+                    for layer in range(worker.kv_cache.cache.config.num_layers):
+                        expected = producer.kv_cache.cache.layer(layer).read(
+                            (1,), start=0, length=2
+                        )
+                        actual = worker.kv_cache.cache.layer(layer).read((1,), start=0, length=2)
                         for left, right in zip(actual, expected, strict=True):
                             torch.testing.assert_close(left, right, rtol=0, atol=0)
                 finally:

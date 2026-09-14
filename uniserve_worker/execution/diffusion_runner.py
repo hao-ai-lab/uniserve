@@ -11,27 +11,35 @@ from typing import TYPE_CHECKING, TypeVar, cast
 
 import torch
 
-from uniserve_worker.modeling.tensors import FlowPatches, TokenSelection
+from uniserve.attention.context import sparse_attention_scope
+from uniserve.attention.inputs import physical_columns
+from uniserve.attention.metadata import AttentionMode
+from uniserve.distributed.mesh import Communicator
+from uniserve.math import bucketed_length, ceil_div
+from uniserve.model.batch import DiffusionBatch
+from uniserve.model.denoising import DenoisingStep
+from uniserve.model.diffusion import DiffusionMixin
+from uniserve.model.image_diffusion import ImageDiffusion, LatentLayout
+from uniserve.model.media import ImageSize
+from uniserve.model.tensors import FlowPatches, TensorViews, TokenSelection
+from uniserve.model.text import TextMixin
+from uniserve.nn.diffusion.cfg import Branch, CfgPlan, build_flow_cfg_plan
+from uniserve.nn.diffusion.config import DiffusionConfig
+from uniserve.nn.diffusion.integrator import CleanSampleEulerSolver, EulerSolver
+from uniserve.nn.diffusion.schedule import DiffusionSchedule
+from uniserve.nn.parallel_attention import (
+    AttentionBuffers,
+    ParallelAttention,
+    context_scope,
+    output_scope,
+)
+from uniserve.nn.vision import get_flattened_position_ids_extrapolate
+from uniserve.runtime.cuda_graph import CudaGraph, GraphExecutionError, capture_pools
 
-from ..backends.attention.context import sparse_attention_scope
-from ..foundation.errors import invalid_descriptor
-from ..foundation.math import bucketed_length, ceil_div
-from ..modeling.batch import DiffusionBatch
-from ..modeling.diffusion import DiffusionMixin
-from ..modeling.image_diffusion import ImageDiffusion, LatentLayout
-from ..modeling.tensors import AttentionMode, TensorViews
-from ..nn.diffusion.cfg import Branch, CfgPlan, build_flow_cfg_plan
-from ..nn.diffusion.integrator import euler_step
-from ..nn.diffusion.schedule import DiffusionSchedule, x_pred_to_velocity
-from ..nn.mesh import Communicator
-from ..nn.parallel_attention import AttentionBuffers, ParallelAttention, context_scope, output_scope
-from ..nn.vision import get_flattened_position_ids_extrapolate
 from ..protocol.batch import PipelineStage
 from ..runtime.latent_pool import LatentPool
-from .attention import physical_columns
 from .batch import InputBatch
-from .cuda_graph import CudaGraph, GraphExecutionError, capture_pools
-from .denoising import DenoisingStep, numerical_signature
+from .denoising import numerical_signature
 from .device_transfer import tensor_to_device
 from .diffusion_state import DiffusionState, resolve_prefix
 from .graph_inputs import DiffusionShape
@@ -41,12 +49,13 @@ from .rows import ForwardRow
 from .runners.prefill import stage_text
 
 if TYPE_CHECKING:
-    from ..backends.attention.video_sparse_provider import SparseAttentionProvider
-    from ..nn.sparse_attention import SparseAttention
-    from ..runtime.attention_storage import OutputStorage
+    from uniserve.attention.video_sparse_provider import SparseAttentionProvider
+    from uniserve.nn.sparse_attention import SparseAttention
+    from uniserve.runtime.attention_storage import OutputStorage
+
     from .model_runner import ModelRunner
 
-GeometryT = TypeVar("GeometryT")
+InputT = TypeVar("InputT")
 logger = logging.getLogger(__name__)
 
 
@@ -80,11 +89,15 @@ class DiffusionRunner:
         groups: tuple[Communicator, ...],
         capacity: int,
         generation: ImageDiffusion | None = None,
+        solver: EulerSolver | CleanSampleEulerSolver | None = None,
         sparse_layers: tuple[SparseAttention, ...] = (),
         additional_devices: tuple[torch.device, ...] = (),
         context_buffers: Mapping[ParallelAttention, AttentionBuffers] | None = None,
         output_storage: OutputStorage | None = None,
     ) -> None:
+        self.solver = model.solver if model is not None else solver
+        if generation is not None and self.solver is None:
+            raise ValueError("image diffusion requires its numerical solver")
         self.generation = generation
         self.model = model
         self.device = device
@@ -95,7 +108,7 @@ class DiffusionRunner:
         self.groups = groups
         self.capacity = max(2, capacity)
         self._slots: OrderedDict[Hashable, tuple[Hashable, Hashable]] = OrderedDict()
-        self._geometry: OrderedDict[Hashable, object] = OrderedDict()
+        self.prepared_inputs: OrderedDict[Hashable, object] = OrderedDict()
         self._context_buffers = dict(context_buffers or {})
         self._output_storage = output_storage
         self._sparse_layers = sparse_layers
@@ -103,22 +116,22 @@ class DiffusionRunner:
         self._closed = False
 
     @contextmanager
-    def attention_scope(self, geometry: Hashable) -> Iterator[None]:
-        """Bind sparse plans owned by this runner and numerical geometry.
+    def attention_scope(self, input_key: Hashable) -> Iterator[None]:
+        """Bind sparse plans for this runner and its prepared-input key.
 
         Plans may contain mutable device indices. Separate runners own distinct
-        providers, and geometry retirement releases them after dependent graphs.
+        providers; input retirement releases them after dependent graphs.
         Direct eager numerical callers use the same scope as capture and replay.
         """
 
         if self._closed:
             raise GraphExecutionError("denoising runner is closed")
-        provider = self._sparse.get(geometry)
+        provider = self._sparse.get(input_key)
         if self._sparse_layers and provider is None:
-            from ..backends.attention.video_sparse_provider import resolve_sparse_provider
+            from uniserve.attention.video_sparse_provider import resolve_sparse_provider
 
             provider = resolve_sparse_provider(self.device)
-            self._sparse[geometry] = provider
+            self._sparse[input_key] = provider
         with (
             sparse_attention_scope(provider),
             context_scope(self._context_buffers),
@@ -126,21 +139,15 @@ class DiffusionRunner:
         ):
             yield
 
-    def initialize(
-        self, height: int, width: int, steps: int, timestep_shift: float
-    ) -> DiffusionState:
-        """Prepare a request's numerical schedule independently of accepted progress."""
+    def initialize(self, size: ImageSize, config: DiffusionConfig) -> DiffusionState:
+        """Prepare a request's actual schedule independently of accepted progress."""
 
-        generation = self.generation
-        if generation is None:
+        if self.generation is None:
             raise ValueError("model has no image generation pipeline")
-        if steps <= 0:
-            raise ValueError("num_steps must be positive")
         return DiffusionState(
-            geometry=(height, width, steps, timestep_shift),
-            timesteps=tuple(
-                generation.schedule_pair(steps, timestep_shift, step) for step in range(steps)
-            ),
+            size=size,
+            config=config,
+            schedule=self.generation.create_schedule(config, device="cpu"),
         )
 
     def flow_rows(
@@ -168,7 +175,7 @@ class DiffusionRunner:
         for branch in guide.branches:
             entry = trajectory.entries[branch]
             temporal = conditioning_position if branch is Branch.COND else entry[2]
-            positions, indexes, conditioning, query_tokens, text_local = denoise_geometry(
+            positions, indexes, conditioning, query_tokens, text_local = prepare_denoise_inputs(
                 generation,
                 current,
                 height,
@@ -217,11 +224,9 @@ class DiffusionRunner:
                 for branch, output in zip(guide.branches, outputs, strict=True)
             }
         )
-        if generation.prediction == "sample":
-            velocity = x_pred_to_velocity(velocity, current, timestep)
-        elif generation.prediction != "velocity":
-            raise invalid_descriptor(f"unsupported flow prediction {generation.prediction!r}")
-        current.copy_(euler_step(current, velocity, timestep, next_timestep))
+        if self.solver is None:
+            raise ValueError("image integration requires its numerical solver")
+        self.solver.step(velocity, current, timestep, next_timestep)
 
     @torch.inference_mode()
     def warmup(
@@ -232,14 +237,14 @@ class DiffusionRunner:
         state: TensorViews,
         constants: TensorViews,
         scratch: TensorViews,
-        geometry: Hashable,
+        input_key: Hashable,
     ) -> None:
         if self.model is None:
             raise ValueError("runner has no diffusion model")
         operation = DenoisingStep(self.model, batch, state, constants, scratch, schedule)
         restore = restore_samples(operation)
         try:
-            with self.attention_scope(geometry):
+            with self.attention_scope(input_key):
                 operation()
         finally:
             restore()
@@ -255,20 +260,20 @@ class DiffusionRunner:
         constants: TensorViews,
         scratch: TensorViews,
         slot: Hashable,
-        geometry: Hashable,
+        input_key: Hashable,
     ) -> tuple[TensorOutput, str]:
         if self._closed:
             raise GraphExecutionError("denoising runner is closed")
         if self.model is None:
             raise ValueError("runner has no diffusion model")
-        with self.attention_scope(geometry):
+        with self.attention_scope(input_key):
             operation = DenoisingStep(self.model, batch, state, constants, scratch, schedule)
             if self.capture_stream is None:
                 return operation(), "eager"
             signature = numerical_signature(
                 (
                     batch.latents,
-                    batch.shapes,
+                    batch.sizes,
                     batch.conditioning,
                     batch.positions,
                     batch.sequence_lengths,
@@ -310,7 +315,7 @@ class DiffusionRunner:
                 finally:
                     del restore
                 if resident is None:
-                    self._slots[slot] = (signature, geometry)
+                    self._slots[slot] = (signature, input_key)
             self._slots.move_to_end(slot)
             return self.graphs[key].replay(), "graph_capture" if missing else "graph_replay"
 
@@ -330,25 +335,27 @@ class DiffusionRunner:
             if key[0] == slot:
                 self._discard_graph(key)
 
-    def discard_geometry(self, geometry: Hashable) -> None:
-        for slot, (_signature, resident_geometry) in tuple(self._slots.items()):
-            if resident_geometry == geometry:
+    def release_inputs(self, key: Hashable) -> None:
+        """Release drained prepared inputs after retiring their dependent graphs."""
+
+        for slot, (_signature, resident_key) in tuple(self._slots.items()):
+            if resident_key == key:
                 self.release_slot(slot)
-        self._sparse.pop(geometry, None)
+        self._sparse.pop(key, None)
+        self.prepared_inputs.pop(key, None)
 
-    def prepare_geometry(self, key: Hashable, build: Callable[[], GeometryT]) -> GeometryT:
-        """Retain immutable numerical geometry and retire dependent graph bindings first."""
+    def prepare_inputs(self, key: Hashable, build: Callable[[], InputT]) -> InputT:
+        """Retain prepared numerical inputs and retire dependent graphs before their backing."""
 
-        if key not in self._geometry:
-            if len(self._geometry) >= self.capacity:
+        if key not in self.prepared_inputs:
+            if len(self.prepared_inputs) >= self.capacity:
                 if self.device.type == "cuda":
                     torch.cuda.current_stream(self.device).synchronize()
-                retired = next(iter(self._geometry))
-                self.discard_geometry(retired)
-                del self._geometry[retired]
-            self._geometry[key] = build()
-        self._geometry.move_to_end(key)
-        return cast(GeometryT, self._geometry[key])
+                retired = next(iter(self.prepared_inputs))
+                self.release_inputs(retired)
+            self.prepared_inputs[key] = build()
+        self.prepared_inputs.move_to_end(key)
+        return cast(InputT, self.prepared_inputs[key])
 
     def close(self) -> None:
         for graph in self.graphs.values():
@@ -357,7 +364,7 @@ class DiffusionRunner:
         self.graph_pool = None
         self.device_pools.clear()
         self._slots.clear()
-        self._geometry.clear()
+        self.prepared_inputs.clear()
         self._sparse.clear()
         self._context_buffers.clear()
         self._output_storage = None
@@ -386,7 +393,7 @@ class DiffusionRunner:
             raise ValueError("flow preparation requires a generation binding and input buffers")
         buffers = entry.input_buffers
         forward = partial(runner.batch_forward, entry)
-        packed = runner.model.text_attention_mode is AttentionMode.PACKED
+        packed = cast(TextMixin, runner.model).text_backbone.attention_mode is AttentionMode.PACKED
 
         cache = runner.kv_cache
         for shape in sorted(
@@ -407,7 +414,7 @@ class DiffusionRunner:
             )
             prefixes = tuple(
                 resolve_prefix(
-                    generation,
+                    runner.flow_prompt,
                     generation.branch_source(branch),
                     image_prompt="",
                     negative_prompt="",
@@ -416,7 +423,7 @@ class DiffusionRunner:
                 )[0]
                 for branch in guide.branches
             )
-            page_counts = tuple(ceil_div(len(prefix), cache.block_size) for prefix in prefixes)
+            page_counts = tuple(ceil_div(len(prefix), cache.cache.page_size) for prefix in prefixes)
             with (
                 cache.startup_pages(shape.rows * sum(page_counts)) as scratch,
                 latent_pool.startup_values(
@@ -478,7 +485,7 @@ def _stage_flow(
 ) -> InputBatch:
     rows = shape.rows * shape.cfg_branches
     geometry = tuple(
-        denoise_geometry(
+        prepare_denoise_inputs(
             generation,
             latents[index // shape.cfg_branches],
             shape.height,
@@ -506,7 +513,9 @@ def _stage_flow(
         ForwardRow(
             forward_mode=PipelineStage.DENOISING,
             positions=positions[index],
-            timestep=torch.tensor([generation.schedule_pair(2, 3.0, 0)[0]]),
+            timestep=torch.tensor(
+                [generation.timestep(DiffusionConfig(steps=2, timestep_shift=3.0), 0)]
+            ),
             latent=latents[index // shape.cfg_branches],
             flow_conditioning=conditioning[index],
             image_tokens=queries[index],
@@ -525,7 +534,7 @@ def _stage_flow(
     )
 
 
-def denoise_geometry(
+def prepare_denoise_inputs(
     flow: ImageDiffusion,
     latent: torch.Tensor,
     height: int,

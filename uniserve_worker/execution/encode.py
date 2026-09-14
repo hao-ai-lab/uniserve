@@ -9,13 +9,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from uniserve.model.image_diffusion import LatentLayout
+from uniserve.model.tensors import PositionLayout, TokenSelection
+from uniserve.nn.vision import get_flattened_position_ids_extrapolate
+from uniserve.tensors import ImageRange
+from uniserve_models.processing import FeatureInjection, FeatureLayout, PatchTransform
 from uniserve_worker.execution.output import PendingOutput
-from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.media.codec import quantize_image_hwc, uint8_image_to_png_base64_bytes
-from uniserve_worker.modeling.image_diffusion import LatentLayout
-from uniserve_worker.modeling.inputs import FeatureInjection, FeatureLayout, PatchTransform
-from uniserve_worker.modeling.tensors import ImageRange, PositionLayout, TokenSelection
-from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
 from uniserve_worker.protocol.batch import (
     EncoderTransferValue,
     FinishFlags,
@@ -31,16 +32,13 @@ from uniserve_worker.runtime.cpu import CpuTask
 from uniserve_worker.runtime.tensor_store import FeatureMetadata, ImageMetadata, TensorRecord
 from uniserve_worker.transfer.tickets import publish_tensor
 
-from . import operations as operation_geometry
-from . import transfer
+from . import operations, transfer
 from .batch_state import BatchState
 from .image_input import ImageInputs, patch_grid_shape, prepare_image, prepare_tensor_image
 from .rows import ForwardRow
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-    from transformers import PreTrainedTokenizerBase
 
     from ..bootstrap.worker_info import WorkerInfo
     from ..config import WorkerConfig
@@ -87,7 +85,7 @@ def text(
         raise RuntimeError("module output has no execution statistics")
     state.group_forward_stats[completion_group].append(result.stats)
     request.status = OpStatus.OK
-    request.projected_progress = operation_geometry.execution_runtime(request, None)
+    request.projected_progress = operations.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
     request.product_generations = tuple(output.generation for output in operation.tensor_outputs())
     request.products = products
@@ -204,7 +202,7 @@ def materialization_latent(
         raise invalid_descriptor("latent materialization requires a latent input")
     if (
         int(latent_input.generation) < 1
-        or operation_geometry.require_progress(request).latent_product != latent_input
+        or operations.require_progress(request).latent_product != latent_input
     ):
         raise invalid_descriptor("materialization does not name the current latent generation")
     image_params = request.request.image
@@ -277,10 +275,8 @@ def publish_image(
         max_bytes=int(operation.bounds.max_completion_bytes),
         state=state,
     )
-    request.projected_progress = replace(
-        operation_geometry.require_progress(request), latent_product=None
-    )
-    request.projected_progress = replace(operation_geometry.require_progress(request), flow_step=0)
+    request.projected_progress = replace(operations.require_progress(request), latent_product=None)
+    request.projected_progress = replace(operations.require_progress(request), flow_step=0)
     request.latent_params = params
     request.latent_generation = int(latent_input.generation)
     request.latent_step = int(params.start_step)
@@ -301,7 +297,7 @@ def state_outcome(
     """Stage execution progress and defer successor publication until stateful tensors are ready."""
 
     request = state.pending_output(completion_group, operation.request_key.request_id)
-    cache = operation_geometry.cache_coordinates(request, tables=request_tables)
+    cache = operations.cache_coordinates(request, tables=request_tables)
     selected = request.runtime_cache_length
     if selected is None:
         selected = cache[2]
@@ -309,9 +305,9 @@ def state_outcome(
         raise RuntimeError("visual state completion has a dynamic KV length")
     cache = (cache[0], cache[1], selected, cache[3])
     request.status = OpStatus.OK
-    request.projected_progress = operation_geometry.execution_runtime(request, cache)
+    request.projected_progress = operations.execution_runtime(request, cache)
     request.finish_flags = FinishFlags()
-    request.product_generations = operation_geometry.output_generations(operation)
+    request.product_generations = operations.output_generations(operation)
     request.committed_tokens = ()
     request.products = products
     return request
@@ -329,9 +325,9 @@ def non_state_outcome(
 
     request = state.pending_output(completion_group, operation.request_key.request_id)
     request.status = OpStatus.OK
-    request.projected_progress = operation_geometry.execution_runtime(request, None)
+    request.projected_progress = operations.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
-    request.product_generations = operation_geometry.output_generations(operation)
+    request.product_generations = operations.output_generations(operation)
     request.products = products
     request.completion_tasks = completion_tasks
     return request
@@ -397,11 +393,10 @@ def vision_state_row(
     logits: bool,
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
-    tokenizer: PreTrainedTokenizerBase | None,
 ) -> ForwardRow:
     """Publish vision features and construct the request runtime that references their token span."""
 
-    cache = operation_geometry.cache_coordinates(
+    cache = operations.cache_coordinates(
         state.pending_output(completion_group, operation.request_key.request_id),
         tables=request_tables,
     )
@@ -423,9 +418,9 @@ def vision_state_row(
     token_embeddings[begin : begin + int(embeddings.shape[0])] = embeddings
     embedding_mask[begin : begin + int(embeddings.shape[0])] = True
     if leading:
-        token_ids[0] = _feature_token_id(injection, start=True, tokenizer=tokenizer)
+        token_ids[0] = _feature_token_id(injection, start=True)
     if trailing:
-        token_ids[-1] = _feature_token_id(injection, start=False, tokenizer=tokenizer)
+        token_ids[-1] = _feature_token_id(injection, start=False)
     positions = _vision_positions(
         injection.positions,
         int(embeddings.shape[0]),
@@ -453,21 +448,13 @@ def vision_state_row(
     )
 
 
-def _feature_token_id(
-    injection: FeatureInjection, *, start: bool, tokenizer: PreTrainedTokenizerBase | None
-) -> int:
-    """Resolve the configured opening or closing token for image-feature injection."""
+def _feature_token_id(injection: FeatureInjection, *, start: bool) -> int:
+    """Read a marker identity already bound by the input-asset resolver."""
 
     value = injection.start_token_id if start else injection.end_token_id
-    text = injection.start_token if start else injection.end_token
-    if value is not None:
-        return int(value)
-    if text is None or tokenizer is None:
-        raise unsupported_setup("feature marker requires a worker tokenizer or token id")
-    token_id = tokenizer.convert_tokens_to_ids(text)
-    if not isinstance(token_id, int) or token_id < 0:
-        raise invalid_descriptor("declared feature marker is absent from the tokenizer")
-    return int(token_id)
+    if value is None:
+        raise invalid_descriptor("feature injection requires a resolved marker token id")
+    return value
 
 
 def _vision_positions(
@@ -548,7 +535,7 @@ def latent_state_row(
     temporal[0] = conditioning_position
     temporal[-1] = conditioning_position + int(flow.rope_advance)
     indexes = torch.stack((temporal, torch.zeros_like(temporal), torch.zeros_like(temporal)))
-    cache = operation_geometry.cache_coordinates(
+    cache = operations.cache_coordinates(
         state.pending_output(completion_group, operation.request_key.request_id),
         tables=request_tables,
     )

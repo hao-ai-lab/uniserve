@@ -8,9 +8,10 @@ from functools import partial
 from threading import Lock
 from typing import Any, ParamSpec, TypeVar
 
+from uniserve.profiling import profile_range
+from uniserve.runtime.resources import close_resources
+
 from ..foundation.errors import resource_error
-from ..foundation.resources import close_resources
-from ..profiling import profile_range
 
 __all__ = ["CpuPool", "CpuTask"]
 

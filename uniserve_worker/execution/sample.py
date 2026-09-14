@@ -8,12 +8,12 @@ from typing import cast
 
 import torch
 
-from uniserve_worker.backends.triton import triton_available
+from uniserve.distributed.mesh import Communicator
+from uniserve.model.tensors import packed_tensor_views
+from uniserve.runtime.triton import triton_available
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.modeling.tensors import packed_tensor_views
 from uniserve_worker.protocol.batch import SamplingParams
 
-from ..nn.mesh import Communicator
 from .sampling import LogprobValues, SamplerOutput, SamplerRow, SamplingMetadata
 from .top_k_sampling import sample_top_k
 
