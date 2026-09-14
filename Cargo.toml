@@ -8,6 +8,7 @@ members = [
     "crates/server",
     "crates/bin/uniserve",
     "crates/bin/uniserve-host",
+    "crates/bin/dynamo-worker",
 ]
 
 [workspace.package]
@@ -31,9 +32,12 @@ sha2 = "0.10"
 
 # ---- server third-party deps ----
 anyhow = "1.0.100"
+async-stream = "0.3.6"
+async-trait = "0.1.89"
 arc-swap = "1.9.0"
 asynk-strim-attr = "0.1.0"
-axum = { version = "0.8.8", features = ["multipart"] }
+# Dynamo currently pins 0.8.4 exactly, so the shared workspace range must include it.
+axum = { version = "0.8.4", features = ["multipart"] }
 base64 = "0.22.1"
 bitflags = { version = "2.10.0", features = ["serde"] }
 bytes = "1.11.1"
@@ -93,6 +97,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.22.0", features = ["v4"] }
 validator = { version = "0.20.0", features = ["derive"] }
 winnow = "1.0.2"
+dynamo-backend-common = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "c0de00088f032c18f159c01ec11058767902db4c" }
 iceoryx2 = "0.9.2"
 iceoryx2-bb-elementary-traits = "0.9.2"
 

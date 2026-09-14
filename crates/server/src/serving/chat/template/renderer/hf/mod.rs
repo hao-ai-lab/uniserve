@@ -668,7 +668,9 @@ mod tests {
         .render(&request)
         .unwrap();
 
-        assert_eq!(rendered, "<bos>|true");
+        // Chat templates follow Python Jinja2, which prints booleans as
+        // Python literals.
+        assert_eq!(rendered, "<bos>|True");
     }
 
     #[test]
@@ -746,7 +748,7 @@ mod tests {
 
         let rendered = renderer.render(&request).unwrap();
 
-        assert_eq!(rendered, "true|x");
+        assert_eq!(rendered, "True|x");
     }
 
     #[test]
