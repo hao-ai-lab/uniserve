@@ -15,25 +15,36 @@ from uniserve.quantization import QuantizedTensor, Quantizer
 from . import _binding, functional
 
 
-def _distribution(group: Communicator | None = None, dim: int | None = None) -> Distribution:
+def _distribution(
+    group: Communicator | None = None, dim: int | None = None
+) -> Distribution:
     """View a communicator as a single-axis tensor-parallel distribution."""
-
     group = Communicator() if group is None else group
-    mesh = DeviceMesh(ranks=group.ranks, shape=(group.size,), axes=("tp",), rank=group.global_rank)
+    mesh = DeviceMesh(
+        ranks=group.ranks,
+        shape=(group.size,),
+        axes=("tp",),
+        rank=group.global_rank,
+    )
     object.__setattr__(mesh, "_groups", {("tp",): group})
     return Distribution(mesh, (Replicate() if dim is None else Shard(dim),))
 
 
 def _input(module: Linear, x: torch.Tensor) -> torch.Tensor:
-    """Interpret leading axes as logical matrix rows before choosing statistics."""
-
+    """Interpret leading axes as logical matrix rows before choosing
+    statistics.
+    """  # noqa: D205
     if module.input_quantizer is None or isinstance(x, QuantizedTensor):
         return x
     matrix = functional._matrix(x)
     binding = _binding.matmul.get().get(id(module))
     if binding is not None:
-        return binding.quantize(matrix, module.input_quantizer, module.input_distribution)
-    return module.input_quantizer.quantize(matrix, distribution=module.input_distribution)
+        return binding.quantize(
+            matrix, module.input_quantizer, module.input_distribution
+        )
+    return module.input_quantizer.quantize(
+        matrix, distribution=module.input_distribution
+    )
 
 
 def _coalesce(projections, *, assigned=None):
@@ -43,16 +54,19 @@ def _coalesce(projections, *, assigned=None):
     parameter cannot occupy two different fused orders; its first placement
     owns the backing and other compositions borrow the individual matrices.
     """
-
     assigned = set() if assigned is None else assigned
     for field in ("weight", "bias"):
-        parameters = tuple(getattr(branch, field) for branch in projections.values())
+        parameters = tuple(
+            getattr(branch, field) for branch in projections.values()
+        )
         if any(value is None or id(value) in assigned for value in parameters):
             continue
         if len({id(value) for value in parameters}) != len(parameters):
             continue
 
-        encoded = tuple(isinstance(value, QuantizedTensor) for value in parameters)
+        encoded = tuple(
+            isinstance(value, QuantizedTensor) for value in parameters
+        )
         if any(encoded) and not all(encoded):
             continue
         if all(encoded):
@@ -73,7 +87,10 @@ def _coalesce(projections, *, assigned=None):
 
         backing = torch.cat(tensors, dim=0)
         for parameter, tensor, view in zip(
-            parameters, tensors, backing.split([value.shape[0] for value in tensors]), strict=True
+            parameters,
+            tensors,
+            backing.split([value.shape[0] for value in tensors]),
+            strict=True,
         ):
             # Encoded tensors expose ordinary storage fields. Updating that
             # field preserves every QuantizedTensor/Parameter alias as well.
@@ -104,16 +121,22 @@ class Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, device=device, dtype=dtype), requires_grad=False
+            torch.empty(out_features, in_features, device=device, dtype=dtype),
+            requires_grad=False,
         )
         self.bias = (
-            nn.Parameter(torch.empty(out_features, device=device, dtype=dtype), requires_grad=False)
+            nn.Parameter(
+                torch.empty(out_features, device=device, dtype=dtype),
+                requires_grad=False,
+            )
             if bias
             else None
         )
         nn.init.kaiming_uniform_(self.weight, a=sqrt(5))
         if self.bias is not None:
-            nn.init.uniform_(self.bias, -1 / sqrt(in_features), 1 / sqrt(in_features))
+            nn.init.uniform_(
+                self.bias, -1 / sqrt(in_features), 1 / sqrt(in_features)
+            )
         self.input_quantizer: Quantizer | None = None
         self.input_distribution = _distribution()
         self.weight_distribution = _distribution()
@@ -144,7 +167,11 @@ class Linear(nn.Module):
 
         # Quantization flattens leading axes into GEMM rows; a contiguous
         # caller output can absorb the result directly at that row shape.
-        target = out.reshape(-1, shape[-1]) if out is not None and out.is_contiguous() else None
+        target = (
+            out.reshape(-1, shape[-1])
+            if out is not None and out.is_contiguous()
+            else None
+        )
         result = functional._linear(
             encoded,
             self.weight,
@@ -157,7 +184,9 @@ class Linear(nn.Module):
 
 
 def _check_output(out, shape, dtype, device):
-    if out is not None and (out.shape != shape or out.dtype != dtype or out.device != device):
+    if out is not None and (
+        out.shape != shape or out.dtype != dtype or out.device != device
+    ):
         raise ValueError("projection output must match shape, dtype and device")
 
 
@@ -177,14 +206,23 @@ class ColumnParallelLinear(Linear):
     ):
         self.group = Communicator() if group is None else group
         if out_features % self.group.size:
-            raise ValueError("column output channels must divide the tensor-parallel group")
+            raise ValueError(
+                "column output channels must divide the tensor-parallel group"
+            )
 
         width = out_features // self.group.size
-        super().__init__(in_features, width, bias=bias, device=device, dtype=dtype)
+        super().__init__(
+            in_features, width, bias=bias, device=device, dtype=dtype
+        )
         self.out_features = out_features
         start = self.group.rank * width
-        self._weight_slice = (slice(start, start + width), slice(0, in_features))
-        self.input_distribution = input_distribution or _distribution(self.group)
+        self._weight_slice = (
+            slice(start, start + width),
+            slice(0, in_features),
+        )
+        self.input_distribution = input_distribution or _distribution(
+            self.group
+        )
         self.weight_distribution = _distribution(self.group, 0)
         self.output_distribution = _distribution(self.group, 1)
 
@@ -196,11 +234,14 @@ class ColumnParallelLinear(Linear):
         num_tokens: int,
         output_dtype: torch.dtype | None = None,
     ) -> Iterator[tuple[slice, torch.Tensor]]:
-        """Project gathered token intervals as the input exchange yields them."""
-
+        """Project gathered token intervals as the input exchange yields
+        them.
+        """  # noqa: D205
         from ._chunks import projection_inputs
 
-        for interval, values in projection_inputs(self, x, token_slice, num_tokens):
+        for interval, values in projection_inputs(
+            self, x, token_slice, num_tokens
+        ):
             yield interval, self(values, output_dtype=output_dtype)
 
 
@@ -220,14 +261,23 @@ class RowParallelLinear(Linear):
     ):
         self.group = Communicator() if group is None else group
         if in_features % self.group.size:
-            raise ValueError("row input channels must divide the tensor-parallel group")
+            raise ValueError(
+                "row input channels must divide the tensor-parallel group"
+            )
 
         width = in_features // self.group.size
-        super().__init__(width, out_features, bias=bias, device=device, dtype=dtype)
+        super().__init__(
+            width, out_features, bias=bias, device=device, dtype=dtype
+        )
         self.in_features = in_features
         start = self.group.rank * width
-        self._weight_slice = (slice(0, out_features), slice(start, start + width))
-        self.input_distribution = input_distribution or _distribution(self.group, 1)
+        self._weight_slice = (
+            slice(0, out_features),
+            slice(start, start + width),
+        )
+        self.input_distribution = input_distribution or _distribution(
+            self.group, 1
+        )
         self.weight_distribution = _distribution(self.group, 1)
         self.output_distribution = _distribution(self.group)
 
@@ -252,7 +302,11 @@ class RowParallelLinear(Linear):
         target = (
             out
             if encoded is x
-            else (out.reshape(-1, shape[-1]) if out is not None and out.is_contiguous() else None)
+            else (
+                out.reshape(-1, shape[-1])
+                if out is not None and out.is_contiguous()
+                else None
+            )
         )
         result = functional._linear(
             encoded,
@@ -273,8 +327,9 @@ class RowParallelLinear(Linear):
         *,
         output_dtype: torch.dtype | None = None,
     ) -> Iterator[tuple[slice, torch.Tensor]]:
-        """Reduce each gathered interval, quantizing whole-tensor scales jointly."""
-
+        """Reduce each gathered interval, quantizing whole-tensor scales
+        jointly.
+        """  # noqa: D205
         from ._chunks import tensor_statistics
 
         if not tensor_statistics(self.input_quantizer):
@@ -290,7 +345,9 @@ class RowParallelLinear(Linear):
                 yield interval, self(values, output_dtype=output_dtype)
             return
 
-        maximum = torch.zeros((), dtype=torch.float32, device=self.weight.device)
+        maximum = torch.zeros(
+            (), dtype=torch.float32, device=self.weight.device
+        )
         for _, values in rows:
             if values.numel():
                 maximum = torch.maximum(maximum, values.abs().amax().float())
@@ -298,10 +355,14 @@ class RowParallelLinear(Linear):
             *self.input_distribution.shard_axes(0),
             *self.input_distribution.shard_axes(1),
         ):
-            self.input_distribution.mesh.get_group(axis).all_reduce(maximum, op="max")
+            self.input_distribution.mesh.get_group(axis).all_reduce(
+                maximum, op="max"
+            )
 
         for interval, values in rows:
-            encoded = self.input_quantizer.quantize(functional._matrix(values), amax=maximum)
+            encoded = self.input_quantizer.quantize(
+                functional._matrix(values), amax=maximum
+            )
             yield interval, self(encoded, output_dtype=output_dtype)
 
 
@@ -320,13 +381,17 @@ class MergedColumnParallelLinear(nn.Module):
     ):
         super().__init__()
         if not outputs or any(not name or "." in name for name in outputs):
-            raise ValueError("merged projections require nonempty module branch names")
+            raise ValueError(
+                "merged projections require nonempty module branch names"
+            )
         if branch_width is not None and (
             type(branch_width) is not int
             or branch_width < 1
             or any(width % branch_width for width in outputs.values())
         ):
-            raise ValueError("branch group width must positively divide every output branch")
+            raise ValueError(
+                "branch group width must positively divide every output branch"
+            )
         self.projections = nn.ModuleDict(
             {
                 name: ColumnParallelLinear(
@@ -346,7 +411,9 @@ class MergedColumnParallelLinear(nn.Module):
         out: Mapping[str, torch.Tensor] | None = None,
     ) -> Mapping[str, torch.Tensor]:
         if out is not None and set(out) != set(self.projections):
-            raise ValueError("merged output names must match the projection branches")
+            raise ValueError(
+                "merged output names must match the projection branches"
+            )
 
         branches = tuple(self.projections.values())
         dtype = x.dtype if output_dtype is None else output_dtype
@@ -360,9 +427,16 @@ class MergedColumnParallelLinear(nn.Module):
 
         # Branches with divergent input quantization encode separately and
         # cannot share one fused GEMM over a common encoded input.
-        if any(branch.input_quantizer != branches[0].input_quantizer for branch in branches[1:]):
+        if any(
+            branch.input_quantizer != branches[0].input_quantizer
+            for branch in branches[1:]
+        ):
             return {
-                name: branch(x, output_dtype=dtype, out=None if out is None else out[name])
+                name: branch(
+                    x,
+                    output_dtype=dtype,
+                    out=None if out is None else out[name],
+                )
                 for name, branch in self.projections.items()
             }
 
@@ -379,7 +453,8 @@ class MergedColumnParallelLinear(nn.Module):
         )
 
         result = {
-            name: value.reshape(*x.shape[:-1], value.shape[-1]) for name, value in values.items()
+            name: value.reshape(*x.shape[:-1], value.shape[-1])
+            for name, value in values.items()
         }
         if out is not None:
             for name, value in result.items():
@@ -395,25 +470,42 @@ class MergedColumnParallelLinear(nn.Module):
         num_tokens: int,
         output_dtype: torch.dtype | None = None,
     ) -> Iterator[tuple[slice, Mapping[str, torch.Tensor]]]:
-        """Project gathered token intervals, fusing branches that share quantization."""
-
-        from ._chunks import _assemble, _partition, materialize_input, projection_inputs
+        """Project gathered token intervals, fusing branches that share
+        quantization.
+        """  # noqa: D205
+        from ._chunks import (
+            _assemble,
+            _partition,
+            materialize_input,
+            projection_inputs,
+        )
 
         branches = tuple(self.projections.values())
         if len({branch.input_quantizer for branch in branches}) != 1:
             if not isinstance(x, torch.Tensor):
-                x = _assemble(x, token_slice, branches[0].weight.shape[1], branches[0].weight)
+                x = _assemble(
+                    x,
+                    token_slice,
+                    branches[0].weight.shape[1],
+                    branches[0].weight,
+                )
             _, _, domain = _partition(branches[0], x, token_slice, num_tokens)
-            with materialize_input(branches[0], x, token_slice, num_tokens) as values:
+            with materialize_input(
+                branches[0], x, token_slice, num_tokens
+            ) as values:
                 yield domain, self(values, output_dtype=output_dtype)
             return
 
-        for interval, values in projection_inputs(branches[0], x, token_slice, num_tokens):
+        for interval, values in projection_inputs(
+            branches[0], x, token_slice, num_tokens
+        ):
             yield interval, self(values, output_dtype=output_dtype)
 
 
 class QKVParallelLinear(MergedColumnParallelLinear):
-    """Named Q/K/V projections with whole-head partitioning and GQA replication."""
+    """Named Q/K/V projections with whole-head partitioning and GQA
+    replication.
+    """  # noqa: D205
 
     def __init__(
         self,
@@ -426,11 +518,20 @@ class QKVParallelLinear(MergedColumnParallelLinear):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ):
-        if min(num_heads, num_kv_heads, head_dim) < 1 or num_heads % num_kv_heads:
-            raise ValueError("query heads must be a positive multiple of KV heads")
+        if (
+            min(num_heads, num_kv_heads, head_dim) < 1
+            or num_heads % num_kv_heads
+        ):
+            raise ValueError(
+                "query heads must be a positive multiple of KV heads"
+            )
         super().__init__(
             in_features,
-            {"q": num_heads * head_dim, "k": num_kv_heads * head_dim, "v": num_kv_heads * head_dim},
+            {
+                "q": num_heads * head_dim,
+                "k": num_kv_heads * head_dim,
+                "v": num_kv_heads * head_dim,
+            },
             bias=bias,
             device=device,
             dtype=dtype,
@@ -452,7 +553,9 @@ def _vocabulary(size: int, group: Communicator):
 
     padded = _padded_vocabulary(size, group.size)
     width = padded // group.size
-    return VocabShard(size, slice(group.rank * width, (group.rank + 1) * width), padded, group)
+    return VocabShard(
+        size, slice(group.rank * width, (group.rank + 1) * width), padded, group
+    )
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -480,7 +583,8 @@ class VocabParallelEmbedding(nn.Module):
         self.vocab = _vocabulary(num_embeddings, self.group)
         width = self.vocab.local_slice.stop - self.vocab.local_slice.start
         self.weight = nn.Parameter(
-            torch.empty(width, embedding_dim, device=device, dtype=dtype), requires_grad=False
+            torch.empty(width, embedding_dim, device=device, dtype=dtype),
+            requires_grad=False,
         )
         nn.init.normal_(self.weight)
         start = self.vocab.local_slice.start
@@ -493,7 +597,9 @@ class VocabParallelEmbedding(nn.Module):
         # IDs owned by other shards embed as zeros here; the all-reduce sums
         # every shard's partial rows into the complete embedding.
         region = self.vocab.local_slice
-        outside = (input_ids < region.start) | (input_ids >= min(region.stop, self.vocab.size))
+        outside = (input_ids < region.start) | (
+            input_ids >= min(region.stop, self.vocab.size)
+        )
         local_ids = (input_ids - region.start).masked_fill(outside, 0)
         result = torch.nn.functional.embedding(local_ids, self.weight)
         result.masked_fill_(outside.unsqueeze(-1), 0)
@@ -501,7 +607,9 @@ class VocabParallelEmbedding(nn.Module):
 
 
 class VocabParallelHead(ColumnParallelLinear):
-    """Project local padded vocabulary columns; Logits.gather gathers explicitly."""
+    """Project local padded vocabulary columns; Logits.gather gathers
+    explicitly.
+    """  # noqa: D205
 
     def __init__(
         self,

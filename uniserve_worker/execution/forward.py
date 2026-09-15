@@ -73,8 +73,10 @@ def forward_values(
     states: DecodeState | None,
     sampling_group: Communicator | None,
 ) -> tuple[ForwardValue | None, ...]:
-    """Bind numerical outputs to their completion owners and attribute group statistics."""
+    """Bind numerical outputs to their completion owners and attribute group.
 
+    statistics.
+    """
     for row, _operation, completion_group in inputs:
         state.group_buffers[completion_group].register_device(
             model_runner.operation_devices(_operation)[1]
@@ -97,14 +99,19 @@ def forward_values(
 
         try:
             if output.stats is None or output.request_pool_indices is None:
-                raise RuntimeError("numerical forward lost statistics or request slot views")
+                raise RuntimeError(
+                    "numerical forward lost statistics or request slot views"
+                )
             stats = output.stats
             request_pool_indices = output.request_pool_indices
 
             selected = graph_decode_samples(
                 tuple(inputs[index][1] for index in indexes),
                 tuple(
-                    state.pending_output(inputs[index][2], inputs[index][1].request_key.request_id)
+                    state.pending_output(
+                        inputs[index][2],
+                        inputs[index][1].request_key.request_id,
+                    )
                     for index in indexes
                 ),
                 tuple(inputs[index][0] for index in indexes),
@@ -120,7 +127,9 @@ def forward_values(
             # One forward output group maps back to its input rows; bind each
             # row's value, request slot view, graph sample, and output layout.
             state.group_forward_stats[inputs[indexes[0]][2]].append(stats)
-            for local, (index, value) in enumerate(zip(indexes, output.values, strict=True)):
+            for local, (index, value) in enumerate(
+                zip(indexes, output.values, strict=True)
+            ):
                 values[index] = (
                     value,
                     request_pool_indices[local : local + 1],
@@ -148,8 +157,10 @@ def _publish_sample_groups(
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
 ) -> None:
-    """Sample compatible token rows and publish their request-visible results."""
+    """Sample compatible token rows and publish their request-visible.
 
+    results.
+    """
     from . import token
 
     for group_id, candidates in samples.items():
@@ -162,12 +173,16 @@ def _publish_sample_groups(
             # sample only the rows that still need one, preserving order.
             sample_started = time.perf_counter_ns()
             sampling_inputs = tuple(
-                work for _index, _task, _logits, work, _selected in candidates if work is not None
+                work
+                for _index, _task, _logits, work, _selected in candidates
+                if work is not None
             )
             sampled_values = iter(
                 _sample_task_batch(
                     sampling_inputs,
-                    selection_broadcast=partial(broadcast_selection, sampling_group),
+                    selection_broadcast=partial(
+                        broadcast_selection, sampling_group
+                    ),
                 )
             )
             sampled = tuple(
@@ -178,18 +193,24 @@ def _publish_sample_groups(
                 sampled,
                 tuple(
                     state.pending_output(
-                        completion_group, scheduled[index][0].request_key.request_id
+                        completion_group,
+                        scheduled[index][0].request_key.request_id,
                     )
                     for index, _task, _logits, _work, _selected in candidates
                 ),
                 state.group_buffers[completion_group],
             )
-            record_component(state.group_component_us[group_id], "text_sample", sample_started)
+            record_component(
+                state.group_component_us[group_id],
+                "text_sample",
+                sample_started,
+            )
 
             finalize_started = time.perf_counter_ns()
             token.publish_token_products(
                 tuple(
-                    scheduled[index][0] for index, _task, _logits, _work, _selected in candidates
+                    scheduled[index][0]
+                    for index, _task, _logits, _work, _selected in candidates
                 ),
                 sampled,
                 completion_group,
@@ -211,7 +232,11 @@ def _publish_sample_groups(
                     decode_state=decode_state,
                     state=state,
                 )
-            record_component(state.group_component_us[group_id], "text_finalize", finalize_started)
+            record_component(
+                state.group_component_us[group_id],
+                "text_finalize",
+                finalize_started,
+            )
         except BaseException as error:
             errors[group_id] = error
 
@@ -229,7 +254,6 @@ def initialize_trajectories(
     model_runner: ModelRunner,
 ) -> tuple[dict[int, ImageState], int]:
     """Open diffusion trajectories and return the longest declared interval."""
-
     from . import flow
 
     trajectories: dict[int, ImageState] = {}
@@ -258,10 +282,14 @@ def initialize_trajectories(
     step_count = 1
     for index in trajectories:
         operation, completion_group = scheduled[index]
-        request = state.pending_output(completion_group, operation.request_key.request_id)
+        request = state.pending_output(
+            completion_group, operation.request_key.request_id
+        )
         params = request.input_latent_params
         if params is None:
-            raise invalid_descriptor("diffusion operation has no staged latent parameters")
+            raise invalid_descriptor(
+                "diffusion operation has no staged latent parameters"
+            )
         step_count = max(step_count, int(params.step_count))
 
     return trajectories, step_count
@@ -284,10 +312,11 @@ def prepare_diffusion_step(
     tokenizer: PreTrainedTokenizerBase | None,
 ) -> dict[int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]]:
     """Prepare one solver step and materialize any missing CFG prefixes."""
-
     from . import flow, token
 
-    step_inputs: dict[int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]] = {}
+    step_inputs: dict[
+        int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]
+    ] = {}
     prefixes: list[tuple[int, Branch, ForwardRow]] = []
 
     for index, trajectory in trajectories.items():
@@ -295,11 +324,15 @@ def prepare_diffusion_step(
         if index in outcomes or completion_group in errors:
             continue
 
-        row = state.pending_output(completion_group, operation.request_key.request_id)
+        row = state.pending_output(
+            completion_group, operation.request_key.request_id
+        )
         params = row.input_latent_params
         staging = row.latent_staging
         if params is None or staging is None:
-            raise invalid_descriptor("trajectory operation has no staged latent inputs")
+            raise invalid_descriptor(
+                "trajectory operation has no staged latent inputs"
+            )
         if offset >= int(params.step_count):
             continue
 
@@ -316,12 +349,16 @@ def prepare_diffusion_step(
                 state=state,
             )
             step_inputs[index] = guide, timestep, next_timestep
-            prefixes.extend((index, branch, task) for branch, task in prefix_rows)
+            prefixes.extend(
+                (index, branch, task) for branch, task in prefix_rows
+            )
         except BaseException as error:
             errors[completion_group] = error
 
     active_prefixes = tuple(
-        item for item in prefixes if item[0] not in outcomes and scheduled[item[0]][1] not in errors
+        item
+        for item in prefixes
+        if item[0] not in outcomes and scheduled[item[0]][1] not in errors
     )
     if not active_prefixes:
         return step_inputs
@@ -339,9 +376,15 @@ def prepare_diffusion_step(
         state=state,
         errors=errors,
     )
-    for (index, branch, task), numerical_result in zip(active_prefixes, values, strict=True):
+    for (index, branch, task), numerical_result in zip(
+        active_prefixes, values, strict=True
+    ):
         operation, completion_group = scheduled[index]
-        if index in outcomes or completion_group in errors or numerical_result is None:
+        if (
+            index in outcomes
+            or completion_group in errors
+            or numerical_result is None
+        ):
             continue
 
         value, _sampling_index, _selection, _layout = numerical_result
@@ -349,7 +392,9 @@ def prepare_diffusion_step(
             token.commit_kv(
                 task,
                 task.query_tokens,
-                state.pending_output(completion_group, operation.request_key.request_id),
+                state.pending_output(
+                    completion_group, operation.request_key.request_id
+                ),
                 publish_runtime=False,
                 request_tables=request_tables,
                 decode_state=decode_state,
@@ -370,7 +415,9 @@ def prepare_diffusion_step(
 def prepare_forward_rows(
     numerical: tuple[int, ...],
     offset: int,
-    step_inputs: Mapping[int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]],
+    step_inputs: Mapping[
+        int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]
+    ],
     trajectories: Mapping[int, ImageState],
     scheduled: tuple[tuple[ScheduledRequest, int], ...],
     outcomes: dict[int, PendingOutput],
@@ -384,7 +431,6 @@ def prepare_forward_rows(
     decode_state: DecodeState | None,
 ) -> tuple[list[tuple[int, ForwardRow]], dict[int, PreparedImage]]:
     """Build homogeneous numerical rows for the current dependency frontier."""
-
     from . import encode, flow, token
 
     forward: list[tuple[int, ForwardRow]] = []
@@ -404,11 +450,15 @@ def prepare_forward_rows(
                 if index not in step_inputs:
                     continue
                 guide, timestep, _next_timestep = step_inputs[index]
-                row = state.pending_output(completion_group, operation.request_key.request_id)
+                row = state.pending_output(
+                    completion_group, operation.request_key.request_id
+                )
                 params = row.input_latent_params
                 staging = row.latent_staging
                 if params is None or staging is None:
-                    raise invalid_descriptor("trajectory operation has no staged latent inputs")
+                    raise invalid_descriptor(
+                        "trajectory operation has no staged latent inputs"
+                    )
 
                 rows = flow.flow_rows(
                     flow.require_inputs(model_runner),
@@ -416,7 +466,9 @@ def prepare_forward_rows(
                     staging.value[: int(params.latent_units)],
                     guide,
                     timestep,
-                    conditioning_position=int(operations.require_progress(row).logical_position),
+                    conditioning_position=int(
+                        operations.require_progress(row).logical_position
+                    ),
                     device=model_runner.operation_devices(operation)[1],
                 )
                 forward.extend((index, task) for task in rows)
@@ -452,7 +504,9 @@ def prepare_forward_rows(
                 forward.append(
                     (
                         index,
-                        encode.encode_row(cast(PipelineStage, operation.kind), prepared),
+                        encode.encode_row(
+                            cast(PipelineStage, operation.kind), prepared
+                        ),
                     )
                 )
             elif operation.latent_input is None:
@@ -473,11 +527,15 @@ def prepare_forward_rows(
                     model_runner=model_runner,
                     state=state,
                 )
-                row = state.pending_output(completion_group, operation.request_key.request_id)
+                row = state.pending_output(
+                    completion_group, operation.request_key.request_id
+                )
                 params = row.input_latent_params
                 staging = row.latent_staging
                 if params is None or staging is None:
-                    raise invalid_descriptor("trajectory operation has no staged latent inputs")
+                    raise invalid_descriptor(
+                        "trajectory operation has no staged latent inputs"
+                    )
 
                 forward.append(
                     (
@@ -523,7 +581,6 @@ def publish_forward_values(
     config: WorkerConfig,
 ) -> dict[int, list[torch.Tensor]]:
     """Publish completed numerical values and retain diffusion predictions."""
-
     from . import encode, token
 
     predictions: dict[int, list[torch.Tensor]] = defaultdict(list)
@@ -531,7 +588,11 @@ def publish_forward_values(
 
     for (index, task), numerical_result in zip(forward, values, strict=True):
         operation, completion_group = scheduled[index]
-        if index in outcomes or completion_group in errors or numerical_result is None:
+        if (
+            index in outcomes
+            or completion_group in errors
+            or numerical_result is None
+        ):
             continue
 
         value, sampling_index, graph_sample, layout = numerical_result
@@ -551,7 +612,9 @@ def publish_forward_values(
                         request_tables=request_tables,
                         decode_state=decode_state,
                     )
-                    samples[completion_group].append((index, task, value, None, graph_sample))
+                    samples[completion_group].append(
+                        (index, task, value, None, graph_sample)
+                    )
                 else:
                     selection = token.prepare_sampling(
                         operation,
@@ -568,7 +631,9 @@ def publish_forward_values(
                     if isinstance(selection, PendingOutput):
                         outcomes[index] = selection
                     else:
-                        samples[completion_group].append((index, task, value, selection, None))
+                        samples[completion_group].append(
+                            (index, task, value, selection, None)
+                        )
             elif index in images:
                 outcomes[index] = encode.publish_features(
                     operation,
@@ -583,7 +648,9 @@ def publish_forward_values(
                 )
             else:
                 if layout is None or layout.value_range is None:
-                    raise ValueError("image decoder must declare its numerical range")
+                    raise ValueError(
+                        "image decoder must declare its numerical range"
+                    )
                 outcomes[index] = encode.publish_image(
                     operation,
                     completion_group,
@@ -612,7 +679,9 @@ def publish_forward_values(
 
 def integrate_predictions(
     predictions: Mapping[int, list[torch.Tensor]],
-    step_inputs: Mapping[int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]],
+    step_inputs: Mapping[
+        int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]
+    ],
     trajectories: Mapping[int, ImageState],
     offset: int,
     scheduled: tuple[tuple[ScheduledRequest, int], ...],
@@ -627,8 +696,10 @@ def integrate_predictions(
     model_runner: ModelRunner,
     config: WorkerConfig,
 ) -> None:
-    """Advance diffusion solvers and publish trajectories at their final step."""
+    """Advance diffusion solvers and publish trajectories at their final.
 
+    step.
+    """
     from . import flow
 
     for index, values in predictions.items():
@@ -638,11 +709,15 @@ def integrate_predictions(
 
         try:
             guide, timestep, next_timestep = step_inputs[index]
-            row = state.pending_output(completion_group, operation.request_key.request_id)
+            row = state.pending_output(
+                completion_group, operation.request_key.request_id
+            )
             params = row.input_latent_params
             staging = row.latent_staging
             if params is None or staging is None:
-                raise invalid_descriptor("trajectory operation has no staged latent inputs")
+                raise invalid_descriptor(
+                    "trajectory operation has no staged latent inputs"
+                )
 
             # The solver updates only the model-visible portion of this
             # operation's staging, preserving page padding.

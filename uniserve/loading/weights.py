@@ -31,11 +31,15 @@ class Config:
 
     dtype: torch.dtype = torch.bfloat16
     dtypes: Mapping[str, torch.dtype] = field(default_factory=dict)
-    quantization: Mapping[str, QuantizationConfig | None] = field(default_factory=dict)
+    quantization: Mapping[str, QuantizationConfig | None] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self):
         object.__setattr__(self, "dtypes", MappingProxyType(dict(self.dtypes)))
-        object.__setattr__(self, "quantization", MappingProxyType(dict(self.quantization)))
+        object.__setattr__(
+            self, "quantization", MappingProxyType(dict(self.quantization))
+        )
         if not self.dtype.is_floating_point or any(
             not dtype.is_floating_point for dtype in self.dtypes.values()
         ):
@@ -44,7 +48,9 @@ class Config:
             value is not None and not isinstance(value, QuantizationConfig)
             for value in self.quantization.values()
         ):
-            raise TypeError("weight quantization requires QuantizationConfig values or None")
+            raise TypeError(
+                "weight quantization requires QuantizationConfig values or None"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,13 +89,14 @@ class ModuleMapping:
 
 @dataclass(frozen=True, slots=True)
 class Report:
-    """Per-mapping load outcome: resident parameters and leftover source tensors.
+    """Per-mapping load outcome.
 
-    loaded names module parameters fully or partly assigned; skipped names
-    intentionally unused nonresident sources; missing names required
-    parameters with no assignment; unexpected names source tensors no
-    assignment or derived constant consumed; incomplete maps a loaded
-    parameter to the target regions no assignment covered.
+    Resident parameters and leftover source tensors. loaded names module
+    parameters fully or partly assigned; skipped names intentionally unused
+    nonresident sources; missing names required parameters with no
+    assignment; unexpected names source tensors no assignment or derived
+    constant consumed; incomplete maps a loaded parameter to the target
+    regions no assignment covered.
     """
 
     loaded: frozenset[str]
@@ -99,7 +106,9 @@ class Report:
     incomplete: Mapping[str, tuple[str, ...]]
 
     def __post_init__(self):
-        object.__setattr__(self, "incomplete", MappingProxyType(dict(self.incomplete)))
+        object.__setattr__(
+            self, "incomplete", MappingProxyType(dict(self.incomplete))
+        )
 
 
 def _choice(path, mapping, default):
@@ -134,13 +143,21 @@ def _source_identity(weight):
 
 
 def _fp8_fragments(shape, fragments, *, device, dtype):
-    """Assemble source encodings without deriving new scales from local values."""
+    """Assemble source encodings.
 
+    Without deriving new scales from local values.
+    """
     if not shape:
-        raise ValueError("a scalar FP8 parameter cannot have multiple disjoint assignments")
+        raise ValueError(
+            "a scalar FP8 parameter cannot have multiple disjoint assignments"
+        )
 
     values = torch.zeros(shape, dtype=torch.float8_e4m3fn, device=device)
-    scales = torch.ones((shape[0], *((1,) * (len(shape) - 1))), dtype=torch.float32, device=device)
+    scales = torch.ones(
+        (shape[0], *((1,) * (len(shape) - 1))),
+        dtype=torch.float32,
+        device=device,
+    )
     initialized = torch.zeros(shape[0], dtype=torch.bool, device=device)
     per_row = any(fragment.quantizer.axis == 0 for _, fragment in fragments)
 
@@ -148,17 +165,27 @@ def _fp8_fragments(shape, fragments, *, device, dtype):
         fields = fragment.buffers()
         rows = target[0]
         incoming = (
-            fields["scale"].to(device).expand(rows.stop - rows.start, *((1,) * (len(shape) - 1)))
+            fields["scale"]
+            .to(device)
+            .expand(rows.stop - rows.start, *((1,) * (len(shape) - 1)))
         )
         selected = initialized[rows]
-        if selected.any() and not torch.equal(scales[rows][selected], incoming[selected]):
-            raise ValueError("FP8 source fragments disagree within the same scale domain")
+        if selected.any() and not torch.equal(
+            scales[rows][selected], incoming[selected]
+        ):
+            raise ValueError(
+                "FP8 source fragments disagree within the same scale domain"
+            )
         values[target].copy_(fields["values"].to(device))
         scales[rows].copy_(incoming)
         initialized[rows] = True
 
     # A uniform scale across all rows collapses back to a per-tensor domain.
-    if not per_row and shape[0] and torch.equal(scales, scales[:1].expand_as(scales)):
+    if (
+        not per_row
+        and shape[0]
+        and torch.equal(scales, scales[:1].expand_as(scales))
+    ):
         quantizer = Quantizer("fp8")
         scales = scales[0].reshape(())
     else:
@@ -169,7 +196,10 @@ def _fp8_fragments(shape, fragments, *, device, dtype):
 
 
 class _Loader:
-    """Own readers and materialization while preserving shared parameter identity."""
+    """Own readers and materialization.
+
+    While preserving shared parameter identity.
+    """
 
     def __init__(
         self,
@@ -225,11 +255,21 @@ class _Loader:
         # misspelled paths must still fail against the original module tree.
         paths = self._known_paths
         if paths is None:
-            paths = {path for path, _ in self.model.named_modules(remove_duplicate=False)}
-        for mapping in (self.weights.dtypes, self.weights.quantization, self.devices):
+            paths = {
+                path
+                for path, _ in self.model.named_modules(remove_duplicate=False)
+            }
+        for mapping in (
+            self.weights.dtypes,
+            self.weights.quantization,
+            self.devices,
+        ):
             unknown = set(mapping).difference(paths)
             if unknown:
-                raise ValueError(f"weight settings name unknown module paths: {sorted(unknown)}")
+                raise ValueError(
+                    f"weight settings name unknown module paths: "
+                    f"{sorted(unknown)}"
+                )
 
         for path, module in self.model.named_modules(remove_duplicate=False):
             dtype = _choice(path, self.weights.dtypes, self.weights.dtype)
@@ -241,35 +281,49 @@ class _Loader:
             device = _choice(path, self.devices, self.device)
 
             if isinstance(module, Linear):
-                module.input_quantizer = None if quantization is None else quantization.activation
+                module.input_quantizer = (
+                    None if quantization is None else quantization.activation
+                )
 
-            for name, parameter in module.named_parameters(recurse=False, remove_duplicate=False):
+            for name, parameter in module.named_parameters(
+                recurse=False, remove_duplicate=False
+            ):
                 key = id(parameter)
                 quantizer = (
                     quantization.weight
-                    if isinstance(module, Linear) and name == "weight" and quantization is not None
+                    if isinstance(module, Linear)
+                    and name == "weight"
+                    and quantization is not None
                     else None
                 )
                 settings = (
                     device,
-                    dtype if parameter.dtype.is_floating_point else parameter.dtype,
+                    dtype
+                    if parameter.dtype.is_floating_point
+                    else parameter.dtype,
                     quantizer,
                     explicit,
                 )
                 previous = self._settings.setdefault(key, settings)
                 if previous != settings:
                     raise ValueError(
-                        "shared parameter aliases have conflicting device, dtype or quantization choices"
+                        "shared parameter aliases have conflicting device, "
+                        "dtype or quantization choices"
                     )
                 self._aliases[key].append((module, name))
                 self._owners.setdefault(key, (module, name))
 
                 # Padded vocabulary rows hold no checkpoint values; record the
                 # padding rectangle so reports and materialization ignore it.
-                if isinstance(module, (VocabParallelEmbedding, VocabParallelHead)):
+                if isinstance(
+                    module, (VocabParallelEmbedding, VocabParallelHead)
+                ):
                     start = max(
                         0,
-                        min(parameter.shape[0], module.vocab.size - module.vocab.local_slice.start),
+                        min(
+                            parameter.shape[0],
+                            module.vocab.size - module.vocab.local_slice.start,
+                        ),
                     )
                     self._padding[key] = (
                         slice(start, parameter.shape[0]),
@@ -279,7 +333,10 @@ class _Loader:
     def _compile(self, assignment):
         key = id(assignment.target)
         if key not in self._owners:
-            raise ValueError("checkpoint assignment target is not a registered model Parameter")
+            raise ValueError(
+                "checkpoint assignment target is not a registered model "
+                "Parameter"
+            )
         source = (
             _full(assignment.source.shape)
             if assignment.source_slice is None
@@ -293,18 +350,25 @@ class _Loader:
         if not within(source, assignment.source.shape) or not within(
             target, tuple(assignment.target.shape)
         ):
-            raise ValueError("checkpoint assignment rectangle exceeds its tensor")
+            raise ValueError(
+                "checkpoint assignment rectangle exceeds its tensor"
+            )
 
         # A complete logical source narrows to the owner's bound partition;
         # explicit rectangles already address resident storage and pass through.
         owner, name = self._owners[key]
         if isinstance(owner, (VocabParallelEmbedding, VocabParallelHead)):
-            if source[0].stop - source[0].start == owner.vocab.size and target == _full(
+            if source[0].stop - source[
+                0
+            ].start == owner.vocab.size and target == _full(
                 assignment.target.shape
             ):
                 start = min(owner.vocab.size, owner.vocab.local_slice.start)
                 stop = min(owner.vocab.size, owner.vocab.local_slice.stop)
-                source = (slice(source[0].start + start, source[0].start + stop), *source[1:])
+                source = (
+                    slice(source[0].start + start, source[0].start + stop),
+                    *source[1:],
+                )
                 target = (slice(0, stop - start), *target[1:])
         elif isinstance(owner, Linear) and name in {"weight", "bias"}:
             logical = (
@@ -312,8 +376,14 @@ class _Loader:
                 if name == "weight"
                 else (owner.out_features,)
             )
-            local = owner._weight_slice if name == "weight" else owner._weight_slice[:1]
-            if region_shape(source) == logical and target == _full(assignment.target.shape):
+            local = (
+                owner._weight_slice
+                if name == "weight"
+                else owner._weight_slice[:1]
+            )
+            if region_shape(source) == logical and target == _full(
+                assignment.target.shape
+            ):
                 source = tuple(
                     slice(base.start + part.start, base.start + part.stop)
                     for base, part in zip(source, local, strict=True)
@@ -321,7 +391,8 @@ class _Loader:
 
         if region_shape(source) != region_shape(target):
             raise ValueError(
-                f"checkpoint assignment shape mismatch: {region_shape(source)} to {region_shape(target)}"
+                f"checkpoint assignment shape mismatch: "
+                f"{region_shape(source)} to {region_shape(target)}"
             )
         self._regions[id(assignment)] = source, target
 
@@ -329,14 +400,16 @@ class _Loader:
         # a no-op; a genuinely different overlapping one is ambiguous.
         for previous in self._assignments[key]:
             if (
-                _source_identity(previous.source) == _source_identity(assignment.source)
+                _source_identity(previous.source)
+                == _source_identity(assignment.source)
                 and self._regions[id(previous)] == (source, target)
                 and previous.preserve_dtype == assignment.preserve_dtype
             ):
                 return
             if intersection(self._regions[id(previous)][1], target) is not None:
                 raise ValueError(
-                    "overlapping checkpoint assignments must identify the same source rectangle"
+                    "overlapping checkpoint assignments must identify the "
+                    "same source rectangle"
                 )
         self._assignments[key].append(assignment)
 
@@ -346,15 +419,20 @@ class _Loader:
         for module_mapping, assignments in zip(
             self.mappings, self._mapping_assignments, strict=True
         ):
-            parameters = dict(module_mapping.module.named_parameters(remove_duplicate=False))
+            parameters = dict(
+                module_mapping.module.named_parameters(remove_duplicate=False)
+            )
             unknown = module_mapping.required.difference(parameters)
             if unknown:
                 raise ValueError(
-                    f"mapping required names are not model parameters: {sorted(unknown)}"
+                    f"mapping required names are not model parameters: "
+                    f"{sorted(unknown)}"
                 )
             ids = {id(assignment.target) for assignment in assignments}
             loaded = frozenset(
-                name for name, parameter in parameters.items() if id(parameter) in ids
+                name
+                for name, parameter in parameters.items()
+                if id(parameter) in ids
             )
             # Coverage: subtract every assigned target rectangle (and known
             # padding) from each loaded parameter's full region.
@@ -363,28 +441,42 @@ class _Loader:
                 parameter = parameters[name]
                 uncovered = (_full(parameter.shape),)
                 if id(parameter) in self._padding:
-                    uncovered = subtract(uncovered[0], self._padding[id(parameter)])
+                    uncovered = subtract(
+                        uncovered[0], self._padding[id(parameter)]
+                    )
                 for assignment in self._assignments[id(parameter)]:
                     _, target = self._regions[id(assignment)]
                     uncovered = tuple(
-                        piece for region in uncovered for piece in subtract(region, target)
+                        piece
+                        for region in uncovered
+                        for piece in subtract(region, target)
                     )
                 if uncovered and parameter.numel():
-                    incomplete[name] = tuple(str(region) for region in uncovered)
+                    incomplete[name] = tuple(
+                        str(region) for region in uncovered
+                    )
 
             reader = self._readers[module_mapping.source]
             reports.append(
                 Report(
                     loaded,
-                    tuple(sorted(set(reader.names()) & module_mapping.nonresident)),
+                    tuple(
+                        sorted(set(reader.names()) & module_mapping.nonresident)
+                    ),
                     tuple(
                         sorted(
-                            module_mapping.required.difference(module_mapping.optional).difference(
-                                loaded
+                            module_mapping.required.difference(
+                                module_mapping.optional
+                            ).difference(loaded)
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            set(reader.names()).difference(
+                                used[module_mapping.source]
                             )
                         )
                     ),
-                    tuple(sorted(set(reader.names()).difference(used[module_mapping.source]))),
                     incomplete,
                 )
             )
@@ -392,7 +484,8 @@ class _Loader:
 
     def load(self) -> tuple[Report, ...]:
         if self.io.mode == "dummy" and not any(
-            module_mapping.post_load is not None for module_mapping in self.mappings
+            module_mapping.post_load is not None
+            for module_mapping in self.mappings
         ):
             return self._dummy()
         if len({source.name for source in self.sources}) != len(self.sources):
@@ -400,14 +493,18 @@ class _Loader:
         by_name = {source.name: source for source in self.sources}
         for module_mapping in self.mappings:
             if module_mapping.source not in self._readers:
-                self._readers[module_mapping.source] = self._stack.enter_context(
-                    by_name[module_mapping.source].open(io=self.io)
+                self._readers[module_mapping.source] = (
+                    self._stack.enter_context(
+                        by_name[module_mapping.source].open(io=self.io)
+                    )
                 )
             reader = self._readers[module_mapping.source]
             assignments = module_mapping.map_weights(reader)
             for assignment in assignments:
                 self._compile(assignment)
-                self._used[module_mapping.source].update(_source_names(assignment.source))
+                self._used[module_mapping.source].update(
+                    _source_names(assignment.source)
+                )
             self._used[module_mapping.source].update(module_mapping.nonresident)
             self._mapping_assignments.append(assignments)
 
@@ -418,13 +515,19 @@ class _Loader:
             reader = self._readers.get(module_mapping.source)
             if reader is not None:
                 for assignment in module_mapping.map_weights(reader):
-                    self._used[module_mapping.source].update(_source_names(assignment.source))
-                self._used[module_mapping.source].update(module_mapping.nonresident)
+                    self._used[module_mapping.source].update(
+                        _source_names(assignment.source)
+                    )
+                self._used[module_mapping.source].update(
+                    module_mapping.nonresident
+                )
         reports = self._reports()
         for report in reports:
             if report.missing or report.incomplete:
                 raise RuntimeError(
-                    f"checkpoint load mismatch: missing={report.missing}, unexpected={report.unexpected}, incomplete={dict(report.incomplete)}"
+                    f"checkpoint load mismatch: missing={report.missing}, "
+                    f"unexpected={report.unexpected}, "
+                    f"incomplete={dict(report.incomplete)}"
                 )
 
         for key, assignments in self._assignments.items():
@@ -443,17 +546,21 @@ class _Loader:
                 report,
                 unexpected=tuple(
                     sorted(
-                        set(self._readers[module_mapping.source].names()).difference(
-                            self._used[module_mapping.source]
-                        )
+                        set(
+                            self._readers[module_mapping.source].names()
+                        ).difference(self._used[module_mapping.source])
                     )
                 ),
             )
-            for module_mapping, report in zip(self.mappings, reports, strict=True)
+            for module_mapping, report in zip(
+                self.mappings, reports, strict=True
+            )
         )
         for report in reports:
             if report.unexpected:
-                raise RuntimeError(f"checkpoint load mismatch: unexpected={report.unexpected}")
+                raise RuntimeError(
+                    f"checkpoint load mismatch: unexpected={report.unexpected}"
+                )
 
         self._buffers()
         self._fuse()
@@ -469,34 +576,47 @@ class _Loader:
         device, dtype, quantizer, explicit = self._settings[key]
         parameter = assignments[0].target
         preserved = {
-            assignment.source.dtype for assignment in assignments if assignment.preserve_dtype
+            assignment.source.dtype
+            for assignment in assignments
+            if assignment.preserve_dtype
         }
         if len(preserved) > 1 or (
-            preserved and not all(assignment.preserve_dtype for assignment in assignments)
+            preserved
+            and not all(assignment.preserve_dtype for assignment in assignments)
         ):
-            raise ValueError("one Parameter cannot have conflicting source-dtype requirements")
+            raise ValueError(
+                "one Parameter cannot have conflicting source-dtype "
+                "requirements"
+            )
         if preserved:
             dtype = preserved.pop()
 
-        complete = len(assignments) == 1 and self._regions[id(assignments[0])][1] == _full(
-            parameter.shape
-        )
+        complete = len(assignments) == 1 and self._regions[id(assignments[0])][
+            1
+        ] == _full(parameter.shape)
         if complete:
             assignment = assignments[0]
             source, _ = self._regions[id(assignment)]
-            value = assignment.source.read(source).to(device=device, dtype=dtype)
+            value = assignment.source.read(source).to(
+                device=device, dtype=dtype
+            )
         else:
             fragments = []
             for assignment in assignments:
                 source, target = self._regions[id(assignment)]
                 fragments.append((target, assignment.source.read(source)))
             if all(
-                isinstance(fragment, QuantizedTensor) and fragment.quantizer.format == "fp8"
+                isinstance(fragment, QuantizedTensor)
+                and fragment.quantizer.format == "fp8"
                 for _, fragment in fragments
             ):
-                value = _fp8_fragments(parameter.shape, fragments, device=device, dtype=dtype)
+                value = _fp8_fragments(
+                    parameter.shape, fragments, device=device, dtype=dtype
+                )
             else:
-                value = torch.empty(tuple(parameter.shape), device=device, dtype=dtype)
+                value = torch.empty(
+                    tuple(parameter.shape), device=device, dtype=dtype
+                )
                 for target, fragment in fragments:
                     if isinstance(fragment, QuantizedTensor):
                         fragment = fragment.dequantize(dtype=dtype)
@@ -512,11 +632,14 @@ class _Loader:
         ):
             # A serialized FP8 scale describes the checkpoint's complete
             # statistical domain. Selecting FP8 execution does not derive a
-            # smaller per-row or rank-local scale from that already encoded value.
+            # smaller per-row or rank-local scale from that already encoded
+            # value.
             pass
         elif quantizer is not None:
             owner, _ = self._owners[key]
-            value = quantizer.quantize(value, distribution=owner.weight_distribution)
+            value = quantizer.quantize(
+                value, distribution=owner.weight_distribution
+            )
         elif isinstance(value, QuantizedTensor) and explicit:
             value = value.dequantize(dtype=dtype)
 
@@ -549,13 +672,16 @@ class _Loader:
             device = _choice(path, self.devices, self.device)
             if buffer.is_meta:
                 raise RuntimeError(
-                    f"derived buffer {path}.{name} was not materialized by its numerical owner"
+                    f"derived buffer {path}.{name} was not materialized by "
+                    "its numerical owner"
                 )
 
             # Aliased buffers move once; every owner references the same tensor.
             key = id(buffer)
             if key in moved and moved[key].device != device:
-                raise ValueError("shared buffer aliases have conflicting devices")
+                raise ValueError(
+                    "shared buffer aliases have conflicting devices"
+                )
             if key not in moved:
                 moved[key] = buffer.to(device=device)
             module._buffers[name] = moved[key]
@@ -570,11 +696,14 @@ class _Loader:
                 for name, parameter in module_mapping.module.named_parameters(
                     remove_duplicate=False
                 )
-                if name in module_mapping.required or name in module_mapping.optional
+                if name in module_mapping.required
+                or name in module_mapping.optional
             )
             for module_mapping in self.mappings
         ]
-        for module_mapping, parameter_items in zip(self.mappings, parameters, strict=True):
+        for module_mapping, parameter_items in zip(
+            self.mappings, parameters, strict=True
+        ):
             loaded = set()
             for name, parameter in parameter_items:
                 key = id(parameter)
@@ -583,9 +712,13 @@ class _Loader:
 
                     # Values are deterministic per parameter name so repeated
                     # dummy loads and shared aliases observe identical data.
-                    seed = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "little")
+                    seed = int.from_bytes(
+                        hashlib.sha256(name.encode()).digest()[:8], "little"
+                    )
                     generator = torch.Generator(device="cpu").manual_seed(seed)
-                    value = torch.empty(tuple(parameter.shape), dtype=dtype, device="cpu")
+                    value = torch.empty(
+                        tuple(parameter.shape), dtype=dtype, device="cpu"
+                    )
                     if dtype.is_floating_point:
                         value.normal_(0, 0.02, generator=generator)
                     else:
@@ -595,9 +728,13 @@ class _Loader:
                         value[self._padding[key]].zero_()
                     if quantizer is not None:
                         owner, _ = self._owners[key]
-                        value = quantizer.quantize(value, distribution=owner.weight_distribution)
+                        value = quantizer.quantize(
+                            value, distribution=owner.weight_distribution
+                        )
 
-                    resident = nn.Parameter(value, requires_grad=parameter.requires_grad)
+                    resident = nn.Parameter(
+                        value, requires_grad=parameter.requires_grad
+                    )
                     for owner, field in self._aliases[key]:
                         owner._parameters[field] = resident
                     self._loaded.add(key)

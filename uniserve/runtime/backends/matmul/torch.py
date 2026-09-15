@@ -14,14 +14,21 @@ class _TorchOperator(_Operator):
         x = self._input(x, out)
         weight = self.weight
 
-        encoded = isinstance(x, QuantizedTensor) or isinstance(weight, QuantizedTensor)
+        encoded = isinstance(x, QuantizedTensor) or isinstance(
+            weight, QuantizedTensor
+        )
         if encoded:
             if any(
-                isinstance(value, QuantizedTensor) and value.quantizer.format != "fp8"
+                isinstance(value, QuantizedTensor)
+                and value.quantizer.format != "fp8"
                 for value in (x, weight)
             ):
                 raise ValueError("torch matmul supports dense and FP8 operands")
-            x = x.dequantize(dtype=torch.float32) if isinstance(x, QuantizedTensor) else x.float()
+            x = (
+                x.dequantize(dtype=torch.float32)
+                if isinstance(x, QuantizedTensor)
+                else x.float()
+            )
             weight = (
                 weight.dequantize(dtype=torch.float32)
                 if isinstance(weight, QuantizedTensor)
@@ -39,9 +46,11 @@ class _TorchOperator(_Operator):
                 torch.addmm(bias, x, weight.T, out=out)
         else:
             out.copy_(
-                F.linear(x.float(), weight.float(), None if bias is None else bias.float()).to(
-                    out.dtype
-                )
+                F.linear(
+                    x.float(),
+                    weight.float(),
+                    None if bias is None else bias.float(),
+                ).to(out.dtype)
             )
         return out
 

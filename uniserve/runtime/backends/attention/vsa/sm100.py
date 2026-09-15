@@ -11,7 +11,11 @@ except ImportError:
 
 
 def available(device):
-    return _kernel is not None and _kernel.available(device) and _cute.available(device)
+    return (
+        _kernel is not None
+        and _kernel.available(device)
+        and _cute.available(device)
+    )
 
 
 class _Operator(BaseOperator):
@@ -57,7 +61,21 @@ class _Operator(BaseOperator):
             out.copy_(attended[0].transpose(0, 1))
         return out
 
-    def rows(self, q, k, v, batch, *, gate, compressed, out, owners, chunk_tokens, packed, scale):
+    def rows(
+        self,
+        q,
+        k,
+        v,
+        batch,
+        *,
+        gate,
+        compressed,
+        out,
+        owners,
+        chunk_tokens,
+        packed,
+        scale,
+    ):
         from functools import partial
 
         from ._rows import _Rows
@@ -70,7 +88,9 @@ class _Operator(BaseOperator):
         if not hasattr(self, "_row_operators"):
             self._row_operators = {}
         if key not in self._row_operators:
-            self._row_operators[key] = _Rows(partial(_cute.block_sparse_attention, scale=scale))
+            self._row_operators[key] = _Rows(
+                partial(_cute.block_sparse_attention, scale=scale)
+            )
         return self._row_operators[key].prepare(
             q,
             k,

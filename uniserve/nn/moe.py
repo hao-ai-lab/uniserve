@@ -15,17 +15,21 @@ class TopK(nn.Module):
     """Selects and renormalizes the highest-scoring experts for each token."""
 
     def __init__(self, k: int, *, renormalize: bool = True) -> None:
-        """Validate the expert count and configure optional probability renormalization."""
-
+        """Validate the expert count and configure optional probability
+        renormalization.
+        """  # noqa: D205
         super().__init__()
         if k <= 0:
             raise ValueError("k must be positive")
         self.k = k
         self.renormalize = renormalize
 
-    def forward(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select the highest-probability experts per row and optionally renormalize weights."""
-
+    def forward(
+        self, scores: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select the highest-probability experts per row and optionally
+        renormalize weights.
+        """  # noqa: D205
         probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
         weights, ids = torch.topk(probs, self.k, dim=-1)
         if self.renormalize:
@@ -36,12 +40,13 @@ class TopK(nn.Module):
 
 
 class FusedMoE(nn.Module):
-    """Evaluate every expert densely and accumulate top-k per-token contributions.
+    """Evaluate every expert densely and accumulate top-k per-token
+    contributions.
 
     The implementation preserves exact top-k routing semantics without token
     dispatch: every expert processes every row, so compute scales with the full
     expert count even though unselected outputs receive a zero gate.
-    """
+    """  # noqa: D205
 
     def __init__(
         self,
@@ -51,7 +56,6 @@ class FusedMoE(nn.Module):
         norm_topk_prob: bool = True,
     ) -> None:
         """Register every expert and configure the per-token top-k gate."""
-
         super().__init__()
         self.experts = nn.ModuleList(experts)
         self.topk = TopK(top_k, renormalize=norm_topk_prob)
@@ -61,8 +65,9 @@ class FusedMoE(nn.Module):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        """Route flattened rows to top-k experts and accumulate their gated outputs."""
-
+        """Route flattened rows to top-k experts and accumulate their gated
+        outputs.
+        """  # noqa: D205
         original_shape = hidden_states.shape
         flat = hidden_states.reshape(-1, original_shape[-1])
         flat_logits = router_logits.reshape(-1, router_logits.shape[-1])

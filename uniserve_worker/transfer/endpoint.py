@@ -1,4 +1,4 @@
-"""Process endpoints for bounded publication grants and physical read retirement."""
+"""Process endpoints for bounded publication grants and physical retirement."""
 
 from __future__ import annotations
 
@@ -22,17 +22,18 @@ Source = TypeVar("Source")
 
 
 def locator_digest(locator: Locator) -> bytes:
-    """Bind a grant to the complete registered view, including its producer fence."""
-
+    """Bind a grant to the registered view, including its producer fence."""
     encoded = json.dumps(
-        locator.to_mapping(), sort_keys=True, separators=(",", ":"), default=bytes.hex
+        locator.to_mapping(),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=bytes.hex,
     ).encode("utf-8")
     return hashlib.sha256(encoded).digest()
 
 
 def publication_key(locator: Locator) -> bytes:
-    """Return the fixed-width source key carried by the physical reader protocol."""
-
+    """Return the fixed-width source key carried by the reader protocol."""
     handle = locator.transport
     if isinstance(handle, CudaIpcTransfer):
         return handle.publication_id.encode("ascii")
@@ -42,15 +43,16 @@ def publication_key(locator: Locator) -> bytes:
 
 
 def open_reader(locator: Locator) -> tuple[socket.socket, int | None]:
-    """Acquire source ownership before opening any shared allocation or readiness signal.
+    """Acquire source ownership before opening shared state.
 
-    The request is the 32-byte publication key followed by the 32-byte locator
-    digest. The endpoint answers with one byte: "G" grants the read (a CUDA IPC
-    grant additionally passes the allocation descriptor via SCM_RIGHTS), "F"
-    reports a failed producer, and anything else rejects the request. The
-    returned connection stays open until finish_reader() acknowledges.
+    Ownership is acquired before opening any shared allocation or readiness
+    signal. The request is the 32-byte publication key followed by the
+    32-byte locator digest. The endpoint answers with one byte: "G" grants
+    the read (a CUDA IPC grant additionally passes the allocation
+    descriptor via SCM_RIGHTS), "F" reports a failed producer, and anything
+    else rejects the request. The returned connection stays open until
+    finish_reader() acknowledges.
     """
-
     handle = locator.transport
     if not isinstance(handle, (CudaIpcTransfer, PosixShmTransfer)):
         raise invalid_descriptor("process read requires a shared transport")
@@ -64,23 +66,35 @@ def open_reader(locator: Locator) -> tuple[socket.socket, int | None]:
         )
         for level, kind, payload in ancillary:
             if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                descriptors.frombytes(payload[: len(payload) - len(payload) % descriptors.itemsize])
+                descriptors.frombytes(
+                    payload[
+                        : len(payload) - len(payload) % descriptors.itemsize
+                    ]
+                )
 
         if not response:
-            raise resource_error("publication endpoint was lost before readiness")
+            raise resource_error(
+                "publication endpoint was lost before readiness"
+            )
         if response == b"F":
             raise resource_error("publication producer failed before readiness")
         if response != b"G":
-            raise invalid_descriptor("publication is retired, invalid, or has no reader capacity")
+            raise invalid_descriptor(
+                "publication is retired, invalid, or has no reader capacity"
+            )
         if flags & socket.MSG_CTRUNC or len(descriptors) != int(
             isinstance(handle, CudaIpcTransfer)
         ):
-            raise invalid_descriptor("publication grant has an invalid allocation descriptor")
+            raise invalid_descriptor(
+                "publication grant has an invalid allocation descriptor"
+            )
     except OSError as error:
         for descriptor in descriptors:
             os.close(descriptor)
         connection.close()
-        raise resource_error("publication endpoint was lost before readiness") from error
+        raise resource_error(
+            "publication endpoint was lost before readiness"
+        ) from error
     except BaseException:
         for descriptor in descriptors:
             os.close(descriptor)
@@ -96,12 +110,13 @@ def finish_reader(connection: socket.socket) -> None:
     resulting reclamation, so a completed handshake includes the producer's
     physical release and capacity accounting.
     """
-
     try:
         connection.sendall(b"A")
         response = connection.recv(1)
     except OSError as error:
-        raise resource_error("publication endpoint lost reader acknowledgement") from error
+        raise resource_error(
+            "publication endpoint lost reader acknowledgement"
+        ) from error
     if response != b"D":
         raise resource_error("publication endpoint lost reader acknowledgement")
 
@@ -122,7 +137,7 @@ class _Publication(Generic[Source]):
 
 
 class PublicationEndpoint(Generic[Source]):
-    """Own registered sources and reader grants for one address-space incarnation.
+    """Own registered sources and reader grants for one address space.
 
     A grant pins the exact source before the reader opens its allocation. A
     retirement rejects new grants and waits for both producer completion and
@@ -140,7 +155,9 @@ class PublicationEndpoint(Generic[Source]):
         descriptor: Callable[[Source], int] | None = None,
     ) -> None:
         if min(reader_capacity, publication_capacity) < 1:
-            raise ValueError("publication and reader capacities must be positive")
+            raise ValueError(
+                "publication and reader capacities must be positive"
+            )
 
         self.name = f"uniserve-read-{uuid.uuid4().hex}"
         self._reader_capacity = reader_capacity
@@ -169,25 +186,38 @@ class PublicationEndpoint(Generic[Source]):
         )
         self._worker.start()
 
-    def publish(self, locator: Locator, source: Source, *, pending: bool = False) -> None:
-        """Register an immutable source whose producer may still be writing its bytes."""
+    def publish(
+        self, locator: Locator, source: Source, *, pending: bool = False
+    ) -> None:
+        """Register an immutable source.
 
+        The producer may still be writing its bytes.
+        """
         key = publication_key(locator)
         with self._lock:
             self._reap_locked()
             if self._error is not None:
                 raise self._error
-            if self._closing or len(self._publications) >= self._publication_capacity:
-                raise resource_error("transport publication capacity is unavailable")
+            if (
+                self._closing
+                or len(self._publications) >= self._publication_capacity
+            ):
+                raise resource_error(
+                    "transport publication capacity is unavailable"
+                )
             if key in self._publications:
-                raise invalid_descriptor("publication identity is already registered")
+                raise invalid_descriptor(
+                    "publication identity is already registered"
+                )
             self._publications[key] = _Publication(
                 locator, source, locator_digest(locator), pending
             )
 
     def source(self, locator: Locator) -> Source:
-        """Borrow a registered source after this endpoint granted the caller's read."""
+        """Borrow a registered source.
 
+        The endpoint must have granted the caller's read.
+        """
         with self._lock:
             return self._publications[publication_key(locator)].source
 
@@ -203,7 +233,6 @@ class PublicationEndpoint(Generic[Source]):
         A failure with unknown physical completion keeps the source allocation
         registered even after every reader is rejected and publication retires.
         """
-
         if not producer_completed and error is None:
             raise ValueError("unknown producer completion requires a failure")
 
@@ -222,15 +251,18 @@ class PublicationEndpoint(Generic[Source]):
             pass
 
     def release(self, locator: Locator) -> Future[None] | None:
-        """Revoke publication while retaining already granted physical readers."""
-
+        """Revoke publication while retaining granted physical readers."""
         if locator.transport.endpoint != self.name:
-            raise invalid_descriptor("publication release belongs to another endpoint")
+            raise invalid_descriptor(
+                "publication release belongs to another endpoint"
+            )
         with self._lock:
             publication = self._publications.get(publication_key(locator))
             if publication is not None:
                 if publication.locator != locator:
-                    raise invalid_descriptor("publication release changed its registered view")
+                    raise invalid_descriptor(
+                        "publication release changed its registered view"
+                    )
                 publication.retired = True
                 self._reclaim_locked(publication)
                 return publication.retirement
@@ -238,18 +270,18 @@ class PublicationEndpoint(Generic[Source]):
 
     def retirement(self, locator: Locator) -> Future[None]:
         """Expose the registered publication's physical ownership completion."""
-
         if locator.transport.endpoint != self.name:
             raise invalid_descriptor("publication belongs to another endpoint")
         with self._lock:
             publication = self._publications.get(publication_key(locator))
             if publication is None or publication.locator != locator:
-                raise invalid_descriptor("publication does not match its registered view")
+                raise invalid_descriptor(
+                    "publication does not match its registered view"
+                )
             return publication.retirement
 
     def _reclaim_locked(self, publication: _Publication[Source]) -> None:
-        """Hand the source back once retired, producer-complete, and reader-free."""
-
+        """Hand source back once retired, producer-complete, and reader-free."""
         if (
             publication.retired
             and not publication.pending
@@ -265,8 +297,11 @@ class PublicationEndpoint(Generic[Source]):
                 raise
 
     def _reap_locked(self) -> None:
-        """Remove retired metadata after its physical owner has returned the allocation."""
+        """Remove retired metadata.
 
+        Removal happens after its physical owner has returned the
+        allocation.
+        """
         for key, publication in tuple(self._publications.items()):
             if (
                 publication.reclaiming
@@ -276,8 +311,10 @@ class PublicationEndpoint(Generic[Source]):
                 del self._publications[key]
 
     def close(self) -> None:
-        """Drain granted readers, close the endpoint, and surface unresolved ownership."""
+        """Drain granted readers and close the endpoint.
 
+        Unresolved ownership is surfaced.
+        """
         if not self._closed:
             with self._lock:
                 self._closing = True
@@ -304,9 +341,14 @@ class PublicationEndpoint(Generic[Source]):
         if self._error is not None:
             raise self._error
         if self._lost_readers:
-            raise resource_error("reader disconnected without completion; sources remain retained")
+            raise resource_error(
+                "reader disconnected without completion; "
+                "sources remain retained"
+            )
         if self._publications:
-            raise resource_error("publication lost producer completion; sources remain retained")
+            raise resource_error(
+                "publication lost producer completion; sources remain retained"
+            )
 
     def _serve(self) -> None:
         selector = selectors.DefaultSelector()
@@ -315,7 +357,9 @@ class PublicationEndpoint(Generic[Source]):
         # Per-connection reader state: (None, False) awaits the key+digest
         # packet; (publication, False) holds a counted reader slot awaiting its
         # grant; (publication, True) is granted and awaits the "A" release.
-        clients: dict[socket.socket, tuple[_Publication[Source] | None, bool]] = {}
+        clients: dict[
+            socket.socket, tuple[_Publication[Source] | None, bool]
+        ] = {}
         closing = False
 
         def remove(connection: socket.socket) -> None:
@@ -331,7 +375,10 @@ class PublicationEndpoint(Generic[Source]):
                         self._lost_readers += 1
                         if not publication.retirement.done():
                             publication.retirement.set_exception(
-                                resource_error("reader disconnected without physical completion")
+                                resource_error(
+                                    "reader disconnected without "
+                                    "physical completion"
+                                )
                             )
             selector.unregister(connection)
             connection.close()
@@ -341,7 +388,9 @@ class PublicationEndpoint(Generic[Source]):
             if publication is None or granted:
                 return
             with self._lock:
-                if publication.error is not None or (closing and publication.pending):
+                if publication.error is not None or (
+                    closing and publication.pending
+                ):
                     response = b"F"
                 elif publication.pending:
                     # Producer fence not yet observed; retried on each control
@@ -354,7 +403,13 @@ class PublicationEndpoint(Generic[Source]):
                     descriptor = self._descriptor(publication.source)
                     connection.sendmsg(
                         (response,),
-                        ((socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", (descriptor,))),),
+                        (
+                            (
+                                socket.SOL_SOCKET,
+                                socket.SCM_RIGHTS,
+                                array.array("i", (descriptor,)),
+                            ),
+                        ),
                     )
                 else:
                     connection.send(response)
@@ -412,7 +467,11 @@ class PublicationEndpoint(Generic[Source]):
                         continue
                     except OSError:
                         packet = b""
-                    if publication is None and len(packet) == 64 and not closing:
+                    if (
+                        publication is None
+                        and len(packet) == 64
+                        and not closing
+                    ):
                         with self._lock:
                             # The key selects the publication; the digest binds
                             # the reader to its exact registered view.

@@ -1,16 +1,27 @@
-"""Public loading accepts nonresident source records and rejects unknown names."""
+"""Public loading accepts nonresident source records.
+
+It rejects unknown names.
+"""
 
 import pytest
 import torch
-from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+from diffusers.models.transformers.transformer_minimax_h3 import (
+    MiniMaxH3Transformer3DModel,
+)
 from safetensors.torch import save_file
 
-from tests.python.integration.model_loading.test_bagel import _checkpoint as bagel_checkpoint
+from tests.python.integration.model_loading.test_bagel import (
+    _checkpoint as bagel_checkpoint,
+)
 from uniserve import loading
 from uniserve.distributed import DeviceMesh
 from uniserve.loading import checkpoint, weights
 from uniserve_models import bagel
-from uniserve_models.minimax_h3 import DiffusionConfig, Transformer, TransformerConfig
+from uniserve_models.minimax_h3 import (
+    DiffusionConfig,
+    Transformer,
+    TransformerConfig,
+)
 from uniserve_models.minimax_h3.config import TRANSFORMER_FIELDS
 from uniserve_models.minimax_h3.weights import transformer_component
 
@@ -22,7 +33,9 @@ def _pipeline(rank):
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_bagel_loading_rejects_unknown_records_on_each_pipeline_stage(tmp_path, rank):
+def test_bagel_loading_rejects_unknown_records_on_each_pipeline_stage(
+    tmp_path, rank
+):
     _, state, config = bagel_checkpoint(tmp_path)
 
     def load():
@@ -30,9 +43,9 @@ def test_bagel_loading_rejects_unknown_records_on_each_pipeline_stage(tmp_path, 
             bagel.Model,
             config,
             checkpoint=(
-                checkpoint.Config("primary", filenames=("ema.safetensors",)).resolve(
-                    tmp_path, io=loading.Config()
-                ),
+                checkpoint.Config(
+                    "primary", filenames=("ema.safetensors",)
+                ).resolve(tmp_path, io=loading.Config()),
             ),
             mapping=bagel.checkpoint_mappings,
             device="cpu",
@@ -63,7 +76,9 @@ def test_bagel_loading_rejects_unknown_records_on_each_pipeline_stage(tmp_path, 
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_h3_loading_rejects_unknown_records_on_each_pipeline_stage(tmp_path, rank):
+def test_h3_loading_rejects_unknown_records_on_each_pipeline_stage(
+    tmp_path, rank
+):
     config = TransformerConfig(
         hidden_size=32,
         num_attention_heads=2,
@@ -77,14 +92,19 @@ def test_h3_loading_rejects_unknown_records_on_each_pipeline_stage(tmp_path, ran
         rope_frequency_dim=4,
     )
     native = MiniMaxH3Transformer3DModel(
-        **{source: getattr(config, target) for source, target in TRANSFORMER_FIELDS.items()},
+        **{
+            source: getattr(config, target)
+            for source, target in TRANSFORMER_FIELDS.items()
+        },
         patch_size=(1, 2, 2),
         final_norm_eps=config.norm_eps,
     )
     source = native.state_dict()
     for index in range(config.num_hidden_layers):
-        source[f"transformer_blocks.{index}.attn.to_gate_compress.weight"] = torch.zeros(
-            config.num_attention_heads * config.head_dim, config.hidden_size
+        source[f"transformer_blocks.{index}.attn.to_gate_compress.weight"] = (
+            torch.zeros(
+                config.num_attention_heads * config.head_dim, config.hidden_size
+            )
         )
     save_file(source, tmp_path / "model.safetensors")
 
@@ -92,8 +112,14 @@ def test_h3_loading_rejects_unknown_records_on_each_pipeline_stage(tmp_path, ran
         return loading.load_model(
             Transformer,
             config,
-            checkpoint=(checkpoint.Config("denoiser").resolve(tmp_path, io=loading.Config()),),
-            mapping=lambda model: (transformer_component(model, DiffusionConfig()),),
+            checkpoint=(
+                checkpoint.Config("denoiser").resolve(
+                    tmp_path, io=loading.Config()
+                ),
+            ),
+            mapping=lambda model: (
+                transformer_component(model, DiffusionConfig()),
+            ),
             device="cpu",
             meshes={"": _pipeline(rank)},
             weights=weights.Config(),
@@ -111,7 +137,8 @@ def test_h3_loading_rejects_unknown_records_on_each_pipeline_stage(tmp_path, ran
     source.update(dict.fromkeys(unknown, torch.zeros(1)))
     # safetensors requires independently owned values for distinct records.
     save_file(
-        {name: value.clone() for name, value in source.items()}, tmp_path / "model.safetensors"
+        {name: value.clone() for name, value in source.items()},
+        tmp_path / "model.safetensors",
     )
     with pytest.raises(RuntimeError) as raised:
         load()

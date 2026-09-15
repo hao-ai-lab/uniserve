@@ -59,10 +59,19 @@ def test_paged_input_maps_append_positions_across_reordered_blocks():
 
 def test_empty_attention_lengths_and_batches_remain_well_defined():
     lengths = SequenceLengths.from_lengths((), device="cpu")
-    assert (lengths.batch_size, lengths.num_tokens, lengths.maximum) == (0, 0, 0)
+    assert (lengths.batch_size, lengths.num_tokens, lengths.maximum) == (
+        0,
+        0,
+        0,
+    )
     assert lengths.offsets.tolist() == [0]
     batch = PagedInput.from_blocks(
-        blocks=(), query_lengths=(), prefix_lengths=(), block_size=4, causal=True, device="cpu"
+        blocks=(),
+        query_lengths=(),
+        prefix_lengths=(),
+        block_size=4,
+        causal=True,
+        device="cpu",
     )
     assert batch.block_table.indices.shape == (0, 0)
     assert batch.write_indices.numel() == 0

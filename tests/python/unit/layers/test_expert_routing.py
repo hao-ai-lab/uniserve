@@ -19,7 +19,8 @@ pytestmark = pytest.mark.unit
             marks=[
                 pytest.mark.gpu,
                 pytest.mark.skipif(
-                    torch.cuda.device_count() < 2, reason="two CUDA devices are required"
+                    torch.cuda.device_count() < 2,
+                    reason="two CUDA devices are required",
                 ),
             ],
         ),
@@ -33,7 +34,9 @@ pytestmark = pytest.mark.unit
         ("flow", "text", "flow", "text"),
     ],
 )
-def test_expert_modules_preserve_route_values_and_packed_order(routes, flow_device):
+def test_expert_modules_preserve_route_values_and_packed_order(
+    routes, flow_device
+):
     device = "cpu" if flow_device == "cpu" else "cuda:0"
     text = nn.Linear(2, 2, device=device)
     flow = nn.Linear(2, 2, device=flow_device)
@@ -43,8 +46,12 @@ def test_expert_modules_preserve_route_values_and_packed_order(routes, flow_devi
         text.bias.fill_(1)
         flow.weight.copy_(torch.eye(2) * 3)
         flow.bias.fill_(-1)
-    spans = tuple(RouteSpan(route, 2 * index, 2) for index, route in enumerate(routes))
-    values = torch.arange(4 * len(routes), dtype=torch.float32, device=device).reshape(-1, 2)
+    spans = tuple(
+        RouteSpan(route, 2 * index, 2) for index, route in enumerate(routes)
+    )
+    values = torch.arange(
+        4 * len(routes), dtype=torch.float32, device=device
+    ).reshape(-1, 2)
     expected = torch.cat(
         [
             values[span.start : span.stop] * (2 if span.route == "text" else 3)
@@ -52,7 +59,9 @@ def test_expert_modules_preserve_route_values_and_packed_order(routes, flow_devi
             for span in spans
         ]
     )
-    routed = RoutedTensor.from_packed(values, spans, routes=frozenset({"text", "flow"}))
+    routed = RoutedTensor.from_packed(
+        values, spans, routes=frozenset({"text", "flow"})
+    )
     with ExecutionContext(modules) as context, torch.inference_mode():
         context.prepare(None)
         actual = routed.apply(modules).packed(spans)

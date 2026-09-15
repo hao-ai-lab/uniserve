@@ -18,7 +18,9 @@ if TYPE_CHECKING:
 
 
 checkpoint_sources = (
-    checkpoint.Config("primary", filenames=("ema.safetensors", "model.safetensors")),
+    checkpoint.Config(
+        "primary", filenames=("ema.safetensors", "model.safetensors")
+    ),
     checkpoint.Config("autoencoder", filenames=("ae.safetensors",)),
 )
 
@@ -26,7 +28,10 @@ checkpoint_sources = (
 precisions = MappingProxyType(
     {
         "bf16": weights.Config(
-            dtypes={"latent_encoder": torch.float32, "image_decoder.decoder": torch.float32}
+            dtypes={
+                "latent_encoder": torch.float32,
+                "image_decoder.decoder": torch.float32,
+            }
         )
     }
 )
@@ -38,7 +43,6 @@ def _backbone_names(backbone: Transformer) -> dict[str, str]:
     Text experts keep the plain checkpoint names; flow experts carry the
     ``_moe_gen`` suffix. Only layers resident on this pipeline rank appear.
     """
-
     names = {
         "embedding.weight": "embed_tokens.weight",
         "norm.text.weight": "norm.weight",
@@ -53,7 +57,11 @@ def _backbone_names(backbone: Transformer) -> dict[str, str]:
         tail = ".".join(parts)
         if kind in ("input_norms", "post_attention_norms"):
             target = (
-                ("input_layernorm" if kind == "input_norms" else "post_attention_layernorm")
+                (
+                    "input_layernorm"
+                    if kind == "input_norms"
+                    else "post_attention_layernorm"
+                )
                 + suffix
                 + "."
                 + tail
@@ -65,7 +73,8 @@ def _backbone_names(backbone: Transformer) -> dict[str, str]:
                 target = f"self_attn.{parts[2]}_proj{suffix}.{parts[3]}"
             else:
                 target = (
-                    f"self_attn.{'q' if parts[0] == 'query_norm' else 'k'}_norm{suffix}.{parts[1]}"
+                    f"self_attn.{'q' if parts[0] == 'query_norm' else 'k'}"
+                    f"_norm{suffix}.{parts[1]}"
                 )
         elif kind == "mlps":
             tail = (
@@ -79,11 +88,14 @@ def _backbone_names(backbone: Transformer) -> dict[str, str]:
 
         names[path] = f"layers.{index}.{target}"
 
-    return {target: "language_model.model." + source for target, source in names.items()}
+    return {
+        target: "language_model.model." + source
+        for target, source in names.items()
+    }
 
 
 def _mapped(module, source_names, *, nonresident=frozenset()):
-    """Build a primary-source mapping that skips tensors absent from the file."""
+    """Build a primary-source mapping that skips tensors absent from the file."""  # noqa: E501
 
     def map_weights(reader):
         available = frozenset(reader.names())
@@ -97,14 +109,17 @@ def _mapped(module, source_names, *, nonresident=frozenset()):
         module,
         "primary",
         map_weights,
-        frozenset(name for name, _ in module.named_parameters() if name in source_names),
+        frozenset(
+            name
+            for name, _ in module.named_parameters()
+            if name in source_names
+        ),
         nonresident=nonresident,
     )
 
 
 def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
     """Assign every resident module its checkpoint tensors per pipeline rank."""
-
     backbone = model.text.backbone
     source_names = _backbone_names(backbone)
 
@@ -124,14 +139,24 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
         nonresident.add("language_model.model.embed_tokens.weight")
     if backbone.norm is None:
         nonresident.update(
-            ("language_model.model.norm.weight", "language_model.model.norm_moe_gen.weight")
+            (
+                "language_model.model.norm.weight",
+                "language_model.model.norm_moe_gen.weight",
+            )
         )
 
-    components = [_mapped(backbone, source_names, nonresident=frozenset(nonresident))]
+    components = [
+        _mapped(backbone, source_names, nonresident=frozenset(nonresident))
+    ]
     if model.text.lm_head is not None:
-        components.append(_mapped(model.text, {"lm_head.weight": "language_model.lm_head.weight"}))
+        components.append(
+            _mapped(
+                model.text, {"lm_head.weight": "language_model.lm_head.weight"}
+            )
+        )
     else:
-        # Without a resident head, declare its tensor nonresident on the backbone.
+        # Without a resident head, declare its tensor nonresident on the
+        # backbone.
         first = components[0]
         components[0] = weights.ModuleMapping(
             first.module,
@@ -150,7 +175,9 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
         denoiser_names.update(
             {
                 f"{path}.{name}": prefix + name
-                for name, _ in model.denoiser.get_submodule(path).named_parameters()
+                for name, _ in model.denoiser.get_submodule(
+                    path
+                ).named_parameters()
             }
         )
     denoiser_names["position.weight"] = "latent_pos_embed.pos_embed"
@@ -170,7 +197,9 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
             "primary",
             lambda reader: (
                 projected.map_weights(reader)
-                + siglip.assignments(vision.encoder, reader, prefix="vit_model.vision_model.")
+                + siglip.assignments(
+                    vision.encoder, reader, prefix="vit_model.vision_model."
+                )
             ),
             frozenset(dict(model.vision_encoder.named_parameters())),
         )

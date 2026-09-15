@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from math import prod
 from types import MappingProxyType
-from typing import Any, Literal, Mapping
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
 
 from uniserve.profiling import profile_range
-from uniserve.runtime._communication import stream_collectives, try_sum_reduction
+from uniserve.runtime._communication import (
+    stream_collectives,
+    try_sum_reduction,
+)
 
 
 def divide(numerator: int, denominator: int) -> int:
-    """Return an exact integer quotient after validating divisibility and sign."""
+    """Return an exact integer quotient.
 
+    After validating divisibility and sign.
+    """
     if denominator <= 0:
         raise ValueError("denominator must be positive")
     if numerator % denominator:
@@ -27,7 +33,9 @@ def divide(numerator: int, denominator: int) -> int:
 def _process_group(name: str):
     # A stable backend name is traceable through custom ops; process-group
     # objects cannot cross a torch.library schema or a captured graph boundary.
-    return dist.distributed_c10d._resolve_process_group(dist.distributed_c10d.GroupName(name))
+    return dist.distributed_c10d._resolve_process_group(
+        dist.distributed_c10d.GroupName(name)
+    )
 
 
 def _finish(work: Any, tensor: torch.Tensor) -> None:
@@ -41,22 +49,30 @@ def _finish(work: Any, tensor: torch.Tensor) -> None:
 
 def _start_all_gather(output: torch.Tensor, input: torch.Tensor, group):
     """Publish a gather and return its deferred consumer dependency."""
-
     bound = stream_collectives(group.group_name)
     if bound is not None:
         return bound.start_all_gather(output, input)
-    return dist.all_gather_into_tensor(output, input, group=group, async_op=True)
+    return dist.all_gather_into_tensor(
+        output, input, group=group, async_op=True
+    )
 
 
-@torch.library.custom_op("uniserve::all_gather_into_tensor", mutates_args=("output",))
-def _all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor, group_name: str) -> None:
+@torch.library.custom_op(
+    "uniserve::all_gather_into_tensor", mutates_args=("output",)
+)
+def _all_gather_into_tensor(
+    output: torch.Tensor, input: torch.Tensor, group_name: str
+) -> None:
     with profile_range(
-        f"uniserve.collective kind=all_gather group={group_name} rank={dist.get_rank()}"
+        f"uniserve.collective kind=all_gather group={group_name} "
+        f"rank={dist.get_rank()}"
     ):
         group = _process_group(group_name)
         # In-place AllGather registers one stable allocation for both source
         # and destination. Symmetric workspaces can then use NCCL copy engines.
-        local = output.view(-1).narrow(0, group.rank() * input.numel(), input.numel())
+        local = output.view(-1).narrow(
+            0, group.rank() * input.numel(), input.numel()
+        )
         local = local.view_as(input)
         local.copy_(input)
         bound = stream_collectives(group_name)
@@ -73,7 +89,9 @@ def _all_gather_into_tensor_fake(output, input, group_name):
     pass
 
 
-@torch.library.custom_op("uniserve::all_to_all_single_into", mutates_args=("output",))
+@torch.library.custom_op(
+    "uniserve::all_to_all_single_into", mutates_args=("output",)
+)
 def _all_to_all_single_into(
     output: torch.Tensor,
     input: torch.Tensor,
@@ -82,7 +100,8 @@ def _all_to_all_single_into(
     group_name: str,
 ) -> None:
     with profile_range(
-        f"uniserve.collective kind=all_to_all group={group_name} rank={dist.get_rank()}"
+        f"uniserve.collective kind=all_to_all group={group_name} "
+        f"rank={dist.get_rank()}"
     ):
         bound = stream_collectives(group_name)
         if bound is not None:
@@ -91,7 +110,8 @@ def _all_to_all_single_into(
         # Empty split lists select the native equal-count collective. Explicit
         # lists select variable-count send/recv, including when counts match.
         equal_counts = (
-            input.numel() == output.numel() and len(set(output_splits + input_splits)) == 1
+            input.numel() == output.numel()
+            and len(set(output_splits + input_splits)) == 1
         )
         work = dist.all_to_all_single(
             output,
@@ -105,21 +125,27 @@ def _all_to_all_single_into(
 
 
 @_all_to_all_single_into.register_fake
-def _all_to_all_single_into_fake(output, input, output_splits, input_splits, group_name):
+def _all_to_all_single_into_fake(
+    output, input, output_splits, input_splits, group_name
+):
     pass
 
 
 @torch.library.custom_op("uniserve::all_reduce_max", mutates_args=("value",))
 def _all_reduce_max(value: torch.Tensor, group_name: str) -> None:
     with profile_range(
-        f"uniserve.collective kind=all_reduce_max group={group_name} rank={dist.get_rank()}"
+        f"uniserve.collective kind=all_reduce_max group={group_name} "
+        f"rank={dist.get_rank()}"
     ):
         bound = stream_collectives(group_name)
         if bound is not None:
             bound.all_reduce(value, "max")
             return
         work = dist.all_reduce(
-            value, op=dist.ReduceOp.MAX, group=_process_group(group_name), async_op=True
+            value,
+            op=dist.ReduceOp.MAX,
+            group=_process_group(group_name),
+            async_op=True,
         )
         _finish(work, value)
 
@@ -139,15 +165,20 @@ def _send_recv(
 ) -> None:
     group = _process_group(group_name)
     with profile_range(
-        f"uniserve.collective kind=send_recv group={group_name} rank={dist.get_rank()}"
+        f"uniserve.collective kind=send_recv group={group_name} "
+        f"rank={dist.get_rank()}"
     ):
         bound = stream_collectives(group_name)
         if bound is not None:
             bound.send_recv(output, value, dst, src)
             return
         operations = [
-            dist.P2POp(dist.isend, value.reshape(-1).view(torch.uint8), dst, group),
-            dist.P2POp(dist.irecv, output.reshape(-1).view(torch.uint8), src, group),
+            dist.P2POp(
+                dist.isend, value.reshape(-1).view(torch.uint8), dst, group
+            ),
+            dist.P2POp(
+                dist.irecv, output.reshape(-1).view(torch.uint8), src, group
+            ),
         ]
         for work in dist.batch_isend_irecv(operations):
             _finish(work, value)
@@ -169,7 +200,11 @@ def _destination(
 ) -> torch.Tensor:
     if out is None:
         return torch.empty(shape, dtype=value.dtype, device=value.device)
-    if tuple(out.shape) != shape or out.dtype != value.dtype or out.device != value.device:
+    if (
+        tuple(out.shape) != shape
+        or out.dtype != value.dtype
+        or out.device != value.device
+    ):
         raise ValueError("collective output must match shape, dtype and device")
     return out
 
@@ -191,11 +226,18 @@ class Communicator:
 
     def __post_init__(self) -> None:
         if not self.ranks or len(set(self.ranks)) != len(self.ranks):
-            raise ValueError(f"group {self.name!r} requires unique non-empty membership")
+            raise ValueError(
+                f"group {self.name!r} requires unique non-empty membership"
+            )
         if any(type(rank) is not int or rank < 0 for rank in self.ranks):
-            raise ValueError(f"group {self.name!r} ranks must be nonnegative integers")
+            raise ValueError(
+                f"group {self.name!r} ranks must be nonnegative integers"
+            )
         if type(self.rank) is not int or not 0 <= self.rank < len(self.ranks):
-            raise ValueError(f"local rank {self.rank} is outside group {self.name!r}: {self.ranks}")
+            raise ValueError(
+                f"local rank {self.rank} is outside group {self.name!r}: "
+                f"{self.ranks}"
+            )
 
     @property
     def size(self) -> int:
@@ -208,25 +250,30 @@ class Communicator:
     def _require(self):
         if self._group is None or not dist.is_initialized():
             raise RuntimeError(
-                f"group {self.name!r} requires initialized distributed communication"
+                f"group {self.name!r} requires initialized distributed "
+                "communication"
             )
         return self._group
 
     @property
     def _backend_name(self) -> str | None:
-        """Expose a non-owning collective identity for tensor-layout metadata."""
+        """Expose a non-owning collective identity.
 
+        For tensor-layout metadata.
+        """
         return None if self.size == 1 else self._require().group_name
 
     def _peer(self, peer: int) -> int:
         if not 0 <= peer < self.size:
-            raise ValueError(f"peer {peer} is outside group {self.name!r} of size {self.size}")
+            raise ValueError(
+                f"peer {peer} is outside group {self.name!r} of size "
+                f"{self.size}"
+            )
         return self.ranks[peer]
 
     @property
     def _backend_order(self) -> tuple[int, ...]:
         """Map each ascending backend position to its logical member index."""
-
         return tuple(self.ranks.index(rank) for rank in sorted(self.ranks))
 
     def all_reduce(
@@ -237,12 +284,19 @@ class Communicator:
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Reduce in place, or into matching output storage when supplied."""
-
-        operations = {"sum": dist.ReduceOp.SUM, "min": dist.ReduceOp.MIN, "max": dist.ReduceOp.MAX}
+        operations = {
+            "sum": dist.ReduceOp.SUM,
+            "min": dist.ReduceOp.MIN,
+            "max": dist.ReduceOp.MAX,
+        }
         if op not in operations:
             raise ValueError(f"unsupported reduction {op!r}")
 
-        result = value if out is None else _destination(value, tuple(value.shape), out)
+        result = (
+            value
+            if out is None
+            else _destination(value, tuple(value.shape), out)
+        )
         if result is not value:
             result.copy_(value)
         if self.size > 1:
@@ -264,7 +318,6 @@ class Communicator:
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Concatenate equal tensors in logical membership order."""
-
         dim = _dimension(value, dim)
         shape = list(value.shape)
         shape[dim] *= self.size
@@ -280,16 +333,18 @@ class Communicator:
         # backend-ordered chunk to its logical position along dim.
         group = self._require()
         bound = stream_collectives(group.group_name)
-        storage = torch.empty((self.size, *value.shape), dtype=value.dtype, device=value.device)
+        storage = torch.empty(
+            (self.size, *value.shape), dtype=value.dtype, device=value.device
+        )
         chunks = list(storage.unbind(0))
         if bound is not None:
             bound.all_gather(storage, value.contiguous())
         else:
             dist.all_gather(chunks, value.contiguous(), group=group)
         for backend_rank, logical_rank in enumerate(self._backend_order):
-            result.narrow(dim, logical_rank * value.shape[dim], value.shape[dim]).copy_(
-                chunks[backend_rank]
-            )
+            result.narrow(
+                dim, logical_rank * value.shape[dim], value.shape[dim]
+            ).copy_(chunks[backend_rank])
         return result
 
     def gather(
@@ -301,30 +356,45 @@ class Communicator:
         out: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Concatenate tensors on the destination's group-local rank."""
-
         self._peer(dst)
         dim = _dimension(value, dim)
         if self.rank != dst and out is not None:
-            raise ValueError("only the gather destination may provide output storage")
+            raise ValueError(
+                "only the gather destination may provide output storage"
+            )
 
         shape = list(value.shape)
         shape[dim] *= self.size
-        result = _destination(value, tuple(shape), out) if self.rank == dst else None
+        result = (
+            _destination(value, tuple(shape), out) if self.rank == dst else None
+        )
 
         # A contiguous dim-0 destination can receive the leading member axis
         # directly; other layouts stage through a scratch buffer and copy out.
         if dim == 0 and (result is None or result.is_contiguous()):
-            storage = None if result is None else result.view(self.size, *value.shape)
+            storage = (
+                None if result is None else result.view(self.size, *value.shape)
+            )
         else:
             storage = (
                 None
                 if result is None
-                else torch.empty((self.size, *value.shape), dtype=value.dtype, device=value.device)
+                else torch.empty(
+                    (self.size, *value.shape),
+                    dtype=value.dtype,
+                    device=value.device,
+                )
             )
         self._gather_into_tensor(storage, value.contiguous(), dst=dst)
-        if result is not None and storage is not None and storage.data_ptr() != result.data_ptr():
+        if (
+            result is not None
+            and storage is not None
+            and storage.data_ptr() != result.data_ptr()
+        ):
             for index, chunk in enumerate(storage.unbind(0)):
-                result.narrow(dim, index * value.shape[dim], value.shape[dim]).copy_(chunk)
+                result.narrow(
+                    dim, index * value.shape[dim], value.shape[dim]
+                ).copy_(chunk)
         return result
 
     def all_to_all(
@@ -336,25 +406,40 @@ class Communicator:
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Exchange leading-axis partitions in logical membership order."""
-
         for splits in (input_splits, output_splits):
             if (
                 not isinstance(splits, tuple)
                 or len(splits) != self.size
                 or any(type(count) is not int or count < 0 for count in splits)
             ):
-                raise ValueError("all-to-all requires one nonnegative count per member")
+                raise ValueError(
+                    "all-to-all requires one nonnegative count per member"
+                )
         if value.ndim == 0 or sum(input_splits) != value.shape[0]:
-            raise ValueError("all-to-all counts must cover the input leading axis")
+            raise ValueError(
+                "all-to-all counts must cover the input leading axis"
+            )
 
-        result = _destination(value, (sum(output_splits), *value.shape[1:]), out)
-        target = result if result.is_contiguous() else torch.empty_like(result).contiguous()
-        self._all_to_all_single_into(target, value.contiguous(), output_splits, input_splits)
+        result = _destination(
+            value, (sum(output_splits), *value.shape[1:]), out
+        )
+        target = (
+            result
+            if result.is_contiguous()
+            else torch.empty_like(result).contiguous()
+        )
+        self._all_to_all_single_into(
+            target, value.contiguous(), output_splits, input_splits
+        )
         return result if target is result else result.copy_(target)
 
-    def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor) -> None:
+    def _all_gather_into_tensor(
+        self, output: torch.Tensor, input: torch.Tensor
+    ) -> None:
         if output.numel() != input.numel() * self.size:
-            raise ValueError("all-gather output size must equal input size times group size")
+            raise ValueError(
+                "all-gather output size must equal input size times group size"
+            )
         if self.size == 1:
             output.reshape(-1).copy_(input.reshape(-1))
             return
@@ -381,7 +466,10 @@ class Communicator:
     ) -> None:
         for tensor, splits in ((output, output_splits), (input, input_splits)):
             if len(splits) != self.size or any(size < 0 for size in splits):
-                raise ValueError("all-to-all requires one nonnegative row count per group member")
+                raise ValueError(
+                    "all-to-all requires one nonnegative row count per group "
+                    "member"
+                )
             if sum(splits) != tensor.shape[0]:
                 raise ValueError("all-to-all row counts must cover the tensor")
         if self.size == 1:
@@ -391,7 +479,9 @@ class Communicator:
         name = self._require().group_name
         order = self._backend_order
         if tuple(sorted(self.ranks)) == self.ranks:
-            _all_to_all_single_into(output, input, list(output_splits), list(input_splits), name)
+            _all_to_all_single_into(
+                output, input, list(output_splits), list(input_splits), name
+            )
             return
 
         # Repack splits from logical member order into backend rank order,
@@ -408,7 +498,9 @@ class Communicator:
             name,
         )
         targets = output.split(tuple(output_splits), dim=0)
-        for index, chunk in zip(order, received.split(backend_output_splits, dim=0)):
+        for index, chunk in zip(
+            order, received.split(backend_output_splits, dim=0)
+        ):
             targets[index].copy_(chunk)
 
     def _gather_into_tensor(
@@ -420,12 +512,16 @@ class Communicator:
             if output is None or tuple(output.shape) != expected:
                 raise ValueError(f"gather output must have shape {expected}")
             if output.device != input.device or output.dtype != input.dtype:
-                raise ValueError("gather output must match input dtype and device")
+                raise ValueError(
+                    "gather output must match input dtype and device"
+                )
             chunks = list(output.unbind(0))
             gather_list = [chunks[index] for index in self._backend_order]
         else:
             if output is not None:
-                raise ValueError("only the gather destination may provide output storage")
+                raise ValueError(
+                    "only the gather destination may provide output storage"
+                )
             gather_list = None
 
         if self.size == 1:
@@ -438,7 +534,11 @@ class Communicator:
             bound.gather(gather_list, input, global_dst)
             return
         work = dist.gather(
-            input, gather_list=gather_list, dst=global_dst, group=group, async_op=True
+            input,
+            gather_list=gather_list,
+            dst=global_dst,
+            group=group,
+            async_op=True,
         )
         _finish(work, input)
 
@@ -446,9 +546,12 @@ class Communicator:
         self, value: torch.Tensor, *, src: int, out: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Broadcast from a group-local source into matching tensor storage."""
-
         global_src = self._peer(src)
-        result = value if out is None else _destination(value, tuple(value.shape), out)
+        result = (
+            value
+            if out is None
+            else _destination(value, tuple(value.shape), out)
+        )
         if result is not value:
             result.copy_(value)
         if self.size > 1:
@@ -461,10 +564,16 @@ class Communicator:
         return result
 
     def reduce_scatter(
-        self, value: torch.Tensor, *, dim: int = 0, out: torch.Tensor | None = None
+        self,
+        value: torch.Tensor,
+        *,
+        dim: int = 0,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Sum equal partitions and return the local logical member's partition."""
+        """Sum equal partitions.
 
+        Return the local logical member's partition.
+        """
         dim = _dimension(value, dim)
         shape = list(value.shape)
         shape[dim] = divide(shape[dim], self.size)
@@ -476,10 +585,15 @@ class Communicator:
         # reduce_scatter_tensor consumes a flat concatenation of partitions in
         # ascending backend rank order, one movedim-packed chunk per member.
         chunks = value.chunk(self.size, dim=dim)
-        packed = torch.cat([chunks[index].movedim(dim, 0) for index in self._backend_order], dim=0)
+        packed = torch.cat(
+            [chunks[index].movedim(dim, 0) for index in self._backend_order],
+            dim=0,
+        )
         output = result.movedim(dim, 0)
         if not output.is_contiguous():
-            output = torch.empty_like(output, memory_format=torch.contiguous_format)
+            output = torch.empty_like(
+                output, memory_format=torch.contiguous_format
+            )
 
         group = self._require()
         bound = stream_collectives(group.group_name)
@@ -490,8 +604,10 @@ class Communicator:
         return result.copy_(output.movedim(0, dim))
 
     def send(self, value: torch.Tensor, *, dst: int) -> None:
-        """Send a tensor's logical bytes, including dtypes unsupported by NCCL."""
+        """Send a tensor's logical bytes.
 
+        Including dtypes unsupported by NCCL.
+        """
         payload = value.contiguous().reshape(-1).view(torch.uint8)
         group = self._require()
         bound = stream_collectives(group.group_name)
@@ -501,16 +617,26 @@ class Communicator:
             dist.send(payload, dst=self._peer(dst), group=group)
 
     def recv(self, *, src: int, out: torch.Tensor) -> torch.Tensor:
-        """Receive bytes into caller-owned storage with the agreed shape and dtype."""
+        """Receive bytes into caller-owned storage.
 
+        With the agreed shape and dtype.
+        """
         value = out
-        storage = value if value.is_contiguous() else torch.empty_like(value).contiguous()
+        storage = (
+            value
+            if value.is_contiguous()
+            else torch.empty_like(value).contiguous()
+        )
         group = self._require()
         bound = stream_collectives(group.group_name)
         if bound is not None:
             bound.recv(storage.reshape(-1).view(torch.uint8), self._peer(src))
         else:
-            dist.recv(storage.reshape(-1).view(torch.uint8), src=self._peer(src), group=group)
+            dist.recv(
+                storage.reshape(-1).view(torch.uint8),
+                src=self._peer(src),
+                group=group,
+            )
         if storage is not value:
             value.copy_(storage)
         return value
@@ -523,20 +649,28 @@ class Communicator:
         src: int,
         out: torch.Tensor,
     ) -> torch.Tensor:
-        """Exchange tensor bytes with group-local peers in one batched P2P launch.
+        """Exchange tensor bytes with group-local peers.
 
-        Callers keep send storage live until stream completion and supply
-        contiguous receive storage with the peer's agreed tensor shape.
+        In one batched P2P launch. Callers keep send storage live until
+        stream completion and supply contiguous receive storage with the
+        peer's agreed tensor shape.
         """
-
         output = out
         global_dst, global_src = self._peer(dst), self._peer(src)
         if not output.is_contiguous():
-            raise ValueError("point-to-point exchange requires contiguous output storage")
+            raise ValueError(
+                "point-to-point exchange requires contiguous output storage"
+            )
 
         if self.size == 1:
             return output.copy_(value)
-        _send_recv(value.contiguous(), output, global_dst, global_src, self._require().group_name)
+        _send_recv(
+            value.contiguous(),
+            output,
+            global_dst,
+            global_src,
+            self._require().group_name,
+        )
         return output
 
 
@@ -587,7 +721,6 @@ class DeviceMesh:
 
     def coordinate(self, rank: int) -> tuple[int, ...]:
         """Return a member's coordinates in the declared rank ordering."""
-
         index = self.ranks.index(rank)
         coordinates = []
         for size in reversed(self.shape):
@@ -602,7 +735,9 @@ class DeviceMesh:
             or len(set(selected)) != len(selected)
             or any(axis not in self.axes for axis in selected)
         ):
-            raise ValueError(f"unknown or repeated mesh axes {axes!r}; declared: {self.axes}")
+            raise ValueError(
+                f"unknown or repeated mesh axes {axes!r}; declared: {self.axes}"
+            )
         return selected
 
     def size(self, axes: str | tuple[str, ...]) -> int:
@@ -610,26 +745,41 @@ class DeviceMesh:
         return prod(self.shape[self.axes.index(axis)] for axis in selected)
 
     def members(self, axes: tuple[str, ...]) -> tuple[tuple[int, ...], ...]:
-        """Enumerate fibers in topology order, ordering each by selected axes."""
+        """Enumerate fibers in topology order.
 
+        Ordering each by selected axes.
+        """
         selected = self._selection(axes)
         varying = tuple(self.axes.index(axis) for axis in selected)
-        fixed = tuple(index for index, axis in enumerate(self.axes) if axis not in selected)
+        fixed = tuple(
+            index
+            for index, axis in enumerate(self.axes)
+            if axis not in selected
+        )
         fibers = {}
         for rank in self.ranks:
             coordinate = self.coordinate(rank)
             key = tuple(coordinate[index] for index in fixed)
-            fibers.setdefault(key, []).append((tuple(coordinate[index] for index in varying), rank))
-        return tuple(tuple(rank for _, rank in sorted(fiber)) for fiber in fibers.values())
+            fibers.setdefault(key, []).append(
+                (tuple(coordinate[index] for index in varying), rank)
+            )
+        return tuple(
+            tuple(rank for _, rank in sorted(fiber))
+            for fiber in fibers.values()
+        )
 
     def get_group(self, axes: str | tuple[str, ...]) -> Communicator:
         selected = self._selection(axes)
         if self.rank not in self.ranks:
-            raise ValueError("nonparticipating rank cannot borrow a mesh communicator")
+            raise ValueError(
+                "nonparticipating rank cannot borrow a mesh communicator"
+            )
         if selected in self._groups:
             return self._groups[selected]
 
-        members = next(fiber for fiber in self.members(selected) if self.rank in fiber)
+        members = next(
+            fiber for fiber in self.members(selected) if self.rank in fiber
+        )
         # The same axis set selected in a different order shares one backend
         # group; only the logical member ordering of the descriptor changes.
         for axes, group in self._groups.items():
@@ -655,7 +805,9 @@ class DeviceMesh:
         selected = self._selection(axes)
         if self.rank not in self.ranks:
             raise ValueError("nonparticipating rank has no local submesh")
-        members = next(fiber for fiber in self.members(selected) if self.rank in fiber)
+        members = next(
+            fiber for fiber in self.members(selected) if self.rank in fiber
+        )
         result = DeviceMesh(
             ranks=members,
             shape=tuple(self.shape[self.axes.index(axis)] for axis in selected),

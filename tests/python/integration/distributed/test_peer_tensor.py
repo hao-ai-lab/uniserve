@@ -1,12 +1,12 @@
 """Runtime-owned peer tensors preserve ordered values and captured reuse."""
 
-from uniserve.distributed import DeviceMesh
 from pathlib import Path
 
 import pytest
 import torch
 import torch.multiprocessing as mp
 
+from uniserve.distributed import DeviceMesh
 from uniserve.runtime._peer_memory import allocate_peer_workspace
 from uniserve.runtime.process_groups import initialize_process_groups
 from uniserve_worker.bootstrap.config import ParallelConfig, SequenceConfig
@@ -26,7 +26,18 @@ def _run_peer_tensor(rank: int, rendezvous: str, world_size: int) -> None:
     )
     ranks = tuple(reversed(range(world_size)))
     bound_meshes = {}
-    for mesh_name, (mesh_ranks, mesh_parallel) in sorted(({'model': (ranks, ParallelConfig(sequence_parallel=SequenceConfig('ring', (world_size,))))}).items()):
+    for mesh_name, (mesh_ranks, mesh_parallel) in sorted(
+        (
+            {
+                "model": (
+                    ranks,
+                    ParallelConfig(
+                        sequence_parallel=SequenceConfig("ring", (world_size,))
+                    ),
+                )
+            }
+        ).items()
+    ):
         topology = DeviceMesh(
             ranks=mesh_ranks,
             shape=tuple(size for _, size in mesh_parallel.dimensions),
@@ -36,10 +47,16 @@ def _run_peer_tensor(rank: int, rendezvous: str, world_size: int) -> None:
         bound_mesh = environment.bind(topology, device=environment.device)
         if environment.rank in mesh_ranks:
             bound_meshes[mesh_name] = bound_mesh
-    mesh = bound_meshes['model']
-    group = mesh.get_group(tuple(axis for axis in mesh.axes if axis.startswith("cp")))
-    workspace = allocate_peer_workspace(group, (123, 7, 128), dtype=torch.bfloat16, row_multiple=64)
-    assert workspace.local.shape[0] >= 123 and workspace.local.shape[0] % 64 == 0
+    mesh = bound_meshes["model"]
+    group = mesh.get_group(
+        tuple(axis for axis in mesh.axes if axis.startswith("cp"))
+    )
+    workspace = allocate_peer_workspace(
+        group, (123, 7, 128), dtype=torch.bfloat16, row_multiple=64
+    )
+    assert (
+        workspace.local.shape[0] >= 123 and workspace.local.shape[0] % 64 == 0
+    )
     sync_input = torch.zeros(1, dtype=torch.int32, device=device)
     sync_output = torch.empty(world_size, dtype=torch.int32, device=device)
     output = torch.empty_like(workspace.global_tensor)
@@ -52,7 +69,10 @@ def _run_peer_tensor(rank: int, rendezvous: str, world_size: int) -> None:
         workspace.fence(sync_input, sync_output)
 
     def check_result(increments):
-        expected = torch.tensor(ranks, dtype=torch.bfloat16, device=device) + increments
+        expected = (
+            torch.tensor(ranks, dtype=torch.bfloat16, device=device)
+            + increments
+        )
         expected = expected.repeat_interleave(workspace.local.shape[0])
         expected = expected[:, None, None].expand_as(output)
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
@@ -72,7 +92,9 @@ def _run_peer_tensor(rank: int, rendezvous: str, world_size: int) -> None:
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_peer_tensor_preserves_ordered_rows_and_graph_reuse(tmp_path: Path, world_size: int):
+def test_peer_tensor_preserves_ordered_rows_and_graph_reuse(
+    tmp_path: Path, world_size: int
+):
     mp.spawn(
         _run_peer_tensor,
         ((tmp_path / "rendezvous").as_uri(), world_size),

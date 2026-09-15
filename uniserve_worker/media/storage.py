@@ -4,8 +4,10 @@ from ..foundation.shared_memory import allocate_shared_memory
 
 
 def publish_media_bytes(payload: bytes) -> str:
-    """Transfer ownership of final media storage to the host artifact consumer."""
+    """Transfer ownership of final media storage.
 
+    Ownership passes to the host artifact consumer.
+    """
     from multiprocessing import resource_tracker
 
     if not payload:

@@ -12,7 +12,6 @@ def timestep_embedding(
     timesteps: torch.Tensor, dim: int, max_period: float = 10000.0
 ) -> torch.Tensor:
     """Return cosine-then-sine FP32 features in GLIDE/DiT frequency order."""
-
     half = dim // 2
     frequency = torch.exp(
         -math.log(max_period)

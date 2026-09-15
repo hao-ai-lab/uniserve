@@ -21,19 +21,28 @@ from .modulation import TimestepEmbedding
 
 checkpoint_sources = (
     checkpoint.Config("denoiser", "transformer", module_path="denoiser"),
-    checkpoint.Config("text_encoder", "text_encoder", module_path="text_encoder"),
+    checkpoint.Config(
+        "text_encoder", "text_encoder", module_path="text_encoder"
+    ),
     checkpoint.Config("video_decoder", "vae", module_path="video_decoder"),
-    checkpoint.Config("audio_decoder", "audio_vae", module_path="audio_decoder"),
+    checkpoint.Config(
+        "audio_decoder", "audio_vae", module_path="audio_decoder"
+    ),
 )
 
 
 @cache
 def _transformer_names(config: TransformerConfig) -> frozenset[str]:
-    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+    from diffusers.models.transformers.transformer_minimax_h3 import (
+        MiniMaxH3Transformer3DModel,
+    )
 
     with torch.device("meta"):
         native = MiniMaxH3Transformer3DModel(
-            **{source: getattr(config, target) for source, target in TRANSFORMER_FIELDS.items()},
+            **{
+                source: getattr(config, target)
+                for source, target in TRANSFORMER_FIELDS.items()
+            },
             patch_size=(1, 2, 2),
             final_norm_eps=config.norm_eps,
         )
@@ -48,7 +57,10 @@ def _text_names(config) -> frozenset[str]:
     from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 
     native_config = Qwen3VLConfig(
-        text_config={source: getattr(config, target) for source, target in TEXT_FIELDS.items()},
+        text_config={
+            source: getattr(config, target)
+            for source, target in TEXT_FIELDS.items()
+        },
         vision_config={"depth": 27, "deepstack_visual_indexes": [8, 16, 24]},
     )
     with torch.device("meta"):
@@ -58,7 +70,9 @@ def _text_names(config) -> frozenset[str]:
 
 @cache
 def _video_names(config) -> frozenset[str]:
-    from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import AutoencoderKLMiniMaxH3
+    from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import (
+        AutoencoderKLMiniMaxH3,
+    )
 
     with torch.device("meta"):
         native = AutoencoderKLMiniMaxH3(**asdict(config))
@@ -77,11 +91,12 @@ def _audio_names(config) -> frozenset[str]:
 
 
 def _resident_layers(model):
-    """Keep checkpoint layers and endpoint heads at their mathematical PP stage."""
-
+    """Keep checkpoint layers and endpoint heads at their mathematical PP stage."""  # noqa: E501
     pipeline = model.mesh.get_group("pp" if "pp" in model.mesh.axes else ())
     if pipeline.size > model.config.num_hidden_layers:
-        raise ValueError("every H3 pipeline stage requires at least one transformer layer")
+        raise ValueError(
+            "every H3 pipeline stage requires at least one transformer layer"
+        )
     start = model.config.num_hidden_layers * pipeline.rank // pipeline.size
     stop = model.config.num_hidden_layers * (pipeline.rank + 1) // pipeline.size
     model.layers = nn.ModuleDict(
@@ -96,7 +111,6 @@ def _resident_layers(model):
 
 def transformer_assignments(model, reader):
     """Map independent attention branches and value-first SwiGLU source rows."""
-
     available = frozenset(reader.names())
     for name, parameter in model.named_parameters():
         branch = None
@@ -139,11 +153,15 @@ def transformer_assignments(model, reader):
             continue
         value = reader.get(source)
 
-        # SwiGLU branches share one fused checkpoint tensor with value rows first.
+        # SwiGLU branches share one fused checkpoint tensor with value rows
+        # first.
         region = None
         if branch is not None:
             width = value.shape[0] // 2
-            region = (slice(branch * width, (branch + 1) * width), slice(0, value.shape[1]))
+            region = (
+                slice(branch * width, (branch + 1) * width),
+                slice(0, value.shape[1]),
+            )
         yield weights.Assignment(parameter, value, source_slice=region)
 
 
@@ -162,14 +180,18 @@ def _prepare_modulation(model, diffusion, reader):
                 .to(device=device, dtype=torch.float32)
             )
             setattr(
-                embedding.video_projection[index], field, nn.Parameter(value, requires_grad=False)
+                embedding.video_projection[index],
+                field,
+                nn.Parameter(value, requires_grad=False),
             )
     ladder = schedules(diffusion, device=device)
     activated = torch.stack(
         [
             F.silu(embedding(torch.stack((video, audio))))
             for video, audio in zip(
-                ladder["video"].timesteps[:-1], ladder["audio"].timesteps[:-1], strict=True
+                ladder["video"].timesteps[:-1],
+                ladder["audio"].timesteps[:-1],
+                strict=True,
             )
         ]
     )
@@ -177,14 +199,21 @@ def _prepare_modulation(model, diffusion, reader):
 
     def projection(prefix):
         return tuple(
-            reader.get(f"{prefix}.{field}").read().to(device=device, dtype=torch.bfloat16)
+            reader.get(f"{prefix}.{field}")
+            .read()
+            .to(device=device, dtype=torch.bfloat16)
             for field in ("weight", "bias")
         )
 
     prepared = Modulation.from_projections(
         activated,
-        (projection(f"transformer_blocks.{index}.adaln_proj.linear") for index in model.layers),
-        projection("norm_out.linear") if model.output_norm is not None else None,
+        (
+            projection(f"transformer_blocks.{index}.adaln_proj.linear")
+            for index in model.layers
+        ),
+        projection("norm_out.linear")
+        if model.output_norm is not None
+        else None,
         layer_count=len(model.layers),
     )
     # Keep the existing module identity so the loader can retain its buffers
@@ -195,23 +224,34 @@ def _prepare_modulation(model, diffusion, reader):
 
 def transformer_component(model, diffusion):
     """Declare resident transformer matrices and streamed modulation sources."""
-
     _resident_layers(model)
     all_names = _transformer_names(model.config)
     nonresident = set()
     for name in all_names:
         parts = name.split(".")
         if name.startswith(
-            ("context_embedder.", "token_refiner.", "time_embedder.", "norm_out.linear.")
+            (
+                "context_embedder.",
+                "token_refiner.",
+                "time_embedder.",
+                "norm_out.linear.",
+            )
         ):
             nonresident.add(name)
         elif parts[0] == "transformer_blocks" and (
             parts[1] not in model.layers or parts[2] == "adaln_proj"
         ):
             nonresident.add(name)
-        elif model.video_input is None and parts[0] in {"proj_in", "audio_proj_in"}:
+        elif model.video_input is None and parts[0] in {
+            "proj_in",
+            "audio_proj_in",
+        }:
             nonresident.add(name)
-        elif model.output_norm is None and parts[0] in {"norm_out", "proj_out", "audio_proj_out"}:
+        elif model.output_norm is None and parts[0] in {
+            "norm_out",
+            "proj_out",
+            "audio_proj_out",
+        }:
             nonresident.add(name)
     return weights.ModuleMapping(
         model,
@@ -253,9 +293,10 @@ def _text_component(model):
 
 def checkpoint_mappings(model) -> tuple[weights.ModuleMapping, ...]:
     """Account for every native source using the complete model architecture."""
-
     denoiser = model.denoiser
-    transformer = transformer_component(denoiser.transformer, denoiser.diffusion)
+    transformer = transformer_component(
+        denoiser.transformer, denoiser.diffusion
+    )
     pipeline = denoiser.transformer.mesh.get_group(
         "pp" if "pp" in denoiser.transformer.mesh.axes else ()
     )
@@ -268,12 +309,16 @@ def checkpoint_mappings(model) -> tuple[weights.ModuleMapping, ...]:
             weights.ModuleMapping(
                 conditioner,
                 "denoiser",
-                lambda reader: tuple(conditioning_assignments(conditioner, reader)),
+                lambda reader: tuple(
+                    conditioning_assignments(conditioner, reader)
+                ),
                 frozenset(name for name, _ in conditioner.named_parameters()),
                 nonresident=frozenset(
                     name
                     for name in _transformer_names(denoiser.config)
-                    if not name.startswith(("context_embedder.", "token_refiner."))
+                    if not name.startswith(
+                        ("context_embedder.", "token_refiner.")
+                    )
                 ),
             )
         )

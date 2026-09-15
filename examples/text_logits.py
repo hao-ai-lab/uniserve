@@ -19,21 +19,25 @@ from uniserve_models.processing import load_tokenizer
 def text_logits(
     checkpoint: str, text: str, *, device: str = "cuda:0"
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return CPU token IDs and [tokens, vocabulary] logits for untemplated text.
+    """Return CPU token IDs and logits for untemplated text.
 
-    Capability discovery selects the language module of Qwen, BAGEL or U1.
-    Tokenization, prefix allocation and execution resources belong to this
-    caller; the numerical model receives only explicit tokens and index views.
+    Logits have shape [tokens, vocabulary]. Capability discovery selects
+    the language module of Qwen, BAGEL or U1. Tokenization, prefix allocation
+    and execution resources belong to this caller; the numerical model
+    receives only explicit tokens and index views.
     """
-
     metadata = read_config(checkpoint, modules=frozenset())
     with torch.device("meta"):
         architecture = metadata.model_class(metadata.model)
     paths = tuple(
-        path for path, module in architecture.named_modules() if isinstance(module, CausalLM)
+        path
+        for path, module in architecture.named_modules()
+        if isinstance(module, CausalLM)
     )
     if len(paths) != 1:
-        raise TypeError("this example requires one causal-language-model capability")
+        raise TypeError(
+            "this example requires one causal-language-model capability"
+        )
     path = paths[0]
     del architecture
     config = read_config(checkpoint, modules=frozenset({path}))
@@ -59,7 +63,10 @@ def text_logits(
     inputs = TextInput(input_ids.to(device), positions, attention)
     with (
         PrefixCache(
-            model.cache_config, num_blocks=blocks, block_size=block_size, device=device
+            model.cache_config,
+            num_blocks=blocks,
+            block_size=block_size,
+            device=device,
         ) as cache,
         ExecutionContext(model, cache=cache, attention="torch") as execution,
     ):
@@ -79,7 +86,9 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    input_ids, logits = text_logits(args.checkpoint, args.text, device=args.device)
+    input_ids, logits = text_logits(
+        args.checkpoint, args.text, device=args.device
+    )
     torch.save({"input_ids": input_ids, "logits": logits}, args.output)
     print(f"Saved {tuple(logits.shape)} {logits.dtype} logits to {args.output}")
 

@@ -17,7 +17,6 @@ from uniserve_models.processing import (
 
 def image_processor() -> ImageProcessor:
     """Build the checkpoint architecture's caller-owned image transforms."""
-
     return ImageProcessor(
         vit=PatchTransform(
             patch_size=16,
@@ -27,7 +26,9 @@ def image_processor() -> ImageProcessor:
             normalization="signed_unit",
         ),
         vae=TowerTransform(
-            StrideResize(max_size=512, min_size=16, stride=16, max_pixels=512 * 512)
+            StrideResize(
+                max_size=512, min_size=16, stride=16, max_pixels=512 * 512
+            )
         ),
         staging_dtype=torch.bfloat16,
         feature_injection=FeatureInjection(

@@ -16,12 +16,20 @@ from .operation import (
     TransferMode,
     computation,
 )
-from .validation import _bool, _enum, _map, _optional_uint, _seq, _str, _uint, _uints
+from .validation import (
+    _bool,
+    _enum,
+    _map,
+    _optional_uint,
+    _seq,
+    _str,
+    _uint,
+    _uints,
+)
 
 
 def _logprob_entries(value: object) -> tuple[tuple[int, float, int], ...]:
     """Read ranked scores carried directly by a result record."""
-
     # Each entry decodes to (token_id, logprob, rank) for one candidate token.
     entries = []
     for item in _seq(value, "logprob entries"):
@@ -39,7 +47,6 @@ def _logprob_entries(value: object) -> tuple[tuple[int, float, int], ...]:
 
 def _logprob_value(value: object) -> float:
     """Read a score, including negative infinity for zero-probability tokens."""
-
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise invalid_descriptor("logprob value must be numeric")
     return float(value)
@@ -47,16 +54,20 @@ def _logprob_value(value: object) -> float:
 
 @dataclass(frozen=True, slots=True)
 class FinishFlags:
-    """Records length, stop-token, EOS, and forced termination conditions for generated output."""
+    """Records length, stop-token, EOS, and forced termination conditions.
+
+    The conditions describe generated output.
+    """
 
     eos: bool = False
     length: bool = False
     stop: bool = False
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "finish_flags") -> FinishFlags:
+    def from_mapping(
+        cls, value: object, where: str = "finish_flags"
+    ) -> FinishFlags:
         """Parse EOS, length-limit, and stop-sequence termination flags."""
-
         data = _map(value, where)
         return cls(
             eos=_bool(data.get("eos", False), f"{where}.eos"),
@@ -66,13 +77,15 @@ class FinishFlags:
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize generation termination flags for IPC."""
-
         return {"eos": self.eos, "length": self.length, "stop": self.stop}
 
 
 @dataclass(frozen=True, slots=True)
 class TimingCounters:
-    """Accumulates queue, device, copy, and host execution time in microseconds."""
+    """Accumulates queue, device, copy, and host execution time.
+
+    All values are in microseconds.
+    """
 
     queued_us: int = 0
     device_us: int = 0
@@ -80,9 +93,13 @@ class TimingCounters:
     host_us: int = 0
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "timing_counters") -> TimingCounters:
-        """Parse nonnegative queue, device, copy, and host timings in microseconds."""
+    def from_mapping(
+        cls, value: object, where: str = "timing_counters"
+    ) -> TimingCounters:
+        """Parse nonnegative queue, device, copy, and host timings.
 
+        All values are in microseconds.
+        """
         data = _map(value, where)
         return cls(
             queued_us=_uint(data.get("queued_us", 0), f"{where}.queued_us"),
@@ -93,7 +110,6 @@ class TimingCounters:
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize execution-stage timings in microseconds for IPC."""
-
         return {
             "queued_us": self.queued_us,
             "device_us": self.device_us,
@@ -110,14 +126,16 @@ class PosixShmArtifact:
 
     def __post_init__(self) -> None:
         """Validate the shared-memory artifact name and byte length."""
-
         if not self.name or "/" in self.name:
-            raise invalid_descriptor("POSIX shared-memory artifact name is invalid")
+            raise invalid_descriptor(
+                "POSIX shared-memory artifact name is invalid"
+            )
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "artifact handle") -> PosixShmArtifact:
+    def from_mapping(
+        cls, value: object, where: str = "artifact handle"
+    ) -> PosixShmArtifact:
         """Parse and validate a POSIX shared-memory media handle."""
-
         data = _map(value, where)
         if data.get("transport") != "posix_shm":
             raise invalid_descriptor(f"{where}.transport is invalid")
@@ -126,42 +144,51 @@ class PosixShmArtifact:
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize the shared-memory handle as a tagged transport value."""
-
         return {"transport": "posix_shm", "value": {"name": self.name}}
 
 
 @dataclass(frozen=True, slots=True)
 class MediaOutput:
-    """Describes a produced media artifact by format, dimensions, duration, and storage reference."""
+    """Describes a produced media artifact.
+
+    Covers format, dimensions, duration, and storage reference.
+    """
 
     handle: PosixShmArtifact
     bytes: int
 
     def __post_init__(self) -> None:
-        """Validate media format, dimensions, duration, and artifact consistency."""
+        """Validate media format, dimensions, and duration.
 
+        Also validates artifact consistency.
+        """
         if self.bytes < 1:
             raise invalid_descriptor("media output locator is invalid")
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "media_output") -> MediaOutput:
+    def from_mapping(
+        cls, value: object, where: str = "media_output"
+    ) -> MediaOutput:
         """Parse a validated media artifact handle and byte extent."""
-
         data = _map(value, where)
         return cls(
-            handle=PosixShmArtifact.from_mapping(data.get("handle"), f"{where}.handle"),
+            handle=PosixShmArtifact.from_mapping(
+                data.get("handle"), f"{where}.handle"
+            ),
             bytes=_uint(data.get("bytes"), f"{where}.bytes"),
         )
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize a completed media artifact for IPC."""
-
         return {"handle": self.handle.to_mapping(), "bytes": self.bytes}
 
 
 @dataclass(frozen=True, slots=True)
 class RequestOutput:
-    """An operation completion with accepted progress, tokens, products, and timing."""
+    """An operation completion with accepted progress and tokens.
+
+    Also carries products and timing.
+    """
 
     request_key: identity.RequestKey
     op_id: identity.ComputationId
@@ -183,8 +210,11 @@ class RequestOutput:
     prompt_logprobs: tuple[tuple[tuple[int, float, int], ...], ...] = ()
 
     def validate(self) -> None:
-        """Verify that status, products, errors, and timing form a coherent completion."""
+        """Verify completion coherence.
 
+        Status, products, errors, and timing must form a coherent
+        completion.
+        """
         if self.op_id.batch_id < 1:
             raise invalid_descriptor("completion op id must be positive")
         if self.kv_output is not None and (
@@ -193,20 +223,35 @@ class RequestOutput:
             or self.kv_output.source.owner != self.request_key
             or self.kv_output.source.producer_op_id != self.op_id
         ):
-            raise invalid_descriptor("KV publication does not belong to its successful completion")
+            raise invalid_descriptor(
+                "KV publication does not belong to its successful completion"
+            )
 
         if self.kv_visible_len > self.kv_computed_len:
-            raise invalid_descriptor("completion selected KV length exceeds computed length")
+            raise invalid_descriptor(
+                "completion selected KV length exceeds computed length"
+            )
         if (
-            min(self.position, self.kv_visible_len, self.kv_computed_len, self.num_completed_steps)
+            min(
+                self.position,
+                self.kv_visible_len,
+                self.kv_computed_len,
+                self.num_completed_steps,
+            )
             < 0
         ):
-            raise invalid_descriptor("completion execution coordinates must be non-negative")
+            raise invalid_descriptor(
+                "completion execution coordinates must be non-negative"
+            )
         if self.status is OpStatus.ERROR:
             if self.error_code is None:
-                raise invalid_descriptor("an error completion must carry an error code")
+                raise invalid_descriptor(
+                    "an error completion must carry an error code"
+                )
         elif self.error_code is not None:
-            raise invalid_descriptor("a non-error completion must not carry an error code")
+            raise invalid_descriptor(
+                "a non-error completion must not carry an error code"
+            )
         if self.status is OpStatus.PREDICATED and (
             self.committed_tokens
             or self.sampled_logprob is not None
@@ -218,22 +263,30 @@ class RequestOutput:
             or self.finish_flags.stop
         ):
             raise invalid_descriptor(
-                "a predicated completion must select its parent without semantic output"
+                "a predicated completion must select its parent without "
+                "semantic output"
             )
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "completion") -> RequestOutput:
-        """Parse a completion and enforce its status-specific result and error rules."""
+    def from_mapping(
+        cls, value: object, where: str = "completion"
+    ) -> RequestOutput:
+        """Parse a completion.
 
+        Enforces its status-specific result and error rules.
+        """
         data = _map(value, where)
         record = cls(
             request_key=identity.RequestKey.from_mapping(
                 data.get("request_key"), f"{where}.request_key"
             ),
-            op_id=identity.ComputationId.from_mapping(data.get("op_id"), f"{where}.op_id"),
+            op_id=identity.ComputationId.from_mapping(
+                data.get("op_id"), f"{where}.op_id"
+            ),
             status=_enum(OpStatus, data.get("status"), f"{where}.status"),
             product_generations=_uints(
-                data.get("product_generations", ()), f"{where}.product_generations"
+                data.get("product_generations", ()),
+                f"{where}.product_generations",
             ),
             error_code=(
                 None
@@ -245,8 +298,12 @@ class RequestOutput:
             ),
             kind=computation(data.get("code"), f"{where}.code"),
             position=_uint(data.get("position"), f"{where}.position"),
-            kv_visible_len=_uint(data.get("kv_visible_len"), f"{where}.kv_visible_len"),
-            kv_computed_len=_uint(data.get("kv_computed_len"), f"{where}.kv_computed_len"),
+            kv_visible_len=_uint(
+                data.get("kv_visible_len"), f"{where}.kv_visible_len"
+            ),
+            kv_computed_len=_uint(
+                data.get("kv_computed_len"), f"{where}.kv_computed_len"
+            ),
             num_completed_steps=_uint(
                 data.get("num_completed_steps"), f"{where}.num_completed_steps"
             ),
@@ -258,26 +315,36 @@ class RequestOutput:
             top_logprobs=_logprob_entries(data.get("top_logprobs", ())),
             prompt_logprobs=tuple(
                 _logprob_entries(entries)
-                for entries in _seq(data.get("prompt_logprobs", ()), "prompt_logprobs")
+                for entries in _seq(
+                    data.get("prompt_logprobs", ()), "prompt_logprobs"
+                )
             ),
-            committed_tokens=_uints(data.get("committed_tokens", ()), f"{where}.committed_tokens"),
+            committed_tokens=_uints(
+                data.get("committed_tokens", ()), f"{where}.committed_tokens"
+            ),
             finish_flags=FinishFlags.from_mapping(
                 data.get("finish_flags"), f"{where}.finish_flags"
             ),
             kv_output=None
             if data.get("kv_output") is None
-            else transfer.KvTransfer.from_mapping(data["kv_output"], f"{where}.kv_output"),
+            else transfer.KvTransfer.from_mapping(
+                data["kv_output"], f"{where}.kv_output"
+            ),
             media_output=None
             if data.get("media_output") is None
-            else MediaOutput.from_mapping(data["media_output"], f"{where}.media_output"),
+            else MediaOutput.from_mapping(
+                data["media_output"], f"{where}.media_output"
+            ),
         )
 
         record.validate()
         return record
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode one operation completion with accepted progress, products, timing, and error metadata."""
+        """Encode one operation completion.
 
+        Includes accepted progress, products, timing, and error metadata.
+        """
         flags = self.finish_flags
         key = self.request_key
         timing = self.timing_counters
@@ -308,9 +375,17 @@ class RequestOutput:
                 ]
                 for entries in self.prompt_logprobs
             ],
-            "finish_flags": {"eos": flags.eos, "length": flags.length, "stop": flags.stop},
-            "media_output": None if self.media_output is None else self.media_output.to_mapping(),
-            "kv_output": None if self.kv_output is None else self.kv_output.to_mapping(),
+            "finish_flags": {
+                "eos": flags.eos,
+                "length": flags.length,
+                "stop": flags.stop,
+            },
+            "media_output": None
+            if self.media_output is None
+            else self.media_output.to_mapping(),
+            "kv_output": None
+            if self.kv_output is None
+            else self.kv_output.to_mapping(),
             "product_generations": list(self.product_generations),
             "error_code": None if error_code is None else error_code.value,
             "timing_counters": {
@@ -324,7 +399,10 @@ class RequestOutput:
 
 @dataclass(frozen=True, slots=True)
 class ForwardStats:
-    """Aggregates model-path, attention, graph, relay, and speculative-decoding measurements for a run."""
+    """Aggregates model-path, attention, graph, and relay measurements.
+
+    Also aggregates speculative-decoding measurements for a run.
+    """
 
     mode_counts: Mapping[str, int] = field(default_factory=dict)
     mode_tokens: Mapping[str, int] = field(default_factory=dict)
@@ -339,7 +417,9 @@ class ForwardStats:
     cuda_graph_fallbacks: int = 0
     cuda_graph_unpadded_tokens: int = 0
     cuda_graph_padded_tokens: int = 0
-    cuda_graph_runtime_mode_counts: Mapping[str, int] = field(default_factory=dict)
+    cuda_graph_runtime_mode_counts: Mapping[str, int] = field(
+        default_factory=dict
+    )
     text_decode_token_relay_hits: int = 0
     text_decode_token_relay_misses: int = 0
     text_decode_position_relay_hits: int = 0
@@ -359,8 +439,10 @@ class ForwardStats:
 
     @classmethod
     def combine(cls, values: Sequence[ForwardStats]) -> ForwardStats:
-        """Sum scalar and keyed counters without changing their wire definitions."""
+        """Sum scalar and keyed counters.
 
+        Does not change their wire definitions.
+        """
         if not values:
             return cls()
         if len(values) == 1:
@@ -372,7 +454,9 @@ class ForwardStats:
             if isinstance(fields[0], Mapping):
                 totals: dict[str, int] = {}
                 for field_value in fields:
-                    for key, count in cast(Mapping[str, int], field_value).items():
+                    for key, count in cast(
+                        Mapping[str, int], field_value
+                    ).items():
                         totals[key] = totals.get(key, 0) + count
                 merged[name] = totals
             else:
@@ -381,17 +465,22 @@ class ForwardStats:
         return cls(**cast(Any, merged))
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "worker forward stats") -> ForwardStats:
-        """Parse aggregate execution counters and reject malformed mode, backend, or speculative statistics."""
+    def from_mapping(
+        cls, value: object, where: str = "worker forward stats"
+    ) -> ForwardStats:
+        """Parse aggregate execution counters.
 
+        Rejects malformed mode, backend, or speculative statistics.
+        """
         data = _map(value, where)
 
         def counter_map(name: str) -> dict[str, int]:
             """Parse one string-keyed map of nonnegative execution counters."""
-
             values = _map(data.get(name, {}), f"{where}.{name}")
             return {
-                _str(key, f"{where}.{name}.key"): _uint(raw, f"{where}.{name}.{key}")
+                _str(key, f"{where}.{name}.key"): _uint(
+                    raw, f"{where}.{name}.{key}"
+                )
                 for key, raw in values.items()
             }
 
@@ -448,35 +537,68 @@ class ForwardStats:
             cuda_graph_replays=scalar_fields["cuda_graph_replays"],
             cuda_graph_misses=scalar_fields["cuda_graph_misses"],
             cuda_graph_fallbacks=scalar_fields["cuda_graph_fallbacks"],
-            cuda_graph_unpadded_tokens=scalar_fields["cuda_graph_unpadded_tokens"],
+            cuda_graph_unpadded_tokens=scalar_fields[
+                "cuda_graph_unpadded_tokens"
+            ],
             cuda_graph_padded_tokens=scalar_fields["cuda_graph_padded_tokens"],
-            cuda_graph_runtime_mode_counts=map_fields["cuda_graph_runtime_mode_counts"],
-            text_decode_token_relay_hits=scalar_fields["text_decode_token_relay_hits"],
-            text_decode_token_relay_misses=scalar_fields["text_decode_token_relay_misses"],
-            text_decode_position_relay_hits=scalar_fields["text_decode_position_relay_hits"],
-            text_decode_position_relay_misses=scalar_fields["text_decode_position_relay_misses"],
-            flashinfer_decode_plan_calls=scalar_fields["flashinfer_decode_plan_calls"],
-            flashinfer_decode_plan_reuses=scalar_fields["flashinfer_decode_plan_reuses"],
-            flashinfer_decode_plan_rows=scalar_fields["flashinfer_decode_plan_rows"],
-            flashinfer_decode_plan_indices=scalar_fields["flashinfer_decode_plan_indices"],
-            flashinfer_decode_graph_plan_calls=scalar_fields["flashinfer_decode_graph_plan_calls"],
+            cuda_graph_runtime_mode_counts=map_fields[
+                "cuda_graph_runtime_mode_counts"
+            ],
+            text_decode_token_relay_hits=scalar_fields[
+                "text_decode_token_relay_hits"
+            ],
+            text_decode_token_relay_misses=scalar_fields[
+                "text_decode_token_relay_misses"
+            ],
+            text_decode_position_relay_hits=scalar_fields[
+                "text_decode_position_relay_hits"
+            ],
+            text_decode_position_relay_misses=scalar_fields[
+                "text_decode_position_relay_misses"
+            ],
+            flashinfer_decode_plan_calls=scalar_fields[
+                "flashinfer_decode_plan_calls"
+            ],
+            flashinfer_decode_plan_reuses=scalar_fields[
+                "flashinfer_decode_plan_reuses"
+            ],
+            flashinfer_decode_plan_rows=scalar_fields[
+                "flashinfer_decode_plan_rows"
+            ],
+            flashinfer_decode_plan_indices=scalar_fields[
+                "flashinfer_decode_plan_indices"
+            ],
+            flashinfer_decode_graph_plan_calls=scalar_fields[
+                "flashinfer_decode_graph_plan_calls"
+            ],
             flashinfer_decode_graph_plan_reuses=scalar_fields[
                 "flashinfer_decode_graph_plan_reuses"
             ],
             spec_verify_rows=scalar_fields["spec_verify_rows"],
             spec_verify_draft_tokens=scalar_fields["spec_verify_draft_tokens"],
-            spec_verify_accepted_tokens=scalar_fields["spec_verify_accepted_tokens"],
-            spec_verify_rejected_tokens=scalar_fields["spec_verify_rejected_tokens"],
-            spec_verify_committed_tokens=scalar_fields["spec_verify_committed_tokens"],
+            spec_verify_accepted_tokens=scalar_fields[
+                "spec_verify_accepted_tokens"
+            ],
+            spec_verify_rejected_tokens=scalar_fields[
+                "spec_verify_rejected_tokens"
+            ],
+            spec_verify_committed_tokens=scalar_fields[
+                "spec_verify_committed_tokens"
+            ],
             spec_verify_path_counts=map_fields["spec_verify_path_counts"],
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize scalar and keyed execution counters using plain wire values."""
+        """Serialize scalar and keyed execution counters.
 
+        Uses plain wire values.
+        """
         return {
             name: dict(value) if isinstance(value, Mapping) else value
-            for name, value in ((name, getattr(self, name)) for name in self.__dataclass_fields__)
+            for name, value in (
+                (name, getattr(self, name))
+                for name in self.__dataclass_fields__
+            )
         }
 
 
@@ -495,15 +617,20 @@ class BatchOutput:
 
     @classmethod
     def combine(cls, fragments: Sequence[BatchOutput]) -> BatchOutput:
-        """Collect response fragments from one run without changing field ordering."""
+        """Collect response fragments from one run.
 
+        Does not change field ordering.
+        """
         if not fragments:
             raise ValueError("batch output requires at least one fragment")
         first = fragments[0]
         if any(
-            (value.batch_id, value.run_id) != (first.batch_id, first.run_id) for value in fragments
+            (value.batch_id, value.run_id) != (first.batch_id, first.run_id)
+            for value in fragments
         ):
-            raise invalid_descriptor("output fragments belong to different batches")
+            raise invalid_descriptor(
+                "output fragments belong to different batches"
+            )
 
         # Only fragments that carry results participate in merged timing,
         # stats, and registration visibility; empty fragments are inert.
@@ -516,17 +643,28 @@ class BatchOutput:
             or value.forward_stats is not None
         )
         durations = tuple(
-            value.worker_exec_us for value in payloads if value.worker_exec_us is not None
+            value.worker_exec_us
+            for value in payloads
+            if value.worker_exec_us is not None
         )
-        stats = tuple(value.forward_stats for value in payloads if value.forward_stats is not None)
+        stats = tuple(
+            value.forward_stats
+            for value in payloads
+            if value.forward_stats is not None
+        )
 
         return cls(
             batch_id=first.batch_id,
             run_id=first.run_id,
-            completions=tuple(output for value in fragments for output in value.completions),
-            products=tuple(output for value in fragments for output in value.products),
+            completions=tuple(
+                output for value in fragments for output in value.completions
+            ),
+            products=tuple(
+                output for value in fragments for output in value.products
+            ),
             registration=RegistrationAck(
-                visible=bool(payloads) and all(value.registration.visible for value in payloads)
+                visible=bool(payloads)
+                and all(value.registration.visible for value in payloads)
             ),
             worker_exec_us=max(durations) if durations else None,
             forward_stats=ForwardStats.combine(stats) if stats else None,
@@ -534,38 +672,54 @@ class BatchOutput:
         )
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "completion report") -> BatchOutput:
-        """Parse the unchanged flat response fields without execution wrappers."""
+    def from_mapping(
+        cls, value: object, where: str = "completion report"
+    ) -> BatchOutput:
+        """Parse the unchanged flat response fields.
 
+        Adds no execution wrappers.
+        """
         data = _map(value, where)
         return cls(
             batch_id=_uint(data.get("batch_id"), f"{where}.batch_id"),
             run_id=_uint(data.get("run_id"), f"{where}.run_id"),
             completions=tuple(
-                RequestOutput.from_mapping(item, f"{where}.completions[{index}]")
+                RequestOutput.from_mapping(
+                    item, f"{where}.completions[{index}]"
+                )
                 for index, item in enumerate(
                     _seq(data.get("completions", ()), f"{where}.completions")
                 )
             ),
             products=tuple(
-                TensorPublication.from_mapping(item, f"{where}.products[{index}]")
-                for index, item in enumerate(_seq(data.get("products", ()), f"{where}.products"))
+                TensorPublication.from_mapping(
+                    item, f"{where}.products[{index}]"
+                )
+                for index, item in enumerate(
+                    _seq(data.get("products", ()), f"{where}.products")
+                )
             ),
             registration=RegistrationAck.from_mapping(
                 data.get("registration", {}), f"{where}.registration"
             ),
-            worker_exec_us=_optional_uint(data.get("worker_exec_us"), f"{where}.worker_exec_us"),
+            worker_exec_us=_optional_uint(
+                data.get("worker_exec_us"), f"{where}.worker_exec_us"
+            ),
             forward_stats=(
                 None
                 if data.get("forward_stats") is None
-                else ForwardStats.from_mapping(data["forward_stats"], f"{where}.forward_stats")
+                else ForwardStats.from_mapping(
+                    data["forward_stats"], f"{where}.forward_stats"
+                )
             ),
             done=_bool(data.get("done", True), f"{where}.done"),
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode final values in protocol order; pending resources cannot enter this type."""
+        """Encode final values in protocol order.
 
+        Pending resources cannot enter this type.
+        """
         return {
             "batch_id": self.batch_id,
             "run_id": self.run_id,

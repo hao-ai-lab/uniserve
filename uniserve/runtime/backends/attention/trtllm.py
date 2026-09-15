@@ -31,11 +31,17 @@ class _TRTLLM(_Operator):
         from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
         if self.head_dim not in {64, 128, 256}:
-            raise ValueError("TensorRT-LLM MHA requires head dimension 64, 128 or 256")
+            raise ValueError(
+                "TensorRT-LLM MHA requires head dimension 64, 128 or 256"
+            )
         if self.dtype not in {torch.float16, torch.bfloat16}:
             raise ValueError("TensorRT-LLM MHA requires FP16 or BF16 queries")
-        if self.cache is not None and isinstance(self.cache.key, QuantizedTensor):
-            raise ValueError("TensorRT-LLM MHA does not consume per-block FP8 prefix scales")
+        if self.cache is not None and isinstance(
+            self.cache.key, QuantizedTensor
+        ):
+            raise ValueError(
+                "TensorRT-LLM MHA does not consume per-block FP8 prefix scales"
+            )
         self._decode = trtllm_batch_decode_with_kv_cache
         self._prefill = trtllm_batch_context_with_kv_cache
         self.workspace["scratch"].zero_()
@@ -63,13 +69,20 @@ class _TRTLLM(_Operator):
             return out
 
         if q.ndim != 3 or (
-            batch.queries.num_tokens is not None and q.shape[0] != batch.queries.num_tokens
+            batch.queries.num_tokens is not None
+            and q.shape[0] != batch.queries.num_tokens
         ):
-            raise ValueError("packed attention rows must match their declared query lengths")
+            raise ValueError(
+                "packed attention rows must match their declared query lengths"
+            )
 
-        key, value = (k, v) if self.cache is None else (self.cache.key, self.cache.value)
+        key, value = (
+            (k, v) if self.cache is None else (self.cache.key, self.cache.value)
+        )
         if key.ndim != 4:
-            raise ValueError("TensorRT-LLM MHA requires physical paged K/V backing")
+            raise ValueError(
+                "TensorRT-LLM MHA requires physical paged K/V backing"
+            )
         cache = (_head_major(key), _head_major(value))
 
         # Native stores require contiguous, aligned backing. An aliased
@@ -78,9 +91,16 @@ class _TRTLLM(_Operator):
         direct = (
             out.is_contiguous()
             and out.data_ptr() % 16 == 0
-            and not any(torch._C._overlaps(out, tensor) for tensor in (q, k, v, key, value))
+            and not any(
+                torch._C._overlaps(out, tensor)
+                for tensor in (q, k, v, key, value)
+            )
         )
-        destination = out if direct else torch.empty(out.shape, dtype=out.dtype, device=out.device)
+        destination = (
+            out
+            if direct
+            else torch.empty(out.shape, dtype=out.dtype, device=out.device)
+        )
 
         if len(set(batch.causal)) > 1 and batch.write_indices is not None:
             # Causal runs slice query domains. Commit the complete write once
@@ -98,21 +118,27 @@ class _TRTLLM(_Operator):
 
             # The table's capacity is invariant across replay; actual key
             # lengths remain device inputs, including a growing decode prefix.
-            maximum = run.block_table.indices.shape[1] * run.block_table.block_size
-            options = dict(
-                query=query.contiguous(),
-                kv_cache=cache,
-                workspace_buffer=self.workspace["scratch"],
-                block_tables=run.block_table.indices.to(dtype=torch.int32).contiguous(),
-                seq_lens=lengths,
-                bmm1_scale=float(scale),
-                bmm2_scale=1.0,
-                window_left=-1,
-                out_dtype=q.dtype,
-                out=destination[query_slice],
-                kv_layout="HND",
+            maximum = (
+                run.block_table.indices.shape[1] * run.block_table.block_size
             )
-            if run.queries.host is not None and all(count == 1 for count in run.queries.host):
+            options = {
+                "query": query.contiguous(),
+                "kv_cache": cache,
+                "workspace_buffer": self.workspace["scratch"],
+                "block_tables": run.block_table.indices.to(
+                    dtype=torch.int32
+                ).contiguous(),
+                "seq_lens": lengths,
+                "bmm1_scale": float(scale),
+                "bmm2_scale": 1.0,
+                "window_left": -1,
+                "out_dtype": q.dtype,
+                "out": destination[query_slice],
+                "kv_layout": "HND",
+            }
+            if run.queries.host is not None and all(
+                count == 1 for count in run.queries.host
+            ):
                 self._decode(max_seq_len=maximum, **options)
             else:
                 self._prefill(
@@ -138,7 +164,9 @@ class Backend(_Backend):
             raise ValueError("TensorRT-LLM workspace size must be positive")
         self.workspace_size = workspace_size
 
-    def workspace_buffers(self, *, num_heads, num_kv_heads, head_dim, dtype, size, cache):
+    def workspace_buffers(
+        self, *, num_heads, num_kv_heads, head_dim, dtype, size, cache
+    ):
         return {
             "scratch": BufferConfig((self.workspace_size,), torch.uint8),
             "lengths": BufferConfig((size.batch_size,), torch.int32),

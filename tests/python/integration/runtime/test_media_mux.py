@@ -1,4 +1,7 @@
-"""Encoded media preserves declared frame order, dimensions and output clocks."""
+"""Encoded media preserves declared frame order and dimensions.
+
+It also preserves output clocks.
+"""
 
 import io
 
@@ -35,7 +38,10 @@ def test_audio_and_ordered_video_units_form_a_decodable_mp4():
         video, audio = container.streams.video[0], container.streams.audio[0]
         assert (video.width, video.height, video.average_rate) == (32, 16, 24)
         assert (audio.sample_rate, audio.layout.name) == (32000, "stereo")
-        assert abs(float(audio.duration * audio.time_base) - 6 / 24) <= 1024 / 32000
+        assert (
+            abs(float(audio.duration * audio.time_base) - 6 / 24)
+            <= 1024 / 32000
+        )
         frames = tuple(container.decode(video))
         assert len(frames) == 6
         for index, frame in enumerate(frames):

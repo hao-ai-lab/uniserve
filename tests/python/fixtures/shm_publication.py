@@ -6,12 +6,15 @@ import socket
 import uuid
 from multiprocessing import shared_memory
 
-from uniserve_worker.protocol.transfer import Locator, PosixShmTransfer, WorkerEndpoint
+from uniserve_worker.protocol.transfer import (
+    Locator,
+    PosixShmTransfer,
+    WorkerEndpoint,
+)
 
 
 def serve_pending_publication(channel, shape=(1024,)) -> None:
     """Exit on command before permitting a registered reader to access bytes."""
-
     storage = shared_memory.SharedMemory(create=True, size=4096)
     endpoint = f"uniserve-test-pending-{uuid.uuid4().hex}"
     try:
@@ -20,7 +23,9 @@ def serve_pending_publication(channel, shape=(1024,)) -> None:
             listener.listen(1)
             locator = Locator(
                 source=WorkerEndpoint.local("publisher"),
-                transport=PosixShmTransfer(endpoint=endpoint, name=storage.name),
+                transport=PosixShmTransfer(
+                    endpoint=endpoint, name=storage.name
+                ),
                 nbytes=4096,
                 dtype="float32",
                 shape=shape,

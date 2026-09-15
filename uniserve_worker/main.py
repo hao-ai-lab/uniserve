@@ -14,8 +14,10 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> None:
-    """Configure diagnostics and run the worker until shutdown or interruption."""
+    """Configure diagnostics and run the worker.
 
+    The worker runs until shutdown or interruption.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -32,8 +34,10 @@ def main() -> None:
 
 
 def _install_fault_dump_handlers() -> None:
-    """Enable Python fault dumps and register user-triggered traceback signals."""
+    """Enable Python fault dumps.
 
+    Also register user-triggered traceback signals.
+    """
     for sig_name in ("SIGQUIT", "SIGUSR1"):
         sig = getattr(signal, sig_name, None)
         if sig is None:
@@ -41,7 +45,10 @@ def _install_fault_dump_handlers() -> None:
         try:
             faulthandler.register(sig, file=sys.stderr, all_threads=True)
         except Exception:
-            logger.debug("could not register faulthandler signal", extra={"signal": sig_name})
+            logger.debug(
+                "could not register faulthandler signal",
+                extra={"signal": sig_name},
+            )
 
 
 if __name__ == "__main__":

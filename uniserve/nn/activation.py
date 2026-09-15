@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -19,9 +19,10 @@ __all__ = [
 class SiLUAndMul(nn.Module):
     """Apply SiLU gating to equal channel halves of a packed tensor."""
 
-    def forward(self, x: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, *, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Apply SiLU to the gate half and multiply by the value half."""
-
         return functional.silu_and_mul(x, out=out)
 
 
@@ -30,13 +31,13 @@ class GELUAndMul(nn.Module):
 
     def __init__(self, approximate: str = "none") -> None:
         """Select the PyTorch GELU approximation used by the gate."""
-
         super().__init__()
         self.approximate = approximate
 
-    def forward(self, x: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, *, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Apply GELU to the gate half and multiply by the value half."""
-
         return functional.gelu_and_mul(x, approximate=self.approximate, out=out)
 
 
@@ -57,8 +58,9 @@ _ACT_FN_REGISTRY: dict[str, Callable[[], nn.Module]] = {
 
 
 def get_act_fn(name: str) -> nn.Module:
-    """Construct the registered activation module for a checkpoint activation name."""
-
+    """Construct the registered activation module for a checkpoint activation
+    name.
+    """  # noqa: D205
     factory = _ACT_FN_REGISTRY.get(name.lower())
     if factory is None:
         raise ValueError(f"unknown activation {name!r}")

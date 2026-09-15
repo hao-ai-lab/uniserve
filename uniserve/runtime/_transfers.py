@@ -12,7 +12,6 @@ _ACTIVE = ContextVar("uniserve_transfers", default=None)
 
 def _map(value, function):
     """Apply ``function`` to every tensor inside a nested argument structure."""
-
     if isinstance(value, torch.Tensor):
         return function(value)
     if is_dataclass(value) and not isinstance(value, type):
@@ -36,14 +35,15 @@ def _map(value, function):
 
 def _copy_out(value, out):
     """Return caller output storage after delivery from a remote module."""
-
     if isinstance(out, torch.Tensor):
         return out.copy_(value, non_blocking=out.device.type != "cpu")
     if isinstance(out, Mapping) and isinstance(value, Mapping):
         for name, destination in out.items():
             _copy_out(value[name], destination)
         return out
-    raise TypeError("cross-device output storage must be a tensor or named tensors")
+    raise TypeError(
+        "cross-device output storage must be a tensor or named tensors"
+    )
 
 
 @dataclass
@@ -61,8 +61,11 @@ class _Binding:
         self.calls = ContextVar("uniserve_transfer_calls", default=())
 
     def prepare(self, args, kwargs):
-        """Record the caller's devices, select the delivery stream, and move inputs."""
+        """Record devices, select the stream, and move inputs.
 
+        Record the caller's devices, select the delivery stream, and move
+        inputs.
+        """
         devices = []
 
         def locate(value):
@@ -72,7 +75,9 @@ class _Binding:
         _map((args, kwargs), locate)
         target = devices[0] if devices else None
 
-        origin = torch.cuda.current_stream() if self.device.type == "cuda" else None
+        origin = (
+            torch.cuda.current_stream() if self.device.type == "cuda" else None
+        )
         stream = origin
         if origin is not None and origin.device != self.device:
             key = (origin.device, origin.cuda_stream, self.device)
@@ -81,17 +86,31 @@ class _Binding:
                 # A graph can use a different root stream from eager warmup.
                 # Its context still owns the same serialized destination stream.
                 stream = next(
-                    (value for value in self.streams.values() if value.device == self.device), None
+                    (
+                        value
+                        for value in self.streams.values()
+                        if value.device == self.device
+                    ),
+                    None,
                 )
             if stream is None:
                 if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("warm cross-device numerical calls before capture")
+                    raise RuntimeError(
+                        "warm cross-device numerical calls before capture"
+                    )
                 stream = torch.cuda.Stream(device=self.device)
             self.streams[key] = stream
-            self.streams[(stream.device, stream.cuda_stream, origin.device)] = origin
+            self.streams[(stream.device, stream.cuda_stream, origin.device)] = (
+                origin
+            )
 
         scope = ExitStack()
-        self.calls.set((*self.calls.get(), _Call(target, scope, origin, stream, kwargs.get("out"))))
+        self.calls.set(
+            (
+                *self.calls.get(),
+                _Call(target, scope, origin, stream, kwargs.get("out")),
+            )
+        )
         if stream is not None:
             if stream != origin:
                 stream.wait_stream(origin)
@@ -100,12 +119,16 @@ class _Binding:
 
         return _map(
             (args, kwargs),
-            lambda value: value.to(self.device, non_blocking=self.device.type != "cpu"),
+            lambda value: value.to(
+                self.device, non_blocking=self.device.type != "cpu"
+            ),
         )
 
     def finish(self, result):
-        """Return outputs to the caller's device and rejoin its origin stream."""
+        """Return outputs to the caller's device.
 
+        Return outputs to the caller's device and rejoin its origin stream.
+        """
         calls = self.calls.get()
         if not calls:
             return result
@@ -118,7 +141,10 @@ class _Binding:
             if call.out is not None:
                 return _copy_out(result, call.out)
             return _map(
-                result, lambda value: value.to(call.target, non_blocking=call.target.type != "cpu")
+                result,
+                lambda value: value.to(
+                    call.target, non_blocking=call.target.type != "cpu"
+                ),
             )
         finally:
             try:
@@ -144,9 +170,17 @@ class _Transfers:
         inherited = {"": device}
         for path, child in module.named_modules(remove_duplicate=False):
             parent = inherited[path.rpartition(".")[0]]
-            devices = {value.device for value in child.parameters() if not value.is_meta}
+            devices = {
+                value.device
+                for value in child.parameters()
+                if not value.is_meta
+            }
             if not devices:
-                devices = {value.device for value in child.buffers() if not value.is_meta}
+                devices = {
+                    value.device
+                    for value in child.buffers()
+                    if not value.is_meta
+                }
             target = next(iter(devices)) if len(devices) == 1 else parent
             inherited[path] = target
             if path and target != parent:
@@ -175,15 +209,22 @@ class _Transfers:
             scope.callback(_ACTIVE.reset, token)
             for module in self.modules.values():
                 scope.callback(
-                    module.register_forward_pre_hook(prepare, prepend=True, with_kwargs=True).remove
+                    module.register_forward_pre_hook(
+                        prepare, prepend=True, with_kwargs=True
+                    ).remove
                 )
                 scope.callback(
-                    module.register_forward_hook(finish, with_kwargs=True, always_call=True).remove
+                    module.register_forward_hook(
+                        finish, with_kwargs=True, always_call=True
+                    ).remove
                 )
             yield
 
     def reset(self):
-        """Release retired streams without replacing active binding identities."""
+        """Release retired streams.
+
+        Release retired streams without replacing active binding identities.
+        """
         self.streams.clear()
 
     def close(self):

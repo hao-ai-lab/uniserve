@@ -8,7 +8,12 @@ import torch
 
 from uniserve.media import image
 from uniserve.model import EmbeddingReplacement, TextInput, VisionInput
-from uniserve.nn.attention import BlockTable, PagedInput, SegmentedInput, SequenceLengths
+from uniserve.nn.attention import (
+    BlockTable,
+    PagedInput,
+    SegmentedInput,
+    SequenceLengths,
+)
 from uniserve.runtime.device import fill_cpu_bools, fill_cpu_ints
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig, adjacent_view
@@ -35,21 +40,38 @@ class InputBufferConfig:
 
     def __post_init__(self):
         if min(self.max_rows, self.max_tokens, self.max_blocks_per_row) < 1:
-            raise ValueError("input-buffer row, token and block bounds must be positive")
-        if self.hidden_size < 0 or not 1 <= self.max_text_tokens <= self.max_tokens:
-            raise ValueError("input-buffer text or embedding capacity is invalid")
-        if self.embedding_dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+            raise ValueError(
+                "input-buffer row, token and block bounds must be positive"
+            )
+        if (
+            self.hidden_size < 0
+            or not 1 <= self.max_text_tokens <= self.max_tokens
+        ):
+            raise ValueError(
+                "input-buffer text or embedding capacity is invalid"
+            )
+        if self.embedding_dtype not in {
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        }:
             raise ValueError("input embeddings require a logical compute dtype")
 
     def buffers(self):
-        rows, tokens, text = self.max_rows, self.max_tokens, self.max_text_tokens
+        rows, tokens, text = (
+            self.max_rows,
+            self.max_tokens,
+            self.max_text_tokens,
+        )
         fields = {
             "input_ids": BufferConfig((text,), torch.int64),
             "positions": BufferConfig((3, tokens), torch.int64),
             "embedding_mask": BufferConfig((text,), torch.bool),
             "request_pool_indices": BufferConfig((rows,), torch.int64),
             "decode_force_finish": BufferConfig((rows,), torch.bool),
-            "block_tables": BufferConfig((rows, self.max_blocks_per_row), torch.int32),
+            "block_tables": BufferConfig(
+                (rows, self.max_blocks_per_row), torch.int32
+            ),
             "cache_lengths": BufferConfig((rows,), torch.int32),
             "query_lengths": BufferConfig((rows,), torch.int32),
             "cumulative_query_lengths": BufferConfig((rows + 1,), torch.int32),
@@ -66,7 +88,10 @@ class InputBufferConfig:
 
 
 class InputBuffers:
-    """Own lane staging; models receive only its borrowed typed numerical inputs."""
+    """Own lane staging.
+
+    models receive only its borrowed typed numerical inputs.
+    """
 
     def __init__(
         self,
@@ -86,7 +111,9 @@ class InputBuffers:
         )
         self.hidden_size = config.hidden_size
 
-        self._backing = TensorBuffers.allocate(config.buffers(), device=self.device)
+        self._backing = TensorBuffers.allocate(
+            config.buffers(), device=self.device
+        )
         for name, tensor in self._backing.view(config.buffers()).items():
             tensor.zero_()
             setattr(self, name, tensor)
@@ -110,8 +137,10 @@ class InputBuffers:
         self._backing.close()
 
     def _requests(self, rows):
-        """Copy request pool indices and any force-finish flags into device staging."""
+        """Copy request pool indices and any force-finish flags into device.
 
+        staging.
+        """
         count = len(rows)
         slot, host = self._request_host.acquire()
         fill_cpu_ints(host, tuple(row.request_pool_idx for row in rows))
@@ -120,7 +149,10 @@ class InputBuffers:
         self._request_host.record_copy(slot)
 
         finish = None
-        if all(row.decode_predicate is not None and row.decode_predicate_tagged for row in rows):
+        if all(
+            row.decode_predicate is not None and row.decode_predicate_tagged
+            for row in rows
+        ):
             finish = self.decode_force_finish[:count]
             slot, host = self._finish_host.acquire()
             fill_cpu_bools(host, tuple(row.decode_force_finish for row in rows))
@@ -139,14 +171,17 @@ class InputBuffers:
         tables=None,
         states=None,
     ):
-        """Stage one homogeneous call into the lane's fixed buffers and bind its typed inputs."""
+        """Stage one homogeneous call into the lane's fixed buffers and bind.
 
+        its typed inputs.
+        """
         if not 0 < len(rows) <= self.max_rows:
             raise ValueError("forward row count exceeds input-buffer capacity")
         if any(
             row.forward_mode != forward_mode
             and not (
-                isinstance(row.forward_mode, ForwardMode) and isinstance(forward_mode, ForwardMode)
+                isinstance(row.forward_mode, ForwardMode)
+                and isinstance(forward_mode, ForwardMode)
             )
             for row in rows
         ):
@@ -167,7 +202,9 @@ class InputBuffers:
                 for row in rows
                 if row.request_indexed_decode
             ):
-                raise ValueError("indexed decode requires valid resident request slots")
+                raise ValueError(
+                    "indexed decode requires valid resident request slots"
+                )
 
             if (
                 attention is None
@@ -180,7 +217,11 @@ class InputBuffers:
                 _, width = cache_pages(rows, cache=cache, tables=tables)
                 inputs = self._indexed(rows, width, cache, tables, states)
                 return InputBatch(
-                    forward_mode, inputs, requests, tuple(row.selection for row in rows), finish
+                    forward_mode,
+                    inputs,
+                    requests,
+                    tuple(row.selection for row in rows),
+                    finish,
                 )
 
             # Without a compatible resident CUDA cache, materialize one token
@@ -188,7 +229,9 @@ class InputBuffers:
             rows = tuple(
                 replace(
                     row,
-                    token_ids=states.future_input_tokens[row.request_pool_idx, :1],
+                    token_ids=states.future_input_tokens[
+                        row.request_pool_idx, :1
+                    ],
                     positions=states.logical_lengths[
                         row.request_pool_idx : row.request_pool_idx + 1
                     ],
@@ -200,9 +243,14 @@ class InputBuffers:
             )
 
         selections = ()
-        if isinstance(forward_mode, ForwardMode) or forward_mode is PipelineStage.DENOISING:
+        if (
+            isinstance(forward_mode, ForwardMode)
+            or forward_mode is PipelineStage.DENOISING
+        ):
             attention = (
-                columns(rows, cache=cache, tables=tables) if attention is None else attention
+                columns(rows, cache=cache, tables=tables)
+                if attention is None
+                else attention
             )
             staged = self.stage_attention(attention)
 
@@ -211,11 +259,16 @@ class InputBuffers:
                 selections = tuple(row.selection for row in rows)
             else:
                 inputs = self._images(rows, staged)
-        elif forward_mode in {PipelineStage.VISION_ENCODING, PipelineStage.LATENT_ENCODING}:
+        elif forward_mode in {
+            PipelineStage.VISION_ENCODING,
+            PipelineStage.LATENT_ENCODING,
+        }:
             inputs = VisionInput(
                 tuple(self._device_view(row.encode_pixels) for row in rows),
                 tuple(
-                    None if row.encode_grid is None else self._device_view(row.encode_grid)
+                    None
+                    if row.encode_grid is None
+                    else self._device_view(row.encode_grid)
                     for row in rows
                 ),
                 tuple(row.encode_grid_shape for row in rows),
@@ -223,7 +276,10 @@ class InputBuffers:
         elif forward_mode is PipelineStage.IMAGE_DECODING:
             inputs = DecodeInput(
                 tuple(self._device_view(row.latent) for row in rows),
-                tuple(image.Config(row.image_height, row.image_width) for row in rows),
+                tuple(
+                    image.Config(row.image_height, row.image_width)
+                    for row in rows
+                ),
             )
         else:
             raise ValueError(f"unsupported staged computation {forward_mode}")
@@ -231,12 +287,19 @@ class InputBuffers:
         return InputBatch(forward_mode, inputs, requests, selections, finish)
 
     def _text(self, rows, attention):
-        """Stage token IDs, positions and optional embeddings into the text columns."""
+        """Stage token IDs.
 
+        positions and optional embeddings into the text columns.
+        """
         if any(
-            row.token_ids is None or row.positions is None or row.selection is None for row in rows
+            row.token_ids is None
+            or row.positions is None
+            or row.selection is None
+            for row in rows
         ):
-            raise ValueError("text inputs require IDs, positions and output selection")
+            raise ValueError(
+                "text inputs require IDs, positions and output selection"
+            )
 
         lengths = tuple(row.token_ids.numel() for row in rows)
         total = sum(lengths)
@@ -276,46 +339,68 @@ class InputBuffers:
                 )
 
             self._positions(row.positions, offset, length)
-            axes = max(axes, 1 if row.positions.ndim == 1 else row.positions.shape[0])
+            axes = max(
+                axes, 1 if row.positions.ndim == 1 else row.positions.shape[0]
+            )
 
             if row.token_embeddings is not None:
                 values = row.token_embeddings.reshape(length, -1)
                 if values.shape[1] != self.hidden_size:
-                    raise ValueError("input embeddings must match the hidden width")
+                    raise ValueError(
+                        "input embeddings must match the hidden width"
+                    )
 
-                self.input_embeddings[offset : offset + length].copy_(values, non_blocking=True)
+                self.input_embeddings[offset : offset + length].copy_(
+                    values, non_blocking=True
+                )
                 mask = self.embedding_mask[offset : offset + length]
                 if row.token_embedding_mask is None:
                     mask.fill_(True)
                 else:
-                    mask.copy_(row.token_embedding_mask.reshape(-1), non_blocking=True)
+                    mask.copy_(
+                        row.token_embedding_mask.reshape(-1), non_blocking=True
+                    )
 
             offset += length
 
         return TextInput(
             self.input_ids[:total],
-            self.positions[0, :total] if axes == 1 else self.positions[:axes, :total],
+            self.positions[0, :total]
+            if axes == 1
+            else self.positions[:axes, :total],
             attention,
-            EmbeddingReplacement(self.input_embeddings[:total], self.embedding_mask[:total])
+            EmbeddingReplacement(
+                self.input_embeddings[:total], self.embedding_mask[:total]
+            )
             if use_embeddings
             else None,
         )
 
     def _images(self, rows, attention):
-        """Stage denoising positions and timesteps, then bind the image inputs."""
+        """Stage denoising positions and timesteps.
 
+        then bind the image inputs.
+        """
         if self.image_builder is None:
             raise ValueError("image denoising requires its bound input builder")
 
-        sizes = tuple(image.Config(row.image_height, row.image_width) for row in rows)
-        lengths = tuple(self.image_builder.sequence_length(size) for size in sizes)
+        sizes = tuple(
+            image.Config(row.image_height, row.image_width) for row in rows
+        )
+        lengths = tuple(
+            self.image_builder.sequence_length(size) for size in sizes
+        )
         if sum(lengths) > self.max_tokens:
             raise ValueError("image sequences exceed input-buffer capacity")
 
         positions, offset = [], 0
-        for index, (row, size, length) in enumerate(zip(rows, sizes, lengths, strict=True)):
+        for index, (row, size, length) in enumerate(
+            zip(rows, sizes, lengths, strict=True)
+        ):
             if row.timestep is None or row.positions is None:
-                raise ValueError("image denoising requires positions and a timestep")
+                raise ValueError(
+                    "image denoising requires positions and a timestep"
+                )
 
             self._positions(row.positions, offset, length)
             positions.append(self.positions[:, offset : offset + length])
@@ -325,28 +410,39 @@ class InputBuffers:
         return self.image_builder.bind(
             samples=tuple(self._device_view(row.latent) for row in rows),
             sizes=sizes,
-            timesteps=tuple(self.timesteps[index : index + 1] for index in range(len(rows))),
+            timesteps=tuple(
+                self.timesteps[index : index + 1] for index in range(len(rows))
+            ),
             positions=tuple(positions),
             attention=attention,
             step_index=0,
         )
 
     def stage_attention(self, attention):
-        """Copy paged or segmented attention columns into the lane's fixed buffers."""
+        """Copy paged or segmented attention columns into the lane's fixed.
 
+        buffers.
+        """
         if not isinstance(attention, (PagedInput, SegmentedInput)):
-            raise TypeError("worker token staging requires paged or prefix/current attention")
+            raise TypeError(
+                "worker token staging requires paged or prefix/current "
+                "attention"
+            )
 
         count = attention.queries.batch_size
         queries = SequenceLengths(
             host=attention.queries.host,
             values=self._vector(self.query_lengths, attention.queries.values),
-            offsets=self._vector(self.cumulative_query_lengths, attention.queries.offsets),
+            offsets=self._vector(
+                self.cumulative_query_lengths, attention.queries.offsets
+            ),
         )
         prefixes = SequenceLengths(
             host=attention.prefixes.host,
             values=self._vector(self.cache_lengths, attention.prefixes.values),
-            offsets=self._vector(self.cumulative_prefix_lengths, attention.prefixes.offsets),
+            offsets=self._vector(
+                self.cumulative_prefix_lengths, attention.prefixes.offsets
+            ),
         )
 
         source = attention.block_table.indices
@@ -364,10 +460,14 @@ class InputBuffers:
         )
 
         if isinstance(attention, PagedInput):
-            return PagedInput(queries, prefixes, blocks, writes, attention.causal)
+            return PagedInput(
+                queries, prefixes, blocks, writes, attention.causal
+            )
 
         if not attention.fully_visible_current:
-            raise ValueError("image staging requires fully visible current sequences")
+            raise ValueError(
+                "image staging requires fully visible current sequences"
+            )
 
         return SegmentedInput(
             queries,
@@ -380,7 +480,6 @@ class InputBuffers:
 
     def _indexed(self, rows, width, cache, tables, states):
         """Gather resident decode rows on device directly into paged staging."""
-
         count = len(rows)
         gather_request_decode_inputs(
             request_pool_indices=self.request_pool_indices,
@@ -389,7 +488,9 @@ class InputBuffers:
             request_tokens=states.future_input_tokens[:, 0],
             request_positions=states.logical_lengths,
             input_ids=self.input_ids,
-            positions=self.positions if self.image_builder is not None else self.positions[:1],
+            positions=self.positions
+            if self.image_builder is not None
+            else self.positions[:1],
             block_tables=self.block_tables[:, :width],
             cache_lengths=self.cache_lengths,
             query_lengths=self.query_lengths,
@@ -416,7 +517,9 @@ class InputBuffers:
         attention = PagedInput(
             queries,
             prefixes,
-            BlockTable(self.block_tables[:count, :width], cache.info.block_size),
+            BlockTable(
+                self.block_tables[:count, :width], cache.info.block_size
+            ),
             writes,
             tuple(row.causal for row in rows),
         )
@@ -431,9 +534,17 @@ class InputBuffers:
     def _positions(self, source, offset, count):
         if source.ndim == 1:
             source = source.unsqueeze(0)
-        if source.ndim != 2 or source.shape[0] not in (1, 3) or source.shape[1] != count:
-            raise ValueError("positions must have one or three axes over the token span")
-        self.positions[: source.shape[0], offset : offset + count].copy_(source, non_blocking=True)
+        if (
+            source.ndim != 2
+            or source.shape[0] not in (1, 3)
+            or source.shape[1] != count
+        ):
+            raise ValueError(
+                "positions must have one or three axes over the token span"
+            )
+        self.positions[: source.shape[0], offset : offset + count].copy_(
+            source, non_blocking=True
+        )
 
     def _vector(self, target, source):
         if source.numel() > target.numel():

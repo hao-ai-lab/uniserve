@@ -1,10 +1,10 @@
 """The public rotary projection preserves head values and caller ownership."""
 
+from contextlib import ExitStack
+
 import pytest
 import torch
 import torch.nn.functional as F
-
-from contextlib import ExitStack
 from torch import nn
 
 from uniserve.nn import QKVParallelLinear, RMSNorm
@@ -38,7 +38,9 @@ pytestmark = pytest.mark.unit
             "cuda:1",
             marks=[
                 pytest.mark.gpu,
-                pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs"),
+                pytest.mark.skipif(
+                    torch.cuda.device_count() < 2, reason="requires two GPUs"
+                ),
             ],
         ),
     ],
@@ -66,16 +68,22 @@ def test_rotary_projection_preserves_qkv_values_and_replay(rows, flow_device):
     cosine, sine = phase.cos(), phase.sin()
 
     def expected(values):
-        query, key, value = F.linear(F.layer_norm(values, (8,)), weight, bias).split(
-            (8, 4, 4), dim=-1
-        )
+        query, key, value = F.linear(
+            F.layer_norm(values, (8,)), weight, bias
+        ).split((8, 4, 4), dim=-1)
 
         def rotate(value, heads):
             value = value.reshape(rows, heads, 4)
-            value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6) * scales
+            value = (
+                value
+                * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
+                * scales
+            )
             left, right = value.chunk(2, dim=-1)
             cos, sin = cosine[:, None], sine[:, None]
-            return torch.cat((left * cos - right * sin, right * cos + left * sin), -1)
+            return torch.cat(
+                (left * cos - right * sin, right * cos + left * sin), -1
+            )
 
         return rotate(query, 2), rotate(key, 1), value.reshape(rows, 1, 4)
 
@@ -97,7 +105,9 @@ def test_rotary_projection_preserves_qkv_values_and_replay(rows, flow_device):
             with torch.cuda.device(flow_device):
                 pool = torch.cuda.MemPool()
             graph = scope.enter_context(
-                CUDAGraph(context=context, pools={torch.device(flow_device): pool})
+                CUDAGraph(
+                    context=context, pools={torch.device(flow_device): pool}
+                )
             )
             graph.capture(lambda: module(inputs, cos, sin))
             inputs.mul_(1.25)

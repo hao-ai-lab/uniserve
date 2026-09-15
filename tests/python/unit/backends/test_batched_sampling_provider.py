@@ -18,13 +18,16 @@ def _reference(
 ) -> torch.Tensor:
     work = logits.float().clone()
     work /= torch.where(parameters[:, :1] > 0, parameters[:, :1], 1)
-    candidate_values, candidate_ids = torch.topk(work, top_k, dim=-1, sorted=True)
+    candidate_values, candidate_ids = torch.topk(
+        work, top_k, dim=-1, sorted=True
+    )
     for row in range(work.shape[0]):
         min_p = float(parameters[row, 2])
         if min_p > 0:
             candidate_values[
                 row,
-                candidate_values[row] < candidate_values[row, 0] + torch.log(parameters[row, 2]),
+                candidate_values[row]
+                < candidate_values[row, 0] + torch.log(parameters[row, 2]),
             ] = float("-inf")
         cumulative = torch.softmax(candidate_values[row], dim=-1).cumsum(dim=-1)
         drop = cumulative > parameters[row, 1]
@@ -34,9 +37,13 @@ def _reference(
     candidate_probabilities = torch.softmax(candidate_values, dim=-1)
     token_order = torch.argsort(candidate_ids, dim=-1)
     cumulative = candidate_probabilities.gather(1, token_order).cumsum(dim=-1)
-    sampled_order = (cumulative < draws.unsqueeze(1)).sum(dim=-1).clamp_max(top_k - 1)
+    sampled_order = (
+        (cumulative < draws.unsqueeze(1)).sum(dim=-1).clamp_max(top_k - 1)
+    )
     sampled = token_order.gather(1, sampled_order.unsqueeze(1))[:, 0]
-    selected = torch.where(parameters[:, 0] > 0, sampled, torch.zeros_like(sampled))
+    selected = torch.where(
+        parameters[:, 0] > 0, sampled, torch.zeros_like(sampled)
+    )
     return candidate_ids.gather(1, selected.unsqueeze(1))[:, 0]
 
 

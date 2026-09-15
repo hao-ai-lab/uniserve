@@ -23,7 +23,9 @@ class SequenceLengths:
     def __post_init__(self) -> None:
         if self.host is not None and (
             not isinstance(self.host, tuple)
-            or any(type(length) is not int or length < 0 for length in self.host)
+            or any(
+                type(length) is not int or length < 0 for length in self.host
+            )
         ):
             raise ValueError("sequence lengths must be nonnegative integers")
         if (
@@ -33,10 +35,18 @@ class SequenceLengths:
             or self.offsets.dtype != torch.int32
             or self.values.device != self.offsets.device
         ):
-            raise ValueError("sequence values and offsets require matching int32 device columns")
+            raise ValueError(
+                "sequence values and offsets require matching int32 device "
+                "columns"
+            )
         if self.host is not None and len(self.host) != self.batch_size:
-            raise ValueError("host lengths must match the device sequence count")
-        if self.num_tokens is not None and self.num_tokens > torch.iinfo(torch.int32).max:
+            raise ValueError(
+                "host lengths must match the device sequence count"
+            )
+        if (
+            self.num_tokens is not None
+            and self.num_tokens > torch.iinfo(torch.int32).max
+        ):
             raise ValueError("sequence offsets exceed int32 indexing")
 
     @property
@@ -60,11 +70,15 @@ class SequenceLengths:
             or any(type(length) is not int or length < 0 for length in lengths)
             or sum(lengths) > torch.iinfo(torch.int32).max
         ):
-            raise ValueError("sequence lengths must fit nonnegative int32 offsets")
+            raise ValueError(
+                "sequence lengths must fit nonnegative int32 offsets"
+            )
         return cls(
             values=torch.tensor(lengths, dtype=torch.int32, device=device),
             offsets=torch.tensor(
-                tuple(accumulate(lengths, initial=0)), dtype=torch.int32, device=device
+                tuple(accumulate(lengths, initial=0)),
+                dtype=torch.int32,
+                device=device,
             ),
             host=lengths,
         )
@@ -88,12 +102,20 @@ class BlockTable:
             or self.indices.ndim != 2
             or self.indices.dtype not in {torch.int32, torch.int64}
         ):
-            raise ValueError("block tables require a positive block size and an integer matrix")
+            raise ValueError(
+                "block tables require a positive block size and an integer "
+                "matrix"
+            )
 
 
 def _sequences(queries: SequenceLengths, keys: SequenceLengths) -> None:
-    if queries.batch_size != keys.batch_size or queries.values.device != keys.values.device:
-        raise ValueError("query and key sequences must share batch size and device")
+    if (
+        queries.batch_size != keys.batch_size
+        or queries.values.device != keys.values.device
+    ):
+        raise ValueError(
+            "query and key sequences must share batch size and device"
+        )
 
 
 def _causal(values: tuple[bool, ...], count: int) -> None:
@@ -119,11 +141,17 @@ def _paged(
         raise ValueError("block tables must match query batch size and device")
     if write_indices is not None and (
         write_indices.ndim != 1
-        or (queries.num_tokens is not None and write_indices.shape != (queries.num_tokens,))
+        or (
+            queries.num_tokens is not None
+            and write_indices.shape != (queries.num_tokens,)
+        )
         or write_indices.dtype != torch.int64
         or write_indices.device != queries.values.device
     ):
-        raise ValueError("write indices must be an int64 address per query token on its device")
+        raise ValueError(
+            "write indices must be an int64 address per query token on its "
+            "device"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +180,9 @@ class PagedInput:
     causal: tuple[bool, ...]
 
     def __post_init__(self) -> None:
-        _paged(self.queries, self.prefixes, self.block_table, self.write_indices)
+        _paged(
+            self.queries, self.prefixes, self.block_table, self.write_indices
+        )
         _causal(self.causal, self.queries.batch_size)
 
     @classmethod
@@ -166,8 +196,9 @@ class PagedInput:
         causal: bool | tuple[bool, ...],
         device: torch.device | str,
     ) -> PagedInput:
-        """Build a block table and addresses for appending each query to its prefix."""
-
+        """Build a block table and addresses for appending each query to its
+        prefix.
+        """  # noqa: D205
         if (
             not isinstance(blocks, tuple)
             or type(block_size) is not int
@@ -175,7 +206,10 @@ class PagedInput:
             or len(blocks) != len(query_lengths)
             or len(blocks) != len(prefix_lengths)
         ):
-            raise ValueError("block lists and sequence lengths must have matching batch sizes")
+            raise ValueError(
+                "block lists and sequence lengths must have matching batch "
+                "sizes"
+            )
         queries = SequenceLengths.from_lengths(query_lengths, device=device)
         prefixes = SequenceLengths.from_lengths(prefix_lengths, device=device)
         flags = (causal,) * len(blocks) if type(causal) is bool else causal
@@ -184,14 +218,22 @@ class PagedInput:
         width = max(map(len, blocks), default=0)
         rows = []
         addresses = []
-        for row, query, prefix in zip(blocks, query_lengths, prefix_lengths, strict=True):
+        for row, query, prefix in zip(
+            blocks, query_lengths, prefix_lengths, strict=True
+        ):
             if not isinstance(row, tuple) or any(
-                type(block) is not int or block < 0 or block > torch.iinfo(torch.int32).max
+                type(block) is not int
+                or block < 0
+                or block > torch.iinfo(torch.int32).max
                 for block in row
             ):
-                raise ValueError("physical block IDs must be nonnegative int32 integers")
+                raise ValueError(
+                    "physical block IDs must be nonnegative int32 integers"
+                )
             if len(row) * block_size < prefix + query:
-                raise ValueError("block table does not cover the prefix and query")
+                raise ValueError(
+                    "block table does not cover the prefix and query"
+                )
             # Short rows are zero-padded to the shared table width; padded
             # entries are never read because lengths bound the valid span.
             rows.append((*row, *((0,) * (width - len(row)))))
@@ -201,7 +243,9 @@ class PagedInput:
                 for position in range(prefix, prefix + query)
             )
 
-        table = torch.tensor(rows, dtype=torch.int32, device=device).reshape(len(blocks), width)
+        table = torch.tensor(rows, dtype=torch.int32, device=device).reshape(
+            len(blocks), width
+        )
         return cls(
             queries,
             prefixes,
@@ -227,7 +271,9 @@ class VisibleInput:
             self.block_table.indices.shape[0] != self.queries.batch_size
             or self.block_table.indices.device != self.queries.values.device
         ):
-            raise ValueError("visible block table must match query batch and device")
+            raise ValueError(
+                "visible block table must match query batch and device"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,7 +286,9 @@ class SegmentedInput:
     fully_visible_current: bool
 
     def __post_init__(self) -> None:
-        _paged(self.queries, self.prefixes, self.block_table, self.write_indices)
+        _paged(
+            self.queries, self.prefixes, self.block_table, self.write_indices
+        )
         _visibility(self.visible_current_end, self.queries)
 
 
@@ -252,8 +300,12 @@ def _visibility(value: torch.Tensor, queries: SequenceLengths) -> None:
         or value.dtype not in {torch.int32, torch.int64}
         or value.device != queries.values.device
     ):
-        raise ValueError("visibility must provide an integer endpoint per query token")
+        raise ValueError(
+            "visibility must provide an integer endpoint per query token"
+        )
 
 
 # Union of every index representation the numerical attention layers accept.
-AttentionInput = DenseInput | VarlenInput | PagedInput | VisibleInput | SegmentedInput
+AttentionInput = (
+    DenseInput | VarlenInput | PagedInput | VisibleInput | SegmentedInput
+)

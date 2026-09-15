@@ -9,7 +9,7 @@ and lane-dependent softmax underflow to obey the same warp collective protocol.
 """
 
 import math
-from typing import Optional, no_type_check
+from typing import no_type_check
 
 import cutlass
 import cutlass.cute as cute
@@ -39,13 +39,16 @@ class SparseAttentionSm100(BlockSparseAttnForwardSm100Blk64):
         scale1: Float32,
         my_sum: Float32,
         my_max: Float32,
-        sO: cute.Tensor,
-        oStats: cute.Tensor,
-        oExchange: cute.Tensor,
+        sO: cute.Tensor,  # noqa: N803
+        oStats: cute.Tensor,  # noqa: N803
+        oExchange: cute.Tensor,  # noqa: N803
         reduce_mbar_addr: Int32,
-        mLSE_cur: Optional[cute.Tensor] = None,
+        mLSE_cur: cute.Tensor | None = None,  # noqa: N803
     ):
-        """C++ blk64-style WS epilogue combine using raw TMEM/SMEM addressing."""
+        """Combine partial outputs.
+
+        C++ blk64-style WS epilogue combine using raw TMEM/SMEM addressing.
+        """
         corr_warp = tidx // cute.arch.WARP_SIZE
         lane_idx = tidx % cute.arch.WARP_SIZE
         partner_warp = corr_warp ^ 2
@@ -63,26 +66,37 @@ class SparseAttentionSm100(BlockSparseAttnForwardSm100Blk64):
         max_total = cutlass.max(my_max, partner_max)
         max_total_safe = max_total if max_total > -Float32.inf else Float32(0.0)
         my_rescale = (
-            cute.math.exp2((my_max - max_total_safe) * softmax_scale_log2, fastmath=True)
+            cute.math.exp2(
+                (my_max - max_total_safe) * softmax_scale_log2, fastmath=True
+            )
             if my_sum > Float32(0.0)
             else Float32(0.0)
         )
         partner_rescale = (
-            cute.math.exp2((partner_max - max_total_safe) * softmax_scale_log2, fastmath=True)
+            cute.math.exp2(
+                (partner_max - max_total_safe) * softmax_scale_log2,
+                fastmath=True,
+            )
             if partner_sum > Float32(0.0)
             else Float32(0.0)
         )
         sum_total = my_sum * my_rescale + partner_sum * partner_rescale
         total_is_valid = sum_total > Float32(0.0)
-        inv_sum_total = cute.arch.rcp_approx(sum_total) if total_is_valid else Float32(0.0)
+        inv_sum_total = (
+            cute.arch.rcp_approx(sum_total) if total_is_valid else Float32(0.0)
+        )
         my_weight = my_rescale * inv_sum_total
         my_scale0 = scale0 * my_weight
         my_scale1 = scale1 * my_weight
 
         exchange_warp_base = corr_warp * 4 * 32 * 32
-        exchange_addr = Int32((oExchange.iterator + exchange_warp_base + lane_idx * 4).toint())
+        exchange_addr = Int32(
+            (oExchange.iterator + exchange_warp_base + lane_idx * 4).toint()
+        )
         if const_expr(self.allow_empty_block_nums):
-            is_zero_output = my_scale0 == Float32(0.0) and my_scale1 == Float32(0.0)
+            is_zero_output = my_scale0 == Float32(0.0) and my_scale1 == Float32(
+                0.0
+            )
             # TMEM loads are warp collectives. Row-dependent softmax weights
             # can underflow on only some lanes, even for nonempty key tiles.
             # Skip TMEM only when the entire warp contributes zero output.
@@ -95,7 +109,9 @@ class SparseAttentionSm100(BlockSparseAttnForwardSm100Blk64):
                     my_scale1,
                 )
             else:
-                bsa_fwd_helpers.smem_zero_store_exchange_4x32dp32b32x(exchange_addr)
+                bsa_fwd_helpers.smem_zero_store_exchange_4x32dp32b32x(
+                    exchange_addr
+                )
         else:
             bsa_fwd_helpers.tmem_combine_store_exchange_4x32dp32b32x(
                 Int32(tmem_o0_addr),
@@ -131,25 +147,61 @@ class SparseAttentionSm100(BlockSparseAttnForwardSm100Blk64):
                     col6 = (((c * 8) + 6) ^ lane_col_swizzle) * 4
                     col7 = (((c * 8) + 7) ^ lane_col_swizzle) * 4
                     bsa_fwd_helpers.smem_exchange_reduce_store_f32x32(
-                        Int32((oExchange.iterator + own_warp_base + off).toint()),
-                        Int32((oExchange.iterator + partner_warp_base + off).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col0))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col1))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col2))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col3))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col4))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col5))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col6))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col7))).toint()),
+                        Int32(
+                            (oExchange.iterator + own_warp_base + off).toint()
+                        ),
+                        Int32(
+                            (
+                                oExchange.iterator + partner_warp_base + off
+                            ).toint()
+                        ),
+                        Int32(
+                            (sO.iterator + sO.layout((out_row, col0))).toint()
+                        ),
+                        Int32(
+                            (sO.iterator + sO.layout((out_row, col1))).toint()
+                        ),
+                        Int32(
+                            (sO.iterator + sO.layout((out_row, col2))).toint()
+                        ),
+                        Int32(
+                            (sO.iterator + sO.layout((out_row, col3))).toint()
+                        ),
+                        Int32(
+                            (sO.iterator + sO.layout((out_row, col4))).toint()
+                        ),
+                        Int32(
+                            (sO.iterator + sO.layout((out_row, col5))).toint()
+                        ),
+                        Int32(
+                            (sO.iterator + sO.layout((out_row, col6))).toint()
+                        ),
+                        Int32(
+                            (sO.iterator + sO.layout((out_row, col7))).toint()
+                        ),
                     )
                 else:
                     bsa_fwd_helpers.smem_exchange_reduce_store_bf16x32(
-                        Int32((oExchange.iterator + own_warp_base + off).toint()),
-                        Int32((oExchange.iterator + partner_warp_base + off).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col0))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col1))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col2))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col3))).toint()),
+                        Int32(
+                            (oExchange.iterator + own_warp_base + off).toint()
+                        ),
+                        Int32(
+                            (
+                                oExchange.iterator + partner_warp_base + off
+                            ).toint()
+                        ),
+                        Int32(
+                            (sO.iterator + sO.layout((out_row, col0))).toint()
+                        ),
+                        Int32(
+                            (sO.iterator + sO.layout((out_row, col1))).toint()
+                        ),
+                        Int32(
+                            (sO.iterator + sO.layout((out_row, col2))).toint()
+                        ),
+                        Int32(
+                            (sO.iterator + sO.layout((out_row, col3))).toint()
+                        ),
                     )
 
         cute.arch.fence_view_async_shared()
@@ -162,10 +214,13 @@ class SparseAttentionSm100(BlockSparseAttnForwardSm100Blk64):
             out_row = (corr_warp & 1) * cute.arch.WARP_SIZE + lane_idx
             valid_rows = seqlen_q - m_block * self.m_block_size
             if corr_warp < 2 and out_row < valid_rows:
-                LN2 = math.log(2.0)
+                ln2 = math.log(2.0)
                 lse = (
-                    (max_total_safe * softmax_scale_log2 + cute.math.log2(sum_total, fastmath=True))
-                    * LN2
+                    (
+                        max_total_safe * softmax_scale_log2
+                        + cute.math.log2(sum_total, fastmath=True)
+                    )
+                    * ln2
                     if total_is_valid
                     else -Float32.inf
                 )

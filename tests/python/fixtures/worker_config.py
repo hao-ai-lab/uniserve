@@ -16,7 +16,6 @@ def stub_worker_config(
     max_batch_tokens: int,
 ) -> WorkerConfig:
     """Build CPU execution capacity for the deterministic simulator."""
-
     return WorkerConfig(
         device="cpu",
         rank=0,

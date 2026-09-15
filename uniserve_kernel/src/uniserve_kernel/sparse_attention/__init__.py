@@ -8,10 +8,11 @@ import torch
 
 def available(device: torch.device | None = None) -> bool:
     """Resolve the required native artifact before serving or CUDA capture."""
-
     # The extension contains sm_100a code, whose architecture-conditional
     # instructions do not carry the major-version cubin compatibility promise.
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability(device) != (10, 0):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability(
+        device
+    ) != (10, 0):
         return False
     _extension()
     return True
@@ -58,5 +59,4 @@ def block_sparse_attention(
     values are consumed without a host synchronization.
     The output has Q's shape, dtype and device. Compilation precedes capture.
     """
-
     return _extension().forward(query, key, value, indices, counts, valid_sizes)

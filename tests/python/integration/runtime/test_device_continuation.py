@@ -28,13 +28,17 @@ from uniserve_worker.protocol.operation import (
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
+    pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA is required"
+    ),
 ]
 
 
 @pytest.mark.parametrize("graphs", [False, True])
 @pytest.mark.parametrize("finish_policy", ["admission", "operation", "force"])
-def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(graphs, finish_policy) -> None:
+def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
+    graphs, finish_policy
+) -> None:
     policy = WorkerConfig(
         graph_policy="full" if graphs else "off",
         prefill_cuda_graph=False,
@@ -45,9 +49,14 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(graph
     terminal = expected_successor(expected_successor(4))
     if finish_policy == "admission":
         assert first.generation is not None
-        first = replace(first, generation=replace(first.generation, finish_token_ids=(terminal,)))
+        first = replace(
+            first,
+            generation=replace(first.generation, finish_token_ids=(terminal,)),
+        )
 
-    with execution_worker(device="cuda:0", pipeline_depth=3, execution=policy) as worker:
+    with execution_worker(
+        device="cuda:0", pipeline_depth=3, execution=policy
+    ) as worker:
         parents = tuple(
             token_operation(
                 admission.request_key,
@@ -59,7 +68,9 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(graph
             for index, admission in enumerate((first, second))
         )
         parent_report = worker.submit(
-            execution_run(run_id=1, admissions=(first, second), operations=parents)
+            execution_run(
+                run_id=1, admissions=(first, second), operations=parents
+            )
         )
         decodes = tuple(
             token_operation(
@@ -77,13 +88,17 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(graph
                 replace(
                     decodes[0],
                     sampling_state=SamplingState(
-                        finish_token_ids=(terminal,) if finish_policy == "operation" else (),
+                        finish_token_ids=(terminal,)
+                        if finish_policy == "operation"
+                        else (),
                         force_finish=finish_policy == "force",
                     ),
                 ),
                 decodes[1],
             )
-        decode_report = worker.submit(execution_run(run_id=2, operations=decodes))
+        decode_report = worker.submit(
+            execution_run(run_id=2, operations=decodes)
+        )
         successors = tuple(
             token_operation(
                 decode.request_key,
@@ -96,12 +111,17 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(graph
             for index, decode in enumerate(decodes)
         )
         # Queue the dependent work before consuming either parent's host result.
-        successor_report = worker.submit(execution_run(run_id=3, operations=successors))
+        successor_report = worker.submit(
+            execution_run(run_id=3, operations=successors)
+        )
         finalized_report(worker, parent_report)
         selected = finalized_report(worker, decode_report).completions
         following = finalized_report(worker, successor_report).completions
 
-        assert tuple(output.committed_tokens for output in selected) == ((terminal,), (terminal,))
+        assert tuple(output.committed_tokens for output in selected) == (
+            (terminal,),
+            (terminal,),
+        )
         assert following[0].status is OpStatus.PREDICATED
         assert following[0].committed_tokens == ()
         assert following[1].status is OpStatus.OK
@@ -170,7 +190,9 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
 
     first = expected_successor(4)
     assert parent_report.completions[0].committed_tokens == (first,)
-    assert successor_report.completions[0].committed_tokens == (expected_successor(first),)
+    assert successor_report.completions[0].committed_tokens == (
+        expected_successor(first),
+    )
 
 
 def test_device_continuation_chain_matches_serial_token_sequence() -> None:
@@ -216,7 +238,9 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
         operations.append(operation)
 
     torch.cuda.synchronize()
-    completions = tuple(finalized_report(worker, report).completions[0] for report in reports)
+    completions = tuple(
+        finalized_report(worker, report).completions[0] for report in reports
+    )
     tokens = tuple(completion.committed_tokens[0] for completion in completions)
     for position, completion in enumerate(completions, start=2):
         assert completion.position == position
@@ -272,7 +296,8 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
 
     torch.cuda.synchronize()
     tokens = tuple(
-        finalized_report(worker, report).completions[0].committed_tokens[0] for report in reports
+        finalized_report(worker, report).completions[0].committed_tokens[0]
+        for report in reports
     )
     expected = []
     current = 4
@@ -282,7 +307,9 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
     assert tokens == tuple(expected)
 
 
-def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> None:
+def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> (  # noqa: E501
+    None
+):
     worker = execution_worker(device="cuda:0", pipeline_depth=2)
     sampling = SamplingParams(temperature=0.8, top_k=32, top_p=0.93, seed=917)
     pipelined = ar_params(41, block_ids=(2,), sampling=sampling)
@@ -292,7 +319,11 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         predecessor=root_parent(pipelined),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
-        rng=Rng(seed=917, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
+        rng=Rng(
+            seed=917,
+            semantic_index_base=2,
+            draw_layout=DrawLayout.TARGET_SAMPLING,
+        ),
     )
     parent_report = worker.submit(
         execution_run(
@@ -308,7 +339,11 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         mode=ForwardMode.DECODE,
         tokens=(0,),
         predicate=predecessor.token_output,
-        rng=Rng(seed=917, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
+        rng=Rng(
+            seed=917,
+            semantic_index_base=3,
+            draw_layout=DrawLayout.TARGET_SAMPLING,
+        ),
     )
     successor_report = worker.submit(
         execution_run(
@@ -332,7 +367,11 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         predecessor=root_parent(serial),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
-        rng=Rng(seed=917, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
+        rng=Rng(
+            seed=917,
+            semantic_index_base=2,
+            draw_layout=DrawLayout.TARGET_SAMPLING,
+        ),
     )
     serial_parent_report = serial_worker.submit(
         execution_run(
@@ -351,7 +390,11 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         predecessor=observation.op_id,
         mode=ForwardMode.DECODE,
         tokens=(serial_first,),
-        rng=Rng(seed=917, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
+        rng=Rng(
+            seed=917,
+            semantic_index_base=3,
+            draw_layout=DrawLayout.TARGET_SAMPLING,
+        ),
     )
     serial_successor_report = serial_worker.submit(
         execution_run(
@@ -362,14 +405,22 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         )
     )
     torch.cuda.synchronize()
-    serial_successor_report = finalized_report(serial_worker, serial_successor_report)
+    serial_successor_report = finalized_report(
+        serial_worker, serial_successor_report
+    )
 
     assert parent_tokens == serial_parent_report.completions[0].committed_tokens
-    assert successor_tokens == serial_successor_report.completions[0].committed_tokens
+    assert (
+        successor_tokens
+        == serial_successor_report.completions[0].committed_tokens
+    )
 
 
-def test_penalty_device_continuation_matches_depth_one_serial_execution() -> None:
-    # A penalty-bearing pipelined successor must match the equivalent serial lineage.
+def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
+    None
+):
+    # A penalty-bearing pipelined successor must match the equivalent serial
+    # lineage.
     sampling = SamplingParams(
         temperature=0.8,
         top_k=48,
@@ -386,7 +437,11 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         predecessor=root_parent(pipelined),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
-        rng=Rng(seed=613, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
+        rng=Rng(
+            seed=613,
+            semantic_index_base=2,
+            draw_layout=DrawLayout.TARGET_SAMPLING,
+        ),
     )
     parent_report = worker.submit(
         execution_run(
@@ -402,7 +457,11 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         mode=ForwardMode.DECODE,
         tokens=(0,),
         predicate=predecessor.token_output,
-        rng=Rng(seed=613, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
+        rng=Rng(
+            seed=613,
+            semantic_index_base=3,
+            draw_layout=DrawLayout.TARGET_SAMPLING,
+        ),
     )
     successor_report = worker.submit(
         execution_run(
@@ -426,7 +485,11 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         predecessor=root_parent(serial),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
-        rng=Rng(seed=613, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
+        rng=Rng(
+            seed=613,
+            semantic_index_base=2,
+            draw_layout=DrawLayout.TARGET_SAMPLING,
+        ),
     )
     serial_parent_report = serial_worker.submit(
         execution_run(
@@ -445,7 +508,11 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         predecessor=observation.op_id,
         mode=ForwardMode.DECODE,
         tokens=(serial_first,),
-        rng=Rng(seed=613, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
+        rng=Rng(
+            seed=613,
+            semantic_index_base=3,
+            draw_layout=DrawLayout.TARGET_SAMPLING,
+        ),
     )
     serial_successor_report = serial_worker.submit(
         execution_run(
@@ -456,7 +523,12 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         )
     )
     torch.cuda.synchronize()
-    serial_successor_report = finalized_report(serial_worker, serial_successor_report)
+    serial_successor_report = finalized_report(
+        serial_worker, serial_successor_report
+    )
 
     assert parent_tokens == serial_parent_report.completions[0].committed_tokens
-    assert successor_tokens == serial_successor_report.completions[0].committed_tokens
+    assert (
+        successor_tokens
+        == serial_successor_report.completions[0].committed_tokens
+    )

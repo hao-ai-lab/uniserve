@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from . import audio_vae, output, video_vae
 from .encoder import TextEncoderConfig
@@ -26,12 +27,15 @@ def _validate_manifest(manifest: Mapping[str, object]) -> None:
     pinned FastVideo basic_fasth3 recipe uses five uniformly spaced grid points;
     its explicit DMD-index override is a different numerical protocol.
     """
-
     expected = {
         "schema_version": "fasth3-inference-contract-v1",
         "model_id": FASTH3_MODEL_ID,
-        "checkpoint_content_sha256": "b36987515e4c75fa4c7aaa632a7842c829ea141b235358a54d782b51230497b3",
-        "checkpoint_metadata_sha256": "dcad0fbee2a7c7e75e53435f4fd98fccf3138844883874edf057962ab48fa428",
+        "checkpoint_content_sha256": (
+            "b36987515e4c75fa4c7aaa632a7842c829ea141b235358a54d782b51230497b3"
+        ),
+        "checkpoint_metadata_sha256": (
+            "dcad0fbee2a7c7e75e53435f4fd98fccf3138844883874edf057962ab48fa428"
+        ),
         "fastvideo_commit": "48a047c05ff4138f20cfa33351499c6ec5945f5d",
         "task": "t2av",
         "transformer_forwards": 4,
@@ -43,16 +47,20 @@ def _validate_manifest(manifest: Mapping[str, object]) -> None:
         "vsa_sparsity": 0.9,
     }
     for name, value in expected.items():
-        if type(manifest.get(name)) is not type(value) or manifest.get(name) != value:
+        if (
+            type(manifest.get(name)) is not type(value)
+            or manifest.get(name) != value
+        ):
             raise ValueError(
                 f"unsupported FastH3 checkpoint: {name} must be {value!r}, "
-                f"got {manifest.get(name)!r}; use {FASTH3_MODEL_ID}@{FASTH3_REVISION}"
+                f"got {manifest.get(name)!r}; "
+                f"use {FASTH3_MODEL_ID}@{FASTH3_REVISION}"
             )
 
 
 @dataclass(frozen=True, slots=True)
 class TransformerConfig:
-    """Define H3 widths, layers, attention, experts, modulation, and sparse-video layout."""
+    """Define H3 widths, layers, attention, experts, modulation, and sparse-video layout."""  # noqa: E501
 
     hidden_size: int = 5376
     num_attention_heads: int = 56
@@ -88,15 +96,27 @@ class TransformerConfig:
             "rope_frequency_dim",
         ):
             value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                raise ValueError(f"H3 transformer {name} must be a positive integer")
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"H3 transformer {name} must be a positive integer"
+                )
         for name in ("rope_theta", "norm_eps", "qk_norm_eps"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"H3 transformer {name} must be finite and positive")
-        if self.frequency_dim % 2 or self.rope_frequency_dim * 6 > self.head_dim:
+                raise ValueError(
+                    f"H3 transformer {name} must be finite and positive"
+                )
+        if (
+            self.frequency_dim % 2
+            or self.rope_frequency_dim * 6 > self.head_dim
+        ):
             raise ValueError(
-                "H3 transformer rotary dimensions must fit its attention num_attention_heads"
+                "H3 transformer rotary dimensions must fit its attention "
+                "num_attention_heads"
             )
 
 
@@ -112,7 +132,10 @@ class DiffusionConfig:
     def __post_init__(self) -> None:
         if (
             not isinstance(self.ladder, tuple)
-            or any(not isinstance(value, int) or isinstance(value, bool) for value in self.ladder)
+            or any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in self.ladder
+            )
             or self.ladder != FASTH3_LADDER
         ):
             raise ValueError("FastH3 requires its fixed four-evaluation ladder")
@@ -120,7 +143,9 @@ class DiffusionConfig:
             self.video_shift,
             self.audio_shift,
         ) != FASTH3_SHIFTS or self.time_scale != FASTH3_TIME_SCALE:
-            raise ValueError("FastH3 requires its trained video/audio shifts and time scale")
+            raise ValueError(
+                "FastH3 requires its trained video/audio shifts and time scale"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,13 +161,16 @@ class Config:
 
     def __post_init__(self) -> None:
         if self.text_encoder.hidden_size != self.denoiser.text_dim:
-            raise ValueError("H3 text features must match denoiser conditioning width")
+            raise ValueError(
+                "H3 text features must match denoiser conditioning width"
+            )
         if self.video_decoder.latent_channels != self.denoiser.video_channels:
             raise ValueError("H3 video latent channels must match the denoiser")
         if self.audio_decoder.latent_channels != self.denoiser.audio_channels:
             raise ValueError("H3 audio latent channels must match the denoiser")
-        # Packing, sparse attention, native reconstruction and checkpoint identity
-        # implement this architecture. Typed configs do not imply arbitrary variants.
+        # Packing, sparse attention, native reconstruction and checkpoint
+        # identity implement this architecture. Typed configs do not imply
+        # arbitrary variants.
         for name, expected in (
             ("text_encoder", TextEncoderConfig()),
             ("denoiser", TransformerConfig()),
@@ -158,11 +186,13 @@ class Config:
                 supported = getattr(expected, field.name)
                 if value != supported:
                     raise ValueError(
-                        f"FastH3 {name}.{field.name} must be {supported!r}, got {value!r}"
+                        f"FastH3 {name}.{field.name} must be {supported!r}, "
+                        f"got {value!r}"
                     )
 
 
-# Checkpoint field names differ from the mathematical modules' established names.
+# Checkpoint field names differ from the mathematical modules' established
+# names.
 # The reader and native weight-name enumeration use this single correspondence.
 TRANSFORMER_FIELDS = {
     "num_attention_heads": "num_attention_heads",
@@ -197,8 +227,7 @@ TEXT_FIELDS = {
 
 
 def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
-    """Normalize the seven checkpoint sidecars without allocating model resources."""
-
+    """Normalize the seven checkpoint sidecars without allocating model resources."""  # noqa: E501
     for name in (
         "inference",
         "transformer",
@@ -214,13 +243,21 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
     transformer = metadata["transformer"]
     missing = set(TRANSFORMER_FIELDS) - transformer.keys()
     if missing:
-        raise ValueError(f"FastH3 transformer is missing fields: {', '.join(sorted(missing))}")
+        raise ValueError(
+            f"FastH3 transformer is missing fields: "
+            f"{', '.join(sorted(missing))}"
+        )
     if transformer.get("patch_size") != [1, 2, 2]:
         raise ValueError("FastH3 transformer patch_size must be [1, 2, 2]")
     if transformer.get("final_norm_eps") != transformer.get("norm_eps"):
-        raise ValueError("FastH3 transformer final_norm_eps must equal norm_eps")
+        raise ValueError(
+            "FastH3 transformer final_norm_eps must equal norm_eps"
+        )
     denoiser = TransformerConfig(
-        **{target: transformer[source] for source, target in TRANSFORMER_FIELDS.items()}
+        **{
+            target: transformer[source]
+            for source, target in TRANSFORMER_FIELDS.items()
+        }
     )
 
     text = metadata["text_encoder"].get("text_config")
@@ -230,7 +267,9 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
         if text.get(name) != expected:
             raise ValueError(f"unsupported FastH3 text encoder {name}")
     if metadata["text_encoder"].get("tie_word_embeddings", False):
-        raise ValueError("FastH3 checkpoint requires an independent vocabulary head")
+        raise ValueError(
+            "FastH3 checkpoint requires an independent vocabulary head"
+        )
     if text.get("rope_scaling") != {
         "mrope_interleaved": True,
         "mrope_section": [24, 20, 20],
@@ -248,9 +287,12 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
     missing = set(TEXT_FIELDS) - text.keys()
     if missing:
         raise ValueError(
-            f"FastH3 text_encoder.text_config is missing fields: {', '.join(sorted(missing))}"
+            f"FastH3 text_encoder.text_config is missing fields: "
+            f"{', '.join(sorted(missing))}"
         )
-    encoder = TextEncoderConfig(**{target: text[source] for source, target in TEXT_FIELDS.items()})
+    encoder = TextEncoderConfig(
+        **{target: text[source] for source, target in TEXT_FIELDS.items()}
+    )
 
     video_values = {}
     for field in fields(video_vae.Config):
@@ -259,7 +301,9 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
         value = metadata["video_vae"][field.name]
         if isinstance(field.default, tuple):
             if not isinstance(value, (tuple, list)):
-                raise ValueError(f"FastH3 video_vae.{field.name} must be a sequence")
+                raise ValueError(
+                    f"FastH3 video_vae.{field.name} must be a sequence"
+                )
             value = tuple(value)
         video_values[field.name] = value
 
@@ -268,11 +312,18 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
         if field.name not in metadata["audio_vae"]:
             raise ValueError(f"FastH3 audio_vae is missing field {field.name}")
         value = metadata["audio_vae"][field.name]
-        if isinstance(field.default, tuple) and not isinstance(value, (tuple, list)):
-            raise ValueError(f"FastH3 audio_vae.{field.name} must be a sequence")
+        if isinstance(field.default, tuple) and not isinstance(
+            value, (tuple, list)
+        ):
+            raise ValueError(
+                f"FastH3 audio_vae.{field.name} must be a sequence"
+            )
         if field.name == "resblock_dilation_sizes":
             if any(not isinstance(row, (tuple, list)) for row in value):
-                raise ValueError("FastH3 audio_vae.resblock_dilation_sizes must contain sequences")
+                raise ValueError(
+                    "FastH3 audio_vae.resblock_dilation_sizes "
+                    "must contain sequences"
+                )
             value = tuple(tuple(row) for row in value)
         elif isinstance(field.default, tuple):
             value = tuple(value)
@@ -295,7 +346,7 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
 
 
 def read_config(root: Path, io) -> Config:
-    """Read all architecture sidecars before any numerical module construction."""
+    """Read all architecture sidecars before any numerical module construction."""  # noqa: E501
     metadata = {}
     for name, relative in (
         ("inference", "fastvideo_inference.json"),
@@ -306,9 +357,13 @@ def read_config(root: Path, io) -> Config:
         ("scheduler", "scheduler/scheduler_config.json"),
         ("audio_scheduler", "audio_scheduler/scheduler_config.json"),
     ):
-        metadata[name] = json.loads((root / relative).read_text(encoding="utf-8"))
+        metadata[name] = json.loads(
+            (root / relative).read_text(encoding="utf-8")
+        )
     if metadata["audio_vae"].get("sampling_rate") != 32000:
-        raise ValueError("FastH3 audio output requires a 32000 Hz sampling clock")
+        raise ValueError(
+            "FastH3 audio output requires a 32000 Hz sampling clock"
+        )
     return _normalize(metadata)
 
 

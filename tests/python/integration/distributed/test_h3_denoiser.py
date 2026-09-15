@@ -1,11 +1,16 @@
-"""H3's public denoiser composes latent packing, partitions and solver feedback."""
+"""H3's public denoiser composes latent packing.
+
+It also composes partitions and solver feedback.
+"""
 
 from functools import partial
 
 import pytest
 import torch
 import torch.multiprocessing as mp
-from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+from diffusers.models.transformers.transformer_minimax_h3 import (
+    MiniMaxH3Transformer3DModel,
+)
 from safetensors.torch import save_file
 from torch.nn import functional as F
 
@@ -14,8 +19,17 @@ from uniserve.diffusion import DenoisingStep, normal_noise
 from uniserve.distributed import DeviceMesh
 from uniserve.loading import checkpoint, weights
 from uniserve.model import LatentInput
-from uniserve.nn.attention import AttentionParallelConfig, ContextParallelConfig, Ulysses
-from uniserve.runtime import CUDAGraph, ExecutionContext, TensorBuffers, initialize_process_groups
+from uniserve.nn.attention import (
+    AttentionParallelConfig,
+    ContextParallelConfig,
+    Ulysses,
+)
+from uniserve.runtime import (
+    CUDAGraph,
+    ExecutionContext,
+    TensorBuffers,
+    initialize_process_groups,
+)
 from uniserve_models.minimax_h3 import (
     Denoiser,
     DenoiserInput,
@@ -23,7 +37,9 @@ from uniserve_models.minimax_h3 import (
     DiffusionConfig,
     TransformerConfig,
 )
-from uniserve_models.minimax_h3.conditioning import assignments as conditioning_assignments
+from uniserve_models.minimax_h3.conditioning import (
+    assignments as conditioning_assignments,
+)
 from uniserve_models.minimax_h3.config import TRANSFORMER_FIELDS
 from uniserve_models.minimax_h3.weights import transformer_component
 
@@ -68,15 +84,20 @@ def _mapping(model):
 def _prediction(sample, source, name):
     prefix = "" if name == "video" else "audio_"
     hidden = F.linear(
-        sample, source[prefix + "proj_in.weight"], source[prefix + "proj_in.bias"]
+        sample,
+        source[prefix + "proj_in.weight"],
+        source[prefix + "proj_in.bias"],
     ).bfloat16()
     normalized = (
-        hidden.float() * torch.rsqrt(hidden.float().square().mean(-1, keepdim=True) + 1e-5)
+        hidden.float()
+        * torch.rsqrt(hidden.float().square().mean(-1, keepdim=True) + 1e-5)
     ).bfloat16()
     shift, scale = source["norm_out.linear.bias"].bfloat16().chunk(2)
     normalized = normalized * (1.0 + scale) + shift
     return F.linear(
-        normalized.float(), source[prefix + "proj_out.weight"], source[prefix + "proj_out.bias"]
+        normalized.float(),
+        source[prefix + "proj_out.weight"],
+        source[prefix + "proj_out.bias"],
     )
 
 
@@ -85,16 +106,34 @@ def _run(rank, rendezvous, directory, source):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     groups = initialize_process_groups(
-        rank=rank, local_rank=rank, world_size=4, device=device, init_method=rendezvous
+        rank=rank,
+        local_rank=rank,
+        world_size=4,
+        device=device,
+        init_method=rendezvous,
     )
     cases = (
-        ((1, 1, 4), ("pp", "tp", "heads"), AttentionParallelConfig(heads=Ulysses("heads"))),
-        ((1, 2, 2), ("pp", "tp", "heads"), AttentionParallelConfig(heads=Ulysses("heads"))),
-        ((2, 1, 2), ("pp", "tp", "heads"), AttentionParallelConfig(heads=Ulysses("heads"))),
+        (
+            (1, 1, 4),
+            ("pp", "tp", "heads"),
+            AttentionParallelConfig(heads=Ulysses("heads")),
+        ),
+        (
+            (1, 2, 2),
+            ("pp", "tp", "heads"),
+            AttentionParallelConfig(heads=Ulysses("heads")),
+        ),
+        (
+            (2, 1, 2),
+            ("pp", "tp", "heads"),
+            AttentionParallelConfig(heads=Ulysses("heads")),
+        ),
         (
             (1, 1, 4),
             ("pp", "tp", "context"),
-            AttentionParallelConfig(context=ContextParallelConfig(peer_axis="context")),
+            AttentionParallelConfig(
+                context=ContextParallelConfig(peer_axis="context")
+            ),
         ),
     )
     matrices = {
@@ -104,12 +143,17 @@ def _run(rank, rendezvous, directory, source):
     }
     for shape, axes, attention in cases:
         mesh = groups.bind(
-            DeviceMesh(ranks=(3, 1, 0, 2), shape=shape, axes=axes, rank=rank), device=device
+            DeviceMesh(ranks=(3, 1, 0, 2), shape=shape, axes=axes, rank=rank),
+            device=device,
         )
         model = loading.load_model(
             partial(Denoiser, diffusion=DiffusionConfig()),
             _config(),
-            checkpoint=(checkpoint.Config("denoiser").resolve(directory, io=loading.Config()),),
+            checkpoint=(
+                checkpoint.Config("denoiser").resolve(
+                    directory, io=loading.Config()
+                ),
+            ),
             mapping=_mapping,
             device=device,
             meshes={"": mesh},
@@ -117,7 +161,12 @@ def _run(rank, rendezvous, directory, source):
             weights=weights.Config(
                 dtypes={
                     f"transformer.{name}": torch.float32
-                    for name in ("video_input", "audio_input", "video_output", "audio_output")
+                    for name in (
+                        "video_input",
+                        "audio_input",
+                        "video_output",
+                        "audio_output",
+                    )
                 }
             ),
         ).model
@@ -133,11 +182,14 @@ def _run(rank, rendezvous, directory, source):
             ):
                 state = resident.view(requirements)
                 prepared = {
-                    name: value.unsqueeze(0) for name, value in host.view(requirements).items()
+                    name: value.unsqueeze(0)
+                    for name, value in host.view(requirements).items()
                 }
                 noise = {
                     name: torch.empty(
-                        (1, *model.noise_shape(name, size)), dtype=torch.float32, device="cpu"
+                        (1, *model.noise_shape(name, size)),
+                        dtype=torch.float32,
+                        device="cpu",
                     )
                     for name in model.modalities
                 }
@@ -161,7 +213,9 @@ def _run(rank, rendezvous, directory, source):
                 assert model.prediction_type == "velocity"
                 inputs = DenoiserInput(
                     latents={
-                        name: (LatentInput(value, schedules[name].timesteps[1]),)
+                        name: (
+                            LatentInput(value, schedules[name].timesteps[1]),
+                        )
                         for name, value in state.items()
                     },
                     sizes=(size,),
@@ -170,7 +224,8 @@ def _run(rank, rendezvous, directory, source):
                 )
                 initial = {name: value.clone() for name, value in state.items()}
                 predicted = {
-                    name: _prediction(value, matrices, name) for name, value in initial.items()
+                    name: _prediction(value, matrices, name)
+                    for name, value in initial.items()
                 }
                 output = model(
                     inputs,
@@ -181,14 +236,27 @@ def _run(rank, rendezvous, directory, source):
                 for name in model.modalities:
                     if mesh.get_group("pp").rank + 1 == mesh.size("pp"):
                         torch.testing.assert_close(
-                            output[name][0].tensor, predicted[name], rtol=2e-2, atol=2e-2
+                            output[name][0].tensor,
+                            predicted[name],
+                            rtol=2e-2,
+                            atol=2e-2,
                         )
-                        assert output[name][0].layout == model.output_layout(size)[name]
+                        assert (
+                            output[name][0].layout
+                            == model.output_layout(size)[name]
+                        )
                     else:
                         assert output[name] == (None,)
-                    torch.testing.assert_close(state[name], initial[name], rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        state[name], initial[name], rtol=0, atol=0
+                    )
                 step = DenoisingStep(
-                    model, inputs, schedules, state, execution.constants, execution.workspace
+                    model,
+                    inputs,
+                    schedules,
+                    state,
+                    execution.constants,
+                    execution.workspace,
                 )
                 expected = {}
                 for name, value in initial.items():
@@ -196,10 +264,12 @@ def _run(rank, rendezvous, directory, source):
                     ratio = schedule.sigmas[2] / schedule.sigmas[1]
                     clean = (
                         value.double()
-                        + predicted[name].double() * (1.0 - schedule.timesteps[1]).double()
+                        + predicted[name].double()
+                        * (1.0 - schedule.timesteps[1]).double()
                     )
                     expected[name] = (
-                        ratio.double() * value.double() + (1.0 - ratio).double() * clean
+                        ratio.double() * value.double()
+                        + (1.0 - ratio).double() * clean
                     ).float()
 
                 def restore():
@@ -212,9 +282,15 @@ def _run(rank, rendezvous, directory, source):
                     graph.capture(step, restore=restore)
                     result = graph.replay()
                     for name in model.modalities:
-                        if mesh.get_group("pp").rank in (0, mesh.size("pp") - 1):
+                        if mesh.get_group("pp").rank in (
+                            0,
+                            mesh.size("pp") - 1,
+                        ):
                             torch.testing.assert_close(
-                                result[name][0], expected[name], rtol=2e-2, atol=2e-2
+                                result[name][0],
+                                expected[name],
+                                rtol=2e-2,
+                                atol=2e-2,
                             )
                 torch.cuda.synchronize(device)
     # Exceptions leave teardown to multiprocessing, so a failing rank can
@@ -226,7 +302,10 @@ def _checkpoint(tmp_path):
     config = _config()
     torch.manual_seed(922)
     native = MiniMaxH3Transformer3DModel(
-        **{source: getattr(config, target) for source, target in TRANSFORMER_FIELDS.items()},
+        **{
+            source: getattr(config, target)
+            for source, target in TRANSFORMER_FIELDS.items()
+        },
         patch_size=(1, 2, 2),
         final_norm_eps=config.norm_eps,
     )
@@ -243,8 +322,10 @@ def _checkpoint(tmp_path):
     )
     source["norm_out.linear.bias"][config.hidden_size :] = 0.125
     for index in range(config.num_hidden_layers):
-        source[f"transformer_blocks.{index}.attn.to_gate_compress.weight"] = torch.zeros(
-            config.num_attention_heads * config.head_dim, config.hidden_size
+        source[f"transformer_blocks.{index}.attn.to_gate_compress.weight"] = (
+            torch.zeros(
+                config.num_attention_heads * config.head_dim, config.hidden_size
+            )
         )
     save_file(source, tmp_path / "model.safetensors")
     return source
@@ -252,7 +333,12 @@ def _checkpoint(tmp_path):
 
 def test_partitioned_denoising_and_feedback(tmp_path):
     source = _checkpoint(tmp_path)
-    mp.spawn(_run, args=((tmp_path / "rendezvous").as_uri(), tmp_path, source), nprocs=4, join=True)
+    mp.spawn(
+        _run,
+        args=((tmp_path / "rendezvous").as_uri(), tmp_path, source),
+        nprocs=4,
+        join=True,
+    )
 
 
 @torch.inference_mode()
@@ -262,21 +348,33 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
 
     source = _checkpoint(tmp_path)
     device = torch.device("cuda", 0)
-    with initialize_process_groups(rank=0, local_rank=0, world_size=1, device=device) as groups:
+    with initialize_process_groups(
+        rank=0, local_rank=0, world_size=1, device=device
+    ) as groups:
         mesh = groups.bind(
-            DeviceMesh(ranks=(0,), shape=(1, 1), axes=("pp", "tp"), rank=0), device=device
+            DeviceMesh(ranks=(0,), shape=(1, 1), axes=("pp", "tp"), rank=0),
+            device=device,
         )
         model = loading.load_model(
             partial(Denoiser, diffusion=DiffusionConfig()),
             _config(),
-            checkpoint=(checkpoint.Config("denoiser").resolve(tmp_path, io=loading.Config()),),
+            checkpoint=(
+                checkpoint.Config("denoiser").resolve(
+                    tmp_path, io=loading.Config()
+                ),
+            ),
             mapping=_mapping,
             device=device,
             meshes={"": mesh},
             weights=weights.Config(
                 dtypes={
                     f"transformer.{name}": torch.float32
-                    for name in ("video_input", "audio_input", "video_output", "audio_output")
+                    for name in (
+                        "video_input",
+                        "audio_input",
+                        "video_output",
+                        "audio_output",
+                    )
                 }
             ),
         ).model
@@ -309,31 +407,49 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                     )
                     for target, value in copies:
                         target.copy_(value, non_blocking=True)
-                    initial = {name: value.clone() for name, value in state.items()}
+                    initial = {
+                        name: value.clone() for name, value in state.items()
+                    }
                     inputs = factory.bind(size, views, schedules, 0)
-                    runner.warmup(inputs, schedules, state=state, input_key=size)
+                    runner.warmup(
+                        inputs, schedules, state=state, input_key=size
+                    )
                     for name in model.modalities:
-                        torch.testing.assert_close(state[name], initial[name], rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            state[name], initial[name], rtol=0, atol=0
+                        )
                     for index in range(4):
                         inputs = factory.bind(size, views, schedules, index)
                         expected = {}
                         for name, value in state.items():
                             prediction = _prediction(value, matrices, name)
                             schedule = schedules[name]
-                            ratio = schedule.sigmas[index + 1] / schedule.sigmas[index]
+                            ratio = (
+                                schedule.sigmas[index + 1]
+                                / schedule.sigmas[index]
+                            )
                             clean = (
                                 value.double()
-                                + prediction.double() * (1.0 - schedule.timesteps[index]).double()
+                                + prediction.double()
+                                * (1.0 - schedule.timesteps[index]).double()
                             )
                             expected[name] = (
-                                ratio.double() * value.double() + (1.0 - ratio).double() * clean
+                                ratio.double() * value.double()
+                                + (1.0 - ratio).double() * clean
                             ).float()
                         result, _ = runner.step(
-                            inputs, schedules, state=state, slot=0, input_key=size
+                            inputs,
+                            schedules,
+                            state=state,
+                            slot=0,
+                            input_key=size,
                         )
                         for name in model.modalities:
                             torch.testing.assert_close(
-                                result[name][0], expected[name], rtol=2e-2, atol=2e-2
+                                result[name][0],
+                                expected[name],
+                                rtol=2e-2,
+                                atol=2e-2,
                             )
                     torch.cuda.synchronize(device)
                     # Retired request schedules may be overwritten immediately.

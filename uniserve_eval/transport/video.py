@@ -14,21 +14,22 @@ class VideoOutputError(ValueError):
 
     def __init__(self, classifier: str, message: str) -> None:
         """Initialize the error with its classifier and diagnostic detail."""
-
         self.classifier = classifier
         super().__init__(message)
 
 
 def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
     """Decode one video and audio stream and return verified media metadata."""
-
     # Validate the HTTP-level envelope before invoking the media decoder.
     if not data:
-        raise VideoOutputError("response_empty_video", "video response body is empty")
+        raise VideoOutputError(
+            "response_empty_video", "video response body is empty"
+        )
     mime = declared_mime.partition(";")[0].strip().lower()
     if mime != "video/mp4":
         raise VideoOutputError(
-            "response_invalid_video_mime", f"expected video/mp4, received {declared_mime!r}"
+            "response_invalid_video_mime",
+            f"expected video/mp4, received {declared_mime!r}",
         )
 
     try:
@@ -42,7 +43,8 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
             if len(video_streams) != 1 or len(audio_streams) != 1:
                 raise VideoOutputError(
                     "response_invalid_media_streams",
-                    "fixed H3 output must contain one video and one audio stream",
+                    "fixed H3 output must contain one video and one audio "
+                    "stream",
                 )
             video_stream = video_streams[0]
             audio_stream = audio_streams[0]
@@ -81,18 +83,21 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
             rate_value = video_stream.average_rate
             if rate_value is None:
                 raise VideoOutputError(
-                    "response_missing_video_rate", "video stream has no average frame rate"
+                    "response_missing_video_rate",
+                    "video stream has no average frame rate",
                 )
             frame_rate = Fraction(rate_value)
             video_codec = str(video_stream.codec_context.name or "")
             audio_codec = str(audio_stream.codec_context.name or "")
             if frame_count < 1 or audio_samples < 1:
                 raise VideoOutputError(
-                    "response_undecodable_video", "video or audio stream decoded no frames"
+                    "response_undecodable_video",
+                    "video or audio stream decoded no frames",
                 )
             if audio_channels is None or audio_sample_rate is None:
                 raise VideoOutputError(
-                    "response_undecodable_audio", "audio stream decoded no valid PCM frames"
+                    "response_undecodable_audio",
+                    "audio stream decoded no valid PCM frames",
                 )
             checksum = hashlib.sha256(data).hexdigest()
             return DecodedVideo(
@@ -117,7 +122,8 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
     except Exception as error:
         # Normalize decoder-specific failures into the evaluator classifier set.
         raise VideoOutputError(
-            "response_undecodable_video", f"MP4 decode failed: {type(error).__name__}: {error}"
+            "response_undecodable_video",
+            f"MP4 decode failed: {type(error).__name__}: {error}",
         ) from error
 
 

@@ -36,8 +36,10 @@ class BlockTables:
         device: torch.device | str,
         staging_depth: int = 1,
     ) -> None:
-        """Allocate device block tables and bounded host staging for atomic table updates."""
+        """Allocate device block tables and bounded host staging for atomic.
 
+        table updates.
+        """
         # Slot zero is included in every device row allocation but remains
         # reserved for padding and graph replay rather than scheduler requests.
         self._prefix_slots: dict[RequestKey, set[int]] = {}
@@ -54,7 +56,9 @@ class BlockTables:
             )
             < 1
         ):
-            raise invalid_descriptor("request-to-token pool dimensions are invalid")
+            raise invalid_descriptor(
+                "request-to-token pool dimensions are invalid"
+            )
 
         self._table_capacity = self.request_pool_size * self.group_count
         buffer_configs = self.buffers(
@@ -62,8 +66,14 @@ class BlockTables:
             request_pool_size=self.request_pool_size,
             max_blocks_per_request=self.max_blocks_per_request,
         )
-        tensors = TensorBuffers.allocate(buffer_configs, device=device).view(buffer_configs)
-        for name, value in {"page_tables": 0, "verified_lengths": 0, "alloced_lens": 0}.items():
+        tensors = TensorBuffers.allocate(buffer_configs, device=device).view(
+            buffer_configs
+        )
+        for name, value in {
+            "page_tables": 0,
+            "verified_lengths": 0,
+            "alloced_lens": 0,
+        }.items():
             tensors[name].fill_(value)
 
         self.page_tables = tensors["page_tables"]
@@ -109,19 +119,27 @@ class BlockTables:
     def buffers(
         *, group_count: int, request_pool_size: int, max_blocks_per_request: int
     ) -> dict[str, BufferConfig]:
-        """Describe page tables and the full request/group installation workspace."""
+        """Describe page tables and the full request/group installation.
 
+        workspace.
+        """
         if min(group_count, request_pool_size, max_blocks_per_request) < 1:
-            raise invalid_descriptor("request-to-token pool dimensions are invalid")
+            raise invalid_descriptor(
+                "request-to-token pool dimensions are invalid"
+            )
         rows, tables = request_pool_size + 1, request_pool_size * group_count
         return {
             # [group, slot, block]: page ids per request slot and cache group.
-            "page_tables": BufferConfig((group_count, rows, max_blocks_per_request), torch.int32),
+            "page_tables": BufferConfig(
+                (group_count, rows, max_blocks_per_request), torch.int32
+            ),
             # [slot]: verified and allocated token lengths per request slot.
             "verified_lengths": BufferConfig((rows,), torch.int32),
             "alloced_lens": BufferConfig((rows,), torch.int32),
             # Device staging targets for one full installation batch.
-            "_page_staging": BufferConfig((tables, max_blocks_per_request), torch.int32),
+            "_page_staging": BufferConfig(
+                (tables, max_blocks_per_request), torch.int32
+            ),
             "_slot_staging": BufferConfig((2, tables), torch.int64),
             "_group_staging": BufferConfig((tables,), torch.int64),
             "_allocated_staging": BufferConfig((tables,), torch.int32),
@@ -131,13 +149,17 @@ class BlockTables:
         self,
         tables: Sequence[tuple[int, int, Sequence[int], int]],
     ) -> None:
-        """Atomically install validated request block tables and allocated lengths on the device."""
+        """Atomically install validated request block tables and allocated.
 
+        lengths on the device.
+        """
         count = len(tables)
         if count == 0:
             return
         if count > self._table_capacity:
-            raise invalid_descriptor("block-table update exceeds staging capacity")
+            raise invalid_descriptor(
+                "block-table update exceeds staging capacity"
+            )
         rows: list[tuple[int, ...]] = []
         slots: list[int] = []
         groups: list[int] = []
@@ -165,7 +187,9 @@ class BlockTables:
                 raise invalid_descriptor("scheduler block table is invalid")
             previous = slot_allocations.setdefault(slot, allocated_tokens)
             if previous != allocated_tokens:
-                raise invalid_descriptor("cache groups disagree on allocated length")
+                raise invalid_descriptor(
+                    "cache groups disagree on allocated length"
+                )
             identities.add((slot, group))
             if self._host_tables.get((slot, group)) != pages:
                 rows.append(pages)
@@ -198,7 +222,9 @@ class BlockTables:
             fill_cpu_ints(group_host[:changed_count], groups)
             for row, pages in enumerate(rows):
                 fill_cpu_ints(pages_host[row, : len(pages)], pages)
-            self._page_staging[:changed_count].copy_(pages_host, non_blocking=non_blocking)
+            self._page_staging[:changed_count].copy_(
+                pages_host, non_blocking=non_blocking
+            )
             self._group_staging[:changed_count].copy_(
                 group_host[:changed_count], non_blocking=non_blocking
             )
@@ -236,36 +262,49 @@ class BlockTables:
             self._host_alloced_lens[slot] = allocated_tokens
 
     def pages(self, request_pool_idx: int, group_id: int) -> tuple[int, ...]:
-        """Resolve the installed cache-page table for one request slot and cache group."""
+        """Resolve the installed cache-page table for one request slot.
 
+        and cache group.
+        """
         try:
             return self._host_tables[(int(request_pool_idx), int(group_id))]
         except KeyError:
-            raise invalid_descriptor("request slot has no installed block table") from None
+            raise invalid_descriptor(
+                "request slot has no installed block table"
+            ) from None
 
     def allocated_length(self, request_pool_idx: int) -> int:
         """Expose the token capacity currently installed for a request slot."""
-
         return self._host_alloced_lens.get(int(request_pool_idx), 0)
 
     def set_verified(self, slots: torch.Tensor, lengths: torch.Tensor) -> None:
-        """Update verified cache lengths for selected request slots without changing page tables."""
+        """Update verified cache lengths for selected request slots without.
 
+        changing page tables.
+        """
         slots = slots.to(device=self.page_tables.device, dtype=torch.int64)
         lengths = lengths.to(device=self.page_tables.device, dtype=torch.int32)
         if slots.ndim != 1 or lengths.shape != slots.shape:
-            raise invalid_descriptor("verified-length update is not row aligned")
+            raise invalid_descriptor(
+                "verified-length update is not row aligned"
+            )
         allocated = self.alloced_lens.index_select(0, slots)
         bounds = torch.all((lengths >= 0) & (lengths <= allocated))
         if bounds.device.type == "cuda":
-            torch._assert_async(bounds, "verified length exceeds allocated KV capacity")
+            torch._assert_async(
+                bounds, "verified length exceeds allocated KV capacity"
+            )
         elif not bool(bounds):
-            raise invalid_descriptor("verified length exceeds allocated KV capacity")
+            raise invalid_descriptor(
+                "verified length exceeds allocated KV capacity"
+            )
         self.verified_lengths.index_copy_(0, slots, lengths)
 
     def close(self) -> None:
-        """Retire pinned page-table sources before their borrowed streams are destroyed."""
+        """Retire pinned page-table sources before their borrowed streams are.
 
+        destroyed.
+        """
         close_resources(
             self._page_host.close,
             self._slot_host.close,
@@ -277,13 +316,19 @@ class BlockTables:
         self._host_alloced_lens.clear()
 
     def retain_prefix(self, request_key: RequestKey, slot: int) -> None:
-        """Associate an alternative CFG prefix row with its exact request epoch."""
+        """Associate an alternative CFG prefix row with its exact request.
 
+        epoch.
+        """
         self._prefix_slots.setdefault(request_key, set()).add(int(slot))
 
-    def release_prefixes(self, request_key: RequestKey, slots: Sequence[int] | None = None) -> None:
-        """Release selected alternative rows, or every row owned by a retiring epoch."""
+    def release_prefixes(
+        self, request_key: RequestKey, slots: Sequence[int] | None = None
+    ) -> None:
+        """Release selected alternative rows, or every row owned by a retiring.
 
+        epoch.
+        """
         tracked = self._prefix_slots.get(request_key, set())
         selected = tuple(tracked) if slots is None else tuple(slots)
         self.release(selected)
@@ -292,19 +337,25 @@ class BlockTables:
             self._prefix_slots.pop(request_key, None)
 
     def release(self, slots: Sequence[int]) -> None:
-        """Clear selected request slots and return them to the scheduler-owned free state."""
+        """Clear selected request slots and return them to the scheduler-owned.
 
+        free state.
+        """
         values = tuple(dict.fromkeys(int(slot) for slot in slots))
         if not values:
             return
         if any(slot < 1 or slot > self.request_pool_size for slot in values):
-            raise invalid_descriptor("released request slot is outside capacity")
+            raise invalid_descriptor(
+                "released request slot is outside capacity"
+            )
 
         count = len(values)
         slot, host = self._slot_host.acquire()
         fill_cpu_ints(host[0, :count], values)
         indices = self._slot_staging[0, :count]
-        indices.copy_(host[0, :count], non_blocking=self.page_tables.device.type == "cuda")
+        indices.copy_(
+            host[0, :count], non_blocking=self.page_tables.device.type == "cuda"
+        )
         self._slot_host.record_copy(slot)
 
         self.page_tables.index_fill_(1, indices, 0)
@@ -324,8 +375,12 @@ def page_spans(page_ids, start: int, length: int, page_size: int):
 
     Each returned span is (page id, token offset within the page, token count).
     """
-
-    if page_size < 1 or start < 0 or length < 0 or start + length > len(page_ids) * page_size:
+    if (
+        page_size < 1
+        or start < 0
+        or length < 0
+        or start + length > len(page_ids) * page_size
+    ):
         raise ValueError("KV token interval exceeds its block table")
     spans = []
     while length:

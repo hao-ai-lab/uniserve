@@ -29,7 +29,6 @@ class ProcessGroups:
 
     def __enter__(self) -> Self:
         """Enter a scope owning the process groups created here."""
-
         return self
 
     def __exit__(
@@ -43,12 +42,13 @@ class ProcessGroups:
         except BaseException as cleanup_error:
             if exc_value is None:
                 raise
-            exc_value.add_note(f"Resource cleanup also failed: {cleanup_error!r}")
+            exc_value.add_note(
+                f"Resource cleanup also failed: {cleanup_error!r}"
+            )
 
     @property
     def process_group(self) -> Communicator:
         """Bind component transfers to the instance's ordered physical ranks."""
-
         return Communicator(
             tuple(range(self.world_size)),
             self.rank,
@@ -57,15 +57,18 @@ class ProcessGroups:
             dist.group.WORLD if dist.is_initialized() else None,
         )
 
-    def bind(self, mesh: DeviceMesh, *, device: torch.device | str) -> DeviceMesh:
+    def bind(
+        self, mesh: DeviceMesh, *, device: torch.device | str
+    ) -> DeviceMesh:
         """Bind topology fibers in the same order on every process.
 
         Nonmembers participate in group creation and retain only the topology.
         Equivalent fibers of this binding share one backend handle; each mesh
         binding owns its own ordering domain for independent model components.
         """
-
-        if mesh.rank != self.rank or any(rank >= self.world_size for rank in mesh.ranks):
+        if mesh.rank != self.rank or any(
+            rank >= self.world_size for rank in mesh.ranks
+        ):
             raise ValueError("mesh ranks disagree with the process world")
 
         device = torch.device(device)
@@ -78,13 +81,16 @@ class ProcessGroups:
                     if len(members) > 1 and ordered not in handles:
                         if not dist.is_initialized():
                             raise RuntimeError(
-                                "multi-rank mesh binding requires an initialized process world"
+                                "multi-rank mesh binding requires an "
+                                "initialized process world"
                             )
                         handle = dist.new_group(
                             ranks=list(ordered),
                             backend=self.backend,
                             pg_options=_group_options(self.backend),
-                            device_id=device if self.backend == "nccl" else None,
+                            device_id=device
+                            if self.backend == "nccl"
+                            else None,
                         )
                         handles[ordered] = handle
                         if self.rank in members:
@@ -98,23 +104,28 @@ class ProcessGroups:
                             handles.get(ordered),
                         )
 
-        result = DeviceMesh(ranks=mesh.ranks, shape=mesh.shape, axes=mesh.axes, rank=mesh.rank)
+        result = DeviceMesh(
+            ranks=mesh.ranks, shape=mesh.shape, axes=mesh.axes, rank=mesh.rank
+        )
         object.__setattr__(result, "_device", device)
         object.__setattr__(result, "_groups", MappingProxyType(groups))
         return result
 
     def close(self) -> None:
-        """Destroy owned process groups after all communication consumers retire.
+        """Destroy owned process groups.
+
+        Destroy owned process groups after all communication consumers
+        retire.
 
         Attempt every release even if device synchronization or a group teardown
         fails. Component groups retire before the default world they depend on.
         """
-
         actions: list[Callable[[], object]] = []
         if self.device.type == "cuda":
             actions.append(partial(torch.cuda.synchronize, self.device))
         actions.extend(
-            partial(dist.destroy_process_group, group) for group in reversed(self._groups)
+            partial(dist.destroy_process_group, group)
+            for group in reversed(self._groups)
         )
         self._groups.clear()
         close_resources(*actions)
@@ -135,17 +146,21 @@ def initialize_process_groups(
     after all dependent execution resources retire, or transfers that obligation
     to the constructed Worker. Its context manager closes on every scope exit.
     """
-
     if world_size < 1 or not 0 <= rank < world_size or local_rank < 0:
-        raise ValueError("launch rank must satisfy 0 <= rank < positive world_size")
+        raise ValueError(
+            "launch rank must satisfy 0 <= rank < positive world_size"
+        )
 
     local_device = torch.device(device)
     if local_device.type == "cuda":
-        index = local_device.index if local_device.index is not None else local_rank
+        index = (
+            local_device.index if local_device.index is not None else local_rank
+        )
         local_device = torch.device("cuda", index)
         if not torch.cuda.is_available() or index >= torch.cuda.device_count():
             raise ValueError(
-                f"cuda device {local_device} is outside the {torch.cuda.device_count()} visible CUDA device(s)"
+                f"cuda device {local_device} is outside the "
+                f"{torch.cuda.device_count()} visible CUDA device(s)"
             )
         torch.cuda.set_device(local_device)
 
@@ -154,15 +169,23 @@ def initialize_process_groups(
 
     if dist.is_initialized():
         if (dist.get_rank(), dist.get_world_size()) != (rank, world_size):
-            raise ValueError("existing process world disagrees with supplied rank/world_size")
+            raise ValueError(
+                "existing process world disagrees with supplied rank/world_size"
+            )
         if dist.get_backend() != backend:
-            raise ValueError("existing process world disagrees with supplied backend")
+            raise ValueError(
+                "existing process world disagrees with supplied backend"
+            )
     elif world_size > 1:
         if not init_method:
             port = os.environ.get("MASTER_PORT")
             if not port:
-                raise ValueError("MASTER_PORT or an explicit init_method is required")
-            init_method = f"tcp://{os.environ.get('MASTER_ADDR', '127.0.0.1')}:{port}"
+                raise ValueError(
+                    "MASTER_PORT or an explicit init_method is required"
+                )
+            init_method = (
+                f"tcp://{os.environ.get('MASTER_ADDR', '127.0.0.1')}:{port}"
+            )
         dist.init_process_group(
             backend=backend,
             init_method=init_method,

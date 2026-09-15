@@ -36,7 +36,8 @@ class Model(nn.Module):
 
         backbone = Transformer(config.text)
         self.text = CausalLM(
-            backbone, VocabParallelHead(config.text.hidden_size, config.text.vocab_size)
+            backbone,
+            VocabParallelHead(config.text.hidden_size, config.text.vocab_size),
         )
         if config.text.tie_word_embeddings:
             self.text.lm_head.weight = backbone.embedding.weight

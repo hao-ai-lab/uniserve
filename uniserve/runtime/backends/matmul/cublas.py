@@ -17,14 +17,21 @@ class _CUBLASOperator(_Operator):
         if x.shape[0] == 0:
             return out
 
-        if isinstance(x, QuantizedTensor) or isinstance(weight, QuantizedTensor):
+        if isinstance(x, QuantizedTensor) or isinstance(
+            weight, QuantizedTensor
+        ):
             if any(
-                isinstance(value, QuantizedTensor) and value.quantizer.format != "fp8"
+                isinstance(value, QuantizedTensor)
+                and value.quantizer.format != "fp8"
                 for value in (x, weight)
             ):
-                raise ValueError("cuBLAS encoded operands require the FP8 format")
+                raise ValueError(
+                    "cuBLAS encoded operands require the FP8 format"
+                )
 
-            if not all(isinstance(value, QuantizedTensor) for value in (x, weight)):
+            if not all(
+                isinstance(value, QuantizedTensor) for value in (x, weight)
+            ):
                 # One encoded operand does not authorize quantizing the other.
                 # Its existing FP8 values and scales define an FP32 product.
                 left = (
@@ -61,7 +68,12 @@ class _CUBLASOperator(_Operator):
                 else torch.empty(out.shape, dtype=out.dtype, device=out.device)
             )
             torch._scaled_mm(
-                left["values"], right["values"].T, scale_a, scale_b, out_dtype=out.dtype, out=target
+                left["values"],
+                right["values"].T,
+                scale_a,
+                scale_b,
+                out_dtype=out.dtype,
+                out=target,
             )
             if target is not out:
                 out.copy_(target)

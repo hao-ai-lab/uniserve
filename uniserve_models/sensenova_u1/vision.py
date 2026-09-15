@@ -34,14 +34,17 @@ class Config:
             or self.hidden_size % 4
         ):
             raise ValueError(
-                "NEO patch dimensions must be positive and its rotary width divisible by four"
+                "NEO patch dimensions must be positive and its rotary "
+                "width divisible by four"
             )
         if (
             not math.isfinite(self.downsample_ratio)
             or not 0 < self.downsample_ratio <= 1
             or round(1 / self.downsample_ratio) * self.downsample_ratio != 1
         ):
-            raise ValueError("NEO downsampling must be the reciprocal of a positive integer")
+            raise ValueError(
+                "NEO downsampling must be the reciprocal of a positive integer"
+            )
         if not math.isfinite(self.rope_theta) or self.rope_theta <= 0:
             raise ValueError("NEO rotary theta must be finite and positive")
 
@@ -59,54 +62,93 @@ class Encoder(nn.Module):
         self.config = config
         factor = round(1 / config.downsample_ratio)
         self.patch_embedding = nn.Conv2d(
-            config.num_channels, config.hidden_size, config.patch_size, stride=config.patch_size
+            config.num_channels,
+            config.hidden_size,
+            config.patch_size,
+            stride=config.patch_size,
         )
         self.dense_embedding = nn.Conv2d(
             config.hidden_size, config.output_size, factor, stride=factor
         )
-        self.rotary = RotaryEmbedding(config.hidden_size // 2, theta=config.rope_theta)
+        self.rotary = RotaryEmbedding(
+            config.hidden_size // 2, theta=config.rope_theta
+        )
         self.activation = nn.GELU()
 
     def forward(
-        self, pixels: torch.Tensor, grids: torch.Tensor, grid_shapes: tuple[tuple[int, int], ...]
+        self,
+        pixels: torch.Tensor,
+        grids: torch.Tensor,
+        grid_shapes: tuple[tuple[int, int], ...],
     ) -> torch.Tensor:
         counts = tuple(height * width for height, width in grid_shapes)
-        if grids.shape != (len(counts), 2) or grids.dtype not in (torch.int32, torch.int64):
-            raise ValueError("NEO grids require one integer height/width pair per image")
+        if grids.shape != (len(counts), 2) or grids.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError(
+                "NEO grids require one integer height/width pair per image"
+            )
         factor = round(1 / self.config.downsample_ratio)
-        if any(min(shape) < 1 or any(axis % factor for axis in shape) for shape in grid_shapes):
-            raise ValueError("NEO image grids must align with dense spatial downsampling")
+        if any(
+            min(shape) < 1 or any(axis % factor for axis in shape)
+            for shape in grid_shapes
+        ):
+            raise ValueError(
+                "NEO image grids must align with dense spatial downsampling"
+            )
 
         if pixels.ndim == 2:
             # Packed patches arrive as [total_patches, channels*patch*patch].
-            if pixels.shape != (sum(counts), self.config.num_channels * self.config.patch_size**2):
-                raise ValueError("NEO packed CHW pixels must cover the declared image grids")
+            if pixels.shape != (
+                sum(counts),
+                self.config.num_channels * self.config.patch_size**2,
+            ):
+                raise ValueError(
+                    "NEO packed CHW pixels must cover the declared image grids"
+                )
             pixels = pixels.reshape(
-                -1, self.config.num_channels, self.config.patch_size, self.config.patch_size
+                -1,
+                self.config.num_channels,
+                self.config.patch_size,
+                self.config.patch_size,
             )
         if pixels.ndim != 4:
-            raise ValueError("NEO pixels must be NCHW images or flattened CHW patches")
+            raise ValueError(
+                "NEO pixels must be NCHW images or flattened CHW patches"
+            )
 
         features = self.activation(
             self.patch_embedding(pixels.to(self.patch_embedding.weight.dtype))
         )
         # [patches, hidden, h, w] -> [total_patches, hidden] across all images.
-        features = features.permute(0, 2, 3, 1).reshape(-1, self.config.hidden_size)
+        features = features.permute(0, 2, 3, 1).reshape(
+            -1, self.config.hidden_size
+        )
         if features.shape[0] != sum(counts):
             raise ValueError("NEO image grids must cover all projected patches")
 
-        columns, rows = build_abs_positions_from_grid_hw(grids, total=sum(counts))
+        columns, rows = build_abs_positions_from_grid_hw(
+            grids, total=sum(counts)
+        )
         parts = []
         for hidden, coordinates, axis in zip(
-            features.float().chunk(2, dim=-1), (columns, rows), (1, 0), strict=True
+            features.float().chunk(2, dim=-1),
+            (columns, rows),
+            (1, 0),
+            strict=True,
         ):
             cosine, sine = self.rotary(
                 coordinates,
                 dtype=torch.float32,
-                sequence_length=max((shape[axis] for shape in grid_shapes), default=0),
+                sequence_length=max(
+                    (shape[axis] for shape in grid_shapes), default=0
+                ),
             )
             parts.append(
-                apply_rotary(hidden.unsqueeze(1), cosine, sine, rotation="interleaved").squeeze(1)
+                apply_rotary(
+                    hidden.unsqueeze(1), cosine, sine, rotation="interleaved"
+                ).squeeze(1)
             )
         features = torch.cat(parts, dim=-1).to(features.dtype)
 
@@ -116,14 +158,18 @@ class Encoder(nn.Module):
         # Equal grids reduce in one batched convolution; mixed grids loop.
         if all(shape == grid_shapes[0] for shape in grid_shapes):
             height, width = grid_shapes[0]
-            spatial = features.reshape(len(grid_shapes), height, width, -1).permute(0, 3, 1, 2)
+            spatial = features.reshape(
+                len(grid_shapes), height, width, -1
+            ).permute(0, 3, 1, 2)
             return (
                 self.dense_embedding(spatial)
                 .permute(0, 2, 3, 1)
                 .reshape(-1, self.config.output_size)
             )
         outputs = []
-        for values, (height, width) in zip(features.split(counts), grid_shapes, strict=True):
+        for values, (height, width) in zip(
+            features.split(counts), grid_shapes, strict=True
+        ):
             spatial = values.reshape(1, height, width, -1).permute(0, 3, 1, 2)
             outputs.append(
                 self.dense_embedding(spatial)

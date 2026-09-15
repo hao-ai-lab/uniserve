@@ -1,4 +1,7 @@
-"""Checkpoint metadata supplies numerical construction values without model allocation."""
+"""Checkpoint metadata supplies numerical construction values.
+
+The values are supplied without model allocation.
+"""
 
 import json
 
@@ -13,7 +16,9 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.mark.parametrize("inline", [False, True])
-def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(tmp_path, inline):
+def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
+    tmp_path, inline
+):
     towers = {
         "llm_config": {
             "hidden_size": 16,
@@ -30,7 +35,12 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(tmp_path,
             "patch_size": 2,
             "image_size": 16,
         },
-        "vae_config": {"z_channels": 4, "downsample": 2, "ch_mult": [1, 2], "scale_factor": 0.5},
+        "vae_config": {
+            "z_channels": 4,
+            "downsample": 2,
+            "ch_mult": [1, 2],
+            "scale_factor": 0.5,
+        },
     }
     if not inline:
         for name, values in towers.items():
@@ -38,7 +48,11 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(tmp_path,
     path = tmp_path / "ema.safetensors"
     save_file({"latent_pos_embed.pos_embed": torch.zeros(9, 16)}, path)
 
-    raw = {**(towers if inline else {}), "start_of_image_id": 62, "end_of_image_id": 63}
+    raw = {
+        **(towers if inline else {}),
+        "start_of_image_id": 62,
+        "end_of_image_id": 63,
+    }
     (tmp_path / "config.json").write_text(json.dumps(raw))
     config = bagel_config(tmp_path, IOConfig())
 
@@ -53,7 +67,9 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(tmp_path,
 
     # Released checkpoints may serialize a constructor default; actual learned
     # positions determine both numerical packing and allocation bounds.
-    (tmp_path / "config.json").write_text(json.dumps({**raw, "max_latent_size": 4}))
+    (tmp_path / "config.json").write_text(
+        json.dumps({**raw, "max_latent_size": 4})
+    )
     normalized = bagel_config(tmp_path, IOConfig())
     assert normalized.max_latent_size == 3
 
@@ -61,7 +77,8 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(tmp_path,
     with pytest.raises(ValueError, match="square grid at text width"):
         bagel_config(tmp_path, IOConfig())
 
-    # Positional vectors must form the square grid used by latent patch indexing.
+    # Positional vectors must form the square grid used by latent patch
+    # indexing.
     save_file({"latent_pos_embed.pos_embed": torch.zeros(10, 16)}, path)
     with pytest.raises(ValueError, match="square grid at text width"):
         bagel_config(tmp_path, IOConfig())
@@ -69,7 +86,10 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(tmp_path,
 
 def test_h3_worker_advertises_bounded_media_products():
     from uniserve_models.minimax_h3 import Config, Model
-    from uniserve_worker.bootstrap.components import media_components, supported_operations
+    from uniserve_worker.bootstrap.components import (
+        media_components,
+        supported_operations,
+    )
     from uniserve_worker.config import WorkerConfig
     from uniserve_worker.protocol.operation import (
         VIDEO_STAGES,
@@ -88,7 +108,10 @@ def test_h3_worker_advertises_bounded_media_products():
         min_request_pool_size=2,
     )
     outputs = resolve_outputs(model, config)
-    assert set(supported_operations(model)) == {*VIDEO_STAGES, TransferMode.TENSOR}
+    assert set(supported_operations(model)) == {
+        *VIDEO_STAGES,
+        TransferMode.TENSOR,
+    }
     assert media_components(model) == {
         PipelineStage.TEXT_ENCODING: "text_encoder",
         PipelineStage.LATENT_PREPARATION: "denoiser",
@@ -99,7 +122,9 @@ def test_h3_worker_advertises_bounded_media_products():
         PipelineStage.AUDIO_ENCODING: "output",
         PipelineStage.MUXING: "output",
     }
-    products = {value.name: value for values in outputs.values() for value in values}
+    products = {
+        value.name: value for values in outputs.values() for value in values
+    }
     # One second is covered by two native 17-frame windows and the final
     # five-frame overlap. Each video latent frame contains 24x42 patch tokens.
     expected = {
@@ -111,7 +136,9 @@ def test_h3_worker_advertises_bounded_media_products():
     }
     assert products.keys() == expected.keys()
     for name, shape in expected.items():
-        assert products[name].shape_bound.max_elements == torch.Size(shape).numel()
+        assert (
+            products[name].shape_bound.max_elements == torch.Size(shape).numel()
+        )
 
     from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
 
@@ -134,7 +161,11 @@ def _neo_metadata():
             "head_dim": 8,
             "rope_theta": 10000.0,
         },
-        "vision_config": {"hidden_size": 8, "llm_hidden_size": [16], "downsample_ratio": [0.5]},
+        "vision_config": {
+            "hidden_size": 8,
+            "llm_hidden_size": [16],
+            "downsample_ratio": [0.5],
+        },
         "pad_token_id": 3,
     }
 
@@ -143,7 +174,9 @@ def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes(tmp_path):
     from uniserve_models.sensenova_u1 import read_config
 
     raw = _neo_metadata()
-    raw["llm_config"].update(use_sliding_window=False, sliding_window=64, max_window_layers=1)
+    raw["llm_config"].update(
+        use_sliding_window=False, sliding_window=64, max_window_layers=1
+    )
     (tmp_path / "config.json").write_text(json.dumps(raw))
     config = read_config(tmp_path, IOConfig())
     assert config.text.layer_types == ("full_attention",) * 3
@@ -159,13 +192,19 @@ def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes(tmp_path):
 @pytest.mark.parametrize(
     "field, value, error",
     [
-        ("rope_parameters", {"rope_theta": 20000.0}, "conflicting aliases for rope_theta"),
+        (
+            "rope_parameters",
+            {"rope_theta": 20000.0},
+            "conflicting aliases for rope_theta",
+        ),
         ("layer_types", ["full_attention"], "every decoder layer"),
         ("num_key_value_heads", 3, "divisible by KV heads"),
         ("num_experts", 8, "sparse MoE is not supported"),
     ],
 )
-def test_sensenova_reader_rejects_inconsistent_checkpoint_math(tmp_path, field, value, error):
+def test_sensenova_reader_rejects_inconsistent_checkpoint_math(
+    tmp_path, field, value, error
+):
     from uniserve_models.sensenova_u1 import read_config
 
     raw = _neo_metadata()
@@ -190,7 +229,9 @@ def test_sensenova_reader_rejects_unimplemented_sliding_attention(tmp_path):
     from uniserve_models.sensenova_u1 import read_config
 
     raw = _neo_metadata()
-    raw["llm_config"].update(use_sliding_window=True, sliding_window=64, max_window_layers=1)
+    raw["llm_config"].update(
+        use_sliding_window=True, sliding_window=64, max_window_layers=1
+    )
     (tmp_path / "config.json").write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="sliding_attention is not supported"):
         read_config(tmp_path, IOConfig())
@@ -241,4 +282,6 @@ def test_text_worker_reports_exact_cache_capacity(storage):
     payload = 2 * 2 * 2 * 8 * (1 if storage == "float8_e4m3fn" else 2) * 64
     scales = 2 * 2 * 4 if storage == "float8_e4m3fn" else 0
     initialization = 2 * 2
-    assert cache.bytes_per_token == (payload + scales + initialization + 63) // 64
+    assert (
+        cache.bytes_per_token == (payload + scales + initialization + 63) // 64
+    )

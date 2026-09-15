@@ -30,9 +30,13 @@ class ImageBuilder:
     def sequence_length(self, size: image.Config) -> int:
         return self.denoiser.latent_shape("image", size)[0] + self.framing
 
-    def positions(self, size: image.Config, temporal: int, *, device) -> torch.Tensor:
-        """Construct temporal/height/width coordinates in model sequence order."""
+    def positions(
+        self, size: image.Config, temporal: int, *, device
+    ) -> torch.Tensor:
+        """Construct temporal/height/width coordinates in model sequence.
 
+        order.
+        """
         stride = self.denoiser.downsample
         height, width = size.height // stride, size.width // stride
         count = self.sequence_length(size)
@@ -42,7 +46,9 @@ class ImageBuilder:
         result = torch.zeros((3, count), dtype=torch.int64, device=device)
         result[0].fill_(temporal)
         interior = result[:, 1:-1] if self.framing else result
-        interior[1].copy_(torch.arange(height, device=device).repeat_interleave(width))
+        interior[1].copy_(
+            torch.arange(height, device=device).repeat_interleave(width)
+        )
         interior[2].copy_(torch.arange(width, device=device).repeat(height))
         return result
 
@@ -57,14 +63,22 @@ class ImageBuilder:
         raise ValueError("unknown image guidance branch")
 
     @torch.inference_mode()
-    def initialize(self, size: image.Config, *, seed: int, out: torch.Tensor) -> None:
-        """Draw on the trajectory device and preserve the model's native RNG order."""
+    def initialize(
+        self, size: image.Config, *, seed: int, out: torch.Tensor
+    ) -> None:
+        """Draw on the trajectory device and preserve the model's native RNG.
 
+        order.
+        """
         if out.shape != self.denoiser.latent_shape("image", size):
-            raise ValueError("image trajectory storage must have its canonical patch shape")
+            raise ValueError(
+                "image trajectory storage must have its canonical patch shape"
+            )
 
         noise = torch.empty(
-            (1, *self.denoiser.noise_shape("image", size)), dtype=out.dtype, device=out.device
+            (1, *self.denoiser.noise_shape("image", size)),
+            dtype=out.dtype,
+            device=out.device,
         )
         normal_noise((seed,), out=(noise,))
         self.denoiser.prepare_latents(

@@ -39,8 +39,9 @@ def _dist(name: str, vals: list[float], unit: str = "") -> None:
         print(f"  {name}: (empty)")
         return
     print(
-        f"  {name}: n={len(vals)} p50={_pct(vals, 50):.1f} p90={_pct(vals, 90):.1f} "
-        f"p95={_pct(vals, 95):.1f} p99={_pct(vals, 99):.1f} max={max(vals):.1f}{unit}"
+        f"  {name}: n={len(vals)} p50={_pct(vals, 50):.1f} "
+        f"p90={_pct(vals, 90):.1f} p95={_pct(vals, 95):.1f} "
+        f"p99={_pct(vals, 99):.1f} max={max(vals):.1f}{unit}"
     )
 
 
@@ -48,7 +49,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace", help="scheduler_trace.jsonl path")
     parser.add_argument("started_at", nargs="?", type=float, default=None)
-    parser.add_argument("--run-json", help="harness run.json to read started_at from")
+    parser.add_argument(
+        "--run-json", help="harness run.json to read started_at from"
+    )
     args = parser.parse_args()
 
     started_at = args.started_at
@@ -69,7 +72,11 @@ def main() -> None:
         elif d["event"] == "request_queued":
             queued[d["request_id"]] = d["prompt_tokens"]
 
-    steps = sorted(s for s in submitted if submitted[s]["at_s"] >= started_at and s in resolved)
+    steps = sorted(
+        s
+        for s in submitted
+        if submitted[s]["at_s"] >= started_at and s in resolved
+    )
 
     def kind_of(step: int) -> str:
         operation_types = set(submitted[step]["operation_types"])
@@ -87,7 +94,8 @@ def main() -> None:
     others = [s for s in steps if kinds[s] not in ("prefill", "decode")]
     print(
         f"measured batches: total={len(steps)} prefill={len(prefills)} "
-        f"decode={len(decodes)} other={len(others)} {sorted({kinds[s] for s in others})}"
+        f"decode={len(decodes)} other={len(others)} "
+        f"{sorted({kinds[s] for s in others})}"
     )
 
     print("\n== PREFILL residuals (measured) ==")
@@ -121,13 +129,16 @@ def main() -> None:
     _dist("host_roundtrip", host_ms, " ms")
     if total_prompt:
         print(
-            f"  prefill ops: {len(token_costs)}, pos0: {n_pos0}; residual tokens "
-            f"{total_cost}/{total_prompt} = {total_cost / total_prompt * 100:.2f}% of prompt tokens"
+            f"  prefill ops: {len(token_costs)}, pos0: {n_pos0}; "
+            f"residual tokens {total_cost}/{total_prompt} = "
+            f"{total_cost / total_prompt * 100:.2f}% of prompt tokens"
         )
 
     print("\n== DECODE adjacency (measured) ==")
     idx_of = {s: i for i, s in enumerate(steps)}
-    groups: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    groups: dict[str, dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     for s in decodes:
         i = idx_of[s]
         prev_k = kinds[steps[i - 1]] if i > 0 else "none"
@@ -156,8 +167,15 @@ def main() -> None:
         g = groups[grp]
         print(f" [{grp}] n={len(g['host_ms'])}")
         for k in (
-            "batch_size", "host_ms", "exec_ms", "deferred_wait_ms", "cuda_ready_ms",
-            "model_forward_ms", "build_batch_ms", "sample_ms", "finalize_ms",
+            "batch_size",
+            "host_ms",
+            "exec_ms",
+            "deferred_wait_ms",
+            "cuda_ready_ms",
+            "model_forward_ms",
+            "build_batch_ms",
+            "sample_ms",
+            "finalize_ms",
         ):
             if g[k]:
                 _dist(k, g[k])

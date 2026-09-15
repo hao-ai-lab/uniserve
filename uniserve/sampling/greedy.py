@@ -15,11 +15,15 @@ def greedy(
     A sharded vocabulary exchanges one score/token pair per row. Padded tokens
     never participate, and communicator order defines the global token order.
     """
-
     if vocab is None:
         return torch.max(logits, dim=-1)
-    if logits.ndim != 2 or logits.shape[-1] != vocab.local_slice.stop - vocab.local_slice.start:
-        raise ValueError("greedy logits must be rows of the declared vocabulary shard")
+    if (
+        logits.ndim != 2
+        or logits.shape[-1] != vocab.local_slice.stop - vocab.local_slice.start
+    ):
+        raise ValueError(
+            "greedy logits must be rows of the declared vocabulary shard"
+        )
 
     begin = vocab.local_slice.start
     valid = max(0, min(logits.shape[-1], vocab.size - begin))
@@ -38,8 +42,12 @@ def greedy(
     # Ship each rank's (score, token) pair as two int64 lanes through one
     # integer all-gather; the float64 bit pattern is viewed back for the
     # exact-ordering max reduction across ranks.
-    candidates = torch.stack((values.to(torch.float64).view(torch.int64), tokens), dim=-1)
-    gathered = vocab.group.all_gather(candidates, dim=0).reshape(vocab.group.size, -1, 2)
+    candidates = torch.stack(
+        (values.to(torch.float64).view(torch.int64), tokens), dim=-1
+    )
+    gathered = vocab.group.all_gather(candidates, dim=0).reshape(
+        vocab.group.size, -1, 2
+    )
     scores = gathered[..., 0].contiguous().view(torch.float64)
     maxima, owners = scores.max(dim=0)
     selected = gathered[..., 1].gather(0, owners.unsqueeze(0)).squeeze(0)

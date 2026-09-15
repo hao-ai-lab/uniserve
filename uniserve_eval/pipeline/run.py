@@ -15,7 +15,13 @@ from ..load import GpuMemorySampler, WarmupFailure, run_load
 from ..nsys import NsysCapture
 from ..tasks import get_task
 from ..transport import send_request
-from ..types import BenchmarkPoint, Example, RequestRecord, RunResult, selected_rows_identity
+from ..types import (
+    BenchmarkPoint,
+    Example,
+    RequestRecord,
+    RunResult,
+    selected_rows_identity,
+)
 from .report import build_summary, render_markdown
 
 
@@ -28,8 +34,7 @@ async def run_point(
     timeout_s: float = 6 * 60 * 60.0,
     measurement: NsysCapture | None = None,
 ) -> RunResult:
-    """Run dataset loading, warmup, measured load, validation, and persistence."""
-
+    """Run dataset loading, warmup, measured load, validation, and persistence."""  # noqa: E501
     output_path = Path(output_dir)
     if output_path.exists() and any(output_path.iterdir()):
         raise FileExistsError(f"result directory is not empty: {output_path}")
@@ -43,8 +48,8 @@ async def run_point(
     sampler: GpuMemorySampler | None = None
     duration = 0.0
 
-    # Empty streams and the preparing record make partial failures inspectable with
-    # the same artifact names as completed points.
+    # Empty streams and the preparing record make partial failures
+    # inspectable with the same artifact names as completed points.
     _write_empty_streams(writer)
     writer.write_json(
         "run.json",
@@ -57,8 +62,9 @@ async def run_point(
     )
 
     try:
-        # Dataset selection and request construction are fixed before the measured
-        # window opens, and their identity is persisted with the running state.
+        # Dataset selection and request construction are fixed before the
+        # measured window opens, and their identity is persisted with the
+        # running state.
         task = get_task(point.task)(point)
         rows, tokenizer = load_examples(point)
         selection = selected_rows_identity(rows)
@@ -74,12 +80,17 @@ async def run_point(
         )
 
         np.random.seed(point.load.seed)
-        limits = httpx.Limits(max_connections=None, max_keepalive_connections=None)
-        async with httpx.AsyncClient(timeout=timeout_s, limits=limits) as client:
+        limits = httpx.Limits(
+            max_connections=None, max_keepalive_connections=None
+        )
+        async with httpx.AsyncClient(
+            timeout=timeout_s, limits=limits
+        ) as client:
 
-            async def submit(example: Example, scheduled: float | None) -> RequestRecord:
+            async def submit(
+                example: Example, scheduled: float | None
+            ) -> RequestRecord:
                 """Build and send one task request with its timing fallbacks."""
-
                 request = task.build_request(example)
                 output_len_fallback = int(
                     example.output_len
@@ -115,9 +126,11 @@ async def run_point(
             finally:
                 sampler.stop()
 
-            # Only measured outputs feed metrics; warmup records remain a separate
-            # diagnostic stream.
-            warmup_records = cast(list[RequestRecord], list(load_result.warmup_outputs))
+            # Only measured outputs feed metrics; warmup records remain a
+            # separate diagnostic stream.
+            warmup_records = cast(
+                list[RequestRecord], list(load_result.warmup_outputs)
+            )
             records = cast(list[RequestRecord], list(load_result.outputs))
             duration = load_result.duration_s
             server_version = await _fetch_server_version(client, base_url)
@@ -134,15 +147,17 @@ async def run_point(
             launch=launch_record,
         )
 
-        # The completed lifecycle record is written after every result artifact so
-        # it acts as the bundle's commit marker.
+        # The completed lifecycle record is written after every result
+        # artifact so it acts as the bundle's commit marker.
         if sampler.summary() is not None:
             summary["gpu_memory"] = sampler.summary()
         _write_records(writer, "warmup_requests.jsonl", warmup_records)
         _write_records(writer, "requests.jsonl", records)
         writer.write_jsonl("gpu_samples.jsonl", list(sampler.sample_records))
         writer.write_json("summary.json", summary)
-        (output_path / "summary.md").write_text(render_markdown(summary), encoding="utf-8")
+        (output_path / "summary.md").write_text(
+            render_markdown(summary), encoding="utf-8"
+        )
         writer.write_json(
             "run.json",
             _run_state(
@@ -157,7 +172,8 @@ async def run_point(
         )
         return RunResult(summary, output_path)
     except BaseException as error:
-        # Failure artifacts preserve every record collected before the exception.
+        # Failure artifacts preserve every record collected before the
+        # exception.
         if sampler is not None:
             sampler.stop()
         _write_records(writer, "warmup_requests.jsonl", warmup_records)
@@ -184,7 +200,6 @@ async def run_point(
 
 def _write_empty_streams(writer: ArtifactWriter) -> None:
     """Create durable empty record streams before fallible benchmark work."""
-
     writer.write_jsonl("warmup_requests.jsonl", [])
     writer.write_jsonl("requests.jsonl", [])
     writer.write_jsonl("gpu_samples.jsonl", [])
@@ -196,7 +211,6 @@ def _write_records(
     records: list[RequestRecord],
 ) -> None:
     """Persist decoded media samples and their request records."""
-
     for record in records:
         for image in record.decoded_images:
             writer.write_image_sample(image)
@@ -216,7 +230,6 @@ def _run_state(
     valid: bool | None = None,
 ) -> dict[str, Any]:
     """Build the lifecycle record for the benchmark's current state."""
-
     state: dict[str, Any] = {
         "status": status,
         "benchmark": point.name,
@@ -233,12 +246,17 @@ def _run_state(
     return state
 
 
-async def _fetch_server_version(client: httpx.AsyncClient, base_url: str) -> dict[str, Any] | None:
-    """Fetch optional server provenance without affecting benchmark completion."""
-
+async def _fetch_server_version(
+    client: httpx.AsyncClient, base_url: str
+) -> dict[str, Any] | None:
+    """Fetch optional server provenance without affecting benchmark completion."""  # noqa: E501
     try:
-        response = await client.get(base_url.rstrip("/") + "/version", timeout=15.0)
-        if response.status_code == 200 and isinstance(payload := response.json(), dict):
+        response = await client.get(
+            base_url.rstrip("/") + "/version", timeout=15.0
+        )
+        if response.status_code == 200 and isinstance(
+            payload := response.json(), dict
+        ):
             return payload
     except Exception:
         return None

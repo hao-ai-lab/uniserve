@@ -36,16 +36,18 @@ class _TokenShard:
 
     def local(self, value, *, dim=0):
         """Select this member's token interval from a complete-domain tensor."""
-
         if value.shape[dim] != self.num_tokens:
-            raise ValueError("the input does not cover the complete token domain")
+            raise ValueError(
+                "the input does not cover the complete token domain"
+            )
         return value.narrow(dim, self.token_slice.start, self.count)
 
     def pad(self, value):
         """Right-pad local tokens with zeros up to the uniform capacity."""
-
         if value.shape[0] != self.count:
-            raise ValueError("the input does not match its local token interval")
+            raise ValueError(
+                "the input does not match its local token interval"
+            )
         if self.count == self.capacity:
             return value.contiguous()
         result = value.new_zeros((self.capacity, *value.shape[1:]))
@@ -54,7 +56,6 @@ class _TokenShard:
 
     def gather(self, value):
         """Reassemble the complete token domain from padded local intervals."""
-
         if self.group.size == 1 or self.num_tokens == 0:
             return value
         return self.group.all_gather(self.pad(value), dim=0)[: self.num_tokens]
@@ -72,10 +73,11 @@ class _HeadExchange:
         Fewer heads than members means every head is replicated across
         ``group.size // heads`` adjacent members, each owning one slot.
         """
-
         if heads < self.group.size:
             if self.group.size % heads:
-                raise ValueError("replicated KV heads must divide Ulysses membership")
+                raise ValueError(
+                    "replicated KV heads must divide Ulysses membership"
+                )
             start = self.group.rank // (self.group.size // heads)
             return slice(start, start + 1)
         if heads % self.group.size:
@@ -84,12 +86,12 @@ class _HeadExchange:
         return slice(self.group.rank * count, (self.group.rank + 1) * count)
 
     def heads(self, value, *, storage=None, role):
-        """Scatter all tokens of this member's head slice; gather every member's tokens.
+        """Scatter all tokens of this member's head slice.
 
-        Input and output are [tokens, heads, features]; the output carries
-        the full token domain for the local head interval.
+        Gather every member's tokens. Input and output are
+        [tokens, heads, features]; the output carries the full token domain
+        for the local head interval.
         """
-
         if value.ndim != 3 or value.shape[1] < 1:
             raise ValueError("head exchange requires [tokens, heads, features]")
         if self.group.size == 1:
@@ -105,12 +107,16 @@ class _HeadExchange:
 
         # [tokens, heads, features] -> [members, tokens, local heads, features]:
         # one outgoing payload per member holding the heads that member owns.
-        source = value.view(tokens, self.group.size, width, features).transpose(0, 1)
+        source = value.view(tokens, self.group.size, width, features).transpose(
+            0, 1
+        )
         if storage is None:
             outgoing, incoming = source.contiguous(), None
         else:
             outgoing = storage.view(f"{role}_send", tuple(source.shape), value)
-            incoming = storage.view(f"{role}_receive", tuple(source.shape), value)
+            incoming = storage.view(
+                f"{role}_receive", tuple(source.shape), value
+            )
             outgoing.copy_(source)
 
         splits = (1,) * self.group.size
@@ -125,18 +131,24 @@ class _HeadExchange:
         Input is [members * tokens, local heads, features] as produced by
         ``heads``; output is [tokens, heads, features] for the local tokens.
         """
-
         if value.ndim != 3 or value.shape[0] % self.group.size:
-            raise ValueError("attention output tokens must divide Ulysses membership")
+            raise ValueError(
+                "attention output tokens must divide Ulysses membership"
+            )
         if self.group.size == 1:
             return value
         if value.shape[0] == 0:
-            return value.new_empty((0, value.shape[1] * self.group.size, value.shape[2]))
+            return value.new_empty(
+                (0, value.shape[1] * self.group.size, value.shape[2])
+            )
 
         tokens = value.shape[0] // self.group.size
         heads, features = value.shape[1:]
-        # [members * tokens, heads, features] -> [members, tokens, heads, features]
-        outgoing = value.reshape(self.group.size, tokens, heads, features).contiguous()
+        # [members * tokens, heads, features]
+        #   -> [members, tokens, heads, features]
+        outgoing = value.reshape(
+            self.group.size, tokens, heads, features
+        ).contiguous()
         incoming = (
             None
             if storage is None
@@ -147,4 +159,6 @@ class _HeadExchange:
         result = self.group.all_to_all(
             outgoing, input_splits=splits, output_splits=splits, out=incoming
         )
-        return result.transpose(0, 1).reshape(tokens, heads * self.group.size, features)
+        return result.transpose(0, 1).reshape(
+            tokens, heads * self.group.size, features
+        )

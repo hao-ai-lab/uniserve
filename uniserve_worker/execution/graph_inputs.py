@@ -8,7 +8,12 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 import torch
 
 from uniserve.model import EmbeddingReplacement, TextInput
-from uniserve.nn.attention import BlockTable, PagedInput, SegmentedInput, SequenceLengths
+from uniserve.nn.attention import (
+    BlockTable,
+    PagedInput,
+    SegmentedInput,
+    SequenceLengths,
+)
 from uniserve.runtime import CUDAGraph, ExecutionContext, PrefixCache
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.sampling import greedy
@@ -19,7 +24,7 @@ from .batch import ExecutionOutput, InputBatch
 from .sampling import TOKEN_CONTINUATION_BIT, SamplerOutput, TokenSelection
 
 
-class GraphMiss(RuntimeError):
+class GraphMiss(RuntimeError):  # noqa: N818  # deliberate taxonomy name
     """The requested numerical shape is outside the installed graph catalog."""
 
 
@@ -52,8 +57,10 @@ def select_flow_captures(
     physical_tokens: Callable[[int, int], int],
     image_tokens: Callable[[int, int], int],
 ) -> tuple[DiffusionShape, ...]:
-    """Intersect configured shapes with staging, per-image and latent capacity."""
+    """Intersect configured shapes with staging.
 
+    per-image and latent capacity.
+    """
     return tuple(
         DiffusionShape(rows, height, width, branches)
         for height, width in shapes
@@ -66,19 +73,23 @@ def select_flow_captures(
     )
 
 
-def select_prefill_captures(token_sizes, row_sizes, *, max_rows, max_tokens, visual=False):
+def select_prefill_captures(
+    token_sizes, row_sizes, *, max_rows, max_tokens, visual=False
+):
     """Build prefill capture buckets from configured token and row sizes.
 
     Each row bucket carries the previous bucket's row count as its live-row
     minimum, so a bucket only serves batches larger than the next smaller one.
     """
-
     buckets = []
     variants = ((True, TokenSelection.LAST_LOGITS),)
     if visual:
         # Feature appends expose the whole image to each query, optionally
         # sampling at its trailing marker after publishing the prefix.
-        variants += ((False, TokenSelection.LAST_LOGITS), (False, TokenSelection.HIDDEN))
+        variants += (
+            (False, TokenSelection.LAST_LOGITS),
+            (False, TokenSelection.HIDDEN),
+        )
 
     minimum_rows = 1
     for rows in sorted({int(value) for value in row_sizes if value > 1}):
@@ -86,7 +97,11 @@ def select_prefill_captures(token_sizes, row_sizes, *, max_rows, max_tokens, vis
             break
         minimum_tokens = minimum_rows if minimum_rows == 1 else minimum_rows + 1
         for tokens in sorted(
-            {value for value in token_sizes if minimum_tokens <= value <= max_tokens}
+            {
+                value
+                for value in token_sizes
+                if minimum_tokens <= value <= max_tokens
+            }
         ):
             buckets.extend(
                 PrefillShape(tokens, rows, minimum_rows, causal, selection)
@@ -98,7 +113,6 @@ def select_prefill_captures(token_sizes, row_sizes, *, max_rows, max_tokens, vis
 
 def tensor_leaves(value):
     """Walk immutable numerical records without reading any tensor contents."""
-
     if isinstance(value, torch.Tensor):
         yield value
     elif is_dataclass(value) and not isinstance(value, type):
@@ -114,7 +128,6 @@ def tensor_leaves(value):
 
 def map_tensors(value, transform):
     """Apply transform to every tensor leaf, preserving the record structure."""
-
     if isinstance(value, torch.Tensor):
         return transform(value)
     if is_dataclass(value) and not isinstance(value, type):
@@ -126,7 +139,9 @@ def map_tensors(value, transform):
             },
         )
     if isinstance(value, Mapping):
-        return {key: map_tensors(item, transform) for key, item in value.items()}
+        return {
+            key: map_tensors(item, transform) for key, item in value.items()
+        }
     if isinstance(value, tuple):
         return tuple(map_tensors(item, transform) for item in value)
     if isinstance(value, list):
@@ -135,8 +150,10 @@ def map_tensors(value, transform):
 
 
 def clone_inputs(value):
-    """Own tensor copies while preserving broadcast views and repeated references."""
+    """Own tensor copies while preserving broadcast views and repeated.
 
+    references.
+    """
     copies = {}
 
     def clone(tensor):
@@ -144,7 +161,8 @@ def clone_inputs(value):
             # A visibility column expanded across tokens must stay a broadcast
             # view, rather than allocating a quadratic mask for each graph.
             slices = tuple(
-                slice(0, 1) if stride == 0 else slice(None) for stride in tensor.stride()
+                slice(0, 1) if stride == 0 else slice(None)
+                for stride in tensor.stride()
             )
             copy = tensor[slices].clone(memory_format=torch.preserve_format)
             copies[id(tensor)] = copy.expand(tensor.shape)
@@ -155,7 +173,6 @@ def clone_inputs(value):
 
 def copy_inputs(target, source):
     """Copy every tensor leaf of source into the matching leaf of target."""
-
     _copy_tensors(tuple(tensor_leaves(target)), tuple(tensor_leaves(source)))
 
 
@@ -169,14 +186,20 @@ def _copy_tensors(targets, sources):
             or destination.dtype != value.dtype
             or destination.device != value.device
         ):
-            raise GraphMiss("numerical graph tensor shape or representation changed")
-        if destination.data_ptr() == value.data_ptr() or id(destination) in copied:
+            raise GraphMiss(
+                "numerical graph tensor shape or representation changed"
+            )
+        if (
+            destination.data_ptr() == value.data_ptr()
+            or id(destination) in copied
+        ):
             continue
         if 0 in destination.stride():
             # Broadcast backing has only one writable element along each
             # expanded dimension; ordinary strided tensors need no slicing.
             slices = tuple(
-                slice(0, 1) if stride == 0 else slice(None) for stride in destination.stride()
+                slice(0, 1) if stride == 0 else slice(None)
+                for stride in destination.stride()
             )
             destination[slices].copy_(value[slices])
         else:
@@ -191,7 +214,6 @@ def bind_inputs(static, live):
     and immutable host scalars/tuples. Host tuples need no element traversal;
     they are supplied anew even when the captured tensor addresses are reused.
     """
-
     changes = {}
     for item in fields(live):
         value = getattr(live, item.name)
@@ -204,10 +226,17 @@ def bind_inputs(static, live):
 
 
 def input_signature(value):
-    """Describe exact static values and tensor layouts, excluding tensor contents."""
+    """Describe exact static values and tensor layouts.
 
+    excluding tensor contents.
+    """
     if isinstance(value, torch.Tensor):
-        return value.device, value.dtype, tuple(value.shape), tuple(value.stride())
+        return (
+            value.device,
+            value.dtype,
+            tuple(value.shape),
+            tuple(value.stride()),
+        )
     if isinstance(value, (PagedInput, SegmentedInput)):
         # Prefix lengths are mutable numerical inputs. Native paged providers
         # launch to table capacity and consume the device lengths on replay.
@@ -223,20 +252,27 @@ def input_signature(value):
         )
     if is_dataclass(value) and not isinstance(value, type):
         return type(value), tuple(
-            (field.name, input_signature(getattr(value, field.name))) for field in fields(value)
+            (field.name, input_signature(getattr(value, field.name)))
+            for field in fields(value)
         )
     if isinstance(value, Mapping):
-        return tuple((key, input_signature(item)) for key, item in value.items())
+        return tuple(
+            (key, input_signature(item)) for key, item in value.items()
+        )
     if isinstance(value, (tuple, list)):
         return tuple(input_signature(item) for item in value)
     return value
 
 
 def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
-    """Choose a resident bucket with the call's attention and output semantics."""
+    """Choose a resident bucket with the call's attention and output.
 
+    semantics.
+    """
     inputs = batch.inputs
-    if not isinstance(inputs, TextInput) or not isinstance(inputs.attention, PagedInput):
+    if not isinstance(inputs, TextInput) or not isinstance(
+        inputs.attention, PagedInput
+    ):
         return None
 
     attention = inputs.attention
@@ -256,7 +292,9 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
         and causal
         and all(length == 1 for length in attention.queries.host)
     ):
-        rows = next((value for value in decode_sizes if value >= batch.row_count), None)
+        rows = next(
+            (value for value in decode_sizes if value >= batch.row_count), None
+        )
         if rows is not None:
             return rows, rows, width, True
 
@@ -270,22 +308,30 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
     )
     if not shapes:
         return None
-    shape = min(shapes, key=lambda value: (value.row_bucket, value.token_bucket))
+    shape = min(
+        shapes, key=lambda value: (value.row_bucket, value.token_bucket)
+    )
     return shape.row_bucket, shape.token_bucket, width, False
 
 
 def _fixed_view(tensor, shape):
-    """Borrow a leading view of shape from a bucket tensor's captured storage."""
+    """Borrow a leading view of shape from a bucket tensor's captured.
 
+    storage.
+    """
     strides = tensor.stride()
     if len(shape) != tensor.ndim or any(value < 0 for value in shape):
         raise GraphMiss("graph view rank changed")
     last = tensor.storage_offset() + sum(
-        (extent - 1) * stride for extent, stride in zip(shape, strides) if extent
+        (extent - 1) * stride
+        for extent, stride in zip(shape, strides)
+        if extent
     )
     if last >= tensor.untyped_storage().nbytes() // tensor.element_size():
         raise GraphMiss("graph bucket exceeds lane input storage")
-    return tensor.as_strided(shape, strides, storage_offset=tensor.storage_offset())
+    return tensor.as_strided(
+        shape, strides, storage_offset=tensor.storage_offset()
+    )
 
 
 def pad_text(batch, rows, tokens, width, decode):
@@ -295,7 +341,6 @@ def pad_text(batch, rows, tokens, width, decode):
     but never write a block: their write indices are -1 and their results are
     discarded. Prefill padding belongs to one additional numerical sequence.
     """
-
     inputs, live_rows = batch.inputs, batch.row_count
     attention, live_tokens = inputs.attention, inputs.input_ids.numel()
     if rows < live_rows or tokens < live_tokens:
@@ -311,12 +356,18 @@ def pad_text(batch, rows, tokens, width, decode):
 
     # Padding tokens belong to one additional inert sequence; any further
     # padding rows are empty sequences.
-    dummy = (1,) * extra if decode else ((padding,) + (0,) * (extra - 1) if extra else ())
+    dummy = (
+        (1,) * extra
+        if decode
+        else ((padding,) + (0,) * (extra - 1) if extra else ())
+    )
     host_queries = attention.queries.host + dummy
 
     ids = _fixed_view(inputs.input_ids, (tokens,))
     ids[live_tokens:].zero_()
-    positions = _fixed_view(inputs.positions, (*inputs.positions.shape[:-1], tokens))
+    positions = _fixed_view(
+        inputs.positions, (*inputs.positions.shape[:-1], tokens)
+    )
     positions[..., live_tokens:].zero_()
 
     slots = _fixed_view(batch.request_pool_indices, (rows,))
@@ -344,9 +395,13 @@ def pad_text(batch, rows, tokens, width, decode):
         writes[live_tokens:].fill_(-1)
 
     padded = PagedInput(
-        SequenceLengths(host=host_queries, values=queries, offsets=query_offsets),
         SequenceLengths(
-            host=attention.prefixes.host + (0,) * extra, values=prefix, offsets=prefix_offsets
+            host=host_queries, values=queries, offsets=query_offsets
+        ),
+        SequenceLengths(
+            host=attention.prefixes.host + (0,) * extra,
+            values=prefix,
+            offsets=prefix_offsets,
         ),
         BlockTable(table, attention.block_table.block_size),
         writes,
@@ -355,7 +410,9 @@ def pad_text(batch, rows, tokens, width, decode):
 
     embeddings = inputs.embeddings
     if embeddings is not None:
-        values = _fixed_view(embeddings.values, (tokens, embeddings.values.shape[1]))
+        values = _fixed_view(
+            embeddings.values, (tokens, embeddings.values.shape[1])
+        )
         mask = _fixed_view(embeddings.mask, (tokens,))
         values[live_tokens:].zero_()
         mask[live_tokens:].zero_()
@@ -369,7 +426,11 @@ def pad_text(batch, rows, tokens, width, decode):
     return replace(
         batch,
         inputs=replace(
-            inputs, input_ids=ids, positions=positions, attention=padded, embeddings=embeddings
+            inputs,
+            input_ids=ids,
+            positions=positions,
+            attention=padded,
+            embeddings=embeddings,
         ),
         request_pool_indices=slots,
         token_selections=(batch.token_selections[0],) * rows,
@@ -379,7 +440,6 @@ def pad_text(batch, rows, tokens, width, decode):
 
 def widen_prefix(batch, width):
     """Borrow fixed table capacity while retaining live prefix lengths."""
-
     attention = getattr(batch.inputs, "attention", None)
     if not isinstance(attention, (PagedInput, SegmentedInput)):
         return batch
@@ -391,19 +451,21 @@ def widen_prefix(batch, width):
         inputs=replace(
             batch.inputs,
             attention=replace(
-                attention, block_table=BlockTable(table, attention.block_table.block_size)
+                attention,
+                block_table=BlockTable(table, attention.block_table.block_size),
             ),
         ),
     )
 
 
 def restore_writes(batch, cache: PrefixCache | None):
-    """Snapshot complete touched cache blocks, including scales and initialization.
+    """Snapshot complete touched cache blocks.
+
+    including scales and initialization.
 
     Capturing or warming a call is observationally neutral to the live prefix.
     Reading addresses here is startup preparation, outside graph capture.
     """
-
     snapshots = []
     attention = getattr(batch.inputs, "attention", None)
     writes = getattr(attention, "write_indices", None)
@@ -421,7 +483,9 @@ def restore_writes(batch, cache: PrefixCache | None):
             for tensors in cache.state(name).transfer_views(blocks).values():
                 snapshots.extend((tensor, tensor.clone()) for tensor in tensors)
     if batch.decode_force_finish is not None:
-        snapshots.append((batch.decode_force_finish, batch.decode_force_finish.clone()))
+        snapshots.append(
+            (batch.decode_force_finish, batch.decode_force_finish.clone())
+        )
 
     def restore():
         for target, saved in snapshots:
@@ -449,7 +513,8 @@ class BatchGraph:
         # lifetime. Only live tensors and attention metadata change on replay.
         self._tensors = tuple(tensor_leaves(self.inputs))
         self._hidden_output = isinstance(self.inputs.inputs, TextInput) and all(
-            selection is TokenSelection.HIDDEN for selection in self.inputs.token_selections
+            selection is TokenSelection.HIDDEN
+            for selection in self.inputs.token_selections
         )
 
     @classmethod
@@ -492,19 +557,27 @@ class BatchGraph:
             _copy_tensors(self._tensors, tuple(tensor_leaves(batch)))
             attention = getattr(batch.inputs, "attention", None)
             if attention is not None:
-                context.bind_attention(bind_inputs(self.inputs.inputs.attention, attention))
+                context.bind_attention(
+                    bind_inputs(self.inputs.inputs.attention, attention)
+                )
 
             output, greedy = self.graph.replay()
             count = batch.row_count if rows is None else rows
             values = output.values
             if self._hidden_output:
                 # Capture fixes tensor addresses, not the live sequence cuts.
-                # Uniform hidden results share one contiguous, pipeline-published
-                # tensor; split its views again using this invocation's lengths.
+                # Uniform hidden results share one contiguous,
+                # pipeline-published tensor; split its views again using this
+                # invocation's lengths.
                 view = adjacent_view(values)
                 if view is None:
-                    raise GraphMiss("hidden graph results must share contiguous output storage")
-                values = view.reshape(-1, values[0].shape[-1]).split(attention.queries.host)
+                    raise GraphMiss(
+                        "hidden graph results must share contiguous output "
+                        "storage"
+                    )
+                values = view.reshape(-1, values[0].shape[-1]).split(
+                    attention.queries.host
+                )
             result = replace(
                 output,
                 values=values[:count],
@@ -517,14 +590,16 @@ class BatchGraph:
 
 def private_pool_bytes(device, pools):
     """Sum memory-pool segment bytes the given pools hold on this device."""
-
     if device.type != "cuda" or not pools:
         return 0
-    index = torch.cuda.current_device() if device.index is None else device.index
+    index = (
+        torch.cuda.current_device() if device.index is None else device.index
+    )
     return sum(
         int(segment.get("total_size", 0))
         for segment in torch.cuda.memory_snapshot()
-        if segment.get("device") == index and segment.get("segment_pool_id") in pools
+        if segment.get("device") == index
+        and segment.get("segment_pool_id") in pools
     )
 
 
@@ -533,8 +608,10 @@ def greedy_decode(
     output: ExecutionOutput,
     predicate_state: torch.Tensor | None,
 ) -> SamplerOutput | None:
-    """Derive graph-capturable greedy tokens and continuation state from model logits."""
+    """Derive graph-capturable greedy tokens and continuation state from model.
 
+    logits.
+    """
     force_finish = batch.decode_force_finish
     if (
         not isinstance(batch.inputs, TextInput)
@@ -543,7 +620,10 @@ def greedy_decode(
         or predicate_state is None
         or force_finish is None
         or len(output.values) != batch.row_count
-        or any(selection is not TokenSelection.LAST_LOGITS for selection in batch.token_selections)
+        or any(
+            selection is not TokenSelection.LAST_LOGITS
+            for selection in batch.token_selections
+        )
     ):
         return None
     # [rows, vocab] logits, gathered from one contiguous graph output.
@@ -558,7 +638,9 @@ def greedy_decode(
 
     max_values, tokens = greedy(logits, partitions[0])
     valid = torch.isfinite(max_values)
-    active = predicate_state.index_select(0, batch.request_pool_indices.reshape(-1))
+    active = predicate_state.index_select(
+        0, batch.request_pool_indices.reshape(-1)
+    )
     finish = force_finish.reshape(-1) & valid & active
     continuation = valid & active & ~finish
     tags = torch.where(continuation, TOKEN_CONTINUATION_BIT, 0)
@@ -590,7 +672,6 @@ def trim_greedy(
     rows: int,
 ) -> SamplerOutput | None:
     """Slice padded graph-greedy output tensors back to the live row count."""
-
     if output is None:
         return None
     total = int(output.tokens.numel())
@@ -602,7 +683,10 @@ def trim_greedy(
     # Slice each of the four completion sections independently; they are
     # concatenated along the row axis, so a plain [:rows] cut would mix them.
     completion = torch.cat(
-        tuple(output.completion[index * total : index * total + rows] for index in range(4))
+        tuple(
+            output.completion[index * total : index * total + rows]
+            for index in range(4)
+        )
     )
     return SamplerOutput(
         tokens=output.tokens[:rows],

@@ -21,11 +21,14 @@ class BeansDataset(Dataset):
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
         """Select seeded rows and encode their RGB images as JPEG data."""
-
         point = self.point
-        load_dataset = getattr(importlib.import_module("datasets"), "load_dataset")
+        load_dataset = getattr(
+            importlib.import_module("datasets"), "load_dataset"
+        )
         dataset = (
-            load_dataset("parquet", data_files=point.dataset_path, split="train")
+            load_dataset(
+                "parquet", data_files=point.dataset_path, split="train"
+            )
             if point.dataset_path
             else load_dataset(
                 BEANS_REPOSITORY,
@@ -46,7 +49,9 @@ class BeansDataset(Dataset):
                 Example(
                     id=f"beans-{position:03d}-{source_index}",
                     prompt=question,
-                    input_image_b64=base64.b64encode(buffer.getvalue()).decode("ascii"),
+                    input_image_b64=base64.b64encode(buffer.getvalue()).decode(
+                        "ascii"
+                    ),
                     input_image_mime="image/jpeg",
                 )
             )

@@ -35,7 +35,9 @@ if triton is not None:
             if tile >= first and tile < first + tiles[field]:
                 offsets = (tile - first) * block + tl.arange(0, block)
                 tl.store(
-                    tensors[field] + page.to(tl.int64) * widths[field] + offsets,
+                    tensors[field]
+                    + page.to(tl.int64) * widths[field]
+                    + offsets,
                     values[field],
                     offsets < widths[field],
                 )
@@ -51,7 +53,9 @@ class BlockFill:
     the caller's stream before a subsequent numerical consumer can use them.
     """
 
-    def __init__(self, tensors: tuple[torch.Tensor, ...], values: tuple[int, ...]):
+    def __init__(
+        self, tensors: tuple[torch.Tensor, ...], values: tuple[int, ...]
+    ):
         self.tensors, self.values = tensors, values
         self.widths = tuple(prod(tensor.shape[1:]) for tensor in tensors)
         self.tiles = tuple((width + 1023) // 1024 for width in self.widths)
@@ -81,14 +85,22 @@ class BlockFill:
         )
 
     def __call__(self, start: int, stop: int) -> None:
-        """Fill the leading-axis block interval ``[start, stop)`` on every field."""
+        """Fill a block interval on every field.
 
+        Fill the leading-axis block interval ``[start, stop)`` on every
+        field.
+        """
         if self._cuda:
             # A public cache operation follows its backing device even when
             # the calling thread currently has another CUDA device selected.
             with torch.cuda.device(self.tensors[0].device):
                 _fill_kernel[(sum(self.tiles), stop - start)](
-                    self.tensors, self.widths, self.values, self.tiles, start, 1024
+                    self.tensors,
+                    self.widths,
+                    self.values,
+                    self.tiles,
+                    start,
+                    1024,
                 )
         else:
             for tensor, value in zip(self.tensors, self.values, strict=True):

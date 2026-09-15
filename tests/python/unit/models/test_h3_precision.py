@@ -12,7 +12,9 @@ pytestmark = pytest.mark.unit
 def _quantized(format, *, tensorwise=False):
     if format in {"bf16", "fp16"}:
         return None
-    quantizer = Quantizer(format, axis=0 if format == "fp8" and not tensorwise else None)
+    quantizer = Quantizer(
+        format, axis=0 if format == "fp8" and not tensorwise else None
+    )
     return QuantizationConfig(quantizer, quantizer)
 
 
@@ -34,20 +36,22 @@ def test_named_representations(name, formats):
     attention, mlp, text, video = formats
     config = precisions[name]
     assert config.dtype == torch.bfloat16
-    assert config.quantization["denoiser.transformer.layers.0.attention.projection"] == _quantized(
-        attention, tensorwise=True
-    )
-    assert config.quantization["denoiser.transformer.layers.0.attention.output"] == _quantized(
-        attention
-    )
-    assert config.quantization["denoiser.transformer.layers.0.mlp"] == _quantized(mlp)
+    assert config.quantization[
+        "denoiser.transformer.layers.0.attention.projection"
+    ] == _quantized(attention, tensorwise=True)
+    assert config.quantization[
+        "denoiser.transformer.layers.0.attention.output"
+    ] == _quantized(attention)
+    assert config.quantization[
+        "denoiser.transformer.layers.0.mlp"
+    ] == _quantized(mlp)
     assert config.quantization["text_encoder"] == _quantized(text)
-    assert config.quantization["video_decoder.decoder.decoder.decoder.layers.0.qkv"] == _quantized(
-        video
-    )
-    assert config.dtypes["video_decoder.decoder.decoder.decoder.layers.0.qkv"] == (
-        torch.float16 if video == "fp16" else torch.bfloat16
-    )
+    assert config.quantization[
+        "video_decoder.decoder.decoder.decoder.layers.0.qkv"
+    ] == _quantized(video)
+    assert config.dtypes[
+        "video_decoder.decoder.decoder.decoder.layers.0.qkv"
+    ] == (torch.float16 if video == "fp16" else torch.bfloat16)
     for component in (
         "audio_decoder",
         "video_decoder",
@@ -59,7 +63,12 @@ def test_named_representations(name, formats):
 
 @pytest.mark.parametrize(
     "choices",
-    [{"attention": "mxfp8"}, {"mlp": "fp16"}, {"text_encoder": "mxfp8"}, {"video_vae": "fp8"}],
+    [
+        {"attention": "mxfp8"},
+        {"mlp": "fp16"},
+        {"text_encoder": "mxfp8"},
+        {"video_vae": "fp8"},
+    ],
 )
 def test_unsupported_component_formats(choices):
     with pytest.raises(ValueError, match=next(iter(choices))):

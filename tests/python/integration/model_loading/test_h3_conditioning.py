@@ -1,10 +1,17 @@
-"""H3 checkpoint conditioning preserves independent document and timestep equations."""
+"""H3 checkpoint conditioning preserves independent document equations.
+
+It also preserves independent timestep equations.
+"""
 
 import pytest
 import torch
-from diffusers.models.embeddings import TimestepEmbedding as ReferenceTimestepEmbedding
+from diffusers.models.embeddings import (
+    TimestepEmbedding as ReferenceTimestepEmbedding,
+)
 from diffusers.models.embeddings import get_timestep_embedding
-from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3TokenRefiner
+from diffusers.models.transformers.transformer_minimax_h3 import (
+    MiniMaxH3TokenRefiner,
+)
 from safetensors.torch import save_file
 
 from uniserve import loading
@@ -36,7 +43,9 @@ def _config():
 def test_conditioning_loader_preserves_variable_documents(tmp_path, dtype):
     config = _config()
     torch.manual_seed(108)
-    projection = torch.nn.Linear(config.text_dim, config.hidden_size).to(dtype).eval()
+    projection = (
+        torch.nn.Linear(config.text_dim, config.hidden_size).to(dtype).eval()
+    )
     reference = (
         MiniMaxH3TokenRefiner(
             config.hidden_size,
@@ -52,8 +61,14 @@ def test_conditioning_loader_preserves_variable_documents(tmp_path, dtype):
         .eval()
     )
     values = {
-        **{f"context_embedder.{name}": value for name, value in projection.state_dict().items()},
-        **{f"token_refiner.{name}": value for name, value in reference.state_dict().items()},
+        **{
+            f"context_embedder.{name}": value
+            for name, value in projection.state_dict().items()
+        },
+        **{
+            f"token_refiner.{name}": value
+            for name, value in reference.state_dict().items()
+        },
     }
     save_file(values, tmp_path / "model.safetensors")
 
@@ -70,18 +85,27 @@ def test_conditioning_loader_preserves_variable_documents(tmp_path, dtype):
     model = loading.load_model(
         Conditioner,
         config,
-        checkpoint=(checkpoint.Config().resolve(tmp_path, io=loading.Config()),),
+        checkpoint=(
+            checkpoint.Config().resolve(tmp_path, io=loading.Config()),
+        ),
         mapping=mapping,
         device="cpu",
         weights=weights.Config(dtype=dtype),
     ).model
-    features = tuple(torch.randn(tokens, config.text_dim, dtype=dtype) for tokens in (7, 3, 7))
+    features = tuple(
+        torch.randn(tokens, config.text_dim, dtype=dtype)
+        for tokens in (7, 3, 7)
+    )
     with torch.no_grad():
-        expected = tuple(reference(projection(value.unsqueeze(0)))[0] for value in features)
+        expected = tuple(
+            reference(projection(value.unsqueeze(0)))[0] for value in features
+        )
         actual = model.encode(features)
     tolerance = (2e-2, 2e-2) if dtype == torch.bfloat16 else (1e-4, 1e-5)
     for value, result in zip(expected, actual, strict=True):
-        torch.testing.assert_close(result, value, rtol=tolerance[0], atol=tolerance[1])
+        torch.testing.assert_close(
+            result, value, rtol=tolerance[0], atol=tolerance[1]
+        )
 
 
 def test_timestep_projection_preserves_both_modality_coordinates():
@@ -98,7 +122,10 @@ def test_timestep_projection_preserves_both_modality_coordinates():
         model.video_projection[2].bias.copy_(reference.linear_2.bias)
         times = torch.tensor([[0.0, 0.0], [0.125, 0.4], [0.7, 0.95]])
         features = get_timestep_embedding(
-            times.flatten(), config.frequency_dim, flip_sin_to_cos=True, downscale_freq_shift=0
+            times.flatten(),
+            config.frequency_dim,
+            flip_sin_to_cos=True,
+            downscale_freq_shift=0,
         )
         expected = reference(features).reshape(*times.shape, config.time_dim)
         torch.testing.assert_close(model(times), expected, rtol=1e-5, atol=1e-6)

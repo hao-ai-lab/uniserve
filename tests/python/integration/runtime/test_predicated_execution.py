@@ -53,7 +53,8 @@ def _release_relay_outputs(worker, *operations: ScheduledRequest) -> None:
         worker,
         worker.submit(
             execution_run(
-                run_id=max(operation.op_id.batch_id for operation in operations) + 1,
+                run_id=max(operation.op_id.batch_id for operation in operations)
+                + 1,
                 commands=tuple(
                     Free(output.buffer_id)
                     for operation in operations
@@ -69,7 +70,9 @@ def _release_relay_outputs(worker, *operations: ScheduledRequest) -> None:
     )
 
 
-def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> None:
+def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> (
+    None
+):
     worker = execution_worker(device="cpu", pipeline_depth=2)
     admission = ar_params(50, block_ids=(0,))
     base = token_operation(
@@ -120,13 +123,16 @@ def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> Non
     _release_relay_outputs(worker, operation)
 
 
-def test_false_device_predicate_preserves_parent_cutoff_across_registered_descendants() -> None:
+def test_false_device_predicate_preserves_parent_cutoff_across_registered_descendants(  # noqa: E501
+) -> None:
     worker = execution_worker(device="cpu", pipeline_depth=2)
     base = ar_params(51, block_ids=(0,))
     admission = NewRequest(
         base.request_key,
         request_pool_idx=base.request_pool_idx,
-        generation=replace(base.generation, finish_token_ids=(expected_successor(4),)),
+        generation=replace(
+            base.generation, finish_token_ids=(expected_successor(4),)
+        ),
     )
     predecessor = token_operation(
         admission.request_key,
@@ -189,11 +195,16 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
     assert completion.position == parent_completion.position
     assert completion.kv_visible_len == parent_completion.kv_visible_len
     assert completion.kv_computed_len == parent_completion.kv_computed_len
-    assert completion.num_completed_steps == parent_completion.num_completed_steps
+    assert (
+        completion.num_completed_steps == parent_completion.num_completed_steps
+    )
     assert descendant_completion.position == completion.position
     assert descendant_completion.kv_visible_len == completion.kv_visible_len
     assert descendant_completion.kv_computed_len == completion.kv_computed_len
-    assert descendant_completion.num_completed_steps == completion.num_completed_steps
+    assert (
+        descendant_completion.num_completed_steps
+        == completion.num_completed_steps
+    )
 
     selected = predecessor.op_id
 
@@ -234,9 +245,12 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
     assert close_report.completions == ()
 
 
-def test_false_generation_predicate_preserves_the_selected_text_state_and_latent_capacity() -> None:
+def test_false_generation_predicate_preserves_the_selected_text_state_and_latent_capacity(  # noqa: E501
+) -> None:
     worker = execution_worker(device="cpu", pipeline_depth=2)
-    generation = umm_params(52, ImageParams(steps=2, height=16, width=16, seed=29))
+    generation = umm_params(
+        52, ImageParams(steps=2, height=16, width=16, seed=29)
+    )
     understanding = ar_params(52, block_ids=(0,))
     admission = NewRequest(
         understanding.request_key,
@@ -310,9 +324,17 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     candidate_completion = candidate_report.completions[0]
     assert candidate_completion.status is OpStatus.PREDICATED
     assert candidate_completion.position == parent_completion.position
-    assert candidate_completion.kv_visible_len == parent_completion.kv_visible_len
-    assert candidate_completion.kv_computed_len == parent_completion.kv_computed_len
-    assert candidate_completion.num_completed_steps == parent_completion.num_completed_steps
+    assert (
+        candidate_completion.kv_visible_len == parent_completion.kv_visible_len
+    )
+    assert (
+        candidate_completion.kv_computed_len
+        == parent_completion.kv_computed_len
+    )
+    assert (
+        candidate_completion.num_completed_steps
+        == parent_completion.num_completed_steps
+    )
     assert candidate_completion.product_generations == ()
 
     parent_observation = record_completion(predecessor, parent_report)

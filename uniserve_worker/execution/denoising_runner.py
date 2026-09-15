@@ -1,4 +1,7 @@
-"""Own prepared denoising calls, graph residency and numerical resource lifetime."""
+"""Own prepared denoising calls.
+
+graph residency and numerical resource lifetime.
+"""
 
 from __future__ import annotations
 
@@ -22,13 +25,14 @@ SizeT = TypeVar("SizeT")
 
 
 def _numerical_signature(value: object) -> Hashable:
-    """Identify static values and tensor backing independently of tensor contents.
+    """Identify static values and tensor backing independently of tensor.
+
+    contents.
 
     Immutable numerical records may be rebuilt between calls. Their values and
     borrowed tensor addresses determine graph reuse; mutable device contents do
     not, so this function never reads tensors back to the host.
     """
-
     if isinstance(value, torch.Tensor):
         return (
             value.device,
@@ -38,7 +42,9 @@ def _numerical_signature(value: object) -> Hashable:
             value.data_ptr(),
         )
     if isinstance(value, Mapping):
-        return tuple((key, _numerical_signature(item)) for key, item in value.items())
+        return tuple(
+            (key, _numerical_signature(item)) for key, item in value.items()
+        )
     if isinstance(value, (tuple, list)):
         return tuple(_numerical_signature(item) for item in value)
     if is_dataclass(value) and not isinstance(value, type):
@@ -48,16 +54,22 @@ def _numerical_signature(value: object) -> Hashable:
         )
     if isinstance(value, Hashable):
         return value
-    raise TypeError(f"unsupported numerical graph value: {type(value).__name__}")
+    raise TypeError(
+        f"unsupported numerical graph value: {type(value).__name__}"
+    )
 
 
 def restore_samples(inputs: DenoiserInput):
-    """Snapshot solver samples while keeping disposable prediction storage separate."""
+    """Snapshot solver samples while keeping disposable prediction storage.
 
+    separate.
+    """
     # Keying by identity snapshots each backing tensor once, even when several
     # latent views alias the same storage.
     samples = {
-        id(value.tensor): value.tensor for values in inputs.latents.values() for value in values
+        id(value.tensor): value.tensor
+        for values in inputs.latents.values()
+        for value in values
     }
     snapshots = tuple((value, value.clone()) for value in samples.values())
 
@@ -72,10 +84,10 @@ class DenoisingRunner(Generic[InputT, SizeT]):
     """Execute one denoiser capability over caller-supplied typed inputs.
 
     Prepared contexts own plans, constants, communication resources and scratch.
-    Graphs borrow those contexts and request-slot samples, but own their schedule
-    and timestep inputs. New requests can supply new schedule tensors without
-    replacing a slot's captured sample addresses. Retirement releases graphs
-    before their contexts or sample backing can be reused.
+    Graphs borrow those contexts and request-slot samples, but own their
+    schedule and timestep inputs. New requests can supply new schedule tensors
+    without replacing a slot's captured sample addresses. Retirement releases
+    graphs before their contexts or sample backing can be reused.
     """
 
     def __init__(
@@ -92,10 +104,16 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         additional_devices: tuple[torch.device, ...] = (),
     ):
         if capacity < 1:
-            raise ValueError("denoising requires a positive resident request capacity")
+            raise ValueError(
+                "denoising requires a positive resident request capacity"
+            )
 
         self.model, self.device = model, device
-        self.capture_stream, self.groups, self.capacity = capture_stream, groups, capacity
+        self.capture_stream, self.groups, self.capacity = (
+            capture_stream,
+            groups,
+            capacity,
+        )
         self.cache, self.attention, self.matmul = cache, attention, matmul
 
         # Captured graphs draw their workspace from per-device memory pools.
@@ -105,14 +123,24 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                 with torch.cuda.device(target):
                     self.device_pools[target] = torch.cuda.MemPool()
 
-        self.graphs: dict[tuple[Hashable, Hashable, Hashable], tuple[CUDAGraph, tuple]] = {}
-        self.prepared_inputs: OrderedDict[Hashable, ExecutionContext] = OrderedDict()
-        self._slots: OrderedDict[Hashable, tuple[Hashable, Hashable]] = OrderedDict()
+        self.graphs: dict[
+            tuple[Hashable, Hashable, Hashable], tuple[CUDAGraph, tuple]
+        ] = {}
+        self.prepared_inputs: OrderedDict[Hashable, ExecutionContext] = (
+            OrderedDict()
+        )
+        self._slots: OrderedDict[Hashable, tuple[Hashable, Hashable]] = (
+            OrderedDict()
+        )
         self._closed = False
 
-    def prepare_inputs(self, key: Hashable, size: SizeT) -> ExecutionContext[SizeT]:
-        """Prepare one exact numerical size, retaining it through dependent graphs."""
+    def prepare_inputs(
+        self, key: Hashable, size: SizeT
+    ) -> ExecutionContext[SizeT]:
+        """Prepare one exact numerical size.
 
+        retaining it through dependent graphs.
+        """
         if self._closed:
             raise RuntimeError("denoising runner is closed")
 
@@ -129,7 +157,9 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             )
             try:
                 if context.stream is not None:
-                    context.stream.wait_stream(torch.cuda.current_stream(self.device))
+                    context.stream.wait_stream(
+                        torch.cuda.current_stream(self.device)
+                    )
                 context.prepare(size)
             except BaseException:
                 context.close()
@@ -144,7 +174,12 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             raise RuntimeError("denoising runner is closed")
         context = self.prepared_inputs[key]
         return context, DenoisingStep(
-            self.model, inputs, schedules, state, context.constants, context.workspace
+            self.model,
+            inputs,
+            schedules,
+            state,
+            context.constants,
+            context.workspace,
         )
 
     @torch.inference_mode()
@@ -156,9 +191,13 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         state: Mapping[str, torch.Tensor],
         input_key: Hashable,
     ) -> None:
-        """Prepare the actual call's kernel specializations without advancing its samples."""
+        """Prepare the actual call's kernel specializations without advancing.
 
-        context, operation = self._operation(inputs, schedules, state, input_key)
+        its samples.
+        """
+        context, operation = self._operation(
+            inputs, schedules, state, input_key
+        )
         if context.stream is not None:
             context.stream.wait_stream(torch.cuda.current_stream(self.device))
 
@@ -170,7 +209,9 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                 restore()
 
         if self.device.type == "cuda":
-            (context.stream or torch.cuda.current_stream(self.device)).synchronize()
+            (
+                context.stream or torch.cuda.current_stream(self.device)
+            ).synchronize()
 
     @torch.inference_mode()
     def step(
@@ -182,9 +223,13 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         slot: Hashable,
         input_key: Hashable,
     ) -> tuple[Mapping[str, tuple[torch.Tensor, ...]], str]:
-        """Run one numerical update; the worker separately commits request progress."""
+        """Run one numerical update.
 
-        context, operation = self._operation(inputs, schedules, state, input_key)
+        the worker separately commits request progress.
+        """
+        context, operation = self._operation(
+            inputs, schedules, state, input_key
+        )
         if self.capture_stream is None:
             with context.activate():
                 return operation(), "eager"
@@ -219,7 +264,9 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         variant = inputs.step_index, input_signature(timesteps)
         key = (slot, signature, variant)
 
-        missing = capture_required(key not in self.graphs, self.groups, self.device)
+        missing = capture_required(
+            key not in self.graphs, self.groups, self.device
+        )
         if missing:
             resident = self._slots.get(slot)
             if resident is not None and resident != (signature, input_key):
@@ -242,13 +289,20 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                         latents={
                             name: tuple(
                                 replace(value, timestep=timestep)
-                                for value, timestep in zip(values, staged[1][name], strict=True)
+                                for value, timestep in zip(
+                                    values, staged[1][name], strict=True
+                                )
                             )
                             for name, values in inputs.latents.items()
                         },
                     )
                     operation = DenoisingStep(
-                        self.model, bound, staged[0], state, context.constants, context.workspace
+                        self.model,
+                        bound,
+                        staged[0],
+                        state,
+                        context.constants,
+                        context.workspace,
                     )
                     restore = restore_samples(inputs)
                 graph.capture(operation, restore=restore)
@@ -275,12 +329,16 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             graph, _staged = resident
             # Automatic residency eviction may follow an asynchronous replay.
             # Finish this producer before resetting its captured allocations.
-            (graph.context.stream or torch.cuda.current_stream(self.device)).synchronize()
+            (
+                graph.context.stream or torch.cuda.current_stream(self.device)
+            ).synchronize()
             graph.close()
 
     def release_slot(self, slot: Hashable) -> None:
-        """Retire a drained slot's graphs before its sample backing is reused."""
+        """Retire a drained slot's graphs before its sample backing is.
 
+        reused.
+        """
         for key in tuple(self.graphs):
             if key[0] == slot:
                 self._discard_graph(key)
@@ -288,7 +346,6 @@ class DenoisingRunner(Generic[InputT, SizeT]):
 
     def release_inputs(self, key: Hashable) -> None:
         """Retire dependent calls before releasing their execution context."""
-
         for slot, (_signature, resident_key) in tuple(self._slots.items()):
             if resident_key == key:
                 self.release_slot(slot)
@@ -296,7 +353,9 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         context = self.prepared_inputs.pop(key, None)
         if context is not None:
             if self.device.type == "cuda":
-                (context.stream or torch.cuda.current_stream(self.device)).synchronize()
+                (
+                    context.stream or torch.cuda.current_stream(self.device)
+                ).synchronize()
             context.close()
 
     def close(self) -> None:

@@ -21,6 +21,10 @@ def test_position_embedding_returns_requested_learned_rows():
     with torch.no_grad():
         embedding.weight.copy_(torch.arange(24).reshape(6, 4))
         expected = torch.tensor(
-            [[20.0, 21.0, 22.0, 23.0], [0.0, 1.0, 2.0, 3.0], [20.0, 21.0, 22.0, 23.0]]
+            [
+                [20.0, 21.0, 22.0, 23.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [20.0, 21.0, 22.0, 23.0],
+            ]
         )
         torch.testing.assert_close(embedding(torch.tensor([5, 0, 5])), expected)

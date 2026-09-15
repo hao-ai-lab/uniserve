@@ -1,4 +1,4 @@
-"""Exposes jagged visible-end FlashAttention with optional CuTe runtime loading."""
+"""Jagged visible-end FlashAttention with optional CuTe runtime loading."""
 
 from __future__ import annotations
 
@@ -16,19 +16,16 @@ except Exception as exc:  # pragma: no cover
 
 def available() -> bool:
     """Report whether the jagged FlashAttention runtime loaded successfully."""
-
     return flash_attn_fwd is not None
 
 
 def import_error() -> BaseException | None:
     """Return the exception that prevented runtime loading, when present."""
-
     return _IMPORT_ERROR
 
 
 def require_available() -> None:
-    """Require the optional runtime and raise an actionable error when absent."""
-
+    """Require the optional runtime, raising an actionable error if absent."""
     if available():
         return
     detail = f": {_IMPORT_ERROR}" if _IMPORT_ERROR is not None else ""

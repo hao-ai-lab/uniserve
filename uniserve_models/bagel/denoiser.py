@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import torch
 
-from uniserve.diffusion import EulerSolver, NestedGuidance, NoiseScale, Renorm, make_schedule
+from uniserve.diffusion import (
+    EulerSolver,
+    NestedGuidance,
+    NoiseScale,
+    Renorm,
+    make_schedule,
+)
 from uniserve.media import image
 from uniserve.model import ImageDenoiser
 from uniserve.nn.linear import Linear
@@ -34,14 +40,18 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         width = config.latent_patch_size**2 * config.vae.latent_channels
         self.input = Linear(width, config.text.hidden_size)
         self.time_embedding = TimestepEmbedding(config.text.hidden_size)
-        self.position = PositionEmbedding((config.max_latent_size,) * 2, config.text.hidden_size)
+        self.position = PositionEmbedding(
+            (config.max_latent_size,) * 2, config.text.hidden_size
+        )
         self.prediction = Linear(config.text.hidden_size, width)
         # Derived marker IDs are numerical constants. Explicit CPU construction
         # survives meta initialization; loading places their borrowed buffer.
         self.register_buffer(
             "markers",
             torch.tensor(
-                (config.start_of_image_id, config.end_of_image_id), dtype=torch.long, device="cpu"
+                (config.start_of_image_id, config.end_of_image_id),
+                dtype=torch.long,
+                device="cpu",
             ),
             persistent=False,
         )
@@ -70,7 +80,9 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         renorm: Renorm,
         renorm_min: float,
     ):
-        return NestedGuidance(text_scale, image_scale, interval, renorm, renorm_min)
+        return NestedGuidance(
+            text_scale, image_scale, interval, renorm, renorm_min
+        )
 
     def forward(self, inputs: DenoiserInput, *, state, constants, workspace):
         if set(inputs.latents) != {"image"}:
@@ -88,17 +100,29 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         ):
             shape = self.latent_shape("image", size)
             if latent.tensor.shape != shape or count != shape[0] + 2:
-                raise ValueError("BAGEL latents must cover their framed image sequence")
+                raise ValueError(
+                    "BAGEL latents must cover their framed image sequence"
+                )
 
             if group.rank == 0:
-                # Frame latent features with embedded start/end-of-image markers;
-                # the marker rows route as text, the interior rows as flow.
-                marker = self.backbone.embed_input_ids(self.markers).to(torch.bfloat16)
-                coordinates = positions[1, 1:-1] * self.config.max_latent_size + positions[2, 1:-1]
-                features = self.input(latent.tensor.to(torch.bfloat16))  # [latents, hidden]
+                # Frame latent features with embedded start/end-of-image
+                # markers; the marker rows route as text, the interior rows
+                # as flow.
+                marker = self.backbone.embed_input_ids(self.markers).to(
+                    torch.bfloat16
+                )
+                coordinates = (
+                    positions[1, 1:-1] * self.config.max_latent_size
+                    + positions[2, 1:-1]
+                )
+                features = self.input(
+                    latent.tensor.to(torch.bfloat16)
+                )  # [latents, hidden]
                 features = (
                     features
-                    + self.time_embedding(latent.timestep.reshape(1).expand(shape[0]))
+                    + self.time_embedding(
+                        latent.timestep.reshape(1).expand(shape[0])
+                    )
                     + self.position(coordinates)
                 ).to(torch.bfloat16)
                 chunks.append(torch.cat((marker[:1], features, marker[1:])))
@@ -134,7 +158,11 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
             outputs.append(
                 TensorOutput(
                     prediction,
-                    OutputLayout(shape, prediction.dtype, tuple(slice(0, n) for n in shape)),
+                    OutputLayout(
+                        shape,
+                        prediction.dtype,
+                        tuple(slice(0, n) for n in shape),
+                    ),
                 )
             )
         return {"image": tuple(outputs)}

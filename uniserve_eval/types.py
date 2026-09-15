@@ -40,12 +40,10 @@ class MetricDefinition:
     @property
     def name(self) -> str:
         """Return the dotted metric path."""
-
         return ".".join(self.path)
 
     def as_dict(self) -> dict[str, str]:
         """Return a JSON-compatible metric declaration."""
-
         return {"path": self.name, "direction": self.direction}
 
 
@@ -61,7 +59,6 @@ class LoadConfig:
 
     def __post_init__(self) -> None:
         """Validate load parameters that govern request scheduling."""
-
         if self.num_prompts < 1:
             raise ValueError("num_prompts must be positive")
         if self.request_rate <= 0 or math.isnan(self.request_rate):
@@ -106,7 +103,6 @@ class ImageConfig:
 
     def __post_init__(self) -> None:
         """Validate image settings with structural or positivity constraints."""
-
         if self.cfg_interval is not None and len(self.cfg_interval) != 2:
             raise ValueError("cfg_interval must contain exactly two values")
         if self.steps is not None and self.steps < 1:
@@ -124,7 +120,6 @@ class VideoConfig:
 
     def __post_init__(self) -> None:
         """Validate finite duration and positive prompt length."""
-
         if not math.isfinite(self.seconds) or self.seconds <= 0.0:
             raise ValueError("video seconds must be finite and positive")
         if self.prompt_tokens < 1:
@@ -152,8 +147,11 @@ class Example:
 
     def as_dict(self) -> dict[str, Any]:
         """Return populated fields as a JSON-compatible mapping."""
-
-        return {key: value for key, value in asdict(self).items() if value is not None}
+        return {
+            key: value
+            for key, value in asdict(self).items()
+            if value is not None
+        }
 
 
 @dataclass(frozen=True)
@@ -179,7 +177,6 @@ class DecodedImage:
 
     def metadata_dict(self) -> dict[str, int | str]:
         """Return persistent image metadata without the encoded bytes."""
-
         return {
             "sha256": self.sha256,
             "byte_size": self.byte_size,
@@ -213,24 +210,20 @@ class DecodedVideo:
     @property
     def fps(self) -> float:
         """Return the exact rational frame rate as a float."""
-
         return self.fps_numerator / self.fps_denominator
 
     @property
     def video_duration_s(self) -> float:
         """Return duration derived from decoded frames and frame rate."""
-
         return self.frame_count / self.fps
 
     @property
     def audio_duration_s(self) -> float:
         """Return duration derived from decoded samples and sample rate."""
-
         return self.audio_samples / self.audio_sample_rate
 
     def metadata_dict(self) -> dict[str, float | int | str]:
         """Return persistent media metadata without the encoded bytes."""
-
         return {
             "sha256": self.sha256,
             "byte_size": self.byte_size,
@@ -298,7 +291,6 @@ class RequestRecord:
         requested_output_len: int,
     ) -> None:
         """Initialize endpoint metadata and the monotonic request clock."""
-
         self.endpoint = endpoint
         self.scheduled_time = scheduled_time
         self.requested_output_len = requested_output_len
@@ -306,26 +298,22 @@ class RequestRecord:
 
     def note_http(self, status_code: int) -> None:
         """Record when the HTTP response headers become available."""
-
         self.http_response_time = time.perf_counter()
         self.status_code = status_code
 
     def close_now(self) -> None:
         """Close the request at the current monotonic time."""
-
         now = time.perf_counter()
         self.latency = now - self.start_time
         self.final_event_time = now
 
     def close_at(self, timestamp: float) -> None:
         """Close the request at a supplied monotonic event timestamp."""
-
         self.final_event_time = timestamp
         self.latency = timestamp - self.start_time
 
     def mark_failure(self, classifier: str, error: str | None = None) -> None:
         """Mark the request unsuccessful with a stable classifier."""
-
         self.success = False
         self.classifier = classifier
         if error is not None:
@@ -333,19 +321,18 @@ class RequestRecord:
 
     def mark_success(self) -> None:
         """Mark the request successful."""
-
         self.success = True
         self.classifier = "ok"
 
     def mark_transport_exception(self, error: BaseException) -> None:
         """Close and classify an exception raised by the transport path."""
-
         self.close_now()
-        self.mark_failure("transport_failure", f"{type(error).__name__}: {error}")
+        self.mark_failure(
+            "transport_failure", f"{type(error).__name__}: {error}"
+        )
 
     def apply_choice_metadata(self, choice: dict[str, Any]) -> None:
         """Record finish and stop reasons from a completion choice."""
-
         finish_reason = choice.get("finish_reason")
         if isinstance(finish_reason, str):
             self.finish_reason = finish_reason
@@ -355,7 +342,6 @@ class RequestRecord:
 
     def apply_usage(self, usage: dict[str, Any]) -> None:
         """Apply authoritative token and image-step usage fields."""
-
         if isinstance(usage.get("completion_tokens"), int):
             self.output_len = int(usage["completion_tokens"])
             self.output_len_source = "server_usage"
@@ -363,12 +349,13 @@ class RequestRecord:
             self.prompt_len = int(usage["prompt_tokens"])
             self.prompt_len_source = "server_usage"
         steps = usage.get("image_steps_per_image")
-        if isinstance(steps, list) and all(_is_token_count(step) for step in steps):
+        if isinstance(steps, list) and all(
+            _is_token_count(step) for step in steps
+        ):
             self.image_steps = [int(step) for step in steps]
 
     def apply_cached_prompt_tokens(self, payload: dict[str, Any]) -> None:
         """Extract cached-token usage from an OpenAI-compatible payload."""
-
         usage = payload.get("usage")
         if not isinstance(usage, dict):
             return
@@ -378,11 +365,14 @@ class RequestRecord:
         cached = details.get("cached_tokens")
         if _is_token_count(cached):
             self.cached_prompt_tokens = int(cached)
-            self.cached_prompt_tokens_source = "openai_usage_prompt_tokens_details"
+            self.cached_prompt_tokens_source = (
+                "openai_usage_prompt_tokens_details"
+            )
 
-    def apply_token_fallbacks(self, *, prompt_len: int, output_len_fallback: int) -> None:
+    def apply_token_fallbacks(
+        self, *, prompt_len: int, output_len_fallback: int
+    ) -> None:
         """Fill token counts that the server did not report."""
-
         if self.output_len_source != "server_usage":
             self.output_len = output_len_fallback
         if self.prompt_len_source != "server_usage":
@@ -397,7 +387,6 @@ class RequestRecord:
         count_itl: bool,
     ) -> None:
         """Append streamed text and update first-token or inter-token timing."""
-
         self.token_timing_available = True
         self.generated_text += content
         if timestamp is None:
@@ -410,7 +399,6 @@ class RequestRecord:
 
     def add_image_arrival(self, count: int, timestamp: float | None) -> None:
         """Record completion latency for newly observed image parts."""
-
         if timestamp is None:
             return
         latency = timestamp - self.start_time
@@ -422,16 +410,14 @@ class RequestRecord:
     def attach_images(
         self, decoded: list[DecodedImage], *, assign_json_latency: bool = False
     ) -> None:
-        """Attach validated images and optionally assign response latency to each."""
-
+        """Attach validated images and optionally assign response latency to each."""  # noqa: E501
         self.decoded_images = decoded
         self.images = len(decoded)
         if assign_json_latency and decoded:
             self.image_latencies = [self.latency] * self.images
 
     def record_dict(self) -> dict[str, Any]:
-        """Return the durable request record, including generated text and media metadata."""
-
+        """Return the durable request record, including generated text and media metadata."""  # noqa: E501
         generated_text_bytes = self.generated_text.encode("utf-8")
         http_response = (
             self.http_response_time - self.start_time
@@ -439,7 +425,9 @@ class RequestRecord:
             else None
         )
         dispatch_wait = (
-            self.start_time - self.scheduled_time if self.scheduled_time is not None else None
+            self.start_time - self.scheduled_time
+            if self.scheduled_time is not None
+            else None
         )
 
         return {
@@ -462,10 +450,16 @@ class RequestRecord:
             "client_dispatch_wait_ms": (
                 dispatch_wait * 1000.0 if dispatch_wait is not None else None
             ),
-            "http_response_ms": (http_response * 1000.0 if http_response is not None else None),
+            "http_response_ms": (
+                http_response * 1000.0 if http_response is not None else None
+            ),
             "e2e_ms": self.latency * 1000.0,
             "token_timing_available": self.token_timing_available,
-            "ttft_ms": (self.ttft * 1000.0 if self.token_timing_available and self.ttft else None),
+            "ttft_ms": (
+                self.ttft * 1000.0
+                if self.token_timing_available and self.ttft
+                else None
+            ),
             "tpot_ms": (
                 (self.latency - self.ttft) / (self.output_len - 1) * 1000.0
                 if self.token_timing_available and self.output_len > 1
@@ -484,19 +478,29 @@ class RequestRecord:
             "generated_text": self.generated_text,
             "generated_text_bytes": len(generated_text_bytes),
             "generated_text_sha256": (
-                hashlib.sha256(generated_text_bytes).hexdigest() if generated_text_bytes else None
+                hashlib.sha256(generated_text_bytes).hexdigest()
+                if generated_text_bytes
+                else None
             ),
             # Media entries retain verified metadata while sample bytes live in
             # their own content-addressed artifacts.
             "images": self.images,
-            "image_outputs": [image.metadata_dict() for image in self.decoded_images],
+            "image_outputs": [
+                image.metadata_dict() for image in self.decoded_images
+            ],
             "first_image_latency_ms": (
-                self.first_image_latency * 1000.0 if self.first_image_latency is not None else None
+                self.first_image_latency * 1000.0
+                if self.first_image_latency is not None
+                else None
             ),
-            "image_latencies_ms": [value * 1000.0 for value in self.image_latencies],
+            "image_latencies_ms": [
+                value * 1000.0 for value in self.image_latencies
+            ],
             "image_steps": list(self.image_steps),
             "video_output": (
-                self.decoded_video.metadata_dict() if self.decoded_video is not None else None
+                self.decoded_video.metadata_dict()
+                if self.decoded_video is not None
+                else None
             ),
             # Transport terminal state remains available for validation reports.
             "status_code": self.status_code,
@@ -507,7 +511,7 @@ class RequestRecord:
 
 @dataclass(frozen=True)
 class BenchmarkPoint:
-    """Defines one fully resolved workload, task, server, and metric contract."""
+    """Defines one fully resolved workload, task, server, and metric contract."""  # noqa: E501
 
     name: str
     server: str
@@ -527,17 +531,19 @@ class BenchmarkPoint:
 
     def __post_init__(self) -> None:
         """Normalize the task identifier and require protected metrics."""
-
         object.__setattr__(self, "task", TaskName(self.task))
         if not self.metrics:
-            raise ValueError("a benchmark point must protect at least one metric")
+            raise ValueError(
+                "a benchmark point must protect at least one metric"
+            )
 
     def workload_dict(self) -> dict[str, Any]:
         """Return the benchmark workload as a JSON-compatible mapping."""
-
         load = asdict(self.load)
         load["request_rate"] = (
-            "inf" if math.isinf(self.load.request_rate) else self.load.request_rate
+            "inf"
+            if math.isinf(self.load.request_rate)
+            else self.load.request_rate
         )
         return {
             "name": self.name,
@@ -569,12 +575,10 @@ class ValidationResult:
     @property
     def valid(self) -> bool:
         """Report whether at least one check exists and every check passes."""
-
         return bool(self.checks) and all(self.checks.values())
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible validation report."""
-
         return {
             "valid": self.valid,
             "checks": dict(self.checks),
@@ -584,10 +588,11 @@ class ValidationResult:
 
     def merged(self, other: ValidationResult) -> ValidationResult:
         """Combine validation reports whose check names do not overlap."""
-
         overlap = set(self.checks) & set(other.checks)
         if overlap:
-            raise ValueError(f"duplicate validation checks: {', '.join(sorted(overlap))}")
+            raise ValueError(
+                f"duplicate validation checks: {', '.join(sorted(overlap))}"
+            )
         return ValidationResult(
             checks={**self.checks, **other.checks},
             statistics={**self.statistics, **other.statistics},
@@ -605,13 +610,11 @@ class RunResult:
 
 def _is_token_count(value: Any) -> TypeGuard[int]:
     """Recognize non-negative integer token counts while excluding booleans."""
-
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def selected_rows_identity(rows: list[Example]) -> dict[str, Any]:
     """Return a deterministic count and digest for selected dataset rows."""
-
     encoded = json.dumps(
         [row.as_dict() for row in rows],
         sort_keys=True,

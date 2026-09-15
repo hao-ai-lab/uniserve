@@ -35,7 +35,6 @@ _ROPE_SPATIAL_SCALE = 32.0
 
 def video_latent_frames(num_frames: int) -> int:
     """Convert a valid H3 output-frame count into temporal video-VAE latents."""
-
     if type(num_frames) is not int or num_frames < 22 or num_frames % 17 != 5:
         raise ValueError("H3 frame count must have the form 17 * n + 5")
     return (num_frames - 5) // 17 * 5 + 2
@@ -43,17 +42,17 @@ def video_latent_frames(num_frames: int) -> int:
 
 def audio_latent_frames(num_frames: int) -> int:
     """Size the 40 Hz audio latent timeline for a 24 Hz video frame count."""
-
     return math.ceil(num_frames / FPS * AUDIO_LATENTS_PER_SECOND)
 
 
 @dataclass(frozen=True, slots=True)
 class Packing:
-    """CPU indices for the mathematical text, stereo audio and tiled video order.
+    """CPU indices for the mathematical text, stereo audio and tiled video
+    order.
 
     num_tokens counts valid tokens. padded_tokens also includes tile-boundary
     and partition alignment, whose validity is represented separately.
-    """
+    """  # noqa: D205
 
     num_tokens: int
     padded_tokens: int
@@ -74,8 +73,7 @@ class Packing:
 
 
 def _spatial_grid(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
-    """Choose a patch-aligned spatial extent near the target square-root area."""
-
+    """Choose a patch-aligned spatial extent near the target square-root area."""  # noqa: E501
     ratio = dim / sqrt_area
     left = (1.0 - ratio) / 2.0
     values = np.linspace(left, left + ratio, dim // patch, endpoint=False)
@@ -84,17 +82,20 @@ def _spatial_grid(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
 
 def _temporal_grid(count: int, origin: float) -> torch.Tensor:
     """Generate evenly spaced temporal coordinates from an origin."""
-
     spans = torch.tensor(
         [
-            ROPE_FRAME_RESCALE * ROPE_FRAMES_PER_LATENT[index % len(ROPE_FRAMES_PER_LATENT)]
+            ROPE_FRAME_RESCALE
+            * ROPE_FRAMES_PER_LATENT[index % len(ROPE_FRAMES_PER_LATENT)]
             for index in range(count)
         ],
         dtype=torch.float64,
         device="cpu",
     )
     return origin + torch.cat(
-        (torch.zeros(1, dtype=torch.float64, device="cpu"), spans[:-1].cumsum(0))
+        (
+            torch.zeros(1, dtype=torch.float64, device="cpu"),
+            spans[:-1].cumsum(0),
+        )
     )
 
 
@@ -111,21 +112,35 @@ def build_packing(
     """Build CPU coordinates for `[text | audio | tiled video | padding]` rows.
 
     These host metadata values remain concrete during deferred parameter
-    construction. Execution supplies device views for numerical kernels."""
-
+    construction. Execution supplies device views for numerical kernels.
+    """
     if num_text_tokens < 1 or height != 768 or width != 1344:
-        raise ValueError("the FastH3 profile requires 1344x768 output and nonempty text")
+        raise ValueError(
+            "the FastH3 profile requires 1344x768 output and nonempty text"
+        )
     if token_multiple < 1 or token_multiple % 64:
-        raise ValueError("packing alignment must contain complete 64-token tiles")
+        raise ValueError(
+            "packing alignment must contain complete 64-token tiles"
+        )
     text_rows = math.ceil(num_text_tokens / 64) * 64
     patch_t, patch_h, patch_w = patch_size
     latent_height, latent_width = height // 16, width // 16
     video_frames = video_latent_frames(num_frames)
-    audio_frames = audio_latent_frames(num_frames) if audio_frames is None else int(audio_frames)
+    audio_frames = (
+        audio_latent_frames(num_frames)
+        if audio_frames is None
+        else int(audio_frames)
+    )
     if audio_frames < 1:
         raise ValueError("H3 audio latent frame count must be positive")
-    if video_frames % patch_t or latent_height % patch_h or latent_width % patch_w:
-        raise ValueError("fixed latent dimensions are not divisible by the transformer patch")
+    if (
+        video_frames % patch_t
+        or latent_height % patch_h
+        or latent_width % patch_w
+    ):
+        raise ValueError(
+            "fixed latent dimensions are not divisible by the transformer patch"
+        )
 
     # Text and audio occupy dense 64-row tiles before the sparse video region.
     # Latents are 16x spatially compressed relative to the output raster.
@@ -135,14 +150,16 @@ def build_packing(
     audio_block_rows = math.ceil(audio_rows / 64) * 64
     video_start = text_rows + audio_block_rows
 
-    # Sparse attention consumes 4x4x4 spatiotemporal tiles. Boundary tiles reserve
-    # 64 transport rows and pack their valid raster rows at the front.
+    # Sparse attention consumes 4x4x4 spatiotemporal tiles. Boundary tiles
+    # reserve 64 transport rows and pack their valid raster rows at the
+    # front.
     tile_t, tile_h, tile_w = (4, 4, 4)
     grid_t = video_frames // patch_t
     grid_h = latent_height // patch_h
     grid_w = latent_width // patch_w
     tiles_t, tiles_h, tiles_w = (
-        math.ceil(extent / tile) for extent, tile in zip((grid_t, grid_h, grid_w), (4, 4, 4))
+        math.ceil(extent / tile)
+        for extent, tile in zip((grid_t, grid_h, grid_w), (4, 4, 4))
     )
     video_tiles = tiles_t * tiles_h * tiles_w
     tile_ids = np.arange(video_tiles, dtype=np.int64)[:, None]
@@ -150,7 +167,11 @@ def build_packing(
     temporal_rows = tile_ids // (tiles_h * tiles_w) * tile_t + offsets // 16
     height_rows = tile_ids // tiles_w % tiles_h * tile_h + offsets // 4 % 4
     width_rows = tile_ids % tiles_w * tile_w + offsets % 4
-    valid = (temporal_rows < grid_t) & (height_rows < grid_h) & (width_rows < grid_w)
+    valid = (
+        (temporal_rows < grid_t)
+        & (height_rows < grid_h)
+        & (width_rows < grid_w)
+    )
     valid_sizes = valid.sum(axis=1, dtype=np.int32)
     # These are CPU index tables. NumPy's integer ufuncs avoid launching an
     # intra-op worker team for each small coordinate expression. Tensor views
@@ -168,37 +189,64 @@ def build_packing(
     transport_rows = video_start + video_transport_rows
     # The block-sparse kernel consumes tile pairs, so an odd logical tile count
     # receives one all-zero transport partner that is not a semantic model row.
-    padded_tokens = math.ceil(transport_rows / max(token_multiple, 128)) * max(token_multiple, 128)
+    padded_tokens = math.ceil(transport_rows / max(token_multiple, 128)) * max(
+        token_multiple, 128
+    )
     if padded_tokens // 64 % 2:
         padded_tokens += 64
     num_tokens = num_text_tokens + audio_rows + video_rows
 
     # Map semantic video raster rows to their tile-major transport positions.
     text_indices = torch.arange(num_text_tokens, dtype=torch.long, device="cpu")
-    audio_indices = torch.arange(text_rows, text_rows + audio_rows, dtype=torch.long, device="cpu")
-    raster_to_transport = torch.empty(video_rows, dtype=torch.long, device="cpu")
+    audio_indices = torch.arange(
+        text_rows, text_rows + audio_rows, dtype=torch.long, device="cpu"
+    )
+    raster_to_transport = torch.empty(
+        video_rows, dtype=torch.long, device="cpu"
+    )
     raster_to_transport[video_raster_indices] = video_indices
-    tags = torch.full((padded_tokens,), VIDEO_TAG, dtype=torch.long, device="cpu")
+    tags = torch.full(
+        (padded_tokens,), VIDEO_TAG, dtype=torch.long, device="cpu"
+    )
     tags[:text_rows] = TEXT_TAG
     tags[text_rows:video_start] = AUDIO_TAG
 
     # Rotary coordinates share a temporal origin at the end of the text prefix;
     # video rows additionally carry normalized height and width coordinates.
-    positions = torch.zeros((padded_tokens, 3), dtype=torch.float64, device="cpu")
-    positions[:text_rows, 0] = torch.arange(text_rows, dtype=torch.float64, device="cpu")
+    positions = torch.zeros(
+        (padded_tokens, 3), dtype=torch.float64, device="cpu"
+    )
+    positions[:text_rows, 0] = torch.arange(
+        text_rows, dtype=torch.float64, device="cpu"
+    )
     sqrt_area = math.sqrt(latent_height * latent_width)
     height_grid = _spatial_grid(latent_height, patch_h, sqrt_area)
     width_grid = _spatial_grid(latent_width, patch_w, sqrt_area)
     spatial = torch.stack(
-        [grid.reshape(-1) for grid in torch.meshgrid(height_grid, width_grid, indexing="ij")],
+        [
+            grid.reshape(-1)
+            for grid in torch.meshgrid(height_grid, width_grid, indexing="ij")
+        ],
         dim=-1,
     )
-    audio_time = float(text_rows) + torch.arange(audio_frames, dtype=torch.float64, device="cpu")
+    audio_time = float(text_rows) + torch.arange(
+        audio_frames, dtype=torch.float64, device="cpu"
+    )
     positions[audio_indices, 0] = audio_time.repeat(AUDIO_CHANNELS)
     positions[audio_indices, 2] = torch.cat(
         (
-            torch.full((audio_frames,), float(width_grid[0]), dtype=torch.float64, device="cpu"),
-            torch.full((audio_frames,), float(width_grid[-1]), dtype=torch.float64, device="cpu"),
+            torch.full(
+                (audio_frames,),
+                float(width_grid[0]),
+                dtype=torch.float64,
+                device="cpu",
+            ),
+            torch.full(
+                (audio_frames,),
+                float(width_grid[-1]),
+                dtype=torch.float64,
+                device="cpu",
+            ),
         )
     )
     temporal = _temporal_grid(video_frames, float(text_rows))
@@ -207,20 +255,28 @@ def build_packing(
     )
     video_positions[:, :, 0] = temporal[:, None]
     video_positions[:, :, 1:] = spatial[None]
-    positions[video_indices] = video_positions.reshape(-1, 3).index_select(0, video_raster_indices)
+    positions[video_indices] = video_positions.reshape(-1, 3).index_select(
+        0, video_raster_indices
+    )
 
     positions[text_rows:, 0].add_(num_text_tokens - text_rows)
 
     # Per-tile valid counts let sparse attention ignore audio, video-boundary,
     # and pair-alignment padding without changing the fixed row allocation.
-    tile_valid_sizes = torch.zeros((padded_tokens // 64,), dtype=torch.int32, device="cpu")
+    tile_valid_sizes = torch.zeros(
+        (padded_tokens // 64,), dtype=torch.int32, device="cpu"
+    )
     for offset in range(text_rows // 64):
         tile_valid_sizes[offset] = min(64, num_text_tokens - offset * 64)
     audio_tile_start = text_rows // 64
     for offset in range(audio_block_rows // 64):
-        tile_valid_sizes[audio_tile_start + offset] = max(0, min(64, audio_rows - offset * 64))
+        tile_valid_sizes[audio_tile_start + offset] = max(
+            0, min(64, audio_rows - offset * 64)
+        )
     video_tile_start = video_start // 64
-    tile_valid_sizes[video_tile_start : video_tile_start + video_tiles] = video_valid_sizes
+    tile_valid_sizes[video_tile_start : video_tile_start + video_tiles] = (
+        video_valid_sizes
+    )
     return Packing(
         num_tokens=num_tokens,
         padded_tokens=padded_tokens,
@@ -244,8 +300,7 @@ def build_packing(
 def patchify_video(
     latents: torch.Tensor, patch_size: tuple[int, int, int] = (1, 2, 2)
 ) -> torch.Tensor:
-    """Flatten `[B, C, T, H, W]` latents into raster-ordered spatiotemporal patch rows."""
-
+    """Flatten `[B, C, T, H, W]` latents into raster-ordered spatiotemporal patch rows."""  # noqa: E501
     patch_t, patch_h, patch_w = patch_size
     batch, channels, frames, height, width = latents.shape
     # Split each axis into (cell, patch) pairs, then walk cells in raster order.
@@ -275,8 +330,7 @@ def unpatchify_video(
     channels: int = 24,
     patch_size: tuple[int, int, int] = (1, 2, 2),
 ) -> torch.Tensor:
-    """Restore raster patch rows to contiguous `[B, C, T, H, W]` video latents."""
-
+    """Restore raster patch rows to contiguous `[B, C, T, H, W]` video latents."""  # noqa: E501
     patch_t, patch_h, patch_w = patch_size
     value = rows.reshape(
         -1,
@@ -306,7 +360,6 @@ def unpatchify_video_into(
     patch_size: tuple[int, int, int] = (1, 2, 2),
 ) -> None:
     """Write raster patch rows into one caller-owned decoder input tensor."""
-
     patch_t, patch_h, patch_w = patch_size
     expected = (1, channels, frames, height, width)
     if tuple(output.shape) != expected:

@@ -52,8 +52,10 @@ if triton is not None:
         page_size: tl.constexpr,
         block: tl.constexpr,
     ):
-        """Gather block-table cells and per-row decode scalars by request slot."""
+        """Gather block-table cells and per-row decode scalars.
 
+        Rows are selected by request slot.
+        """
         # Request counts and table extents change during serving. Keep them as
         # runtime values so an arrival does not load another kernel variant.
         # The scalar CTA reads the same request state as table-copy CTAs. Its
@@ -62,11 +64,21 @@ if triton is not None:
             offsets = tl.arange(0, row_block)
             scalar_mask = offsets < max_rows
             live_rows = scalar_mask & (offsets < rows)
-            slots = tl.load(request_pool_indices + offsets, mask=live_rows, other=0)
-            cache = tl.load(request_cache_lengths + slots, mask=live_rows, other=0)
-            tokens = tl.load(request_tokens + slots * request_token_stride, mask=live_rows, other=1)
+            slots = tl.load(
+                request_pool_indices + offsets, mask=live_rows, other=0
+            )
+            cache = tl.load(
+                request_cache_lengths + slots, mask=live_rows, other=0
+            )
+            tokens = tl.load(
+                request_tokens + slots * request_token_stride,
+                mask=live_rows,
+                other=1,
+            )
             token_positions = tl.load(
-                request_positions + slots * request_position_stride, mask=live_rows, other=0
+                request_positions + slots * request_position_stride,
+                mask=live_rows,
+                other=0,
             )
 
             # Cache length identifies the append page and its token offset.
@@ -81,9 +93,13 @@ if triton is not None:
                 other=-1,
             )
             writes = tl.where(
-                write_pages >= 0, write_pages.to(tl.int64) * page_size + cache % page_size, -1
+                write_pages >= 0,
+                write_pages.to(tl.int64) * page_size + cache % page_size,
+                -1,
             )
-            tl.store(request_pool_indices + offsets, 0, mask=scalar_mask & ~live_rows)
+            tl.store(
+                request_pool_indices + offsets, 0, mask=scalar_mask & ~live_rows
+            )
             tl.store(input_ids + offsets, tokens, mask=scalar_mask)
             for axis in tl.static_range(position_axes):
                 tl.store(
@@ -97,12 +113,15 @@ if triton is not None:
             tl.store(query_offsets, 0)
             tl.store(prefix_offsets, 0)
             tl.store(query_offsets + offsets + 1, offsets + 1, mask=scalar_mask)
-            tl.store(prefix_offsets + offsets + 1, tl.cumsum(cache), mask=scalar_mask)
+            tl.store(
+                prefix_offsets + offsets + 1, tl.cumsum(cache), mask=scalar_mask
+            )
         else:
             table_offsets = (tl.program_id(0) - 1) * block + tl.arange(0, block)
 
-            # Map active output rows through the request pool into the selected KV
-            # group. Stores span the full graph capacity, zeroing inactive rows.
+            # Map active output rows through the request pool into the
+            # selected KV group. Stores span the full graph capacity,
+            # zeroing inactive rows.
             table_elements = max_rows * table_width
             table_mask = table_offsets < table_elements
             table_rows = table_offsets // table_width
@@ -155,7 +174,6 @@ def gather_request_decode_inputs(
     Output rows beyond ``rows`` are initialized for safe fixed-shape graph
     replay. Every tensor must reside on the same CUDA device.
     """
-
     # A single-device requirement lets the fused kernel dereference every input
     # directly and prevents partially staged graph inputs.
     tensors = (
@@ -174,8 +192,12 @@ def gather_request_decode_inputs(
         write_indices,
     )
     device = request_pool_indices.device
-    if device.type != "cuda" or any(value.device != device for value in tensors):
-        raise ValueError("request-indexed decode staging requires one CUDA device")
+    if device.type != "cuda" or any(
+        value.device != device for value in tensors
+    ):
+        raise ValueError(
+            "request-indexed decode staging requires one CUDA device"
+        )
     if triton is None or not triton_available(device):
         raise RuntimeError("request-indexed decode staging requires Triton")
 
@@ -184,9 +206,13 @@ def gather_request_decode_inputs(
     row_count = int(rows)
     max_rows = int(request_pool_indices.numel())
     if row_count < 1 or row_count > max_rows:
-        raise ValueError("request-indexed decode row count exceeds staging capacity")
+        raise ValueError(
+            "request-indexed decode row count exceeds staging capacity"
+        )
     if request_page_tables.ndim != 3 or block_tables.ndim != 2:
-        raise ValueError("request-indexed decode page tables must be rank three and two")
+        raise ValueError(
+            "request-indexed decode page tables must be rank three and two"
+        )
 
     # The graph's dense table may expose a narrower page horizon than the
     # request pool, but it must hold every output row and the chosen KV group.
@@ -198,9 +224,17 @@ def gather_request_decode_inputs(
         or int(group_id) >= int(request_page_tables.shape[0])
         or int(page_size) < 1
     ):
-        raise ValueError("request-indexed decode table capacity or group is invalid")
-    if positions.ndim != 2 or positions.shape[0] not in (1, 3) or positions.stride(1) != 1:
-        raise ValueError("decode positions require one or three contiguous token axes")
+        raise ValueError(
+            "request-indexed decode table capacity or group is invalid"
+        )
+    if (
+        positions.ndim != 2
+        or positions.shape[0] not in (1, 3)
+        or positions.stride(1) != 1
+    ):
+        raise ValueError(
+            "decode positions require one or three contiguous token axes"
+        )
     scalar_outputs = (
         input_ids,
         positions[0],
@@ -215,7 +249,9 @@ def gather_request_decode_inputs(
 
     # One CTA produces all scalar columns; the remaining CTAs copy table cells.
     block = 256
-    _gather_request_decode_inputs_kernel[(1 + triton.cdiv(int(block_tables.numel()), block),)](
+    _gather_request_decode_inputs_kernel[
+        (1 + triton.cdiv(int(block_tables.numel()), block),)
+    ](
         *tensors,
         rows=row_count,
         page_table_group_stride=int(request_page_tables.stride(0)),

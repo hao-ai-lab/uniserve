@@ -38,38 +38,66 @@ class State:
         if type(self.block_size) is not int or self.block_size < 1:
             raise ValueError("state block size must be positive")
         if not self.tensors or set(self.tensors) != set(self.initialized):
-            raise ValueError("each state field requires its own initialization flags")
+            raise ValueError(
+                "each state field requires its own initialization flags"
+            )
         if any(tensor.ndim == 0 for tensor in self.tensors.values()):
             raise ValueError("state tensors must retain a block dimension")
 
         count = next(iter(self.tensors.values())).shape[0]
         for name, tensor in self.tensors.items():
-            if not name or "." in name or tensor.ndim == 0 or tensor.shape[0] != count:
-                raise ValueError("state fields must name tensors with the same block count")
+            if (
+                not name
+                or "." in name
+                or tensor.ndim == 0
+                or tensor.shape[0] != count
+            ):
+                raise ValueError(
+                    "state fields must name tensors with the same block count"
+                )
             flag = self.initialized[name]
             if flag.shape != (count,) or flag.dtype != torch.bool:
-                raise ValueError("initialization flags must be one boolean per block")
+                raise ValueError(
+                    "initialization flags must be one boolean per block"
+                )
             buffers = (
-                tensor.buffers().values() if isinstance(tensor, QuantizedTensor) else (tensor,)
+                tensor.buffers().values()
+                if isinstance(tensor, QuantizedTensor)
+                else (tensor,)
             )
-            if any(value.ndim == 0 or value.shape[0] != count for value in buffers):
-                raise ValueError("each state backing must retain the leading block dimension")
+            if any(
+                value.ndim == 0 or value.shape[0] != count for value in buffers
+            ):
+                raise ValueError(
+                    "each state backing must retain the leading block dimension"
+                )
 
-        object.__setattr__(self, "tensors", MappingProxyType(dict(self.tensors)))
-        object.__setattr__(self, "initialized", MappingProxyType(dict(self.initialized)))
+        object.__setattr__(
+            self, "tensors", MappingProxyType(dict(self.tensors))
+        )
+        object.__setattr__(
+            self, "initialized", MappingProxyType(dict(self.initialized))
+        )
 
     def _storage(self) -> Mapping[str, torch.Tensor]:
         """Flatten each field into its physical buffers plus its flag vector."""
-
         result = {}
         for name, tensor in self.tensors.items():
-            fields = tensor.buffers() if isinstance(tensor, QuantizedTensor) else {"values": tensor}
-            result.update((f"{name}.{field}", value) for field, value in fields.items())
+            fields = (
+                tensor.buffers()
+                if isinstance(tensor, QuantizedTensor)
+                else {"values": tensor}
+            )
+            result.update(
+                (f"{name}.{field}", value) for field, value in fields.items()
+            )
             result[f"{name}.initialized"] = self.initialized[name]
         return result
 
     def copy_blocks(
-        self, source: tuple[int, ...] | torch.Tensor, target: tuple[int, ...] | torch.Tensor
+        self,
+        source: tuple[int, ...] | torch.Tensor,
+        target: tuple[int, ...] | torch.Tensor,
     ) -> None:
         """Copy complete blocks using all source values from before this call.
 
@@ -78,7 +106,6 @@ class State:
         lie within the backing and valid targets must be distinct. Device
         vectors stay on their backing device, including during graph replay.
         """
-
         count = next(iter(self.tensors.values())).shape[0]
         storage = tuple(
             # One-byte floating storage includes formats without index_copy
@@ -89,7 +116,9 @@ class State:
             for tensor in self._storage().values()
         )
 
-        vector = isinstance(source, torch.Tensor) or isinstance(target, torch.Tensor)
+        vector = isinstance(source, torch.Tensor) or isinstance(
+            target, torch.Tensor
+        )
         if vector:
             if (
                 not isinstance(source, torch.Tensor)
@@ -102,27 +131,41 @@ class State:
                 or any(tensor.device != source.device for tensor in storage)
             ):
                 raise ValueError(
-                    "block copy vectors must be matching int64 indices on the backing device"
+                    "block copy vectors must be matching int64 indices on "
+                    "the backing device"
                 )
             if not source.numel():
                 return
 
             valid = ((source == -1) & (target == -1)) | (
-                (source >= 0) & (source < count) & (target >= 0) & (target < count)
+                (source >= 0)
+                & (source < count)
+                & (target >= 0)
+                & (target < count)
             )
             ordered = target.sort().values
             unique = ((ordered[1:] < 0) | (ordered[1:] != ordered[:-1])).all()
             if source.is_cuda:
-                torch._assert_async(valid.all(), "state block indices must lie within the backing")
+                torch._assert_async(
+                    valid.all(),
+                    "state block indices must lie within the backing",
+                )
                 torch._assert_async(unique, "block copy targets must be unique")
             elif not bool(valid.all()) or not bool(unique):
-                raise ValueError("block copies require valid addresses and unique targets")
-            selections = {source.device: (source.clamp(0, max(0, count - 1)), target)}
+                raise ValueError(
+                    "block copies require valid addresses and unique targets"
+                )
+            selections = {
+                source.device: (source.clamp(0, max(0, count - 1)), target)
+            }
         else:
             _blocks(source, count)
             _blocks(target, count)
             if len(source) != len(target) or len(set(target)) != len(target):
-                raise ValueError("block copies require equally sized sources and unique targets")
+                raise ValueError(
+                    "block copies require equally sized sources and unique "
+                    "targets"
+                )
             if not source:
                 return
             selections = {
@@ -138,7 +181,8 @@ class State:
         # Take every field's snapshot before writing any target, including
         # when distinct named fields borrow overlapping physical storage.
         snapshots = tuple(
-            tensor.index_select(0, selections[tensor.device][0]) for tensor in storage
+            tensor.index_select(0, selections[tensor.device][0])
+            for tensor in storage
         )
         for tensor, snapshot in zip(storage, snapshots, strict=True):
             indices = selections[tensor.device][1]
@@ -152,9 +196,13 @@ class State:
             else:
                 tensor.index_copy_(0, indices, snapshot)
 
-    def transfer_views(self, blocks: tuple[int, ...]) -> Mapping[str, tuple[torch.Tensor, ...]]:
-        """Borrow complete encoded fields and flags in the requested block order."""
+    def transfer_views(
+        self, blocks: tuple[int, ...]
+    ) -> Mapping[str, tuple[torch.Tensor, ...]]:
+        """Borrow complete encoded fields and flags.
 
+        In the requested block order.
+        """
         _blocks(blocks, next(iter(self.tensors.values())).shape[0])
         return MappingProxyType(
             {
@@ -166,7 +214,10 @@ class State:
 
 @dataclass(frozen=True)
 class StateConfig(ABC):
-    """A numerical state layout; allocation and prefix policy belong to callers."""
+    """A numerical state layout.
+
+    Allocation and prefix policy belong to callers.
+    """
 
     indexing: ClassVar[Literal["tokens", "states"]]
 
@@ -179,7 +230,10 @@ class StateConfig(ABC):
         dtype: torch.dtype | None,
         quantizer: Quantizer | None,
     ) -> Mapping[str, BufferConfig]:
-        """Declare all ordinary backing fields, including initialization bits."""
+        """Declare all ordinary backing fields.
+
+        Including initialization bits.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -191,7 +245,10 @@ class StateConfig(ABC):
         dtype: torch.dtype | None,
         quantizer: Quantizer | None,
     ) -> State:
-        """Validate and borrow supplied backing without allocation or conversion."""
+        """Validate and borrow supplied backing.
+
+        Without allocation or conversion.
+        """
         raise NotImplementedError
 
 
@@ -203,10 +260,14 @@ class Config:
 
     def __post_init__(self) -> None:
         if any(
-            not isinstance(name, str) or not name or any(not part for part in name.split("."))
+            not isinstance(name, str)
+            or not name
+            or any(not part for part in name.split("."))
             for name in self.layers
         ):
             raise ValueError("state names must be nonempty module paths")
-        if any(not isinstance(value, StateConfig) for value in self.layers.values()):
+        if any(
+            not isinstance(value, StateConfig) for value in self.layers.values()
+        ):
             raise TypeError("each layer must supply a StateConfig")
         object.__setattr__(self, "layers", MappingProxyType(dict(self.layers)))

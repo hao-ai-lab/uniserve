@@ -1,13 +1,22 @@
-"""Worker image staging preserves public numerical predictions and cache state."""
+"""Worker image staging preserves public numerical predictions.
+
+It also preserves cache state.
+"""
 
 from dataclasses import replace
 
 import pytest
 import torch
 
-from tests.python.integration.model_loading.test_bagel import _checkpoint as bagel_checkpoint
-from tests.python.integration.model_loading.test_bagel import _load as load_bagel
-from tests.python.integration.model_loading.test_sensenova_u1 import _checkpoint as u1_checkpoint
+from tests.python.integration.model_loading.test_bagel import (
+    _checkpoint as bagel_checkpoint,
+)
+from tests.python.integration.model_loading.test_bagel import (
+    _load as load_bagel,
+)
+from tests.python.integration.model_loading.test_sensenova_u1 import (
+    _checkpoint as u1_checkpoint,
+)
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import image
 from uniserve.model import TextSize
@@ -17,7 +26,12 @@ from uniserve_worker.bootstrap.capacity import input_buffer_config
 from uniserve_worker.bootstrap.config import ComponentConfig
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.attention import from_blocks
-from uniserve_worker.execution.flow import flow_rows, image_state, integrate, prefix_row
+from uniserve_worker.execution.flow import (
+    flow_rows,
+    image_state,
+    integrate,
+    prefix_row,
+)
 from uniserve_worker.execution.model_entry import ModelEntry
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.protocol.identity import ComputationId, RequestKey
@@ -60,7 +74,11 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
         model = loading.load_model(
             sensenova_u1.Model,
             model.config,
-            checkpoint=(checkpoint.Config("primary").resolve(tmp_path, io=loading.Config()),),
+            checkpoint=(
+                checkpoint.Config("primary").resolve(
+                    tmp_path, io=loading.Config()
+                ),
+            ),
             mapping=sensenova_u1.checkpoint_mappings,
             weights=weights.Config(dtype=torch.bfloat16),
             device="cuda:0",
@@ -75,8 +93,18 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             DeviceMesh(
                 ranks=(0,),
                 rank=0,
-                shape=tuple(size for _, size in ComponentConfig((0,)).parallel_config.dimensions),
-                axes=tuple(axis for axis, _ in ComponentConfig((0,)).parallel_config.dimensions),
+                shape=tuple(
+                    size
+                    for _, size in ComponentConfig(
+                        (0,)
+                    ).parallel_config.dimensions
+                ),
+                axes=tuple(
+                    axis
+                    for axis, _ in ComponentConfig(
+                        (0,)
+                    ).parallel_config.dimensions
+                ),
             ),
             torch.device("cuda:0"),
         )
@@ -100,7 +128,9 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
     size = image.Config(16, 16)
     factory = runner.image_builder
     shape = factory.denoiser.latent_shape("image", size)
-    cache = PrefixCache(model.text.cache_config, num_blocks=8, block_size=16, device="cuda:0")
+    cache = PrefixCache(
+        model.text.cache_config, num_blocks=8, block_size=16, device="cuda:0"
+    )
     manager = CacheManager(
         cache,
         info=cache_info(model.text, config, num_blocks=8),
@@ -121,7 +151,9 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             input_config=input_buffer_config(model, config),
             kv_cache=manager,
             latent_pool=latents,
-            decode_predicates=torch.tensor([False, True, True, True], device="cuda:0"),
+            decode_predicates=torch.tensor(
+                [False, True, True, True], device="cuda:0"
+            ),
             max_operations=3,
             request_slots=3,
             max_tokens=64,
@@ -132,7 +164,9 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
         )
         runner.capture(tokenizer=None, latents=latents)
         runner.complete_startup()
-        manager.block_tables.install(((1, 0, (1, 2), 32), (2, 0, (3, 4), 32), (3, 0, (5, 6), 32)))
+        manager.block_tables.install(
+            ((1, 0, (1, 2), 32), (2, 0, (3, 4), 32), (3, 0, (5, 6), 32))
+        )
         oracle.prepare(TextSize(64, 3))
         params = ImageParams(
             steps=3,
@@ -150,24 +184,33 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
         for index, prefix_length in enumerate((2, 5)):
             branches = trajectory.guidance.branches(trajectory.schedule, index)
             prefixes = tuple(
-                tuple((token + branch * 3) % 30 + 1 for token in range(prefix_length))
+                tuple(
+                    (token + branch * 3) % 30 + 1
+                    for token in range(prefix_length)
+                )
                 for branch in range(len(branches))
             )
             trajectory.entries = {
-                branch: (slot + 1, 0, prefix_length, 32) for slot, branch in enumerate(branches)
+                branch: (slot + 1, 0, prefix_length, 32)
+                for slot, branch in enumerate(branches)
             }
 
             def operations(mode):
                 return tuple(
                     ScheduledRequest(
-                        RequestKey(1, slot, 0), ComputationId(1, index), None, mode, Bounds()
+                        RequestKey(1, slot, 0),
+                        ComputationId(1, index),
+                        None,
+                        mode,
+                        Bounds(),
                     )
                     for slot in range(len(branches))
                 )
 
             result = runner.run_forward_group(
                 tuple(
-                    prefix_row(tokens, (slot + 1, 0, 0, 32)) for slot, tokens in enumerate(prefixes)
+                    prefix_row(tokens, (slot + 1, 0, 0, 32))
+                    for slot, tokens in enumerate(prefixes)
                 ),
                 operations=operations(ForwardMode.PREFILL),
                 cache=manager,
@@ -178,16 +221,22 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             saved = tuple(
                 (tensor, tensor.clone())
                 for layer in cache.config.layers
-                for fields in cache.state(layer).transfer_views(tuple(range(8))).values()
+                for fields in cache.state(layer)
+                .transfer_views(tuple(range(8)))
+                .values()
                 for tensor in fields
             )
             time = trajectory.schedule.timesteps[index].to("cuda:0")
             next_time = trajectory.schedule.timesteps[index + 1].to("cuda:0")
             positions = tuple(
-                factory.positions(size, prefix_length, device="cuda:0") for _ in branches
+                factory.positions(size, prefix_length, device="cuda:0")
+                for _ in branches
             )
             attention = from_blocks(
-                pages=tuple((slot * 2 + 1, slot * 2 + 2) for slot in range(len(branches))),
+                pages=tuple(
+                    (slot * 2 + 1, slot * 2 + 2)
+                    for slot in range(len(branches))
+                ),
                 query_lengths=(factory.sequence_length(size),) * len(branches),
                 prefix_lengths=(prefix_length,) * len(branches),
                 block_size=16,
@@ -210,7 +259,10 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 expected = tuple(
                     value.tensor.clone()
                     for value in model.denoiser(
-                        inputs, state={}, constants=oracle.constants, workspace=oracle.workspace
+                        inputs,
+                        state={},
+                        constants=oracle.constants,
+                        workspace=oracle.workspace,
                     )["image"]
                 )
             rows = flow_rows(
@@ -230,18 +282,32 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 states=None,
             ).materialize()
             for value, reference in zip(result.values, expected, strict=True):
-                torch.testing.assert_close(value, reference, rtol=2e-2, atol=2e-3)
+                torch.testing.assert_close(
+                    value, reference, rtol=2e-2, atol=2e-3
+                )
             retained.extend(zip(result.values, expected, strict=True))
             for value, reference in saved:
                 torch.testing.assert_close(value, reference, rtol=0, atol=0)
             velocity = trajectory.guidance.combine(
-                dict(zip(branches, expected, strict=True)), trajectory.schedule, index
+                dict(zip(branches, expected, strict=True)),
+                trajectory.schedule,
+                index,
             )
-            expected_sample = (sample + velocity * (next_time - time).to(sample.dtype)).to(
-                sample.dtype
+            expected_sample = (
+                sample + velocity * (next_time - time).to(sample.dtype)
+            ).to(sample.dtype)
+            integrate(
+                factory,
+                trajectory,
+                sample,
+                result.values,
+                index,
+                time,
+                next_time,
             )
-            integrate(factory, trajectory, sample, result.values, index, time, next_time)
-            torch.testing.assert_close(sample, expected_sample, rtol=2e-2, atol=2e-3)
+            torch.testing.assert_close(
+                sample, expected_sample, rtol=2e-2, atol=2e-3
+            )
         for value, reference in retained:
             torch.testing.assert_close(value, reference, rtol=2e-2, atol=2e-3)
     finally:
@@ -278,7 +344,11 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         shape=tuple(size for _, size in placement.parallel_config.dimensions),
         axes=tuple(axis for axis, _ in placement.parallel_config.dimensions),
     )
-    bindings = {"model": ModelEntry("model", placement, group, mesh, torch.device("cuda:0"))}
+    bindings = {
+        "model": ModelEntry(
+            "model", placement, group, mesh, torch.device("cuda:0")
+        )
+    }
     config = WorkerConfig(
         device="cuda:0",
         attention_backend="torch",
@@ -297,7 +367,9 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
     from uniserve_models.processing import ImageProcessor, PatchTransform
 
     processor = (
-        ImageProcessor(vit=PatchTransform(2, 0.5, 16, 256), staging_dtype=torch.bfloat16)
+        ImageProcessor(
+            vit=PatchTransform(2, 0.5, 16, 256), staging_dtype=torch.bfloat16
+        )
         if name == "sensenova_u1"
         else None
     )
@@ -317,7 +389,9 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         assert worker.requests.request_ids() == ()
         worker.kv_cache.block_tables.install(((1, 0, (4, 5), 32),))
         tokens = torch.tensor([3, 7, 2], device="cuda:0")
-        positions = torch.tensor([[0, 1, 2], [0, 1, 0], [0, 2, 0]], device="cuda:0")
+        positions = torch.tensor(
+            [[0, 1, 2], [0, 1, 0], [0, 2, 0]], device="cuda:0"
+        )
         features = (
             torch.arange(3 * model.text.backbone.hidden_size, device="cuda:0")
             .reshape(3, model.text.backbone.hidden_size)
@@ -335,13 +409,16 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         # Feature appends use noncausal visibility with either hidden states
         # or logits; all forms consume live spatial positions and features.
         for selection in (TokenSelection.HIDDEN, TokenSelection.LAST_LOGITS):
-            visual = replace(inputs, attention=VarlenInput(lengths, lengths, (False,)))
+            visual = replace(
+                inputs, attention=VarlenInput(lengths, lengths, (False,))
+            )
             with ExecutionContext(model.text, attention="torch") as context:
                 context.prepare(TextSize(3, 1))
                 expected = model.text(visual)
                 if selection is TokenSelection.LAST_LOGITS:
                     expected = model.text.compute_logits(
-                        expected, token_indices=torch.tensor([2], device="cuda:0")
+                        expected,
+                        token_indices=torch.tensor([2], device="cuda:0"),
                     ).gather()
             row = ForwardRow(
                 forward_mode=ForwardMode.PREFILL,
@@ -356,7 +433,11 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 selection=selection,
             )
             operation = ScheduledRequest(
-                RequestKey(1, 0, 0), ComputationId(1, 0), None, ForwardMode.PREFILL, Bounds()
+                RequestKey(1, 0, 0),
+                ComputationId(1, 0),
+                None,
+                ForwardMode.PREFILL,
+                Bounds(),
             )
             actual = worker.runner.run_forward_group(
                 (row,),
@@ -365,14 +446,17 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 tables=worker.kv_cache.block_tables,
                 states=None,
             ).materialize()
-            torch.testing.assert_close(actual.values[0], expected, rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(
+                actual.values[0], expected, rtol=2e-2, atol=2e-2
+            )
 
         # Replace the visual prefix with causal text before testing ordinary
         # continuation against a fully causal reference below.
         with ExecutionContext(model.text, attention="torch") as context:
             context.prepare(TextSize(3, 1))
             expected = model.text.compute_logits(
-                model.text(inputs), token_indices=torch.tensor([2], device="cuda:0")
+                model.text(inputs),
+                token_indices=torch.tensor([2], device="cuda:0"),
             ).gather()
         row = ForwardRow(
             forward_mode=ForwardMode.PREFILL,
@@ -386,7 +470,11 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             selection=TokenSelection.LAST_LOGITS,
         )
         operation = ScheduledRequest(
-            RequestKey(1, 0, 0), ComputationId(1, 0), None, ForwardMode.PREFILL, Bounds()
+            RequestKey(1, 0, 0),
+            ComputationId(1, 0),
+            None,
+            ForwardMode.PREFILL,
+            Bounds(),
         )
         actual = worker.runner.run_forward_group(
             (row,),
@@ -395,7 +483,9 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             tables=worker.kv_cache.block_tables,
             states=None,
         ).materialize()
-        torch.testing.assert_close(actual.values[0], expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(
+            actual.values[0], expected, rtol=2e-2, atol=2e-2
+        )
 
         # Decode after spatial feature positions must read the same prefix
         # while ordinary continuation tokens use zero height/width coordinates.
@@ -409,7 +499,9 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 positions = torch.cat((positions, next_position), dim=1)
                 features = torch.cat((features, torch.zeros_like(features[:1])))
                 mask = torch.cat((mask, torch.zeros_like(mask[:1])))
-                lengths = SequenceLengths.from_lengths((prefix + 1,), device="cuda:0")
+                lengths = SequenceLengths.from_lengths(
+                    (prefix + 1,), device="cuda:0"
+                )
                 inputs = TextInput(
                     tokens,
                     positions,
@@ -444,7 +536,9 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                     tables=worker.kv_cache.block_tables,
                     states=None,
                 ).materialize()
-                torch.testing.assert_close(actual.values[0], expected, rtol=2e-2, atol=2e-2)
+                torch.testing.assert_close(
+                    actual.values[0], expected, rtol=2e-2, atol=2e-2
+                )
 
         if processor is not None:
             import base64
@@ -475,13 +569,20 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 latent_downsample=worker.runner.image_builder.denoiser.downsample,
             )
             encoded = io.BytesIO()
-            Image.new("RGB", (16, 16), (64, 96, 128)).save(encoded, format="PNG")
+            Image.new("RGB", (16, 16), (64, 96, 128)).save(
+                encoded, format="PNG"
+            )
             payload = base64.b64encode(encoded.getvalue()).decode("ascii")
             pixels = prepare_image(
-                processor, PipelineStage.VISION_ENCODING, payload, device=torch.device("cuda:0")
+                processor,
+                PipelineStage.VISION_ENCODING,
+                payload,
+                device=torch.device("cuda:0"),
             )
             expected_features = model.vision_encoder.encode(
-                VisionInput((pixels.pixels,), (pixels.grid,), (pixels.grid_shape,))
+                VisionInput(
+                    (pixels.pixels,), (pixels.grid,), (pixels.grid_shape,)
+                )
             )[0]
             admission = ar_params(0)
             encode = encode_operation(
@@ -495,13 +596,17 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 encode,
                 encoder_output=replace(
                     encode.encoder_output,
-                    shape_bound=ShapeBound((DeviceDim(expected_features.numel()),)),
+                    shape_bound=ShapeBound(
+                        (DeviceDim(expected_features.numel()),)
+                    ),
                 ),
             )
             result = finalized_report(
                 worker,
                 worker.submit(
-                    execution_run(run_id=1, admissions=(admission,), operations=(encode,))
+                    execution_run(
+                        run_id=1, admissions=(admission,), operations=(encode,)
+                    )
                 ),
             )
             assert result.completions[0].status is OpStatus.OK
@@ -509,6 +614,8 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 encode.encoder_output, consumer_op_id=ComputationId(2, 0)
             )
             try:
-                torch.testing.assert_close(read.tensor, expected_features, rtol=2e-2, atol=2e-2)
+                torch.testing.assert_close(
+                    read.tensor, expected_features, rtol=2e-2, atol=2e-2
+                )
             finally:
                 worker.tensor_store.complete_reads((read,))

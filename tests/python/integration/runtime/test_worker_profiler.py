@@ -1,4 +1,7 @@
-"""Standard profiler artifacts exposed by the worker diagnostic configuration."""
+"""Standard profiler artifacts.
+
+They are exposed by the worker diagnostic configuration.
+"""
 
 import gzip
 import json
@@ -29,5 +32,9 @@ def test_worker_profiler_exports_only_the_selected_execution_window(tmp_path):
     assert len(traces) == 1
     with gzip.open(traces[0], "rt") as source:
         events = json.load(source)["traceEvents"]
-    captured = {event["name"] for event in events if event["name"].startswith("worker-step-")}
+    captured = {
+        event["name"]
+        for event in events
+        if event["name"].startswith("worker-step-")
+    }
     assert captured == {"worker-step-2", "worker-step-3"}

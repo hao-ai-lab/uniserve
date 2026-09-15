@@ -27,7 +27,7 @@ from .config import Config
 
 
 def _activation(name: str) -> str:
-    """Map checkpoint activation aliases onto the library's implemented kernels."""
+    """Map checkpoint activation aliases onto the library's implemented kernels."""  # noqa: E501
     if name in {"silu", "swish", "silu_and_mul", "swiglu"}:
         return "silu"
     if name in {"gelu", "gelu_and_mul", "geglu"}:
@@ -64,11 +64,18 @@ class Attention(nn.Module):
         )
         self.rotary = RotaryEmbedding(config.head_dim, theta=config.rope_theta)
 
-    def forward(self, hidden: torch.Tensor, positions: torch.Tensor, attention: AttentionInput):
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        attention: AttentionInput,
+    ):
         # This unscaled recipe depends only on positions, so computing factors
         # does not require a host mirror of the attention lengths.
         cos, sin = self.rotary(
-            positions.reshape(-1), dtype=torch.float32, sequence_length=positions.numel()
+            positions.reshape(-1),
+            dtype=torch.float32,
+            sequence_length=positions.numel(),
         )
 
         # hidden: [tokens, hidden_size]; q/k/v: [tokens, heads, head_dim]
@@ -103,7 +110,9 @@ class TransformerLayer(nn.Module):
         super().__init__()
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.attention = Attention(config, layer)
-        self.post_attention_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_norm = RMSNorm(
+            config.hidden_size, config.rms_norm_eps
+        )
         self.mlp = (
             MoE(config)
             if config.num_experts
@@ -127,13 +136,16 @@ class TransformerLayer(nn.Module):
 
         hidden = self.attention(hidden, positions, attention)
         hidden, residual = add_rms_norm(
-            hidden, residual, self.post_attention_norm.weight, self.post_attention_norm.eps
+            hidden,
+            residual,
+            self.post_attention_norm.weight,
+            self.post_attention_norm.eps,
         )
         return self.mlp(hidden), residual
 
 
 class Transformer(TransformerDecoder):
-    """Qwen3 decoder stack: embedding, pre-norm layers, and the final RMS norm."""
+    """Qwen3 decoder stack: embedding, pre-norm layers, and the final RMS norm."""  # noqa: E501
 
     def __init__(self, config: Config):
         super().__init__(

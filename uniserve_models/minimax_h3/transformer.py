@@ -35,23 +35,29 @@ class TransformerLayer(nn.Module):
         self.mlp = GatedMLP(config.hidden_size, config.intermediate_size)
 
     @torch.inference_mode()
-    def forward_chunks(self, hidden, modulation, inputs: AttentionInput, *, workspace):
-        """Connect token-local residual updates to the following layer's projection."""
-
+    def forward_chunks(
+        self, hidden, modulation, inputs: AttentionInput, *, workspace
+    ):
+        """Connect token-local residual updates to the following layer's projection."""  # noqa: E501
         if isinstance(hidden, torch.Tensor):
             source = ((inputs.token_slice, hidden),)
         else:
             source = iter(hidden)
             first = next(source)
             hidden = first[1].new_empty(
-                (inputs.token_slice.stop - inputs.token_slice.start, self.hidden_size)
+                (
+                    inputs.token_slice.stop - inputs.token_slice.start,
+                    self.hidden_size,
+                )
             )
             source = chain((first,), source)
         indices = workspace["modulation_indices"]
         # Six per-token affine vectors: shift/scale/gate for attention and MLP.
         shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = (
             value.to(hidden.dtype)
-            for value in modulation.reshape(-1, 6 * self.hidden_size).chunk(6, dim=-1)
+            for value in modulation.reshape(-1, 6 * self.hidden_size).chunk(
+                6, dim=-1
+            )
         )
 
         def normalize():
@@ -76,18 +82,24 @@ class TransformerLayer(nn.Module):
                 )
 
         attended = self.attention.forward_chunks(
-            normalize(), workspace["cos"], workspace["sin"], inputs, workspace=workspace
+            normalize(),
+            workspace["cos"],
+            workspace["sin"],
+            inputs,
+            workspace=workspace,
         )
 
         def finish(interval, update):
             local = slice(
-                interval.start - inputs.token_slice.start, interval.stop - inputs.token_slice.start
+                interval.start - inputs.token_slice.start,
+                interval.stop - inputs.token_slice.start,
             )
             selected = indices[local]
             quantizer = self.mlp.gate_up.projections["gate"].input_quantizer
             if (
                 quantizer == Quantizer("fp8", axis=0)
-                and self.mlp.gate_up.projections["up"].input_quantizer == quantizer
+                and self.mlp.gate_up.projections["up"].input_quantizer
+                == quantizer
             ):
                 residual, values, scales = ops.gated_residual_rms_norm_fp8(
                     hidden[local],
@@ -115,7 +127,9 @@ class TransformerLayer(nn.Module):
                     selected,
                     eps=self.norm[1].eps,
                 )
-            return ops.gated_residual(residual, self.mlp(normalized), gate_mlp, selected)
+            return ops.gated_residual(
+                residual, self.mlp(normalized), gate_mlp, selected
+            )
 
         # Tensor-wide activation statistics require the complete source domain.
         # Row/block quantizers retain interval consumption and transfer overlap.
@@ -126,7 +140,10 @@ class TransformerLayer(nn.Module):
         )
         if any(
             value is not None
-            and (value.format == "nvfp4" or (value.format == "fp8" and value.axis is None))
+            and (
+                value.format == "nvfp4"
+                or (value.format == "fp8" and value.axis is None)
+            )
             for value in quantizers
         ):
             outputs = tuple(value for _, value in attended)
@@ -139,7 +156,9 @@ class TransformerLayer(nn.Module):
     def forward(self, hidden, modulation, inputs: AttentionInput, *, workspace):
         outputs = tuple(
             value
-            for _, value in self.forward_chunks(hidden, modulation, inputs, workspace=workspace)
+            for _, value in self.forward_chunks(
+                hidden, modulation, inputs, workspace=workspace
+            )
         )
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
@@ -159,16 +178,26 @@ class Transformer(nn.Module):
         self.video_input = Linear(
             config.video_channels * 4, config.hidden_size, dtype=torch.float32
         )
-        self.audio_input = Linear(config.audio_channels, config.hidden_size, dtype=torch.float32)
+        self.audio_input = Linear(
+            config.audio_channels, config.hidden_size, dtype=torch.float32
+        )
         self.layers = nn.ModuleDict(
-            {str(index): TransformerLayer(config) for index in range(config.num_hidden_layers)}
+            {
+                str(index): TransformerLayer(config)
+                for index in range(config.num_hidden_layers)
+            }
         )
         # Precomputed affine products of the fixed four-evaluation ladder:
-        # [step, layer, modality, packed shift/scale/gate] per transformer layer,
-        # and [step, modality, shift + scale] for the final output norm.
+        # [step, layer, modality, packed shift/scale/gate] per transformer
+        # layer, and [step, modality, shift + scale] for the final output
+        # norm.
         self.modulation = Modulation(
             torch.empty(
-                4, config.num_hidden_layers, 2, 18 * config.hidden_size, dtype=torch.bfloat16
+                4,
+                config.num_hidden_layers,
+                2,
+                18 * config.hidden_size,
+                dtype=torch.bfloat16,
             ),
             torch.empty(4, 2, 2 * config.hidden_size, dtype=torch.bfloat16),
         )
@@ -176,7 +205,9 @@ class Transformer(nn.Module):
         self.video_output = Linear(
             config.hidden_size, config.video_channels * 4, dtype=torch.float32
         )
-        self.audio_output = Linear(config.hidden_size, config.audio_channels, dtype=torch.float32)
+        self.audio_output = Linear(
+            config.hidden_size, config.audio_channels, dtype=torch.float32
+        )
 
     @torch.inference_mode()
     def forward(
@@ -212,7 +243,10 @@ class Transformer(nn.Module):
                 },
             }
             chunks = layer.forward_chunks(
-                chunks, self.modulation(step_index, index), inputs, workspace=layer_buffers
+                chunks,
+                self.modulation(step_index, index),
+                inputs,
+                workspace=layer_buffers,
             )
 
         outputs = tuple(value for _, value in chunks)
@@ -232,5 +266,7 @@ class Transformer(nn.Module):
         ):
             selected = hidden.index_select(0, indices)
             selected = self.output_norm(selected, modulation[index : index + 1])
-            results.append(projection(selected.float(), output_dtype=torch.float32))
+            results.append(
+                projection(selected.float(), output_dtype=torch.float32)
+            )
         return tuple(results)

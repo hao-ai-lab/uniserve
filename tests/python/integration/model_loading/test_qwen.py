@@ -1,4 +1,7 @@
-"""Public Qwen loading and cached decoding agree with the checkpoint equations."""
+"""Public Qwen loading agrees with the checkpoint equations.
+
+Cached decoding agrees with the checkpoint equations as well.
+"""
 
 import pytest
 import torch
@@ -45,14 +48,18 @@ def test_checkpoint_prefill_decode_and_selected_logits(tmp_path, tied, theta):
     io = loading.Config()
     config = models.read_config(tmp_path, io=io)
     assert inspect_model(str(tmp_path))["description"] == "qwen3"
-    result = models.load_model(config, device="cpu", weights=weights.Config(dtype=torch.float32))
+    result = models.load_model(
+        config, device="cpu", weights=weights.Config(dtype=torch.float32)
+    )
     model = result.model
     if tied:
         assert model.backbone.embedding.weight is model.lm_head.weight
     tokens = torch.tensor([[1, 3, 9, 2]])
     with torch.no_grad():
         expected = reference(tokens).logits
-    with PrefixCache(model.cache_config, num_blocks=2, block_size=4, device="cpu") as cache:
+    with PrefixCache(
+        model.cache_config, num_blocks=2, block_size=4, device="cpu"
+    ) as cache:
         with ExecutionContext(model, cache=cache, attention="torch") as context:
             context.prepare(TextSize(4, 1))
             for start, stop in ((0, 3), (3, 4)):
@@ -65,10 +72,19 @@ def test_checkpoint_prefill_decode_and_selected_logits(tmp_path, tied, theta):
                     device="cpu",
                 )
                 context.bind_attention(batch)
-                hidden = model(TextInput(tokens[0, start:stop], torch.arange(start, stop), batch))
-                logits = model.compute_logits(hidden, token_indices=torch.arange(stop - start))
+                hidden = model(
+                    TextInput(
+                        tokens[0, start:stop], torch.arange(start, stop), batch
+                    )
+                )
+                logits = model.compute_logits(
+                    hidden, token_indices=torch.arange(stop - start)
+                )
                 torch.testing.assert_close(
-                    logits.gather(), expected[0, start:stop], rtol=1e-5, atol=1e-6
+                    logits.gather(),
+                    expected[0, start:stop],
+                    rtol=1e-5,
+                    atol=1e-6,
                 )
                 assert model.compute_logits(
                     hidden, token_indices=torch.empty(0, dtype=torch.int64)
@@ -81,7 +97,10 @@ def test_embedding_replacement_matches_numerical_embedding_input(tmp_path):
     model = loading.load_model(
         qwen3.Model,
         qwen3.read_config(tmp_path, io),
-        checkpoint=tuple(source.resolve(tmp_path, io=io) for source in qwen3.checkpoint_sources),
+        checkpoint=tuple(
+            source.resolve(tmp_path, io=io)
+            for source in qwen3.checkpoint_sources
+        ),
         mapping=qwen3.checkpoint_mappings,
         device="cpu",
         weights=weights.Config(dtype=torch.float32),
@@ -99,7 +118,9 @@ def test_embedding_replacement_matches_numerical_embedding_input(tmp_path):
         causal=True,
         device="cpu",
     )
-    with PrefixCache(model.cache_config, num_blocks=1, block_size=4, device="cpu") as cache:
+    with PrefixCache(
+        model.cache_config, num_blocks=1, block_size=4, device="cpu"
+    ) as cache:
         with ExecutionContext(model, cache=cache, attention="torch") as context:
             context.prepare(TextSize(3, 1))
             context.bind_attention(batch)
@@ -107,11 +128,15 @@ def test_embedding_replacement_matches_numerical_embedding_input(tmp_path):
                 tokens,
                 torch.arange(3),
                 batch,
-                EmbeddingReplacement(embeddings, torch.tensor([False, True, False])),
+                EmbeddingReplacement(
+                    embeddings, torch.tensor([False, True, False])
+                ),
             )
             hidden = model(inputs)
             torch.testing.assert_close(
-                model.compute_logits(hidden, token_indices=torch.arange(3)).gather(),
+                model.compute_logits(
+                    hidden, token_indices=torch.arange(3)
+                ).gather(),
                 expected,
                 rtol=1e-5,
                 atol=1e-6,
@@ -124,10 +149,15 @@ def _partitioned(rank, rendezvous, root, shape, axes):
     from uniserve.runtime import initialize_process_groups
 
     with initialize_process_groups(
-        rank=rank, local_rank=rank, world_size=4, device="cpu", init_method=rendezvous
+        rank=rank,
+        local_rank=rank,
+        world_size=4,
+        device="cpu",
+        init_method=rendezvous,
     ) as owner:
         mesh = owner.bind(
-            DeviceMesh(ranks=(3, 1, 0, 2), shape=shape, axes=axes, rank=rank), device="cpu"
+            DeviceMesh(ranks=(3, 1, 0, 2), shape=shape, axes=axes, rank=rank),
+            device="cpu",
         )
         io = loading.Config()
         parallel = (
@@ -138,7 +168,10 @@ def _partitioned(rank, rendezvous, root, shape, axes):
         model = loading.load_model(
             qwen3.Model,
             qwen3.read_config(root, io),
-            checkpoint=tuple(source.resolve(root, io=io) for source in qwen3.checkpoint_sources),
+            checkpoint=tuple(
+                source.resolve(root, io=io)
+                for source in qwen3.checkpoint_sources
+            ),
             mapping=qwen3.checkpoint_mappings,
             device="cpu",
             weights=weights.Config(dtype=torch.float32),
@@ -151,8 +184,12 @@ def _partitioned(rank, rendezvous, root, shape, axes):
 
         call = TextCall(model)
         expected = torch.load(root / "expected.pt", weights_only=True)
-        with PrefixCache(model.cache_config, num_blocks=1, block_size=4, device="cpu") as cache:
-            with ExecutionContext(model, cache=cache, attention="torch") as context:
+        with PrefixCache(
+            model.cache_config, num_blocks=1, block_size=4, device="cpu"
+        ) as cache:
+            with ExecutionContext(
+                model, cache=cache, attention="torch"
+            ) as context:
                 context.prepare(TextSize(4, 4))
                 for start, stop in ((0, 3), (3, 4)):
                     batch = PagedInput.from_blocks(
@@ -166,27 +203,39 @@ def _partitioned(rank, rendezvous, root, shape, axes):
                     context.bind_attention(batch)
                     hidden = model(
                         TextInput(
-                            torch.tensor([1, 3, 9, 2])[start:stop], torch.arange(start, stop), batch
+                            torch.tensor([1, 3, 9, 2])[start:stop],
+                            torch.arange(start, stop),
+                            batch,
                         )
                     )
-                    logits = model.compute_logits(hidden, token_indices=torch.arange(stop - start))
+                    logits = model.compute_logits(
+                        hidden, token_indices=torch.arange(stop - start)
+                    )
                     if (
                         "pp" not in axes
-                        or mesh.get_group("pp").rank == mesh.get_group("pp").size - 1
+                        or mesh.get_group("pp").rank
+                        == mesh.get_group("pp").size - 1
                     ):
                         torch.testing.assert_close(
-                            logits.gather(), expected[0, start:stop], rtol=1e-5, atol=1e-6
+                            logits.gather(),
+                            expected[0, start:stop],
+                            rtol=1e-5,
+                            atol=1e-6,
                         )
                     else:
                         assert logits is None
 
-                lengths = SequenceLengths.from_lengths((2, 0, 1, 1), device="cpu")
+                lengths = SequenceLengths.from_lengths(
+                    (2, 0, 1, 1), device="cpu"
+                )
                 attention = VarlenInput(lengths, lengths, (True,) * 4)
                 context.bind_attention(attention)
                 selected = (
                     call(
                         TextInput(
-                            torch.tensor([1, 3, 9, 2]), torch.tensor([0, 1, 0, 0]), attention
+                            torch.tensor([1, 3, 9, 2]),
+                            torch.tensor([0, 1, 0, 0]),
+                            attention,
                         ),
                         (
                             TokenSelection.HIDDEN,
@@ -200,11 +249,17 @@ def _partitioned(rank, rendezvous, root, shape, axes):
                 )
                 reference = torch.load(root / "selected.pt", weights_only=True)
                 for actual, wanted in zip(selected, reference, strict=True):
-                    torch.testing.assert_close(actual, wanted, rtol=1e-5, atol=1e-6)
+                    torch.testing.assert_close(
+                        actual, wanted, rtol=1e-5, atol=1e-6
+                    )
 
 
-@pytest.mark.parametrize("shape,axes", [((4,), ("tp",)), ((2, 2), ("pp", "sp"))])
-def test_partitioned_checkpoint_decoder_matches_complete_model(tmp_path, shape, axes):
+@pytest.mark.parametrize(
+    "shape,axes", [((4,), ("tp",)), ((2, 2), ("pp", "sp"))]
+)
+def test_partitioned_checkpoint_decoder_matches_complete_model(
+    tmp_path, shape, axes
+):
     import torch.multiprocessing as mp
 
     reference = _checkpoint(tmp_path, tied=True)
@@ -212,9 +267,15 @@ def test_partitioned_checkpoint_decoder_matches_complete_model(tmp_path, shape, 
         expected = reference(torch.tensor([[1, 3, 9, 2]])).logits
     torch.save(expected, tmp_path / "expected.pt")
     with torch.no_grad():
-        hidden = reference(torch.tensor([[1, 3]]), output_hidden_states=True).hidden_states[-1][0]
-        logits = tuple(reference(torch.tensor([[token]])).logits[0] for token in (9, 2))
-    torch.save((hidden, torch.empty((0, 37)), *logits), tmp_path / "selected.pt")
+        hidden = reference(
+            torch.tensor([[1, 3]]), output_hidden_states=True
+        ).hidden_states[-1][0]
+        logits = tuple(
+            reference(torch.tensor([[token]])).logits[0] for token in (9, 2)
+        )
+    torch.save(
+        (hidden, torch.empty((0, 37)), *logits), tmp_path / "selected.pt"
+    )
 
     mp.spawn(
         _partitioned,
@@ -232,7 +293,10 @@ def test_decoder_without_prefix_storage(tmp_path):
     model = loading.load_model(
         qwen3.Model,
         qwen3.read_config(tmp_path, io),
-        checkpoint=tuple(source.resolve(tmp_path, io=io) for source in qwen3.checkpoint_sources),
+        checkpoint=tuple(
+            source.resolve(tmp_path, io=io)
+            for source in qwen3.checkpoint_sources
+        ),
         mapping=qwen3.checkpoint_mappings,
         device="cpu",
         weights=weights.Config(dtype=torch.float32),
@@ -243,16 +307,22 @@ def test_decoder_without_prefix_storage(tmp_path):
     inputs = TextInput(tokens, torch.arange(3), batch)
     with torch.no_grad():
         expected = reference(tokens[None]).logits[0]
-    direct = model.compute_logits(model(inputs), token_indices=torch.arange(3)).gather()
+    direct = model.compute_logits(
+        model(inputs), token_indices=torch.arange(3)
+    ).gather()
     torch.testing.assert_close(direct, expected, rtol=1e-5, atol=1e-6)
     with ExecutionContext(model, attention="torch") as context:
         context.prepare(TextSize(3, 1))
         context.bind_attention(batch)
-        bound = model.compute_logits(model(inputs), token_indices=torch.arange(3)).gather()
+        bound = model.compute_logits(
+            model(inputs), token_indices=torch.arange(3)
+        ).gather()
         torch.testing.assert_close(bound, expected, rtol=1e-5, atol=1e-6)
 
 
-def test_text_encoder_retains_checkpoint_layers_and_sequence_boundaries(tmp_path):
+def test_text_encoder_retains_checkpoint_layers_and_sequence_boundaries(
+    tmp_path,
+):
     from uniserve.model import TextEncoder
 
     reference = _checkpoint(tmp_path)
@@ -260,7 +330,10 @@ def test_text_encoder_retains_checkpoint_layers_and_sequence_boundaries(tmp_path
     model = loading.load_model(
         qwen3.Model,
         qwen3.read_config(tmp_path, io),
-        checkpoint=tuple(source.resolve(tmp_path, io=io) for source in qwen3.checkpoint_sources),
+        checkpoint=tuple(
+            source.resolve(tmp_path, io=io)
+            for source in qwen3.checkpoint_sources
+        ),
         mapping=qwen3.checkpoint_mappings,
         device="cpu",
         weights=weights.Config(dtype=torch.float32),
@@ -269,7 +342,11 @@ def test_text_encoder_retains_checkpoint_layers_and_sequence_boundaries(tmp_path
     # subsequent decoder layers or final normalization.
     model.backbone.norm = torch.nn.Identity()
     encoder = TextEncoder(model.backbone, retained_layers=(0,))
-    tokens = (torch.tensor([1, 2, 3]), torch.tensor([9]), torch.empty(0, dtype=torch.long))
+    tokens = (
+        torch.tensor([1, 2, 3]),
+        torch.tensor([9]),
+        torch.empty(0, dtype=torch.long),
+    )
     with torch.no_grad():
         expected = tuple(
             reference(row[None], output_hidden_states=True).hidden_states[1][0]
@@ -289,20 +366,39 @@ def _partitioned_encoder(rank, rendezvous, root):
     from uniserve.runtime import initialize_process_groups
 
     with initialize_process_groups(
-        rank=rank, local_rank=rank, world_size=4, device="cpu", init_method=rendezvous
+        rank=rank,
+        local_rank=rank,
+        world_size=4,
+        device="cpu",
+        init_method=rendezvous,
     ) as owner:
         mesh = owner.bind(
-            DeviceMesh(ranks=(3, 1, 0, 2), shape=(2, 2), axes=("pp", "tokens"), rank=rank),
+            DeviceMesh(
+                ranks=(3, 1, 0, 2),
+                shape=(2, 2),
+                axes=("pp", "tokens"),
+                rank=rank,
+            ),
             device="cpu",
         )
         model = models.load_model(
-            models.read_config(root), device="cpu", weights=weights.Config(dtype=torch.float32)
+            models.read_config(root),
+            device="cpu",
+            weights=weights.Config(dtype=torch.float32),
         ).model
         encoder = TextEncoder(model.backbone, retained_layers=(0, 1))
-        parallelize_(encoder, mesh, attention=AttentionParallelConfig(heads=Ulysses("tokens")))
+        parallelize_(
+            encoder,
+            mesh,
+            attention=AttentionParallelConfig(heads=Ulysses("tokens")),
+        )
         expected = torch.load(root / "encoder-features.pt", weights_only=True)
         sequences = (
-            (torch.tensor([1, 2, 3]), torch.empty(0, dtype=torch.long), torch.tensor([9])),
+            (
+                torch.tensor([1, 2, 3]),
+                torch.empty(0, dtype=torch.long),
+                torch.tensor([9]),
+            ),
             (torch.tensor([3]),),
         )
         last = mesh.get_group("pp").rank == 1
@@ -312,18 +408,26 @@ def _partitioned_encoder(rank, rendezvous, root):
                 actual = encoder.encode(tokens)
                 if last:
                     for value, target in zip(actual, wanted, strict=True):
-                        torch.testing.assert_close(value, target, rtol=1e-5, atol=1e-6)
+                        torch.testing.assert_close(
+                            value, target, rtol=1e-5, atol=1e-6
+                        )
                 else:
                     assert actual is None
             assert encoder.encode(()) == (() if last else None)
 
 
-def test_text_encoder_pipeline_restores_sequences_after_empty_token_shards(tmp_path):
+def test_text_encoder_pipeline_restores_sequences_after_empty_token_shards(
+    tmp_path,
+):
     import torch.multiprocessing as mp
 
     reference = _checkpoint(tmp_path)
     sequences = (
-        (torch.tensor([1, 2, 3]), torch.empty(0, dtype=torch.long), torch.tensor([9])),
+        (
+            torch.tensor([1, 2, 3]),
+            torch.empty(0, dtype=torch.long),
+            torch.tensor([9]),
+        ),
         (torch.tensor([3]),),
     )
     with torch.no_grad():
@@ -350,7 +454,9 @@ def test_public_partial_loading_exposes_selected_decoder_values(tmp_path):
 
     reference = _checkpoint(tmp_path)
     config = models.read_config(tmp_path, modules=frozenset({"backbone"}))
-    loaded = models.load_model(config, device="cpu", weights=weights.Config(dtype=torch.float32))
+    loaded = models.load_model(
+        config, device="cpu", weights=weights.Config(dtype=torch.float32)
+    )
     backbone = loaded.model.backbone
     tokens = torch.tensor([1, 3, 9])
     lengths = SequenceLengths.from_lengths((3,), device="cpu")
@@ -366,4 +472,6 @@ def test_public_partial_loading_exposes_selected_decoder_values(tmp_path):
     with pytest.raises(ValueError, match="exceeds"):
         models.load_model(config, device="cpu", modules=frozenset({""}))
     with pytest.raises(ValueError, match="mutually exclusive"):
-        models.load_model(config, device="cpu", precision="bf16", weights=weights.Config())
+        models.load_model(
+            config, device="cpu", precision="bf16", weights=weights.Config()
+        )

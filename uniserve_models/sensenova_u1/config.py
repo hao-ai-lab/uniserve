@@ -26,7 +26,6 @@ from . import flow, vision
 
 def _positive(value: object, name: str, *, integer: bool = False) -> None:
     """Require a finite positive number, optionally a strict integer."""
-
     if (
         not isinstance(value, (int, float))
         or isinstance(value, bool)
@@ -35,13 +34,14 @@ def _positive(value: object, name: str, *, integer: bool = False) -> None:
         or value <= 0
     ):
         raise ValueError(
-            f"SenseNova {name} must be a positive {'integer' if integer else 'finite number'}"
+            f"SenseNova {name} must be a positive "
+            f"{'integer' if integer else 'finite number'}"
         )
 
 
 @dataclass(frozen=True, slots=True)
 class TransformerConfig:
-    """Text/flow decoder dimensions, normalization, and multi-axis rotary math."""
+    """Text/flow decoder dimensions, normalization, and multi-axis rotary math."""  # noqa: E501
 
     vocab_size: int
     hidden_size: int
@@ -77,32 +77,54 @@ class TransformerConfig:
             "max_position_embeddings_hw",
         ):
             _positive(getattr(self, name), name, integer=True)
-        for name in ("rms_norm_eps", "rope_theta", "rope_theta_hw", "partial_rotary_factor"):
+        for name in (
+            "rms_norm_eps",
+            "rope_theta",
+            "rope_theta_hw",
+            "partial_rotary_factor",
+        ):
             _positive(getattr(self, name), name)
 
         if self.head_dim % 4:
-            raise ValueError("SenseNova head_dim must divide into temporal/height/width partitions")
+            raise ValueError(
+                "SenseNova head_dim must divide into "
+                "temporal/height/width partitions"
+            )
         if self.num_attention_heads % self.num_key_value_heads:
-            raise ValueError("SenseNova attention heads must be divisible by KV heads")
+            raise ValueError(
+                "SenseNova attention heads must be divisible by KV heads"
+            )
         if self.partial_rotary_factor > 1:
-            raise ValueError("SenseNova partial_rotary_factor must not exceed one")
+            raise ValueError(
+                "SenseNova partial_rotary_factor must not exceed one"
+            )
 
         if (
             not isinstance(self.layer_types, tuple)
             or len(self.layer_types) != self.num_hidden_layers
         ):
-            raise ValueError("SenseNova layer_types must describe every decoder layer")
-        if any(value not in {"full_attention", "sliding_attention"} for value in self.layer_types):
-            raise ValueError("SenseNova layer_types contains an unsupported attention type")
+            raise ValueError(
+                "SenseNova layer_types must describe every decoder layer"
+            )
+        if any(
+            value not in {"full_attention", "sliding_attention"}
+            for value in self.layer_types
+        ):
+            raise ValueError(
+                "SenseNova layer_types contains an unsupported attention type"
+            )
         if self.sliding_window is not None:
             _positive(self.sliding_window, "sliding_window", integer=True)
         if "sliding_attention" in self.layer_types:
             if self.sliding_window is None:
-                raise ValueError("SenseNova sliding_attention requires sliding_window")
+                raise ValueError(
+                    "SenseNova sliding_attention requires sliding_window"
+                )
             # The multimodal mask implements full attention within image
             # blocks and causal text visibility, without a local-window cutoff.
             raise ValueError(
-                "SenseNova layer_types: sliding_attention is not supported by the MoT decoder"
+                "SenseNova layer_types: sliding_attention is not "
+                "supported by the MoT decoder"
             )
 
         for name in ("attention_bias", "tie_word_embeddings"):
@@ -113,7 +135,9 @@ class TransformerConfig:
             or isinstance(self.pad_token_id, bool)
             or not 0 <= self.pad_token_id < self.vocab_size
         ):
-            raise ValueError("SenseNova pad_token_id must be inside the vocabulary")
+            raise ValueError(
+                "SenseNova pad_token_id must be inside the vocabulary"
+            )
         if self.hidden_act not in {
             "silu",
             "swish",
@@ -125,7 +149,9 @@ class TransformerConfig:
             "gelu_pytorch_tanh",
             "gelu_tanh",
         }:
-            raise ValueError(f"unsupported SenseNova hidden_act {self.hidden_act!r}")
+            raise ValueError(
+                f"unsupported SenseNova hidden_act {self.hidden_act!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,47 +166,64 @@ class Config:
     def __post_init__(self) -> None:
         _positive(self.max_image_seq_len, "max_image_seq_len", integer=True)
         if self.vision.output_size != self.text.hidden_size:
-            raise ValueError("SenseNova vision output must match text hidden_size")
+            raise ValueError(
+                "SenseNova vision output must match text hidden_size"
+            )
         if self.vision.num_channels != 3:
-            raise ValueError("SenseNova image prediction requires RGB vision inputs")
+            raise ValueError(
+                "SenseNova image prediction requires RGB vision inputs"
+            )
 
 
 def _stage_scalar(value: Any, name: str) -> Any:
     """Collapse a per-stage list to its first entry; scalars pass through."""
-
     if isinstance(value, (list, tuple)):
         if not value:
-            raise ValueError(f"SenseNova vision_config.{name} must not be empty")
+            raise ValueError(
+                f"SenseNova vision_config.{name} must not be empty"
+            )
         return value[0]
     return value
 
 
 def _alias(
-    primary: Mapping[str, Any], name: str, aliases: tuple[Mapping[str, Any], ...], default: Any
+    primary: Mapping[str, Any],
+    name: str,
+    aliases: tuple[Mapping[str, Any], ...],
+    default: Any,
 ) -> Any:
-    """Return one value for a field that checkpoints may duplicate across maps."""
-
-    values = [source[name] for source in (primary, *aliases) if source.get(name) is not None]
+    """Return one value for a field that checkpoints may duplicate across maps."""  # noqa: E501
+    values = [
+        source[name]
+        for source in (primary, *aliases)
+        if source.get(name) is not None
+    ]
     if any(value != values[0] for value in values[1:]):
-        raise ValueError(f"SenseNova checkpoint has conflicting aliases for {name}")
+        raise ValueError(
+            f"SenseNova checkpoint has conflicting aliases for {name}"
+        )
     return values[0] if values else default
 
 
 def _normalize(raw: Mapping[str, Any]) -> Config:
-    """Resolve checkpoint aliases once, without allocating numerical resources."""
-
+    """Resolve checkpoint aliases once, without allocating numerical resources."""  # noqa: E501
     from packaging.version import Version
 
     required = raw.get("uniserve_sensenova_min_version")
     if required and Version("0.1.0") < Version(str(required)):
-        raise RuntimeError(f"checkpoint requires UniServe model code >= {required}")
+        raise RuntimeError(
+            f"checkpoint requires UniServe model code >= {required}"
+        )
 
     text, image = raw["llm_config"], raw["vision_config"]
     if not isinstance(text, Mapping) or not isinstance(image, Mapping):
-        raise ValueError("SenseNova llm_config and vision_config must be objects")
+        raise ValueError(
+            "SenseNova llm_config and vision_config must be objects"
+        )
     if text.get("num_experts", 0) != 0:
         raise ValueError(
-            "SenseNova llm_config.num_experts: sparse MoE is not supported by the dual-route MoT decoder"
+            "SenseNova llm_config.num_experts: sparse MoE is not "
+            "supported by the dual-route MoT decoder"
         )
 
     # Rotary metadata appears under both rope_scaling and rope_parameters in
@@ -190,10 +233,17 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
     if not isinstance(scaling, Mapping) or not isinstance(parameters, Mapping):
         raise ValueError("SenseNova rotary metadata must be an object")
     kind = _alias(
-        parameters, "rope_type", (scaling,), parameters.get("type", scaling.get("type", "default"))
+        parameters,
+        "rope_type",
+        (scaling,),
+        parameters.get("type", scaling.get("type", "default")),
     )
-    if any(source.get("type", kind) != kind for source in (parameters, scaling)):
-        raise ValueError("SenseNova checkpoint has conflicting rotary type aliases")
+    if any(
+        source.get("type", kind) != kind for source in (parameters, scaling)
+    ):
+        raise ValueError(
+            "SenseNova checkpoint has conflicting rotary type aliases"
+        )
 
     recipe = None
     if kind != "default":
@@ -203,7 +253,8 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
 
         factor = option("factor")
         original = option(
-            "original_max_position_embeddings", text.get("max_position_embeddings", 32768)
+            "original_max_position_embeddings",
+            text.get("max_position_embeddings", 32768),
         )
         match kind:
             case "linear":
@@ -239,7 +290,9 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
                     option("high_freq_factor", 4.0),
                 )
             case _:
-                raise ValueError(f"unsupported SenseNova rotary recipe {kind!r}")
+                raise ValueError(
+                    f"unsupported SenseNova rotary recipe {kind!r}"
+                )
 
     layers, heads = text["num_hidden_layers"], text["num_attention_heads"]
     _positive(layers, "llm_config.num_hidden_layers", integer=True)
@@ -247,18 +300,28 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
     hidden = text["hidden_size"]
     _positive(hidden, "llm_config.hidden_size", integer=True)
     if "head_dim" not in text and hidden % heads:
-        raise ValueError("SenseNova requires explicit head_dim for this hidden width")
+        raise ValueError(
+            "SenseNova requires explicit head_dim for this hidden width"
+        )
 
     use_window = text.get("use_sliding_window", False)
     if not isinstance(use_window, bool):
         raise ValueError("SenseNova use_sliding_window must be boolean")
     window = text.get("sliding_window")
     boundary = text.get("max_window_layers", 0)
-    if not isinstance(boundary, int) or isinstance(boundary, bool) or boundary < 0:
-        raise ValueError("SenseNova llm_config.max_window_layers must be a non-negative integer")
+    if (
+        not isinstance(boundary, int)
+        or isinstance(boundary, bool)
+        or boundary < 0
+    ):
+        raise ValueError(
+            "SenseNova llm_config.max_window_layers must be a "
+            "non-negative integer"
+        )
     layer_types = text.get("layer_types")
     if layer_types is None:
-        # Older checkpoints derive per-layer attention kinds from the window fields.
+        # Older checkpoints derive per-layer attention kinds from the
+        # window fields.
         layer_types = tuple(
             "sliding_attention"
             if use_window and window is not None and index >= boundary
@@ -268,9 +331,13 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
     if not isinstance(layer_types, (list, tuple)):
         raise ValueError("SenseNova layer_types must be a sequence")
 
-    vision_ratio = _stage_scalar(image.get("downsample_ratio", 0.5), "downsample_ratio")
+    vision_ratio = _stage_scalar(
+        image.get("downsample_ratio", 0.5), "downsample_ratio"
+    )
     if raw.get("downsample_ratio", vision_ratio) != vision_ratio:
-        raise ValueError("SenseNova root and vision downsample_ratio must agree")
+        raise ValueError(
+            "SenseNova root and vision downsample_ratio must agree"
+        )
     head_layers = raw.get("fm_head_layers", 2)
     _positive(head_layers, "fm_head_layers", integer=True)
 
@@ -288,20 +355,30 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
             rms_norm_eps=text.get("rms_norm_eps", 1e-6),
             attention_bias=text.get("attention_bias", False),
             max_position_embeddings=text.get("max_position_embeddings", 32768),
-            max_position_embeddings_hw=text.get("max_position_embeddings_hw", 10000),
-            rope_theta=_alias(text, "rope_theta", (parameters, scaling), 10000.0),
+            max_position_embeddings_hw=text.get(
+                "max_position_embeddings_hw", 10000
+            ),
+            rope_theta=_alias(
+                text, "rope_theta", (parameters, scaling), 10000.0
+            ),
             rope_theta_hw=text.get("rope_theta_hw", 10000.0),
             rope_scaling=recipe,
-            partial_rotary_factor=_alias(text, "partial_rotary_factor", (parameters, scaling), 1.0),
+            partial_rotary_factor=_alias(
+                text, "partial_rotary_factor", (parameters, scaling), 1.0
+            ),
             sliding_window=window,
             pad_token_id=text.get("pad_token_id")
             if text.get("pad_token_id") is not None
             else raw.get("pad_token_id"),
-            tie_word_embeddings=_alias(text, "tie_word_embeddings", (raw,), False),
+            tie_word_embeddings=_alias(
+                text, "tie_word_embeddings", (raw,), False
+            ),
         ),
         vision=vision.Config(
             hidden_size=image.get("hidden_size", 1024),
-            output_size=_stage_scalar(image.get("llm_hidden_size", 2048), "llm_hidden_size"),
+            output_size=_stage_scalar(
+                image.get("llm_hidden_size", 2048), "llm_hidden_size"
+            ),
             downsample_ratio=vision_ratio,
             patch_size=image.get("patch_size", 16),
             num_channels=image.get("num_channels", 3),
@@ -314,7 +391,9 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
                 mlp_ratio=raw["fm_head_mlp_ratio"] if head_layers > 2 else 1.0,
             ),
             use_pixel_head=raw.get("use_pixel_head", False),
-            add_noise_scale_embedding=raw.get("add_noise_scale_embedding", False),
+            add_noise_scale_embedding=raw.get(
+                "add_noise_scale_embedding", False
+            ),
             noise=NoiseScale(
                 raw.get("noise_scale", 1.0),
                 "resolution"
@@ -329,7 +408,7 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
 
 
 def read_config(root: Path, io: loading.Config) -> Config:
-    """Normalize checkpoint aliases and typed rotary recipes before construction."""
+    """Normalize checkpoint aliases and typed rotary recipes before construction."""  # noqa: E501
     return _normalize(json.loads((root / "config.json").read_text()))
 
 

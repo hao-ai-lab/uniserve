@@ -1,4 +1,7 @@
-"""Worker protocol and ownership over concrete execution and completion resources."""
+"""Worker protocol and ownership.
+
+The ownership covers concrete execution and completion resources.
+"""
 
 from __future__ import annotations
 
@@ -78,7 +81,9 @@ def test_info_request_is_served_before_close() -> None:
 
 
 @pytest.mark.parametrize("pipeline_depth", (1, 3))
-def test_duplicate_submissions_are_rejected_while_the_original_completes(pipeline_depth) -> None:
+def test_duplicate_submissions_are_rejected_while_the_original_completes(
+    pipeline_depth,
+) -> None:
     _admission, _operation, run = _token_run(
         request_id=11,
         op_id=ComputationId(21, 0),
@@ -108,10 +113,16 @@ def test_duplicate_submissions_are_rejected_while_the_original_completes(pipelin
 
 def test_failed_submissions_cannot_be_reused_and_allow_shutdown() -> None:
     with execution_worker(pipeline_depth=2) as worker:
-        admission = replace(ar_params(91), request_pool_idx=worker.info.request_slots + 1)
+        admission = replace(
+            ar_params(91), request_pool_idx=worker.info.request_slots + 1
+        )
         run = execution_run(run_id=1, admissions=(admission,))
         endpoint = QueuedWorkerIpc(
-            (_request(1, run), _request(2, run), {"kind": "close", "call_id": 3})
+            (
+                _request(1, run),
+                _request(2, run),
+                {"kind": "close", "call_id": 3},
+            )
         )
         worker.bind(endpoint).run()
 
@@ -178,7 +189,10 @@ def test_conflicting_run_identity_fails_before_new_admission() -> None:
     result = responses[4]["result"]
     assert result["batch_id"] == 2
     assert result["run_id"] == 9
-    assert result["completions"][0]["op_id"] == {"batch_id": 2, "request_index": 1}
+    assert result["completions"][0]["op_id"] == {
+        "batch_id": 2,
+        "request_index": 1,
+    }
     assert result["completions"][0]["status"] == "ok"
     assert responses[5]["kind"] == "ok"
 
@@ -209,7 +223,9 @@ def test_unbound_run_failure_closes_worker_at_scope_exit() -> None:
     with pytest.raises(RuntimeError, match="closed"):
         worker.bind(QueuedWorkerIpc())
     with pytest.raises(RuntimeError, match="closed"):
-        worker.submit(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
+        worker.submit(
+            execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),))
+        )
     worker.close()
 
 
@@ -235,7 +251,9 @@ def test_service_is_single_use_and_scope_exit_prevents_reuse() -> None:
         with pytest.raises(RuntimeError, match="closed"):
             action()
     with pytest.raises(RuntimeError, match="closed"):
-        worker.submit(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
+        worker.submit(
+            execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),))
+        )
     worker.close()
 
 
@@ -301,7 +319,9 @@ def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
             shutdown(executor, *args, **kwargs)
             raise OSError("executor shutdown failed")
 
-        monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "shutdown", failed_shutdown)
+        monkeypatch.setattr(
+            concurrent.futures.ThreadPoolExecutor, "shutdown", failed_shutdown
+        )
     with pytest.raises(RuntimeError) as caught:
         with worker:
             if entrypoint == "run":
@@ -312,13 +332,19 @@ def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
     assert endpoint.responses == []
     assert not endpoint.closed
     with pytest.raises(RuntimeError, match="closed"):
-        worker.submit(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
+        worker.submit(
+            execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),))
+        )
     if cleanup_failure:
-        assert any("executor shutdown failed" in note for note in failure.__notes__)
+        assert any(
+            "executor shutdown failed" in note for note in failure.__notes__
+        )
 
 
 @pytest.mark.parametrize("gc_enabled", (False, True))
-def test_transport_failure_releases_worker_and_restores_gc(gc_enabled: bool) -> None:
+def test_transport_failure_releases_worker_and_restores_gc(
+    gc_enabled: bool,
+) -> None:
     import gc
 
     failure = OSError("IPC connection lost")
@@ -339,7 +365,9 @@ def test_transport_failure_releases_worker_and_restores_gc(gc_enabled: bool) -> 
         assert gc.isenabled() == gc_enabled
         assert not endpoint.closed
         with pytest.raises(RuntimeError, match="closed"):
-            worker.submit(execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),)))
+            worker.submit(
+                execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),))
+            )
     finally:
         (gc.enable if was_enabled else gc.disable)()
         worker.close()
@@ -358,7 +386,9 @@ def test_successful_manual_warmup_is_retained_by_run(monkeypatch) -> None:
         # Administrative serving needs no further numerical startup once the
         # execution-only caller has successfully warmed up the worker.
         monkeypatch.setattr(torch.inference_mode, "__enter__", unavailable)
-        endpoint = QueuedWorkerIpc(({"kind": "info", "call_id": 1}, {"kind": "close"}))
+        endpoint = QueuedWorkerIpc(
+            ({"kind": "info", "call_id": 1}, {"kind": "close"})
+        )
         worker.bind(endpoint).run()
         assert endpoint.responses[0]["kind"] == "info"
         assert endpoint.responses[-1]["kind"] == "ok"
@@ -389,7 +419,9 @@ def test_startup_failure_keeps_resources_until_scope_exit(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("gc_enabled", (False, True))
-def test_normal_shutdown_reports_cleanup_failure_and_restores_gc(monkeypatch, gc_enabled) -> None:
+def test_normal_shutdown_reports_cleanup_failure_and_restores_gc(
+    monkeypatch, gc_enabled
+) -> None:
     import concurrent.futures
     import gc
 
@@ -402,7 +434,9 @@ def test_normal_shutdown_reports_cleanup_failure_and_restores_gc(monkeypatch, gc
         shutdown(executor, *args, **kwargs)
         raise failure
 
-    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "shutdown", failed_shutdown)
+    monkeypatch.setattr(
+        concurrent.futures.ThreadPoolExecutor, "shutdown", failed_shutdown
+    )
     was_enabled = gc.isenabled()
     try:
         (gc.enable if gc_enabled else gc.disable)()

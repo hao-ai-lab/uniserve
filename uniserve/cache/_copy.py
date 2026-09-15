@@ -40,7 +40,6 @@ def scatter_blocks(target, indices, snapshot):
     invalid asynchronous inputs cannot access outside the allocated backing.
     Target fields may be strided; index_select supplies a contiguous snapshot.
     """
-
     width = prod(target.shape[1:])
     if not indices.numel() or not width:
         return

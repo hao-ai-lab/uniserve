@@ -45,19 +45,30 @@ class Config:
         if (
             not isinstance(self.channel_multipliers, tuple)
             or not self.channel_multipliers
-            or any(type(value) is not int or value < 1 for value in self.channel_multipliers)
+            or any(
+                type(value) is not int or value < 1
+                for value in self.channel_multipliers
+            )
         ):
-            raise ValueError("VAE channel multipliers must be a nonempty positive integer tuple")
+            raise ValueError(
+                "VAE channel multipliers must be a nonempty positive "
+                "integer tuple"
+            )
         if self.downsample != 2 ** (len(self.channel_multipliers) - 1):
             raise ValueError("VAE downsample must match its resolution stages")
         if self.base_channels % 32:
-            raise ValueError("VAE base channels must be divisible by 32 GroupNorm groups")
+            raise ValueError(
+                "VAE base channels must be divisible by 32 GroupNorm groups"
+            )
         if (
             not math.isfinite(self.scale_factor)
             or self.scale_factor <= 0
             or not math.isfinite(self.shift_factor)
         ):
-            raise ValueError("VAE scale must be finite and positive, and shift must be finite")
+            raise ValueError(
+                "VAE scale must be finite and positive, "
+                "and shift must be finite"
+            )
 
 
 class Encoder(nn.Module):
@@ -88,7 +99,9 @@ class Encoder(nn.Module):
         )
         self.norm = nn.GroupNorm(32, channels, eps=1e-6)
         # Concatenated posterior mean and log-variance per spatial location.
-        self.output = nn.Conv2d(channels, 2 * config.latent_channels, 3, padding=1)
+        self.output = nn.Conv2d(
+            channels, 2 * config.latent_channels, 3, padding=1
+        )
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         hidden = self.input(pixels)
@@ -134,7 +147,7 @@ class Decoder(nn.Module):
 
 
 class Model(nn.Module):
-    """Encode normalized posterior samples and decode their inverse transform."""
+    """Encode normalized posterior samples and decode their inverse transform."""  # noqa: E501
 
     def __init__(self, config: Config):
         super().__init__()
@@ -150,7 +163,9 @@ class Model(nn.Module):
         return self.config.scale_factor * (latent - self.config.shift_factor)
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
-        return self.decoder(latents / self.config.scale_factor + self.config.shift_factor)
+        return self.decoder(
+            latents / self.config.scale_factor + self.config.shift_factor
+        )
 
     def forward(
         self, pixels: torch.Tensor, *, generator: torch.Generator | None = None
@@ -158,7 +173,9 @@ class Model(nn.Module):
         return self.decode(self.encode(pixels, generator=generator))
 
 
-def assignments(module: nn.Module, reader: checkpoint.Reader) -> tuple[weights.Assignment, ...]:
+def assignments(
+    module: nn.Module, reader: checkpoint.Reader
+) -> tuple[weights.Assignment, ...]:
     """Map FLUX tensors into encoder/decoder composition, packing spatial QKV.
 
     Both Model and PatchAutoencoder expose the same encoder/decoder modules.
@@ -184,7 +201,10 @@ def assignments(module: nn.Module, reader: checkpoint.Reader) -> tuple[weights.A
                         if tower_name == "encoder"
                         else len(tower.levels) - 1 - int(level)
                     )
-                    source = f"{'down' if tower_name == 'encoder' else 'up'}.{index}.block.{block}"
+                    source = (
+                        f"{'down' if tower_name == 'encoder' else 'up'}"
+                        f".{index}.block.{block}"
+                    )
                 for target, suffix in (
                     ("norms.0", "norm1"),
                     ("norms.1", "norm2"),
@@ -199,7 +219,9 @@ def assignments(module: nn.Module, reader: checkpoint.Reader) -> tuple[weights.A
                 if tower_name == "decoder":
                     index = len(tower.levels) - 1 - index
                 direction = "down" if tower_name == "encoder" else "up"
-                names[f"{name}.convolution"] = f"{direction}.{index}.{direction}sample.conv"
+                names[f"{name}.convolution"] = (
+                    f"{direction}.{index}.{direction}sample.conv"
+                )
 
             elif isinstance(layer, AttentionBlock):
                 names[f"{name}.norm"] = "mid.attn_1.norm"
@@ -210,13 +232,21 @@ def assignments(module: nn.Module, reader: checkpoint.Reader) -> tuple[weights.A
                     target = parameters[f"{name}.qkv.{field}"]
                     channels = target.shape[0] // 3
                     for index, branch in enumerate(("q", "k", "v")):
-                        source_name = f"{tower_name}.mid.attn_1.{branch}.{field}"
+                        source_name = (
+                            f"{tower_name}.mid.attn_1.{branch}.{field}"
+                        )
                         if source_name in available:
                             source = reader.get(source_name)
-                            region = (slice(index * channels, (index + 1) * channels),) + tuple(
+                            region = (
+                                slice(index * channels, (index + 1) * channels),
+                            ) + tuple(
                                 slice(0, size) for size in target.shape[1:]
                             )
-                            result.append(weights.Assignment(target, source, target_slice=region))
+                            result.append(
+                                weights.Assignment(
+                                    target, source, target_slice=region
+                                )
+                            )
 
         for name, target in parameters.items():
             parent, field = name.rsplit(".", 1)

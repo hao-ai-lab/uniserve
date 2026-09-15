@@ -35,7 +35,9 @@ def _recipe_values(recipe):
             _positive(value, name)
     original = getattr(recipe, "original_max_position_embeddings", None)
     if original is not None and type(original) is not int:
-        raise ValueError("the original rotary context length must be an integer")
+        raise ValueError(
+            "the original rotary context length must be an integer"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +83,9 @@ class LongRoPEScaling:
 
     def __post_init__(self):
         _recipe_values(self)
-        if not isinstance(self.short_factor, tuple) or not isinstance(self.long_factor, tuple):
+        if not isinstance(self.short_factor, tuple) or not isinstance(
+            self.long_factor, tuple
+        ):
             raise ValueError("LongRoPE factors must be immutable tuples")
 
 
@@ -95,7 +99,9 @@ class LlamaScaling:
     def __post_init__(self):
         _recipe_values(self)
         if self.high_freq_factor <= self.low_freq_factor:
-            raise ValueError("Llama's high-frequency boundary must exceed its low boundary")
+            raise ValueError(
+                "Llama's high-frequency boundary must exceed its low boundary"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,17 +158,25 @@ class RotaryEmbedding(nn.Module):
         _positive(attention_scale, "attention_scale")
         _positive(partial_rotary_factor, "partial_rotary_factor")
         if partial_rotary_factor > 1 or max_position_embeddings < 1:
-            raise ValueError("rotary context and partial width must define a valid domain")
+            raise ValueError(
+                "rotary context and partial width must define a valid domain"
+            )
         if scaling is not None and type(scaling) not in _RECIPE_NAMES:
             raise TypeError("rotary scaling must use a typed numerical recipe")
 
         self.dim = (
-            dim if isinstance(scaling, ProportionalScaling) else int(dim * partial_rotary_factor)
+            dim
+            if isinstance(scaling, ProportionalScaling)
+            else int(dim * partial_rotary_factor)
         )
         if self.dim < 2 or self.dim % 2:
-            raise ValueError("the partial rotary width must remain positive and even")
+            raise ValueError(
+                "the partial rotary width must remain positive and even"
+            )
         if isinstance(scaling, DynamicScaling) and self.dim == 2:
-            raise ValueError("dynamic NTK scaling requires a width greater than two")
+            raise ValueError(
+                "dynamic NTK scaling requires a width greater than two"
+            )
 
         self.theta = theta
         self.scaling = scaling
@@ -174,15 +188,24 @@ class RotaryEmbedding(nn.Module):
 
         if isinstance(scaling, LongRoPEScaling):
             expected = self.dim if keep_freq_range else self.dim // 2
-            if len(scaling.short_factor) != expected or len(scaling.long_factor) != expected:
-                raise ValueError("LongRoPE factors must cover every constructed frequency")
+            if (
+                len(scaling.short_factor) != expected
+                or len(scaling.long_factor) != expected
+            ):
+                raise ValueError(
+                    "LongRoPE factors must cover every constructed frequency"
+                )
 
         # Small derived model constants remain real tensors under meta model
         # construction. Loading moves each registered buffer with its module.
-        actual_device = torch.device("cpu") if device is None else torch.device(device)
+        actual_device = (
+            torch.device("cpu") if device is None else torch.device(device)
+        )
         if actual_device.type == "meta":
             actual_device = torch.device("cpu")
-        inv_freq, self._frequency_scale = self._frequencies(actual_device, sequence_length=0)
+        inv_freq, self._frequency_scale = self._frequencies(
+            actual_device, sequence_length=0
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _frequencies(self, device, *, sequence_length):
@@ -192,7 +215,12 @@ class RotaryEmbedding(nn.Module):
             width = self.dim * 2 if self.keep_freq_range else self.dim
             inverse = 1.0 / (
                 self.theta
-                ** (torch.arange(0, width, 2, dtype=torch.float32, device=device) / width)
+                ** (
+                    torch.arange(
+                        0, width, 2, dtype=torch.float32, device=device
+                    )
+                    / width
+                )
             )
             return inverse[::2] if self.keep_freq_range else inverse, 1.0
 
@@ -221,15 +249,20 @@ class RotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, positions, *, dtype: torch.dtype, sequence_length: int):
-        """Return ``(cos, sin)`` factors of shape [..., dim / 2] for ``positions``."""
-
+        """Return ``(cos, sin)`` factors of shape [..., dim / 2] for
+        ``positions``.
+        """  # noqa: D205
         if type(sequence_length) is not int or sequence_length < 0:
-            raise ValueError("rotary sequence length must be a nonnegative host integer")
+            raise ValueError(
+                "rotary sequence length must be a nonnegative host integer"
+            )
         if not dtype.is_floating_point or (
-            positions.dtype not in {torch.int32, torch.int64} and not positions.is_floating_point()
+            positions.dtype not in {torch.int32, torch.int64}
+            and not positions.is_floating_point()
         ):
             raise ValueError(
-                "rotary factors require numerical positions and a floating output dtype"
+                "rotary factors require numerical positions and a floating "
+                "output dtype"
             )
 
         dynamic = isinstance(self.scaling, (DynamicScaling, LongRoPEScaling))
@@ -249,7 +282,9 @@ class RotaryEmbedding(nn.Module):
         if factors is not None:
             return factors
 
-        device_type = positions.device.type if positions.device.type != "mps" else "cpu"
+        device_type = (
+            positions.device.type if positions.device.type != "mps" else "cpu"
+        )
         with torch.autocast(device_type=device_type, enabled=False):
             # [..., dim / 2] phases: positions broadcast against frequencies.
             phases = positions.float().unsqueeze(-1) * frequencies.float()
@@ -258,10 +293,13 @@ class RotaryEmbedding(nn.Module):
         return cosine.to(dtype=dtype), sine.to(dtype=dtype)
 
     def constant_buffers(self, max_position: int):
-        """Describe the FP32 cosine/sine table storage for ``max_position`` rows."""
-
+        """Describe the FP32 cosine/sine table storage for ``max_position``
+        rows.
+        """  # noqa: D205
         if type(max_position) is not int or max_position < 0:
-            raise ValueError("rotary table extent must be a nonnegative integer")
+            raise ValueError(
+                "rotary table extent must be a nonnegative integer"
+            )
         return {
             name: BufferConfig((max_position, self.dim // 2), torch.float32)
             for name in ("cos", "sin")
@@ -269,13 +307,16 @@ class RotaryEmbedding(nn.Module):
 
     def prepare_constants(self, max_position: int, *, out):
         """Fill caller-owned factors for one complete sequence-length domain."""
-
         from .functional import _result
 
         expected = self.constant_buffers(max_position)
         if set(out) != set(expected):
-            raise ValueError("rotary constant storage must supply cosine and sine tables")
+            raise ValueError(
+                "rotary constant storage must supply cosine and sine tables"
+            )
         positions = torch.arange(max_position, device=out["cos"].device)
-        values = self(positions, dtype=torch.float32, sequence_length=max_position)
+        values = self(
+            positions, dtype=torch.float32, sequence_length=max_position
+        )
         for name, value in zip(("cos", "sin"), values, strict=True):
             _result(value, out[name])

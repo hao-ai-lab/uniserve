@@ -45,7 +45,9 @@ def active_model() -> Path:
 def image_start_token_id(model: Path) -> int:
     tokenizer_path = model / "tokenizer.json"
     if not tokenizer_path.is_file():
-        pytest.fail(f"configured checkpoint has no tokenizer.json: {tokenizer_path}")
+        pytest.fail(
+            f"configured checkpoint has no tokenizer.json: {tokenizer_path}"
+        )
     token_id = Tokenizer.from_file(str(tokenizer_path)).token_to_id("<img>")
     if token_id is None:
         pytest.fail("configured SenseNova tokenizer has no <img> control")
@@ -153,7 +155,9 @@ def visible_stream_delta(event: dict[str, Any]) -> dict[str, Any] | None:
     delta = choice.get("delta")
     if not isinstance(delta, dict):
         return None
-    if any(delta.get(field) for field in ("content", "reasoning_content", "images")):
+    if any(
+        delta.get(field) for field in ("content", "reasoning_content", "images")
+    ):
         return delta
     return None
 
@@ -161,9 +165,16 @@ def visible_stream_delta(event: dict[str, Any]) -> dict[str, Any] | None:
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize(
     ("binding", "graph_policy"),
-    [("default", "full"), ("shared", "full"), ("split", "full"), ("split", "off")],
+    [
+        ("default", "full"),
+        ("shared", "full"),
+        ("split", "full"),
+        ("split", "off"),
+    ],
 )
-def test_sensenova_public_production_lineage(tmp_path: Path, binding: str, graph_policy: str):
+def test_sensenova_public_production_lineage(
+    tmp_path: Path, binding: str, graph_policy: str
+):
     model = active_model()
     input_image_url = f"data:image/png;base64,{tiny_input_png_b64()}"
     with production_server(tmp_path, model, binding, graph_policy) as base_url:
@@ -173,7 +184,9 @@ def test_sensenova_public_production_lineage(tmp_path: Path, binding: str, graph
             text = post_chat(
                 base_url,
                 {
-                    "messages": [{"role": "user", "content": "Reply with one word."}],
+                    "messages": [
+                        {"role": "user", "content": "Reply with one word."}
+                    ],
                     "modalities": ["text"],
                     "max_completion_tokens": 2,
                 },
@@ -187,8 +200,14 @@ def test_sensenova_public_production_lineage(tmp_path: Path, binding: str, graph
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": "Describe the dominant color."},
-                                {"type": "image_url", "image_url": {"url": input_image_url}},
+                                {
+                                    "type": "text",
+                                    "text": "Describe the dominant color.",
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": input_image_url},
+                                },
                             ],
                         }
                     ],
@@ -225,8 +244,17 @@ def test_sensenova_public_production_lineage(tmp_path: Path, binding: str, graph
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": "Use this color in two generated images."},
-                                {"type": "image_url", "image_url": {"url": input_image_url}},
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Use this color in two generated "
+                                        "images."
+                                    ),
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": input_image_url},
+                                },
                             ],
                         }
                     ],
@@ -246,7 +274,9 @@ def test_sensenova_public_production_lineage(tmp_path: Path, binding: str, graph
                 if choice.get("finish_reason") is not None
             ]
             assert finish_reasons == ["length"]
-            usage = next(event["usage"] for event in interleaved if event.get("usage"))
+            usage = next(
+                event["usage"] for event in interleaved if event.get("usage")
+            )
             assert usage["completion_tokens"] == 4
             assert usage["image_count"] == 2
             assert usage["image_steps"] == 4
@@ -257,12 +287,20 @@ def test_sensenova_public_production_lineage(tmp_path: Path, binding: str, graph
                 if (delta := visible_stream_delta(event)) is not None
             ]
             assert visible_events
-            images = [image for _, delta in visible_events for image in delta.get("images", [])]
+            images = [
+                image
+                for _, delta in visible_events
+                for image in delta.get("images", [])
+            ]
             assert len(images) == 2
             for image in images:
                 image_url = image["image_url"]["url"]
                 assert image_url.startswith("data:image/png;base64,")
-                assert png_size_from_b64(image_url.split(",", 1)[1]) == IMAGE_SIZE
-            delivered.append((text, image_to_text, generated_images, interleaved))
+                assert (
+                    png_size_from_b64(image_url.split(",", 1)[1]) == IMAGE_SIZE
+                )
+            delivered.append(
+                (text, image_to_text, generated_images, interleaved)
+            )
             snapshots.append(copy.deepcopy(delivered[-1]))
             assert delivered == snapshots

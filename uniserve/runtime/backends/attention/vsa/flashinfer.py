@@ -18,7 +18,9 @@ class _Operator(BaseOperator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         scratch = self.workspace["scratch"]
-        self._state = _flashinfer.SparseExecutionState(workspaces={scratch.device: scratch})
+        self._state = _flashinfer.SparseExecutionState(
+            workspaces={scratch.device: scratch}
+        )
 
     def __call__(self, q, k, v, batch, *, scale, out):
         self._validate(q, k, v, batch, out)
@@ -31,17 +33,23 @@ class _Operator(BaseOperator):
             index_width=batch.block_indices.shape[-1],
             scale=scale,
         )
-        _flashinfer._fill_flattened_bsr(plan, batch.block_indices, batch.valid_sizes)
+        _flashinfer._fill_flattened_bsr(
+            plan, batch.block_indices, batch.valid_sizes
+        )
 
         # Equal Q/K extents share one packed row domain; unequal extents need
         # explicit head-first layouts with invalid keys zeroed by hand.
         if q.shape == k.shape:
-            query, key, value = pack_sparse_input_rows(q, k, v, batch.valid_sizes).unbind(0)
+            query, key, value = pack_sparse_input_rows(
+                q, k, v, batch.valid_sizes
+            ).unbind(0)
         else:
             # BSR masks exclude invalid keys. Zero their payload as well so a
             # masked padding NaN cannot enter the matrix multiplication.
             index = torch.arange(k.shape[0], device=k.device)
-            invalid = (index % 64 >= batch.valid_sizes[index // 64]).view(-1, 1, 1)
+            invalid = (index % 64 >= batch.valid_sizes[index // 64]).view(
+                -1, 1, 1
+            )
             query = q.transpose(0, 1).contiguous()
             key = k.masked_fill(invalid, 0).transpose(0, 1).contiguous()
             value = v.masked_fill(invalid, 0).transpose(0, 1).contiguous()
@@ -51,10 +59,28 @@ class _Operator(BaseOperator):
             key.reshape(-1, 1, self.head_dim),
             value.reshape(-1, 1, self.head_dim),
         )
-        out.copy_(result.view(self.num_heads, q.shape[0], self.head_dim).transpose(0, 1))
+        out.copy_(
+            result.view(self.num_heads, q.shape[0], self.head_dim).transpose(
+                0, 1
+            )
+        )
         return out
 
-    def rows(self, q, k, v, batch, *, gate, compressed, out, owners, chunk_tokens, packed, scale):
+    def rows(
+        self,
+        q,
+        k,
+        v,
+        batch,
+        *,
+        gate,
+        compressed,
+        out,
+        owners,
+        chunk_tokens,
+        packed,
+        scale,
+    ):
         self.bind(batch)
 
         if not _flashinfer.uses_row_major_inputs(q.device):
@@ -88,4 +114,8 @@ class Backend(BaseBackend):
     operator_class = _Operator
 
     def workspace_buffers(self, pattern, *, num_heads, head_dim, dtype):
-        return {"scratch": BufferConfig((_flashinfer._FLOAT_WORKSPACE_BYTES,), torch.uint8)}
+        return {
+            "scratch": BufferConfig(
+                (_flashinfer._FLOAT_WORKSPACE_BYTES,), torch.uint8
+            )
+        }

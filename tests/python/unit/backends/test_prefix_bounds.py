@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 import torch
-from uniserve_kernel.flash_attn_jagged import compute_prefix_bounds, compute_prefix_bounds_varlen
+from uniserve_kernel.flash_attn_jagged import (
+    compute_prefix_bounds,
+    compute_prefix_bounds_varlen,
+)
 
 
 def test_prefix_bounds_match_full_width_varlen() -> None:
@@ -40,7 +43,9 @@ def test_varlen_prefix_bounds_ignore_padded_query_values() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_varlen_prefix_bounds_capture_and_replay_live_lengths() -> None:
     device = torch.device("cuda")
-    visible_end = torch.tensor(((5, 6, 99, 99),), dtype=torch.int32, device=device)
+    visible_end = torch.tensor(
+        ((5, 6, 99, 99),), dtype=torch.int32, device=device
+    )
     seqlens_q = torch.tensor((2,), dtype=torch.int32, device=device)
     compute_prefix_bounds_varlen(
         visible_end,
@@ -59,7 +64,9 @@ def test_varlen_prefix_bounds_capture_and_replay_live_lengths() -> None:
             num_q_tiles=2,
         )
 
-    visible_end.copy_(torch.tensor(((8, 7, 6, 99),), dtype=torch.int32, device=device))
+    visible_end.copy_(
+        torch.tensor(((8, 7, 6, 99),), dtype=torch.int32, device=device)
+    )
     seqlens_q.fill_(3)
     graph.replay()
 

@@ -33,9 +33,10 @@ _DTYPES = {
 
 def product_name(module: nn.Module, name: str) -> str:
     """Name a numerical modality by its downstream protocol use."""
-
     if isinstance(module, Denoiser):
-        return {"video": "video_latents", "audio": "audio_latents"}.get(name, name)
+        return {"video": "video_latents", "audio": "audio_latents"}.get(
+            name, name
+        )
     if isinstance(module, VideoDecoder) and name == "video":
         return "video_segments"
     if isinstance(module, AudioDecoder) and name == "audio":
@@ -43,14 +44,15 @@ def product_name(module: nn.Module, name: str) -> str:
     return name
 
 
-def resolve_outputs(model: nn.Module, config: WorkerConfig) -> Mapping[str, tuple[OutputInfo, ...]]:
+def resolve_outputs(
+    model: nn.Module, config: WorkerConfig
+) -> Mapping[str, tuple[OutputInfo, ...]]:
     """Resolve global product bounds from the worker's admitted numerical sizes.
 
     Local shards retain their global allocation bound so remote consumers can
     assemble them. Wire dtypes and persistent product names belong here; model
     output layouts retain only their numerical representation and placement.
     """
-
     from ..bootstrap.components import describe_components
 
     result = {}
@@ -60,9 +62,14 @@ def resolve_outputs(model: nn.Module, config: WorkerConfig) -> Mapping[str, tupl
             for name, layout in output_layouts(model, config, call).items():
                 dtype = _DTYPES.get(layout.dtype)
                 if dtype is None:
-                    raise ValueError(f"result {entry}.{name} has no protocol dtype")
+                    raise ValueError(
+                        f"result {entry}.{name} has no protocol dtype"
+                    )
                 if len(layout.variable_axes) > 1:
-                    raise ValueError(f"result {entry}.{name} exceeds the protocol dynamic axes")
+                    raise ValueError(
+                        f"result {entry}.{name} exceeds the protocol dynamic "
+                        "axes"
+                    )
                 # A variable axis becomes a device-sized bound; every other
                 # extent is a static protocol dimension.
                 outputs.append(

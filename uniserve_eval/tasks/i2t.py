@@ -5,7 +5,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import ClassVar
 
-from ..types import Example, RequestRecord, TaskName, TaskRequest, ValidationResult
+from ..types import (
+    Example,
+    RequestRecord,
+    TaskName,
+    TaskRequest,
+    ValidationResult,
+)
 from .base import BenchmarkTask, ImageCountRule
 
 
@@ -20,7 +26,6 @@ class I2TTask(BenchmarkTask):
 
     def build_request(self, example: Example) -> TaskRequest:
         """Build a chat request containing text and an embedded input image."""
-
         sampling = self.point.sampling
         max_tokens = int(
             example.max_tokens
@@ -34,7 +39,12 @@ class I2TTask(BenchmarkTask):
                     "role": "user",
                     "content": [
                         {"type": "text", "text": example.prompt},
-                        {"type": "image_url", "image_url": {"url": self.input_image_data_url(example)}},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": self.input_image_data_url(example)
+                            },
+                        },
                     ],
                 }
             ],
@@ -47,9 +57,10 @@ class I2TTask(BenchmarkTask):
             payload["stream_options"] = {"include_usage": True}
         return TaskRequest(self.point.endpoint, payload, stream=sampling.stream)
 
-    def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
+    def validate_output(
+        self, records: Sequence[RequestRecord]
+    ) -> ValidationResult:
         """Require authoritative usage and configured fixed-length output."""
-
         checks = {"server_usage": self.server_usage_ok(records)}
         if self.point.sampling.ignore_eos:
             checks["fixed_output_length"] = self.fixed_output_length_ok(records)

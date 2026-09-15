@@ -58,8 +58,12 @@ def _encoder_bindings(model, components, device="cpu"):
             DeviceMesh(
                 ranks=config.ranks,
                 rank=0,
-                shape=tuple(size for _, size in config.parallel_config.dimensions),
-                axes=tuple(axis for axis, _ in config.parallel_config.dimensions),
+                shape=tuple(
+                    size for _, size in config.parallel_config.dimensions
+                ),
+                axes=tuple(
+                    axis for axis, _ in config.parallel_config.dimensions
+                ),
             ),
             group.device,
         )
@@ -93,7 +97,9 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
         bindings={"reconstruction": binding},
     )
     try:
-        interval = DecodeRange(RequestKey(1, 0, 0), ComputationId(1, 0), cursor=2, max_units=units)
+        interval = DecodeRange(
+            RequestKey(1, 0, 0), ComputationId(1, 0), cursor=2, max_units=units
+        )
         result = runner.output_layout(
             "reconstruction", 0, SimpleNamespace(num_frames=50), interval, 1
         )
@@ -113,10 +119,19 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
         runner.close()
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)])
-def test_decoder_call_preserves_values_across_independent_execution_owners(device):
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)]
+)
+def test_decoder_call_preserves_values_across_independent_execution_owners(
+    device,
+):
     model = DecodedModel().to(device)
-    components = (("reconstruction", ComponentConfig((0,), distribution="temporal_units")),)
+    components = (
+        (
+            "reconstruction",
+            ComponentConfig((0,), distribution="temporal_units"),
+        ),
+    )
     runners = [
         ModelRunner(
             model,
@@ -126,13 +141,18 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(devic
         for _ in range(2)
     ]
     try:
-        source = torch.arange(12, dtype=torch.float32, device=device).reshape(4, 3) / 10
+        source = (
+            torch.arange(12, dtype=torch.float32, device=device).reshape(4, 3)
+            / 10
+        )
 
         def expected(value):
-            normalized = value.T.unsqueeze(0) * torch.tensor([0.5, 1.5, 2.5], device=device).view(
+            normalized = value.T.unsqueeze(0) * torch.tensor(
+                [0.5, 1.5, 2.5], device=device
+            ).view(1, 3, 1)
+            normalized += torch.tensor([0.1, 0.2, 0.3], device=device).view(
                 1, 3, 1
             )
-            normalized += torch.tensor([0.1, 0.2, 0.3], device=device).view(1, 3, 1)
             normalized *= torch.tensor([1.0, 2.0, 3.0, 4.0], device=device)
             return normalized.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
@@ -154,7 +174,9 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(devic
         torch.testing.assert_close(second, expected(source), rtol=0, atol=0)
         torch.testing.assert_close(first, reference, rtol=0, atol=0)
         source.add_(0.5)
-        torch.testing.assert_close(decode(runners[0]), expected(source), rtol=0, atol=0)
+        torch.testing.assert_close(
+            decode(runners[0]), expected(source), rtol=0, atol=0
+        )
         with pytest.raises(InputError, match="unambiguous"):
             runners[0].run_module("audio", (source,), method="decode", size=4)
     finally:
@@ -180,13 +202,17 @@ def test_conditioning_executes_only_on_its_declared_pipeline_stage(rank):
         group.device,
     )
     runner = ModelRunner(
-        model, WorkerConfig(rank=rank, world_size=2), bindings={"conditioner": binding}
+        model,
+        WorkerConfig(rank=rank, world_size=2),
+        bindings={"conditioner": binding},
     )
     try:
         features = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
         if rank == 0:
             output = runner.run_encoder("conditioning", features)
-            torch.testing.assert_close(output.values[0], torch.tensor([[1.0, 2.0]]), rtol=0, atol=0)
+            torch.testing.assert_close(
+                output.values[0], torch.tensor([[1.0, 2.0]]), rtol=0, atol=0
+            )
         else:
             with pytest.raises(InputError, match="does not participate"):
                 runner.run_encoder("conditioning", features)
@@ -203,16 +229,24 @@ def test_conditioning_executes_only_on_its_declared_pipeline_stage(rank):
         pytest.param("green", marks=pytest.mark.gpu),
     ),
 )
-def test_text_encoder_operation_publishes_consumable_conditioning(separate_start, execution_device):
+def test_text_encoder_operation_publishes_consumable_conditioning(
+    separate_start, execution_device
+):
     device = "cpu" if execution_device == "cpu" else "cuda:0"
     model = EncodedModel().to(device)
     execution = WorkerConfig(
         graph_policy="off",
-        lanes=(LaneConfig("text", 64, (PipelineStage.TEXT_ENCODING, TransferMode.TENSOR)),)
+        lanes=(
+            LaneConfig(
+                "text", 64, (PipelineStage.TEXT_ENCODING, TransferMode.TENSOR)
+            ),
+        )
         if execution_device == "green"
         else (),
     )
-    components = tuple((name, ComponentConfig((0,))) for name in ("text_encoder",))
+    components = tuple(
+        (name, ComponentConfig((0,))) for name in ("text_encoder",)
+    )
     worker = execution_worker(
         model,
         device=device,
@@ -253,14 +287,19 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
                 )
             ),
         ),
-        buffer_allocations=(BufferAllocation(reference.buffer_id, 0, reference.max_bytes),),
+        buffer_allocations=(
+            BufferAllocation(reference.buffer_id, 0, reference.max_bytes),
+        ),
     )
     try:
         if separate_start:
             from dataclasses import replace
 
             started = finalized_report(
-                worker, worker.submit(ScheduleBatch(batch_id=2, run_id=2, commands=run.commands))
+                worker,
+                worker.submit(
+                    ScheduleBatch(batch_id=2, run_id=2, commands=run.commands)
+                ),
             )
             assert started.done and not started.completions
             run = replace(run, commands=())
@@ -277,7 +316,9 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
             tensor,
             destination,
             bindings={
-                (location.source, location.backend): worker.transports[location.backend]
+                (location.source, location.backend): worker.transports[
+                    location.backend
+                ]
                 for location in tensor.locations
             },
         )
@@ -288,7 +329,9 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
             ticket.result()
             ticket.close()
         expected = torch.tensor(prompt).reshape(3, 1) * 4 + torch.arange(4)
-        torch.testing.assert_close(destination.cpu(), expected.float(), atol=0, rtol=0)
+        torch.testing.assert_close(
+            destination.cpu(), expected.float(), atol=0, rtol=0
+        )
         from dataclasses import replace
 
         copied = replace(reference, producer_op_id=ComputationId(2, 0))
@@ -310,7 +353,9 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
                 operations=(consumer,),
                 input_products=(TensorPublication(reference, product.value),),
                 buffer_allocations=(
-                    BufferAllocation(reference.buffer_id, 0, reference.max_bytes),
+                    BufferAllocation(
+                        reference.buffer_id, 0, reference.max_bytes
+                    ),
                     BufferAllocation(copied.buffer_id, 256, copied.max_bytes),
                 ),
             )
@@ -326,7 +371,9 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
             copied_value,
             destination,
             bindings={
-                (location.source, location.backend): worker.transports[location.backend]
+                (location.source, location.backend): worker.transports[
+                    location.backend
+                ]
                 for location in copied_value.locations
             },
         )
@@ -336,28 +383,38 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
             assert ready.wait(5)
             ticket.result()
             ticket.close()
-        torch.testing.assert_close(destination.cpu(), expected.float(), atol=0, rtol=0)
+        torch.testing.assert_close(
+            destination.cpu(), expected.float(), atol=0, rtol=0
+        )
     finally:
         worker.close()
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)]
+)
 def test_text_entry_stages_successive_bounded_inputs(device):
     model = EncodedModel().to(device)
     runner = ModelRunner(
         model,
         WorkerConfig(device=device, max_sequence_tokens=16),
-        bindings=_encoder_bindings(model, (("text_encoder", ComponentConfig((0,))),), device),
+        bindings=_encoder_bindings(
+            model, (("text_encoder", ComponentConfig((0,))),), device
+        ),
     )
     try:
         outputs = []
         prompts = ((3, 8, 1), (31,), (0, 5, 19, 7), (1, 2))
         for prompt in prompts:
-            result = runner.run_encoder("text", runner.stage_text_tokens(prompt))
+            result = runner.run_encoder(
+                "text", runner.stage_text_tokens(prompt)
+            )
             outputs.append(result.values[0])
         for prompt, output in zip(prompts, outputs, strict=True):
             expected = torch.tensor(prompt).reshape(-1, 1) * 4 + torch.arange(4)
-            torch.testing.assert_close(output.cpu(), expected.float(), atol=0, rtol=0)
+            torch.testing.assert_close(
+                output.cpu(), expected.float(), atol=0, rtol=0
+            )
         for prompt in ((), (1,) * 17):
             with pytest.raises(InputError, match="capacity"):
                 runner.stage_text_tokens(prompt)
@@ -368,7 +425,9 @@ def test_text_entry_stages_successive_bounded_inputs(device):
 
 def test_worker_reports_text_bounds_and_executes_dense_attention_without_kv():
     model = EncodedModel()
-    components = tuple((name, ComponentConfig((0,))) for name in ("text_encoder", "dense"))
+    components = tuple(
+        (name, ComponentConfig((0,))) for name in ("text_encoder", "dense")
+    )
     with execution_worker(
         model,
         execution=WorkerConfig(max_sequence_tokens=16, graph_policy="off"),
@@ -377,16 +436,22 @@ def test_worker_reports_text_bounds_and_executes_dense_attention_without_kv():
     ) as worker:
         info = WorkerInfo.from_mapping(worker.info.to_mapping())
         assert info.kv_cache is None
-        entry = next(value for value in info.components if value.name == "text_encoder")
+        entry = next(
+            value for value in info.components if value.name == "text_encoder"
+        )
         assert entry.config.ranks == (0,)
         assert entry.outputs == (
-            OutputInfo("conditioning", DType.F32, ShapeBound((DeviceDim(16), StaticDim(4)))),
+            OutputInfo(
+                "conditioning",
+                DType.F32,
+                ShapeBound((DeviceDim(16), StaticDim(4))),
+            ),
         )
         values = torch.arange(64, dtype=torch.float32).reshape(4, 2, 8) / 64
         heads = values.transpose(0, 1)
-        expected = torch.nn.functional.scaled_dot_product_attention(heads, heads, heads).transpose(
-            0, 1
-        )
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            heads, heads, heads
+        ).transpose(0, 1)
         result = worker.runner.run_encoder("conditioning", values)
         torch.testing.assert_close(result.values[0], expected)
 
@@ -401,7 +466,9 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
         bindings=_encoder_bindings(model, components),
     ) as worker:
         key, op = RequestKey(1, 1, 1), ComputationId(1, 0)
-        output = TensorRef(key, op, 0, 1, dtype, ShapeBound((StaticDim(rows), StaticDim(4))))
+        output = TensorRef(
+            key, op, 0, 1, dtype, ShapeBound((StaticDim(rows), StaticDim(4)))
+        )
         operation = ScheduledRequest(
             request_key=key,
             op_id=op,
@@ -422,7 +489,9 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
             run_id=1,
             operations=(operation,),
             commands=(Start(admission),),
-            buffer_allocations=(BufferAllocation(output.buffer_id, 0, output.max_bytes),),
+            buffer_allocations=(
+                BufferAllocation(output.buffer_id, 0, output.max_bytes),
+            ),
         )
         result = finalized_report(worker, worker.submit(run))
         assert result.completions[0].status is OpStatus.ERROR

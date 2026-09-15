@@ -48,8 +48,10 @@ class ForwardRow:
 
     @property
     def query_tokens(self) -> int:
-        """Return the live token or image-patch count represented by this row."""
+        """Return the live token or image-patch count represented by this.
 
+        row.
+        """
         if self.request_indexed_decode:
             return 1
         if self.token_ids is not None:

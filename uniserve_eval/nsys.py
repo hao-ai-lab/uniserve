@@ -26,7 +26,6 @@ class NsysCapture:
         cuda_trace: Literal["cuda", "cuda-hw"] = "cuda",
     ) -> None:
         """Create a unique profiler session for a benchmark point."""
-
         executable = shutil.which("nsys")
         if executable is None:
             raise RuntimeError("Nsight Systems is required for --nsys")
@@ -46,11 +45,16 @@ class NsysCapture:
 
     def wrap_launch(self, launch: ServerLaunch) -> ServerLaunch:
         """Wrap a server launch in a deferred-start profiler command."""
-
         if self.output_dir.exists() and any(self.output_dir.iterdir()):
-            raise FileExistsError(f"nsys result directory is not empty: {self.output_dir}")
+            raise FileExistsError(
+                f"nsys result directory is not empty: {self.output_dir}"
+            )
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        trace = f"{self.cuda_trace},nvtx,osrt,cublas,cudnn" if self.trace_cuda else "nvtx,osrt"
+        trace = (
+            f"{self.cuda_trace},nvtx,osrt,cublas,cudnn"
+            if self.trace_cuda
+            else "nvtx,osrt"
+        )
         cuda_options = (
             (
                 "--cuda-graph-trace=node",
@@ -80,15 +84,15 @@ class NsysCapture:
 
     def start(self) -> None:
         """Start collection for the measured request window."""
-
         if self._started:
-            raise RuntimeError("nsys measurement window was started more than once")
+            raise RuntimeError(
+                "nsys measurement window was started more than once"
+            )
         self._run("start", f"--session={self.session}")
         self._started = True
 
     def stop(self) -> None:
         """Stop an active measurement window."""
-
         if not self._started or self._stopped:
             raise RuntimeError("nsys measurement window is not active")
         self._run("stop", f"--session={self.session}")
@@ -96,7 +100,6 @@ class NsysCapture:
 
     def finalize(self) -> None:
         """Export the report and create its normalized timeline and manifest."""
-
         if not self._started:
             return
         if not self._stopped:
@@ -104,7 +107,8 @@ class NsysCapture:
         reports = sorted(self.output_dir.glob("*.nsys-rep"))
         if len(reports) != 1:
             raise RuntimeError(
-                f"expected one finalized nsys report in {self.output_dir}, found {len(reports)}"
+                f"expected one finalized nsys report in {self.output_dir}, "
+                f"found {len(reports)}"
             )
         report = reports[0]
         exported = self.output_dir / "trace.sqlite"
@@ -134,8 +138,7 @@ class NsysCapture:
         )
 
     def describe(self) -> dict[str, object]:
-        """Return the capture configuration recorded with benchmark artifacts."""
-
+        """Return the capture configuration recorded with benchmark artifacts."""  # noqa: E501
         return {
             "session": self.session,
             "output_directory": str(self.output_dir),
@@ -149,8 +152,7 @@ class NsysCapture:
         }
 
     def _run(self, *arguments: str) -> None:
-        """Run an Nsight Systems command and append its combined output to the log."""
-
+        """Run an Nsight Systems command and append its combined output to the log."""  # noqa: E501
         result = subprocess.run(
             [self.executable, *arguments],
             text=True,
@@ -167,5 +169,6 @@ class NsysCapture:
         if result.returncode != 0:
             tail = "\n".join(result.stdout.splitlines()[-12:])
             raise RuntimeError(
-                f"nsys {' '.join(arguments[:1])} failed with code {result.returncode}:\n{tail}"
+                f"nsys {' '.join(arguments[:1])} failed with code "
+                f"{result.returncode}:\n{tail}"
             )

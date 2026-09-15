@@ -13,7 +13,11 @@ from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.execution.rows import ForwardRow
 from uniserve_worker.protocol.identity import ComputationId, RequestKey
-from uniserve_worker.protocol.operation import Bounds, PipelineStage, ScheduledRequest
+from uniserve_worker.protocol.operation import (
+    Bounds,
+    PipelineStage,
+    ScheduledRequest,
+)
 from uniserve_worker.runtime.cache_manager import CacheManager
 from uniserve_worker.runtime.latent_pool import LatentPool
 
@@ -38,7 +42,9 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
         flow_graph_batch_sizes=(1,),
     )
     runner = ModelRunner(model, config)
-    cache = PrefixCache(model.text.cache_config, num_blocks=8, block_size=16, device="cpu")
+    cache = PrefixCache(
+        model.text.cache_config, num_blocks=8, block_size=16, device="cpu"
+    )
     manager = CacheManager(
         cache,
         info=cache_info(model.text, config, num_blocks=8),
@@ -73,13 +79,20 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
         for count in (1, 3, 1):
             # Three images contain 48 canonical latent patches but 192
             # spatial attention queries, beyond the text token grant of 64.
-            pixels = torch.arange(count * 3 * 16 * 16).reshape(count, 3, 16, 16).float().sin()
+            pixels = (
+                torch.arange(count * 3 * 16 * 16)
+                .reshape(count, 3, 16, 16)
+                .float()
+                .sin()
+            )
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(129)
                 expected = model.latent_encoder.encode(pixels)
                 torch.manual_seed(129)
                 rows = tuple(
-                    ForwardRow(PipelineStage.LATENT_ENCODING, encode_pixels=value)
+                    ForwardRow(
+                        PipelineStage.LATENT_ENCODING, encode_pixels=value
+                    )
                     for value in pixels
                 )
                 encoded = _run(runner, manager, rows)
@@ -111,7 +124,11 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
 def _run(runner, manager, rows):
     operations = tuple(
         ScheduledRequest(
-            RequestKey(1, index, 0), ComputationId(1, 0), None, row.forward_mode, Bounds()
+            RequestKey(1, index, 0),
+            ComputationId(1, 0),
+            None,
+            row.forward_mode,
+            Bounds(),
         )
         for index, row in enumerate(rows)
     )

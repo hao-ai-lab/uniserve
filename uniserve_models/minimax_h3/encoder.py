@@ -44,16 +44,30 @@ class TextEncoderConfig:
             "max_position_embeddings",
         ):
             value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 1
+            ):
                 raise ValueError(f"H3 text {name} must be a positive integer")
         if self.num_retained_layers > self.num_checkpoint_layers:
-            raise ValueError("H3 retained layers must lie within the checkpoint")
-        if self.num_attention_heads % self.num_key_value_heads or self.head_dim % 2:
-            raise ValueError("H3 text requires divisible GQA and even rotary dimensions")
-        if any(
-            not math.isfinite(value) or value <= 0 for value in (self.rope_theta, self.rms_norm_eps)
+            raise ValueError(
+                "H3 retained layers must lie within the checkpoint"
+            )
+        if (
+            self.num_attention_heads % self.num_key_value_heads
+            or self.head_dim % 2
         ):
-            raise ValueError("H3 text rotary base and normalization epsilon must be positive")
+            raise ValueError(
+                "H3 text requires divisible GQA and even rotary dimensions"
+            )
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in (self.rope_theta, self.rms_norm_eps)
+        ):
+            raise ValueError(
+                "H3 text rotary base and normalization epsilon must be positive"
+            )
 
 
 class TextEncoder(BaseTextEncoder):

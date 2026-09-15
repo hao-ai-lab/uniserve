@@ -14,12 +14,16 @@ pytestmark = pytest.mark.integration
 
 @pytest.mark.parametrize("format", ["safetensors", "pt"])
 @pytest.mark.parametrize(
-    "mode,mmap", [("eager", True), ("eager", False), ("layered", True), ("layered", False)]
+    "mode,mmap",
+    [("eager", True), ("eager", False), ("layered", True), ("layered", False)],
 )
 def test_reader_slices_follow_declared_sources(tmp_path, format, mode, mmap):
     values = torch.arange(24).view(4, 6).float()
     suffix = ".safetensors" if format == "safetensors" else ".pt"
-    first, second = tmp_path / ("first" + suffix), tmp_path / ("second" + suffix)
+    first, second = (
+        tmp_path / ("first" + suffix),
+        tmp_path / ("second" + suffix),
+    )
     if format == "safetensors":
         save_file({"weight": values}, first)
         save_file({"scalar": torch.tensor(3.0)}, second)
@@ -32,8 +36,12 @@ def test_reader_slices_follow_declared_sources(tmp_path, format, mode, mmap):
         assert reader.names() == ("network.scalar", "network.weight")
         weight = reader.get("network.weight")
         assert weight.shape == (4, 6)
-        torch.testing.assert_close(weight.read((slice(1, 3), slice(2, 5))), values[1:3, 2:5])
-        torch.testing.assert_close(reader.get("network.scalar").read(), torch.tensor(3.0))
+        torch.testing.assert_close(
+            weight.read((slice(1, 3), slice(2, 5))), values[1:3, 2:5]
+        )
+        torch.testing.assert_close(
+            reader.get("network.scalar").read(), torch.tensor(3.0)
+        )
         torch.testing.assert_close(weight.read(), values)
         assert weight.read((slice(4, 4), slice(0, 6))).shape == (0, 6)
         with pytest.raises(ValueError, match="slice"):
@@ -45,16 +53,26 @@ def test_reader_slices_follow_declared_sources(tmp_path, format, mode, mmap):
 @pytest.mark.parametrize("axis", [None, 0])
 def test_fp8_source_slices_keep_original_scales(tmp_path, axis):
     values = torch.arange(24).view(4, 6).to(torch.float8_e4m3fn)
-    scale = torch.tensor(0.25) if axis is None else torch.tensor([[0.25], [0.5], [1.0], [2.0]])
-    save_file({"values": values, "scale": scale}, tmp_path / "model.safetensors")
+    scale = (
+        torch.tensor(0.25)
+        if axis is None
+        else torch.tensor([[0.25], [0.5], [1.0], [2.0]])
+    )
+    save_file(
+        {"values": values, "scale": scale}, tmp_path / "model.safetensors"
+    )
     io = Config()
     with checkpoint.Config().resolve(tmp_path, io=io).open(io=io) as reader:
         weight = checkpoint.FP8Weight(
             reader.get("values"), reader.get("scale"), axis, torch.float32
         )
         result = weight.read((slice(1, 3), slice(2, 5)))
-        torch.testing.assert_close(result.dequantize(), (values.float() * scale)[1:3, 2:5])
-        torch.testing.assert_close(result.buffers()["scale"], scale if axis is None else scale[1:3])
+        torch.testing.assert_close(
+            result.dequantize(), (values.float() * scale)[1:3, 2:5]
+        )
+        torch.testing.assert_close(
+            result.buffers()["scale"], scale if axis is None else scale[1:3]
+        )
 
 
 def test_index_and_checksum_enforce_declared_file_set(tmp_path):
@@ -63,7 +81,9 @@ def test_index_and_checksum_enforce_declared_file_set(tmp_path):
     index = tmp_path / "model.safetensors.index.json"
     index.write_text(json.dumps({"weight_map": {"weight": path.name}}))
     manifest = tmp_path / "sha256.json"
-    manifest.write_text(json.dumps({path.name: hashlib.sha256(path.read_bytes()).hexdigest()}))
+    manifest.write_text(
+        json.dumps({path.name: hashlib.sha256(path.read_bytes()).hexdigest()})
+    )
     io = Config(checksum_manifest=manifest)
     source = checkpoint.Config().resolve(tmp_path, io=io)
     with source.open(io=io) as reader:
@@ -71,6 +91,8 @@ def test_index_and_checksum_enforce_declared_file_set(tmp_path):
     manifest.write_text(json.dumps({path.name: "0" * 64}))
     with pytest.raises(ValueError, match="checksum mismatch"):
         source.open(io=io)
-    index.write_text(json.dumps({"weight_map": {"weight": "absent.safetensors"}}))
+    index.write_text(
+        json.dumps({"weight_map": {"weight": "absent.safetensors"}})
+    )
     with pytest.raises(FileNotFoundError, match="missing"):
         checkpoint.Config().resolve(tmp_path, io=Config())

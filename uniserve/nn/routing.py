@@ -23,7 +23,10 @@ class RouteSpan:
     def __post_init__(self):
         if not isinstance(self.route, str) or not self.route:
             raise ValueError("route names must be nonempty strings")
-        if any(type(value) is not int or value < 0 for value in (self.start, self.length)):
+        if any(
+            type(value) is not int or value < 0
+            for value in (self.start, self.length)
+        ):
             raise ValueError("route spans require nonnegative integer bounds")
 
     @property
@@ -32,12 +35,13 @@ class RouteSpan:
 
 
 def _counts(spans, routes):
-    counts = {route: 0 for route in routes}
+    counts = dict.fromkeys(routes, 0)
     position = 0
     for span in spans:
         if span.route not in counts or span.start != position:
             raise ValueError(
-                "route spans must cover ordered contiguous tokens using declared routes"
+                "route spans must cover ordered contiguous tokens using "
+                "declared routes"
             )
         counts[span.route] += span.length
         position = span.stop
@@ -54,18 +58,25 @@ class RoutedTensor:
         if not self.values or any(
             not route or value.ndim < 1 for route, value in self.values.items()
         ):
-            raise ValueError("routed tensors require named tensors with a token axis")
+            raise ValueError(
+                "routed tensors require named tensors with a token axis"
+            )
         object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
 
     @classmethod
     def from_packed(
-        cls, value: torch.Tensor, spans: tuple[RouteSpan, ...], *, routes: frozenset[str]
+        cls,
+        value: torch.Tensor,
+        spans: tuple[RouteSpan, ...],
+        *,
+        routes: frozenset[str],
     ) -> RoutedTensor:
         """Split packed token rows into per-route tensors in span order."""
-
         _, count = _counts(spans, routes)
         if value.ndim < 1 or value.shape[0] != count:
-            raise ValueError("packed tensor and route spans must cover the same tokens")
+            raise ValueError(
+                "packed tensor and route spans must cover the same tokens"
+            )
 
         values = {}
         for route in sorted(routes):
@@ -75,35 +86,46 @@ class RoutedTensor:
                 if span.route == route and span.length
             ]
             values[route] = (
-                torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0] if pieces else value[:0]
+                torch.cat(pieces, dim=0)
+                if len(pieces) > 1
+                else pieces[0]
+                if pieces
+                else value[:0]
             )
         return cls(values)
 
     def _validate(self, spans):
         counts, size = _counts(spans, self.values)
-        if any(value.shape[0] != counts[route] for route, value in self.values.items()):
-            raise ValueError("route tensors must contain exactly their declared token counts")
+        if any(
+            value.shape[0] != counts[route]
+            for route, value in self.values.items()
+        ):
+            raise ValueError(
+                "route tensors must contain exactly their declared token counts"
+            )
         return size
 
     def packed(self, spans: tuple[RouteSpan, ...]) -> torch.Tensor:
         """Join the per-route tensors back into packed span order."""
-
         self._validate(spans)
         offsets = dict.fromkeys(self.values, 0)
         pieces = []
         for span in spans:
             start = offsets[span.route]
             if span.length:
-                pieces.append(self.values[span.route][start : start + span.length])
+                pieces.append(
+                    self.values[span.route][start : start + span.length]
+                )
             offsets[span.route] += span.length
 
         if not pieces:
             return next(iter(self.values.values()))[:0]
         return torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0]
 
-    def narrow(self, interval: slice, spans: tuple[RouteSpan, ...]) -> RoutedTensor:
+    def narrow(
+        self, interval: slice, spans: tuple[RouteSpan, ...]
+    ) -> RoutedTensor:
         """Borrow the routes' rows covered by one packed token interval."""
-
         size = self._validate(spans)
         if not within((interval,), (size,)):
             raise ValueError("routed interval exceeds its packed token extent")
@@ -111,10 +133,15 @@ class RoutedTensor:
         offsets = dict.fromkeys(self.values, 0)
         pieces = {route: [] for route in self.values}
         for span in spans:
-            start, stop = max(span.start, interval.start), min(span.stop, interval.stop)
+            start, stop = (
+                max(span.start, interval.start),
+                min(span.stop, interval.stop),
+            )
             if start < stop:
                 local = offsets[span.route] + start - span.start
-                pieces[span.route].append(self.values[span.route][local : local + stop - start])
+                pieces[span.route].append(
+                    self.values[span.route][local : local + stop - start]
+                )
             offsets[span.route] += span.length
 
         return RoutedTensor(
@@ -130,20 +157,32 @@ class RoutedTensor:
 
     def apply(self, modules: Mapping[str, nn.Module]) -> RoutedTensor:
         """Run each route's tensor through its corresponding module."""
-
         if set(self.values).difference(modules):
-            raise ValueError("every numerical route requires a corresponding module")
+            raise ValueError(
+                "every numerical route requires a corresponding module"
+            )
         # Empty routes still execute: their layers may participate in shared
         # quantization statistics or other necessary numerical collectives.
-        return RoutedTensor({route: modules[route](value) for route, value in self.values.items()})
+        return RoutedTensor(
+            {
+                route: modules[route](value)
+                for route, value in self.values.items()
+            }
+        )
 
     def add(self, other: RoutedTensor) -> RoutedTensor:
         """Add another routed tensor route by route."""
-
         if set(other.values) != set(self.values) or any(
-            value.shape != other.values[route].shape for route, value in self.values.items()
+            value.shape != other.values[route].shape
+            for route, value in self.values.items()
         ):
-            raise ValueError("routed addition requires matching route names and tensor shapes")
+            raise ValueError(
+                "routed addition requires matching route names and tensor "
+                "shapes"
+            )
         return RoutedTensor(
-            {route: value + other.values[route] for route, value in self.values.items()}
+            {
+                route: value + other.values[route]
+                for route, value in self.values.items()
+            }
         )

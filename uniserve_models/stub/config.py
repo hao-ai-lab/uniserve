@@ -11,4 +11,6 @@ class Config:
 
     def __post_init__(self):
         if type(self.patch_size) is not int or self.patch_size < 1:
-            raise ValueError("simulation patches must have a positive pixel width")
+            raise ValueError(
+                "simulation patches must have a positive pixel width"
+            )

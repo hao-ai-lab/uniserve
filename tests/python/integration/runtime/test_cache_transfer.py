@@ -12,8 +12,16 @@ from tests.python.fixtures.cache import mha_pool
 from tests.python.fixtures.shm_publication import serve_pending_publication
 from uniserve.runtime import EventPool
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.protocol.identity import BufferId, ComputationId, RequestKey
-from uniserve_worker.protocol.transfer import KvTransfer, Locator, TensorTransfer
+from uniserve_worker.protocol.identity import (
+    BufferId,
+    ComputationId,
+    RequestKey,
+)
+from uniserve_worker.protocol.transfer import (
+    KvTransfer,
+    Locator,
+    TensorTransfer,
+)
 from uniserve_worker.transfer.tickets import make_transport
 
 pytestmark = pytest.mark.integration
@@ -23,7 +31,9 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     shape = (256, 2, 1, 2)
-    process = context.Process(target=serve_pending_publication, args=(child, shape))
+    process = context.Process(
+        target=serve_pending_publication, args=(child, shape)
+    )
     pool = mha_pool(
         num_layers=2,
         num_kv_heads=1,
@@ -39,7 +49,9 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
     )
     publications = pool
     events = EventPool()
-    consumer = make_transport("shm", byte_capacity=8192, ticket_capacity=2, event_pool=events)
+    consumer = make_transport(
+        "shm", byte_capacity=8192, ticket_capacity=2, event_pool=events
+    )
     write = None
     process.start()
     child.close()
@@ -79,8 +91,12 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
             pool.zero_pages(0, (1,))
 
         independent = torch.full((256, 1, 2), 7.0)
-        pool.cache.state(pool.layers[0]).write((2,), start=0, key=independent, value=independent)
-        for actual in pool.cache.state(pool.layers[0]).read((2,), start=0, length=256):
+        pool.cache.state(pool.layers[0]).write(
+            (2,), start=0, key=independent, value=independent
+        )
+        for actual in pool.cache.state(pool.layers[0]).read(
+            (2,), start=0, length=256
+        ):
             torch.testing.assert_close(actual, independent, rtol=0, atol=0)
 
         parent.send("exit")
@@ -89,7 +105,9 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
         write.retirement.result(timeout=5)
         assert pool.retirement_ready(requests=(source.owner,))
         pool.zero_pages(0, (1,))
-        for actual in pool.cache.state(pool.layers[0]).read((1,), start=0, length=256):
+        for actual in pool.cache.state(pool.layers[0]).read(
+            (1,), start=0, length=256
+        ):
             assert torch.count_nonzero(actual).item() == 0
     finally:
         if process.is_alive():
@@ -113,7 +131,9 @@ def _buffer(operation: int) -> BufferId:
     )
 
 
-def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> None:
+def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> (
+    None
+):
     pool = mha_pool(
         num_layers=1,
         num_kv_heads=1,
@@ -131,10 +151,15 @@ def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> N
     tables.install(((1, 0, (1,), 4),))
     publications = pool
     first = _buffer(1)
-    second = replace(first, owner=replace(first.owner, request_epoch=first.owner.request_epoch + 1))
+    second = replace(
+        first,
+        owner=replace(first.owner, request_epoch=first.owner.request_epoch + 1),
+    )
     try:
         for source in (first, second):
-            assert publications.destination_base(source.owner, "consumer") is None
+            assert (
+                publications.destination_base(source.owner, "consumer") is None
+            )
             # An empty extent is a valid publication: its identity and installed
             # base still belong to one exact request incarnation.
             publication = publications.publish(
@@ -150,7 +175,10 @@ def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> N
             for mismatched in (
                 replace(
                     source,
-                    owner=replace(source.owner, request_epoch=source.owner.request_epoch + 1),
+                    owner=replace(
+                        source.owner,
+                        request_epoch=source.owner.request_epoch + 1,
+                    ),
                 ),
                 replace(source, producer_op_id=ComputationId(2, 0)),
                 replace(source, output_index=1),
@@ -187,10 +215,17 @@ def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> N
             )
             publications.commit_publications((), ((source, installed, result),))
             assert publications.publication(installed) == publication
-            assert publications.destination_base(source.owner, "consumer") == source
+            assert (
+                publications.destination_base(source.owner, "consumer")
+                == source
+            )
         with pytest.raises(WorkerError, match="another request"):
             publications.validate_conditioning(
-                second.owner, first, request_pool_idx=1, group_id=0, visible_length=0
+                second.owner,
+                first,
+                request_pool_idx=1,
+                group_id=0,
+                visible_length=0,
             )
     finally:
         pool.close()
@@ -217,7 +252,11 @@ def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> N
     ),
 )
 def test_incremental_kv_import_preserves_values_in_reserved_pages(
-    backend: str, device: str, source_dtype: str, target_dtype: str, page_size: int
+    backend: str,
+    device: str,
+    source_dtype: str,
+    target_dtype: str,
+    page_size: int,
 ) -> None:
     pools = [
         mha_pool(
@@ -243,13 +282,19 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
     publications = [pool for pool, table in zip(pools, tables, strict=True)]
     events = [EventPool(), EventPool()]
     transports = [
-        make_transport(backend, byte_capacity=16384, ticket_capacity=16, event_pool=event)
+        make_transport(
+            backend, byte_capacity=16384, ticket_capacity=16, event_pool=event
+        )
         for event in events
     ]
     # The smaller source values expose BF16 rounding after FP8 dequantization.
     rounding = target_dtype == "float32"
     prefix = (1.0, 2.0, 3.0) if rounding else (112.0, 224.0, 448.0)
-    suffix = (6.0, -6.0, 0.375, 0.75, 1.5) if rounding else (896.0, -896.0, 56.0, 112.0, 224.0)
+    suffix = (
+        (6.0, -6.0, 0.375, 0.75, 1.5)
+        if rounding
+        else (896.0, -896.0, 56.0, 112.0, 224.0)
+    )
     if rounding:
         expected = (0.96484375, 1.9296875, 3.0, 6.0, -6.0, 0.375, 0.75, 1.5)
     else:
@@ -258,11 +303,18 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
     writes = []
     base = None
     try:
-        for operation, (start, values) in enumerate(((0, prefix), (3, suffix)), start=1):
-            tensor = torch.tensor(values, dtype=torch.bfloat16, device=device).view(-1, 1, 1)
+        for operation, (start, values) in enumerate(
+            ((0, prefix), (3, suffix)), start=1
+        ):
+            tensor = torch.tensor(
+                values, dtype=torch.bfloat16, device=device
+            ).view(-1, 1, 1)
             for layer in range(2):
                 pools[0].cache.state(pools[0].layers[layer]).write(
-                    pages[0], start=start, key=tensor * 2**layer, value=-tensor * 2**layer / 2
+                    pages[0],
+                    start=start,
+                    key=tensor * 2**layer,
+                    value=-tensor * 2**layer / 2,
                 )
             extent = start + len(values)
             source = _buffer(operation)
@@ -279,7 +331,9 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                 transports={transports[0].name: transports[0]},
             )
             locators.extend(
-                location for field in publication.tensors for location in field.locations
+                location
+                for field in publication.tensors
+                for location in field.locations
             )
             publications[0].commit_publications(((source, publication),), ())
             if start:
@@ -287,7 +341,9 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                     (pages[1], (pages[1][0],)),
                     (tuple(reversed(pages[1])), ()),
                 ):
-                    with pytest.raises(WorkerError, match="replace its installed base pages"):
+                    with pytest.raises(
+                        WorkerError, match="replace its installed base pages"
+                    ):
                         publications[1].prepare_install(
                             source,
                             publication,
@@ -320,7 +376,9 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                 installed_buffer=installed,
                 write=write,
             )
-            publications[1].commit_publications((), ((source, installed, result),))
+            publications[1].commit_publications(
+                (), ((source, installed, result),)
+            )
             for layer in range(2):
                 key, value = (
                     pools[1]
@@ -333,7 +391,9 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                     else getattr(torch, target_dtype)
                 )
                 wanted = (
-                    torch.tensor(expected[:extent], dtype=dtype, device=device).view(-1, 1, 1)
+                    torch.tensor(
+                        expected[:extent], dtype=dtype, device=device
+                    ).view(-1, 1, 1)
                     * 2**layer
                 )
                 torch.testing.assert_close(key, wanted, rtol=0, atol=0)
@@ -382,7 +442,9 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
         ("bfloat16", "float8_e4m3fn"),
     ),
 )
-@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
+)
 @pytest.mark.parametrize("target_page_size", (3, 4))
 def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
     source_ranks: int,
@@ -453,12 +515,18 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
     events = [EventPool() for _ in pools]
     backend = "cuda_ipc" if device.startswith("cuda") else "shm"
     transports = [
-        make_transport(backend, byte_capacity=32768, ticket_capacity=32, event_pool=event)
+        make_transport(
+            backend, byte_capacity=32768, ticket_capacity=32, event_pool=event
+        )
         for event in events
     ]
-    token_values = torch.tensor((112, 224, 448, 112, 224, 448), dtype=torch.bfloat16, device=device)
+    token_values = torch.tensor(
+        (112, 224, 448, 112, 224, 448), dtype=torch.bfloat16, device=device
+    )
     head_values = torch.tensor(
-        [2**head for head in range(total_heads)], dtype=torch.bfloat16, device=device
+        [2**head for head in range(total_heads)],
+        dtype=torch.bfloat16,
+        device=device,
     )
     wanted = token_values[:, None, None] * head_values[None, :, None]
     publications = []
@@ -469,11 +537,15 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
             source = _buffer(operation)
             shards = []
             for pool, owner, transport in zip(
-                pools[:source_count], owners[:source_count], transports[:source_count], strict=True
+                pools[:source_count],
+                owners[:source_count],
+                transports[:source_count],
+                strict=True,
             ):
                 values = wanted[
                     start:extent,
-                    pool.info.kv_head_offset : pool.info.kv_head_offset + pool.info.num_kv_heads,
+                    pool.info.kv_head_offset : pool.info.kv_head_offset
+                    + pool.info.num_kv_heads,
                 ]
                 for layer in range(pool.info.num_layers):
                     logical_layer = pool.info.layer_offset + layer
@@ -495,7 +567,8 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                 publications.append((pool, transport, source, shard))
                 owner.commit_publications(((source, shard),), ())
                 shards.append(shard)
-            # Rank descriptors identify one logical value with distributed physical coverage.
+            # Rank descriptors identify one logical value with distributed
+            # physical coverage.
             merged = replace(
                 shards[0],
                 tensors=tuple(
@@ -554,7 +627,9 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                         * 2**logical_layer
                     )
                     torch.testing.assert_close(key, expected, rtol=0, atol=0)
-                    torch.testing.assert_close(value, -expected / 2, rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        value, -expected / 2, rtol=0, atol=0
+                    )
             base = source
     finally:
         for pool, write in writes:
@@ -574,7 +649,9 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
             event.close()
 
 
-def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes() -> None:
+def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes() -> (  # noqa: E501
+    None
+):
     pools = [
         mha_pool(
             num_layers=1,
@@ -598,11 +675,15 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
     owners = [pool for pool, table in zip(pools, tables, strict=True)]
     events = [EventPool() for _ in pools]
     transports = [
-        make_transport("local", byte_capacity=4096, ticket_capacity=16, event_pool=event)
+        make_transport(
+            "local", byte_capacity=4096, ticket_capacity=16, event_pool=event
+        )
         for event in events
     ]
     values = (
-        torch.tensor((112, 224, 448, 896), dtype=torch.bfloat16).reshape(1, 4, 1).expand(4, -1, -1)
+        torch.tensor((112, 224, 448, 896), dtype=torch.bfloat16)
+        .reshape(1, 4, 1)
+        .expand(4, -1, -1)
     )
     publications = []
     writes = []
@@ -631,7 +712,9 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
                 transports={"local": transports[source_index]},
             )
             publications.append((source_index, source, publication))
-            owners[source_index].commit_publications(((source, publication),), ())
+            owners[source_index].commit_publications(
+                ((source, publication),), ()
+            )
             write = owners[2].prepare_install(
                 source,
                 publication,
@@ -654,9 +737,15 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
                 write=write,
             )
             owners[2].commit_publications((), ((source, installed, result),))
-            key, value = pools[2].cache.state(pools[2].layers[0]).read((1,), start=0, length=extent)
+            key, value = (
+                pools[2]
+                .cache.state(pools[2].layers[0])
+                .read((1,), start=0, length=extent)
+            )
             torch.testing.assert_close(key, values[:extent, :2], rtol=0, atol=0)
-            torch.testing.assert_close(value, -values[:extent, :2], rtol=0, atol=0)
+            torch.testing.assert_close(
+                value, -values[:extent, :2], rtol=0, atol=0
+            )
             if operation == 1:
                 # A replica publishes the same buffer identity with a wider
                 # quantization group before producing the next suffix.

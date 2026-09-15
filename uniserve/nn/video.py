@@ -11,8 +11,9 @@ def blend_decoded_overlap(
     extent: int,
     dim: int,
 ) -> torch.Tensor:
-    """Cross-fade an overlap extent between adjacent decoded tiles along one dimension."""
-
+    """Cross-fade an overlap extent between adjacent decoded tiles along one
+    dimension.
+    """  # noqa: D205
     if extent < 0:
         raise ValueError("decoded overlap extent cannot be negative")
     extent = min(previous.shape[dim], current.shape[dim], extent)
@@ -61,20 +62,31 @@ def video_segment_rgb(
     Multiplication, addition, clamping and integer rounding preserve that order;
     overlap blending retains the decoded tensor's arithmetic precision.
     """
-
     if segment.ndim != 5 or segment.shape[:2] != (1, 3):
-        raise ValueError("decoded video segments must have shape [1, 3, frames, height, width]")
+        raise ValueError(
+            "decoded video segments must have shape "
+            "[1, 3, frames, height, width]"
+        )
     if (
         min(body_frames, overlap_frames) < 1
         or padding_frames < 0
         or body_frames + padding_frames + overlap_frames > segment.shape[2]
     ):
-        raise ValueError("decoded segment does not cover its body and successor overlap")
-    if pixel_mean.shape != (1, 3, 1, 1, 1) or pixel_std.shape != pixel_mean.shape:
-        raise ValueError("video pixel normalization requires one mean and scale per channel")
+        raise ValueError(
+            "decoded segment does not cover its body and successor overlap"
+        )
+    if (
+        pixel_mean.shape != (1, 3, 1, 1, 1)
+        or pixel_std.shape != pixel_mean.shape
+    ):
+        raise ValueError(
+            "video pixel normalization requires one mean and scale per channel"
+        )
     body = segment[:, :, :body_frames]
     if previous_overlap is not None:
-        body = blend_decoded_overlap(previous_overlap, body, overlap_frames, dim=-3)
+        body = blend_decoded_overlap(
+            previous_overlap, body, overlap_frames, dim=-3
+        )
 
     next_overlap = segment[:, :, body_frames + padding_frames :].contiguous()
     if final_unit:
@@ -82,5 +94,12 @@ def video_segment_rgb(
 
     # Denormalize to [0, 1], then emit [frames, height, width, 3] uint8 rows.
     pixels = (body.float() * pixel_std + pixel_mean).clamp_(0.0, 1.0)
-    rgb24 = pixels[0].permute(1, 2, 3, 0).mul_(255.0).round_().to(torch.uint8).contiguous()
+    rgb24 = (
+        pixels[0]
+        .permute(1, 2, 3, 0)
+        .mul_(255.0)
+        .round_()
+        .to(torch.uint8)
+        .contiguous()
+    )
     return rgb24, next_overlap[:, :, :overlap_frames].contiguous()

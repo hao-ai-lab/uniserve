@@ -14,7 +14,9 @@ from uniserve_worker.worker import Worker
 
 
 def main():
-    config = WorkerProcessArgs.from_namespace(create_worker_cli_parser().parse_args())
+    config = WorkerProcessArgs.from_namespace(
+        create_worker_cli_parser().parse_args()
+    )
     with WorkerIpcEndpoint(
         config.ipc.service_name,
         max_payload=config.ipc.max_payload_bytes,
@@ -29,24 +31,37 @@ def main():
                 call_id = request["call_id"]
                 if kind == "info":
                     endpoint.respond(
-                        {"kind": "info", "call_id": call_id, "info": worker.info.to_mapping()}
+                        {
+                            "kind": "info",
+                            "call_id": call_id,
+                            "info": worker.info.to_mapping(),
+                        }
                     )
                     continue
                 if kind == "close":
                     endpoint.respond({"kind": "ok", "call_id": call_id})
                     break
                 if kind == "submit":
-                    report = finalized_report(worker, worker.submit(request["run"])).to_mapping()
+                    report = finalized_report(
+                        worker, worker.submit(request["run"])
+                    ).to_mapping()
                     media_case = os.environ.get("UNISERVE_TEST_MEDIA_RESPONSE")
                     media_rank = 1 if media_case == "rank-output" else 0
-                    if media_case and config.execution.rank == media_rank and report["completions"]:
+                    if (
+                        media_case
+                        and config.execution.rank == media_rank
+                        and report["completions"]
+                    ):
                         completion = report["completions"][0]
                         payload = b"generated media content"
                         name = publish_media_bytes(payload)
-                        Path(os.environ["UNISERVE_TEST_MEDIA_NAME"]).write_text(name)
+                        Path(os.environ["UNISERVE_TEST_MEDIA_NAME"]).write_text(
+                            name
+                        )
                         completion["media_output"] = MediaOutput(
                             handle=PosixShmArtifact(name),
-                            bytes=len(payload) + (1 if media_case == "short-storage" else 0),
+                            bytes=len(payload)
+                            + (1 if media_case == "short-storage" else 0),
                         ).to_mapping()
                         if media_case == "unknown-operation":
                             completion["op_id"] = {
@@ -54,13 +69,20 @@ def main():
                                 "request_index": 1000,
                             }
                     fragments = deque()
-                    if config.execution.rank == 0 and len(report["completions"]) > 1:
-                        for index, completion in enumerate(report["completions"]):
+                    if (
+                        config.execution.rank == 0
+                        and len(report["completions"]) > 1
+                    ):
+                        for index, completion in enumerate(
+                            report["completions"]
+                        ):
                             products = [
                                 product
                                 for product in report["products"]
-                                if product["product"]["request_key"] == completion["request_key"]
-                                and product["product"]["producer_op_id"] == completion["op_id"]
+                                if product["product"]["request_key"]
+                                == completion["request_key"]
+                                and product["product"]["producer_op_id"]
+                                == completion["op_id"]
                             ]
                             fragments.append(
                                 {
@@ -86,7 +108,9 @@ def main():
                 else:
                     raise ValueError(f"unsupported framing request {kind}")
                 report = pending[run_id].popleft()
-                endpoint.respond({"kind": "result", "call_id": call_id, "result": report})
+                endpoint.respond(
+                    {"kind": "result", "call_id": call_id, "result": report}
+                )
                 if not pending[run_id]:
                     del pending[run_id]
 

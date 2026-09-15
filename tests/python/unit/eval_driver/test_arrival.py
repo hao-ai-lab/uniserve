@@ -33,7 +33,9 @@ def test_warmup_and_measurement_share_the_submission_concurrency_limit():
     assert len(result.warmup_outputs) == len(result.outputs) == 2
 
 
-def test_measured_duration_excludes_external_profiler_control(monkeypatch, tmp_path):
+def test_measured_duration_excludes_external_profiler_control(
+    monkeypatch, tmp_path
+):
     clock = [0.0]
     monkeypatch.setattr("time.perf_counter", lambda: clock[0])
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/nsys")

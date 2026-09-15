@@ -1,4 +1,7 @@
-"""Public numerical model inputs, outputs and shared computation capabilities."""
+"""Public numerical model inputs and outputs.
+
+Also shared computation capabilities.
+"""
 
 from .decoder import ImageDecoder
 from .denoiser import Denoiser, ImageDenoiser

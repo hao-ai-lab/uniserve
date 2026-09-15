@@ -25,7 +25,10 @@ class _EmptyStreamHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler method name.
         length = int(self.headers.get("content-length", "0"))
         self.rfile.read(length)
-        payload = b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n'
+        payload = (
+            b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("content-length", str(len(payload)))
@@ -36,7 +39,9 @@ class _EmptyStreamHandler(BaseHTTPRequestHandler):
         return
 
 
-def test_failed_warmup_writes_terminal_diagnostic_artifacts(tmp_path: Path) -> None:
+def test_failed_warmup_writes_terminal_diagnostic_artifacts(
+    tmp_path: Path,
+) -> None:
     dataset = tmp_path / "rows.jsonl"
     dataset.write_text(
         json.dumps({"id": "row", "prompt": "hello", "output_len": 2}) + "\n",
@@ -78,7 +83,9 @@ def test_failed_warmup_writes_terminal_diagnostic_artifacts(tmp_path: Path) -> N
     assert state["error"]["type"] == "WarmupFailure"
     warmup = [
         json.loads(line)
-        for line in (output / "warmup_requests.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (output / "warmup_requests.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
     assert len(warmup) == 1
     assert warmup[0]["classifier"] == "response_empty_output"

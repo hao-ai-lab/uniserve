@@ -14,13 +14,16 @@ def split_tiles(
     length: int, tile_size: int, minimum_overlap: int, alignment: int
 ) -> tuple[list[int], list[int], list[int]]:
     """Cover an aligned output extent, distributing excess overlap in order."""
-
     if (
         min(length, tile_size, alignment) < 1
         or not 0 <= minimum_overlap < tile_size
-        or any(value % alignment for value in (length, tile_size, minimum_overlap))
+        or any(
+            value % alignment for value in (length, tile_size, minimum_overlap)
+        )
     ):
-        raise ValueError("spatial tiles and overlap must align with the decoder scale")
+        raise ValueError(
+            "spatial tiles and overlap must align with the decoder scale"
+        )
     if tile_size >= length:
         return [0], [length], []
 
@@ -52,18 +55,23 @@ def stitch_tiles(
     edge arithmetic. Trimming happens only after both blends. The decoded dtype
     determines the cross-fade weights and intermediate rounding.
     """
-
     assembled_rows: list[torch.Tensor] = []
     for row_index, row in enumerate(tiles):
         assembled: list[torch.Tensor] = []
         for column_index, tile in enumerate(row):
             if row_index:
                 tile = blend_decoded_overlap(
-                    tiles[row_index - 1][column_index], tile, height_overlaps[row_index - 1], -2
+                    tiles[row_index - 1][column_index],
+                    tile,
+                    height_overlaps[row_index - 1],
+                    -2,
                 )
             if column_index:
                 tile = blend_decoded_overlap(
-                    row[column_index - 1], tile, width_overlaps[column_index - 1], -1
+                    row[column_index - 1],
+                    tile,
+                    width_overlaps[column_index - 1],
+                    -1,
                 )
             if row_index + 1 < len(tiles) and height_overlaps[row_index]:
                 tile = tile[..., : -height_overlaps[row_index], :]
@@ -93,7 +101,10 @@ class SpatialDecoder(nn.Module):
         overlap_width: int,
     ):
         super().__init__()
-        for extent, overlap in ((tile_height, overlap_height), (tile_width, overlap_width)):
+        for extent, overlap in (
+            (tile_height, overlap_height),
+            (tile_width, overlap_width),
+        ):
             split_tiles(extent, extent, overlap, spatial_compression)
         self.decoder = decoder
         self.spatial_compression = spatial_compression
@@ -104,20 +115,30 @@ class SpatialDecoder(nn.Module):
         return self.decoder(latents)
 
     def decode(self, latents: torch.Tensor, *, tiled: bool) -> torch.Tensor:
-        """Restore NCTHW latents, preserving sample independence within each tile."""
-
+        """Restore NCTHW latents, preserving sample independence within each
+        tile.
+        """  # noqa: D205
         if latents.ndim != 5 or latents.shape[0] < 1:
-            raise ValueError("spatial decoding requires a nonempty NCTHW latent")
+            raise ValueError(
+                "spatial decoding requires a nonempty NCTHW latent"
+            )
         if not tiled:
             return self(latents)
 
-        # Tile extents are output pixels; latent slices divide them by the ratio.
+        # Tile extents are output pixels; latent slices divide them by the
+        # ratio.
         ratio = self.spatial_compression
         y_indices, y_lengths, y_overlaps = split_tiles(
-            int(latents.shape[-2]) * ratio, self.tile_height, self.overlap_height, ratio
+            int(latents.shape[-2]) * ratio,
+            self.tile_height,
+            self.overlap_height,
+            ratio,
         )
         x_indices, x_lengths, x_overlaps = split_tiles(
-            int(latents.shape[-1]) * ratio, self.tile_width, self.overlap_width, ratio
+            int(latents.shape[-1]) * ratio,
+            self.tile_width,
+            self.overlap_width,
+            ratio,
         )
 
         # Decode every tile as one batch: [batch * rows * columns, C, T, H, W].

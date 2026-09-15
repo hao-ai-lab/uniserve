@@ -35,18 +35,28 @@ from .config import ComponentConfig
 
 
 def call_operations(calls: Iterable[Call]) -> frozenset[Computation]:
-    """Resolve computation from capability type and the declared numerical method."""
+    """Resolve computation from capability type and method.
 
+    The computation follows the declared numerical method.
+    """
     operations: set[Computation] = set()
     for call in calls:
         module, method = call.module, call.entry.method
         if isinstance(module, CausalLM) and method == "forward":
-            operations.update((ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY))
+            operations.update(
+                (ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY)
+            )
         elif isinstance(module, Denoiser) and method == "forward":
-            operations.update((PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING))
+            operations.update(
+                (PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING)
+            )
         elif isinstance(module, VideoPostprocessor) and method == "forward":
             operations.update(
-                (PipelineStage.VIDEO_ENCODING, PipelineStage.AUDIO_ENCODING, PipelineStage.MUXING)
+                (
+                    PipelineStage.VIDEO_ENCODING,
+                    PipelineStage.AUDIO_ENCODING,
+                    PipelineStage.MUXING,
+                )
             )
         elif method == "encode":
             if isinstance(module, TextEncoder):
@@ -80,10 +90,11 @@ def describe_components(
     method and thereby name its whole component. Numerical sharing does not
     imply placement ownership.
     """
-
     if entries is None or paths is None:
         package = import_module(type(model).__module__)
-        entries = package.entry_points(model.config) if entries is None else entries
+        entries = (
+            package.entry_points(model.config) if entries is None else entries
+        )
         paths = package.entry_paths if paths is None else paths
 
     owners: dict[tuple[str, str], str] = {}
@@ -99,7 +110,9 @@ def describe_components(
             try:
                 module = model.get_submodule(path)
             except AttributeError as error:
-                raise unsupported_setup(f"entry module {path!r} does not exist") from error
+                raise unsupported_setup(
+                    f"entry module {path!r} does not exist"
+                ) from error
             if module is None:
                 # The full declaration remains available on ranks where a
                 # first/last-stage submodule has no resident numerical state.
@@ -109,22 +122,34 @@ def describe_components(
                     parent = model.get_submodule(parent_path)
                     mesh = getattr(parent, "mesh", None)
                     if isinstance(mesh, DeviceMesh):
-                        pipeline = mesh.get_group("pp" if "pp" in mesh.axes else ())
+                        pipeline = mesh.get_group(
+                            "pp" if "pp" in mesh.axes else ()
+                        )
                         if (point.stage == "first" and pipeline.rank != 0) or (
-                            point.stage == "last" and pipeline.rank != pipeline.size - 1
+                            point.stage == "last"
+                            and pipeline.rank != pipeline.size - 1
                         ):
                             break
-                        raise unsupported_setup(f"participating component {path!r} was removed")
+                        raise unsupported_setup(
+                            f"participating component {path!r} was removed"
+                        )
                 else:
-                    raise unsupported_setup(f"component {path!r} has no numerical module")
+                    raise unsupported_setup(
+                        f"component {path!r} has no numerical module"
+                    )
                 continue
             if not callable(getattr(module, method, None)):
-                raise unsupported_setup(f"component {path!r} has no callable {method!r}")
+                raise unsupported_setup(
+                    f"component {path!r} has no callable {method!r}"
+                )
             call = Call(path, module, replace(point, method=method))
             if not call_operations((call,)) and not (
-                isinstance(module, CausalLM) and method in {"embed_input_ids", "compute_logits"}
+                isinstance(module, CausalLM)
+                and method in {"embed_input_ids", "compute_logits"}
             ):
-                raise unsupported_setup(f"worker cannot execute capability {path}.{method}")
+                raise unsupported_setup(
+                    f"worker cannot execute capability {path}.{method}"
+                )
             calls[component].append(call)
 
     anchors = {}
@@ -132,23 +157,32 @@ def describe_components(
         owner, _, method = path.rpartition(".")
         key = (owner, method)
         if key not in owners:
-            raise unsupported_setup(f"IPC entry {name!r} references undeclared method {path!r}")
+            raise unsupported_setup(
+                f"IPC entry {name!r} references undeclared method {path!r}"
+            )
         component = owners[key]
         if component in anchors:
-            raise unsupported_setup(f"component {component!r} belongs to multiple IPC entries")
+            raise unsupported_setup(
+                f"component {component!r} belongs to multiple IPC entries"
+            )
         anchors[component] = name
 
     missing = entries.keys() - anchors.keys()
     if missing:
-        raise unsupported_setup(f"components {sorted(missing)} require an explicit IPC entry")
+        raise unsupported_setup(
+            f"components {sorted(missing)} require an explicit IPC entry"
+        )
 
-    return {name: tuple(calls[component]) for component, name in anchors.items()}
+    return {
+        name: tuple(calls[component]) for component, name in anchors.items()
+    }
 
 
 def supported_operations(model: nn.Module) -> frozenset[Computation]:
-    """Collect every computation and transfer mode the loaded model can serve."""
-
-    calls = tuple(call for calls in describe_components(model).values() for call in calls)
+    """Collect every computation and transfer mode the model can serve."""
+    calls = tuple(
+        call for calls in describe_components(model).values() for call in calls
+    )
     operations = {TransferMode.TENSOR, *call_operations(calls)}
     if any(isinstance(call.module, CausalLM) for call in calls):
         operations.update((TransferMode.KV_PUBLISH, TransferMode.KV_INSTALL))
@@ -157,7 +191,6 @@ def supported_operations(model: nn.Module) -> frozenset[Computation]:
 
 def media_components(model: nn.Module) -> dict[PipelineStage, str]:
     """Resolve the media pipeline's component routing from its capabilities."""
-
     components = describe_components(model)
     if not any(
         isinstance(call.module, VideoPostprocessor)
@@ -181,13 +214,22 @@ def media_components(model: nn.Module) -> dict[PipelineStage, str]:
     for name, calls in components.items():
         for stage in call_operations(calls) & stages:
             if stage in routes:
-                raise unsupported_setup(f"media pipeline repeats {stage.value} computation")
+                raise unsupported_setup(
+                    f"media pipeline repeats {stage.value} computation"
+                )
             routes[stage] = name
 
     if stages - routes.keys():
-        raise unsupported_setup("media pipeline lacks required numerical capabilities")
-    if routes[PipelineStage.LATENT_PREPARATION] != routes[PipelineStage.DENOISING]:
-        raise unsupported_setup("latent preparation must participate in the denoiser entry")
+        raise unsupported_setup(
+            "media pipeline lacks required numerical capabilities"
+        )
+    if (
+        routes[PipelineStage.LATENT_PREPARATION]
+        != routes[PipelineStage.DENOISING]
+    ):
+        raise unsupported_setup(
+            "latent preparation must participate in the denoiser entry"
+        )
     return routes
 
 
@@ -199,22 +241,29 @@ def validate_components(
     paths: Mapping[str, str] | None = None,
 ) -> dict[str, tuple[Call, ...]]:
     """Validate physical placement before loading weights or creating groups."""
-
     declared = describe_components(model, entries=entries, paths=paths)
     unknown = components.keys() - declared.keys()
     if unknown:
-        raise unsupported_setup(f"unknown computation entries {sorted(unknown)}")
+        raise unsupported_setup(
+            f"unknown computation entries {sorted(unknown)}"
+        )
     for name, component in components.items():
         calls = declared[name]
         if not calls:
             raise unsupported_setup(f"entry {name!r} has no numerical methods")
         if any(isinstance(call.module, VideoDecoder) for call in calls):
-            if component.distribution != "temporal_units" or component.units_per_rank != 1:
+            if (
+                component.distribution != "temporal_units"
+                or component.units_per_rank != 1
+            ):
                 raise unsupported_setup(
-                    "video decoding requires temporal_units with one native unit per rank"
+                    "video decoding requires temporal_units with one native "
+                    "unit per rank"
                 )
         elif component.distribution is not None:
-            raise unsupported_setup(f"entry {name!r} requires model-parallel membership")
+            raise unsupported_setup(
+                f"entry {name!r} requires model-parallel membership"
+            )
     return declared
 
 
@@ -225,8 +274,10 @@ def bind_components(
     entries: Mapping[str, tuple[EntryPoint, ...]] | None = None,
     paths: Mapping[str, str] | None = None,
 ) -> None:
-    """Borrow methods and communicator views for each local participating stage."""
+    """Borrow methods and communicator views for each local stage.
 
+    Views are borrowed for every participating stage.
+    """
     declared = validate_components(
         model,
         {name: binding.config for name, binding in bindings.items()},
@@ -254,7 +305,8 @@ def bind_components(
                     tuple(
                         axis
                         for axis in mesh.axes
-                        if axis.startswith("cp") or (role == "sp" and axis == "ulysses")
+                        if axis.startswith("cp")
+                        or (role == "sp" and axis == "ulysses")
                     )
                     if role in {"cp", "sp"}
                     else (role,)

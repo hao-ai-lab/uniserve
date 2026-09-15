@@ -21,7 +21,9 @@ class MediaBuilder:
     views required for one invocation.
     """
 
-    def __init__(self, denoiser: Denoiser, *, max_frames: int, max_text_tokens: int) -> None:
+    def __init__(
+        self, denoiser: Denoiser, *, max_frames: int, max_text_tokens: int
+    ) -> None:
         # Admission advertises complete native windows, including the final
         # overlap. Cover the configured duration with the next legal input.
         frames = max(22, max_frames + (5 - max_frames) % 17)
@@ -35,12 +37,16 @@ class MediaBuilder:
             size.num_frames > self.maximum.num_frames
             or size.num_text_tokens > self.maximum.num_text_tokens
         ):
-            raise ValueError("media input exceeds the worker frame or conditioning capacity")
+            raise ValueError(
+                "media input exceeds the worker frame or conditioning capacity"
+            )
         return size
 
     def buffers(self, size: DenoiserSize) -> Mapping[str, BufferConfig]:
-        """Describe request state, complete CPU draws and transfer source views."""
+        """Describe request state.
 
+        complete CPU draws and transfer source views.
+        """
         result = dict(self.denoiser.state_buffers(size))
         for name in self.denoiser.modalities:
             result[f"{name}_noise"] = BufferConfig(
@@ -48,7 +54,8 @@ class MediaBuilder:
             )
             result[f"{name}_source"] = replace(result[name], host=True)
         result["text_condition"] = BufferConfig(
-            (size.num_text_tokens, self.denoiser.config.hidden_size), torch.bfloat16
+            (size.num_text_tokens, self.denoiser.config.hidden_size),
+            torch.bfloat16,
         )
         return result
 
@@ -59,7 +66,6 @@ class MediaBuilder:
         sequence rank. Global modality extents provide a conservative bound
         without assuming that the maximum-size request has the largest shard.
         """
-
         result = dict(self.buffers(self.maximum))
         for name in self.denoiser.modalities:
             capacity = self.denoiser.latent_shape(name, self.maximum)
@@ -67,9 +73,13 @@ class MediaBuilder:
                 result[key] = replace(result[key], capacity_shape=capacity)
         return result
 
-    def schedules(self, *, device: torch.device | str) -> Mapping[str, Schedule]:
+    def schedules(
+        self, *, device: torch.device | str
+    ) -> Mapping[str, Schedule]:
         """Build the fixed denoising schedule for every modality."""
-        return self.denoiser.make_schedules(self.num_steps, shift=None, device=device)
+        return self.denoiser.make_schedules(
+            self.num_steps, shift=None, device=device
+        )
 
     @torch.inference_mode()
     def initialize(
@@ -81,18 +91,28 @@ class MediaBuilder:
         constants: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
-        """Fill CPU transfer sources and return destination/source pairs to stage."""
+        """Fill CPU transfer sources and return destination/source pairs to.
 
+        stage.
+        """
         names = self.denoiser.modalities
         # The denoiser's numerical calls batch over leading size 1.
         noise = {name: tensors[f"{name}_noise"].unsqueeze(0) for name in names}
-        source = {name: tensors[f"{name}_source"].unsqueeze(0) for name in names}
+        source = {
+            name: tensors[f"{name}_source"].unsqueeze(0) for name in names
+        }
 
         normal_noise((seed,), out=tuple(noise.values()))
         self.denoiser.prepare_latents(
-            (size,), noise=noise, state=source, constants=constants, workspace=workspace
+            (size,),
+            noise=noise,
+            state=source,
+            constants=constants,
+            workspace=workspace,
         )
-        return tuple((tensors[name], tensors[f"{name}_source"]) for name in names)
+        return tuple(
+            (tensors[name], tensors[f"{name}_source"]) for name in names
+        )
 
     def bind(
         self,
@@ -107,7 +127,11 @@ class MediaBuilder:
 
         return DenoiserInput(
             latents={
-                name: (LatentInput(tensors[name], schedules[name].timesteps[index]),)
+                name: (
+                    LatentInput(
+                        tensors[name], schedules[name].timesteps[index]
+                    ),
+                )
                 for name in self.denoiser.modalities
             },
             sizes=(size,),

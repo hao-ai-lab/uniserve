@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from uniserve.nn.attention import SequenceLengths, VarlenInput
 from uniserve_models.qwen3 import Config, Transformer
 
-
 pytestmark = pytest.mark.unit
 
 
@@ -41,27 +40,41 @@ def _decoder(*, normalize_output: bool) -> Transformer:
             if parameter.ndim == 1:
                 parameter.fill_(1)
             else:
-                parameter.copy_(torch.randn(parameter.shape, generator=generator) / 8)
+                parameter.copy_(
+                    torch.randn(parameter.shape, generator=generator) / 8
+                )
     return model
 
 
 def _forward(model, embeddings, positions):
     batch, length, width = embeddings.shape
-    lengths = SequenceLengths.from_lengths((length,) * batch, device=embeddings.device)
+    lengths = SequenceLengths.from_lengths(
+        (length,) * batch, device=embeddings.device
+    )
     attention = VarlenInput(lengths, lengths, (True,) * batch)
-    result = model(embeddings.reshape(-1, width), positions.expand(batch, -1).flatten(), attention)
+    result = model(
+        embeddings.reshape(-1, width),
+        positions.expand(batch, -1).flatten(),
+        attention,
+    )
     return result.view(batch, length, width)
 
 
 @pytest.mark.parametrize("normalize_output", [False, True])
-def test_full_sequence_decoder_preserves_causal_prefix_and_batch_independence(normalize_output):
+def test_full_sequence_decoder_preserves_causal_prefix_and_batch_independence(
+    normalize_output,
+):
     model = _decoder(normalize_output=normalize_output)
     tokens = torch.tensor([[1, 3, 5, 7, 9, 11], [1, 3, 5, 2, 4, 6]])
     positions = torch.arange(tokens.shape[1]).expand_as(tokens)
     with torch.inference_mode():
         together = _forward(model, model.embed_input_ids(tokens), positions)
-        first = _forward(model, model.embed_input_ids(tokens[:1]), positions[:1])
-        prefix = _forward(model, model.embed_input_ids(tokens[:1, :3]), positions[:1, :3])
+        first = _forward(
+            model, model.embed_input_ids(tokens[:1]), positions[:1]
+        )
+        prefix = _forward(
+            model, model.embed_input_ids(tokens[:1, :3]), positions[:1, :3]
+        )
 
     torch.testing.assert_close(together[0], first[0])
     torch.testing.assert_close(together[0, :3], together[1, :3])
@@ -70,7 +83,9 @@ def test_full_sequence_decoder_preserves_causal_prefix_and_batch_independence(no
 
 
 @pytest.mark.parametrize("normalize_output", [False, True])
-def test_full_sequence_decoder_returns_requested_residual_stream(normalize_output):
+def test_full_sequence_decoder_returns_requested_residual_stream(
+    normalize_output,
+):
     model = _decoder(normalize_output=normalize_output)
     with torch.no_grad():
         for parameter in model.parameters():
@@ -79,7 +94,9 @@ def test_full_sequence_decoder_returns_requested_residual_stream(normalize_outpu
     inputs = torch.arange(1, 49, dtype=torch.float32).reshape(1, 3, 16) / 16
     with torch.inference_mode():
         actual = _forward(model, inputs, torch.arange(3))
-    expected = F.rms_norm(inputs, (16,), eps=1e-6) if normalize_output else inputs
+    expected = (
+        F.rms_norm(inputs, (16,), eps=1e-6) if normalize_output else inputs
+    )
     torch.testing.assert_close(actual, expected)
 
 

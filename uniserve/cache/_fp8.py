@@ -13,12 +13,12 @@ def rescale_(
     *,
     dtype: torch.dtype,
 ) -> None:
-    """Preserve decoded values, including logical-dtype rounding, on growing blocks.
+    """Preserve decoded values on growing blocks.
 
-    Scale tensors are read-only during this operation. The caller commits new
-    scales after re-encoding, on the same stream, then writes incoming values.
+    Including logical-dtype rounding. Scale tensors are read-only during
+    this operation. The caller commits new scales after re-encoding, on
+    the same stream, then writes incoming values.
     """
-
     if values.is_cuda:
         # Numerical views select their backing device, independently of the
         # caller's ambient CUDA device. The context restores it on return.
@@ -30,7 +30,11 @@ def rescale_(
     for block in range(values.shape[0]):
         if initialized[block] and new[block] > old[block]:
             decoded = (values[block].float() * old[block]).to(dtype).float()
-            values[block].copy_((decoded / new[block]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn))
+            values[block].copy_(
+                (decoded / new[block])
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+            )
 
 
 def _rescale(values, old, new, initialized, *, dtype):
@@ -49,6 +53,10 @@ def _rescale(values, old, new, initialized, *, dtype):
         initialized,
         width,
         triton.next_power_of_2(min(width, 1024)),
-        {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}[dtype],
+        {
+            torch.float16: tl.float16,
+            torch.bfloat16: tl.bfloat16,
+            torch.float32: tl.float32,
+        }[dtype],
         num_warps=4,
     )

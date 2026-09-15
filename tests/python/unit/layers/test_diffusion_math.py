@@ -1,4 +1,7 @@
-"""Diffusion trajectories retain analytical selection, draw order and solver math."""
+"""Diffusion trajectories retain analytical selection and draw order.
+
+They also retain solver math.
+"""
 
 import pytest
 import torch
@@ -17,9 +20,14 @@ from uniserve.diffusion import (
 
 
 def test_guidance_interval_uses_unrounded_coordinate():
-    schedule = make_schedule(3, shift=1.0, direction="ascending", shift_domain="time", device="cpu")
+    schedule = make_schedule(
+        3, shift=1.0, direction="ascending", shift_domain="time", device="cpu"
+    )
     guidance = AdditiveGuidance(4.0, 1.0, (1 / 3, 1 / 3), Renorm.NONE, 0.0)
-    assert guidance.branches(schedule, 1) == (Branch.CONDITIONED, Branch.TEXT_UNCONDITIONAL)
+    assert guidance.branches(schedule, 1) == (
+        Branch.CONDITIONED,
+        Branch.TEXT_UNCONDITIONAL,
+    )
     assert guidance.branches(schedule, 0) == (Branch.CONDITIONED,)
     assert guidance.branches(schedule, 2) == (Branch.CONDITIONED,)
     with pytest.raises(IndexError):
@@ -34,7 +42,9 @@ def test_guidance_interval_uses_unrounded_coordinate():
     ],
 )
 def test_guidance_combines_text_and_image_equations(guidance, expected):
-    schedule = make_schedule(1, shift=1.0, direction="ascending", shift_domain="time", device="cpu")
+    schedule = make_schedule(
+        1, shift=1.0, direction="ascending", shift_domain="time", device="cpu"
+    )
     # C = [[5, -1], [3, 7]], T = [[1, 1], [1, 3]], I = [[-1, 1], [3, 1]].
     # Additive: I + 2(T-I) + 3(C-T); nested: I + 2(T + 3(C-T) - I).
     outputs = {
@@ -49,14 +59,19 @@ def test_guidance_combines_text_and_image_equations(guidance, expected):
 
 
 def test_guidance_channel_norm_does_not_expand_predictions():
-    schedule = make_schedule(1, shift=1, direction="ascending", shift_domain="time", device="cpu")
+    schedule = make_schedule(
+        1, shift=1, direction="ascending", shift_domain="time", device="cpu"
+    )
     options = AdditiveGuidance(2, 1, (0, 1), Renorm.CHANNEL, 0)
     outputs = {
         Branch.CONDITIONED: torch.tensor([[3.0, 4.0], [0.0, 2.0]]),
         Branch.TEXT_UNCONDITIONAL: torch.zeros(2, 2),
     }
     torch.testing.assert_close(
-        options.combine(outputs, schedule, 0), outputs[Branch.CONDITIONED], rtol=0, atol=0
+        options.combine(outputs, schedule, 0),
+        outputs[Branch.CONDITIONED],
+        rtol=0,
+        atol=0,
     )
 
 
@@ -70,10 +85,14 @@ def test_guidance_channel_norm_does_not_expand_predictions():
     ],
 )
 def test_shifted_schedule_has_complete_endpoints(direction, domain, expected):
-    schedule = make_schedule(2, shift=3, direction=direction, shift_domain=domain, device="cpu")
+    schedule = make_schedule(
+        2, shift=3, direction=direction, shift_domain=domain, device="cpu"
+    )
     assert schedule.coordinates == expected
     assert schedule.num_steps == 2
-    torch.testing.assert_close(schedule.sigmas[[0, -1]], torch.tensor([1.0, 0.0]), rtol=0, atol=0)
+    torch.testing.assert_close(
+        schedule.sigmas[[0, -1]], torch.tensor([1.0, 0.0]), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -91,7 +110,9 @@ def test_euler_and_clean_sample_predictions_update_the_same_trajectory(dtype):
             sigma=torch.tensor(0.5),
             next_sigma=torch.tensor(0.25),
         )
-        torch.testing.assert_close(output, torch.tensor([2.25, -0.5], dtype=dtype), rtol=0, atol=0)
+        torch.testing.assert_close(
+            output, torch.tensor([2.25, -0.5], dtype=dtype), rtol=0, atol=0
+        )
     output = sample.clone()
     prediction = velocity.clone()
     CleanSampleEulerSolver().step_(
@@ -102,7 +123,9 @@ def test_euler_and_clean_sample_predictions_update_the_same_trajectory(dtype):
         sigma=torch.tensor(0.5),
         next_sigma=torch.tensor(0.25),
     )
-    torch.testing.assert_close(output, torch.tensor([2.25, -0.5], dtype=dtype), rtol=0, atol=0)
+    torch.testing.assert_close(
+        output, torch.tensor([2.25, -0.5], dtype=dtype), rtol=0, atol=0
+    )
     torch.testing.assert_close(prediction, clean, rtol=0, atol=0)
 
 
@@ -130,11 +153,16 @@ def test_patch_order_preserves_pixels_then_channels():
     from uniserve.nn.functional import patchify, unpatchify
 
     pixels = torch.arange(16).reshape(2, 2, 4)
-    expected = torch.tensor([[0, 8, 1, 9, 4, 12, 5, 13], [2, 10, 3, 11, 6, 14, 7, 15]])
+    expected = torch.tensor(
+        [[0, 8, 1, 9, 4, 12, 5, 13], [2, 10, 3, 11, 6, 14, 7, 15]]
+    )
     patches = patchify(pixels, patch_size=2)
     torch.testing.assert_close(patches, expected, rtol=0, atol=0)
     torch.testing.assert_close(
-        unpatchify(patches, image.Config(2, 4), patch_size=2, channels=2), pixels, rtol=0, atol=0
+        unpatchify(patches, image.Config(2, 4), patch_size=2, channels=2),
+        pixels,
+        rtol=0,
+        atol=0,
     )
 
 
@@ -173,7 +201,9 @@ def test_public_image_step_uses_borrowed_sample_and_input_time():
                 layout = OutputLayout(
                     tuple(prediction.shape),
                     prediction.dtype,
-                    local_slice=tuple(slice(0, width) for width in prediction.shape),
+                    local_slice=tuple(
+                        slice(0, width) for width in prediction.shape
+                    ),
                 )
                 outputs.append(TensorOutput(prediction, layout))
             return {"image": tuple(outputs)}
@@ -183,10 +213,18 @@ def test_public_image_step_uses_borrowed_sample_and_input_time():
     noise = torch.ones(1, *network.noise_shape("image", size))
     sample = torch.empty(1, *network.latent_shape("image", size))
     network.prepare_latents(
-        (size,), noise={"image": noise}, state={"image": sample}, constants={}, workspace={}
+        (size,),
+        noise={"image": noise},
+        state={"image": sample},
+        constants={},
+        workspace={},
     )
-    torch.testing.assert_close(sample, torch.full_like(sample, 2), rtol=0, atol=0)
-    inputs = DenoiserInput({"image": (LatentInput(sample[0], torch.tensor(0.5)),)}, (size,), 0)
+    torch.testing.assert_close(
+        sample, torch.full_like(sample, 2), rtol=0, atol=0
+    )
+    inputs = DenoiserInput(
+        {"image": (LatentInput(sample[0], torch.tensor(0.5)),)}, (size,), 0
+    )
     step = DenoisingStep(
         network,
         inputs,
@@ -198,7 +236,9 @@ def test_public_image_step_uses_borrowed_sample_and_input_time():
     result = step()
     assert result["image"][0] is inputs.latents["image"][0].tensor
     # dx/dt = 2x evaluated at x=2, from supplied t=1/2 to the terminal t=1.
-    torch.testing.assert_close(sample, torch.full_like(sample, 4), rtol=0, atol=0)
+    torch.testing.assert_close(
+        sample, torch.full_like(sample, 4), rtol=0, atol=0
+    )
     torch.testing.assert_close(noise, torch.ones_like(noise), rtol=0, atol=0)
 
 
@@ -210,7 +250,10 @@ def test_image_decoder_restores_different_rasters_in_input_order():
 
     sizes = (image.Config(2, 4), image.Config(4, 2), image.Config(2, 4))
     pixels = tuple(
-        torch.arange(3 * size.height * size.width).reshape(3, size.height, size.width).float() / 20
+        torch.arange(3 * size.height * size.width)
+        .reshape(3, size.height, size.width)
+        .float()
+        / 20
         + index
         for index, size in enumerate(sizes)
     )

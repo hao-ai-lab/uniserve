@@ -1,10 +1,12 @@
 """Typed worker error taxonomy.
 
-Every failure is classified into a stable error class with ``code``, ``message``,
-``retryable``, and ``fatal`` (whether the worker process must be torn down).
+Every failure is classified into a stable error class with ``code``,
+``message``, ``retryable``, and ``fatal`` (whether the worker process must
+be torn down).
 
-``to_mapping()`` produces ``{"kind": "error", "message", "code", "retryable",
-"fatal", ...}``. Message fields are scalars and short strings only — never tensors.
+``to_mapping()`` produces ``{"kind": "error", "message", "code",
+"retryable", "fatal", ...}``. Message fields are scalars and short strings
+only — never tensors.
 """
 
 from __future__ import annotations
@@ -88,16 +90,20 @@ _POLICY: dict[WorkerErrorCode, ErrorPolicy] = {
 
 
 def should_capture_trace(code: WorkerErrorCode) -> bool:
-    """Return whether an error of this class warrants a stack trace in its log line.
+    """Return whether an error of this class warrants a stack trace.
 
-    The single source for that decision so the request handler shares one policy table.
+    The trace appears in the error's log line. The single source for that
+    decision, so the request handler shares one policy table.
     """
     return _POLICY.get(code, _DEFAULT_POLICY).capture_trace
 
 
 @dataclass
 class WorkerError(Exception):
-    """A classified worker error. Raise it directly or build via ``classify``."""
+    """A classified worker error.
+
+    Raise it directly or build via ``classify``.
+    """
 
     code: WorkerErrorCode
     message: str
@@ -112,14 +118,19 @@ class WorkerError(Exception):
     details: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Initialize the exception message from the classified worker error fields."""
+        """Initialize the exception message.
 
+        The message is built from the classified worker error fields.
+        """
         Exception.__init__(self, f"{self.code}: {self.message}")
 
     def to_mapping(self) -> dict[str, Any]:
-        """Serialize the stable error code, message, fatal flag, and optional operation context."""
+        """Serialize the stable error code, message, and fatal flag.
 
-        # Only the fields modeled on the Rust WorkerResponse cross the IPC boundary.
+        Optional operation context is serialized as well.
+        """
+        # Only the fields modeled on the Rust WorkerResponse cross the IPC
+        # boundary.
         # Richer context (req_id, op_id, op_kind, details) stays local
         # for logging and metrics.
         return {
@@ -139,7 +150,12 @@ class WorkerError(Exception):
                     },
                     "op_id": op_id.to_mapping(),
                 }
-                for engine_id, request_id, request_epoch, op_id in self.operations
+                for (
+                    engine_id,
+                    request_id,
+                    request_epoch,
+                    op_id,
+                ) in self.operations
             ],
         }
 
@@ -148,41 +164,52 @@ class InputError(WorkerError):
     """A staged execution input is invalid for its declared route."""
 
     def __init__(self, message: str, **kw: Any) -> None:
-        """Create a request-scoped input failure with the configured retry policy."""
+        """Create a request-scoped input failure.
 
+        The failure carries the configured retry policy.
+        """
         policy = _POLICY[WorkerErrorCode.INPUT_ERROR]
         kw.setdefault("retryable", policy.retryable)
         kw.setdefault("fatal", policy.fatal)
-        super().__init__(code=WorkerErrorCode.INPUT_ERROR, message=message, **kw)
+        super().__init__(
+            code=WorkerErrorCode.INPUT_ERROR, message=message, **kw
+        )
 
 
 class ComputeError(WorkerError):
     """Neural execution or raw-output validation failed."""
 
     def __init__(self, message: str, **kw: Any) -> None:
-        """Create a request-scoped execution failure with the configured retry policy."""
+        """Create a request-scoped execution failure.
 
+        The failure carries the configured retry policy.
+        """
         policy = _POLICY[WorkerErrorCode.COMPUTE_ERROR]
         kw.setdefault("retryable", policy.retryable)
         kw.setdefault("fatal", policy.fatal)
-        super().__init__(code=WorkerErrorCode.COMPUTE_ERROR, message=message, **kw)
+        super().__init__(
+            code=WorkerErrorCode.COMPUTE_ERROR, message=message, **kw
+        )
 
 
 class ResourceError(WorkerError):
     """Graph, device, allocation, communication, or residency failed."""
 
     def __init__(self, message: str, **kw: Any) -> None:
-        """Create a resource failure with the configured retry and fatality policy."""
+        """Create a resource failure.
 
+        The failure carries the configured retry and fatality policy.
+        """
         policy = _POLICY[WorkerErrorCode.RESOURCE_ERROR]
         kw.setdefault("retryable", policy.retryable)
         kw.setdefault("fatal", policy.fatal)
-        super().__init__(code=WorkerErrorCode.RESOURCE_ERROR, message=message, **kw)
+        super().__init__(
+            code=WorkerErrorCode.RESOURCE_ERROR, message=message, **kw
+        )
 
 
 def _make(code: WorkerErrorCode, message: str, **kw: Any) -> WorkerError:
     """Construct a classified worker error with shared contextual fields."""
-
     policy = _POLICY.get(code, _DEFAULT_POLICY)
     kw.setdefault("retryable", policy.retryable)
     kw.setdefault("fatal", policy.fatal)
@@ -213,8 +240,10 @@ _FATAL_CUDA_TEXT_TOKENS = (
 
 
 def _looks_like_oom(exc: BaseException, lowered_msg: str) -> bool:
-    """Return whether an exception type or message denotes resource exhaustion."""
+    """Return whether an exception denotes resource exhaustion.
 
+    Both the exception type and its message are examined.
+    """
     for cls in type(exc).__mro__:
         lname = cls.__name__.lower()
         if any(tok in lname for tok in _OOM_TYPE_TOKENS):
@@ -223,14 +252,15 @@ def _looks_like_oom(exc: BaseException, lowered_msg: str) -> bool:
 
 
 def _looks_like_fatal_cuda(lowered_msg: str) -> bool:
-    """Return whether an error message denotes an unrecoverable CUDA context failure."""
+    """Return whether a message denotes an unrecoverable CUDA failure.
 
+    The failure corrupts the CUDA context.
+    """
     return any(tok in lowered_msg for tok in _FATAL_CUDA_TEXT_TOKENS)
 
 
 def unsupported_control(name: str) -> WorkerError:
     """Create a classified error for an unrecognized control-plane request."""
-
     return _make(
         WorkerErrorCode.UNSUPPORTED_CONTROL,
         f"control {name!r} is not supported by this worker",
@@ -238,8 +268,10 @@ def unsupported_control(name: str) -> WorkerError:
 
 
 def unsupported_operation(kind: str, req_id: int | None = None) -> WorkerError:
-    """Create a classified error for an operation kind unavailable on this worker."""
+    """Create a classified error for an unavailable operation kind.
 
+    The operation kind is unavailable on this worker.
+    """
     return _make(
         WorkerErrorCode.UNSUPPORTED_OPERATION,
         f"op kind {kind!r} is not supported by this worker",
@@ -250,25 +282,27 @@ def unsupported_operation(kind: str, req_id: int | None = None) -> WorkerError:
 
 def invalid_descriptor(message: str, **kw: Any) -> WorkerError:
     """Create a classified error for malformed scheduler or transport input."""
-
     return _make(WorkerErrorCode.INVALID_DESCRIPTOR, message, **kw)
 
 
 def unsupported_setup(message: str, **kw: Any) -> WorkerError:
-    """Create a classified error for launch configuration the runtime cannot provide."""
+    """Create a classified error for launch configuration.
 
+    The configuration is one the runtime cannot provide.
+    """
     return _make(WorkerErrorCode.UNSUPPORTED_SETUP, message, **kw)
 
 
 def compute_error(message: str, **kw: Any) -> ComputeError:
     """Create a nonfatal classified error for model execution failure."""
-
     return ComputeError(message, **kw)
 
 
 def resource_error(message: str, **kw: Any) -> ResourceError:
-    """Create a classified error for exhausted or unavailable runtime resources."""
+    """Create a classified error for exhausted runtime resources.
 
+    Unavailable runtime resources are covered as well.
+    """
     return ResourceError(message, **kw)
 
 
@@ -281,8 +315,14 @@ def resource_error(message: str, **kw: Any) -> ResourceError:
 #     follow the text/hierarchy heuristics.
 # An exception matching no rule falls through to ComputeError below.
 _CLASSIFY_RULES: list[tuple[Any, WorkerErrorCode]] = [
-    (lambda exc, lowered: _looks_like_fatal_cuda(lowered), WorkerErrorCode.FATAL_WORKER_FAILURE),
-    (lambda exc, lowered: _looks_like_oom(exc, lowered), WorkerErrorCode.RESOURCE_ERROR),
+    (
+        lambda exc, lowered: _looks_like_fatal_cuda(lowered),
+        WorkerErrorCode.FATAL_WORKER_FAILURE,
+    ),
+    (
+        lambda exc, lowered: _looks_like_oom(exc, lowered),
+        WorkerErrorCode.RESOURCE_ERROR,
+    ),
     (
         lambda exc, lowered: isinstance(exc, EventPoolError),
         WorkerErrorCode.INVARIANT_VIOLATION,
@@ -293,7 +333,9 @@ _CLASSIFY_RULES: list[tuple[Any, WorkerErrorCode]] = [
     ),
     # malformed operation or descriptor decoded from IPC
     (
-        lambda exc, lowered: isinstance(exc, (KeyError, IndexError, TypeError, ValueError)),
+        lambda exc, lowered: isinstance(
+            exc, (KeyError, IndexError, TypeError, ValueError)
+        ),
         WorkerErrorCode.INPUT_ERROR,
     ),
     (
@@ -303,7 +345,9 @@ _CLASSIFY_RULES: list[tuple[Any, WorkerErrorCode]] = [
 ]
 
 
-def classify(exc: BaseException, *, context: str | None = None, **kw: Any) -> WorkerError:
+def classify(
+    exc: BaseException, *, context: str | None = None, **kw: Any
+) -> WorkerError:
     """Map an arbitrary exception onto the taxonomy.
 
     Already-classified ``WorkerError``s pass through (callers may enrich ids).
@@ -319,7 +363,8 @@ def classify(exc: BaseException, *, context: str | None = None, **kw: Any) -> Wo
     if context:
         msg = f"{context}: {msg}"
 
-    # torch CUDA OOM (avoid importing torch here; match by class hierarchy + text).
+    # torch CUDA OOM (avoid importing torch here; match by class
+    # hierarchy + text).
     lowered = msg.lower()
     code = WorkerErrorCode.COMPUTE_ERROR
     for predicate, rule_code in _CLASSIFY_RULES:

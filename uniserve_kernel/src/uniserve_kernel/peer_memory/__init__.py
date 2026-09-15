@@ -22,32 +22,38 @@ def _extension():
 
 def allocation_granularity(device: torch.device) -> int:
     """Return the CUDA device allocation granularity in bytes."""
-
     if device.type != "cuda":
         raise ValueError("peer tensor mappings require CUDA")
-    index = torch.cuda.current_device() if device.index is None else device.index
+    index = (
+        torch.cuda.current_device() if device.index is None else device.index
+    )
     return _extension().allocation_granularity(index)
 
 
-def allocate(shape: tuple[int, ...], *, dtype: torch.dtype, device: torch.device):
+def allocate(
+    shape: tuple[int, ...], *, dtype: torch.dtype, device: torch.device
+):
     """Create exactly page-aligned physical storage for one peer's tensor.
 
     The returned allocation exports a POSIX descriptor and maps an ordered
     descriptor list into one tensor via ``map_peers``. Descriptor transport,
     publication, reuse, and retirement belong to the distributed runtime.
     """
+    return _extension().PeerAllocation(
+        torch.empty(0, dtype=dtype, device=device), list(shape)
+    )
 
-    return _extension().PeerAllocation(torch.empty(0, dtype=dtype, device=device), list(shape))
 
+def empty(
+    shape: tuple[int, ...], *, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Allocate exportable CUDA storage.
 
-def empty(shape: tuple[int, ...], *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    """Allocate exportable CUDA storage, rounding physical backing to CUDA pages.
-
-    The tensor owns its allocation and mapping. Its owner must retain it until
-    all local device accesses and remote grants have retired. Logical shape and
-    storage size remain distinct; views retain the complete physical backing.
+    Physical backing is rounded up to CUDA pages. The tensor owns its
+    allocation and mapping. Its owner must retain it until all local device
+    accesses and remote grants have retired. Logical shape and storage size
+    remain distinct; views retain the complete physical backing.
     """
-
     elements = prod(shape)
     if elements == 0:
         return torch.empty(shape, dtype=dtype, device=device)
@@ -66,11 +72,12 @@ def export_fd(tensor: torch.Tensor) -> tuple[int, int, int] | None:
     closes the descriptor and retains the source through every reader grant.
     Other CUDA failures are raised.
     """
-
     return _extension().export_fd(tensor)
 
 
-def import_fd(prototype: torch.Tensor, descriptor: int, allocation_bytes: int) -> torch.Tensor:
+def import_fd(
+    prototype: torch.Tensor, descriptor: int, allocation_bytes: int
+) -> torch.Tensor:
     """Map a granted allocation on the prototype device as a flat typed tensor.
 
     The descriptor remains caller-owned and may be closed after this call. The
@@ -78,7 +85,6 @@ def import_fd(prototype: torch.Tensor, descriptor: int, allocation_bytes: int) -
     until all device reads complete, then release it before acknowledging the
     source grant. This primitive does not synchronize consumer streams.
     """
-
     return _extension().import_fd(prototype, descriptor, allocation_bytes)
 
 
@@ -91,7 +97,6 @@ def copy_host_device(
     agree; this primitive performs no conversion or GPU packing allocation.
     Destination elements must be disjoint, as validated by the transfer owner.
     """
-
     device = source.device if source.is_cuda else destination.device
     if device != stream.device:
         raise ValueError("host/device copy stream belongs to another device")
@@ -101,9 +106,11 @@ def copy_host_device(
 def record_host_usage(tensor: torch.Tensor, stream: torch.cuda.Stream) -> None:
     """Retain pinned storage through a native asynchronous DMA submission.
 
-    Call after native code enqueues a host/device copy outside PyTorch's copy
-    operator. The pinned allocator delays storage reuse until this stream retires
-    the copy; the owner must leave the submitted contents immutable meanwhile.
+    Call after native code enqueues a host/device copy outside PyTorch's
+    copy operator. The pinned allocator delays storage reuse until this
+    stream retires the copy; the owner must leave the submitted contents
+    immutable meanwhile.
     """
-
-    _extension().record_host_usage(tensor, stream.device_index, int(stream.cuda_stream))
+    _extension().record_host_usage(
+        tensor, stream.device_index, int(stream.cuda_stream)
+    )

@@ -46,13 +46,19 @@ class Config:
             "moe_intermediate_size",
         ):
             value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+            ):
                 raise ValueError(f"Qwen3 {name} must be a positive integer")
 
         if self.head_dim % 2:
             raise ValueError("Qwen3 head_dim must be even for rotary positions")
         if self.num_attention_heads % self.num_key_value_heads:
-            raise ValueError("Qwen3 attention heads must be divisible by KV heads")
+            raise ValueError(
+                "Qwen3 attention heads must be divisible by KV heads"
+            )
 
         if (
             not isinstance(self.num_experts, int)
@@ -61,7 +67,9 @@ class Config:
         ):
             raise ValueError("Qwen3 num_experts must be a non-negative integer")
         if self.num_experts and self.num_experts_per_tok > self.num_experts:
-            raise ValueError("Qwen3 num_experts_per_tok must not exceed num_experts")
+            raise ValueError(
+                "Qwen3 num_experts_per_tok must not exceed num_experts"
+            )
 
         for name in ("rms_norm_eps", "rope_theta"):
             value = getattr(self, name)
@@ -88,12 +96,13 @@ class Config:
             "gelu_pytorch_tanh",
             "gelu_tanh",
         }:
-            raise ValueError(f"unsupported Qwen3 hidden_act {self.hidden_act!r}")
+            raise ValueError(
+                f"unsupported Qwen3 hidden_act {self.hidden_act!r}"
+            )
 
 
 def _required_int(config: Mapping[str, object], name: str) -> int:
     """Read a required non-boolean integer from model configuration."""
-
     raw = config.get(name)
     if not isinstance(raw, int) or isinstance(raw, bool):
         raise ValueError(f"Qwen3 config requires integer field {name!r}")
@@ -110,28 +119,29 @@ def _optional_int(
     minimum: int,
 ) -> int:
     """Read and lower-bound an optional integer model setting."""
-
     raw = config.get(name, default)
     if not isinstance(raw, int) or isinstance(raw, bool) or raw < minimum:
-        raise ValueError(f"Qwen3 config field {name!r} must be an integer >= {minimum}")
+        raise ValueError(
+            f"Qwen3 config field {name!r} must be an integer >= {minimum}"
+        )
     return raw
 
 
 def _number(config: Mapping[str, object], name: str, default: float) -> float:
     """Read a numeric model setting while rejecting boolean values."""
-
     raw = config.get(name, default)
     if not isinstance(raw, (int, float)) or isinstance(raw, bool):
         raise ValueError(f"Qwen3 config field {name!r} must be numeric")
     value = float(raw)
     if not math.isfinite(value) or value <= 0:
-        raise ValueError(f"Qwen3 config field {name!r} must be finite and positive")
+        raise ValueError(
+            f"Qwen3 config field {name!r} must be finite and positive"
+        )
     return value
 
 
 def _boolean(config: Mapping[str, object], name: str, default: bool) -> bool:
     """Read a boolean model setting with a default."""
-
     raw = config.get(name, default)
     if not isinstance(raw, bool):
         raise ValueError(f"Qwen3 config field {name!r} must be boolean")
@@ -140,16 +150,16 @@ def _boolean(config: Mapping[str, object], name: str, default: bool) -> bool:
 
 def _string(config: Mapping[str, object], name: str, default: str) -> str:
     """Read a textual model setting with a default."""
-
     raw = config.get(name, default)
     if not isinstance(raw, str) or not raw:
-        raise ValueError(f"Qwen3 config field {name!r} must be a non-empty string")
+        raise ValueError(
+            f"Qwen3 config field {name!r} must be a non-empty string"
+        )
     return raw
 
 
 def read_config(root: Path, io: loading.Config) -> Config:
     """Normalize checkpoint metadata into immutable decoder configuration."""
-
     config = json.loads((root / "config.json").read_text())
 
     rotary = config.get("rope_parameters") or {}
@@ -158,8 +168,13 @@ def read_config(root: Path, io: loading.Config) -> Config:
     if rotary.get("rope_type", "default") != "default":
         raise ValueError("Qwen3 requires the default rotary embedding recipe")
     if "rope_theta" in rotary:
-        if "rope_theta" in config and config["rope_theta"] != rotary["rope_theta"]:
-            raise ValueError("Qwen3 checkpoint has conflicting rope_theta aliases")
+        if (
+            "rope_theta" in config
+            and config["rope_theta"] != rotary["rope_theta"]
+        ):
+            raise ValueError(
+                "Qwen3 checkpoint has conflicting rope_theta aliases"
+            )
         # Current Transformers serializes this numerical field under
         # rope_parameters. Constructors consume its single normalized value.
         config["rope_theta"] = rotary["rope_theta"]
@@ -167,7 +182,9 @@ def read_config(root: Path, io: loading.Config) -> Config:
     hidden_size = _required_int(config, "hidden_size")
     num_attention_heads = _required_int(config, "num_attention_heads")
     if "head_dim" not in config and hidden_size % num_attention_heads:
-        raise ValueError("Qwen3 hidden_size must be divisible by num_attention_heads")
+        raise ValueError(
+            "Qwen3 hidden_size must be divisible by num_attention_heads"
+        )
     head_dim = _optional_int(
         config,
         "head_dim",
@@ -175,7 +192,9 @@ def read_config(root: Path, io: loading.Config) -> Config:
         minimum=1,
     )
     num_experts = _optional_int(config, "num_experts", 0, minimum=0)
-    num_experts_per_tok = _optional_int(config, "num_experts_per_tok", 1, minimum=1)
+    num_experts_per_tok = _optional_int(
+        config, "num_experts_per_tok", 1, minimum=1
+    )
     intermediate_size = _required_int(config, "intermediate_size")
 
     cfg = Config(
@@ -189,7 +208,9 @@ def read_config(root: Path, io: loading.Config) -> Config:
         hidden_act=_string(config, "hidden_act", "silu"),
         rms_norm_eps=_number(config, "rms_norm_eps", 1e-6),
         rope_theta=_number(config, "rope_theta", 1_000_000.0),
-        max_position_embeddings=_optional_int(config, "max_position_embeddings", 4096, minimum=1),
+        max_position_embeddings=_optional_int(
+            config, "max_position_embeddings", 4096, minimum=1
+        ),
         attention_bias=_boolean(config, "attention_bias", False),
         tie_word_embeddings=_boolean(config, "tie_word_embeddings", False),
         num_experts=num_experts,

@@ -28,14 +28,20 @@ class LoadResult:
     duration_s: float
 
 
-class WarmupFailure(RuntimeError):
+class WarmupFailure(RuntimeError):  # noqa: N818  # deliberate taxonomy name
     """Reports outputs from a warmup batch containing a failed request."""
 
     def __init__(self, outputs: list[Any]) -> None:
         """Capture warmup outputs and summarize the first failure."""
-
         self.outputs = tuple(outputs)
-        first = next((output for output in outputs if not getattr(output, "success", False)), None)
+        first = next(
+            (
+                output
+                for output in outputs
+                if not getattr(output, "success", False)
+            ),
+            None,
+        )
         super().__init__(
             "Warmup failed -- check the benchmark arguments and server. "
             f"First classifier: {getattr(first, 'classifier', None)}; "
@@ -49,7 +55,6 @@ async def get_request(
     request_rate: float,
 ) -> AsyncGenerator[Example, None]:
     """Yield rows with exponential inter-arrival delays at a finite rate."""
-
     for row in rows:
         yield row
         if request_rate == float("inf"):
@@ -68,7 +73,6 @@ async def run_load(
     measurement: NsysCapture | None = None,
 ) -> LoadResult:
     """Run warmup, settle, and measured requests under a concurrency limit."""
-
     if not rows:
         return LoadResult((), (), 0.0)
 
@@ -78,20 +82,21 @@ async def run_load(
 
     async def limited(row: Example, scheduled: float | None) -> T:
         """Submit one row within the optional concurrency semaphore."""
-
         if semaphore is None:
             return await submit(row, scheduled)
         async with semaphore:
             return await submit(row, scheduled)
 
-    # Warmup exercises the same request path but remains outside both the profiler
-    # window and the reported duration.
+    # Warmup exercises the same request path but remains outside both the
+    # profiler window and the reported duration.
     warmup_outputs: list[T] = []
     if warmup_requests > 0:
         warmup_outputs = await asyncio.gather(
             *[limited(rows[0], None) for _ in range(warmup_requests)]
         )
-        if not all(getattr(output, "success", False) for output in warmup_outputs):
+        if not all(
+            getattr(output, "success", False) for output in warmup_outputs
+        ):
             raise WarmupFailure(list(warmup_outputs))
 
     await asyncio.sleep(1.0)
@@ -111,8 +116,8 @@ async def run_load(
         if measurement is not None:
             measurement.stop()
 
-    # Duration covers scheduled arrival generation through completion of the final
-    # measured request, matching the throughput denominator.
+    # Duration covers scheduled arrival generation through completion of the
+    # final measured request, matching the throughput denominator.
     return LoadResult(
         tuple(warmup_outputs),
         tuple(outputs),

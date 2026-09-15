@@ -18,10 +18,13 @@ from .packing import build_packing, unpatchify_video_into, video_latent_frames
 
 
 class VideoDecoder(BaseVideoDecoder):
-    """Unpack tile-major H3 video latents into each native seven-frame VAE window."""
+    """Unpack tile-major H3 video latents into each native seven-frame VAE window."""  # noqa: E501
 
     def __init__(self, config: video_vae.Config, *, frame_size: image.Config):
-        super().__init__(video_vae.Model(config, frame_size=frame_size), frame_size=frame_size)
+        super().__init__(
+            video_vae.Model(config, frame_size=frame_size),
+            frame_size=frame_size,
+        )
         self.config = config
 
     def frame_slices(self, num_frames: int) -> tuple[slice, ...]:
@@ -33,7 +36,10 @@ class VideoDecoder(BaseVideoDecoder):
         shape = (units, 1, 3, 25, self.frame_size.height, self.frame_size.width)
         return {
             "video": OutputLayout(
-                shape, torch.float16, tuple(slice(0, n) for n in shape), variable_axes=(0,)
+                shape,
+                torch.float16,
+                tuple(slice(0, n) for n in shape),
+                variable_axes=(0,),
             )
         }
 
@@ -43,7 +49,9 @@ class VideoDecoder(BaseVideoDecoder):
         width = self.frame_size.width // self.config.spatial_compression
         channels = self.config.latent_channels
         return {
-            "video_input": BufferConfig((1, channels, 7, height, width), torch.float32),
+            "video_input": BufferConfig(
+                (1, channels, 7, height, width), torch.float32
+            ),
             "reconstruction_tokens": BufferConfig(
                 (7 * (height // 2) * (width // 2), channels * 4), torch.float32
             ),
@@ -55,18 +63,30 @@ class VideoDecoder(BaseVideoDecoder):
         width = self.frame_size.width // self.config.spatial_compression
         return {
             "video_raster_order": BufferConfig(
-                (video_latent_frames(num_frames) * (height // 2) * (width // 2),), torch.int64
+                (
+                    video_latent_frames(num_frames)
+                    * (height // 2)
+                    * (width // 2),
+                ),
+                torch.int64,
             )
         }
 
     @torch.inference_mode()
-    def prepare_constants(self, num_frames: int, *, out: Mapping[str, torch.Tensor]) -> None:
+    def prepare_constants(
+        self, num_frames: int, *, out: Mapping[str, torch.Tensor]
+    ) -> None:
         configs = self.constant_buffers(num_frames)
         if out.keys() != configs.keys():
             raise ValueError("video decoding requires its raster-order indices")
-        target, config = out["video_raster_order"], configs["video_raster_order"]
+        target, config = (
+            out["video_raster_order"],
+            configs["video_raster_order"],
+        )
         if target.shape != config.shape or target.dtype != config.dtype:
-            raise ValueError("video raster-order indices have incompatible shape or dtype")
+            raise ValueError(
+                "video raster-order indices have incompatible shape or dtype"
+            )
         packed = build_packing(
             num_text_tokens=64,
             num_frames=num_frames,
@@ -75,8 +95,13 @@ class VideoDecoder(BaseVideoDecoder):
         )
         target.copy_(torch.argsort(packed.video_raster_indices))
 
-    def unpack_latents(self, latent, frames, num_frames, *, constants, workspace):
-        target, tokens = workspace["video_input"], workspace["reconstruction_tokens"]
+    def unpack_latents(
+        self, latent, frames, num_frames, *, constants, workspace
+    ):
+        target, tokens = (
+            workspace["video_input"],
+            workspace["reconstruction_tokens"],
+        )
         height, width = target.shape[-2:]
         tokens_per_frame = (height // 2) * (width // 2)
         shape = (
@@ -85,13 +110,17 @@ class VideoDecoder(BaseVideoDecoder):
         )
         if latent.shape != shape:
             raise ValueError(
-                f"video decoder requires complete final latent tokens with shape {shape}"
+                f"video decoder requires complete final latent tokens "
+                f"with shape {shape}"
             )
-        # Each 17-frame unit consumes a 7-latent-frame VAE window: 5 new frames
-        # beyond the previous unit plus the 2-frame temporal overlap behind them.
+        # Each 17-frame unit consumes a 7-latent-frame VAE window: 5 new
+        # frames beyond the previous unit plus the 2-frame temporal overlap
+        # behind them.
         unit = frames.start // 17
         start = unit * 5 * tokens_per_frame
-        indices = constants["video_raster_order"][start : start + 7 * tokens_per_frame]
+        indices = constants["video_raster_order"][
+            start : start + 7 * tokens_per_frame
+        ]
         torch.index_select(latent, 0, indices, out=tokens)
         unpatchify_video_into(
             tokens,
@@ -124,12 +153,18 @@ class AudioDecoder(BaseAudioDecoder):
 
     def latent_frames(self, num_samples: int) -> int:
         if type(num_samples) is not int or num_samples < 1:
-            raise ValueError("audio duration must contain a positive sample count")
+            raise ValueError(
+                "audio duration must contain a positive sample count"
+            )
         return math.ceil(num_samples / math.prod(self.config.encoder_rates))
 
-    def workspace_buffers(self, latent_frames: int) -> Mapping[str, BufferConfig]:
+    def workspace_buffers(
+        self, latent_frames: int
+    ) -> Mapping[str, BufferConfig]:
         if type(latent_frames) is not int or latent_frames < 1:
-            raise ValueError("audio reconstruction requires positive latent frames")
+            raise ValueError(
+                "audio reconstruction requires positive latent frames"
+            )
         return {
             "audio_latents": BufferConfig(
                 (2, self.config.latent_channels, latent_frames), torch.float32
@@ -137,12 +172,23 @@ class AudioDecoder(BaseAudioDecoder):
         }
 
     def unpack_latents(self, latent, num_samples, *, workspace):
-        frames, channels = self.latent_frames(num_samples), self.config.latent_channels
+        frames, channels = (
+            self.latent_frames(num_samples),
+            self.config.latent_channels,
+        )
         if latent.shape != (2 * frames, channels):
-            raise ValueError("audio decoder requires one complete stereo latent timeline")
+            raise ValueError(
+                "audio decoder requires one complete stereo latent timeline"
+            )
         backing = workspace["audio_latents"]
-        if backing.ndim != 3 or backing.shape[:2] != (2, channels) or backing.shape[2] < frames:
-            raise ValueError("audio workspace must cover both channel-major latent sequences")
+        if (
+            backing.ndim != 3
+            or backing.shape[:2] != (2, channels)
+            or backing.shape[2] < frames
+        ):
+            raise ValueError(
+                "audio workspace must cover both channel-major latent sequences"
+            )
         # Repack [2 * frames, channels] token rows into the VAE's channel-major
         # [stereo, channels, frames] layout.
         inputs = backing[:, :, :frames]

@@ -11,6 +11,6 @@ from uniserve.nn.attention import AttentionInput
 
 @dataclass(frozen=True)
 class DenoiserInput(NumericalDenoiserInput[image.Config]):
-    """Latents and image sizes plus the attention input for cache publication."""
+    """Latents and image sizes plus the attention input for cache publication."""  # noqa: E501
 
     attention: AttentionInput

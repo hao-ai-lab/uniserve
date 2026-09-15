@@ -22,7 +22,9 @@ from ._merge import merge_attention_states
 from ._sequences import causal_runs
 
 
-def _visible_options(batch, keys, *, query_capacity, key_capacity, segmented=False):
+def _visible_options(
+    batch, keys, *, query_capacity, key_capacity, segmented=False
+):
     from uniserve_kernel.flash_attn_jagged import hybrid_multimodal_mask
 
     visible = batch.visible_current_end if segmented else batch.visible_end
@@ -46,7 +48,9 @@ def _visible_options(batch, keys, *, query_capacity, key_capacity, segmented=Fal
     ):
         # Native block-sparse traversal consumes contiguous K/V. Paged K/V
         # retains the identical elementwise visibility mask above.
-        from uniserve_kernel.flash_attn_jagged.prefix_bounds import prefix_block_sparsity
+        from uniserve_kernel.flash_attn_jagged.prefix_bounds import (
+            prefix_block_sparsity,
+        )
 
         result.update(
             pack_gqa=False,
@@ -59,7 +63,11 @@ def _visible_options(batch, keys, *, query_capacity, key_capacity, segmented=Fal
                 max_key_length=key_capacity,
                 # Match the compiled SM100 query staging to its full launch
                 # capacity; live sequence boundaries can change on replay.
-                query_tile=(256 if architecture in (10, 11) and query_capacity > 128 else 128),
+                query_tile=(
+                    256
+                    if architecture in (10, 11) and query_capacity > 128
+                    else 128
+                ),
                 key_tile=128,
                 variable_length=True,
             ),
@@ -70,42 +78,65 @@ def _visible_options(batch, keys, *, query_capacity, key_capacity, segmented=Fal
 def _lse(result):
     output, lse = result[:2]
     if lse is None or lse.shape != (output.shape[1], output.shape[0]):
-        raise RuntimeError("FlashAttention-4 returned an incompatible packed LSE layout")
+        raise RuntimeError(
+            "FlashAttention-4 returned an incompatible packed LSE layout"
+        )
     return output, lse.transpose(0, 1).contiguous()
 
 
 class _FlashAttentionOperator(_Operator):
     def requires_host_lengths(self, batch):
-        return isinstance(batch, (PagedInput, VarlenInput)) and len(set(batch.causal)) > 1
+        return (
+            isinstance(batch, (PagedInput, VarlenInput))
+            and len(set(batch.causal)) > 1
+        )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        from uniserve_kernel.flash_attn_jagged import flash_attn_fwd, require_available
+        from uniserve_kernel.flash_attn_jagged import (
+            flash_attn_fwd,
+            require_available,
+        )
 
         require_available()
         if self.dtype not in {torch.float16, torch.bfloat16}:
-            raise ValueError("FlashAttention-4 requires FP16 or BF16 computation")
-        if self.cache is not None and isinstance(self.cache.key, QuantizedTensor):
-            raise ValueError("FlashAttention-4 does not consume per-block FP8 prefix scales")
+            raise ValueError(
+                "FlashAttention-4 requires FP16 or BF16 computation"
+            )
+        if self.cache is not None and isinstance(
+            self.cache.key, QuantizedTensor
+        ):
+            raise ValueError(
+                "FlashAttention-4 does not consume per-block FP8 prefix scales"
+            )
         # Partial channel tiles use the ordinary epilogue: the packed-GQA
         # store predicate does not match its vector fragment for these widths.
         # Grouped attention remains native, with explicit query-head traversal.
         self._forward = (
-            partial(flash_attn_fwd, pack_gqa=False) if self.head_dim % 32 else flash_attn_fwd
+            partial(flash_attn_fwd, pack_gqa=False)
+            if self.head_dim % 32
+            else flash_attn_fwd
         )
 
     def __call__(self, q, k, v, batch, *, scale, out):
         if not q.is_cuda:
             raise ValueError("FlashAttention-4 requires CUDA tensors")
-        if not isinstance(batch, (DenseInput, VarlenInput)) and torch.cuda.get_device_capability(
-            q.device
-        )[0] in (8, 12):
-            raise ValueError("paged FlashAttention-4 requires an SM90 or SM100 family GPU")
+        if not isinstance(
+            batch, (DenseInput, VarlenInput)
+        ) and torch.cuda.get_device_capability(q.device)[0] in (8, 12):
+            raise ValueError(
+                "paged FlashAttention-4 requires an SM90 or SM100 family GPU"
+            )
         if isinstance(batch, DenseInput) and batch.mask is not None:
-            raise ValueError("FlashAttention-4 does not consume arbitrary dense masks")
+            raise ValueError(
+                "FlashAttention-4 does not consume arbitrary dense masks"
+            )
         self._validate(q, k, v, batch, out)
 
-        if isinstance(batch, (PagedInput, SegmentedInput)) and batch.write_indices is not None:
+        if (
+            isinstance(batch, (PagedInput, SegmentedInput))
+            and batch.write_indices is not None
+        ):
             self.update_cache(k, v, indices=batch.write_indices)
 
         if q.numel() == 0:
@@ -114,63 +145,93 @@ class _FlashAttentionOperator(_Operator):
         if isinstance(batch, DenseInput):
             packed = q.ndim == 3
             query, key, value = (
-                tensor.unsqueeze(0) if packed else tensor.transpose(1, 2) for tensor in (q, k, v)
+                tensor.unsqueeze(0) if packed else tensor.transpose(1, 2)
+                for tensor in (q, k, v)
             )
             destination = out.unsqueeze(0) if packed else out.transpose(1, 2)
             self._forward(
-                query, key, value, softmax_scale=scale, causal=batch.causal, out=destination
+                query,
+                key,
+                value,
+                softmax_scale=scale,
+                causal=batch.causal,
+                out=destination,
             )
             return out
 
         if q.ndim != 3 or (
-            batch.queries.num_tokens is not None and q.shape[0] != batch.queries.num_tokens
+            batch.queries.num_tokens is not None
+            and q.shape[0] != batch.queries.num_tokens
         ):
-            raise ValueError("packed attention rows must match the declared query lengths")
+            raise ValueError(
+                "packed attention rows must match the declared query lengths"
+            )
 
         if isinstance(batch, (PagedInput, VarlenInput)):
             for query_slice, key_slice, run in causal_runs(batch):
                 if query_slice.stop == query_slice.start:
                     continue
                 self._sequence(
-                    q[query_slice], k[key_slice], v[key_slice], run, scale, out[query_slice]
+                    q[query_slice],
+                    k[key_slice],
+                    v[key_slice],
+                    run,
+                    scale,
+                    out[query_slice],
                 )
         elif isinstance(batch, VisibleInput):
-            key, value = (k, v) if batch.block_table is None else self._cache_values(k, v)
+            key, value = (
+                (k, v)
+                if batch.block_table is None
+                else self._cache_values(k, v)
+            )
 
             self._forward(
                 q,
                 key,
                 value,
                 cu_seqlens_q=batch.queries.offsets,
-                cu_seqlens_k=batch.keys.offsets if batch.block_table is None else None,
-                page_table=None if batch.block_table is None else batch.block_table.indices,
-                seqused_k=None if batch.block_table is None else batch.keys.values,
+                cu_seqlens_k=batch.keys.offsets
+                if batch.block_table is None
+                else None,
+                page_table=None
+                if batch.block_table is None
+                else batch.block_table.indices,
+                seqused_k=None
+                if batch.block_table is None
+                else batch.keys.values,
                 max_seqlen_q=q.shape[0],
                 max_seqlen_k=(
                     k.shape[0]
                     if batch.block_table is None
-                    else batch.block_table.indices.shape[1] * batch.block_table.block_size
+                    else batch.block_table.indices.shape[1]
+                    * batch.block_table.block_size
                 ),
                 softmax_scale=scale,
                 out=out,
                 **_visible_options(
-                    batch, batch.keys, query_capacity=q.shape[0], key_capacity=k.shape[0]
+                    batch,
+                    batch.keys,
+                    query_capacity=q.shape[0],
+                    key_capacity=k.shape[0],
                 ),
             )
         elif isinstance(batch, SegmentedInput):
             if self.cache is None:
-                raise RuntimeError("segmented attention requires bound prefix state")
+                raise RuntimeError(
+                    "segmented attention requires bound prefix state"
+                )
 
             # Evaluate the current window and the paged prefix independently,
             # then merge both partial states with online softmax.
-            common = dict(
-                cu_seqlens_q=batch.queries.offsets,
-                max_seqlen_q=q.shape[0],
-                softmax_scale=scale,
-                tile_mn=(128, 128),
-                num_threads=384,
-                return_lse=True,
-            )
+            common = {
+                "cu_seqlens_q": batch.queries.offsets,
+                "max_seqlen_q": q.shape[0],
+                "softmax_scale": scale,
+                "tile_mn": (128, 128),
+                "num_threads": 384,
+                "return_lse": True,
+            }
             current = _lse(
                 self._forward(
                     q,
@@ -198,7 +259,8 @@ class _FlashAttentionOperator(_Operator):
                     self.cache.value,
                     page_table=batch.block_table.indices,
                     seqused_k=batch.prefixes.values,
-                    max_seqlen_k=batch.block_table.indices.shape[1] * batch.block_table.block_size,
+                    max_seqlen_k=batch.block_table.indices.shape[1]
+                    * batch.block_table.block_size,
                     **common,
                 )
             )
@@ -209,16 +271,18 @@ class _FlashAttentionOperator(_Operator):
         return out
 
     def _cache_values(self, k, v):
-        return (k, v) if self.cache is None else (self.cache.key, self.cache.value)
+        return (
+            (k, v) if self.cache is None else (self.cache.key, self.cache.value)
+        )
 
     def _sequence(self, q, k, v, batch, scale, out):
-        common = dict(
-            cu_seqlens_q=batch.queries.offsets,
-            max_seqlen_q=q.shape[0],
-            softmax_scale=scale,
-            causal=batch.causal[0],
-            out=out,
-        )
+        common = {
+            "cu_seqlens_q": batch.queries.offsets,
+            "max_seqlen_q": q.shape[0],
+            "softmax_scale": scale,
+            "causal": batch.causal[0],
+            "out": out,
+        }
 
         if isinstance(batch, PagedInput):
             key, value = self._cache_values(k, v)
@@ -233,19 +297,27 @@ class _FlashAttentionOperator(_Operator):
                 seqused_k=lengths,
                 # Capacity bounds the launch while device lengths select the
                 # live prefix after a graph replay changes sequence lengths.
-                max_seqlen_k=batch.block_table.indices.shape[1] * batch.block_table.block_size,
+                max_seqlen_k=batch.block_table.indices.shape[1]
+                * batch.block_table.block_size,
                 tile_mn=(128, 128),
                 num_threads=384,
                 **common,
             )
         else:
             self._forward(
-                q, k, v, cu_seqlens_k=batch.keys.offsets, max_seqlen_k=k.shape[0], **common
+                q,
+                k,
+                v,
+                cu_seqlens_k=batch.keys.offsets,
+                max_seqlen_k=k.shape[0],
+                **common,
             )
 
 
 class Backend(_Backend):
     operator_class = _FlashAttentionOperator
 
-    def workspace_buffers(self, *, num_heads, num_kv_heads, head_dim, dtype, size, cache):
+    def workspace_buffers(
+        self, *, num_heads, num_kv_heads, head_dim, dtype, size, cache
+    ):
         return {"lengths": BufferConfig((size.batch_size,), torch.int32)}

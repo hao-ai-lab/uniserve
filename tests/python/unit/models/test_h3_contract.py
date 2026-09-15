@@ -1,4 +1,7 @@
-"""Supported checkpoint metadata controls capabilities independently of directory names."""
+"""Supported checkpoint metadata controls capabilities.
+
+Control is independent of directory names.
+"""
 
 import json
 import shutil
@@ -54,12 +57,29 @@ def test_architecture_without_variant_metadata_is_rejected(tmp_path):
 @pytest.mark.parametrize(
     "sidecar, field, value, error",
     [
-        ("vae/config.json", "decoder_num_layers", 35, "video_decoder.decoder_num_layers"),
-        ("audio_vae/config.json", "latents_std", [0.0] * 32, "standard deviations"),
-        ("vae/config.json", "spatial_downsample_factors", 16, "must be a sequence"),
+        (
+            "vae/config.json",
+            "decoder_num_layers",
+            35,
+            "video_decoder.decoder_num_layers",
+        ),
+        (
+            "audio_vae/config.json",
+            "latents_std",
+            [0.0] * 32,
+            "standard deviations",
+        ),
+        (
+            "vae/config.json",
+            "spatial_downsample_factors",
+            16,
+            "must be a sequence",
+        ),
     ],
 )
-def test_h3_reader_rejects_unsupported_decoder_math(checkpoint, sidecar, field, value, error):
+def test_h3_reader_rejects_unsupported_decoder_math(
+    checkpoint, sidecar, field, value, error
+):
     path = checkpoint / sidecar
     values = json.loads(path.read_text())
     values[field] = value
@@ -73,7 +93,9 @@ def test_h3_reader_reports_missing_decoder_field(checkpoint):
     values = json.loads(path.read_text())
     del values["latent_channels"]
     path.write_text(json.dumps(values))
-    with pytest.raises(ValueError, match="video_vae is missing field latent_channels"):
+    with pytest.raises(
+        ValueError, match="video_vae is missing field latent_channels"
+    ):
         read_config(checkpoint, IOConfig())
 
 

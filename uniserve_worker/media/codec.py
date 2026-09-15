@@ -23,7 +23,6 @@ def pil_image_to_png_bytes(image: Image.Image) -> bytes:
     Low compression preserves lossless pixels while keeping CPU encoding latency
     practical for high-resolution generated images.
     """
-
     buffer = io.BytesIO()
     image.save(buffer, format="PNG", compress_level=1)
     return buffer.getvalue()
@@ -31,13 +30,11 @@ def pil_image_to_png_bytes(image: Image.Image) -> bytes:
 
 def png_bytes_to_b64(png: bytes) -> str:
     """Encode PNG container bytes as an ASCII base64 string."""
-
     return base64.b64encode(png).decode("ascii")
 
 
 def pil_image_to_png_b64(image: Image.Image) -> str:
     """Encode a PIL image as a base64 PNG string."""
-
     return png_bytes_to_b64(pil_image_to_png_bytes(image))
 
 
@@ -52,7 +49,6 @@ def quantize_image_hwc(
     clamping and conversion to ``[0, 255]``. The default ``(-1, 1)`` matches
     diffusion decoder output; callers with normalized pixels pass ``(0, 1)``.
     """
-
     # Collapse the supported singleton batch form into the canonical CHW layout.
     image = tensor.detach()
     if image.ndim == 4:
@@ -69,13 +65,24 @@ def quantize_image_hwc(
     if span != 0:
         image = (image - lo) / span
     image = image.clamp(0, 1)
-    return (image.permute(1, 2, 0) * 255.0).round().to(dtype=torch.uint8).contiguous()
+    return (
+        (image.permute(1, 2, 0) * 255.0)
+        .round()
+        .to(dtype=torch.uint8)
+        .contiguous()
+    )
 
 
 def uint8_image_to_png_base64_bytes(image: torch.Tensor) -> bytes:
-    """Encode a query-ready CPU HWC uint8 tensor without observing a device value."""
+    """Encode a query-ready CPU HWC uint8 tensor.
 
-    if image.device.type != "cpu" or image.dtype is not torch.uint8 or image.ndim != 3:
+    Encoding completes without observing a device value.
+    """
+    if (
+        image.device.type != "cpu"
+        or image.dtype is not torch.uint8
+        or image.ndim != 3
+    ):
         raise ValueError("PNG encoding requires a CPU HWC uint8 tensor")
     png = pil_image_to_png_bytes(Image.fromarray(image.numpy()))
     return base64.b64encode(png)

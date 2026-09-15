@@ -16,12 +16,15 @@ class QKVProjection(nn.Module):
         self.projection = projection
 
     def forward(self, hidden, cos, sin):
-        """Project to ``[tokens, heads, head_dim]`` and normalize/rotate Q and K."""
-
+        """Project to ``[tokens, heads, head_dim]`` and normalize/rotate Q
+        and K.
+        """  # noqa: D205
         values = self.projection(hidden)
         query, key, value = (
             values[name].reshape(
-                -1, values[name].shape[-1] // self.projection.head_dim, self.projection.head_dim
+                -1,
+                values[name].shape[-1] // self.projection.head_dim,
+                self.projection.head_dim,
             )
             for name in ("q", "k", "v")
         )
@@ -29,10 +32,13 @@ class QKVProjection(nn.Module):
         return query, key, value.to(query.dtype)
 
     def normalize(self, q, k, cos, sin):
-        """Leave heads unchanged when the network has no positional transform."""
-
+        """Leave heads unchanged when the network has no positional
+        transform.
+        """  # noqa: D205
         if cos or sin:
-            raise ValueError("unrotated QKV projection does not consume rotary factors")
+            raise ValueError(
+                "unrotated QKV projection does not consume rotary factors"
+            )
         return q, k
 
 
@@ -68,9 +74,9 @@ class RotaryQKVProjection(QKVProjection):
             functional.apply_rotary(
                 self.query_norm(q.float()), cos[0], sin[0], rotation="split"
             ).to(q.dtype),
-            functional.apply_rotary(self.key_norm(k.float()), cos[0], sin[0], rotation="split").to(
-                k.dtype
-            ),
+            functional.apply_rotary(
+                self.key_norm(k.float()), cos[0], sin[0], rotation="split"
+            ).to(k.dtype),
         )
 
 
@@ -82,35 +88,48 @@ class AxialQKVProjection(QKVProjection):
     axes. Adjacent axes in one domain share the same checkpoint scale tensor.
     """
 
-    def __init__(self, projection, query_norm, key_norm, *, axis_dims, rotations):
+    def __init__(
+        self, projection, query_norm, key_norm, *, axis_dims, rotations
+    ):
         super().__init__(projection)
         if (
             not isinstance(axis_dims, tuple)
             or sum(axis_dims) != projection.head_dim
-            or any(type(width) is not int or width < 2 or width % 2 for width in axis_dims)
+            or any(
+                type(width) is not int or width < 2 or width % 2
+                for width in axis_dims
+            )
             or not isinstance(rotations, tuple)
             or len(rotations) != len(axis_dims)
-            or any(rotation not in {"interleaved", "split"} for rotation in rotations)
+            or any(
+                rotation not in {"interleaved", "split"}
+                for rotation in rotations
+            )
         ):
             raise ValueError("rotary axes must partition the Q/K head width")
         self.query_norm, self.key_norm = query_norm, key_norm
         self.axis_dims, self.rotations = axis_dims, rotations
-        if isinstance(query_norm, nn.ModuleList) or isinstance(key_norm, nn.ModuleList):
+        if isinstance(query_norm, nn.ModuleList) or isinstance(
+            key_norm, nn.ModuleList
+        ):
             query = self._axis_norms(query_norm)
             key = self._axis_norms(key_norm)
             if any(
                 q.weight.shape != k.weight.shape or q.eps != k.eps
                 for q, k in zip(query, key, strict=True)
             ):
-                raise ValueError("query and key normalization domains must align")
+                raise ValueError(
+                    "query and key normalization domains must align"
+                )
 
     def _axis_norms(self, norms):
         """Map each rotary axis to the RMSNorm domain that covers it."""
-
         if not isinstance(norms, nn.ModuleList) or not all(
             isinstance(norm, RMSNorm) for norm in norms
         ):
-            raise ValueError("partitioned Q/K normalization requires ordered RMSNorm modules")
+            raise ValueError(
+                "partitioned Q/K normalization requires ordered RMSNorm modules"
+            )
 
         result = []
         axis = 0
@@ -121,7 +140,9 @@ class AxialQKVProjection(QKVProjection):
                 result.append(norm)
                 axis += 1
             if consumed != norm.weight.numel():
-                raise ValueError("normalization domains must cover complete rotary axes")
+                raise ValueError(
+                    "normalization domains must cover complete rotary axes"
+                )
         if axis != len(self.axis_dims):
             raise ValueError("normalization domains must cover the whole head")
         return tuple(result)
@@ -131,10 +152,15 @@ class AxialQKVProjection(QKVProjection):
             raise ValueError("each rotary axis requires one factor pair")
 
         partitioned = isinstance(self.query_norm, nn.ModuleList)
-        if partitioned and all(rotation == "split" for rotation in self.rotations):
+        if partitioned and all(
+            rotation == "split" for rotation in self.rotations
+        ):
             from uniserve import ops
 
-            query, key = self._axis_norms(self.query_norm), self._axis_norms(self.key_norm)
+            query, key = (
+                self._axis_norms(self.query_norm),
+                self._axis_norms(self.key_norm),
+            )
             if len({norm.eps for norm in (*query, *key)}) == 1:
                 # Preserve shared normalization identities when several rotary
                 # axes consume one domain; the fused kernel reduces it once.
@@ -174,7 +200,9 @@ class AxialQKVProjection(QKVProjection):
                     tuple(
                         module(part)
                         for module, part in zip(
-                            norm, tensor.float().split(widths, dim=-1), strict=True
+                            norm,
+                            tensor.float().split(widths, dim=-1),
+                            strict=True,
                         )
                     ),
                     dim=-1,
@@ -184,7 +212,9 @@ class AxialQKVProjection(QKVProjection):
             outputs.append(
                 torch.cat(
                     tuple(
-                        functional.apply_rotary(part, cosine, sine, rotation=rotation)
+                        functional.apply_rotary(
+                            part, cosine, sine, rotation=rotation
+                        )
                         for part, cosine, sine, rotation in zip(
                             normalized.split(self.axis_dims, dim=-1),
                             cos,

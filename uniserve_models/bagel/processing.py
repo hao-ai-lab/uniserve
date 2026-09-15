@@ -24,7 +24,6 @@ _BAGEL_MAX_IMAGE_PIXELS = 14 * 14 * 9 * 1024
 
 def image_processor(config: Config) -> ImageProcessor:
     """Build the checkpoint architecture's caller-owned image transforms."""
-
     return ImageProcessor(
         vit=TowerTransform(
             resize=StrideResize(

@@ -15,7 +15,11 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as vision
 
-from uniserve_models.processing import ImageProcessor, PatchTransform, StrideResize
+from uniserve_models.processing import (
+    ImageProcessor,
+    PatchTransform,
+    StrideResize,
+)
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.protocol.operation import PipelineStage
 
@@ -41,12 +45,20 @@ def prepare_image(
     *,
     device: torch.device,
 ) -> PreparedImage:
-    """Decode, resize, normalize, and stage one encoded image for the selected model tower."""
+    """Decode, resize, normalize.
 
+    and stage one encoded image for the selected model tower.
+    """
     image = _decode_rgb(encoded)
-    transform = processor.vit if kind is PipelineStage.VISION_ENCODING else processor.vae
+    transform = (
+        processor.vit
+        if kind is PipelineStage.VISION_ENCODING
+        else processor.vae
+    )
     if transform is None:
-        raise invalid_descriptor(f"model declares no {kind.value} image transform")
+        raise invalid_descriptor(
+            f"model declares no {kind.value} image transform"
+        )
 
     if isinstance(transform, PatchTransform):
         height, width = image.height, image.width
@@ -82,7 +94,9 @@ def prepare_image(
 
     tower_image = _resize_stride(canvas, transform.resize)
     pixels = _normalize(tower_image, transform.normalization)
-    return PreparedImage(_stage(pixels, processor, device), None, None, height, width)
+    return PreparedImage(
+        _stage(pixels, processor, device), None, None, height, width
+    )
 
 
 def prepare_tensor_image(
@@ -94,23 +108,32 @@ def prepare_tensor_image(
     signed_unit: bool,
 ) -> PreparedImage:
     """Apply the declared image transform to an already decoded RGB tensor."""
-
     value = image.detach().to(dtype=torch.float32)
     if value.ndim == 4:
         if int(value.shape[0]) != 1:
-            raise invalid_descriptor("generated image staging accepts one image")
+            raise invalid_descriptor(
+                "generated image staging accepts one image"
+            )
         value = value[0]
     if value.ndim != 3 or int(value.shape[0]) != 3:
-        raise invalid_descriptor("generated image tensor must have shape [3, height, width]")
+        raise invalid_descriptor(
+            "generated image tensor must have shape [3, height, width]"
+        )
 
     if signed_unit:
         value = (value + 1.0) * 0.5
     value = value.clamp(0.0, 1.0)
     source_height, source_width = int(value.shape[1]), int(value.shape[2])
 
-    transform = processor.vit if kind is PipelineStage.VISION_ENCODING else processor.vae
+    transform = (
+        processor.vit
+        if kind is PipelineStage.VISION_ENCODING
+        else processor.vae
+    )
     if transform is None:
-        raise invalid_descriptor(f"model declares no {kind.value} image transform")
+        raise invalid_descriptor(
+            f"model declares no {kind.value} image transform"
+        )
 
     if isinstance(transform, PatchTransform):
         resized_height, resized_width = _patch_image_shape(
@@ -121,7 +144,8 @@ def prepare_tensor_image(
         value = _resize_tensor(value, resized_height, resized_width)
         normalized = _normalize_tensor(value, transform.normalization)
 
-        # Unfold into row-major patches: [grid_height * grid_width, channels * patch * patch].
+        # Unfold into row-major patches: [grid_height * grid_width, channels *
+        # patch * patch].
         patch = int(transform.patch_size)
         channels = int(normalized.shape[0])
         grid_height = resized_height // patch
@@ -183,15 +207,18 @@ def prepare_tensor_image(
 
 def _decode_rgb(encoded: str) -> Image.Image:
     """Decode a base64 image payload and normalize it to RGB."""
-
     if not isinstance(encoded, str) or not encoded:
-        raise invalid_descriptor("inline image payload must be non-empty base64")
+        raise invalid_descriptor(
+            "inline image payload must be non-empty base64"
+        )
     try:
         raw = base64.b64decode(encoded, validate=True)
         image = Image.open(io.BytesIO(raw))
         image.load()
     except (binascii.Error, OSError, ValueError) as error:
-        raise invalid_descriptor("inline image payload is not a valid encoded image") from error
+        raise invalid_descriptor(
+            "inline image payload is not a valid encoded image"
+        ) from error
 
     # Composite transparency onto white so alpha never reaches the towers.
     if image.mode == "RGBA" or image.info.get("transparency") is not None:
@@ -202,9 +229,13 @@ def _decode_rgb(encoded: str) -> Image.Image:
     return image.convert("RGB")
 
 
-def _resize_patch_image(image: Image.Image, processor: PatchTransform) -> Image.Image:
-    """Resize an image to the processor's bounded aspect-preserving patch grid."""
+def _resize_patch_image(
+    image: Image.Image, processor: PatchTransform
+) -> Image.Image:
+    """Resize an image to the processor's bounded aspect-preserving patch.
 
+    grid.
+    """
     height, width = _patch_image_shape(processor, image.height, image.width)
     return vision.resize(
         image,
@@ -220,7 +251,6 @@ def patch_grid_shape(
     source_width: int,
 ) -> tuple[int, int]:
     """Return the host-known patch grid for the declared image dimensions."""
-
     height, width = _patch_image_shape(processor, source_height, source_width)
     patch = int(processor.patch_size)
     return height // patch, width // patch
@@ -232,8 +262,9 @@ def _patch_image_shape(
     source_width: int,
 ) -> tuple[int, int]:
     """Resolve patch-grid dimensions after applying processor pixel bounds."""
-
-    factor = int(round(int(processor.patch_size) / float(processor.downsample_ratio)))
+    factor = int(
+        round(int(processor.patch_size) / float(processor.downsample_ratio))
+    )
     return _bounded_grid_shape(
         source_height,
         source_width,
@@ -251,8 +282,10 @@ def _bounded_grid_shape(
     minimum: int,
     maximum: int,
 ) -> tuple[int, int]:
-    """Fit an aspect-preserving patch grid within minimum and maximum token bounds."""
+    """Fit an aspect-preserving patch grid within minimum and maximum token.
 
+    bounds.
+    """
     if min(height, width, factor) < 1:
         raise invalid_descriptor("image dimensions must be positive")
     if max(height, width) / min(height, width) > 200:
@@ -262,7 +295,9 @@ def _bounded_grid_shape(
     result_width = max(factor, round(width / factor) * factor)
     if result_height * result_width > maximum:
         scale = math.sqrt((height * width) / maximum)
-        result_height = max(factor, math.floor(height / scale / factor) * factor)
+        result_height = max(
+            factor, math.floor(height / scale / factor) * factor
+        )
         result_width = max(factor, math.floor(width / scale / factor) * factor)
     elif result_height * result_width < minimum:
         scale = math.sqrt(minimum / (height * width))
@@ -272,18 +307,26 @@ def _bounded_grid_shape(
 
 
 def _resize_stride(image: Image.Image, processor: StrideResize) -> Image.Image:
-    """Resize an image so both dimensions align with the configured spatial stride."""
+    """Resize an image so both dimensions align with the configured spatial.
 
+    stride.
+    """
     width, height = image.size
     scale = min(int(processor.max_size) / max(width, height), 1.0)
     scale = max(scale, int(processor.min_size) / min(width, height))
-    new_width, new_height = _stride_shape(width, height, scale, int(processor.stride))
+    new_width, new_height = _stride_shape(
+        width, height, scale, int(processor.stride)
+    )
     if new_width * new_height > int(processor.max_pixels):
         scale = int(processor.max_pixels) / (new_width * new_height)
-        new_width, new_height = _stride_shape(new_width, new_height, scale, int(processor.stride))
+        new_width, new_height = _stride_shape(
+            new_width, new_height, scale, int(processor.stride)
+        )
     if max(new_width, new_height) > int(processor.max_size):
         scale = int(processor.max_size) / max(new_width, new_height)
-        new_width, new_height = _stride_shape(new_width, new_height, scale, int(processor.stride))
+        new_width, new_height = _stride_shape(
+            new_width, new_height, scale, int(processor.stride)
+        )
     return vision.resize(
         image,
         (new_height, new_width),
@@ -292,12 +335,13 @@ def _resize_stride(image: Image.Image, processor: StrideResize) -> Image.Image:
     )
 
 
-def _stride_shape(width: int, height: int, scale: float, stride: int) -> tuple[int, int]:
+def _stride_shape(
+    width: int, height: int, scale: float, stride: int
+) -> tuple[int, int]:
     """Round scaled dimensions to positive multiples of the required stride."""
 
     def align(value: float) -> int:
         """Round a scaled edge to the nearest positive model stride."""
-
         return max(stride, round(value / stride) * stride)
 
     return align(width * scale), align(height * scale)
@@ -305,7 +349,6 @@ def _stride_shape(width: int, height: int, scale: float, stride: int) -> tuple[i
 
 def _normalize(image: Image.Image, name: str) -> torch.Tensor:
     """Normalize decoded RGB bytes into contiguous FP32 CHW model inputs."""
-
     # PIL decoding and resizing produce host bytes. Keep the pointwise FP32
     # transform in one owned CHW array instead of dispatching each pass through
     # the process-wide tensor thread pool on the serving thread.
@@ -324,7 +367,6 @@ def _normalize(image: Image.Image, name: str) -> torch.Tensor:
 
 def _normalize_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
     """Apply the named channel normalization policy to an image tensor."""
-
     if name == "signed_unit":
         return (tensor - 0.5) / 0.5
     if name == "imagenet":
@@ -334,9 +376,10 @@ def _normalize_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
     raise invalid_descriptor(f"unknown image normalization {name!r}")
 
 
-def _resize_tensor(value: torch.Tensor, height: int, width: int) -> torch.Tensor:
+def _resize_tensor(
+    value: torch.Tensor, height: int, width: int
+) -> torch.Tensor:
     """Resize a batched tensor image with bicubic interpolation."""
-
     return F.interpolate(
         value.unsqueeze(0),
         size=(int(height), int(width)),
@@ -346,12 +389,20 @@ def _resize_tensor(value: torch.Tensor, height: int, width: int) -> torch.Tensor
     )[0]
 
 
-def _stage(value: torch.Tensor, processor: ImageProcessor, device: torch.device) -> torch.Tensor:
-    """Convert preprocessing output to the processor staging dtype and device."""
+def _stage(
+    value: torch.Tensor, processor: ImageProcessor, device: torch.device
+) -> torch.Tensor:
+    """Convert preprocessing output to the processor staging dtype and.
 
+    device.
+    """
     dtype = processor.staging_dtype
-    if processor.staging_dtype is not None and not isinstance(dtype, torch.dtype):
-        raise invalid_descriptor(f"unknown image staging dtype {processor.staging_dtype!r}")
+    if processor.staging_dtype is not None and not isinstance(
+        dtype, torch.dtype
+    ):
+        raise invalid_descriptor(
+            f"unknown image staging dtype {processor.staging_dtype!r}"
+        )
     return value.to(device=device, dtype=dtype, non_blocking=True)
 
 

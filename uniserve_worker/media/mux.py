@@ -35,15 +35,23 @@ __all__ = ["AvMuxConfig", "AvMuxSession", "require_media_codecs"]
 
 
 def require_media_codecs(video_codec: str, audio_codec: str) -> None:
-    """Verify that the configured video and audio encoders are available through PyAV."""
+    """Verify that the configured encoders are available through PyAV.
 
+    Both the video and the audio encoder are checked.
+    """
     try:
         import av
     except ImportError as error:
         raise RuntimeError("media output requires the PyAV runtime") from error
-    missing = [name for name in (video_codec, audio_codec) if name not in av.codecs_available]
+    missing = [
+        name
+        for name in (video_codec, audio_codec)
+        if name not in av.codecs_available
+    ]
     if missing:
-        raise RuntimeError(f"media output is missing required encoders {missing!r}")
+        raise RuntimeError(
+            f"media output is missing required encoders {missing!r}"
+        )
     for name in (video_codec, audio_codec):
         av.CodecContext.create(name, "w")
 
@@ -63,8 +71,10 @@ class AvMuxConfig:
     audio_frame_samples: int = 1024
 
     def __post_init__(self) -> None:
-        """Validate positive media dimensions and complete decode-unit coverage."""
+        """Validate positive media dimensions.
 
+        Also validate complete decode-unit coverage.
+        """
         if (
             min(
                 self.width,
@@ -76,16 +86,26 @@ class AvMuxConfig:
             < 1
         ):
             raise ValueError("media mux dimensions and rates must be positive")
-        if not self.video_unit_frames or sum(self.video_unit_frames) != self.frame_count:
-            raise ValueError("media mux decode units must cover the output frame count")
+        if (
+            not self.video_unit_frames
+            or sum(self.video_unit_frames) != self.frame_count
+        ):
+            raise ValueError(
+                "media mux decode units must cover the output frame count"
+            )
 
 
 class AvMuxSession:
-    """Request-owned media container with independent audio and video producers."""
+    """Request-owned media container.
+
+    Audio and video producers are independent.
+    """
 
     def __init__(self, config: AvMuxConfig) -> None:
-        """Create an in-memory container session with independent audio and video locks."""
+        """Create an in-memory container session.
 
+        Audio and video use independent locks.
+        """
         self.config = config
         self._buffer = io.BytesIO()
         self._container: OutputContainer | None = None
@@ -102,25 +122,31 @@ class AvMuxSession:
 
     def _open(self) -> None:
         """Create the container and both encoder streams exactly once."""
-
         with self._container_lock:
             if self._container is not None:
                 return
             import av
 
-            # Stream creation is atomic under the container lock so either producer may
-            # be the first to initialize their shared mux destination.
+            # Stream creation is atomic under the container lock so either
+            # producer may be the first to initialize their shared mux
+            # destination.
             config = self.config
             container = av.open(self._buffer, mode="w", format="mp4")
             video = cast(
-                "VideoStream", container.add_stream(config.video_codec, rate=config.frame_rate)
+                "VideoStream",
+                container.add_stream(
+                    config.video_codec, rate=config.frame_rate
+                ),
             )
             video.width = config.width
             video.height = config.height
             video.pix_fmt = "yuv420p"
             video.options = {"preset": "ultrafast", "tune": "zerolatency"}
             audio = cast(
-                "AudioStream", container.add_stream(config.audio_codec, rate=config.audio_rate)
+                "AudioStream",
+                container.add_stream(
+                    config.audio_codec, rate=config.audio_rate
+                ),
             )
             audio.layout = "stereo"
             audio.sample_rate = config.audio_rate
@@ -130,14 +156,16 @@ class AvMuxSession:
             self._video = video
             self._audio = audio
 
-    def write_video(self, start_unit: int, unit_count: int, rgb24: np.ndarray) -> None:
+    def write_video(
+        self, start_unit: int, unit_count: int, rgb24: np.ndarray
+    ) -> None:
         """Validate and encode the next ordered unit of packed RGB frames."""
-
         import av
 
         config = self.config
         with self._video_lock:
-            # Decode-unit ordering makes frame timestamps independent of producer timing.
+            # Decode-unit ordering makes frame timestamps independent of
+            # producer timing.
             stop_unit = int(start_unit) + int(unit_count)
             if (
                 self._closed
@@ -146,7 +174,9 @@ class AvMuxSession:
                 or stop_unit > len(config.video_unit_frames)
             ):
                 raise RuntimeError("video mux units are not request-ordered")
-            expected_frames = sum(config.video_unit_frames[int(start_unit) : stop_unit])
+            expected_frames = sum(
+                config.video_unit_frames[int(start_unit) : stop_unit]
+            )
             if (
                 rgb24.ndim != 4
                 or rgb24.shape[1:] != (config.height, config.width, 3)
@@ -154,13 +184,15 @@ class AvMuxSession:
             ):
                 raise RuntimeError("video capture has invalid RGB24 dimensions")
 
-            # Initialize shared streams only after the input has passed validation.
+            # Initialize shared streams only after the input has passed
+            # validation.
             self._open()
             container, stream = self._container, self._video
             if container is None or stream is None:
                 raise RuntimeError("video stream was not initialized")
 
-            # Packet muxing is serialized with audio while frame preparation remains local.
+            # Packet muxing is serialized with audio while frame
+            # preparation remains local.
             for pixels in rgb24:
                 frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
                 frame.pts = self._video_frames
@@ -172,66 +204,89 @@ class AvMuxSession:
             self._next_unit = stop_unit
 
     def write_audio(self, pcm: np.ndarray) -> None:
-        """Validate and encode the request's complete stereo PCM track exactly once."""
+        """Validate and encode the request's stereo PCM track.
 
+        The complete track is encoded exactly once.
+        """
         import av
 
         config = self.config
         with self._audio_lock:
-            # Audio is a single request-owned contribution rather than an ordered unit stream.
+            # Audio is a single request-owned contribution rather than an
+            # ordered unit stream.
             if self._closed or self._audio_written:
                 raise RuntimeError("audio was muxed more than once")
             if pcm.ndim != 2 or pcm.shape[1] != 2:
-                raise RuntimeError("audio capture has invalid stereo dimensions")
+                raise RuntimeError(
+                    "audio capture has invalid stereo dimensions"
+                )
 
             self._open()
             container, stream = self._container, self._audio
             if container is None or stream is None:
                 raise RuntimeError("audio stream was not initialized")
 
-            # Align audio duration to the video timeline, truncating or zero-padding PCM.
-            target_samples = round(config.frame_count * config.audio_rate / config.frame_rate)
+            # Align audio duration to the video timeline, truncating or
+            # zero-padding PCM.
+            target_samples = round(
+                config.frame_count * config.audio_rate / config.frame_rate
+            )
             source = pcm[:target_samples]
             if source.shape[0] < target_samples:
-                source = np.pad(source, ((0, target_samples - source.shape[0]), (0, 0)))
+                source = np.pad(
+                    source, ((0, target_samples - source.shape[0]), (0, 0))
+                )
 
-            # Encode fixed-size planar frames; the final frame carries zero padding only.
+            # Encode fixed-size planar frames; the final frame carries
+            # zero padding only.
             packets: list[Packet] = []
             pts = 0
             for start in range(0, target_samples, config.audio_frame_samples):
                 stop = min(start + config.audio_frame_samples, target_samples)
-                planar = np.zeros((2, config.audio_frame_samples), dtype=np.int16)
+                planar = np.zeros(
+                    (2, config.audio_frame_samples), dtype=np.int16
+                )
                 planar[:, : stop - start] = source[start:stop].T
-                frame = av.AudioFrame.from_ndarray(planar, format="s16p", layout="stereo")
+                frame = av.AudioFrame.from_ndarray(
+                    planar, format="s16p", layout="stereo"
+                )
                 frame.sample_rate = config.audio_rate
                 frame.pts = pts
                 frame.time_base = Fraction(1, config.audio_rate)
                 packets.extend(stream.encode(frame))
                 pts += config.audio_frame_samples
 
-            # Defer audio packet muxing until close so video units can arrive independently.
+            # Defer audio packet muxing until close so video units can
+            # arrive independently.
             self._audio_packets = packets
             self._audio_written = True
 
     def close(self) -> bytes:
-        """Flush encoders, finalize the container, and return its bytes exactly once."""
+        """Flush encoders, finalize the container, and return its bytes.
 
+        Finalization happens exactly once.
+        """
         config = self.config
         with self._video_lock, self._audio_lock:
-            # Repeated close calls expose the same finalized immutable container bytes.
+            # Repeated close calls expose the same finalized immutable
+            # container bytes.
             if self._closed:
                 value = self._buffer.getvalue()
                 if not value:
                     raise RuntimeError("media mux produced an empty container")
                 return value
-            if self._video_frames != config.frame_count or not self._audio_written:
+            if (
+                self._video_frames != config.frame_count
+                or not self._audio_written
+            ):
                 raise RuntimeError("media materialization is incomplete")
 
             container, video, audio = self._container, self._video, self._audio
             if container is None or video is None or audio is None:
                 raise RuntimeError("media mux session was never initialized")
 
-            # Drain delayed video packets before committing queued and delayed audio packets.
+            # Drain delayed video packets before committing queued and
+            # delayed audio packets.
             for packet in video.encode(None):
                 with self._container_lock:
                     container.mux(packet)
@@ -242,7 +297,8 @@ class AvMuxSession:
                     container.mux(packet)
                 container.close()
 
-            # Closing the PyAV container commits the complete MP4 structure to the buffer.
+            # Closing the PyAV container commits the complete MP4
+            # structure to the buffer.
             self._closed = True
             value = self._buffer.getvalue()
             if not value:
@@ -250,8 +306,10 @@ class AvMuxSession:
             return value
 
     def abort(self) -> None:
-        """Close the container and discard its buffered output after a failed request."""
+        """Close the container and discard its buffered output.
 
+        Used after a failed request.
+        """
         with self._video_lock, self._audio_lock:
             completed = self._closed
             if not self._closed and self._container is not None:
@@ -259,7 +317,8 @@ class AvMuxSession:
                     with self._container_lock:
                         self._container.close()
                 except Exception:
-                    # Teardown is best-effort because aborted output is never published.
+                    # Teardown is best-effort because aborted output is
+                    # never published.
                     pass
             self._closed = True
         if not completed:
@@ -287,7 +346,6 @@ class MediaMux:
 
     def __init__(self, *, rank: int) -> None:
         """Initialize per-request mux sessions and temporal overlap tails."""
-
         self.rank = rank
         self._sessions: dict[RequestKey, MuxSession] = {}
 
@@ -300,8 +358,10 @@ class MediaMux:
         audio_rate: int,
         video_unit_frames: tuple[int, ...],
     ) -> None:
-        """Create the request-owned mux session for validated output dimensions."""
+        """Create the request-owned mux session.
 
+        Output dimensions are validated beforehand.
+        """
         if request_key in self._sessions:
             return
         self._sessions[request_key] = MuxSession(
@@ -318,10 +378,16 @@ class MediaMux:
         )
 
     def validate_track(
-        self, request_key: RequestKey, track: MediaTrack, cursor: int, count: int
+        self,
+        request_key: RequestKey,
+        track: MediaTrack,
+        cursor: int,
+        count: int,
     ) -> None:
-        """Reject duplicate tracks and temporal gaps before numerical assembly."""
+        """Reject duplicate tracks and temporal gaps.
 
+        Validation runs before numerical assembly.
+        """
         session = self._sessions.get(request_key)
         if session is None:
             raise invalid_descriptor("media output has no active session")
@@ -332,7 +398,9 @@ class MediaMux:
             or count < 1
             or cursor + count > len(session.container.config.video_unit_frames)
         ):
-            raise invalid_descriptor("video assembly requires the next temporal range")
+            raise invalid_descriptor(
+                "video assembly requires the next temporal range"
+            )
         if track is MediaTrack.AUDIO and session.audio_written:
             raise invalid_descriptor("audio output is already written")
 
@@ -347,8 +415,10 @@ class MediaMux:
         *,
         profile_name: str,
     ) -> CpuTask:
-        """Submit one ordered mux action and release its reservation and ring lease on completion."""
+        """Submit one ordered mux action.
 
+        Its reservation and ring lease are released on completion.
+        """
         session = self._sessions.get(request_key)
         if session is None:
             raise RuntimeError("video mux session is not active")
@@ -356,7 +426,9 @@ class MediaMux:
             lambda: action(session.container),
             dependencies=dependencies,
             input_ready=None if output is None else output.ready,
-            input_completion=None if output is None else output.completion_future,
+            input_completion=None
+            if output is None
+            else output.completion_future,
             release=None if ring_lease is None else ring_lease.release,
             profile_name=profile_name,
         )
@@ -372,15 +444,21 @@ class MediaMux:
         ring_lease: MediaLease,
         operation_id: ComputationId,
     ) -> CpuTask:
-        """Schedule ordered RGB frame encoding from a captured output-ring slot."""
+        """Schedule ordered RGB frame encoding.
 
-        self.validate_track(request_key, MediaTrack.VIDEO, start_unit, unit_count)
+        Frames come from a captured output-ring slot.
+        """
+        self.validate_track(
+            request_key, MediaTrack.VIDEO, start_unit, unit_count
+        )
         dependency = self._sessions[request_key].video_tail
 
         task = self._task(
             request_key,
             reservation,
-            lambda session: session.write_video(start_unit, unit_count, frames.numpy()),
+            lambda session: session.write_video(
+                start_unit, unit_count, frames.numpy()
+            ),
             output,
             () if dependency is None else (dependency,),
             ring_lease,
@@ -405,7 +483,6 @@ class MediaMux:
         operation_id: ComputationId,
     ) -> CpuTask:
         """Schedule PCM encoding from a captured output-ring slot."""
-
         self.validate_track(request_key, MediaTrack.AUDIO, 0, 1)
         dependency = self._sessions[request_key].audio_tail
 
@@ -422,7 +499,9 @@ class MediaMux:
             ring_lease,
             profile_name=(
                 f"uniserve.video.mux request={_key_label(request_key)} "
-                f"step={operation_id.batch_id} op={operation_id.request_index} kind=audio rank={self.rank}"
+                f"step={operation_id.batch_id} "
+                f"op={operation_id.request_index} "
+                f"kind=audio rank={self.rank}"
             ),
         )
         self._sessions[request_key].audio_tail = task.promise
@@ -435,16 +514,21 @@ class MediaMux:
         reservation: CpuTask,
         operation_id: ComputationId,
     ) -> CpuTask:
-        """Schedule mux finalization and shared-memory publication after all segment jobs."""
+        """Schedule mux finalization and shared-memory publication.
 
+        Finalization runs after all segment jobs.
+        """
         state = self._sessions.get(request_key)
         if (
             state is None
-            or state.video_units != len(state.container.config.video_unit_frames)
+            or state.video_units
+            != len(state.container.config.video_unit_frames)
             or not state.audio_written
             or state.finalized
         ):
-            raise invalid_descriptor("media finalization requires both completed output tracks")
+            raise invalid_descriptor(
+                "media finalization requires both completed output tracks"
+            )
 
         dependencies = tuple(
             tail
@@ -456,8 +540,10 @@ class MediaMux:
         )
 
         def publish(session: AvMuxSession) -> MediaOutput:
-            """Close the container and publish its final bytes after both tracks."""
+            """Close the container and publish its final bytes.
 
+            Publication happens after both tracks complete.
+            """
             payload = session.close()
             name = publish_media_bytes(payload)
             return MediaOutput(
@@ -473,7 +559,9 @@ class MediaMux:
             dependencies,
             profile_name=(
                 f"uniserve.video.mux request={_key_label(request_key)} "
-                f"step={operation_id.batch_id} op={operation_id.request_index} kind=artifact rank={self.rank}"
+                f"step={operation_id.batch_id} "
+                f"op={operation_id.request_index} "
+                f"kind=artifact rank={self.rank}"
             ),
         )
         state.finalized = True
@@ -481,15 +569,15 @@ class MediaMux:
 
     def drop(self, request_id: int) -> None:
         """Abort and remove every mux session owned by a request identifier."""
-
-        selected = [key for key in self._sessions if key.request_id == int(request_id)]
+        selected = [
+            key for key in self._sessions if key.request_id == int(request_id)
+        ]
         for key in selected:
             session = self._sessions.pop(key)
             session.container.abort()
 
     def close(self) -> None:
         """Abort all active mux sessions and reject new media work."""
-
         for session in self._sessions.values():
             session.container.abort()
         self._sessions.clear()
@@ -497,5 +585,7 @@ class MediaMux:
 
 def _key_label(request_key: RequestKey) -> str:
     """Format a stable request key for media task profiling."""
-
-    return f"{request_key.engine_id}:{request_key.request_id}:{request_key.request_epoch}"
+    return (
+        f"{request_key.engine_id}:{request_key.request_id}:"
+        f"{request_key.request_epoch}"
+    )

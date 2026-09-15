@@ -14,8 +14,10 @@ from ..protocol.output import BatchOutput
 
 
 def response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
-    """Build a protocol response with the canonical kind tag and payload fields."""
+    """Build a protocol response.
 
+    With the canonical kind tag and payload fields.
+    """
     # The envelope carries every field the wire protocol allows; payloads may
     # only override declared fields, leaving the rest at their null defaults.
     response: dict[str, Any] = {
@@ -34,14 +36,18 @@ def response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
 
     unknown = set(payload) - set(response)
     if unknown:
-        raise invalid_descriptor(f"worker response contains unknown fields {sorted(unknown)!r}")
+        raise invalid_descriptor(
+            f"worker response contains unknown fields {sorted(unknown)!r}"
+        )
     response.update(payload)
     return response
 
 
 def required(request: Mapping[str, Any], field: str, kind: RequestKind) -> Any:
-    """Return a required request field or raise a classified descriptor error."""
+    """Return a required request field.
 
+    Raise a classified descriptor error when it is absent.
+    """
     value = request.get(field)
     if value is None:
         raise invalid_descriptor(
@@ -53,11 +59,11 @@ def required(request: Mapping[str, Any], field: str, kind: RequestKind) -> Any:
 
 def integer(request: Mapping[str, Any], field: str, kind: RequestKind) -> int:
     """Decode a required request field as a non-negative integer."""
-
     value = required(request, field, kind)
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise invalid_descriptor(
-            f"request {kind.value!r} field {field!r} must be a non-negative integer",
+            f"request {kind.value!r} field {field!r} must be a "
+            "non-negative integer",
             op_kind=kind.value,
         )
     return value
@@ -65,19 +71,22 @@ def integer(request: Mapping[str, Any], field: str, kind: RequestKind) -> int:
 
 def request_kind(request: Mapping[str, Any]) -> RequestKind:
     """Decode and validate the request kind discriminator."""
-
     raw = request.get("kind")
     if not isinstance(raw, str):
         raise invalid_descriptor("worker request kind must be a string")
     try:
         return RequestKind(raw)
     except ValueError:
-        raise invalid_descriptor(f"unknown worker request kind {raw!r}") from None
+        raise invalid_descriptor(
+            f"unknown worker request kind {raw!r}"
+        ) from None
 
 
 def run_requests(run: ScheduleBatch) -> frozenset[int]:
-    """Collect request identifiers referenced by a run's admissions, operations, and commands."""
+    """Collect request identifiers referenced by a run.
 
+    Admissions, operations, and commands each reference request keys.
+    """
     keys = (
         *(admission.request_key for admission in run.admissions),
         *(operation.request_key for operation in run.operations),
@@ -87,8 +96,10 @@ def run_requests(run: ScheduleBatch) -> frozenset[int]:
 
 
 def raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
-    """Extract the request identifiers touched by a submit or lifecycle command."""
+    """Extract the request identifiers a command touches.
 
+    Covers submit and lifecycle commands.
+    """
     requests: set[int] = set()
     run = request.get("run")
     if isinstance(run, ScheduleBatch):
@@ -117,7 +128,9 @@ def raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
             if key is None and isinstance(request_value, Mapping):
                 key = request_value.get("request_key")
 
-            request_id = key.get("request_id") if isinstance(key, Mapping) else None
+            request_id = (
+                key.get("request_id") if isinstance(key, Mapping) else None
+            )
             if isinstance(request_id, int) and not isinstance(request_id, bool):
                 requests.add(int(request_id))
 
@@ -126,7 +139,6 @@ def raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
 
 def finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
     """Convert an in-memory run result into its transport mapping."""
-
     finalized = dict(response)
     report = finalized.get("result")
     if isinstance(report, BatchOutput):
@@ -136,7 +148,10 @@ def finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
 
 @dataclass(slots=True)
 class ServiceRequest:
-    """Tracks one decoded IPC request, its dependencies, successors, run, and release state."""
+    """Track one decoded IPC request.
+
+    Covers its dependencies, successors, run, and release state.
+    """
 
     sequence: int
     request: dict[str, Any]
@@ -158,18 +173,23 @@ class PendingResponse:
     run: BatchState | None = None
 
 
-def with_call_id(response: dict[str, Any], request: Mapping[str, Any]) -> dict[str, Any]:
+def with_call_id(
+    response: dict[str, Any], request: Mapping[str, Any]
+) -> dict[str, Any]:
     """Copy the caller correlation identifier onto a response when present."""
-
     call_id = request.get("call_id")
     if call_id is not None:
         response["call_id"] = call_id
     return response
 
 
-def error_response(error: WorkerError, request: Mapping[str, Any]) -> dict[str, Any]:
-    """Encode a classified error and preserve the request correlation identifier."""
+def error_response(
+    error: WorkerError, request: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Encode a classified error.
 
+    Preserve the request correlation identifier on the response.
+    """
     fields = error.to_mapping()
     fields.pop("kind", None)
     return with_call_id(response(ResponseKind.ERROR, **fields), request)

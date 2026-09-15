@@ -1,16 +1,21 @@
-"""H3's loaded sparse transformer preserves its fixed-step numerical equations."""
+"""H3's loaded sparse transformer preserves its numerical equations.
+
+Each preserved equation uses a fixed step.
+"""
 
 import pytest
 import torch
-from torch.nn import functional as F
 from diffusers.models.embeddings import get_timestep_embedding
-from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+from diffusers.models.transformers.transformer_minimax_h3 import (
+    MiniMaxH3Transformer3DModel,
+)
 from safetensors.torch import save_file
+from torch.nn import functional as F
 
 from tests.python.fixtures.vsa import reference_attention
 from uniserve import loading
-from uniserve.loading import checkpoint, weights
 from uniserve.distributed import DeviceMesh
+from uniserve.loading import checkpoint, weights
 from uniserve.nn.attention import vsa
 from uniserve.runtime import CUDAGraph, ExecutionContext, TensorBuffers
 from uniserve_models.minimax_h3 import (
@@ -31,7 +36,11 @@ def _reference(hidden, source, config, step, tags, cosine, sine, valid):
         return source[name].to(device=hidden.device, dtype=dtype)
 
     def linear(x, prefix, dtype=torch.bfloat16):
-        bias = parameter(prefix + ".bias", dtype) if prefix + ".bias" in source else None
+        bias = (
+            parameter(prefix + ".bias", dtype)
+            if prefix + ".bias" in source
+            else None
+        )
         return F.linear(x.to(dtype), parameter(prefix + ".weight", dtype), bias)
 
     sigma = torch.tensor(
@@ -42,7 +51,10 @@ def _reference(hidden, source, config, step, tags, cosine, sine, valid):
         device=hidden.device,
     )
     features = get_timestep_embedding(
-        1.0 - sigma, config.frequency_dim, flip_sin_to_cos=True, downscale_freq_shift=0
+        1.0 - sigma,
+        config.frequency_dim,
+        flip_sin_to_cos=True,
+        downscale_freq_shift=0,
     )
     times = F.silu(
         linear(
@@ -60,12 +72,17 @@ def _reference(hidden, source, config, step, tags, cosine, sine, valid):
             .index_select(0, indices)
             .float()
         )
-        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = vectors.chunk(6, dim=-1)
+        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = vectors.chunk(
+            6, dim=-1
+        )
         normalized = hidden.float() * torch.rsqrt(
             hidden.float().square().mean(-1, keepdim=True) + config.norm_eps
         )
         normalized = (
-            normalized * parameter(prefix + ".norm1.weight").float() * (1 + scale_a) + shift_a
+            normalized
+            * parameter(prefix + ".norm1.weight").float()
+            * (1 + scale_a)
+            + shift_a
         ).bfloat16()
         projections = [
             linear(normalized, prefix + ".attn.to_" + name).view(
@@ -77,13 +94,22 @@ def _reference(hidden, source, config, step, tags, cosine, sine, valid):
             value = projections[branch].float()
             value = (
                 value
-                * torch.rsqrt(value.square().mean(-1, keepdim=True) + config.qk_norm_eps)
+                * torch.rsqrt(
+                    value.square().mean(-1, keepdim=True) + config.qk_norm_eps
+                )
                 * parameter(prefix + ".attn.norm_" + name + ".weight").float()
             )
             width = cosine.shape[-1]
-            first, second = value[..., :width].clone(), value[..., width : 2 * width].clone()
-            value[..., :width] = first * cosine[:, None] - second * sine[:, None]
-            value[..., width : 2 * width] = second * cosine[:, None] + first * sine[:, None]
+            first, second = (
+                value[..., :width].clone(),
+                value[..., width : 2 * width].clone(),
+            )
+            value[..., :width] = (
+                first * cosine[:, None] - second * sine[:, None]
+            )
+            value[..., width : 2 * width] = (
+                second * cosine[:, None] + first * sine[:, None]
+            )
             projections[branch] = value.bfloat16()
         attended, live = reference_attention(*projections, valid)
         update = linear(attended.flatten(1), prefix + ".attn.to_out.0")
@@ -92,15 +118,25 @@ def _reference(hidden, source, config, step, tags, cosine, sine, valid):
             residual.square().mean(-1, keepdim=True) + config.norm_eps
         )
         normalized = (
-            normalized * parameter(prefix + ".norm2.weight").float() * (1 + scale_f) + shift_f
+            normalized
+            * parameter(prefix + ".norm2.weight").float()
+            * (1 + scale_f)
+            + shift_f
         ).bfloat16()
-        value, gate = linear(normalized, prefix + ".ff.net.0.proj").chunk(2, dim=-1)
-        mlp = linear((F.silu(gate.float()) * value.float()).bfloat16(), prefix + ".ff.net.2")
+        value, gate = linear(normalized, prefix + ".ff.net.0.proj").chunk(
+            2, dim=-1
+        )
+        mlp = linear(
+            (F.silu(gate.float()) * value.float()).bfloat16(),
+            prefix + ".ff.net.2",
+        )
         hidden = (residual.bfloat16().float() + gate_f * mlp.float()).bfloat16()
     shift, scale = linear(times, "norm_out.linear").chunk(2, dim=-1)
     normalized = (
         hidden.float()
-        * torch.rsqrt(hidden.float().square().mean(-1, keepdim=True) + config.norm_eps)
+        * torch.rsqrt(
+            hidden.float().square().mean(-1, keepdim=True) + config.norm_eps
+        )
         * parameter("norm_out.norm.weight").float()
     ).bfloat16()
     results = []
@@ -127,27 +163,44 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
     )
     torch.manual_seed(181)
     native = MiniMaxH3Transformer3DModel(
-        **{source: getattr(config, target) for source, target in TRANSFORMER_FIELDS.items()},
+        **{
+            source: getattr(config, target)
+            for source, target in TRANSFORMER_FIELDS.items()
+        },
         patch_size=(1, 2, 2),
         final_norm_eps=config.norm_eps,
     )
     source = native.state_dict()
     for index in range(config.num_hidden_layers):
         source[f"transformer_blocks.{index}.attn.to_gate_compress.weight"] = (
-            torch.randn(config.num_attention_heads * config.head_dim, config.hidden_size) * 0.04
+            torch.randn(
+                config.num_attention_heads * config.head_dim, config.hidden_size
+            )
+            * 0.04
         )
     save_file(source, tmp_path / "model.safetensors")
     model = loading.load_model(
         Transformer,
         config,
-        checkpoint=(checkpoint.Config("denoiser").resolve(tmp_path, io=loading.Config()),),
-        mapping=lambda model: (transformer_component(model, DiffusionConfig()),),
+        checkpoint=(
+            checkpoint.Config("denoiser").resolve(
+                tmp_path, io=loading.Config()
+            ),
+        ),
+        mapping=lambda model: (
+            transformer_component(model, DiffusionConfig()),
+        ),
         device="cuda",
         weights=weights.Config(
-            dtypes={
-                name: torch.float32
-                for name in ("video_input", "audio_input", "video_output", "audio_output")
-            }
+            dtypes=dict.fromkeys(
+                (
+                    "video_input",
+                    "audio_input",
+                    "video_output",
+                    "audio_output",
+                ),
+                torch.float32,
+            )
         ),
     ).model
     valid = torch.tensor([64, 17, 64, 0], dtype=torch.int32, device="cuda")
@@ -158,9 +211,14 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
         name: torch.where((tags == tag) & live)[0]
         for name, tag in (("text", 1), ("audio", 2), ("video", 0))
     }
-    positions = torch.arange(768, device="cuda", dtype=torch.float32).reshape(256, 3) / 17
+    positions = (
+        torch.arange(768, device="cuda", dtype=torch.float32).reshape(256, 3)
+        / 17
+    )
     frequencies = config.rope_theta ** (
-        -torch.arange(config.rope_frequency_dim, device="cuda", dtype=torch.float32)
+        -torch.arange(
+            config.rope_frequency_dim, device="cuda", dtype=torch.float32
+        )
         / config.rope_frequency_dim
     )
     angles = (positions[..., None] * frequencies).flatten(1)
@@ -183,7 +241,9 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
         latent_width=1,
         audio_frames=16,
     )
-    group = DeviceMesh(ranks=(0,), shape=(1,), axes=("tp",), rank=0).get_group(())
+    group = DeviceMesh(ranks=(0,), shape=(1,), axes=("tp",), rank=0).get_group(
+        ()
+    )
     sparse = vsa.Input(
         256,
         1,
@@ -203,7 +263,11 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
         selections["video"],
         selections["audio"],
     )
-    constants = {"cos": cosine, "sin": sine, "modulation_indices": (tags == 2).long() * 3 + tags}
+    constants = {
+        "cos": cosine,
+        "sin": sine,
+        "modulation_indices": (tags == 2).long() * 3 + tags,
+    }
     requirements = {
         f"attention.{slot}.{name}": config
         for slot in range(2)
@@ -211,26 +275,44 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
         .attention.workspace_buffers(256, 256, dtype=torch.bfloat16)
         .items()
     }
-    hidden = torch.randn(256, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(
+        256, config.hidden_size, device="cuda", dtype=torch.bfloat16
+    )
     with TensorBuffers.allocate(requirements, device="cuda") as owner:
         workspace = owner.view(requirements)
         with ExecutionContext(model, vsa="cute") as context:
             context.prepare(None)
             for step in range(4):
-                expected = _reference(hidden, source, config, step, tags, cosine, sine, valid)
+                expected = _reference(
+                    hidden, source, config, step, tags, cosine, sine, valid
+                )
                 actual = model(
-                    hidden, inputs, step_index=step, constants=constants, workspace=workspace
+                    hidden,
+                    inputs,
+                    step_index=step,
+                    constants=constants,
+                    workspace=workspace,
                 )
                 for result, reference in zip(actual, expected, strict=True):
-                    torch.testing.assert_close(result, reference, rtol=2e-2, atol=2e-2)
+                    torch.testing.assert_close(
+                        result, reference, rtol=2e-2, atol=2e-2
+                    )
             with CUDAGraph(context=context) as graph:
                 graph.capture(
                     lambda: model(
-                        hidden, inputs, step_index=3, constants=constants, workspace=workspace
+                        hidden,
+                        inputs,
+                        step_index=3,
+                        constants=constants,
+                        workspace=workspace,
                     )
                 )
                 hidden.mul_(0.5)
                 actual = graph.replay()
-                expected = _reference(hidden, source, config, 3, tags, cosine, sine, valid)
+                expected = _reference(
+                    hidden, source, config, 3, tags, cosine, sine, valid
+                )
                 for result, reference in zip(actual, expected, strict=True):
-                    torch.testing.assert_close(result, reference, rtol=2e-2, atol=2e-2)
+                    torch.testing.assert_close(
+                        result, reference, rtol=2e-2, atol=2e-2
+                    )

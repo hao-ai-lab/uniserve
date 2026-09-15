@@ -8,7 +8,10 @@ from uniserve.runtime.device import canonical_device
 
 
 class StagingBuffers:
-    """Own generation-safe CPU sources for asynchronous host-to-device copies."""
+    """Own generation-safe CPU sources for asynchronous host-to-device.
+
+    copies.
+    """
 
     def __init__(
         self,
@@ -19,7 +22,6 @@ class StagingBuffers:
         device: torch.device | str,
     ) -> None:
         """Allocate a generation-safe ring of pinned host copy sources."""
-
         count = int(depth)
         if count < 1:
             raise ValueError("host staging depth must be positive")
@@ -27,14 +29,17 @@ class StagingBuffers:
         self.device = canonical_device(device)
         pin = self.device.type == "cuda"
         self._buffers = tuple(
-            torch.empty(shape, dtype=dtype, device="cpu", pin_memory=pin) for _ in range(count)
+            torch.empty(shape, dtype=dtype, device="cpu", pin_memory=pin)
+            for _ in range(count)
         )
         self._events: list[torch.cuda.Event | None] = [None] * count
         self._cursor = 0
 
     def acquire(self) -> tuple[int, torch.Tensor]:
-        """Lease the next pinned host integer buffer and return its generation-tagged slot."""
+        """Lease the next pinned host integer buffer and return.
 
+        its generation-tagged slot.
+        """
         if not self._buffers:
             raise RuntimeError("host staging storage is closed")
         slot = self._cursor % len(self._buffers)
@@ -47,7 +52,6 @@ class StagingBuffers:
 
     def record_copy(self, slot: int) -> None:
         """Return a validated host-staging slot to the free ring."""
-
         if self.device.type != "cuda":
             return
         index = int(slot)
@@ -60,8 +64,10 @@ class StagingBuffers:
         event.record(torch.cuda.current_stream(self.device))
 
     def close(self) -> None:
-        """Drain copies and release pinned storage while its streams still exist."""
+        """Drain copies and release pinned storage while its streams still.
 
+        exist.
+        """
         for event in self._events:
             if event is not None:
                 event.synchronize()

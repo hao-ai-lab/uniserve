@@ -14,7 +14,16 @@ from uniserve.tensors import BufferConfig, _join_channels
 class Operator:
     """One prepared local GEMM; operands and workspace are borrowed."""
 
-    def __init__(self, weight, *, input_dtype, input_quantizer, max_rows, output_dtype, workspace):
+    def __init__(
+        self,
+        weight,
+        *,
+        input_dtype,
+        input_quantizer,
+        max_rows,
+        output_dtype,
+        workspace,
+    ):
         self.weight = weight
         self.input_dtype = input_dtype
         self.input_quantizer = input_quantizer
@@ -24,23 +33,35 @@ class Operator:
 
     def _input(self, x, out):
         """Validate the call against preparation and return GEMM-ready input."""
-
-        if x.ndim != 2 or x.shape[-1] != self.weight.shape[-1] or x.shape[0] > self.max_rows:
-            raise ValueError("linear input exceeds the prepared matrix dimensions")
+        if (
+            x.ndim != 2
+            or x.shape[-1] != self.weight.shape[-1]
+            or x.shape[0] > self.max_rows
+        ):
+            raise ValueError(
+                "linear input exceeds the prepared matrix dimensions"
+            )
         if x.dtype != self.input_dtype or x.device != self.weight.device:
-            raise ValueError("linear input disagrees with the prepared dtype or device")
+            raise ValueError(
+                "linear input disagrees with the prepared dtype or device"
+            )
         if (
             out.shape != (x.shape[0], self.weight.shape[0])
             or out.dtype != self.output_dtype
             or out.device != x.device
         ):
-            raise ValueError("linear output disagrees with the prepared shape, dtype or device")
+            raise ValueError(
+                "linear output disagrees with the prepared shape, dtype "
+                "or device"
+            )
 
         if self.input_quantizer is None:
             return x
         if isinstance(x, QuantizedTensor):
             if x.quantizer != self.input_quantizer:
-                raise ValueError("input encoding disagrees with the prepared quantizer")
+                raise ValueError(
+                    "input encoding disagrees with the prepared quantizer"
+                )
             return x
 
         target = self._input_storage(x)
@@ -48,7 +69,6 @@ class Operator:
 
     def _input_storage(self, x):
         """Borrow the active row prefix of this operator's encoded workspace."""
-
         rows = x.shape[0]
         fields = {}
         for name, value in self.workspace.items():
@@ -58,13 +78,22 @@ class Operator:
                 # per-column fields keep their full prepared extent.
                 row_field = field in {"values", "block_scale"} or (
                     field == "scale"
-                    and (self.input_quantizer.axis == 0 or self.input_quantizer.format == "mxfp8")
+                    and (
+                        self.input_quantizer.axis == 0
+                        or self.input_quantizer.format == "mxfp8"
+                    )
                 )
                 fields[field] = value[:rows] if row_field else value
-        return self.input_quantizer.from_tensors(fields, shape=tuple(x.shape), dtype=x.dtype)
+        return self.input_quantizer.from_tensors(
+            fields, shape=tuple(x.shape), dtype=x.dtype
+        )
 
     def __call__(
-        self, x: torch_lib.Tensor, bias: torch_lib.Tensor | None, *, out: torch_lib.Tensor
+        self,
+        x: torch_lib.Tensor,
+        bias: torch_lib.Tensor | None,
+        *,
+        out: torch_lib.Tensor,
     ) -> torch_lib.Tensor:
         raise NotImplementedError
 
@@ -72,7 +101,9 @@ class Operator:
 class MergedOperator:
     """Prepared fused projection over the logical branches of one matrix."""
 
-    def __init__(self, operators, *, fused=None, output=None, bias=None, widths=None):
+    def __init__(
+        self, operators, *, fused=None, output=None, bias=None, widths=None
+    ):
         self.operators = operators
         self.fused = fused
         self.output = output
@@ -80,8 +111,13 @@ class MergedOperator:
         self.widths = widths
 
     def __call__(self, x, biases, *, out):
-        if set(out) != set(self.operators) or set(biases) != set(self.operators):
-            raise ValueError("merged projection outputs and biases must match the named branches")
+        if set(out) != set(self.operators) or set(biases) != set(
+            self.operators
+        ):
+            raise ValueError(
+                "merged projection outputs and biases must match the "
+                "named branches"
+            )
 
         if self.fused is None:
             # Different block encodings or NVFP4 tensor multipliers cannot be
@@ -93,7 +129,9 @@ class MergedOperator:
 
         # Adjacent branch outputs form one channel matrix directly; otherwise
         # the fused GEMM lands in execution scratch and is scattered below.
-        target = _join_channels(tuple(out[name] for name in self.operators), copy=False)
+        target = _join_channels(
+            tuple(out[name] for name in self.operators), copy=False
+        )
         direct = target is not None
         if target is None:
             target = self.output[: x.shape[0]]
@@ -105,7 +143,9 @@ class MergedOperator:
             for operator, destination in zip(
                 self.operators.values(), scales.split(self.widths), strict=True
             ):
-                destination.copy_(operator.weight.buffers()["scale"].expand_as(destination))
+                destination.copy_(
+                    operator.weight.buffers()["scale"].expand_as(destination)
+                )
 
         bias_values = tuple(biases.values())
         if all(value is None for value in bias_values):
@@ -114,15 +154,21 @@ class MergedOperator:
             bias = _concatenate(bias_values)
         else:
             bias = self.bias
-            for value, destination in zip(bias_values, bias.split(self.widths), strict=True):
-                destination.zero_() if value is None else destination.copy_(value)
+            for value, destination in zip(
+                bias_values, bias.split(self.widths), strict=True
+            ):
+                destination.zero_() if value is None else destination.copy_(
+                    value
+                )
 
         self.fused(x, bias, out=target)
         if direct:
             return out
 
         for (name, operator), value in zip(
-            self.operators.items(), target.split(self.widths, dim=-1), strict=True
+            self.operators.items(),
+            target.split(self.widths, dim=-1),
+            strict=True,
         ):
             destination = out[name]
             if (
@@ -130,17 +176,23 @@ class MergedOperator:
                 or destination.dtype != value.dtype
                 or destination.device != value.device
             ):
-                raise ValueError("merged output disagrees with its branch representation")
+                raise ValueError(
+                    "merged output disagrees with its branch representation"
+                )
             destination.copy_(value)
         return out
 
 
 def _concatenate(values, *, copy=True):
-    """Borrow adjacent parameter views when the loader supplied fused backing."""
+    """Borrow adjacent parameter views.
 
+    Borrow adjacent parameter views when the loader supplied fused backing.
+    """
     first = values[0]
     if all(
-        value.is_contiguous() and value.dtype == first.dtype and value.device == first.device
+        value.is_contiguous()
+        and value.dtype == first.dtype
+        and value.device == first.device
         for value in values
     ):
         # Probe whether the values tile one storage back to back; only then
@@ -148,40 +200,54 @@ def _concatenate(values, *, copy=True):
         position = first.storage_offset()
         storage = first.untyped_storage().data_ptr()
         for value in values:
-            if value.untyped_storage().data_ptr() != storage or value.storage_offset() != position:
+            if (
+                value.untyped_storage().data_ptr() != storage
+                or value.storage_offset() != position
+            ):
                 break
             position += value.numel()
         else:
             return first.as_strided(
-                (sum(value.shape[0] for value in values), *first.shape[1:]), first.stride()
+                (sum(value.shape[0] for value in values), *first.shape[1:]),
+                first.stride(),
             )
     return torch_lib.cat(values, dim=0) if copy else None
 
 
 def _fused_weight(weights, scale):
-    """Form GEMM backing while retaining each logical branch's encoded scales."""
+    """Form GEMM backing.
 
+    Form GEMM backing while retaining each logical branch's encoded scales.
+    """
     values = tuple(weights.values())
     first = values[0]
 
-    if any(value.dtype != first.dtype or value.device != first.device for value in values):
+    if any(
+        value.dtype != first.dtype or value.device != first.device
+        for value in values
+    ):
         return None
     if not any(isinstance(value, QuantizedTensor) for value in values):
         return _concatenate(values, copy=False)
     if not all(
-        isinstance(value, QuantizedTensor) and value.quantizer.format == "fp8" for value in values
+        isinstance(value, QuantizedTensor) and value.quantizer.format == "fp8"
+        for value in values
     ):
         return None
 
     # A per-tensor branch scale is broadcast over only that branch's channels.
     # This changes its physical scale view, never its original statistics.
-    backing = _concatenate(tuple(value.buffers()["values"] for value in values), copy=False)
+    backing = _concatenate(
+        tuple(value.buffers()["values"] for value in values), copy=False
+    )
     if backing is None:
         return None
 
     fields = {"values": backing, "scale": scale}
     return Quantizer("fp8", axis=0).from_tensors(
-        fields, shape=(sum(value.shape[0] for value in values), first.shape[1]), dtype=first.dtype
+        fields,
+        shape=(sum(value.shape[0] for value in values), first.shape[1]),
+        dtype=first.dtype,
     )
 
 
@@ -200,7 +266,10 @@ class Backend:
         output_dtype: torch_lib.dtype,
     ) -> Mapping[str, BufferConfig]:
         if weight.ndim != 2 or max_rows < 0:
-            raise ValueError("matmul preparation requires a matrix and nonnegative row capacity")
+            raise ValueError(
+                "matmul preparation requires a matrix and nonnegative "
+                "row capacity"
+            )
         if input_quantizer is None:
             return {}
         # Meta conversion describes physical fields without allocating device
@@ -233,7 +302,14 @@ class Backend:
         )
 
     def merged_workspace_buffers(
-        self, weights, *, input_dtype, input_quantizer, max_rows, branch_width, output_dtype
+        self,
+        weights,
+        *,
+        input_dtype,
+        input_quantizer,
+        max_rows,
+        branch_width,
+        output_dtype,
     ):
         configs = {
             f"{name}.{field}": config
@@ -248,17 +324,20 @@ class Backend:
         }
 
         configs["output"] = BufferConfig(
-            (max_rows, sum(weight.shape[0] for weight in weights.values())), output_dtype
+            (max_rows, sum(weight.shape[0] for weight in weights.values())),
+            output_dtype,
         )
         configs["bias"] = BufferConfig(
             (sum(weight.shape[0] for weight in weights.values()),), input_dtype
         )
         if all(
-            isinstance(value, QuantizedTensor) and value.quantizer.format == "fp8"
+            isinstance(value, QuantizedTensor)
+            and value.quantizer.format == "fp8"
             for value in weights.values()
         ):
             configs["weight.scale"] = BufferConfig(
-                (sum(weight.shape[0] for weight in weights.values()), 1), torch_lib.float32
+                (sum(weight.shape[0] for weight in weights.values()), 1),
+                torch_lib.float32,
             )
         return configs
 
@@ -276,10 +355,13 @@ class Backend:
         if branch_width is not None and (
             type(branch_width) is not int
             or branch_width < 1
-            or any(weight.shape[0] % branch_width for weight in weights.values())
+            or any(
+                weight.shape[0] % branch_width for weight in weights.values()
+            )
         ):
             raise ValueError(
-                "interleaved branches require a positive group width dividing each branch"
+                "interleaved branches require a positive group width "
+                "dividing each branch"
             )
 
         operators = {
@@ -321,13 +403,19 @@ class Backend:
 
 
 def resolve(backend: str | Backend, weight: torch_lib.Tensor) -> Backend:
-    """Select a provider by name; ``auto`` follows the weight's encoding and device."""
+    """Select a provider by name.
 
+    Select a provider by name; ``auto`` follows the weight's encoding and
+    device.
+    """
     if isinstance(backend, Backend):
         return backend
 
     if backend == "auto":
-        if isinstance(weight, QuantizedTensor) and weight.quantizer.format in {"mxfp8", "nvfp4"}:
+        if isinstance(weight, QuantizedTensor) and weight.quantizer.format in {
+            "mxfp8",
+            "nvfp4",
+        }:
             backend = "flashinfer"
         else:
             backend = "cublas" if weight.is_cuda else "torch"

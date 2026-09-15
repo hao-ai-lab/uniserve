@@ -12,16 +12,24 @@ __all__ = ["Backend"]
 
 
 class _SGL(_FlashOperator):
-    """SGLang's FlashAttention build, sharing the FlashAttention operator flow."""
+    """SGLang's FlashAttention build.
+
+    SGLang's FlashAttention build, sharing the FlashAttention operator flow.
+    """
 
     def requires_host_lengths(self, batch):
         # This native entry takes rectangular queries; variable paged batches
         # need exact host boundaries to select their separate query views.
-        return isinstance(batch, PagedInput) or super().requires_host_lengths(batch)
+        return isinstance(batch, PagedInput) or super().requires_host_lengths(
+            batch
+        )
 
     def __init__(self, **kwargs):
         _Operator.__init__(self, **kwargs)
-        from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+        from sgl_kernel.flash_attn import (
+            flash_attn_varlen_func,
+            flash_attn_with_kvcache,
+        )
 
         self._varlen_kernel = flash_attn_varlen_func
         self._paged_kernel = flash_attn_with_kvcache
@@ -32,15 +40,21 @@ class _SGL(_FlashOperator):
     def _dense(self, q, k, v, causal, scale):
         packed = q.ndim == 3
         query, key, value = (
-            tensor.unsqueeze(0) if packed else tensor.transpose(1, 2) for tensor in (q, k, v)
+            tensor.unsqueeze(0) if packed else tensor.transpose(1, 2)
+            for tensor in (q, k, v)
         )
         batches, queries, keys = query.shape[0], query.shape[1], key.shape[1]
         if keys == 0:
             return torch.zeros_like(q)
 
         # No native dense entry: flatten the rectangular batch into varlen form.
-        query_offsets = torch.arange(batches + 1, dtype=torch.int32, device=q.device) * queries
-        key_offsets = torch.arange(batches + 1, dtype=torch.int32, device=q.device) * keys
+        query_offsets = (
+            torch.arange(batches + 1, dtype=torch.int32, device=q.device)
+            * queries
+        )
+        key_offsets = (
+            torch.arange(batches + 1, dtype=torch.int32, device=q.device) * keys
+        )
 
         result = self._varlen_kernel(
             query.flatten(0, 1),
@@ -69,7 +83,9 @@ class _SGL(_FlashOperator):
                         k,
                         v,
                         cache_seqlens=lengths[row : row + 1],
-                        page_table=batch.block_table.indices[row : row + 1].to(dtype=torch.int32),
+                        page_table=batch.block_table.indices[row : row + 1].to(
+                            dtype=torch.int32
+                        ),
                         softmax_scale=scale,
                         causal=batch.causal[row],
                         ver=3,

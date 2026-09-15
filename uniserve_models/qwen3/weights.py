@@ -25,7 +25,7 @@ precisions = MappingProxyType(
 
 
 def parameter_sources(config: Config) -> Mapping[str, str]:
-    """Map complete logical Qwen parameters to checkpoint names before partitioning."""
+    """Map complete logical Qwen parameters to checkpoint names before partitioning."""  # noqa: E501
     names = {
         "backbone.embedding.weight": "model.embed_tokens.weight",
         "backbone.norm.weight": "model.norm.weight",
@@ -35,15 +35,23 @@ def parameter_sources(config: Config) -> Mapping[str, str]:
     }
     for index in range(config.num_hidden_layers):
         target, source = f"backbone.layers.{index}", f"model.layers.{index}"
-        names[f"{target}.input_norm.weight"] = f"{source}.input_layernorm.weight"
-        names[f"{target}.post_attention_norm.weight"] = f"{source}.post_attention_layernorm.weight"
+        names[f"{target}.input_norm.weight"] = (
+            f"{source}.input_layernorm.weight"
+        )
+        names[f"{target}.post_attention_norm.weight"] = (
+            f"{source}.post_attention_layernorm.weight"
+        )
 
-        for field in ("weight", "bias") if config.attention_bias else ("weight",):
+        for field in (
+            ("weight", "bias") if config.attention_bias else ("weight",)
+        ):
             for branch in ("q", "k", "v"):
-                names[f"{target}.attention.qkv.projection.projections.{branch}.{field}"] = (
-                    f"{source}.self_attn.{branch}_proj.{field}"
-                )
-            names[f"{target}.attention.output.{field}"] = f"{source}.self_attn.o_proj.{field}"
+                names[
+                    f"{target}.attention.qkv.projection.projections.{branch}.{field}"
+                ] = f"{source}.self_attn.{branch}_proj.{field}"
+            names[f"{target}.attention.output.{field}"] = (
+                f"{source}.self_attn.o_proj.{field}"
+            )
 
         for branch in ("q", "k"):
             norm = "query_norm" if branch == "q" else "key_norm"
@@ -54,7 +62,10 @@ def parameter_sources(config: Config) -> Mapping[str, str]:
         if config.num_experts:
             names[f"{target}.mlp.router.weight"] = f"{source}.mlp.gate.weight"
             mlps = tuple(
-                (f"{target}.mlp.experts.experts.{expert}", f"{source}.mlp.experts.{expert}")
+                (
+                    f"{target}.mlp.experts.experts.{expert}",
+                    f"{source}.mlp.experts.{expert}",
+                )
                 for expert in range(config.num_experts)
             )
         else:
@@ -64,7 +75,9 @@ def parameter_sources(config: Config) -> Mapping[str, str]:
                 names[f"{target_mlp}.gate_up.projections.{branch}.weight"] = (
                     f"{source_mlp}.{branch}_proj.weight"
                 )
-            names[f"{target_mlp}.down.weight"] = f"{source_mlp}.down_proj.weight"
+            names[f"{target_mlp}.down.weight"] = (
+                f"{source_mlp}.down_proj.weight"
+            )
 
     return names
 
@@ -72,7 +85,9 @@ def parameter_sources(config: Config) -> Mapping[str, str]:
 def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
     names = parameter_sources(model.config)
     parameters = dict(model.named_parameters(remove_duplicate=False))
-    off_stage = frozenset(source for target, source in names.items() if target not in parameters)
+    off_stage = frozenset(
+        source for target, source in names.items() if target not in parameters
+    )
     # Tied heads can have a redundant checkpoint copy; the embedding is the
     # unique source for their shared Parameter on either pipeline endpoint.
     if model.config.tie_word_embeddings:
@@ -95,6 +110,10 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
 
     return (
         weights.ModuleMapping(
-            model, "primary", assign, frozenset(parameters), nonresident=off_stage
+            model,
+            "primary",
+            assign,
+            frozenset(parameters),
+            nonresident=off_stage,
         ),
     )

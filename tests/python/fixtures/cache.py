@@ -5,7 +5,11 @@ import torch
 from uniserve.cache import Config, mha
 from uniserve.quantization import Quantizer
 from uniserve.runtime import PrefixCache
-from uniserve_worker.bootstrap.worker_info import KVCacheInfo, KvGroup, KvGroupKind
+from uniserve_worker.bootstrap.worker_info import (
+    KVCacheInfo,
+    KvGroup,
+    KvGroupKind,
+)
 from uniserve_worker.runtime.cache_manager import CacheManager
 
 
@@ -37,7 +41,9 @@ def mha_pool(
         for index in range(layer_offset, layer_offset + num_layers)
     }
     encoded = store_dtype is torch.float8_e4m3fn
-    quantization = {name: Quantizer("fp8", axis=0) for name in layers} if encoded else None
+    quantization = (
+        {name: Quantizer("fp8", axis=0) for name in layers} if encoded else None
+    )
     cache = PrefixCache(
         Config(layers),
         num_blocks=num_pages,

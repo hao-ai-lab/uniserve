@@ -9,7 +9,11 @@ from types import MappingProxyType
 import torch
 
 from uniserve.distributed.mesh import Communicator
-from uniserve.nn.attention._parallel import AttentionBuffers, OutputBuffers, ParallelAttention
+from uniserve.nn.attention._parallel import (
+    AttentionBuffers,
+    OutputBuffers,
+    ParallelAttention,
+)
 from uniserve.runtime._peer_memory import allocate_peer_workspace
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig
@@ -17,7 +21,10 @@ from uniserve.tensors import BufferConfig
 
 @dataclass(frozen=True)
 class OutputStorage:
-    """Keep symmetric attention destinations alive through their final reader."""
+    """Keep attention destinations alive through their final reader.
+
+    Keep symmetric attention destinations alive through their final reader.
+    """
 
     allocations: tuple[TensorBuffers, ...]
     views: Mapping[ParallelAttention, OutputBuffers]
@@ -36,11 +43,11 @@ def allocate_output_storage(
 ) -> OutputStorage:
     """Allocate peer outputs shared only by one caller's serialized layers.
 
-    The dimensions describe query rows and heads after Ulysses exchange. Each peer
-    receives its sequence rows with every head in that logical group. Runtime
-    owns registration, synchronization values, and allocation retirement.
+    The dimensions describe query rows and heads after Ulysses exchange.
+    Each peer receives its sequence rows with every head in that logical
+    group. Runtime owns registration, synchronization values, and allocation
+    retirement.
     """
-
     if min(rows, heads, head_dim) < 1:
         raise ValueError("attention output extents must be positive")
 
@@ -49,17 +56,25 @@ def allocate_output_storage(
     for layer in layers:
         group = layer.ulysses_group
         if rows % group.size:
-            raise ValueError("attention output rows must divide Ulysses membership")
+            raise ValueError(
+                "attention output rows must divide Ulysses membership"
+            )
 
         schema = {
-            "output": BufferConfig((rows // group.size, heads * group.size, head_dim), dtype),
-            "receive": BufferConfig((rows // group.size, heads * group.size, head_dim), dtype),
+            "output": BufferConfig(
+                (rows // group.size, heads * group.size, head_dim), dtype
+            ),
+            "receive": BufferConfig(
+                (rows // group.size, heads * group.size, head_dim), dtype
+            ),
             "sync_input": BufferConfig((1,), torch.int32),
             "sync_output": BufferConfig((group.size,), torch.int32),
         }
         if group not in allocations:
             allocation = TensorBuffers.allocate(
-                schema, device=group.device, symmetric={"output": group, "receive": group}
+                schema,
+                device=group.device,
+                symmetric={"output": group, "receive": group},
             )
             # Each rank seeds its own sync slot for the peer rendezvous.
             allocation.view(schema)["sync_input"].fill_(group.rank)
@@ -86,12 +101,16 @@ def allocate_attention_context(
     block_size: int,
     mapped: bool,
 ) -> AttentionBuffers:
-    """Allocate context K/V and fences using their actual physical row capacity."""
+    """Allocate context K/V and fences.
 
+    Allocate context K/V and fences using their actual physical row capacity.
+    """
     if min(rows, heads, head_dim, block_size) < 1:
         raise ValueError("attention context extents must be positive")
     if rows % block_size:
-        raise ValueError("attention context rows must align to its validity blocks")
+        raise ValueError(
+            "attention context rows must align to its validity blocks"
+        )
 
     shape = (rows, heads, head_dim)
     if mapped:
@@ -111,10 +130,15 @@ def allocate_attention_context(
         local_key, local_value = keys.local, values.local
     else:
         # Replicated compact domain: each rank owns one contiguous row window.
-        key = torch.empty((rows * group.size, *shape[1:]), dtype=dtype, device=group.device)
+        key = torch.empty(
+            (rows * group.size, *shape[1:]), dtype=dtype, device=group.device
+        )
         value = torch.empty_like(key)
         begin = group.rank * rows
-        local_key, local_value = key[begin : begin + rows], value[begin : begin + rows]
+        local_key, local_value = (
+            key[begin : begin + rows],
+            value[begin : begin + rows],
+        )
 
     # Trailing fields: per-block valid-row counts, local fence, per-peer fences.
     return AttentionBuffers(
@@ -122,7 +146,9 @@ def allocate_attention_context(
         value,
         local_key,
         local_value,
-        torch.empty(key.shape[0] // block_size, dtype=torch.int32, device=group.device),
+        torch.empty(
+            key.shape[0] // block_size, dtype=torch.int32, device=group.device
+        ),
         torch.zeros(1, dtype=torch.int32, device=group.device),
         torch.empty(group.size, dtype=torch.int32, device=group.device),
     )
@@ -143,7 +169,6 @@ def allocate_context_storage(
     allocation preserves page padding and peer offsets. Numerical layers only
     borrow the resulting views when the caller enters ``context_scope``.
     """
-
     # All layers in this call share head dimensions, dtype and block size.
     # Only communicator, gathered row count and mapping can vary per layer.
     allocations: dict[tuple[Communicator, int, bool], AttentionBuffers] = {}
@@ -153,7 +178,9 @@ def allocate_context_storage(
             continue
 
         group = layer.key_group
-        gathered_rows = rows * (layer.col_group.size if layer.col_group is not None else 1)
+        gathered_rows = rows * (
+            layer.col_group.size if layer.col_group is not None else 1
+        )
         key = (group, gathered_rows, layer.mapped)
         if key not in allocations:
             allocations[key] = allocate_attention_context(

@@ -26,15 +26,22 @@ class ImageState:
     size: Config
     schedule: Schedule
     guidance: Guidance
-    prefixes: dict[BranchSource, tuple[tuple[int, ...], bool]] = field(default_factory=dict)
+    prefixes: dict[BranchSource, tuple[tuple[int, ...], bool]] = field(
+        default_factory=dict
+    )
     positions: dict[int, torch.Tensor] = field(default_factory=dict)
     cache: tuple[int, int, int, int] = (0, 0, 0, 0)
-    entries: dict[Branch, tuple[int, int, int, int]] = field(default_factory=dict)
+    entries: dict[Branch, tuple[int, int, int, int]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(slots=True)
 class VideoState:
-    """Borrow request media tensors while their execution owners retain backing."""
+    """Borrow request media tensors while their execution owners retain.
+
+    backing.
+    """
 
     size: Any
     schedules: dict[str, Schedule]
@@ -50,8 +57,10 @@ def resolve_prefix(
     negative_token_ids: tuple[int, ...],
     tokenizer: Any | None,
 ) -> tuple[tuple[int, ...], bool]:
-    """Resolve a branch prefix and flag an empty positive prompt as start-state conditioning."""
+    """Resolve a branch prefix and flag an empty positive prompt as start-state.
 
+    conditioning.
+    """
     if source is BranchSource.CONDITIONING and not image_prompt.strip():
         return (), True
     if source is BranchSource.NEGATIVE_OR_START and negative_token_ids:
@@ -59,7 +68,9 @@ def resolve_prefix(
 
     if prompt is None:
         if source is BranchSource.CONDITIONING:
-            raise invalid_descriptor("this model does not accept a generation prompt override")
+            raise invalid_descriptor(
+                "this model does not accept a generation prompt override"
+            )
         return (), False
 
     if source is BranchSource.CONDITIONING:

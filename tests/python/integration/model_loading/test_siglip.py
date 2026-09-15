@@ -37,11 +37,15 @@ def test_variable_image_grids_match_independent_encoder(tmp_path):
             value = value.permute(0, 2, 3, 1).flatten(1).contiguous()
         state[name] = value
     save_file(state, tmp_path / "model.safetensors")
-    config = siglip.Config(2, 8, 3, siglip.TransformerConfig(32, 4, 48, 2, 1e-6))
+    config = siglip.Config(
+        2, 8, 3, siglip.TransformerConfig(32, 4, 48, 2, 1e-6)
+    )
     model = loading.load_model(
         siglip.Encoder,
         config,
-        checkpoint=(checkpoint.Config("vision").resolve(tmp_path, io=loading.Config()),),
+        checkpoint=(
+            checkpoint.Config("vision").resolve(tmp_path, io=loading.Config()),
+        ),
         mapping=lambda model: (
             weights.ModuleMapping(
                 model,
@@ -54,7 +58,12 @@ def test_variable_image_grids_match_independent_encoder(tmp_path):
         weights=weights.Config(dtype=torch.float32),
     ).model
     encoder = PatchEncoder(
-        model, nn.Identity(), patch_size=2, downsample=1, output_size=32, output_dtype=torch.float32
+        model,
+        nn.Identity(),
+        patch_size=2,
+        downsample=1,
+        output_size=32,
+        output_dtype=torch.float32,
     )
     pixels = (torch.randn(3, 8, 8), torch.randn(3, 8, 4), torch.randn(3, 4, 8))
     expected = []
@@ -63,13 +72,24 @@ def test_variable_image_grids_match_independent_encoder(tmp_path):
         # no interpolation is part of the NaViT checkpoint's grid convention.
         for value in pixels:
             rows, columns = value.shape[-2] // 2, value.shape[-1] // 2
-            features = reference.embeddings.patch_embedding(value[None]).flatten(2).transpose(1, 2)
-            positions = (torch.arange(rows)[:, None] * 4 + torch.arange(columns)).flatten()
-            features = features + reference.embeddings.position_embedding(positions)[None]
+            features = (
+                reference.embeddings.patch_embedding(value[None])
+                .flatten(2)
+                .transpose(1, 2)
+            )
+            positions = (
+                torch.arange(rows)[:, None] * 4 + torch.arange(columns)
+            ).flatten()
+            features = (
+                features
+                + reference.embeddings.position_embedding(positions)[None]
+            )
             hidden = reference.encoder(inputs_embeds=features).last_hidden_state
             expected.append(reference.post_layernorm(hidden)[0])
         actual = encoder.encode(VisionInput(pixels, (None,) * 3, (None,) * 3))
-        shapes = tuple((value.shape[-2] // 2, value.shape[-1] // 2) for value in pixels)
+        shapes = tuple(
+            (value.shape[-2] // 2, value.shape[-1] // 2) for value in pixels
+        )
         packed = encoder.encode(
             VisionInput(
                 tuple(patchify(value, patch_size=2) for value in pixels),
@@ -77,9 +97,13 @@ def test_variable_image_grids_match_independent_encoder(tmp_path):
                 shapes,
             )
         )
-        for output, patch_output, target in zip(actual, packed, expected, strict=True):
+        for output, patch_output, target in zip(
+            actual, packed, expected, strict=True
+        ):
             torch.testing.assert_close(output, target, rtol=1e-5, atol=1e-6)
-            torch.testing.assert_close(patch_output, target, rtol=1e-5, atol=1e-6)
+            torch.testing.assert_close(
+                patch_output, target, rtol=1e-5, atol=1e-6
+            )
     assert encoder.encode(VisionInput((), (), ())) == ()
 
 
@@ -90,7 +114,9 @@ def test_image_encoding_replay_reads_updated_pixels():
     from uniserve.runtime import CUDAGraph, ExecutionContext
 
     torch.manual_seed(987)
-    config = siglip.Config(2, 8, 3, siglip.TransformerConfig(32, 4, 48, 1, 1e-6))
+    config = siglip.Config(
+        2, 8, 3, siglip.TransformerConfig(32, 4, 48, 1, 1e-6)
+    )
     encoder = (
         PatchEncoder(
             siglip.Encoder(config),

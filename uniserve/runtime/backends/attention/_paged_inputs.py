@@ -43,12 +43,24 @@ def _prepare_kernel(
             # queries/prefixes are per-sequence length columns; offsets are
             # cumulative over the batch with one extra leading zero entry.
             rows = tl.arange(0, sequence_block)
-            q = tl.load(queries + rows * sequence_strides[0], rows < batch_size, 0)
-            p = tl.load(prefixes + rows * sequence_strides[1], rows < batch_size, 0)
+            q = tl.load(
+                queries + rows * sequence_strides[0], rows < batch_size, 0
+            )
+            p = tl.load(
+                prefixes + rows * sequence_strides[1], rows < batch_size, 0
+            )
             tl.store(lengths + rows, q + p, rows < batch_size)
 
-            q_offset = tl.load(query_offsets + rows * sequence_strides[2], rows <= batch_size, 0)
-            p_offset = tl.load(prefix_offsets + rows * sequence_strides[3], rows <= batch_size, 0)
+            q_offset = tl.load(
+                query_offsets + rows * sequence_strides[2],
+                rows <= batch_size,
+                0,
+            )
+            p_offset = tl.load(
+                prefix_offsets + rows * sequence_strides[3],
+                rows <= batch_size,
+                0,
+            )
             # Prefix and query offsets are cumulative in the same sequence
             # order, so their sum is the cumulative complete key length.
             tl.store(offsets + rows, q_offset + p_offset, rows <= batch_size)
@@ -79,15 +91,18 @@ def prepare(state, key, value, batch, *, lengths, offsets):
     Other numerical representations use the state's ordinary write operation.
     The outputs borrow context workspace and are valid until its next use.
     """
-
     indices = batch.write_indices
     fused = False
 
     if indices is not None:
         if state is None:
-            raise RuntimeError("attention cache update requires bound prefix state")
+            raise RuntimeError(
+                "attention cache update requires bound prefix state"
+            )
         state._validate_update(key, value, indices)
-        fused = _triton_paged_kv_write_eligible(state.key, state.value, indices, None, key, value)
+        fused = _triton_paged_kv_write_eligible(
+            state.key, state.value, indices, None, key, value
+        )
         if not fused:
             state.update(key, value, indices=indices)
 

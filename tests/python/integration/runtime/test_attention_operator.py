@@ -57,7 +57,9 @@ def test_dense_varlen_and_visible_attention_use_declared_ranges():
     operator = _operator()
     batch = DenseInput(causal=True, mask=None)
     assert operator(q, k, v, batch, scale=0.5, out=out) is out
-    torch.testing.assert_close(out, _expected(q, k, v, torch.ones(5, 5, dtype=torch.bool).tril()))
+    torch.testing.assert_close(
+        out, _expected(q, k, v, torch.ones(5, 5, dtype=torch.bool).tril())
+    )
     allowed = torch.ones(5, 5, dtype=torch.bool)
     allowed[:, 1] = False
     operator(q, k, v, DenseInput(causal=True, mask=allowed), scale=0.5, out=out)
@@ -67,15 +69,27 @@ def test_dense_varlen_and_visible_attention_use_declared_ranges():
     batch = VarlenInput(queries, keys, (True, False))
     operator(q, k, v, batch, scale=0.5, out=out)
     allowed = torch.tensor([[True, True, False], [True, True, True]])
-    expected = torch.cat((_expected(q[:2], k[:3], v[:3], allowed), _expected(q[2:], k[3:], v[3:])))
+    expected = torch.cat(
+        (
+            _expected(q[:2], k[:3], v[:3], allowed),
+            _expected(q[2:], k[3:], v[3:]),
+        )
+    )
     torch.testing.assert_close(out, expected)
     ends = torch.tensor([[1, 3, 0], [0, 1, 2]], dtype=torch.int32)
     batch = VisibleInput(queries, keys, ends, None, False, False)
     operator(q, k, v, batch, scale=0.5, out=out)
     expected = torch.cat(
         (
-            _expected(q[:2], k[:3], v[:3], torch.arange(3)[None, :] < ends[0, :2, None]),
-            _expected(q[2:], k[3:], v[3:], torch.arange(2)[None, :] < ends[1, :, None]),
+            _expected(
+                q[:2],
+                k[:3],
+                v[:3],
+                torch.arange(3)[None, :] < ends[0, :2, None],
+            ),
+            _expected(
+                q[2:], k[3:], v[3:], torch.arange(2)[None, :] < ends[1, :, None]
+            ),
         )
     )
     torch.testing.assert_close(out, expected)
@@ -89,7 +103,9 @@ def test_paged_attention_observes_updates_and_mutated_block_tables(quantized):
         num_blocks=3,
         block_size=2,
         device="cpu",
-        quantization={"attention": Quantizer("fp8", axis=0)} if quantized else None,
+        quantization={"attention": Quantizer("fp8", axis=0)}
+        if quantized
+        else None,
     ) as cache:
         state = cache.state("attention")
         operator = _operator(state)
@@ -119,7 +135,9 @@ def test_paged_attention_observes_updates_and_mutated_block_tables(quantized):
 
 
 @pytest.mark.parametrize("prefix_length", [0, 1, 2, 3])
-def test_segmented_attention_merges_visible_current_tokens_with_prefix(prefix_length):
+def test_segmented_attention_merges_visible_current_tokens_with_prefix(
+    prefix_length,
+):
     with PrefixCache(
         Config({"attention": mha.Config(1, 4, (0,), torch.float32)}),
         num_blocks=2,
@@ -129,7 +147,12 @@ def test_segmented_attention_merges_visible_current_tokens_with_prefix(prefix_le
         state = cache.state("attention")
         key = torch.arange((prefix_length + 2) * 4).view(-1, 1, 4).float() / 8
         value = key + 1
-        state.write((0, 1), start=0, key=key[:prefix_length], value=value[:prefix_length])
+        state.write(
+            (0, 1),
+            start=0,
+            key=key[:prefix_length],
+            value=value[:prefix_length],
+        )
         batch = SegmentedInput(
             SequenceLengths.from_lengths((2,), device="cpu"),
             SequenceLengths.from_lengths((prefix_length,), device="cpu"),
@@ -141,7 +164,12 @@ def test_segmented_attention_merges_visible_current_tokens_with_prefix(prefix_le
         query = torch.ones(2, 2, 4)
         out = torch.empty_like(query)
         _operator(state)(
-            query, key[prefix_length:], value[prefix_length:], batch, scale=0.5, out=out
+            query,
+            key[prefix_length:],
+            value[prefix_length:],
+            batch,
+            scale=0.5,
+            out=out,
         )
         allowed = torch.arange(prefix_length + 2)[None] < torch.tensor(
             [[prefix_length], [prefix_length + 2]]

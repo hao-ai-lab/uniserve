@@ -12,7 +12,10 @@ from uniserve.distributed.mesh import Communicator
 from uniserve.runtime.triton import triton_available
 from uniserve.sampling import SamplingParams, sample_top_k
 from uniserve.tensors import adjacent_view
-from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.foundation.errors import (
+    invalid_descriptor,
+    unsupported_setup,
+)
 
 from .sampling import (
     SAMPLING_COMPLETION_FIELDS,
@@ -26,8 +29,10 @@ from .sampling import (
 
 
 def device_greedy_parameters(parameters: SamplingParams) -> bool:
-    """Return whether sampling parameters reduce exactly to unpenalized greedy selection."""
+    """Return whether sampling parameters reduce exactly to unpenalized greedy.
 
+    selection.
+    """
     return (
         float(parameters.temperature) <= 0.0
         and not parameters.return_logprobs
@@ -47,10 +52,9 @@ def sample(
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> tuple[SamplerRow, ...]:
     """Shape and draw every compatible sampling row in each device batch."""
-
-    grouped: dict[tuple[torch.device, int, int], list[tuple[int, SamplingMetadata]]] = defaultdict(
-        list
-    )
+    grouped: dict[
+        tuple[torch.device, int, int], list[tuple[int, SamplingMetadata]]
+    ] = defaultdict(list)
     for index, task in enumerate(tasks):
         if (
             task.logits.ndim != 2
@@ -60,7 +64,9 @@ def sample(
             or int(task.logits.shape[0]) != len(task.allowed)
             or len(task.penalty_counts) != len(task.allowed)
         ):
-            raise invalid_descriptor("sampling task logits must be shaped [rows, vocab]")
+            raise invalid_descriptor(
+                "sampling task logits must be shaped [rows, vocab]"
+            )
 
         device_greedy = (
             not task.draft_token_ids
@@ -79,7 +85,9 @@ def sample(
                 or task.draft_token_ids
                 or len(task.allowed) != 1
             ):
-                raise invalid_descriptor("greedy sampling task has shaped metadata")
+                raise invalid_descriptor(
+                    "greedy sampling task has shaped metadata"
+                )
         else:
             draws = cast(torch.Tensor, task.draws)
             parameter_values = cast(torch.Tensor, task.parameter_values)
@@ -88,32 +96,52 @@ def sample(
                 or tuple(draws.shape) != (len(task.allowed),)
                 or not draws.is_floating_point()
             ):
-                raise invalid_descriptor("sampling task draws must align with its rows")
+                raise invalid_descriptor(
+                    "sampling task draws must align with its rows"
+                )
 
-            if parameter_values.device != task.logits.device or parameter_values.shape != (
-                len(task.allowed),
-                3,
+            if (
+                parameter_values.device != task.logits.device
+                or parameter_values.shape
+                != (
+                    len(task.allowed),
+                    3,
+                )
             ):
-                raise invalid_descriptor("sampling task parameter vectors do not align")
+                raise invalid_descriptor(
+                    "sampling task parameter vectors do not align"
+                )
 
         if task.draft_token_ids:
             if len(task.allowed) != len(task.draft_token_ids) + 1:
-                raise invalid_descriptor("speculative sampling rows do not cover the draft chain")
+                raise invalid_descriptor(
+                    "speculative sampling rows do not cover the draft chain"
+                )
         elif len(task.allowed) != 1:
-            raise invalid_descriptor("ordinary sampling tasks must contain exactly one row")
+            raise invalid_descriptor(
+                "ordinary sampling tasks must contain exactly one row"
+            )
 
         vocab = int(task.logits.shape[1])
         if vocab > TOKEN_VALUE_MASK:
-            raise unsupported_setup("vocabulary exceeds the device token decision range")
+            raise unsupported_setup(
+                "vocabulary exceeds the device token decision range"
+            )
         if any(value < 0 or value >= vocab for value in task.draft_token_ids):
-            raise invalid_descriptor("speculative draft token is outside the model vocabulary")
+            raise invalid_descriptor(
+                "speculative draft token is outside the model vocabulary"
+            )
 
         # Path key: -2 suppressed greedy, -1 plain greedy, 0 generic row-wise
         # sampling, or a positive fused top-k width for the compiled kernel.
         sampling_path = (
-            (-2 if task.suppress else -1) if device_greedy else _fused_top_k(task, vocab)
+            (-2 if task.suppress else -1)
+            if device_greedy
+            else _fused_top_k(task, vocab)
         )
-        grouped[(task.logits.device, vocab, sampling_path)].append((index, task))
+        grouped[(task.logits.device, vocab, sampling_path)].append(
+            (index, task)
+        )
 
     result: list[SamplerRow | None] = [None] * len(tasks)
     for (_device, _vocab, sampling_path), compatible in grouped.items():
@@ -148,8 +176,10 @@ def sample_device_greedy_group(
     apply_suppression: bool,
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
 ) -> tuple[SamplerRow, ...]:
-    """Resolve predicates, greedy tokens, finish state, and completion values for a group."""
+    """Resolve predicates, greedy tokens, finish state.
 
+    and completion values for a group.
+    """
     logits = adjacent_view(tuple(task.logits for task in tasks))
     if logits is None:
         logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
@@ -160,7 +190,9 @@ def sample_device_greedy_group(
         selection_logits = logits.to(dtype=torch.float32, copy=True)
         vocab = int(selection_logits.shape[1])
         for row_index, task in enumerate(tasks):
-            for token_id in dict.fromkeys(int(value) for value in task.suppress):
+            for token_id in dict.fromkeys(
+                int(value) for value in task.suppress
+            ):
                 if 0 <= token_id < vocab:
                     selection_logits[row_index, token_id].fill_(float("-inf"))
 
@@ -176,11 +208,21 @@ def sample_device_greedy_group(
 
     active = _sample_predicates(tasks, device_tokens.device)
     device_finish, continuation_values = _resolve_sampled_finish_values(
-        tasks, device_tokens, valid, active, torch.zeros_like(active, dtype=torch.bool)
+        tasks,
+        device_tokens,
+        valid,
+        active,
+        torch.zeros_like(active, dtype=torch.bool),
     )
-    transitions = _sampled_transition_values(tasks, device_tokens, valid, active)
-    span = sampling_columns(valid, active, device_tokens, torch.zeros_like(device_tokens))
-    tagged_tokens = tagged_token_values(device_tokens, continuation_values, in_place=False)
+    transitions = _sampled_transition_values(
+        tasks, device_tokens, valid, active
+    )
+    span = sampling_columns(
+        valid, active, device_tokens, torch.zeros_like(device_tokens)
+    )
+    tagged_tokens = tagged_token_values(
+        device_tokens, continuation_values, in_place=False
+    )
     output = SamplerOutput(
         tokens=device_tokens,
         valid=valid,
@@ -201,8 +243,10 @@ def sample_device_greedy_group(
 
 
 def _fused_top_k(task: SamplingMetadata, vocab: int) -> int:
-    """Return a fused top-k width when the task is supported by the compiled kernel."""
+    """Return a fused top-k width when the task is supported by the compiled.
 
+    kernel.
+    """
     if task.logits.device.type != "cuda":
         return 0
     if task.draft_token_ids:
@@ -240,14 +284,19 @@ def _sample_fused_top_k_group(
     *,
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
 ) -> tuple[SamplerRow, ...]:
-    """Sample a homogeneous fused-top-k group and return its numerical selections."""
+    """Sample a homogeneous fused-top-k group and return its numerical.
 
+    selections.
+    """
     # The compiled kernel consumes one contiguous column for each sampling
     # input, so compatible task rows are concatenated before a single launch.
     logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
-    draws = torch.cat(tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0)
+    draws = torch.cat(
+        tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0
+    )
     parameters = torch.cat(
-        tuple(cast(torch.Tensor, task.parameter_values) for task in tasks), dim=0
+        tuple(cast(torch.Tensor, task.parameter_values) for task in tasks),
+        dim=0,
     )
 
     tokens, valid = _run_fused_top_k_sampling(
@@ -298,7 +347,6 @@ def _run_fused_top_k_sampling(
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the compiled fixed-top-k sampler on a CUDA device."""
-
     if not triton_available(logits.device):
         raise unsupported_setup("fused top-k sampling requires a CUDA device")
     return sample_top_k(
@@ -314,8 +362,10 @@ def _sample_task_group(
     *,
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
 ) -> tuple[SamplerRow, ...]:
-    """Sample arbitrary compatible tasks, resolve speculative acceptance, and capture outputs."""
+    """Sample arbitrary compatible tasks, resolve speculative acceptance.
 
+    and capture outputs.
+    """
     # Flatten task-local candidate rows into one sampling matrix while retaining
     # offsets needed to restore one selected result per operation.
     device = tasks[0].logits.device
@@ -328,7 +378,9 @@ def _sample_task_group(
 
     parameters = tuple(task.parameters for task in tasks for _ in task.allowed)
     logits = torch.cat(tuple(task.logits.float() for task in tasks), dim=0)
-    draws = torch.cat(tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0)
+    draws = torch.cat(
+        tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0
+    )
     work, valid = _shape_sampling_logits_batch(
         logits,
         parameters,
@@ -366,8 +418,13 @@ def _sample_task_group(
     terminal_tokens: list[torch.Tensor] = []
     for task, row_offset in zip(tasks, offsets, strict=True):
         if task.draft_token_ids:
-            draft = torch.tensor(task.draft_token_ids, dtype=row_tokens.dtype, device=device)
-            matches = row_tokens[row_offset : row_offset + len(task.draft_token_ids)] == draft
+            draft = torch.tensor(
+                task.draft_token_ids, dtype=row_tokens.dtype, device=device
+            )
+            matches = (
+                row_tokens[row_offset : row_offset + len(task.draft_token_ids)]
+                == draft
+            )
             raw_accepted = torch.cumprod(matches.to(torch.long), dim=0).sum()
         else:
             draft = torch.empty((0,), dtype=row_tokens.dtype, device=device)
@@ -375,14 +432,18 @@ def _sample_task_group(
         if task.terminal_draft_prefix is None:
             accepted = raw_accepted
             terminal = torch.zeros((), dtype=torch.bool, device=device)
-            terminal_token = torch.zeros((), dtype=row_tokens.dtype, device=device)
+            terminal_token = torch.zeros(
+                (), dtype=row_tokens.dtype, device=device
+            )
         else:
             terminal_prefix = int(task.terminal_draft_prefix)
             accepted = raw_accepted.clamp_max(terminal_prefix)
             terminal = raw_accepted >= terminal_prefix
             terminal_token = draft[terminal_prefix - 1]
         accepted_counts.append(accepted)
-        accepted_token_counts.append(accepted + (~terminal).to(dtype=torch.long))
+        accepted_token_counts.append(
+            accepted + (~terminal).to(dtype=torch.long)
+        )
         terminal_finishes.append(terminal)
         output_rows.append(accepted + row_offset)
         terminal_tokens.append(terminal_token)
@@ -392,7 +453,9 @@ def _sample_task_group(
     counts = torch.stack(accepted_counts)
     points = torch.stack(accepted_token_counts)
     terminal_finish = torch.stack(terminal_finishes)
-    task_tokens = torch.where(terminal_finish, torch.stack(terminal_tokens), task_tokens)
+    task_tokens = torch.where(
+        terminal_finish, torch.stack(terminal_tokens), task_tokens
+    )
 
     # Broadcast the complete selection state so all tensor-parallel ranks
     # advance request state from identical speculative decisions.
@@ -430,7 +493,9 @@ def _sample_task_group(
         active,
         terminal_finish,
     )
-    transitions = _sampled_transition_values(tasks, task_tokens, task_valid, active)
+    transitions = _sampled_transition_values(
+        tasks, task_tokens, task_valid, active
+    )
     tagged_tokens = tagged_token_values(task_tokens, continuation_values)
     span = sampling_columns(task_valid, active, task_tokens, counts)
 
@@ -468,8 +533,10 @@ def sampling_columns(
     tokens: torch.Tensor,
     accepted: torch.Tensor,
 ) -> torch.Tensor:
-    """Pack validity, activity, token, and acceptance vectors into completion storage."""
+    """Pack validity, activity, token.
 
+    and acceptance vectors into completion storage.
+    """
     count = int(tokens.numel())
     if (
         int(valid.numel()) != count
@@ -486,7 +553,9 @@ def sampling_columns(
         )
     )
     if int(metadata.numel()) != SAMPLING_COMPLETION_FIELDS * count:
-        raise RuntimeError("sampling completion field count exceeds its fixed capacity")
+        raise RuntimeError(
+            "sampling completion field count exceeds its fixed capacity"
+        )
     return metadata
 
 
@@ -496,12 +565,18 @@ def sampled_finish_values(
     device_tokens: torch.Tensor,
     valid: torch.Tensor,
 ) -> torch.Tensor:
-    """Evaluate per-row terminal token policies entirely on the sampling device."""
+    """Evaluate per-row terminal token policies entirely on the sampling.
 
+    device.
+    """
     count = len(finish_token_ids)
     tokens = device_tokens.reshape(-1)
     validity = valid.reshape(-1)
-    if len(force_finish) != count or int(tokens.numel()) != count or int(validity.numel()) != count:
+    if (
+        len(force_finish) != count
+        or int(tokens.numel()) != count
+        or int(validity.numel()) != count
+    ):
         raise RuntimeError("sampling finish vectors do not align")
 
     if count == 0:
@@ -513,7 +588,9 @@ def sampled_finish_values(
     first_force = force_finish[0]
     if all(
         forced == first_force and ids == first_ids
-        for forced, ids in zip(force_finish[1:], finish_token_ids[1:], strict=True)
+        for forced, ids in zip(
+            force_finish[1:], finish_token_ids[1:], strict=True
+        )
     ):
         if first_force:
             return validity.to(dtype=torch.bool)
@@ -525,7 +602,9 @@ def sampled_finish_values(
         return matched & validity
 
     values: list[torch.Tensor] = []
-    for index, (ids, forced) in enumerate(zip(finish_token_ids, force_finish, strict=True)):
+    for index, (ids, forced) in enumerate(
+        zip(finish_token_ids, force_finish, strict=True)
+    ):
         selected = tokens[index]
         if forced:
             finish = torch.ones((), dtype=torch.bool, device=tokens.device)
@@ -546,10 +625,16 @@ def _sample_predicates(
     tasks: tuple[SamplingMetadata, ...],
     device: torch.device,
 ) -> torch.Tensor:
-    """Collect one active predicate per task, decoding tagged continuation values when needed."""
+    """Collect one active predicate per task.
 
-    if tasks and all(task.predicate is not None and task.tagged_predicate for task in tasks):
-        predicates = tuple(cast(torch.Tensor, task.predicate).reshape(-1)[:1] for task in tasks)
+    decoding tagged continuation values when needed.
+    """
+    if tasks and all(
+        task.predicate is not None and task.tagged_predicate for task in tasks
+    ):
+        predicates = tuple(
+            cast(torch.Tensor, task.predicate).reshape(-1)[:1] for task in tasks
+        )
         view = adjacent_view(predicates)
         if view is None:
             view = torch.cat(predicates, dim=0)
@@ -561,7 +646,9 @@ def _sample_predicates(
             else (
                 task.predicate.reshape(-1)[:1].ge(TOKEN_CONTINUATION_BIT)
                 if task.tagged_predicate
-                else task.predicate.reshape(-1)[:1].to(device=device, dtype=torch.bool)
+                else task.predicate.reshape(-1)[:1].to(
+                    device=device, dtype=torch.bool
+                )
             )
         )
         for task in tasks
@@ -575,10 +662,14 @@ def tagged_token_values(
     *,
     in_place: bool = False,
 ) -> torch.Tensor:
-    """Pack token identifiers with continuation flags into signed 64-bit relay values."""
+    """Pack token identifiers with continuation flags into signed 64-bit relay.
 
+    values.
+    """
     if int(tokens.numel()) != int(continuation.numel()):
-        raise RuntimeError("token continuation vector does not align with selected tokens")
+        raise RuntimeError(
+            "token continuation vector does not align with selected tokens"
+        )
     tags = torch.where(continuation.reshape(-1), TOKEN_CONTINUATION_BIT, 0)
     target = tokens.reshape(-1) if in_place else tokens.reshape(-1).clone()
     target.bitwise_or_(tags)
@@ -593,16 +684,26 @@ def _sampled_transition_values(
     *,
     destination: torch.Tensor | None = None,
 ) -> dict[int, torch.Tensor]:
-    """Match selected tokens against requested transition sets and return numerical row views."""
+    """Match selected tokens against requested transition sets and return.
 
+    numerical row views.
+    """
     # Only operations declaring a transition product participate; indexes keep
     # their token and eligibility rows aligned after filtering.
-    selected = tuple((index, task) for index, task in enumerate(tasks) if task.return_transition)
+    selected = tuple(
+        (index, task)
+        for index, task in enumerate(tasks)
+        if task.return_transition
+    )
     if not selected:
         return {}
     tokens = device_tokens.reshape(-1)
-    eligibility = valid.reshape(-1).to(dtype=torch.bool) & active.reshape(-1).to(dtype=torch.bool)
-    if int(tokens.numel()) != len(tasks) or int(eligibility.numel()) != len(tasks):
+    eligibility = valid.reshape(-1).to(dtype=torch.bool) & active.reshape(
+        -1
+    ).to(dtype=torch.bool)
+    if int(tokens.numel()) != len(tasks) or int(eligibility.numel()) != len(
+        tasks
+    ):
         raise RuntimeError("sampling transition vectors do not align")
     indexes = tuple(index for index, _task in selected)
     selected_tokens = select_device_values(tokens, indexes)
@@ -622,7 +723,9 @@ def _sampled_transition_values(
 
     # Shared transition sets avoid materializing a per-row token matrix; mixed
     # policies use a padded matrix with -1 as the non-token sentinel.
-    transition_sets = tuple(task.transition_token_ids for _index, task in selected)
+    transition_sets = tuple(
+        task.transition_token_ids for _index, task in selected
+    )
     first = transition_sets[0]
     if all(values == first for values in transition_sets[1:]):
         if not first:
@@ -642,7 +745,10 @@ def _sampled_transition_values(
     else:
         width = max(1, *(len(values) for values in transition_sets))
         transition_ids = torch.tensor(
-            tuple((*values, *((-1,) * (width - len(values)))) for values in transition_sets),
+            tuple(
+                (*values, *((-1,) * (width - len(values))))
+                for values in transition_sets
+            ),
             dtype=selected_tokens.dtype,
             device=selected_tokens.device,
         )
@@ -651,7 +757,10 @@ def _sampled_transition_values(
             target.copy_(transitions)
             transitions = target
     transitions.logical_and_(selected_eligibility)
-    return {index: transitions[row : row + 1] for row, (index, _task) in enumerate(selected)}
+    return {
+        index: transitions[row : row + 1]
+        for row, (index, _task) in enumerate(selected)
+    }
 
 
 def _resolve_sampled_finish_values(
@@ -661,8 +770,10 @@ def _resolve_sampled_finish_values(
     active: torch.Tensor,
     terminal_finish: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Combine token, speculative-terminal, validity, and activity finish policies."""
+    """Combine token, speculative-terminal, validity.
 
+    and activity finish policies.
+    """
     finish_values = sampled_finish_values(
         tuple(task.finish_token_ids for task in tasks),
         tuple(task.force_finish for task in tasks),
@@ -673,9 +784,10 @@ def _resolve_sampled_finish_values(
     return finish_values, continuation_values
 
 
-def select_device_values(values: torch.Tensor, indexes: tuple[int, ...]) -> torch.Tensor:
+def select_device_values(
+    values: torch.Tensor, indexes: tuple[int, ...]
+) -> torch.Tensor:
     """Gather device values at a validated tuple of host-selected indices."""
-
     flat = values.reshape(-1)
     if len(indexes) == int(flat.numel()) and all(
         index == expected for expected, index in enumerate(indexes)
@@ -696,14 +808,20 @@ def _shape_sampling_logits_batch(
     penalty_counts: Sequence[torch.Tensor | None],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the canonical shaping and truncation order to a logits matrix."""
-
     work = logits.to(dtype=torch.float32, copy=True)
     row_count, vocab = (int(value) for value in work.shape)
     if any(
         row_count != len(column)
-        for column in (parameters, allowed_tokens, suppressed_tokens, penalty_counts)
+        for column in (
+            parameters,
+            allowed_tokens,
+            suppressed_tokens,
+            penalty_counts,
+        )
     ):
-        raise invalid_descriptor("sampling parameters do not align with logits rows")
+        raise invalid_descriptor(
+            "sampling parameters do not align with logits rows"
+        )
 
     # Allowed-token restriction masks every other vocabulary entry to -inf.
     allowed_rows: list[int] = []
@@ -712,7 +830,11 @@ def _shape_sampling_logits_batch(
         if allowed_values is None:
             continue
         allowed = tuple(
-            dict.fromkeys(int(value) for value in allowed_values if 0 <= int(value) < vocab)
+            dict.fromkeys(
+                int(value)
+                for value in allowed_values
+                if 0 <= int(value) < vocab
+            )
         )
         allowed_rows.append(row_index)
         allowed_flat.extend(row_index * vocab + value for value in allowed)
@@ -723,14 +845,18 @@ def _shape_sampling_logits_batch(
             torch.tensor(allowed_rows, dtype=torch.long, device=work.device),
             False,
         )
-        mask.reshape(-1)[torch.tensor(allowed_flat, dtype=torch.long, device=work.device)] = True
+        mask.reshape(-1)[
+            torch.tensor(allowed_flat, dtype=torch.long, device=work.device)
+        ] = True
         work.masked_fill_(~mask, float("-inf"))
 
     # Suppressed tokens are masked to -inf regardless of any other shaping.
     suppressed_flat = tuple(
         row_index * vocab + value
         for row_index, suppressed in enumerate(suppressed_tokens)
-        for value in dict.fromkeys(int(token) for token in suppressed if 0 <= int(token) < vocab)
+        for value in dict.fromkeys(
+            int(token) for token in suppressed if 0 <= int(token) < vocab
+        )
     )
     if suppressed_flat:
         work.reshape(-1).index_fill_(
@@ -745,12 +871,19 @@ def _shape_sampling_logits_batch(
     # frequency scales with the count, and presence is a flat once-appeared
     # subtraction. Masked (-inf) entries are preserved.
     penalty_rows = [
-        row_index for row_index, value in enumerate(penalty_counts) if value is not None
+        row_index
+        for row_index, value in enumerate(penalty_counts)
+        if value is not None
     ]
     if penalty_rows:
-        row_index_tensor = torch.tensor(penalty_rows, dtype=torch.long, device=work.device)
+        row_index_tensor = torch.tensor(
+            penalty_rows, dtype=torch.long, device=work.device
+        )
         counts = torch.stack(
-            [cast(torch.Tensor, penalty_counts[row_index]) for row_index in penalty_rows]
+            [
+                cast(torch.Tensor, penalty_counts[row_index])
+                for row_index in penalty_rows
+            ]
         ).to(dtype=work.dtype)
         params = torch.tensor(
             [
@@ -769,10 +902,14 @@ def _shape_sampling_logits_batch(
         presence = params[:, 2].unsqueeze(1)
         values = work.index_select(0, row_index_tensor)
         seen = counts > 0
-        repeated = torch.where(values > 0.0, values / repetition, values * repetition)
+        repeated = torch.where(
+            values > 0.0, values / repetition, values * repetition
+        )
         adjusted = repeated - frequency * counts - presence
         apply = seen & ~torch.isneginf(values)
-        work.index_copy_(0, row_index_tensor, torch.where(apply, adjusted, values))
+        work.index_copy_(
+            0, row_index_tensor, torch.where(apply, adjusted, values)
+        )
 
     # Logit bias adds per-token offsets on top of the penalized logits.
     bias_indexes: list[int] = []
@@ -810,7 +947,8 @@ def _shape_sampling_logits_batch(
         device=work.device,
     )
 
-    # A zero temperature divides by one; the caller selects those rows by argmax.
+    # A zero temperature divides by one; the caller selects those rows by
+    # argmax.
     temperatures = parameter_values[:, 0]
     divisors = torch.where(
         temperatures > 0.0,
@@ -827,7 +965,9 @@ def _shape_sampling_logits_batch(
         if 0 < top_k < vocab:
             top_k_groups[top_k].append(index)
     for top_k, row_indexes in top_k_groups.items():
-        indexes = torch.tensor(row_indexes, dtype=torch.long, device=work.device)
+        indexes = torch.tensor(
+            row_indexes, dtype=torch.long, device=work.device
+        )
         subset = work.index_select(0, indexes)
         values, token_indexes = torch.topk(
             subset,
@@ -887,7 +1027,9 @@ def _shape_sampling_logits_batch(
 
     # Min-p drops tokens below a fraction of the row maximum, compared in log
     # space so the shaped logits can be used directly.
-    min_p_rows = tuple(index for index, row in enumerate(parameters) if float(row.min_p) > 0.0)
+    min_p_rows = tuple(
+        index for index, row in enumerate(parameters) if float(row.min_p) > 0.0
+    )
     if min_p_rows:
         indexes = torch.tensor(min_p_rows, dtype=torch.long, device=work.device)
         subset = work.index_select(0, indexes)
@@ -899,10 +1041,14 @@ def _shape_sampling_logits_batch(
     # Typical-p keeps the tokens whose surprise is closest to the row entropy,
     # covering the requested probability mass.
     typical_rows = tuple(
-        index for index, row in enumerate(parameters) if float(row.typical_p) < 1.0
+        index
+        for index, row in enumerate(parameters)
+        if float(row.typical_p) < 1.0
     )
     if typical_rows:
-        indexes = torch.tensor(typical_rows, dtype=torch.long, device=work.device)
+        indexes = torch.tensor(
+            typical_rows, dtype=torch.long, device=work.device
+        )
         subset = work.index_select(0, indexes)
         typical_p = torch.tensor(
             [float(parameters[index].typical_p) for index in typical_rows],
@@ -918,12 +1064,16 @@ def _shape_sampling_logits_batch(
         over = cumulative >= typical_p.unsqueeze(1)
         drop = torch.cat(
             (
-                torch.zeros((len(typical_rows), 1), dtype=torch.bool, device=work.device),
+                torch.zeros(
+                    (len(typical_rows), 1), dtype=torch.bool, device=work.device
+                ),
                 over[:, :-1],
             ),
             dim=1,
         )
-        subset.scatter_(1, order, subset.gather(1, order).masked_fill(drop, float("-inf")))
+        subset.scatter_(
+            1, order, subset.gather(1, order).masked_fill(drop, float("-inf"))
+        )
         work.index_copy_(0, indexes, subset)
 
     # A row is usable only with no NaN or +inf entries and at least one finite
@@ -942,13 +1092,17 @@ def logprob_details(
     output_tokens: torch.Tensor,
     parameters: Sequence[SamplingParams],
 ) -> LogprobValues | None:
-    """Compute selected-token, top-k, and requested-token log probabilities and ranks."""
+    """Compute selected-token, top-k.
 
+    and requested-token log probabilities and ranks.
+    """
     vocab = int(work.shape[1])
     requested_rows = tuple(
         index
         for index, row in enumerate(parameters)
-        if row.return_logprobs or int(row.n_logprobs) > 0 or bool(row.logprob_token_ids)
+        if row.return_logprobs
+        or int(row.n_logprobs) > 0
+        or bool(row.logprob_token_ids)
     )
     if not requested_rows:
         return None
@@ -961,14 +1115,19 @@ def logprob_details(
     selected_tokens = output_tokens.index_select(0, request_indexes)
     scores = torch.log_softmax(work.index_select(0, score_rows), dim=-1)
     selected_values = scores.gather(1, selected_tokens.unsqueeze(1))[:, 0]
-    selected_ranks = (scores > selected_values.unsqueeze(1)).sum(dim=-1, dtype=torch.long) + 1
+    selected_ranks = (scores > selected_values.unsqueeze(1)).sum(
+        dim=-1, dtype=torch.long
+    ) + 1
 
     counts = tuple(
-        min(max(0, int(parameters[index].n_logprobs)), vocab) for index in requested_rows
+        min(max(0, int(parameters[index].n_logprobs)), vocab)
+        for index in requested_rows
     )
     max_count = max(counts, default=0)
     if max_count:
-        top_values, top_indexes = torch.topk(scores, max_count, dim=-1, sorted=True)
+        top_values, top_indexes = torch.topk(
+            scores, max_count, dim=-1, sorted=True
+        )
         positions = torch.arange(
             1,
             max_count + 1,
@@ -1031,7 +1190,10 @@ def logprob_details(
         candidate_values = scores.gather(1, candidate_indexes)
         candidate_ranks = torch.stack(
             tuple(
-                (scores > candidate_values[:, index].unsqueeze(1)).sum(dim=-1, dtype=torch.long) + 1
+                (scores > candidate_values[:, index].unsqueeze(1)).sum(
+                    dim=-1, dtype=torch.long
+                )
+                + 1
                 for index in range(max_requested)
             ),
             dim=1,
@@ -1050,8 +1212,12 @@ def logprob_details(
 
     def float_bits(values: torch.Tensor) -> torch.Tensor:
         """Encode float32 values as unsigned-preserving integer bit patterns."""
-
-        return values.to(dtype=torch.float32).contiguous().view(torch.int32).to(torch.long)
+        return (
+            values.to(dtype=torch.float32)
+            .contiguous()
+            .view(torch.int32)
+            .to(torch.long)
+        )
 
     encoded = torch.cat(
         (
@@ -1065,10 +1231,21 @@ def logprob_details(
             candidate_ranks.reshape(-1).to(torch.long),
         )
     )
-    return encoded, requested_rows, counts, requested_ids, max_count, max_requested
+    return (
+        encoded,
+        requested_rows,
+        counts,
+        requested_ids,
+        max_count,
+        max_requested,
+    )
 
 
-def broadcast_selection(group: Communicator | None, value: torch.Tensor) -> torch.Tensor:
-    """Publish selected tokens through the bound tensor-parallel communicator."""
+def broadcast_selection(
+    group: Communicator | None, value: torch.Tensor
+) -> torch.Tensor:
+    """Publish selected tokens through the bound tensor-parallel.
 
+    communicator.
+    """
     return value if group is None else group.broadcast(value, src=0)

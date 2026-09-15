@@ -24,11 +24,18 @@ class TransformerDecoder(nn.Module):
     """
 
     def __init__(
-        self, embedding, layers: nn.ModuleDict, norm: nn.Module, *, default_route: str | None = None
+        self,
+        embedding,
+        layers: nn.ModuleDict,
+        norm: nn.Module,
+        *,
+        default_route: str | None = None,
     ):
         super().__init__()
         if not layers:
-            raise ValueError("a transformer decoder requires at least one layer")
+            raise ValueError(
+                "a transformer decoder requires at least one layer"
+            )
         self.embedding, self.layers, self.norm = embedding, layers, norm
         self.mesh = DeviceMesh(ranks=(0,), shape=(1,), axes=("tp",), rank=0)
         self._pipeline = Communicator()
@@ -47,7 +54,10 @@ class TransformerDecoder(nn.Module):
         if default_route is not None and (
             not isinstance(norm, nn.ModuleDict) or default_route not in norm
         ):
-            raise ValueError("a default expert route must name one of the decoder's output norms")
+            raise ValueError(
+                "a default expert route must name one of the decoder's "
+                "output norms"
+            )
         self._default_route = default_route
 
     @property
@@ -57,15 +67,23 @@ class TransformerDecoder(nn.Module):
             # Parameters expose their logical dtype even for encoded weights.
             dtype = next(layer.parameters()).dtype
             for child in layer.modules():
-                if isinstance(child, Attention) and child.cache_name is not None:
+                if (
+                    isinstance(child, Attention)
+                    and child.cache_name is not None
+                ):
                     result[child.cache_name] = mha.Config(
-                        child.num_kv_heads, child.head_dim, child._head_indices, dtype
+                        child.num_kv_heads,
+                        child.head_dim,
+                        child._head_indices,
+                        dtype,
                     )
         return cache.Config(result)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self._pipeline.rank != 0:
-            raise ValueError("token embeddings belong to the first pipeline stage")
+            raise ValueError(
+                "token embeddings belong to the first pipeline stage"
+            )
         return self.embedding(input_ids)
 
     def forward(
@@ -82,8 +100,13 @@ class TransformerDecoder(nn.Module):
         partition = _TokenShard(count, self._tokens)
         positions = partition.local(positions, dim=positions.ndim - 1)
         if self._pipeline.rank == 0:
-            if embeddings is None or embeddings.shape != (count, self.hidden_size):
-                raise ValueError("the first stage requires complete packed token embeddings")
+            if embeddings is None or embeddings.shape != (
+                count,
+                self.hidden_size,
+            ):
+                raise ValueError(
+                    "the first stage requires complete packed token embeddings"
+                )
             hidden = partition.local(embeddings)
             residual = None
         else:
@@ -99,7 +122,8 @@ class TransformerDecoder(nn.Module):
             local_routes = tuple(
                 RouteSpan(
                     span.route,
-                    max(span.start, partition.token_slice.start) - partition.token_slice.start,
+                    max(span.start, partition.token_slice.start)
+                    - partition.token_slice.start,
                     min(span.stop, partition.token_slice.stop)
                     - max(span.start, partition.token_slice.start),
                 )
@@ -110,7 +134,9 @@ class TransformerDecoder(nn.Module):
             keys = frozenset(span.route for span in routes)
             hidden = RoutedTensor.from_packed(hidden, local_routes, routes=keys)
             if residual is not None:
-                residual = RoutedTensor.from_packed(residual, local_routes, routes=keys)
+                residual = RoutedTensor.from_packed(
+                    residual, local_routes, routes=keys
+                )
 
         for layer in self.layers.values():
             if routes:
@@ -123,15 +149,25 @@ class TransformerDecoder(nn.Module):
         last = self._pipeline.rank == self._pipeline.size - 1
         if not last:
             for value in (hidden, residual):
-                packed = value.packed(local_routes) if isinstance(value, RoutedTensor) else value
+                packed = (
+                    value.packed(local_routes)
+                    if isinstance(value, RoutedTensor)
+                    else value
+                )
                 self._pipeline.send(packed, dst=self._pipeline.rank + 1)
-            return hidden.packed(local_routes) if isinstance(hidden, RoutedTensor) else hidden
+            return (
+                hidden.packed(local_routes)
+                if isinstance(hidden, RoutedTensor)
+                else hidden
+            )
 
         # Fold the residual into the output norm only on the final stage.
         if isinstance(hidden, RoutedTensor):
             result = hidden.add(residual).apply(self.norm).packed(local_routes)
         elif isinstance(self.norm, RMSNorm):
-            result, _ = add_rms_norm(hidden, residual, self.norm.weight, self.norm.eps)
+            result, _ = add_rms_norm(
+                hidden, residual, self.norm.weight, self.norm.eps
+            )
         else:
             result = self.norm(hidden + residual)
         return partition.gather(result)
@@ -144,12 +180,16 @@ class TransformerEncoder(nn.Module):
         super().__init__()
         self.layers, self.norm = layers, norm
 
-    def forward(self, features: torch.Tensor, attention: VarlenInput) -> torch.Tensor:
+    def forward(
+        self, features: torch.Tensor, attention: VarlenInput
+    ) -> torch.Tensor:
         if (
             attention.queries.num_tokens is not None
             and features.shape[0] != attention.queries.num_tokens
         ):
-            raise ValueError("encoder features must cover the declared query sequences")
+            raise ValueError(
+                "encoder features must cover the declared query sequences"
+            )
         for layer in self.layers:
             features = layer(features, attention)
         return self.norm(features)

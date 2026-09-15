@@ -11,7 +11,9 @@ from .linear import MergedColumnParallelLinear, RowParallelLinear
 
 
 class GatedMLP(nn.Module):
-    """Compose named gate/up projections, activation, and a reduced down projection."""
+    """Compose named gate/up projections, activation, and a reduced down
+    projection.
+    """  # noqa: D205
 
     def __init__(
         self,
@@ -66,6 +68,8 @@ class GatedMLP(nn.Module):
                 device=packed.device,
             )
             hidden = self.activation(matrix, out=encoded)
-            return self.down(hidden).reshape(*shape[:-1], self.down.out_features)
+            return self.down(hidden).reshape(
+                *shape[:-1], self.down.out_features
+            )
 
         return self.down(self.activation(packed))

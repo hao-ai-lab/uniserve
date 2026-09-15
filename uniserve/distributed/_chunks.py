@@ -25,7 +25,6 @@ def _gather_chunks(
     numerical work between yields while subsequent transfers make progress.
     Workspace is caller-owned and remains live until iterator exhaustion.
     """
-
     if input.ndim != 2 or min(input.shape) < 1:
         raise ValueError("row gathering requires a nonempty matrix")
     rows, width = input.shape
@@ -35,21 +34,29 @@ def _gather_chunks(
 
     byte_count = input.numel() * input.element_size() * group.size
     if not workspace.is_contiguous() or workspace.device != input.device:
-        raise ValueError("row gathering requires contiguous scratch on the input device")
+        raise ValueError(
+            "row gathering requires contiguous scratch on the input device"
+        )
     if workspace.numel() * workspace.element_size() < byte_count:
         raise ValueError("row gathering scratch cannot hold all input rows")
 
     # Scratch layout per segment: [group.size, count, width] with one member
     # slot per rank in backend order. Segments stay near 64 MiB of staged
     # source rows, rounded down to whole 128-row units.
-    storage = workspace.view(torch.uint8).view(-1)[:byte_count].view(input.dtype)
-    segment_rows = max(1, ((64 * 1024 * 1024) // (width * input.element_size()) // 128) * 128)
+    storage = (
+        workspace.view(torch.uint8).view(-1)[:byte_count].view(input.dtype)
+    )
+    segment_rows = max(
+        1, ((64 * 1024 * 1024) // (width * input.element_size()) // 128) * 128
+    )
     local_rank = group._backend_order.index(group.rank)
 
     segments = []
     for start in range(0, rows, segment_rows):
         count = min(segment_rows, rows - start)
-        sources = storage.narrow(0, start * group.size * width, count * group.size * width)
+        sources = storage.narrow(
+            0, start * group.size * width, count * group.size * width
+        )
         sources = sources.view(group.size, count, width)
         sources[local_rank].copy_(input[start : start + count])
         segments.append((start, count, sources))
@@ -59,12 +66,16 @@ def _gather_chunks(
     try:
         for _, _, sources in segments:
             pending.append(
-                _start_all_gather(sources.flatten(0, 1), sources[local_rank], group._require())
+                _start_all_gather(
+                    sources.flatten(0, 1), sources[local_rank], group._require()
+                )
             )
 
         begin = group.rank * rows
         yield slice(begin, begin + rows), input
-        for (start, count, sources), work in zip(segments, pending, strict=True):
+        for (start, count, sources), work in zip(
+            segments, pending, strict=True
+        ):
             _finish(work, input)
             consumed += 1
             for backend_rank, logical_rank in enumerate(group._backend_order):
@@ -91,7 +102,6 @@ def _produce_exchange(
     NCCL's zero-CTA AlltoAll; tensor layout and numerical work belong to
     the caller. Both buffers must remain live until completion is consumed.
     """
-
     if (
         source.ndim < 2
         or source.shape[0] != group.size
@@ -102,7 +112,9 @@ def _produce_exchange(
         or not destination.is_contiguous()
         or source.data_ptr() == destination.data_ptr()
     ):
-        raise ValueError("produced exchange requires distinct matching peer buffers")
+        raise ValueError(
+            "produced exchange requires distinct matching peer buffers"
+        )
 
     order = group._backend_order
     producer(tuple(source[order.index(rank)] for rank in range(group.size)))
@@ -115,12 +127,16 @@ def _produce_exchange(
         if bound is not None:
             work = bound.start_all_to_all(destination, source)
         else:
-            work = dist.all_to_all_single(destination, source, group=native_group, async_op=True)
+            work = dist.all_to_all_single(
+                destination, source, group=native_group, async_op=True
+            )
 
     def complete() -> tuple[torch.Tensor, ...]:
         if work is not None:
             _finish(work, source)
-        return tuple(destination[order.index(rank)] for rank in range(group.size))
+        return tuple(
+            destination[order.index(rank)] for rank in range(group.size)
+        )
 
     return complete
 
@@ -143,9 +159,15 @@ def _produce_chunks(
     temporary inputs to be released before consumer allocations begin.
     Both distinct scratch buffers remain live until iterator exhaustion.
     """
-
-    if len(shape) < 3 or shape[0] != group.size or min(shape) < 1 or chunk_rows < 1:
-        raise ValueError("row production requires a member axis and positive row chunks")
+    if (
+        len(shape) < 3
+        or shape[0] != group.size
+        or min(shape) < 1
+        or chunk_rows < 1
+    ):
+        raise ValueError(
+            "row production requires a member axis and positive row chunks"
+        )
     if (
         not workspace.is_contiguous()
         or not output.is_contiguous()
@@ -155,7 +177,9 @@ def _produce_chunks(
         or workspace.dtype != output.dtype
         or workspace.data_ptr() == output.data_ptr()
     ):
-        raise ValueError("row production requires distinct matching contiguous buffers")
+        raise ValueError(
+            "row production requires distinct matching contiguous buffers"
+        )
 
     rows = shape[1]
     row_elements = prod(shape[2:])
@@ -171,7 +195,9 @@ def _produce_chunks(
             source = source_flat.narrow(0, offset, elements).view(segment_shape)
             target = target_flat.narrow(0, offset, elements).view(segment_shape)
             interval = slice(start, start + count)
-            complete = _produce_exchange(group, source, target, partial(producer, interval))
+            complete = _produce_exchange(
+                group, source, target, partial(producer, interval)
+            )
             segments.append((interval, complete))
 
         del producer

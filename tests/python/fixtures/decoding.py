@@ -24,7 +24,9 @@ class TemporalProjection(nn.Module):
         super().__init__()
         self.projection = nn.Linear(window, window, bias=False)
         with torch.no_grad():
-            self.projection.weight.copy_(torch.diag(torch.arange(1.0, window + 1)))
+            self.projection.weight.copy_(
+                torch.diag(torch.arange(1.0, window + 1))
+            )
 
     def forward(self, values):
         return self.projection(values.movedim(2, -1)).movedim(-1, 2)
@@ -45,9 +47,12 @@ class Decoder(VideoDecoder):
 
     def frame_slices(self, num_frames):
         if num_frames < 1 or num_frames % self.window:
-            raise ValueError("the temporal projection requires complete windows")
+            raise ValueError(
+                "the temporal projection requires complete windows"
+            )
         return tuple(
-            slice(start, start + self.window) for start in range(0, num_frames, self.window)
+            slice(start, start + self.window)
+            for start in range(0, num_frames, self.window)
         )
 
     def output_layout(self, num_frames):
@@ -59,12 +64,18 @@ class Decoder(VideoDecoder):
             self.frame_size.height,
             self.frame_size.width,
         )
-        return {"video": OutputLayout(shape, torch.float32, tuple(slice(0, n) for n in shape))}
+        return {
+            "video": OutputLayout(
+                shape, torch.float32, tuple(slice(0, n) for n in shape)
+            )
+        }
 
-    def unpack_latents(self, latent, frames, num_frames, *, constants, workspace):
-        return latent.T.reshape(1, 3, num_frames, self.frame_size.height, self.frame_size.width)[
-            :, :, frames
-        ]
+    def unpack_latents(
+        self, latent, frames, num_frames, *, constants, workspace
+    ):
+        return latent.T.reshape(
+            1, 3, num_frames, self.frame_size.height, self.frame_size.width
+        )[:, :, frames]
 
 
 class DecodedModel(nn.Module):

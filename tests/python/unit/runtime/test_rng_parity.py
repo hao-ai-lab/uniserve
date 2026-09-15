@@ -16,7 +16,11 @@ from pathlib import Path
 
 from uniserve.nn.rng import philox4x32_10, sampling_key, sampling_uniform
 
-_FIXTURE = Path(__file__).resolve().parents[2] / "generated" / "sampling_rng_parity.json"
+_FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "generated"
+    / "sampling_rng_parity.json"
+)
 
 
 def _bits(value: float) -> int:
@@ -52,7 +56,9 @@ def test_sampling_rng_matches_the_rust_reference() -> None:
             case["processor_stage"] & 0xFFFFFFFF,
             case["draw_index"] & 0xFFFFFFFF,
         )
-        words = philox4x32_10(counter, (key & 0xFFFFFFFF, (key >> 32) & 0xFFFFFFFF))
+        words = philox4x32_10(
+            counter, (key & 0xFFFFFFFF, (key >> 32) & 0xFFFFFFFF)
+        )
         assert list(words) == case["words"]
         draw = sampling_uniform(
             key,

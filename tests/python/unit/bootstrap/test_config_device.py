@@ -10,7 +10,9 @@ from uniserve_worker.protocol.operation import ForwardMode, PipelineStage
 pytestmark = pytest.mark.unit
 
 
-@pytest.mark.parametrize("mesh", ["tower=gen:cuda:1", "tower=text:cuda;gen:cuda:1"])
+@pytest.mark.parametrize(
+    "mesh", ["tower=gen:cuda:1", "tower=text:cuda;gen:cuda:1"]
+)
 def test_flow_component_device_is_resolved_with_the_rank_device(mesh):
     config = parse_worker_args(
         [
@@ -32,7 +34,9 @@ def test_flow_component_device_is_resolved_with_the_rank_device(mesh):
     assert config.execution.generation_device == "cuda:1"
 
 
-@pytest.mark.parametrize("mesh", ["tower=text:cuda:2;gen:cuda:1", "tower=gen:cuda"])
+@pytest.mark.parametrize(
+    "mesh", ["tower=text:cuda:2;gen:cuda:1", "tower=gen:cuda"]
+)
 def test_expert_devices_reject_inconsistent_rank_or_repeated_devices(mesh):
     with pytest.raises(SystemExit):
         parse_worker_args(
@@ -53,7 +57,9 @@ def test_expert_devices_reject_inconsistent_rank_or_repeated_devices(mesh):
         )
 
 
-@pytest.mark.parametrize("allocator", ("expandable_segments:True", "backend:cudaMallocAsync"))
+@pytest.mark.parametrize(
+    "allocator", ("expandable_segments:True", "backend:cudaMallocAsync")
+)
 def test_cuda_ipc_publication_rejects_nonexportable_allocations(
     monkeypatch, allocator: str
 ) -> None:
@@ -183,11 +189,16 @@ def test_execution_lanes_are_typed_and_domain_disjoint() -> None:
         ]
     )
 
-    assert tuple((lane.lane_id, lane.sm_budget) for lane in config.execution.lanes) == (
+    assert tuple(
+        (lane.lane_id, lane.sm_budget) for lane in config.execution.lanes
+    ) == (
         ("decode", 64),
         ("compute", 88),
     )
-    assert config.execution.lanes[0].computations == (ForwardMode.DECODE, ForwardMode.VERIFY)
+    assert config.execution.lanes[0].computations == (
+        ForwardMode.DECODE,
+        ForwardMode.VERIFY,
+    )
 
 
 def test_execution_lanes_reject_duplicate_domain_bindings() -> None:
@@ -214,9 +225,18 @@ def test_execution_lanes_reject_duplicate_domain_bindings() -> None:
     ("selector", "expected"),
     [
         ("ar_decode", {ForwardMode.DECODE}),
-        ("diffusion_decode", {PipelineStage.VIDEO_DECODING, PipelineStage.AUDIO_DECODING}),
-        ("media_append", {PipelineStage.VIDEO_ENCODING, PipelineStage.AUDIO_ENCODING}),
-        ("diffusion_finalize", {PipelineStage.IMAGE_DECODING, PipelineStage.MUXING}),
+        (
+            "diffusion_decode",
+            {PipelineStage.VIDEO_DECODING, PipelineStage.AUDIO_DECODING},
+        ),
+        (
+            "media_append",
+            {PipelineStage.VIDEO_ENCODING, PipelineStage.AUDIO_ENCODING},
+        ),
+        (
+            "diffusion_finalize",
+            {PipelineStage.IMAGE_DECODING, PipelineStage.MUXING},
+        ),
     ],
 )
 def test_launch_capabilities_select_concrete_computations(selector, expected):

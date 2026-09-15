@@ -1,7 +1,7 @@
 """Canonical parsing helpers for worker environment variables.
 
-Boolean flags use allowlist semantics: only ``{"1", "true", "yes", "on"}`` enable
-a flag; unrecognized values fall back to the caller-supplied ``default``.
+Boolean flags use allowlist semantics: only ``{"1", "true", "yes", "on"}``
+enable a flag; unrecognized values fall back to the caller-supplied ``default``.
 """
 
 from __future__ import annotations
@@ -45,7 +45,9 @@ def env_flag(name: str, *, default: bool = False) -> bool:
     return flag_from_value(os.environ.get(name), default=default)
 
 
-def int_from_value(raw: str | None, *, default: int, strict: bool = False) -> int:
+def int_from_value(
+    raw: str | None, *, default: int, strict: bool = False
+) -> int:
     """Parse an already-fetched integer string.
 
     Unset (``None``) or empty -> ``default``. A present-but-unparseable value
@@ -72,12 +74,16 @@ def env_int(name: str, *, default: int, strict: bool = False) -> int:
     naming ``name`` rather than silently using ``default``.
     """
     try:
-        return int_from_value(os.environ.get(name), default=default, strict=strict)
+        return int_from_value(
+            os.environ.get(name), default=default, strict=strict
+        )
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer: {exc}") from None
 
 
-def env_optional_int(name: str, *, default: int | None = None, strict: bool = True) -> int | None:
+def env_optional_int(
+    name: str, *, default: int | None = None, strict: bool = True
+) -> int | None:
     """Parse an optional integer env var.
 
     Unset/empty -> ``default`` (``None`` by default). A present-but-malformed
@@ -91,12 +97,17 @@ def env_optional_int(name: str, *, default: int | None = None, strict: bool = Tr
         return int(raw.strip())
     except ValueError:
         if strict:
-            raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+            raise ValueError(
+                f"{name} must be an integer, got {raw!r}"
+            ) from None
         return default
 
 
 def env_optional_flag(name: str) -> bool | None:
-    """Parse a tri-state flag: unset/sentinel -> ``None``, else allowlist bool."""
+    """Parse a tri-state flag.
+
+    Unset/sentinel -> ``None``, else allowlist bool.
+    """
     raw = os.environ.get(name)
     if raw is None:
         return None

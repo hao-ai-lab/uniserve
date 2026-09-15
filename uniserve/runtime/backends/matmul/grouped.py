@@ -17,7 +17,11 @@ from . import _concatenate
 
 
 def _format(weight):
-    return weight.quantizer.format if isinstance(weight, QuantizedTensor) else weight.dtype
+    return (
+        weight.quantizer.format
+        if isinstance(weight, QuantizedTensor)
+        else weight.dtype
+    )
 
 
 def _groups(weights, branch_width):
@@ -27,14 +31,15 @@ def _groups(weights, branch_width):
     with a branch width, channel groups interleave across branches in
     round-robin order so uneven branches contribute fewer groups.
     """
-
     widths = tuple(weight.shape[0] for weight in weights.values())
     if branch_width is not None and (
         type(branch_width) is not int
         or branch_width < 1
         or any(width % branch_width for width in widths)
     ):
-        raise ValueError("branch width must be positive and divide every branch")
+        raise ValueError(
+            "branch width must be positive and divide every branch"
+        )
 
     columns = next(iter(weights.values())).shape[1]
     vector = 16 if _format(next(iter(weights.values()))) == "nvfp4" else 32
@@ -58,8 +63,10 @@ def _groups(weights, branch_width):
 
 
 def supports(weights, input_quantizer, branch_width):
-    """Return whether the grouped SM100 kernel can serve these branch weights."""
+    """Check grouped SM100 kernel eligibility.
 
+    Return whether the grouped SM100 kernel can serve these branch weights.
+    """
     first = next(iter(weights.values()))
     format = _format(first)
     if not (
@@ -69,7 +76,8 @@ def supports(weights, input_quantizer, branch_width):
         and (
             input_quantizer is None
             if isinstance(format, torch.dtype)
-            else input_quantizer is not None and input_quantizer.format == format
+            else input_quantizer is not None
+            and input_quantizer.format == format
         )
         and all(
             _format(weight) == format
@@ -82,7 +90,9 @@ def supports(weights, input_quantizer, branch_width):
         return False
 
     values = tuple(
-        weight.buffers()["values"] if isinstance(weight, QuantizedTensor) else weight
+        weight.buffers()["values"]
+        if isinstance(weight, QuantizedTensor)
+        else weight
         for weight in weights.values()
     )
 
@@ -94,7 +104,9 @@ def supports(weights, input_quantizer, branch_width):
         or value.stride(0) * value.element_size() % 16
         or value.data_ptr() % 16
         for value in values
-    ) or any((branch_width or weight.shape[0]) % 4 for weight in weights.values()):
+    ) or any(
+        (branch_width or weight.shape[0]) % 4 for weight in weights.values()
+    ):
         return False
 
     # Adjacent dense/FP8 branches already form one borrowed matrix. Logical
@@ -107,8 +119,11 @@ def supports(weights, input_quantizer, branch_width):
 
 
 def workspace_buffers(weights, *, max_rows, branch_width):
-    """Describe the context-owned descriptor and scale scratch for one grouping."""
+    """Describe the descriptor and scale scratch.
 
+    Describe the context-owned descriptor and scale scratch for one
+    grouping.
+    """
     groups, width, scale_size, columns = _groups(weights, branch_width)
     device = next(iter(weights.values())).device
     format = _format(next(iter(weights.values())))
@@ -123,12 +138,16 @@ def workspace_buffers(weights, *, max_rows, branch_width):
         "grouped.shapes": BufferConfig((len(groups), 4), torch.int32),
         "grouped.strides": BufferConfig((len(groups), 3, 2), torch.int32),
         "grouped.pointers": BufferConfig((len(groups), 3), torch.int64),
-        "grouped.maps": BufferConfig((processors, 5 if block_scaled else 3, 16), torch.int64),
+        "grouped.maps": BufferConfig(
+            (processors, 5 if block_scaled else 3, 16), torch.int64
+        ),
         "grouped.initial_a": BufferConfig(
-            (32, 32, 1), format if isinstance(format, torch.dtype) else torch.uint8
+            (32, 32, 1),
+            format if isinstance(format, torch.dtype) else torch.uint8,
         ),
         "grouped.initial_b": BufferConfig(
-            (32, 32, 1), format if isinstance(format, torch.dtype) else torch.uint8
+            (32, 32, 1),
+            format if isinstance(format, torch.dtype) else torch.uint8,
         ),
         "grouped.initial_c": BufferConfig((32, 32, 1), torch.float32),
     }
@@ -138,8 +157,12 @@ def workspace_buffers(weights, *, max_rows, branch_width):
                 "grouped.input_scale": BufferConfig(
                     (ceil(max_rows / 128) * 128 * columns,), torch.uint8
                 ),
-                "grouped.weight_scale": BufferConfig((scale_size,), torch.uint8),
-                "grouped.scale_pointers": BufferConfig((len(groups), 2), torch.int64),
+                "grouped.weight_scale": BufferConfig(
+                    (scale_size,), torch.uint8
+                ),
+                "grouped.scale_pointers": BufferConfig(
+                    (len(groups), 2), torch.int64
+                ),
                 "grouped.initial_sfa": BufferConfig((32, 32, 1), torch.uint8),
                 "grouped.initial_sfb": BufferConfig((32, 32, 1), torch.uint8),
             }
@@ -150,7 +173,6 @@ def workspace_buffers(weights, *, max_rows, branch_width):
 @triton.jit
 def _group_index(head, branch: tl.constexpr, parts: tl.constexpr):
     """Number preceding channel groups, including uneven branch head counts."""
-
     group = tl.full((), 0, tl.int32)
     for index in tl.static_range(len(parts)):
         group += tl.minimum(head, parts[index][1])
@@ -179,7 +201,6 @@ def _pack_scale(
     grid; ``swizzled`` selects the accelerator's atom-internal byte order over
     the plain row-major source layout.
     """
-
     padded_columns: tl.constexpr = triton.cdiv(columns, 4) * 4
     size: tl.constexpr = triton.cdiv(rows, 128) * 128 * padded_columns
     head = tl.program_id(1)
@@ -187,7 +208,11 @@ def _pack_scale(
     output += parts[branch][3] + group * group_stride
     offset = tl.program_id(0) * block + tl.arange(0, block)
     atom = offset // 512
-    row = atom // (padded_columns // 4) * 128 + offset % 512 // 16 + offset % 16 // 4 * 32
+    row = (
+        atom // (padded_columns // 4) * 128
+        + offset % 512 // 16
+        + offset % 16 // 4 * 32
+    )
     column = atom % (padded_columns // 4) * 4 + offset % 4
     source_row = row + head * rows
     if swizzled:
@@ -200,7 +225,9 @@ def _pack_scale(
     else:
         address = source_row * source_stride + column
     value = tl.load(
-        source + address, mask=(offset < size) & (row < rows) & (column < columns), other=0
+        source + address,
+        mask=(offset < size) & (row < rows) & (column < columns),
+        other=0,
     )
     tl.store(output + offset, value, mask=offset < size)
 
@@ -233,7 +260,6 @@ def _descriptors(
     of the input, this group's weight rows, and its output interval. Packed
     4-bit formats express strides in elements, hence the 8 // item_bits scale.
     """
-
     head = tl.program_id(0)
     for branch in tl.static_range(len(parts)):
         if tl.program_id(1) == branch and head < parts[branch][1]:
@@ -250,7 +276,9 @@ def _descriptors(
 
             tl.store(strides + group * 6, input_stride * 8 // item_bits)
             tl.store(strides + group * 6 + 1, 1)
-            tl.store(strides + group * 6 + 2, weight_strides[branch] * 8 // item_bits)
+            tl.store(
+                strides + group * 6 + 2, weight_strides[branch] * 8 // item_bits
+            )
             tl.store(strides + group * 6 + 3, 1)
             tl.store(strides + group * 6 + 4, output_stride)
             tl.store(strides + group * 6 + 5, 1)
@@ -260,10 +288,15 @@ def _descriptors(
                 pointers + group * 3 + 1,
                 (weights[branch] + start * weight_strides[branch]).to(tl.int64),
             )
-            tl.store(pointers + group * 3 + 2, (output + output_offset).to(tl.int64))
+            tl.store(
+                pointers + group * 3 + 2, (output + output_offset).to(tl.int64)
+            )
             if scale_pointers is not None:
                 tl.store(scale_pointers + group * 2, input_scale.to(tl.int64))
-                tl.store(scale_pointers + group * 2 + 1, (weight_scale + scale_offset).to(tl.int64))
+                tl.store(
+                    scale_pointers + group * 2 + 1,
+                    (weight_scale + scale_offset).to(tl.int64),
+                )
 
 
 @triton.jit
@@ -286,26 +319,40 @@ def _output(
     group_stride: tl.constexpr,
     block: tl.constexpr,
 ):
-    """Scatter one branch's FP32 group results into its typed output with bias."""
+    """Scatter one branch's FP32 group results.
 
+    Scatter one branch's FP32 group results into its typed output with bias.
+    """
     offset = tl.program_id(0) * block + tl.arange(0, block)
     row, column = offset // width, offset % width
     head = tl.program_id(1)
     group = _group_index(head, branch, parts)
     source += parts[branch][2] + group * group_stride
-    value = tl.load(source + row * source_stride + column, mask=row < rows, other=0)
+    value = tl.load(
+        source + row * source_stride + column, mask=row < rows, other=0
+    )
     column += head * width
     if input_scale is not None:
-        scale_a = tl.load(input_scale + row * input_scale_stride, mask=row < rows, other=0)
-        scale_b = tl.load(weight_scale + column * weight_scale_stride, mask=row < rows, other=0)
+        scale_a = tl.load(
+            input_scale + row * input_scale_stride, mask=row < rows, other=0
+        )
+        scale_b = tl.load(
+            weight_scale + column * weight_scale_stride,
+            mask=row < rows,
+            other=0,
+        )
         value = value * (scale_a * scale_b)
     # Encoded GEMM rounds before adding bias, matching the standalone operator.
     if encoded:
         value = value.to(target.dtype.element_ty)
     if bias is not None:
-        value = value + tl.load(bias + column, mask=row < rows, other=0).to(value.dtype)
+        value = value + tl.load(bias + column, mask=row < rows, other=0).to(
+            value.dtype
+        )
     tl.store(
-        target + row * target_row_stride + column * target_column_stride, value, mask=row < rows
+        target + row * target_row_stride + column * target_column_stride,
+        value,
+        mask=row < rows,
     )
 
 
@@ -313,20 +360,28 @@ _compiled = {}
 
 
 class GroupedOperator(_MergedOperator):
-    """Borrow branch parameters and context-owned native descriptor workspace."""
+    """Borrow branch parameters and descriptor workspace.
+
+    Borrow branch parameters and context-owned native descriptor workspace.
+    """
 
     def __init__(self, operators, *, branch_width, workspace):
         self.operators = operators
         self.workspace = workspace
-        self.weights = {name: operator.weight for name, operator in operators.items()}
+        self.weights = {
+            name: operator.weight for name, operator in operators.items()
+        }
         self.first = next(iter(operators.values()))
-        self.groups, self.width, _, self.scale_columns = _groups(self.weights, branch_width)
+        self.groups, self.width, _, self.scale_columns = _groups(
+            self.weights, branch_width
+        )
 
         # parts[branch] is (group length, group count, output base, scale base)
         # as consumed by the Triton helper kernels above.
         if branch_width is None:
             self.parts = tuple(
-                (length, 1, output, scale) for _, _, length, output, scale in self.groups
+                (length, 1, output, scale)
+                for _, _, length, output, scale in self.groups
             )
             self.output_group_stride = self.scale_group_stride = 0
         else:
@@ -335,7 +390,9 @@ class GroupedOperator(_MergedOperator):
                 for weight in self.weights.values()
             )
             self.output_group_stride = ceil(branch_width / 4) * 4
-            self.scale_group_stride = ceil(branch_width / 128) * 128 * self.scale_columns
+            self.scale_group_stride = (
+                ceil(branch_width / 128) * 128 * self.scale_columns
+            )
 
         self.format = _format(self.first.weight)
         self.block_scaled = self.format in {"nvfp4", "mxfp8"}
@@ -347,10 +404,10 @@ class GroupedOperator(_MergedOperator):
         import cutlass
         import cutlass.cute as cute
         from cutlass.cute.runtime import from_dlpack
-        from flashinfer.data.cutlass.examples.python.CuTeDSL.blackwell.grouped_blockscaled_gemm import (
+        from flashinfer.data.cutlass.examples.python.CuTeDSL.blackwell.grouped_blockscaled_gemm import (  # noqa: E501
             Sm100GroupedBlockScaledGemmKernel,
         )
-        from flashinfer.data.cutlass.examples.python.CuTeDSL.blackwell.grouped_gemm import (
+        from flashinfer.data.cutlass.examples.python.CuTeDSL.blackwell.grouped_gemm import (  # noqa: E501
             GroupedGemmKernel,
         )
 
@@ -366,32 +423,45 @@ class GroupedOperator(_MergedOperator):
         types = (encoded, encoded, cutlass.Float32)
         fields = ("shapes", "strides", "pointers")
         if self.block_scaled:
-            scale = cutlass.Float8E4M3FN if self.format == "nvfp4" else cutlass.Float8E8M0FNU
+            scale = (
+                cutlass.Float8E4M3FN
+                if self.format == "nvfp4"
+                else cutlass.Float8E8M0FNU
+            )
             names += ("sfa", "sfb")
             types += (scale, scale)
             fields += ("scale_pointers",)
 
         initial = []
         for name, dtype in zip(names, types, strict=True):
-            tensor = from_dlpack(self.workspace[f"grouped.initial_{name}"], assumed_align=16)
+            tensor = from_dlpack(
+                self.workspace[f"grouped.initial_{name}"], assumed_align=16
+            )
             tensor.element_type = dtype
             # Keeping these dimensions dynamic preserves the TMA rank when a
             # real group's scale atoms exceed the small initial descriptor.
             initial.append(tensor.mark_layout_dynamic(leading_dim=1))
 
         metadata = tuple(
-            from_dlpack(self.workspace[f"grouped.{name}"], assumed_align=16) for name in fields
+            from_dlpack(self.workspace[f"grouped.{name}"], assumed_align=16)
+            for name in fields
         )
         maps = from_dlpack(self.workspace["grouped.maps"], assumed_align=16)
         active = self.workspace["grouped.maps"].shape[0]
-        stream = cuda.CUstream(torch.cuda.current_stream(self.first.weight.device).cuda_stream)
+        stream = cuda.CUstream(
+            torch.cuda.current_stream(self.first.weight.device).cuda_stream
+        )
 
         key = (self.format, len(self.groups), active)
         if key not in _compiled:
             kernel = (
-                Sm100GroupedBlockScaledGemmKernel(self.vector, (128, 128), (1, 1))
+                Sm100GroupedBlockScaledGemmKernel(
+                    self.vector, (128, 128), (1, 1)
+                )
                 if self.block_scaled
-                else GroupedGemmKernel(cutlass.Float32, False, (128, 128), (1, 1))
+                else GroupedGemmKernel(
+                    cutlass.Float32, False, (128, 128), (1, 1)
+                )
             )
             _compiled[key] = cute.compile(
                 kernel,
@@ -404,13 +474,19 @@ class GroupedOperator(_MergedOperator):
                 stream,
                 options="--opt-level 2",
             )
-        self._initial, self._metadata, self._maps = tuple(initial), metadata, maps
+        self._initial, self._metadata, self._maps = (
+            tuple(initial),
+            metadata,
+            maps,
+        )
         self._kernel = _compiled[key]
 
     def __call__(self, x, biases, *, out):
         import cuda.bindings.driver as cuda
 
-        if set(out) != set(self.operators) or set(biases) != set(self.operators):
+        if set(out) != set(self.operators) or set(biases) != set(
+            self.operators
+        ):
             raise ValueError("merged projection branches must agree")
         for name, operator in self.operators.items():
             if (
@@ -418,7 +494,9 @@ class GroupedOperator(_MergedOperator):
                 or out[name].device != x.device
                 or out[name].dtype != operator.output_dtype
             ):
-                raise ValueError("merged output disagrees with its branch representation")
+                raise ValueError(
+                    "merged output disagrees with its branch representation"
+                )
 
         x = self.first._input(x, next(iter(out.values())))
         if _format(x) != self.format:
@@ -441,9 +519,16 @@ class GroupedOperator(_MergedOperator):
         ):
             # A contiguous view can still begin at an unaligned offset; clone
             # gives both such views and strided views an aligned allocation.
-            left = {**left, "values": input_values.clone(memory_format=torch.contiguous_format)}
+            left = {
+                **left,
+                "values": input_values.clone(
+                    memory_format=torch.contiguous_format
+                ),
+            }
         field = "block_scale" if self.format == "nvfp4" else "scale"
-        input_scale = left[field].view(torch.uint8) if self.block_scaled else None
+        input_scale = (
+            left[field].view(torch.uint8) if self.block_scaled else None
+        )
         if self.block_scaled and x.scale_layout is ScaleLayout.LINEAR:
             destination = self.workspace["grouped.input_scale"]
             size = ceil(rows / 128) * 128 * self.scale_columns
@@ -462,13 +547,17 @@ class GroupedOperator(_MergedOperator):
             input_scale = destination
 
         values = tuple(
-            (weight.buffers()["values"] if isinstance(weight, QuantizedTensor) else weight).view(
-                torch.uint8
-            )
+            (
+                weight.buffers()["values"]
+                if isinstance(weight, QuantizedTensor)
+                else weight
+            ).view(torch.uint8)
             for weight in self.weights.values()
         )
         weights = tuple(self.weights.values())
-        for branch, (length, count, _, _) in enumerate(self.parts if self.block_scaled else ()):
+        for branch, (length, count, _, _) in enumerate(
+            self.parts if self.block_scaled else ()
+        ):
             source = weights[branch].buffers()[field].view(torch.uint8)
             size = ceil(length / 128) * 128 * self.scale_columns
             _pack_scale[(triton.cdiv(size, 512), count)](
@@ -550,10 +639,21 @@ class GroupedOperator(_MergedOperator):
 
 
 class Backend(_Backend):
-    """CUDA providers share pointer-grouped preparation and workspace ownership."""
+    """CUDA providers sharing pointer-grouped preparation.
+
+    CUDA providers share pointer-grouped preparation and workspace
+    ownership.
+    """
 
     def merged_workspace_buffers(
-        self, weights, *, input_dtype, input_quantizer, max_rows, branch_width, output_dtype
+        self,
+        weights,
+        *,
+        input_dtype,
+        input_quantizer,
+        max_rows,
+        branch_width,
+        output_dtype,
     ):
         if not supports(weights, input_quantizer, branch_width):
             return super().merged_workspace_buffers(
@@ -565,7 +665,8 @@ class Backend(_Backend):
                 output_dtype=output_dtype,
             )
         # Every group borrows the same encoded input. Only one branch needs
-        # input storage; group-specific descriptors and output are context-owned.
+        # input storage; group-specific descriptors and output are
+        # context-owned.
         return {
             **self.workspace_buffers(
                 next(iter(weights.values())),
@@ -574,7 +675,9 @@ class Backend(_Backend):
                 max_rows=max_rows,
                 output_dtype=output_dtype,
             ),
-            **workspace_buffers(weights, max_rows=max_rows, branch_width=branch_width),
+            **workspace_buffers(
+                weights, max_rows=max_rows, branch_width=branch_width
+            ),
         }
 
     def prepare_merged(
@@ -610,4 +713,6 @@ class Backend(_Backend):
             for name, weight in weights.items()
         }
 
-        return GroupedOperator(operators, branch_width=branch_width, workspace=workspace)
+        return GroupedOperator(
+            operators, branch_width=branch_width, workspace=workspace
+        )

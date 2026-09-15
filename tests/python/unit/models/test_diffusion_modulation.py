@@ -15,35 +15,55 @@ def test_streamed_modulation_preserves_projection_batch_and_step_outputs(
 ) -> None:
     generator = torch.Generator().manual_seed(53)
     inputs = torch.randn((4, 2, 64), generator=generator)
-    weights = tuple(torch.randn((96, 64), generator=generator).to(dtype) for _ in range(3))
-    biases = tuple(torch.randn((96,), generator=generator).to(dtype) for _ in range(3))
+    weights = tuple(
+        torch.randn((96, 64), generator=generator).to(dtype) for _ in range(3)
+    )
+    biases = tuple(
+        torch.randn((96,), generator=generator).to(dtype) for _ in range(3)
+    )
     final_weight = torch.randn((32, 64), generator=generator).to(dtype)
     final_bias = torch.randn((32,), generator=generator).to(dtype)
     plan = Modulation.from_projections(
-        inputs, zip(weights, biases, strict=True), (final_weight, final_bias), layer_count=3
+        inputs,
+        zip(weights, biases, strict=True),
+        (final_weight, final_bias),
+        layer_count=3,
     )
     expected = torch.stack(
         tuple(
-            F.linear(inputs.flatten(0, 1).to(dtype), weight, bias).view(4, 2, 96)
+            F.linear(inputs.flatten(0, 1).to(dtype), weight, bias).view(
+                4, 2, 96
+            )
             for weight, bias in zip(weights, biases, strict=True)
         ),
         dim=1,
     )
-    final = F.linear(inputs.flatten(0, 1).to(dtype), final_weight, final_bias).view(4, 2, 32)
+    final = F.linear(
+        inputs.flatten(0, 1).to(dtype), final_weight, final_bias
+    ).view(4, 2, 32)
     for step in (3, 0, 2, 1, 0):
         for layer in range(3):
-            torch.testing.assert_close(plan(step, layer), expected[step, layer], atol=0, rtol=0)
-        torch.testing.assert_close(plan.output(step), final[step], atol=0, rtol=0)
+            torch.testing.assert_close(
+                plan(step, layer), expected[step, layer], atol=0, rtol=0
+            )
+        torch.testing.assert_close(
+            plan.output(step), final[step], atol=0, rtol=0
+        )
     with pytest.raises(ValueError, match="step/layer domain"):
         plan(4, 0)
 
 
 @pytest.mark.parametrize("count", [1, 3])
-def test_modulation_rejects_incomplete_checkpoint_layer_sets(count: int) -> None:
+def test_modulation_rejects_incomplete_checkpoint_layer_sets(
+    count: int,
+) -> None:
     projection = (torch.ones((8, 4)), None)
     with pytest.raises(ValueError, match="layer projections"):
         Modulation.from_projections(
-            torch.ones((4, 2, 4)), iter([projection] * count), projection, layer_count=2
+            torch.ones((4, 2, 4)),
+            iter([projection] * count),
+            projection,
+            layer_count=2,
         )
 
 
@@ -51,7 +71,9 @@ def test_pipeline_layer_products_omit_final_projection():
     torch.manual_seed(103)
     inputs = torch.randn(4, 2, 8)
     weight = torch.randn(12, 8)
-    plan = Modulation.from_projections(inputs, [(weight, None)], None, layer_count=1)
+    plan = Modulation.from_projections(
+        inputs, [(weight, None)], None, layer_count=1
+    )
     for step in range(4):
         torch.testing.assert_close(
             plan(step, 0),

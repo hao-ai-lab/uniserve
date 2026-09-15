@@ -1,4 +1,6 @@
-"""Attention inputs, numerical layers and mathematical parallel configuration."""
+"""Attention inputs, numerical layers and mathematical parallel
+configuration.
+"""  # noqa: D205
 
 from .config import AttentionParallelConfig, ContextParallelConfig, Ulysses
 from .inputs import (

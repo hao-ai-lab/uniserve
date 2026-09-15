@@ -13,11 +13,15 @@ class _FlashInferOperator(_Operator):
         import flashinfer
 
         x = self._input(x, out)
-        if not isinstance(x, QuantizedTensor) or not isinstance(self.weight, QuantizedTensor):
+        if not isinstance(x, QuantizedTensor) or not isinstance(
+            self.weight, QuantizedTensor
+        ):
             raise ValueError("FlashInfer block GEMM requires encoded operands")
         format = self.weight.quantizer.format
         if x.quantizer.format != format or format not in {"mxfp8", "nvfp4"}:
-            raise ValueError("block GEMM operands must use the same MXFP8 or NVFP4 format")
+            raise ValueError(
+                "block GEMM operands must use the same MXFP8 or NVFP4 format"
+            )
         if out.dtype != torch.bfloat16:
             raise ValueError("block GEMM requires BF16 output")
 
@@ -31,7 +35,9 @@ class _FlashInferOperator(_Operator):
         )
 
         left = x.repack(scale_layout=ScaleLayout.SWIZZLED_128X4).buffers()
-        right = self.weight.repack(scale_layout=ScaleLayout.SWIZZLED_128X4).buffers()
+        right = self.weight.repack(
+            scale_layout=ScaleLayout.SWIZZLED_128X4
+        ).buffers()
         if format == "mxfp8":
             flashinfer.mm_mxfp8(
                 left["values"],
@@ -45,7 +51,11 @@ class _FlashInferOperator(_Operator):
         else:
             # cuDNN consumes accelerator-swizzled scales; the original linear
             # scale path uses the existing CuTe GEMM after the same repacking.
-            backend = "cudnn" if x.scale_layout is ScaleLayout.SWIZZLED_128X4 else "cute-dsl"
+            backend = (
+                "cudnn"
+                if x.scale_layout is ScaleLayout.SWIZZLED_128X4
+                else "cute-dsl"
+            )
             flashinfer.mm_fp4(
                 left["values"],
                 right["values"].T,

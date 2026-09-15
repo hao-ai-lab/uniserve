@@ -37,7 +37,8 @@ class Model(nn.Module):
 
         backbone = Transformer(config.text)
         self.text = CausalLM(
-            backbone, VocabParallelHead(config.text.hidden_size, config.text.vocab_size)
+            backbone,
+            VocabParallelHead(config.text.hidden_size, config.text.vocab_size),
         )
         self.denoiser = Denoiser(config, backbone)
 

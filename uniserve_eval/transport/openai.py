@@ -11,8 +11,7 @@ class OpenAIChat:
 
     @staticmethod
     def classify_events(events: Sequence[Any]) -> tuple[bool, str]:
-        """Classify a streamed response by structure, terminal state, and output."""
-
+        """Classify a streamed response by structure, terminal state, and output."""  # noqa: E501
         if not events:
             return False, "response_empty_response"
         if any(not isinstance(event, dict) for event in events):
@@ -21,12 +20,13 @@ class OpenAIChat:
             return False, "response_invalid_event"
         if any(isinstance(event.get("error"), dict) for event in events):
             return False, "model_error"
-        if not any(event.get("type") == "sse_done" for event in events) and not any(
-            OpenAIChat._has_finish_reason(event) for event in events
-        ):
+        if not any(
+            event.get("type") == "sse_done" for event in events
+        ) and not any(OpenAIChat._has_finish_reason(event) for event in events):
             return False, "response_missing_terminal"
         if not any(
-            OpenAIChat.delta_text(event) or OpenAIChat.delta_images(event) for event in events
+            OpenAIChat.delta_text(event) or OpenAIChat.delta_images(event)
+            for event in events
         ):
             return False, "response_empty_output"
         return True, "ok"
@@ -34,7 +34,6 @@ class OpenAIChat:
     @staticmethod
     def message_text(message: dict[str, Any] | None) -> str:
         """Concatenate reasoning and visible text from a completed message."""
-
         message = message or {}
         parts: list[str] = []
         reasoning = OpenAIChat._reasoning_text(message)
@@ -54,7 +53,6 @@ class OpenAIChat:
     @staticmethod
     def message_images(message: dict[str, Any] | None) -> list[dict[str, Any]]:
         """Extract direct and content-part images from a completed message."""
-
         images: list[dict[str, Any]] = []
         if not isinstance(message, dict):
             return images
@@ -64,14 +62,15 @@ class OpenAIChat:
         content = message.get("content")
         if isinstance(content, list):
             images.extend(
-                part for part in content if isinstance(part, dict) and OpenAIChat._is_image_part(part)
+                part
+                for part in content
+                if isinstance(part, dict) and OpenAIChat._is_image_part(part)
             )
         return images
 
     @staticmethod
     def delta_text(event: dict[str, Any]) -> str:
         """Concatenate reasoning and visible text across an event's choices."""
-
         choices = event.get("choices")
         if not isinstance(choices, list) or not choices:
             return ""
@@ -95,7 +94,6 @@ class OpenAIChat:
     @staticmethod
     def delta_images(event: dict[str, Any]) -> list[dict[str, Any]]:
         """Extract image parts across an event's choice deltas."""
-
         choices = event.get("choices")
         if not isinstance(choices, list) or not choices:
             return []
@@ -108,20 +106,22 @@ class OpenAIChat:
                 continue
             delta_images = delta.get("images")
             if isinstance(delta_images, list):
-                images.extend(part for part in delta_images if isinstance(part, dict))
+                images.extend(
+                    part for part in delta_images if isinstance(part, dict)
+                )
             content = delta.get("content")
             if isinstance(content, list):
                 images.extend(
                     part
                     for part in content
-                    if isinstance(part, dict) and OpenAIChat._is_image_part(part)
+                    if isinstance(part, dict)
+                    and OpenAIChat._is_image_part(part)
                 )
         return images
 
     @staticmethod
     def _has_finish_reason(event: dict[str, Any]) -> bool:
         """Report whether any event choice carries a terminal finish reason."""
-
         choices = event.get("choices")
         if not isinstance(choices, list):
             return False
@@ -133,13 +133,15 @@ class OpenAIChat:
     @staticmethod
     def _is_image_part(part: dict[str, Any]) -> bool:
         """Recognize supported embedded image part shapes."""
-
-        return part.get("type") == "image_url" or "image_url" in part or "b64_json" in part
+        return (
+            part.get("type") == "image_url"
+            or "image_url" in part
+            or "b64_json" in part
+        )
 
     @staticmethod
     def _reasoning_text(message: dict[str, Any]) -> str:
         """Extract reasoning text across compatible field names."""
-
         value = message.get("reasoning_content")
         if not isinstance(value, str):
             value = message.get("reasoning")

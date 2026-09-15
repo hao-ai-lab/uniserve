@@ -1,4 +1,7 @@
-"""Captured video reconstruction consumes the supplied overlap on every replay."""
+"""Captured video reconstruction consumes the supplied overlap.
+
+The overlap is consumed on every replay.
+"""
 
 import pytest
 import torch
@@ -23,7 +26,9 @@ def test_video_postprocess_replay_uses_current_overlap_and_pixels():
         frame_size=image.Config(2, 3),
         frame_rate=24,
     )
-    frames = torch.tensor([1, 1, 0.5, 0, 0.25, 1], dtype=torch.float16, device=device)
+    frames = torch.tensor(
+        [1, 1, 0.5, 0, 0.25, 1], dtype=torch.float16, device=device
+    )
     segment = frames.view(1, 1, 6, 1, 1).expand(1, 3, 6, 2, 3).contiguous()
     overlap = torch.ones((1, 3, 2, 2, 3), dtype=torch.float16, device=device)
     saved_overlap = overlap.clone()
@@ -39,7 +44,9 @@ def test_video_postprocess_replay_uses_current_overlap_and_pixels():
                 TensorOutput(
                     segment,
                     OutputLayout(
-                        segment.shape, segment.dtype, tuple(slice(0, n) for n in segment.shape)
+                        segment.shape,
+                        segment.dtype,
+                        tuple(slice(0, n) for n in segment.shape),
                     ),
                 ),
             ),
@@ -62,7 +69,9 @@ def test_video_postprocess_replay_uses_current_overlap_and_pixels():
         )
         result = graph.replay()
         expected = (
-            torch.tensor([255, 255, 128, 64, 255], dtype=torch.uint8, device=device)
+            torch.tensor(
+                [255, 255, 128, 64, 255], dtype=torch.uint8, device=device
+            )
             .view(5, 1, 1, 1)
             .expand_as(pixels)
         )
@@ -78,8 +87,11 @@ def test_video_postprocess_replay_uses_current_overlap_and_pixels():
             .expand_as(pixels)
         )
         torch.testing.assert_close(result[0].tensor, expected, rtol=0, atol=0)
-        torch.testing.assert_close(overlap, torch.zeros_like(overlap), rtol=0, atol=0)
-        # Retained copies remain valid after the graph reuses its scratch result.
+        torch.testing.assert_close(
+            overlap, torch.zeros_like(overlap), rtol=0, atol=0
+        )
+        # Retained copies remain valid after the graph reuses its scratch
+        # result.
         torch.testing.assert_close(
             first[:, 0, 0, 0],
             frames[[0, 1, 2, 4, 5]].mul(255).round().to(torch.uint8),

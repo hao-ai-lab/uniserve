@@ -71,14 +71,16 @@ def load_weights(
     io: Config = Config(),
     devices: Mapping[str, torch.device | str] | None = None,
 ) -> tuple[weight_options.Report, ...]:
-    """Load an existing module using the same assignment and conversion path as construction.
+    """Load an existing module via the construction-time assignment path.
 
+    The same assignment and conversion path applies as in construction.
     Complete-source matrix assignments follow already bound mathematical
     partitions. Readers retire before return; Parameters retain their storage
     and shared identities independently of checkpoint file handles.
     """
-
-    known_paths = frozenset(path for path, _ in model.named_modules(remove_duplicate=False))
+    known_paths = frozenset(
+        path for path, _ in model.named_modules(remove_duplicate=False)
+    )
     return _load(
         model,
         checkpoint,
@@ -105,19 +107,21 @@ def load_model(
     devices: Mapping[str, torch.device | str] | None = None,
     modules: frozenset[str] | None = None,
 ) -> Result[ModelT]:
-    """Construct on meta, bind mathematical partitions, then materialize selected modules.
+    """Construct on meta, bind partitions, then materialize selected modules.
 
-    Module paths choose resources and numerical settings. Unselected modules
-    remain on meta so architecture dimensions and layout queries stay available.
-    Neither constructors nor the resulting model retain loading state.
+    The bound partitions are mathematical. Module paths choose resources and
+    numerical settings. Unselected modules remain on meta so architecture
+    dimensions and layout queries stay available. Neither constructors nor
+    the resulting model retain loading state.
     """
-
     with torch.device("meta"):
         model = model_class(config)
     if not isinstance(model, nn.Module):
         raise TypeError("model constructor must return torch.nn.Module")
 
-    known_paths = frozenset(path for path, _ in model.named_modules(remove_duplicate=False))
+    known_paths = frozenset(
+        path for path, _ in model.named_modules(remove_duplicate=False)
+    )
     selected = {
         id(child)
         for path in (("",) if modules is None else modules)
@@ -127,7 +131,9 @@ def load_model(
     meshes = {} if meshes is None else meshes
     attention = {} if attention is None else attention
     if set(attention).difference(meshes):
-        raise ValueError("attention parallel settings require a mesh at the same module path")
+        raise ValueError(
+            "attention parallel settings require a mesh at the same module path"
+        )
 
     # A mesh this rank does not participate in makes its whole subtree remote:
     # those modules stay on meta and are never materialized here.
@@ -144,12 +150,19 @@ def load_model(
         for child in model.get_submodule(path).modules()
     }
     if remote.intersection(local):
-        raise ValueError("shared numerical modules cannot have conflicting mesh participation")
+        raise ValueError(
+            "shared numerical modules cannot have conflicting mesh "
+            "participation"
+        )
     selected.difference_update(remote)
     for path, mesh in meshes.items():
         child = model.get_submodule(path)
         if mesh.rank in mesh.ranks:
-            parallelize_(child, mesh, attention=attention.get(path, AttentionParallelConfig()))
+            parallelize_(
+                child,
+                mesh,
+                attention=attention.get(path, AttentionParallelConfig()),
+            )
 
     declared = mapping(model)
     parameters = {
@@ -165,17 +178,28 @@ def load_model(
     for component in declared:
         names = {
             name
-            for name, parameter in component.module.named_parameters(remove_duplicate=False)
+            for name, parameter in component.module.named_parameters(
+                remove_duplicate=False
+            )
             if id(parameter) in parameters
         }
         retained = names.intersection(component.required | component.optional)
         if not retained and id(component.module) not in selected:
             continue
-        if component.post_load is not None and not component.required.issubset(names):
-            raise ValueError("checkpoint-derived modules must load their complete numerical inputs")
+        if component.post_load is not None and not component.required.issubset(
+            names
+        ):
+            raise ValueError(
+                "checkpoint-derived modules must load their complete "
+                "numerical inputs"
+            )
 
         def assign(reader, mapping=component.map_weights):
-            return tuple(value for value in mapping(reader) if id(value.target) in parameters)
+            return tuple(
+                value
+                for value in mapping(reader)
+                if id(value.target) in parameters
+            )
 
         mapped.append(
             replace(

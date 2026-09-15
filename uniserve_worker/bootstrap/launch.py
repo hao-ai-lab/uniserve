@@ -10,15 +10,17 @@ logger = logging.getLogger(__name__)
 
 try:
     from .._uniserve_ipc import Server as WorkerIpcEndpoint
-except ImportError as exc:  # pragma: no cover - depends on the installed native extension.
+except (
+    ImportError
+) as exc:  # pragma: no cover - depends on the installed native extension.
     raise ImportError(
-        "_uniserve_ipc is not installed; reinstall the package (pip install -e .) to build it."
+        "_uniserve_ipc is not installed; reinstall the package "
+        "(pip install -e .) to build it."
     ) from exc
 
 
 def run_worker(config: WorkerProcessArgs) -> None:
-    """Own the IPC endpoint around model construction and the worker's blocking run."""
-
+    """Own the IPC endpoint around model construction and the blocking run."""
     from ..worker import Worker
 
     with (
@@ -36,7 +38,9 @@ def run_worker(config: WorkerProcessArgs) -> None:
                 "service": config.ipc.service_name,
                 "max_payload_bytes": config.ipc.max_payload_bytes,
                 "max_inflight": config.ipc.max_inflight,
-                "supported_ops": sorted(value.value for value in config.supported_ops),
+                "supported_ops": sorted(
+                    value.value for value in config.supported_ops
+                ),
             },
         )
         worker.run()

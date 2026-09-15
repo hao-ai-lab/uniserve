@@ -40,8 +40,9 @@ def test_table_updates_and_release_preserve_all_queued_snapshots(device, depth):
                 expected_lengths[slot] = allocated
                 assert tables.pages(slot, group) == pages
                 assert tables.allocated_length(slot) == allocated
-            # These are real consumers on the producer stream. Queue all of them
-            # before host observation to exercise asynchronous source retirement.
+            # These are real consumers on the producer stream. Queue all of
+            # them before host observation to exercise asynchronous source
+            # retirement.
             snapshots.append(
                 (
                     tables.page_tables.clone(),

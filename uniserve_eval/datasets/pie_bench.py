@@ -25,7 +25,6 @@ class PieBenchDataset(Dataset):
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
         """Select seeded entries that contain both an image and instruction."""
-
         point = self.point
         mapping_path, images_root = _resolve_sources(point.dataset_path)
         with open(mapping_path, encoding="utf-8") as handle:
@@ -40,7 +39,9 @@ class PieBenchDataset(Dataset):
         for key, value in entries:
             if len(rows) >= point.load.num_prompts:
                 break
-            image_file = _resolve_image_file(images_root, str(value["image_path"]))
+            image_file = _resolve_image_file(
+                images_root, str(value["image_path"])
+            )
             if image_file is None:
                 continue
             instruction = _edit_instruction(value)
@@ -59,27 +60,31 @@ class PieBenchDataset(Dataset):
 
 def _resolve_sources(dataset_path: str | None) -> tuple[Path, Path]:
     """Resolve the mapping file and image root from local or hub storage."""
-
     if dataset_path:
         base = Path(dataset_path)
         if base.is_file():
             return base, base.parent
         mapping = _find_mapping(base)
         if mapping is None:
-            raise FileNotFoundError(f"no PIE-Bench mapping file found under {base}")
+            raise FileNotFoundError(
+                f"no PIE-Bench mapping file found under {base}"
+            )
         return mapping, base
     from huggingface_hub import snapshot_download
 
-    snapshot = Path(snapshot_download(repo_id=PIE_BENCH_HF_REPO, repo_type="dataset"))
+    snapshot = Path(
+        snapshot_download(repo_id=PIE_BENCH_HF_REPO, repo_type="dataset")
+    )
     mapping = _find_mapping(snapshot)
     if mapping is None:
-        raise FileNotFoundError(f"no PIE-Bench mapping file found in snapshot {snapshot}")
+        raise FileNotFoundError(
+            f"no PIE-Bench mapping file found in snapshot {snapshot}"
+        )
     return mapping, snapshot
 
 
 def _find_mapping(root: Path) -> Path | None:
     """Find the preferred PIE-Bench mapping file beneath a root."""
-
     for name in _MAPPING_CANDIDATES:
         direct = root / name
         if direct.is_file():
@@ -90,7 +95,6 @@ def _find_mapping(root: Path) -> Path | None:
 
 def _resolve_image_file(images_root: Path, rel_path: str) -> Path | None:
     """Resolve an image path across the supported snapshot layouts."""
-
     candidates = [
         images_root / rel_path,
         images_root / "annotation_images" / rel_path,
@@ -106,7 +110,6 @@ def _resolve_image_file(images_root: Path, rel_path: str) -> Path | None:
 
 def _edit_instruction(entry: dict[str, Any]) -> str:
     """Extract and normalize the usable edit instruction for an entry."""
-
     instruction = entry.get("editing_instruction")
     if instruction:
         return str(instruction).strip()
@@ -118,7 +121,6 @@ def _edit_instruction(entry: dict[str, Any]) -> str:
 
 def _png_b64(path: Path) -> str:
     """Normalize an input image to RGB PNG and return base64 text."""
-
     from PIL import Image
 
     with Image.open(path) as image:

@@ -1,4 +1,7 @@
-"""Public VSA providers preserve selected keys, compression and mutable graph inputs."""
+"""Public VSA providers preserve selected keys and compression.
+
+They also preserve mutable graph inputs.
+"""
 
 import pytest
 import torch
@@ -17,15 +20,22 @@ def _input(valid):
         video_tiles=2,
         valid_tiles=3,
         valid_sizes=valid,
-        prefix_key_indices=torch.tensor([0], device=valid.device, dtype=torch.int32),
-        dense_key_indices=torch.arange(3, device=valid.device, dtype=torch.int32),
+        prefix_key_indices=torch.tensor(
+            [0], device=valid.device, dtype=torch.int32
+        ),
+        dense_key_indices=torch.arange(
+            3, device=valid.device, dtype=torch.int32
+        ),
         prefix_count=torch.tensor(1, device=valid.device, dtype=torch.int32),
     )
 
 
 def _workspace(q):
     rows, heads, width = q.shape
-    tensor = lambda shape, dtype=torch.float32: torch.empty(shape, device=q.device, dtype=dtype)
+
+    def tensor(shape, dtype=torch.float32):
+        return torch.empty(shape, device=q.device, dtype=dtype)
+
     return vsa.Workspace(
         attention_output=tensor(q.shape, q.dtype),
         tile_scores=tensor((heads, 4, 4)),
@@ -43,7 +53,9 @@ def _workspace(q):
 @torch.inference_mode()
 def test_selection_compression_and_projected_chunks(provider):
     torch.manual_seed(518)
-    projections = torch.randn(256, 7, 4, 128, device="cuda", dtype=torch.bfloat16)
+    projections = torch.randn(
+        256, 7, 4, 128, device="cuda", dtype=torch.bfloat16
+    )
     q, k, v, gate = projections.unbind(2)
     valid = torch.tensor([64, 17, 64, 0], device="cuda", dtype=torch.int32)
     inputs, workspace = _input(valid), _workspace(q)
@@ -53,14 +65,21 @@ def test_selection_compression_and_projected_chunks(provider):
     stream.wait_stream(torch.cuda.current_stream())
     with ExecutionContext(module, stream=stream, vsa=provider) as context:
         context.prepare(None)
-        batch = module.select(q, k, inputs, selected_tiles=1, workspace=workspace)
+        batch = module.select(
+            q, k, inputs, selected_tiles=1, workspace=workspace
+        )
         actual = module(q, k, v, gate, batch, workspace=workspace)
-        torch.testing.assert_close(actual[live], expected[live], rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(
+            actual[live], expected[live], rtol=2e-2, atol=2e-2
+        )
         result = torch.empty_like(actual)
 
         def chunks():
             for start, stop in ((0, 64), (64, 192), (192, 256)):
-                yield slice(start, stop), tuple(value[start:stop] for value in (q, k, v, gate))
+                yield (
+                    slice(start, stop),
+                    tuple(value[start:stop] for value in (q, k, v, gate)),
+                )
 
         def invoke():
             for interval, output in module.forward_chunks(
@@ -70,7 +89,9 @@ def test_selection_compression_and_projected_chunks(provider):
             return result
 
         invoke()
-        torch.testing.assert_close(result[live], expected[live], rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(
+            result[live], expected[live], rtol=2e-2, atol=2e-2
+        )
         with CUDAGraph(context=context) as graph:
             graph.capture(invoke)
             # Numerical inputs change without changing the prepared tile shape.
@@ -78,4 +99,6 @@ def test_selection_compression_and_projected_chunks(provider):
             valid[1] = 9
             graph.replay()
             expected, live = reference_attention(q, k, v, gate, valid)
-            torch.testing.assert_close(result[live], expected[live], rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(
+                result[live], expected[live], rtol=2e-2, atol=2e-2
+            )

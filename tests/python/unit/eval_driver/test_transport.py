@@ -20,7 +20,9 @@ def test_stream_request_rejects_a_json_response() -> None:
         )
 
     async def run() -> None:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
             record = await send_request(
                 client,
                 "http://server",
@@ -50,7 +52,9 @@ def test_chat_json_records_visible_text_and_server_usage() -> None:
         )
 
     async def run() -> None:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
             record = await send_request(
                 client,
                 "http://server",
@@ -71,9 +75,11 @@ def test_chat_json_records_visible_text_and_server_usage() -> None:
 def test_stream_records_reasoning_content_as_public_text() -> None:
     body = "".join(
         (
-            'data: {"choices":[{"delta":{"reasoning_content":"reason"},"finish_reason":null}]}\n\n',
+            'data: {"choices":[{"delta":{"reasoning_content":"reason"},'
+            '"finish_reason":null}]}\n\n',
             'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n',
-            'data: {"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":1}}\n\n',
+            'data: {"choices":[],"usage":{"prompt_tokens":4,'
+            '"completion_tokens":1}}\n\n',
             "data: [DONE]\n\n",
         )
     )
@@ -86,7 +92,9 @@ def test_stream_records_reasoning_content_as_public_text() -> None:
         )
 
     async def run() -> None:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
             record = await send_request(
                 client,
                 "http://server",
@@ -114,7 +122,10 @@ def test_chat_json_records_reasoning_content_as_public_text() -> None:
                 "choices": [
                     {
                         "finish_reason": "stop",
-                        "message": {"reasoning_content": "reason", "content": None},
+                        "message": {
+                            "reasoning_content": "reason",
+                            "content": None,
+                        },
                     }
                 ],
                 "usage": {"prompt_tokens": 4, "completion_tokens": 1},
@@ -122,7 +133,9 @@ def test_chat_json_records_reasoning_content_as_public_text() -> None:
         )
 
     async def run() -> None:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
             record = await send_request(
                 client,
                 "http://server",
@@ -146,7 +159,9 @@ def test_stream_rejects_non_object_events() -> None:
         )
 
     async def run() -> None:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
             record = await send_request(
                 client,
                 "http://server",

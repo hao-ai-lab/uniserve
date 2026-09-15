@@ -16,12 +16,16 @@ def validate_exports(
     resident: Mapping[BufferId, ExportLocations],
     candidates: Mapping[BufferId, ExportLocations],
 ) -> None:
-    """Reject conflicting registrations before a completion group's writes commit."""
+    """Reject conflicting registrations.
 
+    Registrations are rejected before a completion group's writes commit.
+    """
     for buffer, locations in candidates.items():
         existing = resident.get(buffer)
         if existing is not None and existing != locations:
-            raise RuntimeError("committed transport publication identity was reused")
+            raise RuntimeError(
+                "committed transport publication identity was reused"
+            )
 
 
 def retiring_exports(
@@ -32,11 +36,11 @@ def retiring_exports(
     retained: frozenset[BufferId] = frozenset(),
 ) -> tuple[BufferId, ...]:
     """Select local registrations whose allocation ownership is ending."""
-
     return tuple(
         buffer
         for buffer in exports
-        if buffer in buffers or (buffer.owner in requests and buffer not in retained)
+        if buffer in buffers
+        or (buffer.owner in requests and buffer not in retained)
     )
 
 
@@ -51,7 +55,6 @@ def release_exports(
     together in the storage owner until every already admitted reader retires.
     Remote locators from imports are never inserted into this directory.
     """
-
     pending: list[Future[None]] = []
     for buffer in buffers:
         locations = exports.get(buffer)
@@ -75,7 +78,6 @@ def forget_exports(
     buffers: Iterable[BufferId],
 ) -> None:
     """Forget only registrations whose physical release succeeded."""
-
     for buffer in buffers:
         if buffer not in exports:
             continue

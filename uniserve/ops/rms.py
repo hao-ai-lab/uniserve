@@ -14,7 +14,12 @@ import torch
 
 from uniserve.ops.core import Dispatcher, Operator
 from uniserve.ops.qk_plan import QKNormRopePlan
-from uniserve.ops.requests import AddRmsNormReq, MultiAxisQKNormReq, QKNormRequest, RmsNormReq
+from uniserve.ops.requests import (
+    AddRmsNormReq,
+    MultiAxisQKNormReq,
+    QKNormRequest,
+    RmsNormReq,
+)
 from uniserve.runtime.triton import triton_available
 
 try:  # pragma: no cover - availability depends on the serving environment.
@@ -34,7 +39,6 @@ _SGL_ALIGNMENT_BYTES = 16
 @lru_cache(maxsize=1)
 def _sgl_rmsnorm_kernel():
     """Resolve the optional SGL RMSNorm kernel once per process."""
-
     try:  # pragma: no cover - depends on the installed accelerator stack.
         from sgl_kernel import rmsnorm
     except Exception:
@@ -45,7 +49,6 @@ def _sgl_rmsnorm_kernel():
 @lru_cache(maxsize=1)
 def _sgl_fused_add_rmsnorm_kernel():
     """Resolve the optional SGL residual-add RMSNorm kernel once per process."""
-
     try:  # pragma: no cover - depends on the installed accelerator stack.
         from sgl_kernel import fused_add_rmsnorm
     except Exception:
@@ -57,14 +60,20 @@ if triton is not None:
 
     @triton.jit
     def _rms_norm_kernel(
-        x_ptr, w_ptr, y_ptr, n_cols: tl.constexpr, eps: tl.constexpr, block: tl.constexpr
+        x_ptr,
+        w_ptr,
+        y_ptr,
+        n_cols: tl.constexpr,
+        eps: tl.constexpr,
+        block: tl.constexpr,
     ):
         """Normalize one flattened hidden-state row per Triton program."""
-
         row = tl.program_id(0)
         offs = tl.arange(0, block)
         mask = offs < n_cols
-        x = tl.load(x_ptr + row * n_cols + offs, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + row * n_cols + offs, mask=mask, other=0.0).to(
+            tl.float32
+        )
         w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
 
         # Variance and scaling stay in fp32; the output store performs the
@@ -85,12 +94,15 @@ if triton is not None:
         block: tl.constexpr,
     ):
         """Add a residual, preserve the sum, and normalize it in one program."""
-
         row = tl.program_id(0)
         offs = tl.arange(0, block)
         mask = offs < n_cols
-        x = tl.load(x_ptr + row * n_cols + offs, mask=mask, other=0.0).to(tl.float32)
-        r = tl.load(r_ptr + row * n_cols + offs, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + row * n_cols + offs, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        r = tl.load(r_ptr + row * n_cols + offs, mask=mask, other=0.0).to(
+            tl.float32
+        )
         c = x + r
 
         # Both outputs derive from the same fp32 sum: ``c_ptr`` carries the
@@ -125,7 +137,6 @@ if triton is not None:
         block: tl.constexpr,
     ):
         """Normalize flattened query and key head rows in one launch domain."""
-
         # Sources are [tokens, heads, dim] with arbitrary strides; outputs are
         # contiguous [tokens * heads, dim] in head-minor row order.
         pid = tl.program_id(0)
@@ -137,7 +148,10 @@ if triton is not None:
         q_token = pid // q_heads
         q_head = pid - q_token * q_heads
         q = tl.load(
-            q_ptr + q_token * q_stride_0 + q_head * q_stride_1 + offs * q_stride_2,
+            q_ptr
+            + q_token * q_stride_0
+            + q_head * q_stride_1
+            + offs * q_stride_2,
             mask=q_mask,
             other=0.0,
         ).to(tl.float32)
@@ -153,7 +167,10 @@ if triton is not None:
         k_token = k_pid // k_heads
         k_head = k_pid - k_token * k_heads
         k = tl.load(
-            k_ptr + k_token * k_stride_0 + k_head * k_stride_1 + offs * k_stride_2,
+            k_ptr
+            + k_token * k_stride_0
+            + k_head * k_stride_1
+            + offs * k_stride_2,
             mask=k_mask,
             other=0.0,
         ).to(tl.float32)
@@ -163,9 +180,10 @@ if triton is not None:
         tl.store(k_out_ptr + k_pid * n_cols + offs, k_out, mask=k_mask)
 
 
-def _norm_inputs_eligible(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
+def _norm_inputs_eligible(
+    hidden_states: torch.Tensor, weight: torch.Tensor
+) -> bool:
     """Check the shared CUDA, layout, gradient, and width requirements."""
-
     return not (
         not hidden_states.is_cuda
         or not weight.is_cuda
@@ -179,13 +197,15 @@ def _norm_inputs_eligible(hidden_states: torch.Tensor, weight: torch.Tensor) -> 
 
 def _triton_norm_available(device: torch.device) -> bool:
     """Report whether Triton can launch normalization kernels on ``device``."""
-
     return triton is not None and triton_available(device)
 
 
 def _sgl_rms_norm_input(hidden_states: torch.Tensor) -> torch.Tensor | None:
-    """Return an SGL-compatible contiguous view or reject non-unit inner stride."""
+    """Return an SGL-compatible contiguous view.
 
+    Return an SGL-compatible contiguous view or reject non-unit inner
+    stride.
+    """
     if not hidden_states.is_contiguous():
         if int(hidden_states.stride(-1)) != 1:
             return None
@@ -194,22 +214,27 @@ def _sgl_rms_norm_input(hidden_states: torch.Tensor) -> torch.Tensor | None:
 
 
 def _norm_launch_config(hidden_size: int) -> tuple[int, int]:
-    """Choose a power-of-two reduction block and warp count for ``hidden_size``."""
+    """Choose a reduction block and warp count.
 
+    Choose a power-of-two reduction block and warp count for
+    ``hidden_size``.
+    """
     block = triton.next_power_of_2(hidden_size)
-    num_warps = _NORM_WIDE_WARPS if block >= _NORM_WIDE_BLOCK else _NORM_NARROW_WARPS
+    num_warps = (
+        _NORM_WIDE_WARPS if block >= _NORM_WIDE_BLOCK else _NORM_NARROW_WARPS
+    )
     return block, num_warps
 
 
 def _reshape_norm_rows(tensor: torch.Tensor, hidden_size: int) -> torch.Tensor:
     """Flatten leading dimensions into independent normalization rows."""
-
     return tensor.reshape(tensor.numel() // int(hidden_size), int(hidden_size))
 
 
-def eager_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def eager_rms_norm(
+    hidden_states: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
     """Apply portable RMS normalization along the final dimension."""
-
     in_dtype = hidden_states.dtype
 
     x = hidden_states.to(torch.float32)
@@ -224,8 +249,10 @@ def qk_rms_norm_eligible(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
 ) -> bool:
-    """Check whether paired rank-three Q/K tensors fit the fused Triton kernel."""
+    """Check whether paired Q/K tensors fit the fused kernel.
 
+    Check whether paired rank-three Q/K tensors fit the fused Triton kernel.
+    """
     # Q and K may differ in tokens and heads, but both must expose contiguous
     # feature vectors with matching dtype, width, device, and resident weights.
     if (
@@ -255,7 +282,10 @@ def qk_rms_norm_eligible(
     if head_dim <= 0 or head_dim > 1024:
         return False
     return (
-        int(q.shape[0]) > 0 and int(k.shape[0]) > 0 and int(q.shape[1]) > 0 and int(k.shape[1]) > 0
+        int(q.shape[0]) > 0
+        and int(k.shape[0]) > 0
+        and int(q.shape[1]) > 0
+        and int(k.shape[1]) > 0
     )
 
 
@@ -267,8 +297,11 @@ def run_qk_rms_norm(
     q_eps: float,
     k_eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Normalize Q/K with one Triton launch, returning ``None`` when ineligible."""
+    """Normalize Q/K with one Triton launch.
 
+    Normalize Q/K with one Triton launch, returning ``None`` when
+    ineligible.
+    """
     if not qk_rms_norm_eligible(q, k, q_weight, k_weight):
         return None
 
@@ -317,12 +350,10 @@ class SglRmsNorm(Operator):
 
     def __init__(self) -> None:
         """Register the SGL RMSNorm provider identity."""
-
         super().__init__("sgl_kernel", "rms_norm")
 
     def can_run(self, req: RmsNormReq) -> bool:
         """Accept aligned fp16 or bf16 inputs supported by the SGL kernel."""
-
         if _sgl_rmsnorm_kernel() is None:
             return False
         coerced = _sgl_rms_norm_input(req.hidden_states)
@@ -335,8 +366,10 @@ class SglRmsNorm(Operator):
         return _norm_inputs_eligible(coerced, req.weight)
 
     def run(self, req: RmsNormReq) -> torch.Tensor:
-        """Flatten normalization rows, invoke SGL, and restore the input shape."""
+        """Flatten normalization rows and invoke SGL.
 
+        Flatten normalization rows, invoke SGL, and restore the input shape.
+        """
         original_shape = tuple(req.hidden_states.shape)
         coerced = _sgl_rms_norm_input(req.hidden_states)
         if coerced is None:
@@ -361,19 +394,16 @@ class TritonRmsNorm(Operator):
 
     def __init__(self) -> None:
         """Register the Triton RMSNorm provider identity."""
-
         super().__init__("triton", "rms_norm")
 
     def can_run(self, req: RmsNormReq) -> bool:
         """Accept contiguous CUDA inputs within the fused width limit."""
-
-        return _norm_inputs_eligible(req.hidden_states, req.weight) and _triton_norm_available(
-            req.hidden_states.device
-        )
+        return _norm_inputs_eligible(
+            req.hidden_states, req.weight
+        ) and _triton_norm_available(req.hidden_states.device)
 
     def run(self, req: RmsNormReq) -> torch.Tensor:
         """Launch one RMSNorm program for each flattened input row."""
-
         hidden_size = int(req.weight.numel())
         rows = req.hidden_states.numel() // hidden_size
         out = torch.empty_like(req.hidden_states)
@@ -397,18 +427,15 @@ class EagerRmsNorm(Operator):
 
     def __init__(self) -> None:
         """Register the eager RMSNorm provider identity."""
-
         super().__init__("eager", "rms_norm")
 
     def can_run(self, req: RmsNormReq) -> bool:
         """Accept every request handled by PyTorch tensor operations."""
-
         del req
         return True
 
     def run(self, req: RmsNormReq) -> torch.Tensor:
         """Apply eager RMSNorm to the request tensors."""
-
         return eager_rms_norm(req.hidden_states, req.weight, req.eps)
 
 
@@ -417,12 +444,14 @@ class SglAddRmsNorm(Operator):
 
     def __init__(self) -> None:
         """Register the SGL residual-add RMSNorm provider identity."""
-
         super().__init__("sgl_kernel", "add_rms_norm")
 
     def can_run(self, req: AddRmsNormReq) -> bool:
-        """Accept shape-matched requests that explicitly allow in-place execution."""
+        """Accept shape-matched in-place requests.
 
+        Accept shape-matched requests that explicitly allow in-place
+        execution.
+        """
         if not req.in_place or _sgl_fused_add_rmsnorm_kernel() is None:
             return False
         return not (
@@ -433,8 +462,11 @@ class SglAddRmsNorm(Operator):
         )
 
     def run(self, req: AddRmsNormReq) -> tuple[torch.Tensor, torch.Tensor]:
-        """Normalize hidden states and store the combined residual in caller buffers."""
+        """Normalize hidden states into caller buffers.
 
+        Normalize hidden states and store the combined residual in caller
+        buffers.
+        """
         hidden_size = int(req.weight.numel())
         kernel = _sgl_fused_add_rmsnorm_kernel()
         if kernel is None:
@@ -454,12 +486,10 @@ class TritonAddRmsNorm(Operator):
 
     def __init__(self) -> None:
         """Register the Triton residual-add RMSNorm provider identity."""
-
         super().__init__("triton", "add_rms_norm")
 
     def can_run(self, req: AddRmsNormReq) -> bool:
         """Accept compatible contiguous CUDA hidden and residual tensors."""
-
         return not (
             req.hidden_states.shape != req.residual.shape
             or req.hidden_states.dtype != req.residual.dtype
@@ -469,8 +499,11 @@ class TritonAddRmsNorm(Operator):
         )
 
     def run(self, req: AddRmsNormReq) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return separately allocated normalized and combined residual tensors."""
+        """Return separately allocated outputs.
 
+        Return separately allocated normalized and combined residual
+        tensors.
+        """
         hidden_size = int(req.weight.numel())
         rows = req.hidden_states.numel() // hidden_size
 
@@ -500,18 +533,15 @@ class EagerAddRmsNorm(Operator):
 
     def __init__(self) -> None:
         """Register the eager residual-add RMSNorm provider identity."""
-
         super().__init__("eager", "add_rms_norm")
 
     def can_run(self, req: AddRmsNormReq) -> bool:
         """Accept every request handled by PyTorch tensor operations."""
-
         del req
         return True
 
     def run(self, req: AddRmsNormReq) -> tuple[torch.Tensor, torch.Tensor]:
         """Return RMSNorm of the residual sum together with the sum itself."""
-
         combined = req.hidden_states + req.residual
         return eager_rms_norm(combined, req.weight, req.eps), combined
 
@@ -521,22 +551,23 @@ class TritonQKNorm(Operator):
 
     def __init__(self) -> None:
         """Register the Triton QK normalization provider identity."""
-
         super().__init__("triton", "qk_norm")
 
     def can_run(self, req: QKNormRequest) -> bool:
         """Accept eligible single-axis QK normalization requests."""
-
         if isinstance(req, MultiAxisQKNormReq):
             return False
         return qk_rms_norm_eligible(req.q, req.k, req.q_weight, req.k_weight)
 
     def run(self, req: QKNormRequest) -> tuple[torch.Tensor, torch.Tensor]:
         """Launch fused QK normalization and require retained eligibility."""
-
         if isinstance(req, MultiAxisQKNormReq):
-            raise RuntimeError("triton qk_norm only handles single-axis requests")
-        out = run_qk_rms_norm(req.q, req.k, req.q_weight, req.k_weight, req.eps, req.eps)
+            raise RuntimeError(
+                "triton qk_norm only handles single-axis requests"
+            )
+        out = run_qk_rms_norm(
+            req.q, req.k, req.q_weight, req.k_weight, req.eps, req.eps
+        )
         if out is None:
             raise RuntimeError("triton qk_norm became ineligible")
         return out
@@ -547,18 +578,15 @@ class EagerQKNorm(Operator):
 
     def __init__(self) -> None:
         """Register the eager QK normalization provider identity."""
-
         super().__init__("eager", "qk_norm")
 
     def can_run(self, req: QKNormRequest) -> bool:
         """Accept both single-axis and multi-axis QK requests."""
-
         del req
         return True
 
     def run(self, req: QKNormRequest) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalize Q/K according to the request's axis grouping."""
-
         if isinstance(req, MultiAxisQKNormReq):
             return self._run_multi_axis(req)
         return (
@@ -566,9 +594,14 @@ class EagerQKNorm(Operator):
             eager_rms_norm(req.k, req.k_weight, req.eps),
         )
 
-    def _run_multi_axis(self, req: MultiAxisQKNormReq) -> tuple[torch.Tensor, torch.Tensor]:
-        """Normalize shared axis groups and restore their declared partitioning."""
+    def _run_multi_axis(
+        self, req: MultiAxisQKNormReq
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize shared axis groups.
 
+        Normalize shared axis groups and restore their declared
+        partitioning.
+        """
         groups = QKNormRopePlan.from_norm_request(req)
         q_parts = req.q.split(req.axis_dims, dim=-1)
         k_parts = req.k.split(req.axis_dims, dim=-1)
@@ -580,10 +613,18 @@ class EagerQKNorm(Operator):
         for group in groups:
             q_group = torch.cat(q_parts[group.start : group.end], dim=-1)
             k_group = torch.cat(k_parts[group.start : group.end], dim=-1)
-            q_normed = eager_rms_norm(q_group, req.q_weights[group.start], req.eps)
-            k_normed = eager_rms_norm(k_group, req.k_weights[group.start], req.eps)
-            out_q.extend(q_normed.split(req.axis_dims[group.start : group.end], dim=-1))
-            out_k.extend(k_normed.split(req.axis_dims[group.start : group.end], dim=-1))
+            q_normed = eager_rms_norm(
+                q_group, req.q_weights[group.start], req.eps
+            )
+            k_normed = eager_rms_norm(
+                k_group, req.k_weights[group.start], req.eps
+            )
+            out_q.extend(
+                q_normed.split(req.axis_dims[group.start : group.end], dim=-1)
+            )
+            out_k.extend(
+                k_normed.split(req.axis_dims[group.start : group.end], dim=-1)
+            )
 
         return torch.cat(out_q, dim=-1), torch.cat(out_k, dim=-1)
 
@@ -591,7 +632,6 @@ class EagerQKNorm(Operator):
 @lru_cache(maxsize=1)
 def rms_norm_dispatcher() -> Dispatcher[RmsNormReq, torch.Tensor]:
     """Return the process-wide RMSNorm provider dispatcher."""
-
     return Dispatcher(
         "rms_norm",
         [SglRmsNorm(), TritonRmsNorm(), EagerRmsNorm()],
@@ -600,9 +640,10 @@ def rms_norm_dispatcher() -> Dispatcher[RmsNormReq, torch.Tensor]:
 
 
 @lru_cache(maxsize=1)
-def add_rms_norm_dispatcher() -> Dispatcher[AddRmsNormReq, tuple[torch.Tensor, torch.Tensor]]:
+def add_rms_norm_dispatcher() -> Dispatcher[
+    AddRmsNormReq, tuple[torch.Tensor, torch.Tensor]
+]:
     """Return the process-wide residual-add RMSNorm provider dispatcher."""
-
     return Dispatcher(
         "add_rms_norm",
         [SglAddRmsNorm(), TritonAddRmsNorm(), EagerAddRmsNorm()],
@@ -611,9 +652,10 @@ def add_rms_norm_dispatcher() -> Dispatcher[AddRmsNormReq, tuple[torch.Tensor, t
 
 
 @lru_cache(maxsize=1)
-def qk_norm_dispatcher() -> Dispatcher[QKNormRequest, tuple[torch.Tensor, torch.Tensor]]:
+def qk_norm_dispatcher() -> Dispatcher[
+    QKNormRequest, tuple[torch.Tensor, torch.Tensor]
+]:
     """Return the process-wide query/key normalization provider dispatcher."""
-
     return Dispatcher(
         "qk_norm",
         [TritonQKNorm(), EagerQKNorm()],

@@ -28,7 +28,12 @@ if TYPE_CHECKING:
 
 
 def cache_transfer_workspace_bytes(
-    *, num_layers: int, page_size: int, num_kv_heads: int, head_dim: int, capacity: int
+    *,
+    num_layers: int,
+    page_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+    capacity: int,
 ) -> int:
     """Return the startup bytes for every bounded import workspace.
 
@@ -37,9 +42,10 @@ def cache_transfer_workspace_bytes(
     page becomes rounding/absolute-value scratch after its input has been
     consumed. No prefix-sized conversion allocation is needed.
     """
-
     workers = min(4, int(capacity))
-    elements = int(page_size) * int(num_layers) * int(num_kv_heads) * int(head_dim)
+    elements = (
+        int(page_size) * int(num_layers) * int(num_kv_heads) * int(head_dim)
+    )
     scales = 2 * int(page_size) * int(num_layers) * int(num_kv_heads)
     # 20 bytes per element: two raw float64 pages (2 x 8) plus one FP32
     # conversion page (4). Scale entries are FP32 (4 bytes each).
@@ -48,7 +54,10 @@ def cache_transfer_workspace_bytes(
 
 @dataclass(slots=True)
 class CacheImport:
-    """A scheduler-owned KV destination retained through physical input access."""
+    """A scheduler-owned KV destination retained through physical input.
+
+    access.
+    """
 
     buffer: BufferId
     request_pool_idx: int
@@ -78,14 +87,18 @@ class TransferBuffer:
 
 
 class CacheImports:
-    """Own bounded import execution, destination leases and conversion storage."""
+    """Own bounded import execution, destination leases and conversion.
+
+    storage.
+    """
 
     def __init__(self, pool: CacheManager, *, capacity: int) -> None:
         self.pool = pool
         workers = min(4, int(capacity))
         self._tasks = CpuPool(capacity=capacity, workers=workers)
 
-        # One conversion page holds a full KV page: [tokens, layers, heads, dim].
+        # One conversion page holds a full KV page:
+        # [tokens, layers, heads, dim].
         shape = (
             pool.info.block_size,
             pool.info.num_layers,
@@ -102,7 +115,9 @@ class CacheImports:
         device = pool.cache.device
         self._available = deque(
             TransferBuffer(
-                raw=torch.empty((2, elements * 8), dtype=torch.uint8, device=device),
+                raw=torch.empty(
+                    (2, elements * 8), dtype=torch.uint8, device=device
+                ),
                 values=torch.empty(shape, dtype=torch.float32, device=device),
                 scales=torch.empty(
                     (
@@ -114,7 +129,9 @@ class CacheImports:
                     dtype=torch.float32,
                     device=device,
                 ),
-                stream=torch.cuda.Stream(device=device) if device.type == "cuda" else None,
+                stream=torch.cuda.Stream(device=device)
+                if device.type == "cuda"
+                else None,
             )
             for _ in range(workers)
         )
@@ -125,8 +142,10 @@ class CacheImports:
         self._wake: Callable[[], None] | None = None
 
     def set_completion_wake(self, wake: Callable[[], None] | None) -> None:
-        """Wake the owner after import jobs or destination retirements finish."""
+        """Wake the owner after import jobs or destination retirements.
 
+        finish.
+        """
         self._wake = wake
         self._tasks.set_completion_wake(wake)
 
@@ -134,9 +153,13 @@ class CacheImports:
         with self._condition:
             return bool(self._writes)
 
-    def dependencies(self, ranges: tuple[tuple[int, int, int], ...]) -> tuple[Future[None], ...]:
-        """Return writer retirements that precede reuse of overlapping storage."""
+    def dependencies(
+        self, ranges: tuple[tuple[int, int, int], ...]
+    ) -> tuple[Future[None], ...]:
+        """Return writer retirements that precede reuse of overlapping.
 
+        storage.
+        """
         with self._condition:
             return tuple(
                 write.retirement
@@ -155,35 +178,58 @@ class CacheImports:
         initialized_pages: tuple[int, ...],
         transports: Mapping[str, Transport],
     ) -> CacheImport:
-        """Reserve exact destination ranges before any host or device read starts."""
+        """Reserve exact destination ranges before any host or device read.
 
+        starts.
+        """
         suffix = publication.published_extent - publication.base_extent
         ranges = {
             page: (offset, count)
             for page, offset, count in page_spans(
-                pages, publication.base_extent, suffix, page_size=self.pool.info.block_size
+                pages,
+                publication.base_extent,
+                suffix,
+                page_size=self.pool.info.block_size,
             )
         }
-        ranges.update((page, (0, self.pool.info.block_size)) for page in initialized_pages)
+        ranges.update(
+            (page, (0, self.pool.info.block_size)) for page in initialized_pages
+        )
         for page, (offset, count) in ranges.items():
-            self.pool.require_reusable((page,), group=group, start=offset, length=count)
+            self.pool.require_reusable(
+                (page,), group=group, start=offset, length=count
+            )
 
-        reservation = self._tasks.reserve() if publication.tensors or initialized_pages else None
+        reservation = (
+            self._tasks.reserve()
+            if publication.tensors or initialized_pages
+            else None
+        )
         write = CacheImport(
-            buffer, request_pool_idx, group, pages, initialized_pages, publication, ranges
+            buffer,
+            request_pool_idx,
+            group,
+            pages,
+            initialized_pages,
+            publication,
+            ranges,
         )
 
         try:
             with self._condition:
                 if self._closed or buffer in self._writes:
-                    raise invalid_descriptor("KV import destination is closed or already reserved")
+                    raise invalid_descriptor(
+                        "KV import destination is closed or already reserved"
+                    )
                 self._writes[buffer] = write
             if reservation is None:
                 write._work_finished = True
                 write._stream_finished = True
                 write.completion.set_result(None)
             else:
-                write.completion = reservation.submit(self._copy, write, transports)
+                write.completion = reservation.submit(
+                    self._copy, write, transports
+                )
         except BaseException:
             if reservation is not None:
                 reservation.abandon()
@@ -198,19 +244,19 @@ class CacheImports:
 
     def adopt(self, write: CacheImport) -> None:
         """Hand a completed import to resident cache ownership."""
-
         if not write.completion.done():
             raise RuntimeError("KV import was observed before input readiness")
         write.completion.result()
         with self._condition:
             if not self.owns(write) or write.cancelled:
-                raise invalid_descriptor("KV import destination is no longer active")
+                raise invalid_descriptor(
+                    "KV import destination is no longer active"
+                )
             write.released = True
             self._reclaim(write)
 
     def abandon(self, write: CacheImport) -> None:
         """Revoke consumption while preserving every started physical access."""
-
         with self._condition:
             if not self.owns(write):
                 return
@@ -229,25 +275,37 @@ class CacheImports:
                     self.abandon(write)
 
     def cancel_requests(
-        self, requests: frozenset[RequestKey], *, retained: frozenset[BufferId] = frozenset()
+        self,
+        requests: frozenset[RequestKey],
+        *,
+        retained: frozenset[BufferId] = frozenset(),
     ) -> None:
         with self._condition:
             for write in tuple(self._writes.values()):
-                if write.buffer.owner in requests and write.buffer not in retained:
+                if (
+                    write.buffer.owner in requests
+                    and write.buffer not in retained
+                ):
                     self.abandon(write)
 
     def retirement_ready(
-        self, buffers: set[BufferId], requests: set[RequestKey], retained: frozenset[BufferId]
+        self,
+        buffers: set[BufferId],
+        requests: set[RequestKey],
+        retained: frozenset[BufferId],
     ) -> bool:
         with self._condition:
             return not any(
-                buffer in buffers or (buffer.owner in requests and buffer not in retained)
+                buffer in buffers
+                or (buffer.owner in requests and buffer not in retained)
                 for buffer in self._writes
             )
 
     def stop(self) -> None:
-        """Cancel queued imports and stop submission before transport shutdown."""
+        """Cancel queued imports and stop submission before transport.
 
+        shutdown.
+        """
         with self._condition:
             self._closed = True
             for write in tuple(self._writes.values()):
@@ -277,7 +335,9 @@ class CacheImports:
     def _retain(self, write: CacheImport, ticket: TransferTicket) -> None:
         with self._condition:
             write._tickets.add(ticket)
-            ticket.add_retirement_callback(partial(self._read_retired, write, ticket))
+            ticket.add_retirement_callback(
+                partial(self._read_retired, write, ticket)
+            )
             if write.cancelled:
                 ticket.cancel()
 
@@ -289,7 +349,11 @@ class CacheImports:
     def _reclaim(self, write: CacheImport) -> None:
         # A failed or cancelled task can finish before its transport access.
         # Its workspace and cache pages remain unavailable until both retire.
-        if not write._work_finished or not write._stream_finished or write._tickets:
+        if (
+            not write._work_finished
+            or not write._stream_finished
+            or write._tickets
+        ):
             return
         if write._workspace is not None:
             self._available.append(write._workspace)
@@ -315,7 +379,9 @@ class CacheImports:
             tensor,
             destination,
             bindings={
-                (location.source, location.backend): transports[location.backend]
+                (location.source, location.backend): transports[
+                    location.backend
+                ]
                 for location in tensor.locations
                 if location.backend in transports
             },
@@ -324,14 +390,18 @@ class CacheImports:
         )
 
     @staticmethod
-    def _consume(tickets: tuple[TransferTicket, ...], workspace: TransferBuffer) -> None:
+    def _consume(
+        tickets: tuple[TransferTicket, ...], workspace: TransferBuffer
+    ) -> None:
         for ticket in tickets:
             ready = Event()
             ticket.add_done_callback(ready.set)
             ready.wait()
             ticket.result(workspace.stream)
 
-    def _copy(self, write: CacheImport, transports: Mapping[str, Transport]) -> None:
+    def _copy(
+        self, write: CacheImport, transports: Mapping[str, Transport]
+    ) -> None:
         workspace = None
         stream_finished = True
         try:
@@ -353,18 +423,26 @@ class CacheImports:
                 if not publication.tensors:
                     return
 
-                same_format = publication.tensors[0].dtype == self.pool.info.dtype
+                same_format = (
+                    publication.tensors[0].dtype == self.pool.info.dtype
+                )
                 direct = same_format and (
                     self.pool.info.dtype != "float8_e4m3fn"
                     or (
                         publication.page_size == self.pool.info.block_size
                         # A partial installed page owns its destination scale.
                         # Its base may have arrived through another TP layout.
-                        and publication.base_extent % self.pool.info.block_size == 0
+                        and publication.base_extent % self.pool.info.block_size
+                        == 0
                         and publication.compute_dtype
                         == str(self.pool.compute_dtype).removeprefix("torch.")
-                        and self.pool.info.kv_head_offset // publication.scale_head_size
-                        == (self.pool.info.kv_head_offset + self.pool.info.num_kv_heads - 1)
+                        and self.pool.info.kv_head_offset
+                        // publication.scale_head_size
+                        == (
+                            self.pool.info.kv_head_offset
+                            + self.pool.info.num_kv_heads
+                            - 1
+                        )
                         // publication.scale_head_size
                     )
                 )
@@ -393,7 +471,12 @@ class CacheImports:
     ) -> None:
         publication = write.publication
         suffix = publication.published_extent - publication.base_extent
-        spans = page_spans(write.pages, publication.base_extent, suffix, self.pool.info.block_size)
+        spans = page_spans(
+            write.pages,
+            publication.base_extent,
+            suffix,
+            self.pool.info.block_size,
+        )
         info = self.pool.info
 
         for layer, name in enumerate(self.pool.layers, info.layer_offset):
@@ -403,7 +486,9 @@ class CacheImports:
             for index, tensor_name in enumerate(("key", "value")):
                 tensor = state.tensors[tensor_name]
                 values = (
-                    tensor.buffers()["values"] if isinstance(tensor, QuantizedTensor) else tensor
+                    tensor.buffers()["values"]
+                    if isinstance(tensor, QuantizedTensor)
+                    else tensor
                 )
                 # Each span view is [tokens, 1, kv heads, head dim]: the
                 # unsqueezed axis matches the single-layer fetch region.
@@ -420,14 +505,19 @@ class CacheImports:
                         region=(
                             slice(0, suffix),
                             slice(layer, layer + 1),
-                            slice(info.kv_head_offset, info.kv_head_offset + info.num_kv_heads),
+                            slice(
+                                info.kv_head_offset,
+                                info.kv_head_offset + info.num_kv_heads,
+                            ),
                             slice(0, info.head_dim),
                         ),
                     )
                 )
                 if isinstance(tensor, QuantizedTensor):
                     scales = tensor.buffers()["scale"]
-                    destination = tuple(scales[page : page + 1] for page, _, _ in spans)
+                    destination = tuple(
+                        scales[page : page + 1] for page, _, _ in spans
+                    )
                     head = info.kv_head_offset // publication.scale_head_size
                     tickets.extend(
                         self._fetch(
@@ -478,7 +568,9 @@ class CacheImports:
             )
             # Raw staging views per K/V field: [tokens, layers, kv heads, dim].
             raw = tuple(
-                workspace.raw[field, : elements * itemsize].view(dtype).reshape(count, *trailing)
+                workspace.raw[field, : elements * itemsize]
+                .view(dtype)
+                .reshape(count, *trailing)
                 for field in range(2)
             )
             # Fetch this span's tokens and this worker's layer/head shard.
@@ -497,17 +589,26 @@ class CacheImports:
             )
             tickets = tuple(
                 ticket
-                for tensor, destination in zip(publication.tensors[:2], raw, strict=True)
-                for ticket in self._fetch(write, tensor, destination, transports, region=region)
+                for tensor, destination in zip(
+                    publication.tensors[:2], raw, strict=True
+                )
+                for ticket in self._fetch(
+                    write, tensor, destination, transports, region=region
+                )
             )
 
             source_offset = (start + logical) % publication.page_size
             if quantized:
-                head_start = self.pool.info.kv_head_offset // publication.scale_head_size
+                head_start = (
+                    self.pool.info.kv_head_offset // publication.scale_head_size
+                )
                 head_end = (
-                    self.pool.info.kv_head_offset + self.pool.info.num_kv_heads - 1
+                    self.pool.info.kv_head_offset
+                    + self.pool.info.num_kv_heads
+                    - 1
                 ) // publication.scale_head_size + 1
-                # Source scale rows cover the publication pages this span touches.
+                # Source scale rows cover the publication pages this
+                # span touches.
                 scale_start = (
                     start + logical
                 ) // publication.page_size - start // publication.page_size
@@ -517,14 +618,17 @@ class CacheImports:
                 tickets += self._fetch(
                     write,
                     publication.tensors[2],
-                    workspace.scales[:scale_count, :, :, : head_end - head_start],
+                    workspace.scales[
+                        :scale_count, :, :, : head_end - head_start
+                    ],
                     transports,
                     region=(
                         slice(scale_start, scale_start + scale_count),
                         slice(0, 2),
                         slice(
                             self.pool.info.layer_offset,
-                            self.pool.info.layer_offset + self.pool.info.num_layers,
+                            self.pool.info.layer_offset
+                            + self.pool.info.num_layers,
                         ),
                         slice(head_start, head_start + head_end - head_start),
                     ),
@@ -541,7 +645,10 @@ class CacheImports:
                     # not align with the span boundaries, so walk both.
                     position, scale_index, token_offset = 0, 0, source_offset
                     while position < count:
-                        length = min(publication.page_size - token_offset, count - position)
+                        length = min(
+                            publication.page_size - token_offset,
+                            count - position,
+                        )
                         head, group = 0, 0
                         while head < self.pool.info.num_kv_heads:
                             heads = min(
@@ -550,10 +657,14 @@ class CacheImports:
                                 % publication.scale_head_size,
                                 self.pool.info.num_kv_heads - head,
                             )
-                            scale = workspace.scales[scale_index, field_index, :, group].reshape(
-                                1, self.pool.info.num_layers, 1, 1
-                            )
-                            values[position : position + length, :, head : head + heads].mul_(scale)
+                            scale = workspace.scales[
+                                scale_index, field_index, :, group
+                            ].reshape(1, self.pool.info.num_layers, 1, 1)
+                            values[
+                                position : position + length,
+                                :,
+                                head : head + heads,
+                            ].mul_(scale)
                             head += heads
                             group += 1
                         position += length
@@ -567,7 +678,10 @@ class CacheImports:
                         rounded = (
                             workspace.raw[
                                 field_index,
-                                : elements * torch.empty((), dtype=compute_dtype).element_size(),
+                                : elements
+                                * torch.empty(
+                                    (), dtype=compute_dtype
+                                ).element_size(),
                             ]
                             .view(compute_dtype)
                             .reshape_as(values)
@@ -586,7 +700,10 @@ class CacheImports:
                         field=("key", "value")[field_index],
                         block=page,
                         source_slice=(slice(0, count), *trailing_slice),
-                        target_slice=(slice(offset, offset + count), *trailing_slice),
+                        target_slice=(
+                            slice(offset, offset + count),
+                            *trailing_slice,
+                        ),
                         workspace={},
                     )
 

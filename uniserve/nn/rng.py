@@ -37,7 +37,6 @@ def sampling_key(
     draw_layout: int,
 ) -> int:
     """Return the 64-bit Philox key for one request lineage and draw space."""
-
     value = int(request_seed) & _U64
     for coordinate in (
         int(engine_id),
@@ -53,8 +52,9 @@ def philox4x32_10(
     counter: tuple[int, int, int, int],
     key: tuple[int, int],
 ) -> tuple[int, int, int, int]:
-    """Return the ten-round Philox4x32 bijection of ``counter`` under ``key``."""
-
+    """Return the ten-round Philox4x32 bijection of ``counter`` under
+    ``key``.
+    """  # noqa: D205
     c0, c1, c2, c3 = (int(word) & _U32 for word in counter)
     k0, k1 = (int(word) & _U32 for word in key)
     for rounds in range(10):
@@ -67,7 +67,12 @@ def philox4x32_10(
         p1 = _PHILOX_M1 * c2
         hi0, lo0 = (p0 >> 32) & _U32, p0 & _U32
         hi1, lo1 = (p1 >> 32) & _U32, p1 & _U32
-        c0, c1, c2, c3 = (hi1 ^ c1 ^ k0) & _U32, lo1, (hi0 ^ c3 ^ k1) & _U32, lo0
+        c0, c1, c2, c3 = (
+            (hi1 ^ c1 ^ k0) & _U32,
+            lo1,
+            (hi0 ^ c3 ^ k1) & _U32,
+            lo0,
+        )
     return c0, c1, c2, c3
 
 
@@ -78,7 +83,6 @@ def sampling_uniform(
     draw_index: int = 0,
 ) -> float:
     """Return one uniform draw in ``[0, 1)`` for a semantic coordinate."""
-
     index = int(semantic_token_index)
     counter = (
         index & _U32,
@@ -92,20 +96,23 @@ def sampling_uniform(
 
 
 def flow_noise_seed(request_seed: int, semantic_image_index: int) -> int:
-    """Return the schedule-stable seed for one semantic image's initial noise."""
-
+    """Return the schedule-stable seed for one semantic image's initial
+    noise.
+    """  # noqa: D205
     return _splitmix_coordinate(request_seed, semantic_image_index)
 
 
-def normal_noise(seeds: tuple[int, ...], outputs: tuple[torch.Tensor, ...]) -> None:
-    """Fill complete normal draws in row order using the supplied representations.
+def normal_noise(
+    seeds: tuple[int, ...], outputs: tuple[torch.Tensor, ...]
+) -> None:
+    """Fill complete normal draws in row order using the supplied
+    representations.
 
     Each output begins with the logical row dimension. One local generator per
     seed draws every output row in tuple order before any packing or sharding.
     Callers choose the seed mapping, device, dtype and backing; this function
     neither allocates output storage nor changes the global random generator.
-    """
-
+    """  # noqa: D205
     if not seeds or not outputs:
         raise ValueError("normal noise requires row seeds and output views")
     device = outputs[0].device
@@ -117,7 +124,10 @@ def normal_noise(seeds: tuple[int, ...], outputs: tuple[torch.Tensor, ...]) -> N
             or not value.is_floating_point()
             or not value.is_contiguous()
         ):
-            raise ValueError("noise views require aligned rows and contiguous floating storage")
+            raise ValueError(
+                "noise views require aligned rows and contiguous floating "
+                "storage"
+            )
     for index, seed in enumerate(seeds):
         generator = torch.Generator(device=device).manual_seed(int(seed))
         for value in outputs:
@@ -125,8 +135,9 @@ def normal_noise(seeds: tuple[int, ...], outputs: tuple[torch.Tensor, ...]) -> N
 
 
 def _splitmix_coordinate(seed: int, coordinate: int) -> int:
-    """Mix a seed and logical coordinate into one deterministic unsigned 64-bit value."""
-
+    """Mix a seed and logical coordinate into one deterministic unsigned
+    64-bit value.
+    """  # noqa: D205
     if int(coordinate) < 0:
         raise ValueError("random coordinate must not be negative")
     value = (int(seed) + (int(coordinate) + 1) * _SPLITMIX64_GAMMA) & _U64

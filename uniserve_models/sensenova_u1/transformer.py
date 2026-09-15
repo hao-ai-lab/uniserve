@@ -36,7 +36,11 @@ class TransformerLayer(nn.Module):
 
     def __init__(self, config: TransformerConfig, index: int):
         super().__init__()
-        hidden, dim, eps = config.hidden_size, config.head_dim, config.rms_norm_eps
+        hidden, dim, eps = (
+            config.hidden_size,
+            config.head_dim,
+            config.rms_norm_eps,
+        )
         self.input_norms = nn.ModuleDict()
         self.projections = nn.ModuleDict()
         self.outputs = nn.ModuleDict()
@@ -69,10 +73,14 @@ class TransformerLayer(nn.Module):
                 rotations=("split",) * 3,
             )
             self.outputs[route] = RowParallelLinear(
-                config.num_attention_heads * dim, hidden, bias=config.attention_bias
+                config.num_attention_heads * dim,
+                hidden,
+                bias=config.attention_bias,
             )
             self.post_attention_norms[route] = RMSNorm(hidden, eps)
-            self.mlps[route] = GatedMLP(hidden, config.intermediate_size, activation=activation)
+            self.mlps[route] = GatedMLP(
+                hidden, config.intermediate_size, activation=activation
+            )
 
         self.attention = Attention(
             config.num_attention_heads,
@@ -81,7 +89,9 @@ class TransformerLayer(nn.Module):
             cache_name=f"text.backbone.layers.{index}.attention",
         )
         self.window = (
-            config.sliding_window if config.layer_types[index] == "sliding_attention" else None
+            config.sliding_window
+            if config.layer_types[index] == "sliding_attention"
+            else None
         )
         self.temporal_rotary = RotaryEmbedding(
             dim // 2,
@@ -116,24 +126,40 @@ class TransformerLayer(nn.Module):
         # zero so text tokens share one spatial origin.
         if positions.ndim == 1:
             positions = torch.stack(
-                (positions, torch.zeros_like(positions), torch.zeros_like(positions))
+                (
+                    positions,
+                    torch.zeros_like(positions),
+                    torch.zeros_like(positions),
+                )
             )
         if positions.ndim != 2 or positions.shape[0] != 3:
-            raise ValueError("SenseNova positions require temporal, height and width axes")
+            raise ValueError(
+                "SenseNova positions require temporal, height and width axes"
+            )
 
         # Dynamic and LongRoPE scalings are functions of the full sequence
         # length, which cached attention knows only from its host metadata.
-        dynamic = isinstance(self.temporal_rotary.scaling, (DynamicScaling, LongRoPEScaling))
+        dynamic = isinstance(
+            self.temporal_rotary.scaling, (DynamicScaling, LongRoPEScaling)
+        )
         if not dynamic:
             length = positions.shape[1]
         elif isinstance(attention, (PagedInput, SegmentedInput)):
-            if attention.queries.host is None or attention.prefixes.host is None:
-                raise ValueError("dynamic rotary scaling requires exact host sequence lengths")
+            if (
+                attention.queries.host is None
+                or attention.prefixes.host is None
+            ):
+                raise ValueError(
+                    "dynamic rotary scaling requires exact "
+                    "host sequence lengths"
+                )
             length = max(
                 (
                     query + prefix
                     for query, prefix in zip(
-                        attention.queries.host, attention.prefixes.host, strict=True
+                        attention.queries.host,
+                        attention.prefixes.host,
+                        strict=True,
                     )
                 ),
                 default=0,
@@ -145,7 +171,9 @@ class TransformerLayer(nn.Module):
                 else attention.queries.maximum
             )
         if length is None:
-            raise ValueError("dynamic rotary scaling requires exact host sequence lengths")
+            raise ValueError(
+                "dynamic rotary scaling requires exact host sequence lengths"
+            )
 
         names = frozenset(hidden.values)
         # Height and width use the same frequency recipe. Evaluate their
@@ -153,16 +181,23 @@ class TransformerLayer(nn.Module):
         spatial = tuple(
             table.reshape(2, positions.shape[1], table.shape[-1])
             for table in self.spatial_rotary(
-                positions[1:].reshape(-1), dtype=torch.float32, sequence_length=length
+                positions[1:].reshape(-1),
+                dtype=torch.float32,
+                sequence_length=length,
             )
         )
         pairs = (
-            self.temporal_rotary(positions[0], dtype=torch.float32, sequence_length=length),
+            self.temporal_rotary(
+                positions[0], dtype=torch.float32, sequence_length=length
+            ),
             (spatial[0][0], spatial[1][0]),
             (spatial[0][1], spatial[1][1]),
         )
         cos, sin = (
-            tuple(RoutedTensor.from_packed(pair[index], routes, routes=names) for pair in pairs)
+            tuple(
+                RoutedTensor.from_packed(pair[index], routes, routes=names)
+                for pair in pairs
+            )
             for index in (0, 1)
         )
 
@@ -175,16 +210,20 @@ class TransformerLayer(nn.Module):
             for route, value in normalized.values.items()
         }
         query, key, value = (
-            RoutedTensor({route: values[index] for route, values in projected.items()}).packed(
-                routes
-            )
+            RoutedTensor(
+                {route: values[index] for route, values in projected.items()}
+            ).packed(routes)
             for index in range(3)
         )
 
         attended = self.attention(query, key, value, attention).flatten(1)
-        update = RoutedTensor.from_packed(attended, routes, routes=names).apply(self.outputs)
+        update = RoutedTensor.from_packed(attended, routes, routes=names).apply(
+            self.outputs
+        )
         residual = hidden.add(update)
-        return residual.apply(self.post_attention_norms).apply(self.mlps), residual
+        return residual.apply(self.post_attention_norms).apply(
+            self.mlps
+        ), residual
 
 
 class Transformer(TransformerDecoder):
@@ -193,7 +232,9 @@ class Transformer(TransformerDecoder):
     def __init__(self, config: TransformerConfig):
         super().__init__(
             VocabParallelEmbedding(
-                config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
+                config.vocab_size,
+                config.hidden_size,
+                padding_idx=config.pad_token_id,
             ),
             nn.ModuleDict(
                 (str(index), TransformerLayer(config, index))

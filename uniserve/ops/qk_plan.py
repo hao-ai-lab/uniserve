@@ -9,7 +9,7 @@ head/tail layouts supported by specialized Triton kernels.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 import torch
 
@@ -22,8 +22,11 @@ __all__ = [
 ]
 
 
-class FusedStrategy(str, Enum):
-    """Execution strategies for per-group and specialized two-group layouts."""
+class FusedStrategy(StrEnum):
+    """Fused-launch execution strategy.
+
+    Execution strategies for per-group and specialized two-group layouts.
+    """
 
     PER_GROUP = "per_group"
     IDENTITY_TAIL = "identity_tail"
@@ -41,7 +44,6 @@ class QKAxisGroup:
     @property
     def single_axis(self) -> bool:
         """Report whether the normalization group contains exactly one axis."""
-
         return self.end == self.start + 1
 
 
@@ -60,13 +62,13 @@ class QKNormRopePlan:
     eps: float
 
     @classmethod
-    def from_request(cls, req: MultiAxisQKNormRopeReq) -> "QKNormRopePlan":
+    def from_request(cls, req: MultiAxisQKNormRopeReq) -> QKNormRopePlan:
         """Validate a norm-plus-RoPE request and derive its execution plan."""
-
         _validate_multi_axis_rope(req)
 
-        # Canonical integer dimensions feed both slicing and kernel launch sizes;
-        # group discovery then determines which axes share an RMS reduction.
+        # Canonical integer dimensions feed both slicing and kernel launch
+        # sizes; group discovery then determines which axes share an RMS
+        # reduction.
         axis_dims = tuple(int(dim) for dim in req.axis_dims)
         groups = _groups(axis_dims, req.q_weights, req.k_weights)
 
@@ -83,9 +85,13 @@ class QKNormRopePlan:
         )
 
     @classmethod
-    def from_norm_request(cls, req: MultiAxisQKNormReq) -> tuple[QKAxisGroup, ...]:
-        """Validate a normalization-only request and return its shared groups."""
+    def from_norm_request(
+        cls, req: MultiAxisQKNormReq
+    ) -> tuple[QKAxisGroup, ...]:
+        """Validate a normalization-only request.
 
+        Validate a normalization-only request and return its shared groups.
+        """
         _validate_multi_axis_norm(req)
         return _groups(
             tuple(int(dim) for dim in req.axis_dims),
@@ -96,17 +102,24 @@ class QKNormRopePlan:
 
 def _validate_multi_axis_norm(req: MultiAxisQKNormReq) -> None:
     """Require one query and key weight reference per declared axis."""
-
-    if len(req.q_weights) != len(req.axis_dims) or len(req.k_weights) != len(req.axis_dims):
+    if len(req.q_weights) != len(req.axis_dims) or len(req.k_weights) != len(
+        req.axis_dims
+    ):
         raise RuntimeError("multi-axis qk_norm weight/axis mismatch")
 
 
 def _validate_multi_axis_rope(req: MultiAxisQKNormRopeReq) -> None:
-    """Require parallel axis, rotary-table, and normalization-weight metadata."""
+    """Require parallel axis metadata.
 
-    if len(req.axis_dims) != len(req.cos_tables) or len(req.cos_tables) != len(req.sin_tables):
+    Require parallel axis, rotary-table, and normalization-weight metadata.
+    """
+    if len(req.axis_dims) != len(req.cos_tables) or len(req.cos_tables) != len(
+        req.sin_tables
+    ):
         raise RuntimeError("multi-axis qk_norm_rope axis/cos/sin mismatch")
-    if len(req.q_weights) != len(req.axis_dims) or len(req.k_weights) != len(req.axis_dims):
+    if len(req.q_weights) != len(req.axis_dims) or len(req.k_weights) != len(
+        req.axis_dims
+    ):
         raise RuntimeError("multi-axis qk_norm_rope weight/axis mismatch")
 
 
@@ -115,8 +128,10 @@ def _groups(
     q_weights: tuple[torch.Tensor, ...],
     k_weights: tuple[torch.Tensor, ...],
 ) -> tuple[QKAxisGroup, ...]:
-    """Partition adjacent axes by their shared query/key normalization weights."""
+    """Partition adjacent axes by shared normalization weights.
 
+    Partition adjacent axes by their shared query/key normalization weights.
+    """
     groups: list[QKAxisGroup] = []
     axis = 0
 
@@ -143,7 +158,6 @@ def _shared_norm_group_end(
     start: int,
 ) -> int:
     """Find the exclusive end of the shared normalization group at ``start``."""
-
     q_weight = q_weights[start]
     k_weight = k_weights[start]
     group_end = start + 1
@@ -168,8 +182,10 @@ def _fused_strategy(
     identity_axes: tuple[int, ...],
     n_axes: int,
 ) -> FusedStrategy:
-    """Select a specialized kernel for supported head-plus-tail group layouts."""
+    """Select a specialized kernel for supported layouts.
 
+    Select a specialized kernel for supported head-plus-tail group layouts.
+    """
     # Both fused forms require axis zero as an independent head group and all
     # remaining axes as one shared tail normalization group.
     two_groups = (

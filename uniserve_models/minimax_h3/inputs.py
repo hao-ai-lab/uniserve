@@ -23,19 +23,27 @@ class DenoiserSize:
     def __post_init__(self):
         video_latent_frames(self.num_frames)
         if type(self.num_text_tokens) is not int or self.num_text_tokens < 1:
-            raise ValueError("H3 conditioning must contain a positive number of text tokens")
+            raise ValueError(
+                "H3 conditioning must contain a positive number of text tokens"
+            )
 
 
 @dataclass(frozen=True)
 class DenoiserInput(BaseDenoiserInput[DenoiserSize]):
-    """Carry ordered video/audio latents with one refined text tensor per sample."""
+    """Carry ordered video/audio latents with one refined text tensor per sample."""  # noqa: E501
 
     text_features: tuple[torch.Tensor, ...]
 
     def __post_init__(self):
         super().__post_init__()
-        if tuple(self.latents) != ("video", "audio") or len(self.text_features) != self.batch_size:
-            raise ValueError("H3 inputs require video/audio latents and one condition per sample")
+        if (
+            tuple(self.latents) != ("video", "audio")
+            or len(self.text_features) != self.batch_size
+        ):
+            raise ValueError(
+                "H3 inputs require video/audio latents "
+                "and one condition per sample"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,12 +61,20 @@ class AttentionInput:
     def __post_init__(self):
         tokens = self.packing.padded_tokens
         if tokens % self.group.size:
-            raise ValueError("H3 tokens must divide their numerical sequence group")
+            raise ValueError(
+                "H3 tokens must divide their numerical sequence group"
+            )
         count = tokens // self.group.size
-        if self.token_slice != slice(self.group.rank * count, (self.group.rank + 1) * count):
-            raise ValueError("H3 token slice must match the logical sequence rank")
+        if self.token_slice != slice(
+            self.group.rank * count, (self.group.rank + 1) * count
+        ):
+            raise ValueError(
+                "H3 token slice must match the logical sequence rank"
+            )
         if self.vsa.padded_tokens != tokens:
-            raise ValueError("H3 attention and packing must describe the same token domain")
+            raise ValueError(
+                "H3 attention and packing must describe the same token domain"
+            )
 
         for indices in (
             self.local_text_indices,
@@ -66,4 +82,6 @@ class AttentionInput:
             self.local_audio_indices,
         ):
             if indices.ndim != 1 or indices.dtype != torch.int64:
-                raise ValueError("H3 modality indices must be int64 token vectors")
+                raise ValueError(
+                    "H3 modality indices must be int64 token vectors"
+                )

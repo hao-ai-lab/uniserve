@@ -29,7 +29,12 @@ from uniserve.model import (
     VideoPostprocessor,
 )
 from uniserve.nn.vae import PatchAutoencoder
-from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext, partition_streams
+from uniserve.runtime import (
+    CUDAGraph,
+    CUDAStream,
+    ExecutionContext,
+    partition_streams,
+)
 from uniserve.runtime.backends.attention import resolve as attention_backend
 from uniserve.runtime.backends.attention.flashinfer import Backend as FlashInfer
 from uniserve.runtime.cuda_graph import CUDAGraphError
@@ -58,7 +63,11 @@ from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.runtime.results import resolve_outputs
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
-from ..bootstrap.components import bind_components, call_operations, describe_components
+from ..bootstrap.components import (
+    bind_components,
+    call_operations,
+    describe_components,
+)
 from ..bootstrap.config import ComponentConfig
 from ..bootstrap.inputs import capability, image_builder, media_builder
 from ..profiling import record_component
@@ -93,21 +102,26 @@ logger = logging.getLogger(__name__)
 
 
 def capture_image_parameters(cfg_branches, *, steps, height, width):
-    """Build fixed image-generation params whose CFG scales match the branch count.
+    """Build fixed image-generation params whose CFG scales match the branch.
+
+    count.
 
     One branch runs unconditioned, two add text guidance, and three add text
     and image guidance; each count maps to its (text, image) scale pair.
     """
-
     text, image = {1: (1.0, 1.0), 2: (4.0, 1.0), 3: (4.0, 2.0)}[cfg_branches]
     return ImageParams(
-        steps=steps, cfg_text_scale=text, cfg_img_scale=image, height=height, width=width, seed=0
+        steps=steps,
+        cfg_text_scale=text,
+        cfg_img_scale=image,
+        height=height,
+        width=width,
+        seed=0,
     )
 
 
 def _observations(name, started, path):
     """Build single-call forward statistics for one module, in microseconds."""
-
     elapsed = (time.perf_counter_ns() - started) // 1000
     return ForwardStats(
         mode_counts={name: 1},
@@ -160,24 +174,35 @@ class ModelRunner:
         # Without supplied bindings, every declared component runs standalone
         # on this rank; only video decoders distribute over temporal units.
         if bindings is None:
-            device, rank = canonical_device(worker_config.device), worker_config.rank
+            device, rank = (
+                canonical_device(worker_config.device),
+                worker_config.rank,
+            )
             group = Communicator((rank,), 0, device=device)
             bindings = {}
             for name, calls in self._declarations.items():
-                temporal = any(isinstance(call.module, VideoDecoder) for call in calls)
+                temporal = any(
+                    isinstance(call.module, VideoDecoder) for call in calls
+                )
                 config = ComponentConfig(
                     (rank,), distribution="temporal_units" if temporal else None
                 )
                 mesh = DeviceMesh(
                     ranks=(rank,),
                     rank=rank,
-                    shape=tuple(size for _, size in config.parallel_config.dimensions),
-                    axes=tuple(axis for axis, _ in config.parallel_config.dimensions),
+                    shape=tuple(
+                        size for _, size in config.parallel_config.dimensions
+                    ),
+                    axes=tuple(
+                        axis for axis, _ in config.parallel_config.dimensions
+                    ),
                 )
                 bindings[name] = ModelEntry(name, config, group, mesh, device)
         self.bindings = MappingProxyType(dict(bindings))
         bind_components(model, self.bindings)
-        self.state_buffers = media_state_buffers(model, self.bindings, worker_config)
+        self.state_buffers = media_state_buffers(
+            model, self.bindings, worker_config
+        )
 
         self.entries = {}
         self._forward_entries = {}
@@ -210,12 +235,22 @@ class ModelRunner:
         try:
             for name, binding in self.bindings.items():
                 for call in binding.calls:
-                    if isinstance(call.module, CausalLM) and call.entry.method == "forward":
-                        self._text_calls[id(call.module)] = TextCall(call.module)
-                    elif isinstance(call.module, TextEncoder) and call.entry.method == "encode":
+                    if (
+                        isinstance(call.module, CausalLM)
+                        and call.entry.method == "forward"
+                    ):
+                        self._text_calls[id(call.module)] = TextCall(
+                            call.module
+                        )
+                    elif (
+                        isinstance(call.module, TextEncoder)
+                        and call.entry.method == "encode"
+                    ):
                         device = binding.device
                         self._text_tokens = torch.empty(
-                            worker_config.max_sequence_tokens, dtype=torch.int64, device=device
+                            worker_config.max_sequence_tokens,
+                            dtype=torch.int64,
+                            device=device,
                         )
                         self._text_staging = StagingBuffers(
                             tuple(self._text_tokens.shape),
@@ -229,7 +264,9 @@ class ModelRunner:
                     key = (name, call.path, call.entry.method)
                     self._module_entries[key] = (binding, call)
 
-                    if self.media_builder is not None and isinstance(call.module, Denoiser):
+                    if self.media_builder is not None and isinstance(
+                        call.module, Denoiser
+                    ):
                         self.denoising = DenoisingRunner(
                             call.module,
                             device=binding.device,
@@ -237,18 +274,24 @@ class ModelRunner:
                             groups=call.groups,
                             capacity=worker_config.max_request_pool_size,
                             attention=self.attention,
-                            additional_devices=self._capture_devices(binding.device),
+                            additional_devices=self._capture_devices(
+                                binding.device
+                            ),
                         )
         except BaseException as error:
             try:
                 self.close()
             except BaseException as cleanup:
-                error.add_note(f"execution resource cleanup failed: {cleanup!r}")
+                error.add_note(
+                    f"execution resource cleanup failed: {cleanup!r}"
+                )
             raise
 
     def capture_stream(self):
-        """Return the lazily created graph-capture stream, or None when graphs are disabled."""
+        """Return the lazily created graph-capture stream.
 
+        or None when graphs are disabled.
+        """
         device = canonical_device(self.worker_config.device)
         if self.worker_config.graph_policy == "off" or device.type != "cuda":
             return None
@@ -258,40 +301,56 @@ class ModelRunner:
 
     def _capture_devices(self, device):
         """List CUDA devices besides ``device`` that graphs may allocate on."""
-
         return tuple(
             value
             for value in dict.fromkeys(
                 canonical_device(value)
-                for value in (self.worker_config.device, self.worker_config.generation_device)
+                for value in (
+                    self.worker_config.device,
+                    self.worker_config.generation_device,
+                )
                 if value is not None
             )
             if value.type == "cuda" and value != device
         )
 
     def component(self, kind, *, capability_type=None):
-        """Return the single module that provides a computation kind on this rank."""
+        """Return the single module that provides a computation kind on this.
 
+        rank.
+        """
         calls = [
             call
             for _, call in self._module_entries.values()
             if kind in call_operations((call,))
-            and (capability_type is None or isinstance(call.module, capability_type))
+            and (
+                capability_type is None
+                or isinstance(call.module, capability_type)
+            )
         ]
         if len(calls) != 1:
-            raise InputError(f"computation {kind.value} requires one local capability")
+            raise InputError(
+                f"computation {kind.value} requires one local capability"
+            )
         return calls[0].module
 
     def _module_call(self, name, method=None):
-        """Return the uniquely identified ``(binding, call)`` pair for an entry."""
+        """Return the uniquely identified ``(binding.
 
+        call)`` pair for an entry.
+        """
         entries = [
             (binding, call)
-            for (entry, _, operation), (binding, call) in self._module_entries.items()
+            for (entry, _, operation), (
+                binding,
+                call,
+            ) in self._module_entries.items()
             if entry == name and (method is None or operation == method)
         ]
         if len(entries) != 1:
-            raise InputError(f"entry {name!r} requires an unambiguous numerical method")
+            raise InputError(
+                f"entry {name!r} requires an unambiguous numerical method"
+            )
         return entries[0]
 
     def prepare_module(self, name, size, *, method=None):
@@ -301,19 +360,24 @@ class ModelRunner:
         the residency bound is reached, the oldest context and the graphs that
         borrow it are retired.
         """
-
         binding, call = self._module_call(name, method)
         key = (name, call.path, call.entry.method, input_signature(size))
         if key not in self._module_contexts:
-            resident = tuple(value for value in self._module_contexts if value[:3] == key[:3])
+            resident = tuple(
+                value for value in self._module_contexts if value[:3] == key[:3]
+            )
             if len(resident) >= self.worker_config.max_request_pool_size:
                 self._retire_module(resident[0])
 
             stream = self.module_stream(name, method=call.entry.method)
-            context = ExecutionContext(call.module, attention=self.attention, stream=stream)
+            context = ExecutionContext(
+                call.module, attention=self.attention, stream=stream
+            )
             try:
                 if stream is not None:
-                    stream.wait_stream(torch.cuda.current_stream(binding.device))
+                    stream.wait_stream(
+                        torch.cuda.current_stream(binding.device)
+                    )
                 context.prepare(size)
             except BaseException:
                 context.close()
@@ -322,14 +386,18 @@ class ModelRunner:
             self._module_contexts[key] = context
             if stream is not None:
                 with torch.cuda.device(binding.device):
-                    self._module_pools[id(context)] = {binding.device: torch.cuda.MemPool()}
+                    self._module_pools[id(context)] = {
+                        binding.device: torch.cuda.MemPool()
+                    }
 
         self._module_contexts.move_to_end(key)
         return self._module_contexts[key]
 
     def module_stream(self, name, *, method=None):
-        """Bind one numerical entry to a stream in its existing resource grant."""
+        """Bind one numerical entry to a stream in its existing resource.
 
+        grant.
+        """
         binding, call = self._module_call(name, method)
         if binding.device.type != "cuda":
             return None
@@ -344,22 +412,32 @@ class ModelRunner:
                 stream
                 for lane, stream in self._lane_streams
                 if stream.device == binding.device
-                and (lane is None or computations.intersection(lane.computations))
+                and (
+                    lane is None or computations.intersection(lane.computations)
+                )
             )
             if len(parents) > 1:
-                raise InputError("one numerical entry requires an unambiguous execution partition")
+                raise InputError(
+                    "one numerical entry requires an unambiguous execution "
+                    "partition"
+                )
             if parents:
                 owner = parents[0].fork()
             elif self.worker_config.lanes:
-                raise InputError("numerical entry has no initialized execution partition")
+                raise InputError(
+                    "numerical entry has no initialized execution partition"
+                )
             else:
                 owner = CUDAStream(
                     device=binding.device,
                     stream=torch.cuda.Stream(device=binding.device),
-                    sm_count=torch.cuda.get_device_properties(binding.device).multi_processor_count,
+                    sm_count=torch.cuda.get_device_properties(
+                        binding.device
+                    ).multi_processor_count,
                 )
             # Weights and runtime backing are initialized before their first
-            # borrowed use. Later calls depend on tensor fences, not other entries.
+            # borrowed use. Later calls depend on tensor fences, not other
+            # entries.
             try:
                 owner.wait(torch.cuda.current_stream(binding.device))
             except BaseException:
@@ -369,19 +447,23 @@ class ModelRunner:
         return self._module_streams[key].stream
 
     def operation_stream(self, operation):
-        """Select a standalone capability's stream; staged batches bind their own lanes."""
+        """Select a standalone capability's stream.
 
+        staged batches bind their own lanes.
+        """
         if (operation.entry, operation.kind) in self._forward_entries:
             return None
         if (
             operation.kind is PipelineStage.LATENT_PREPARATION
-            and (operation.entry, PipelineStage.DENOISING) in self._forward_entries
+            and (operation.entry, PipelineStage.DENOISING)
+            in self._forward_entries
         ):
             return None
         calls = tuple(
             call
             for (name, _, _), (_, call) in self._module_entries.items()
-            if name == operation.entry and operation.kind in call_operations((call,))
+            if name == operation.entry
+            and operation.kind in call_operations((call,))
         )
         if not calls:
             return None
@@ -390,26 +472,40 @@ class ModelRunner:
             # Preparation composes the denoiser's initialization with optional
             # conditioning encoders. The denoiser owns this operation's stream;
             # its encoder calls retain their ordinary input/output dependencies.
-            calls = tuple(call for call in calls if isinstance(call.module, Denoiser))
+            calls = tuple(
+                call for call in calls if isinstance(call.module, Denoiser)
+            )
 
         if len(calls) != 1:
-            raise InputError("operation requires one bound numerical capability")
+            raise InputError(
+                "operation requires one bound numerical capability"
+            )
         return self.module_stream(operation.entry, method=calls[0].entry.method)
 
     def _initialize_streams(self, *, event_slots):
-        """Realize execution grants for both staged and standalone capabilities."""
+        """Realize execution grants for both staged and standalone.
 
+        capabilities.
+        """
         if self._lane_streams:
             return
 
-        config, device = self.worker_config, canonical_device(self.worker_config.device)
+        config, device = (
+            self.worker_config,
+            canonical_device(self.worker_config.device),
+        )
         self.uses_lanes = bool(config.lanes)
         if config.lanes:
             # Lanes partition one device's SMs, so multi-device capture is
             # incompatible with a lane configuration.
             if self._capture_devices(device):
-                raise ValueError("Green Context lanes require one physical device")
-            slots = tuple(int(lane.max_inflight or (event_slots - 1)) + 1 for lane in config.lanes)
+                raise ValueError(
+                    "Green Context lanes require one physical device"
+                )
+            slots = tuple(
+                int(lane.max_inflight or (event_slots - 1)) + 1
+                for lane in config.lanes
+            )
             streams = partition_streams(
                 device,
                 tuple(lane.sm_budget for lane in config.lanes),
@@ -434,8 +530,10 @@ class ModelRunner:
                     )
 
     def _retire_module(self, key):
-        """Drain a producer before releasing the graphs that borrow its resources."""
+        """Drain a producer before releasing the graphs that borrow its.
 
+        resources.
+        """
         context = self._module_contexts.pop(key)
         if context.stream is not None:
             context.stream.synchronize()
@@ -466,12 +564,15 @@ class ModelRunner:
         return "conditioning"
 
     def run_encoder(self, kind, *values):
-        """Run the rank's encoder of the given kind ("text", "vision", "latent", "conditioning")."""
+        """Run the rank's encoder of the given kind ("text", "vision", "latent".
 
+        "conditioning").
+        """
         found = [
             (name, call)
             for (name, _, _), (_, call) in self._module_entries.items()
-            if call.entry.method == "encode" and self._encoder_kind(call.module) == kind
+            if call.entry.method == "encode"
+            and self._encoder_kind(call.module) == kind
         ]
         if len(found) != 1:
             raise InputError(f"rank does not participate in {kind} encoding")
@@ -479,7 +580,11 @@ class ModelRunner:
 
         # Text encoders take flat token sequences; other encoders keep their
         # batched input shapes, which also serve as the preparation size.
-        inputs = tuple(value.reshape(-1) for value in values) if kind == "text" else values
+        inputs = (
+            tuple(value.reshape(-1) for value in values)
+            if kind == "text"
+            else values
+        )
         size = (
             TextSize(sum(value.numel() for value in inputs), len(inputs))
             if kind == "text"
@@ -489,13 +594,14 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_module(self, name, *args, method=None, size=None, **kwargs):
-        """Run an actual capability method with caller-supplied numerical arguments.
+        """Run an actual capability method with caller-supplied numerical.
+
+        arguments.
 
         The call runs eager or through a per-signature CUDA graph; either way
         its result is cloned so the caller owns values independent of the
         context's staging storage.
         """
-
         binding, call = self._module_call(name, method)
         context = self.prepare_module(name, size, method=call.entry.method)
         started, path = time.perf_counter_ns(), "eager"
@@ -523,17 +629,24 @@ class ModelRunner:
         )
         with context.activate():
             if can_capture:
-                missing = capture_required(graph is None, call.groups, binding.device)
+                missing = capture_required(
+                    graph is None, call.groups, binding.device
+                )
                 if missing:
                     if graph is not None:
                         graph[0].close()
-                    # One eager warmup run on the static inputs precedes capture.
+                    # One eager warmup run on the static inputs precedes
+                    # capture.
                     static = clone_inputs(values)
                     call.forward(*static[0], **static[1], **resources)
-                    executable = CUDAGraph(context=context, pools=self._module_pools[id(context)])
+                    executable = CUDAGraph(
+                        context=context, pools=self._module_pools[id(context)]
+                    )
                     try:
                         executable.capture(
-                            lambda: call.forward(*static[0], **static[1], **resources)
+                            lambda: call.forward(
+                                *static[0], **static[1], **resources
+                            )
                         )
                     except BaseException:
                         executable.close()
@@ -556,11 +669,12 @@ class ModelRunner:
     @staticmethod
     def _result(result):
         """Normalize a module call result into tensors plus optional layouts."""
-
         if isinstance(result, torch.Tensor):
             result = (result,)
         if isinstance(result, Mapping):
-            result = tuple(value for values in result.values() for value in values)
+            result = tuple(
+                value for values in result.values() for value in values
+            )
 
         values, layouts = [], []
         for value in result:
@@ -571,30 +685,37 @@ class ModelRunner:
                 values.append(value)
                 layouts.append(None)
             else:
-                raise ComputeError("participating numerical call did not return a tensor")
+                raise ComputeError(
+                    "participating numerical call did not return a tensor"
+                )
         return ExecutionOutput(tuple(values), layouts=tuple(layouts))
 
     def run_denoising(self, inputs, schedules, *, state, slot, input_key):
         """Run one denoising step for a resident trajectory and time it."""
-
         if self.denoising is None:
             raise InputError("rank does not own denoising computation")
         started = time.perf_counter_ns()
         values, path = self.denoising.step(
             inputs, schedules, state=state, slot=slot, input_key=input_key
         )
-        return replace(self._result(values), stats=_observations("denoiser", started, path))
+        return replace(
+            self._result(values), stats=_observations("denoiser", started, path)
+        )
 
-    def output_layout(self, entry, output_index, media, decode, num_prompt_tokens):
+    def output_layout(
+        self, entry, output_index, media, decode, num_prompt_tokens
+    ):
         """Resolve the published layout of one operation output on this rank.
 
         Returns None for outputs this rank does not publish: non-output ranks,
         degenerate denoiser slices, and empty temporal-unit shares of a
         distributed decoder.
         """
-
         binding = self.bindings.get(entry)
-        if binding is not None and binding.process_group.global_rank not in binding.output_ranks:
+        if (
+            binding is not None
+            and binding.process_group.global_rank not in binding.output_ranks
+        ):
             return None
 
         results = tuple(
@@ -653,9 +774,11 @@ class ModelRunner:
         prefill capture shapes, and private CUDA graph memory pools. Callable
         exactly once.
         """
-
         from ..bootstrap.capacity import device_total_bytes
-        from ..config import DEFAULT_PREFILL_GRAPH_ROW_BUCKETS, graph_memory_budget_bytes
+        from ..config import (
+            DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
+            graph_memory_budget_bytes,
+        )
 
         if self.batch_graphs:
             raise RuntimeError("input execution resources are already bound")
@@ -678,7 +801,9 @@ class ModelRunner:
             (kv_cache.info.num_blocks - 1) * config.block_size,
         )
         prefill_sizes = tuple(
-            value for value in config.prefill_graph_token_sizes if 0 < value <= prefill_capacity
+            value
+            for value in config.prefill_graph_token_sizes
+            if 0 < value <= prefill_capacity
         )
         if self.image_builder is not None:
             from uniserve.media import image
@@ -692,12 +817,16 @@ class ModelRunner:
                 max_tokens=input_config.max_tokens,
                 per_image_capacity=latent_capacity_units,
                 latent_capacity=latent_pool.capacity_units,
-                physical_tokens=lambda height, width: self.image_builder.sequence_length(
-                    image.Config(height, width)
+                physical_tokens=lambda height, width: (
+                    self.image_builder.sequence_length(
+                        image.Config(height, width)
+                    )
                 ),
-                image_tokens=lambda height, width: self.image_builder.denoiser.latent_shape(
-                    "image", image.Config(height, width)
-                )[0],
+                image_tokens=lambda height, width: (
+                    self.image_builder.denoiser.latent_shape(
+                        "image", image.Config(height, width)
+                    )[0]
+                ),
             )
 
         staged = {
@@ -711,21 +840,31 @@ class ModelRunner:
         if self.image_builder is not None:
             staged.add(PipelineStage.DENOISING)
 
-        for (name, path, method), (placement, call) in self._module_entries.items():
+        for (name, path, method), (
+            placement,
+            call,
+        ) in self._module_entries.items():
             operations = call_operations((call,)) & staged
             if not operations:
                 continue
 
             target = (
                 canonical_device(config.generation_device or config.device)
-                if operations & {PipelineStage.LATENT_ENCODING, PipelineStage.IMAGE_DECODING}
+                if operations
+                & {PipelineStage.LATENT_ENCODING, PipelineStage.IMAGE_DECODING}
                 else placement.device
             )
             streams = [
-                (lane, stream) for lane, stream in self._lane_streams if stream.device == target
+                (lane, stream)
+                for lane, stream in self._lane_streams
+                if stream.device == target
             ]
             for lane, stream in streams or ((None, None),):
-                kinds = operations if lane is None else operations.intersection(lane.computations)
+                kinds = (
+                    operations
+                    if lane is None
+                    else operations.intersection(lane.computations)
+                )
                 if not kinds:
                     continue
 
@@ -738,7 +877,8 @@ class ModelRunner:
                     input_config.max_tokens
                     if lane is None
                     else min(
-                        input_config.max_tokens, lane.max_batch_tokens or input_config.max_tokens
+                        input_config.max_tokens,
+                        lane.max_batch_tokens or input_config.max_tokens,
                     )
                 )
                 decode = (
@@ -763,7 +903,8 @@ class ModelRunner:
                     replace(
                         input_config,
                         max_rows=max(
-                            input_config.max_rows, *(shape.row_bucket for shape in prefill)
+                            input_config.max_rows,
+                            *(shape.row_bucket for shape in prefill),
                         ),
                     )
                     if prefill
@@ -782,7 +923,11 @@ class ModelRunner:
                 try:
                     if stream is not None:
                         stream.wait(torch.cuda.current_stream(target))
-                    with nullcontext() if stream is None else torch.cuda.stream(stream.stream):
+                    with (
+                        nullcontext()
+                        if stream is None
+                        else torch.cuda.stream(stream.stream)
+                    ):
                         entry.input_buffers = InputBuffers(
                             config=fields,
                             device=target,
@@ -792,7 +937,9 @@ class ModelRunner:
                         entry.context = ExecutionContext(
                             call.module,
                             cache=kv_cache.cache
-                            if isinstance(call.module, (CausalLM, ImageDenoiser))
+                            if isinstance(
+                                call.module, (CausalLM, ImageDenoiser)
+                            )
                             else None,
                             attention=self.attention,
                             stream=None if stream is None else stream.stream,
@@ -803,7 +950,9 @@ class ModelRunner:
                         # shapes encountered during preparation/eager execution.
                         size = (
                             TextSize(fields.max_tokens, fields.max_rows)
-                            if isinstance(call.module, (CausalLM, ImageDenoiser))
+                            if isinstance(
+                                call.module, (CausalLM, ImageDenoiser)
+                            )
                             else None
                         )
                         entry.context.prepare(size)
@@ -812,37 +961,56 @@ class ModelRunner:
                         close_resources(
                             *(
                                 owner.close
-                                for owner in (entry.context, entry.input_buffers)
+                                for owner in (
+                                    entry.context,
+                                    entry.input_buffers,
+                                )
                                 if owner is not None
                             )
                         )
                     except BaseException as cleanup:
-                        error.add_note(f"input resource cleanup failed: {cleanup!r}")
+                        error.add_note(
+                            f"input resource cleanup failed: {cleanup!r}"
+                        )
                     raise
 
-                self.entries[(name, path, None if lane is None else lane.lane_id)] = entry
+                self.entries[
+                    (name, path, None if lane is None else lane.lane_id)
+                ] = entry
                 self.batch_graphs[entry] = {}
-                self.decode_shapes[entry], self.prefill_shapes[entry] = decode, prefill
+                self.decode_shapes[entry], self.prefill_shapes[entry] = (
+                    decode,
+                    prefill,
+                )
 
                 if config.graph_policy != "off" and target.type == "cuda":
                     pools = {}
-                    for graph_device in (target, *self._capture_devices(target)):
+                    for graph_device in (
+                        target,
+                        *self._capture_devices(target),
+                    ):
                         with torch.cuda.device(graph_device):
                             pools[graph_device] = torch.cuda.MemPool()
-                        self.graph_memory_budgets[graph_device] = graph_memory_budget_bytes(
-                            device_total_bytes(graph_device)
+                        self.graph_memory_budgets[graph_device] = (
+                            graph_memory_budget_bytes(
+                                device_total_bytes(graph_device)
+                            )
                         )
                     self.graph_pools[entry] = pools
 
                 for kind in kinds:
                     key = (name, kind)
                     if key in self._forward_entries:
-                        raise ValueError(f"computation {key} has multiple lane bindings")
+                        raise ValueError(
+                            f"computation {key} has multiple lane bindings"
+                        )
                     self._forward_entries[key] = entry
 
     def batch_forward(self, entry, batch, *, padded=False):
-        """Dispatch one staged batch to the numerical call of its capability kind."""
+        """Dispatch one staged batch to the numerical call of its capability.
 
+        kind.
+        """
         call = entry.calls[0]
         module, inputs = call.module, batch.inputs
 
@@ -850,7 +1018,8 @@ class ModelRunner:
             text = self._text_calls[id(module)]
             return (
                 text.last_logits(inputs)
-                if padded and batch.token_selections[0] is TokenSelection.LAST_LOGITS
+                if padded
+                and batch.token_selections[0] is TokenSelection.LAST_LOGITS
                 else text(inputs, batch.token_selections)
             )
 
@@ -865,7 +1034,9 @@ class ModelRunner:
             # Predictions come from the last pipeline stage; other stages
             # broadcast placeholder storage that the broadcast overwrites, so
             # every rank returns the same per-image values.
-            pipeline = module.mesh.get_group("pp" if "pp" in module.mesh.axes else ())
+            pipeline = module.mesh.get_group(
+                "pp" if "pp" in module.mesh.axes else ()
+            )
             values = []
             for prediction, size in zip(result, inputs.sizes, strict=True):
                 value = (
@@ -885,7 +1056,9 @@ class ModelRunner:
             return ExecutionOutput(module.encode(inputs))
 
         if isinstance(module, PatchAutoencoder):
-            return ExecutionOutput(tuple(module.encode(torch.stack(inputs.images)).unbind(0)))
+            return ExecutionOutput(
+                tuple(module.encode(torch.stack(inputs.images)).unbind(0))
+            )
 
         if isinstance(module, ImageDecoder):
             values = module.decode(inputs.latents, sizes=inputs.sizes)
@@ -911,7 +1084,6 @@ class ModelRunner:
         Text batches are padded into a configured bucket keyed by shape and
         input signature; other capabilities replay only their exact signature.
         """
-
         if not eligible or entry not in self.graph_pools:
             return None
 
@@ -938,7 +1110,9 @@ class ModelRunner:
                 # Direct token inputs and device continuations use the same
                 # numerical decode graph. Only the latter consumes its greedy
                 # continuation result; the former supplies an inert finish mask.
-                finish = entry.input_buffers.decode_force_finish[: batch.row_count]
+                finish = entry.input_buffers.decode_force_finish[
+                    : batch.row_count
+                ]
                 finish.zero_()
                 batch = replace(batch, decode_force_finish=finish)
 
@@ -962,7 +1136,6 @@ class ModelRunner:
     @torch.inference_mode()
     def eager_batch(self, entry, batch, forward):
         """Run a staged batch eagerly inside its entry's execution context."""
-
         with entry.context.activate():
             attention = getattr(batch.inputs, "attention", None)
             if attention is not None:
@@ -971,10 +1144,16 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_batch(self, entry, batch, forward):
-        """Capture a staged batch's graph on the entry stream, fenced on both sides."""
+        """Capture a staged batch's graph on the entry stream.
 
+        fenced on both sides.
+        """
         context = entry.context
-        current = torch.cuda.current_stream(entry.device) if entry.device.type == "cuda" else None
+        current = (
+            torch.cuda.current_stream(entry.device)
+            if entry.device.type == "cuda"
+            else None
+        )
         if context.stream is not None:
             context.stream.wait_stream(current)
         try:
@@ -997,7 +1176,11 @@ class ModelRunner:
         if key in self.batch_graphs[entry]:
             return
 
-        invoke = partial(self.batch_forward, entry, padded=True) if padded else forward
+        invoke = (
+            partial(self.batch_forward, entry, padded=True)
+            if padded
+            else forward
+        )
         # Text buckets use the entry's stable staging addresses, ordered on
         # its execution stream. Exact calls can include borrowed request
         # latents; own those inputs independently of their pool-slot lifetime.
@@ -1013,13 +1196,21 @@ class ModelRunner:
         self.batch_graphs[entry][key] = graph
 
     @torch.inference_mode()
-    def run_batch(self, entry, batch, forward, *, eligible, borrow_output=False):
+    def run_batch(
+        self, entry, batch, forward, *, eligible, borrow_output=False
+    ):
         with entry.context.activate():
             return self._run_batch(
-                entry, batch, forward, eligible=eligible, borrow_output=borrow_output
+                entry,
+                batch,
+                forward,
+                eligible=eligible,
+                borrow_output=borrow_output,
             )
 
-    def _run_batch(self, entry, batch, forward, *, eligible, borrow_output=False):
+    def _run_batch(
+        self, entry, batch, forward, *, eligible, borrow_output=False
+    ):
         selected = self.select_graph_shape(entry, batch, eligible=eligible)
         if selected is None:
             return replace(
@@ -1035,10 +1226,14 @@ class ModelRunner:
             if not bucketed:
                 return replace(
                     self.eager_batch(entry, batch, forward),
-                    stats=ForwardStats(cuda_graph_runtime_mode_counts={"eager": 1}),
+                    stats=ForwardStats(
+                        cuda_graph_runtime_mode_counts={"eager": 1}
+                    ),
                 )
             if self._startup_complete:
-                raise CUDAGraphError(f"configured graph bucket is not resident: {key!r}")
+                raise CUDAGraphError(
+                    f"configured graph bucket is not resident: {key!r}"
+                )
             self.capture_batch(entry, batch, forward)
             captured = True
 
@@ -1051,7 +1246,9 @@ class ModelRunner:
         return replace(
             result,
             stats=ForwardStats(
-                cuda_graph_runtime_mode_counts={"graph_capture" if captured else "graph_replay": 1},
+                cuda_graph_runtime_mode_counts={
+                    "graph_capture" if captured else "graph_replay": 1
+                },
                 cuda_graph_captures=int(captured),
                 cuda_graph_replays=int(not captured),
                 cuda_graph_unpadded_tokens=batch.row_count,
@@ -1066,16 +1263,20 @@ class ModelRunner:
         configured. The staged device is the bound execution entry's device,
         or the compute device when the operation has no staged binding.
         """
-
         binding = self.bindings.get(operation.entry)
-        source = canonical_device(self.worker_config.device) if binding is None else binding.device
+        source = (
+            canonical_device(self.worker_config.device)
+            if binding is None
+            else binding.device
+        )
         if self.image_builder is not None and operation.kind in {
             PipelineStage.LATENT_PREPARATION,
             PipelineStage.DENOISING,
             PipelineStage.IMAGE_DECODING,
         }:
             source = canonical_device(
-                self.worker_config.generation_device or self.worker_config.device
+                self.worker_config.generation_device
+                or self.worker_config.device
             )
 
         entry = self._forward_entries.get((operation.entry, operation.kind))
@@ -1083,9 +1284,12 @@ class ModelRunner:
 
     def warmup(self, storage):
         """Run media warmup passes, then drain every owned stream."""
-
         if self.media_builder is not None:
-            from .video import warmup_decoders, warmup_denoising, warmup_postprocess
+            from .video import (
+                warmup_decoders,
+                warmup_denoising,
+                warmup_postprocess,
+            )
 
             warmup_denoising(self, storage)
             warmup_decoders(self)
@@ -1095,69 +1299,97 @@ class ModelRunner:
     @torch.inference_mode()
     def capture(self, *, tokenizer, latents):
         """Capture every entry's configured prefill, decode, and flow graphs."""
-
         from .startup import prepare_decode, prepare_prefill
 
         for phase in ("prefill", "decode", "flow"):
             for entry in self.batch_graphs:
                 forward = partial(self.batch_forward, entry)
-                if phase == "prefill" and ForwardMode.PREFILL in entry.computations:
+                if (
+                    phase == "prefill"
+                    and ForwardMode.PREFILL in entry.computations
+                ):
                     shapes = (
                         self.prefill_shapes[entry]
                         if self.worker_config.graph_policy != "off"
                         and self.worker_config.prefill_cuda_graph
                         else (PrefillShape(1, 1, 1),)
                     )
-                    prepare_prefill(self, entry, entry.input_buffers, forward, shapes)
-                elif phase == "decode" and ForwardMode.DECODE in entry.computations:
+                    prepare_prefill(
+                        self, entry, entry.input_buffers, forward, shapes
+                    )
+                elif (
+                    phase == "decode"
+                    and ForwardMode.DECODE in entry.computations
+                ):
                     prepare_decode(self, entry, entry.input_buffers, forward)
-                elif phase == "flow" and PipelineStage.DENOISING in entry.computations:
+                elif (
+                    phase == "flow"
+                    and PipelineStage.DENOISING in entry.computations
+                ):
                     from .flow import prepare_flow
 
                     prepare_flow(self, entry, latents, tokenizer)
         self.synchronize()
 
     def complete_startup(self):
-        """Seal startup: check captured-graph memory budgets and stream grants."""
+        """Seal startup: check captured-graph memory budgets and stream.
 
+        grants.
+        """
         for device, budget in self.graph_memory_budgets.items():
             pools = {
-                tuple(values[device].id) for values in self.graph_pools.values() if device in values
+                tuple(values[device].id)
+                for values in self.graph_pools.values()
+                if device in values
             }
             if private_pool_bytes(device, pools) > budget:
-                raise CUDAGraphError("captured graph residency exceeds its device budget")
+                raise CUDAGraphError(
+                    "captured graph residency exceeds its device budget"
+                )
 
         for _, stream in self._lane_streams:
             stream.verify()
         self._startup_complete = True
 
     def synchronize(self):
-        """Host-synchronize every owned stream and each active device's current stream."""
+        """Host-synchronize every owned stream and each active device's current.
 
+        stream.
+        """
         streams = [self._capture_stream, self._preparation_stream]
         streams.extend(stream.stream for _, stream in self._lane_streams)
-        streams.extend(stream.stream for stream in self._module_streams.values())
+        streams.extend(
+            stream.stream for stream in self._module_streams.values()
+        )
 
         devices = {
             canonical_device(self.worker_config.device),
             *self._capture_devices(canonical_device(self.worker_config.device)),
         }
         streams.extend(
-            torch.cuda.current_stream(device) for device in devices if device.type == "cuda"
+            torch.cuda.current_stream(device)
+            for device in devices
+            if device.type == "cuda"
         )
 
         close_resources(
             *(
                 stream.synchronize
-                for stream in dict.fromkeys(stream for stream in streams if stream is not None)
+                for stream in dict.fromkeys(
+                    stream for stream in streams if stream is not None
+                )
             )
         )
 
     def close_graphs(self):
-        """The caller drains all borrowed output readers before this operation."""
+        """The caller drains all borrowed output readers before this.
 
+        operation.
+        """
         actions = [
-            graph.graph.close for graphs in self.batch_graphs.values() for graph in graphs.values()
+            graph.graph.close
+            for graphs in self.batch_graphs.values()
+            for graph in graphs.values()
         ]
         actions.extend(graph.close for graph, _ in self._module_graphs.values())
         if self.denoising is not None:
@@ -1170,14 +1402,18 @@ class ModelRunner:
             self._module_graphs.clear()
 
     def close(self):
-        """Release every owned context, buffer, graph, and stream exactly once."""
+        """Release every owned context, buffer, graph.
 
+        and stream exactly once.
+        """
         if self._closed:
             return
         self._closed = True
 
         actions = [self.synchronize, self.close_graphs]
-        actions.extend(context.close for context in self._module_contexts.values())
+        actions.extend(
+            context.close for context in self._module_contexts.values()
+        )
         for entry in self.batch_graphs:
             actions.extend((entry.context.close, entry.input_buffers.close))
         if self._text_staging is not None:
@@ -1185,8 +1421,13 @@ class ModelRunner:
 
         # Streams close in reverse creation order so forks retire before
         # the lane streams they borrow from.
-        actions.extend(stream.close for stream in reversed(tuple(self._module_streams.values())))
-        actions.extend(stream.close for _, stream in reversed(self._lane_streams))
+        actions.extend(
+            stream.close
+            for stream in reversed(tuple(self._module_streams.values()))
+        )
+        actions.extend(
+            stream.close for _, stream in reversed(self._lane_streams)
+        )
 
         try:
             close_resources(*actions)
@@ -1201,12 +1442,13 @@ class ModelRunner:
             self._text_tokens = self._text_staging = None
 
     def stage_text_tokens(self, tokens: tuple[int, ...]) -> torch.Tensor:
-        """Stage one text encoder input on the caller's stream without a world broadcast.
+        """Stage one text encoder input on the caller's stream without a world.
+
+        broadcast.
 
         The input is borrowed until the next staging call. Host sources remain
         retained through the copy fence independently of subsequent model work.
         """
-
         staging, storage = self._text_staging, self._text_tokens
         if staging is None or storage is None:
             raise InputError("rank has no text encoder input storage")
@@ -1224,16 +1466,22 @@ class ModelRunner:
     def preparing_inputs(
         self, transfers: tuple[tuple[torch.Tensor, torch.Tensor], ...]
     ) -> Iterator[None]:
-        """Overlap reserved input copies with computation, then join device order.
+        """Overlap reserved input copies with computation.
+
+        then join device order.
 
         Sources and destinations must remain reserved through this operation's
         physical completion. The final stream wait also covers failed compute,
         so completion and request retirement cannot overtake the input copies.
         """
-
         stream = self._preparation_stream
-        if self._closed or canonical_device(self.worker_config.device).type != "cuda":
-            raise RuntimeError("input preparation requires a live CUDA execution owner")
+        if (
+            self._closed
+            or canonical_device(self.worker_config.device).type != "cuda"
+        ):
+            raise RuntimeError(
+                "input preparation requires a live CUDA execution owner"
+            )
         if stream is None:
             stream = torch.cuda.Stream(device=self.worker_config.device)
             self._preparation_stream = stream
@@ -1241,19 +1489,28 @@ class ModelRunner:
         try:
             with torch.cuda.stream(stream):
                 for destination, source in transfers:
-                    if destination.shape != source.shape or destination.dtype != source.dtype:
-                        raise ValueError("prepared input must match destination shape and dtype")
+                    if (
+                        destination.shape != source.shape
+                        or destination.dtype != source.dtype
+                    ):
+                        raise ValueError(
+                            "prepared input must match destination shape and "
+                            "dtype"
+                        )
                     destination.copy_(source, non_blocking=True)
             yield
         finally:
-            torch.cuda.current_stream(self.worker_config.device).wait_stream(stream)
+            torch.cuda.current_stream(self.worker_config.device).wait_stream(
+                stream
+            )
 
     def image_processor(self) -> ImageProcessor:
         """Require image preprocessing settings for the active operation."""
-
         value = self.processor
         if not isinstance(value, ImageProcessor):
-            raise invalid_descriptor("operation requires model image processing")
+            raise invalid_descriptor(
+                "operation requires model image processing"
+            )
         return value
 
     def forward(
@@ -1264,24 +1521,29 @@ class ModelRunner:
         tables: BlockTables | None,
         states: DecodeState | None,
     ) -> Iterator[tuple[tuple[int, ...], ExecutionOutput | BaseException]]:
-        """Execute actual compatible rows, yielding results at their original indexes.
+        """Execute actual compatible rows.
+
+        yielding results at their original indexes.
 
         A failed model call identifies every participating row. The caller owns
         completion groups and decides which dependent operations to suppress.
-        Fatal failures propagate immediately because later device work is unsafe.
+        Fatal failures propagate immediately because later device work is
+        unsafe.
         """
-
         # Rows sharing an entry, forward mode, device, and media shape form
         # one homogeneous numerical call.
         grouped: dict[tuple[object, ...], list[int]] = defaultdict(list)
         bindings: dict[int, ModelEntry] = {}
         for index, (task, operation) in enumerate(tasks):
-            entry = self._forward_entries.get((operation.entry, task.forward_mode))
+            entry = self._forward_entries.get(
+                (operation.entry, task.forward_mode)
+            )
             if entry is None:
                 yield (
                     (index,),
                     invalid_descriptor(
-                        f"execution has no {operation.kind.value!r} binding for {operation.entry!r}"
+                        f"execution has no {operation.kind.value!r} binding "
+                        f"for {operation.entry!r}"
                     ),
                 )
                 continue
@@ -1293,7 +1555,9 @@ class ModelRunner:
                 shape = tuple(int(value) for value in task.encode_pixels.shape)
             elif task.latent is not None:
                 shape = (task.image_height, task.image_width)
-            grouped[(entry, task.forward_mode, str(target), shape)].append(index)
+            grouped[(entry, task.forward_mode, str(target), shape)].append(
+                index
+            )
 
         groups = list(grouped.values())
         for group_index, indexes in enumerate(groups):
@@ -1308,21 +1572,28 @@ class ModelRunner:
                     states=states,
                 )
                 if result.request_pool_indices is None:
-                    raise RuntimeError("forward output has no request slot views")
+                    raise RuntimeError(
+                        "forward output has no request slot views"
+                    )
 
                 # Join the lane stream's output fence so later control-stream
                 # work observes this group's writes in order.
                 if result.output_event is not None:
-                    torch.cuda.current_stream(bindings[indexes[0]].device).wait_event(
-                        result.output_event
-                    )
+                    torch.cuda.current_stream(
+                        bindings[indexes[0]].device
+                    ).wait_event(result.output_event)
 
                 if all(row.forward_mode is ForwardMode.DECODE for row in rows):
                     if result.stats is None:
                         raise RuntimeError("text forward lost its statistics")
                     components = dict(result.stats.component_us)
-                    record_component(components, "text_model_forward", forward_started)
-                    result = replace(result, stats=replace(result.stats, component_us=components))
+                    record_component(
+                        components, "text_model_forward", forward_started
+                    )
+                    result = replace(
+                        result,
+                        stats=replace(result.stats, component_us=components),
+                    )
 
                 # A later call may replay the same graph or reuse its staging.
                 # Preserve these numerical values until their consumer runs.
@@ -1347,8 +1618,10 @@ class ModelRunner:
         tables: BlockTables | None,
         states: DecodeState | None,
     ) -> ExecutionOutput:
-        """Stage forward rows, choose eager or CUDA graph execution, invoke the model, and validate outputs."""
+        """Stage forward rows, choose eager or CUDA graph execution.
 
+        invoke the model, and validate outputs.
+        """
         tasks = rows
         if not tasks:
             raise ValueError("model runner received an empty call")
@@ -1361,7 +1634,9 @@ class ModelRunner:
         )
         modes = frozenset(task.forward_mode for task in tasks)
         if len(modes) != 1:
-            raise ValueError("one numerical call requires homogeneous computations")
+            raise ValueError(
+                "one numerical call requires homogeneous computations"
+            )
         forward_mode = next(iter(modes))
 
         operation_keys = tuple(
@@ -1376,7 +1651,8 @@ class ModelRunner:
         entry = self._forward_entries.get((operations[0].entry, forward_mode))
         if entry is None:
             raise InputError(
-                f"model runner has no {operations[0].kind.value!r} binding for {operations[0].entry!r}",
+                f"model runner has no {operations[0].kind.value!r} binding "
+                f"for {operations[0].entry!r}",
                 phase="input_staging",
                 route=forward_mode.value,
                 operations=operation_keys,
@@ -1391,7 +1667,9 @@ class ModelRunner:
             if lane_runtime is not None:
                 lane_runtime.wait(torch.cuda.current_stream(target))
             stream_context = (
-                nullcontext() if lane_runtime is None else torch.cuda.stream(lane_runtime.stream)
+                nullcontext()
+                if lane_runtime is None
+                else torch.cuda.stream(lane_runtime.stream)
             )
             with stream_context:
                 batch = buffers.stage(
@@ -1403,7 +1681,9 @@ class ModelRunner:
                 )
                 request_pool_indices = batch.request_pool_indices
         except Exception as error:
-            output_event = None if lane_runtime is None else lane_runtime.record()
+            output_event = (
+                None if lane_runtime is None else lane_runtime.record()
+            )
             if output_event is not None:
                 torch.cuda.current_stream(target).wait_event(output_event)
             raise _input_failure(error, forward_mode, operation_keys) from error
@@ -1422,7 +1702,10 @@ class ModelRunner:
                     invoke,
                     eligible=graph_eligible,
                     borrow_output=all(
-                        (task.request_indexed_decode or task.token_ids is not None)
+                        (
+                            task.request_indexed_decode
+                            or task.token_ids is not None
+                        )
                         and task.query_tokens == 1
                         and task.selection is TokenSelection.LAST_LOGITS
                         for task in tasks
@@ -1432,10 +1715,14 @@ class ModelRunner:
             output.validate_for(batch)
             _validate_outputs(output.values, tasks, target)
 
-            output_event = None if lane_runtime is None else lane_runtime.record()
+            output_event = (
+                None if lane_runtime is None else lane_runtime.record()
+            )
             duration_us = (time.perf_counter_ns() - started) // 1000
             if output.stats is None:
-                raise RuntimeError("entry forward lost its execution statistics")
+                raise RuntimeError(
+                    "entry forward lost its execution statistics"
+                )
             stats = replace(
                 output.stats,
                 mode_counts={forward_mode.value: 1},
@@ -1454,10 +1741,14 @@ class ModelRunner:
             # retires storage behind the current stream's output fence, so join
             # every submitted lane access before reporting the failure.
             if output_event is None:
-                output_event = None if lane_runtime is None else lane_runtime.record()
+                output_event = (
+                    None if lane_runtime is None else lane_runtime.record()
+                )
             if output_event is not None:
                 torch.cuda.current_stream(target).wait_event(output_event)
-            raise _execution_failure(error, forward_mode, operation_keys) from error
+            raise _execution_failure(
+                error, forward_mode, operation_keys
+            ) from error
 
 
 def _validate_outputs(
@@ -1466,10 +1757,11 @@ def _validate_outputs(
     device: torch.device,
 ) -> None:
     """Validate one model output tensor per task on the expected device."""
-
     for value, task in zip(values, tasks, strict=True):
         if value.device != device:
-            raise ValueError(f"model output is on {value.device}, expected {device}")
+            raise ValueError(
+                f"model output is on {value.device}, expected {device}"
+            )
         if not value.is_floating_point():
             raise ValueError("raw neural outputs must use a floating dtype")
 
@@ -1478,9 +1770,15 @@ def _validate_outputs(
             or task.token_ids is not None
             or task.token_embeddings is not None
         ) and value.ndim < 2:
-            raise ValueError("token output must retain token and feature dimensions")
+            raise ValueError(
+                "token output must retain token and feature dimensions"
+            )
 
-        if task.latent is not None and task.image_tokens > 0 and value.shape != task.latent.shape:
+        if (
+            task.latent is not None
+            and task.image_tokens > 0
+            and value.shape != task.latent.shape
+        ):
             raise ValueError("flow prediction shape does not match its latent")
 
         if task.encode_pixels is not None and value.numel() == 0:
@@ -1493,7 +1791,9 @@ def _validate_outputs(
                 task.image_height,
                 task.image_width,
             ):
-                raise ValueError("decoded tensor does not match the requested image shape")
+                raise ValueError(
+                    "decoded tensor does not match the requested image shape"
+                )
 
 
 def _input_failure(
@@ -1501,8 +1801,10 @@ def _input_failure(
     forward_mode: ForwardMode | PipelineStage,
     operations: tuple[tuple[int, int, int, ComputationId], ...],
 ) -> InputError:
-    """Classify invalid model inputs with their phase and operation identities."""
+    """Classify invalid model inputs with their phase and operation.
 
+    identities.
+    """
     if isinstance(error, InputError):
         return error
     return InputError(
@@ -1518,8 +1820,10 @@ def _execution_failure(
     forward_mode: ForwardMode | PipelineStage,
     operations: tuple[tuple[int, int, int, ComputationId], ...],
 ) -> WorkerError:
-    """Classify a model failure and attach the active phase and operation identities."""
+    """Classify a model failure and attach the active phase and operation.
 
+    identities.
+    """
     if isinstance(error, WorkerError):
         return error
     classified = classify(error)

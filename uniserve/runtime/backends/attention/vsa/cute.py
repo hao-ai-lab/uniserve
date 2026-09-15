@@ -13,11 +13,32 @@ class _Operator(BaseOperator):
     def __call__(self, q, k, v, batch, *, scale, out):
         self._validate(q, k, v, batch, out)
         _cute.block_sparse_attention(
-            q, k, v, out, batch.block_indices, batch.block_counts, batch.valid_sizes, scale=scale
+            q,
+            k,
+            v,
+            out,
+            batch.block_indices,
+            batch.block_counts,
+            batch.valid_sizes,
+            scale=scale,
         )
         return out
 
-    def rows(self, q, k, v, batch, *, gate, compressed, out, owners, chunk_tokens, packed, scale):
+    def rows(
+        self,
+        q,
+        k,
+        v,
+        batch,
+        *,
+        gate,
+        compressed,
+        out,
+        owners,
+        chunk_tokens,
+        packed,
+        scale,
+    ):
         from functools import partial
 
         from ._rows import _Rows
@@ -30,7 +51,9 @@ class _Operator(BaseOperator):
         if not hasattr(self, "_row_operators"):
             self._row_operators = {}
         if key not in self._row_operators:
-            self._row_operators[key] = _Rows(partial(_cute.block_sparse_attention, scale=scale))
+            self._row_operators[key] = _Rows(
+                partial(_cute.block_sparse_attention, scale=scale)
+            )
         return self._row_operators[key].prepare(
             q,
             k,

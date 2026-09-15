@@ -10,7 +10,14 @@ from uniserve.nn.attention import Attention, DenseInput
 class ResidualBlock(nn.Module):
     """Apply two normalized convolutions and an optional channel projection."""
 
-    def __init__(self, in_channels: int, out_channels: int, *, groups: int = 32, eps: float = 1e-6):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        *,
+        groups: int = 32,
+        eps: float = 1e-6,
+    ):
         super().__init__()
         self.norms = nn.ModuleList(
             (
@@ -32,7 +39,9 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden = x
-        for norm, convolution in zip(self.norms, self.convolutions, strict=True):
+        for norm, convolution in zip(
+            self.norms, self.convolutions, strict=True
+        ):
             hidden = convolution(F.silu(norm(hidden)))
         return self.shortcut(x) + hidden
 
@@ -65,12 +74,18 @@ class AttentionBlock(nn.Module):
             ),
             dim=2,
         )
-        hidden = result.squeeze(1).transpose(1, 2).reshape(batch, channels, height, width)
+        hidden = (
+            result.squeeze(1)
+            .transpose(1, 2)
+            .reshape(batch, channels, height, width)
+        )
         return x + self.output(hidden)
 
 
 class Downsample(nn.Module):
-    """Halve the spatial extent with a strided convolution and asymmetric pad."""
+    """Halve the spatial extent with a strided convolution and asymmetric
+    pad.
+    """  # noqa: D205
 
     def __init__(self, channels: int):
         super().__init__()
@@ -82,14 +97,18 @@ class Downsample(nn.Module):
 
 
 class Upsample(nn.Module):
-    """Double the spatial extent with nearest interpolation and a convolution."""
+    """Double the spatial extent with nearest interpolation and a
+    convolution.
+    """  # noqa: D205
 
     def __init__(self, channels: int):
         super().__init__()
         self.convolution = nn.Conv2d(channels, channels, 3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.convolution(F.interpolate(x, scale_factor=2.0, mode="nearest"))
+        return self.convolution(
+            F.interpolate(x, scale_factor=2.0, mode="nearest")
+        )
 
 
 class DiagonalGaussian(nn.Module):
@@ -103,11 +122,19 @@ class DiagonalGaussian(nn.Module):
         self, moments: torch.Tensor, *, generator: torch.Generator | None = None
     ) -> torch.Tensor:
         if moments.shape[self.chunk_dim] % 2:
-            raise ValueError("posterior moments require equally sized mean and log-variance fields")
+            raise ValueError(
+                "posterior moments require equally sized mean and "
+                "log-variance fields"
+            )
 
         mean, log_variance = moments.chunk(2, dim=self.chunk_dim)
         if not self.sample:
             return mean
 
-        noise = torch.randn(mean.shape, dtype=mean.dtype, device=mean.device, generator=generator)
+        noise = torch.randn(
+            mean.shape,
+            dtype=mean.dtype,
+            device=mean.device,
+            generator=generator,
+        )
         return mean + torch.exp(0.5 * log_variance) * noise

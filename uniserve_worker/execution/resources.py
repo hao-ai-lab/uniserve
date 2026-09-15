@@ -1,4 +1,7 @@
-"""Query numerical result layouts and reserve caller-owned media input storage."""
+"""Query numerical result layouts and reserve caller-owned media input.
+
+storage.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +9,13 @@ from collections.abc import Mapping
 
 from torch import nn
 
-from uniserve.model import AudioDecoder, Denoiser, TextEncoder, VideoDecoder, VideoPostprocessor
+from uniserve.model import (
+    AudioDecoder,
+    Denoiser,
+    TextEncoder,
+    VideoDecoder,
+    VideoPostprocessor,
+)
 from uniserve.tensors import BufferConfig, OutputLayout
 
 from ..config import WorkerConfig
@@ -16,8 +25,10 @@ from .model_entry import Call, ModelEntry
 def media_state_buffers(
     model: nn.Module, bindings: Mapping[str, ModelEntry], config: WorkerConfig
 ) -> dict[str, BufferConfig]:
-    """Reserve resident samples and transfer staging only on participating ranks."""
+    """Reserve resident samples and transfer staging only on participating.
 
+    ranks.
+    """
     from ..bootstrap.inputs import media_builder
 
     builder = media_builder(model, config)
@@ -27,7 +38,10 @@ def media_state_buffers(
     result = {}
     for binding in bindings.values():
         for call in binding.calls:
-            if isinstance(call.module, Denoiser) and call.entry.method == "forward":
+            if (
+                isinstance(call.module, Denoiser)
+                and call.entry.method == "forward"
+            ):
                 fields = builder.capacity_buffers()
             elif isinstance(call.module, VideoPostprocessor):
                 fields = call.module.state_buffers(builder.maximum.num_frames)
@@ -36,7 +50,9 @@ def media_state_buffers(
 
             for name, field in fields.items():
                 if name in result and result[name] != field:
-                    raise ValueError(f"media request fields disagree about {name!r}")
+                    raise ValueError(
+                        f"media request fields disagree about {name!r}"
+                    )
                 result[name] = field
     return result
 
@@ -50,13 +66,14 @@ def output_layouts(
     prompt_tokens: int | None = None,
 ) -> Mapping[str, OutputLayout]:
     """Describe complete persistent tensor products for one capability call."""
-
     from ..bootstrap.inputs import capability, media_builder
 
     component = call.module
     if isinstance(component, TextEncoder) and call.entry.method == "encode":
         return component.output_layout(
-            config.max_sequence_tokens if prompt_tokens is None else prompt_tokens
+            config.max_sequence_tokens
+            if prompt_tokens is None
+            else prompt_tokens
         )
 
     if not isinstance(component, (Denoiser, VideoDecoder, AudioDecoder)):

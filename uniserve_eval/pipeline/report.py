@@ -30,13 +30,16 @@ def build_summary(
     launch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Combine workload identity, metrics, validation, and provenance."""
-
     metrics = summarize(records, dur_s, tokenizer=tokenizer)
-    validation = task.validate(records).merged(_metric_validation(point.metrics, metrics))
+    validation = task.validate(records).merged(
+        _metric_validation(point.metrics, metrics)
+    )
     warnings = _warnings(records, server_version, launch or {})
     classifiers: dict[str, int] = {}
     for record in records:
-        classifiers[record.classifier] = classifiers.get(record.classifier, 0) + 1
+        classifiers[record.classifier] = (
+            classifiers.get(record.classifier, 0) + 1
+        )
     return {
         "status": "completed",
         "benchmark": point.name,
@@ -53,7 +56,9 @@ def build_summary(
         "failed_count": sum(not record.success for record in records),
         "classifiers": classifiers,
         "metrics": metrics,
-        "metric_definitions": [definition.as_dict() for definition in point.metrics],
+        "metric_definitions": [
+            definition.as_dict() for definition in point.metrics
+        ],
         "validation": validation.as_dict(),
         "warnings": warnings,
         "server_version": server_version,
@@ -61,9 +66,10 @@ def build_summary(
     }
 
 
-def metric_value(metrics: dict[str, Any], definition: MetricDefinition) -> float | None:
+def metric_value(
+    metrics: dict[str, Any], definition: MetricDefinition
+) -> float | None:
     """Resolve a finite numeric value from a dotted metric definition."""
-
     value: Any = metrics
     for part in definition.path:
         if not isinstance(value, dict):
@@ -77,11 +83,11 @@ def metric_value(metrics: dict[str, Any], definition: MetricDefinition) -> float
 
 def render_markdown(summary: dict[str, Any]) -> str:
     """Render protected metrics and validation status as Markdown."""
-
     lines = [
         f"# {summary['benchmark']}",
         "",
-        f"- requests: {summary['ok_count']}/{summary['request_count']} successful",
+        f"- requests: {summary['ok_count']}"
+        f"/{summary['request_count']} successful",
         f"- elapsed: {summary['elapsed_s']:.3f} s",
         f"- validation: {'pass' if summary['validation']['valid'] else 'fail'}",
         "",
@@ -90,13 +96,28 @@ def render_markdown(summary: dict[str, Any]) -> str:
     ]
     metrics = summary.get("metrics", {})
     for raw in summary.get("metric_definitions", []):
-        definition = MetricDefinition(tuple(str(raw["path"]).split(".")), raw["direction"])
+        definition = MetricDefinition(
+            tuple(str(raw["path"]).split(".")), raw["direction"]
+        )
         value = metric_value(metrics, definition)
         rendered = "n/a" if value is None else f"{value:.6g}"
-        lines.append(f"| `{definition.name}` | {rendered} | {definition.direction} |")
-    failed = [name for name, passed in summary["validation"]["checks"].items() if not passed]
+        lines.append(
+            f"| `{definition.name}` | {rendered} | {definition.direction} |"
+        )
+    failed = [
+        name
+        for name, passed in summary["validation"]["checks"].items()
+        if not passed
+    ]
     if failed:
-        lines.extend(["", "Failed checks: " + ", ".join(f"`{name}`" for name in failed) + "."])
+        lines.extend(
+            [
+                "",
+                "Failed checks: "
+                + ", ".join(f"`{name}`" for name in failed)
+                + ".",
+            ]
+        )
     if summary.get("warnings"):
         lines.extend(["", "Warnings: " + ", ".join(summary["warnings"]) + "."])
     return "\n".join(lines) + "\n"
@@ -106,7 +127,6 @@ def _metric_validation(
     definitions: tuple[MetricDefinition, ...], metrics: dict[str, Any]
 ) -> ValidationResult:
     """Check that every protected metric is finite and positive."""
-
     checks = {}
     for definition in definitions:
         value = metric_value(metrics, definition)
@@ -120,8 +140,9 @@ def _warnings(
     launch: dict[str, Any],
 ) -> list[str]:
     """Collect stable request and launch provenance warnings."""
-
-    values = sorted({warning for record in records for warning in record.warnings})
+    values = sorted(
+        {warning for record in records for warning in record.warnings}
+    )
     if server_version is None:
         values.append("server_version_unavailable")
     if launch.get("dirty") is True:
@@ -129,4 +150,9 @@ def _warnings(
     return values
 
 
-__all__ = ["build_summary", "metric_value", "render_markdown", "selected_rows_identity"]
+__all__ = [
+    "build_summary",
+    "metric_value",
+    "render_markdown",
+    "selected_rows_identity",
+]

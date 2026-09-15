@@ -26,8 +26,11 @@ async def send_request(
     scheduled_time: float | None = None,
 ) -> RequestRecord:
     """Dispatch one task request through its endpoint-specific transport."""
-
-    payload = {key: value for key, value in request.payload.items() if value is not None}
+    payload = {
+        key: value
+        for key, value in request.payload.items()
+        if value is not None
+    }
     url = base_url.rstrip("/") + request.endpoint
     record = RequestRecord(request_id=request_id, task=task)
     record.begin(
@@ -41,9 +44,13 @@ async def send_request(
         elif request.endpoint == IMAGES_GENERATIONS:
             await _send_images(client, url, payload, record)
         elif request.stream:
-            await _send_chat_stream(client, url, payload, record, prompt_len, output_len_fallback)
+            await _send_chat_stream(
+                client, url, payload, record, prompt_len, output_len_fallback
+            )
         else:
-            await _send_chat(client, url, payload, record, prompt_len, output_len_fallback)
+            await _send_chat(
+                client, url, payload, record, prompt_len, output_len_fallback
+            )
     except Exception as error:  # noqa: BLE001 - benchmarks emit structured failures.
         record.mark_transport_exception(error)
     return record
@@ -56,14 +63,15 @@ async def _send_images(
     record: RequestRecord,
 ) -> None:
     """Execute an image-generations request and validate embedded outputs."""
-
     response = await client.post(url, json=payload)
     record.note_http(response.status_code)
     record.close_now()
     try:
         data = response.json()
     except Exception:
-        record.mark_failure(f"transport_status_{response.status_code}", response.text[:500])
+        record.mark_failure(
+            f"transport_status_{response.status_code}", response.text[:500]
+        )
         return
     body_ok, classifier = _classify_images(data)
     transport_ok = response.status_code < 400
@@ -76,7 +84,9 @@ async def _send_images(
             image_error = "invalid_image_part"
             record.mark_failure(image_error, image_error)
         else:
-            image_error = _attach_images(record, images, assign_json_latency=False)
+            image_error = _attach_images(
+                record, images, assign_json_latency=False
+            )
     if image_error is None and body_ok and transport_ok:
         record.mark_success()
         record.attach_images(record.decoded_images, assign_json_latency=True)
@@ -92,15 +102,16 @@ async def _send_chat(
     prompt_len: int,
     output_len_fallback: int,
 ) -> None:
-    """Execute a non-streaming chat request and record text, images, and usage."""
-
+    """Execute a non-streaming chat request and record text, images, and usage."""  # noqa: E501
     response = await client.post(url, json=payload)
     record.note_http(response.status_code)
     record.close_now()
     try:
         data = response.json()
     except Exception:
-        record.mark_failure(f"transport_status_{response.status_code}", response.text[:500])
+        record.mark_failure(
+            f"transport_status_{response.status_code}", response.text[:500]
+        )
         return
     choices = data.get("choices") if isinstance(data, dict) else None
     content = ""
@@ -109,8 +120,12 @@ async def _send_chat(
         choice = choices[0] if isinstance(choices[0], dict) else {}
         record.apply_choice_metadata(choice)
         message = choice.get("message")
-        content = OpenAIChat.message_text(message if isinstance(message, dict) else None)
-        images = OpenAIChat.message_images(message if isinstance(message, dict) else None)
+        content = OpenAIChat.message_text(
+            message if isinstance(message, dict) else None
+        )
+        images = OpenAIChat.message_images(
+            message if isinstance(message, dict) else None
+        )
     record.generated_text = content
     record.token_timing_available = False
     image_error = _attach_images(record, images, assign_json_latency=True)
@@ -119,7 +134,9 @@ async def _send_chat(
         if isinstance(usage, dict):
             record.apply_usage(usage)
         record.apply_cached_prompt_tokens(data)
-    record.apply_token_fallbacks(prompt_len=prompt_len, output_len_fallback=output_len_fallback)
+    record.apply_token_fallbacks(
+        prompt_len=prompt_len, output_len_fallback=output_len_fallback
+    )
     if image_error is not None:
         return
     if response.status_code < 400 and bool(content or record.decoded_images):
@@ -141,7 +158,6 @@ async def _send_chat_stream(
     output_len_fallback: int,
 ) -> None:
     """Execute an SSE chat request and record event-level output timing."""
-
     async with client.stream("POST", url, json=payload) as response:
         # Reject transport or framing mismatches before interpreting event data.
         record.note_http(response.status_code)
@@ -156,7 +172,10 @@ async def _send_chat_stream(
         if _is_json_content_type(response.headers.get("content-type", "")):
             await response.aread()
             record.close_now()
-            record.mark_failure("response_expected_sse", "stream request received a JSON response")
+            record.mark_failure(
+                "response_expected_sse",
+                "stream request received a JSON response",
+            )
             return
         events = await aiter_sse_events(
             response.aiter_lines(),
@@ -177,8 +196,9 @@ async def _send_chat_stream(
     if any(not isinstance(event, dict) for event in events):
         return
 
-    # Fold deltas in arrival order so text inter-token timing excludes image-only
-    # events while image latency still records every completed image part.
+    # Fold deltas in arrival order so text inter-token timing excludes
+    # image-only events while image latency still records every completed
+    # image part.
     last_text_time: float | None = None
     image_since_last_text = False
     image_parts: list[dict[str, Any]] = []
@@ -221,7 +241,6 @@ async def _send_video(
     record: RequestRecord,
 ) -> None:
     """Execute a synchronous video request and validate its raw MP4 body."""
-
     async with client.stream("POST", url, json=payload) as response:
         record.note_http(response.status_code)
         body = await response.aread()
@@ -244,7 +263,6 @@ async def _send_video(
 
 def _classify_images(payload: Any) -> tuple[bool, str]:
     """Classify the structural validity of an image-generations payload."""
-
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list) or not data:
         return False, "empty_image_data"
@@ -260,8 +278,7 @@ def _attach_images(
     *,
     assign_json_latency: bool = False,
 ) -> str | None:
-    """Decode image parts into a record and return any stable error classifier."""
-
+    """Decode image parts into a record and return any stable error classifier."""  # noqa: E501
     try:
         decoded = decode_openai_image_parts(parts)
     except ImageOutputError as error:
@@ -273,14 +290,12 @@ def _attach_images(
 
 def _is_json_content_type(content_type: str) -> bool:
     """Report whether a response media type denotes JSON."""
-
     media_type = content_type.partition(";")[0].strip().lower()
     return media_type == "application/json" or media_type.endswith("+json")
 
 
 def _last_event_time(events: list[Any]) -> float:
     """Return the latest stamped event time or the current monotonic time."""
-
     times = [
         float(event["_client_t"])
         for event in events

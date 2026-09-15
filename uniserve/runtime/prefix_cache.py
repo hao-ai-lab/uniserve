@@ -39,24 +39,45 @@ class PrefixCache:
         self._fills: dict[str, BlockFill] = {}
 
         if quantization is not None and set(quantization) - set(config.layers):
-            raise ValueError("cache quantization names must identify resident state layers")
+            raise ValueError(
+                "cache quantization names must identify resident state layers"
+            )
         for parameter in (num_blocks, block_size):
-            if isinstance(parameter, Mapping) and set(parameter) != set(config.layers):
-                raise ValueError("per-layer block allocation must cover every state layer")
+            if isinstance(parameter, Mapping) and set(parameter) != set(
+                config.layers
+            ):
+                raise ValueError(
+                    "per-layer block allocation must cover every state layer"
+                )
 
         for name, layout in config.layers.items():
-            count = num_blocks[name] if isinstance(num_blocks, Mapping) else num_blocks
-            size = block_size[name] if isinstance(block_size, Mapping) else block_size
+            count = (
+                num_blocks[name]
+                if isinstance(num_blocks, Mapping)
+                else num_blocks
+            )
+            size = (
+                block_size[name]
+                if isinstance(block_size, Mapping)
+                else block_size
+            )
             quantizer = None if quantization is None else quantization.get(name)
 
             requirements = layout.buffers(
-                num_blocks=count, block_size=size, dtype=dtype, quantizer=quantizer
+                num_blocks=count,
+                block_size=size,
+                dtype=dtype,
+                quantizer=quantizer,
             )
-            allocation = TensorBuffers.allocate(requirements, device=self.device)
+            allocation = TensorBuffers.allocate(
+                requirements, device=self.device
+            )
             tensors = allocation.view(requirements)
             for tensor in tensors.values():
                 tensor.zero_()
-            state = layout.bind(tensors, block_size=size, dtype=dtype, quantizer=quantizer)
+            state = layout.bind(
+                tensors, block_size=size, dtype=dtype, quantizer=quantizer
+            )
             self._backing[name] = allocation
             self._states[name] = state
 
@@ -65,7 +86,9 @@ class PrefixCache:
             fields, values = [], []
             for field, tensor in state.tensors.items():
                 buffers = (
-                    tensor.buffers() if isinstance(tensor, QuantizedTensor) else {"values": tensor}
+                    tensor.buffers()
+                    if isinstance(tensor, QuantizedTensor)
+                    else {"values": tensor}
                 )
                 for key, backing in buffers.items():
                     value = int(key in {"scale", "tensor_scale"})
@@ -73,20 +96,27 @@ class PrefixCache:
                         backing.fill_(1)
                     # Zero bytes cover encoded values and metadata without
                     # depending on arithmetic support for their storage dtype.
-                    fields.append(backing if value else backing.view(torch.uint8))
+                    fields.append(
+                        backing if value else backing.view(torch.uint8)
+                    )
                     values.append(value)
                 fields.append(state.initialized[field])
                 values.append(0)
             self._fills[name] = BlockFill(tuple(fields), tuple(values))
 
     def state(self, name: str) -> State:
-        """Borrow one layer's state while retaining this owner through its use."""
+        """Borrow one layer's state.
 
+        Borrow one layer's state while retaining this owner through its use.
+        """
         return self._states[name]
 
     def zero_blocks(self, name: str, blocks: tuple[int, ...]) -> None:
-        """Reset caller-selected blocks and their encoding initialization state."""
+        """Reset caller-selected blocks.
 
+        Reset caller-selected blocks and their encoding initialization
+        state.
+        """
         state = self.state(name)
         _blocks(blocks, next(iter(state.tensors.values())).shape[0])
 
@@ -105,20 +135,27 @@ class PrefixCache:
     def mark_initialized(
         self, name: str, blocks: tuple[int, ...], *, fields: tuple[str, ...]
     ) -> None:
-        """Commit externally transferred values and scales for specified fields."""
+        """Commit externally transferred fields.
 
+        Commit externally transferred values and scales for specified
+        fields.
+        """
         state = self.state(name)
         _blocks(blocks, next(iter(state.tensors.values())).shape[0])
         if any(field not in state.initialized for field in fields):
-            raise ValueError("initialized fields must belong to the selected state")
+            raise ValueError(
+                "initialized fields must belong to the selected state"
+            )
 
         for field in fields:
             for block in blocks:
                 state.initialized[field][block] = True
 
     def close(self) -> None:
-        """Release owner references after the caller has retired borrowed uses."""
+        """Release owner references.
 
+        Release owner references after the caller has retired borrowed uses.
+        """
         self._states.clear()
         self._fills.clear()
         for allocation in self._backing.values():

@@ -1,4 +1,7 @@
-"""Public execution contexts bind direct communicators to Green Context streams."""
+"""Public execution contexts bind direct communicators.
+
+The communicators bind to Green Context streams.
+"""
 
 from pathlib import Path
 
@@ -23,9 +26,13 @@ class _Collectives(nn.Module):
         group = mesh.get_group("tokens")
         self.group = group
         self.register_buffer("reference", torch.empty(0, device=group.device))
-        self.projection = ColumnParallelLinear(4, 4, bias=False, device=group.device)
+        self.projection = ColumnParallelLinear(
+            4, 4, bias=False, device=group.device
+        )
         parallelize_(
-            self.projection, mesh, attention=AttentionParallelConfig(heads=Ulysses("tokens"))
+            self.projection,
+            mesh,
+            attention=AttentionParallelConfig(heads=Ulysses("tokens")),
         )
         self.projection.weight = nn.Parameter(
             torch.eye(4, device=group.device), requires_grad=False
@@ -35,9 +42,13 @@ class _Collectives(nn.Module):
         group = self.group
         half = value.shape[0] // 2
         destination = (
-            value.new_empty((2 * value.shape[0], value.shape[1])) if group.rank == 0 else None
+            value.new_empty((2 * value.shape[0], value.shape[1]))
+            if group.rank == 0
+            else None
         )
-        projected = value.new_empty((group.size * value.shape[0], value.shape[1]))
+        projected = value.new_empty(
+            (group.size * value.shape[0], value.shape[1])
+        )
         total = None
         start = group.rank * value.shape[0]
         for interval, chunk in self.projection.forward_chunks(
@@ -57,10 +68,15 @@ class _Collectives(nn.Module):
             group.all_gather(value),
             group.broadcast(value, src=0, out=torch.empty_like(value)),
             group.reduce_scatter(value),
-            group.all_to_all(value, input_splits=(half, half), output_splits=(half, half)),
+            group.all_to_all(
+                value, input_splits=(half, half), output_splits=(half, half)
+            ),
             group.gather(value, dst=0, out=destination),
             group.send_recv(
-                value, dst=1 - group.rank, src=1 - group.rank, out=torch.empty_like(value)
+                value,
+                dst=1 - group.rank,
+                src=1 - group.rank,
+                out=torch.empty_like(value),
             ),
             projected,
             total,
@@ -79,7 +95,8 @@ def _run_collectives(rank: int, rendezvous: str):
         init_method=rendezvous,
     ) as environment:
         mesh = environment.bind(
-            DeviceMesh(ranks=(1, 0), shape=(2,), axes=("tokens",), rank=rank), device=device
+            DeviceMesh(ranks=(1, 0), shape=(2,), axes=("tokens",), rank=rank),
+            device=device,
         )
         group = mesh.get_group("tokens")
         module = _Collectives(mesh)
@@ -93,7 +110,9 @@ def _run_collectives(rank: int, rendezvous: str):
                     for rows in (2, 4):
                         context.prepare(TextSize(2 * rows, 1))
                         value = (
-                            torch.arange(rows * 4, dtype=torch.float32, device=device).view(rows, 4)
+                            torch.arange(
+                                rows * 4, dtype=torch.float32, device=device
+                            ).view(rows, 4)
                             + rank * 10
                         )
                         module(value)
@@ -101,19 +120,25 @@ def _run_collectives(rank: int, rendezvous: str):
                             graph.capture(lambda: module(value))
                             for iteration in range(2):
                                 value.copy_(
-                                    torch.arange(rows * 4, device=device).view(rows, 4)
+                                    torch.arange(rows * 4, device=device).view(
+                                        rows, 4
+                                    )
                                     + rank * 10
                                     + iteration
                                 )
                                 actual = graph.replay()
                                 green.stream.synchronize()
                                 base = (
-                                    torch.arange(rows * 4, dtype=torch.float32, device=device).view(
-                                        rows, 4
-                                    )
+                                    torch.arange(
+                                        rows * 4,
+                                        dtype=torch.float32,
+                                        device=device,
+                                    ).view(rows, 4)
                                     + iteration
                                 )
-                                peers = [base + member * 10 for member in group.ranks]
+                                peers = [
+                                    base + member * 10 for member in group.ranks
+                                ]
                                 expected = (
                                     base * 2 + 10,
                                     base + 10,
@@ -121,13 +146,22 @@ def _run_collectives(rank: int, rendezvous: str):
                                     torch.cat(peers),
                                     base + 10,
                                     (base * 2 + 10).chunk(2)[group.rank],
-                                    torch.cat([peer.chunk(2)[group.rank] for peer in peers]),
-                                    torch.cat(peers) if group.rank == 0 else None,
+                                    torch.cat(
+                                        [
+                                            peer.chunk(2)[group.rank]
+                                            for peer in peers
+                                        ]
+                                    ),
+                                    torch.cat(peers)
+                                    if group.rank == 0
+                                    else None,
                                     base + (1 - rank) * 10,
                                     torch.cat(peers),
                                     base * 2 + 10,
                                 )
-                                for result, reference in zip(actual, expected, strict=True):
+                                for result, reference in zip(
+                                    actual, expected, strict=True
+                                ):
                                     if reference is None:
                                         assert result is None
                                     else:
@@ -140,5 +174,9 @@ def _run_collectives(rank: int, rendezvous: str):
                 green.close()
 
 
-def test_stream_collectives_preserve_values_and_rank_order_under_capture(tmp_path: Path):
-    mp.spawn(_run_collectives, ((tmp_path / "world").as_uri(),), nprocs=2, join=True)
+def test_stream_collectives_preserve_values_and_rank_order_under_capture(
+    tmp_path: Path,
+):
+    mp.spawn(
+        _run_collectives, ((tmp_path / "world").as_uri(),), nprocs=2, join=True
+    )

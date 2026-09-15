@@ -35,15 +35,25 @@ class TransformerLayer(nn.Module):
             self.input_norms[route] = RMSNorm(hidden, config.rms_norm_eps)
             self.projections[route] = RotaryQKVProjection(
                 QKVParallelLinear(
-                    hidden, config.num_attention_heads, config.num_key_value_heads, dim, bias=True
+                    hidden,
+                    config.num_attention_heads,
+                    config.num_key_value_heads,
+                    dim,
+                    bias=True,
                 ),
-                RMSNorm(dim, config.rms_norm_eps) if config.qk_norm else nn.Identity(),
-                RMSNorm(dim, config.rms_norm_eps) if config.qk_norm else nn.Identity(),
+                RMSNorm(dim, config.rms_norm_eps)
+                if config.qk_norm
+                else nn.Identity(),
+                RMSNorm(dim, config.rms_norm_eps)
+                if config.qk_norm
+                else nn.Identity(),
             )
             self.outputs[route] = RowParallelLinear(
                 config.num_attention_heads * dim, hidden, bias=False
             )
-            self.post_attention_norms[route] = RMSNorm(hidden, config.rms_norm_eps)
+            self.post_attention_norms[route] = RMSNorm(
+                hidden, config.rms_norm_eps
+            )
             self.mlps[route] = GatedMLP(hidden, config.intermediate_size)
         self.attention = Attention(
             config.num_attention_heads,
@@ -68,31 +78,40 @@ class TransformerLayer(nn.Module):
         # All routes share one temporal rotary domain; only the expert
         # projections, outputs, and MLPs differ per route.
         temporal = positions if positions.ndim == 1 else positions[0]
-        cosine, sine = self.rotary(temporal, dtype=torch.float32, sequence_length=temporal.numel())
+        cosine, sine = self.rotary(
+            temporal, dtype=torch.float32, sequence_length=temporal.numel()
+        )
         route_names = frozenset(hidden.values)
         cos = RoutedTensor.from_packed(cosine, routes, routes=route_names)
         sin = RoutedTensor.from_packed(sine, routes, routes=route_names)
 
         projected = {
-            route: self.projections[route](value, (cos.values[route],), (sin.values[route],))
+            route: self.projections[route](
+                value, (cos.values[route],), (sin.values[route],)
+            )
             for route, value in normalized.values.items()
         }
         query, key, value = (
-            RoutedTensor({route: values[index] for route, values in projected.items()}).packed(
-                routes
-            )
+            RoutedTensor(
+                {route: values[index] for route, values in projected.items()}
+            ).packed(routes)
             for index in range(3)
         )
 
         attended = self.attention(query, key, value, attention).flatten(1)
-        update = RoutedTensor.from_packed(attended, routes, routes=route_names).apply(self.outputs)
+        update = RoutedTensor.from_packed(
+            attended, routes, routes=route_names
+        ).apply(self.outputs)
         residual = hidden.add(update)
 
         normalized = residual.apply(self.post_attention_norms)
         # The checkpoint's expert FFNs consume BF16 normalization results,
         # including when their surrounding accumulation is higher precision.
         normalized = RoutedTensor(
-            {route: value.to(torch.bfloat16) for route, value in normalized.values.items()}
+            {
+                route: value.to(torch.bfloat16)
+                for route, value in normalized.values.items()
+            }
         )
         return normalized.apply(self.mlps), residual
 

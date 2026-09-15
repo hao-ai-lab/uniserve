@@ -33,24 +33,30 @@ def test_declared_scratch_borrows_compact_views():
     from uniserve.runtime.tensor_buffers import TensorBuffers
 
     storage = TensorBuffers.allocate(
-        {"rows": BufferConfig((2, 3), torch.float32, capacity_shape=(4, 6))}, device="cpu"
+        {"rows": BufferConfig((2, 3), torch.float32, capacity_shape=(4, 6))},
+        device="cpu",
     )
     storage.view({"rows": BufferConfig((4, 6), torch.float32)})["rows"].copy_(
         torch.arange(24).reshape(4, 6)
     )
     views = storage.view({"rows": BufferConfig((2, 3), torch.float32)})
-    torch.testing.assert_close(views["rows"], torch.arange(6).float().reshape(2, 3))
+    torch.testing.assert_close(
+        views["rows"], torch.arange(6).float().reshape(2, 3)
+    )
     views["rows"].add_(10)
     expected = torch.arange(24).float()
     expected[:6] += 10
     torch.testing.assert_close(
-        storage.view({"rows": BufferConfig((4, 6), torch.float32)})["rows"], expected.reshape(4, 6)
+        storage.view({"rows": BufferConfig((4, 6), torch.float32)})["rows"],
+        expected.reshape(4, 6),
     )
     larger = storage.view({"rows": BufferConfig((4, 6), torch.float32)})
     torch.testing.assert_close(larger["rows"], expected.reshape(4, 6))
     with pytest.raises(ValueError, match="capacity"):
         storage.view({"rows": BufferConfig((5, 6), torch.float32)})
-    incompatible = TensorBuffers.from_tensors({"rows": torch.empty((4, 6), dtype=torch.int32)})
+    incompatible = TensorBuffers.from_tensors(
+        {"rows": torch.empty((4, 6), dtype=torch.int32)}
+    )
     with pytest.raises(ValueError, match="dtype"):
         incompatible.view({"rows": BufferConfig((2, 3), torch.float32)})
 
@@ -70,7 +76,11 @@ def test_tensor_capacity_covers_packed_selections_that_move_between_ranks():
         }
 
     storage = TensorBuffers.allocate(fields(16), device="cpu")
-    for prompt, expected in ((16, []), (0, [[0, 1], [2, 3], [4, 5]]), (2, [[0, 1], [2, 3]])):
+    for prompt, expected in (
+        (16, []),
+        (0, [[0, 1], [2, 3], [4, 5]]),
+        (2, [[0, 1], [2, 3]]),
+    ):
         features = storage.view(fields(prompt))["features"]
         features.copy_(torch.arange(features.numel()).reshape_as(features))
         torch.testing.assert_close(
@@ -83,7 +93,11 @@ def test_closed_request_storage_rejects_admission_and_borrowing():
     from uniserve_worker.runtime.request import RequestPool
 
     admission = replace(ar_params(71, block_ids=(0,)), request_pool_idx=1)
-    pool = RequestPool(2, state_buffers={"state": BufferConfig((4,), torch.float32)}, device="cpu")
+    pool = RequestPool(
+        2,
+        state_buffers={"state": BufferConfig((4,), torch.float32)},
+        device="cpu",
+    )
     pool.start(admission)
     pool.close()
     pool.close()
@@ -130,7 +144,9 @@ def test_request_capacity_accounts_for_the_candidate_output_horizon():
         maximum=4,
         minimum=2,
         available_bytes=10_240,
-        auxiliary_bytes=lambda slots: slots * request_tensor_window(12, slots) * 1024,
+        auxiliary_bytes=lambda slots: (
+            slots * request_tensor_window(12, slots) * 1024
+        ),
     )
     assert count == 4
 
@@ -172,18 +188,24 @@ def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:
         kv_token_capacity=1024 + 1,
     )
 
-    layout = build_worker_layout(TEST_MODEL, worker_config, image_processor=image_processor())
+    layout = build_worker_layout(
+        TEST_MODEL, worker_config, image_processor=image_processor()
+    )
 
     expected_pages = ceil_div(
         1024 + 1,
         int(worker_config.block_size),
     )
     assert layout.info.latent_pages == expected_pages + 1
-    assert layout.info.latent_capacity_units == expected_pages * int(worker_config.block_size)
+    assert layout.info.latent_capacity_units == expected_pages * int(
+        worker_config.block_size
+    )
 
 
 def test_persistent_buffer_capacity_includes_active_encoder_output() -> None:
-    layout = build_worker_layout(TEST_MODEL, TEST_WORKER_CONFIG, image_processor=image_processor())
+    layout = build_worker_layout(
+        TEST_MODEL, TEST_WORKER_CONFIG, image_processor=image_processor()
+    )
     feature_bytes = max(
         layout.max_latent_feature_bytes,
         layout.max_vision_feature_bytes,
@@ -194,9 +216,13 @@ def test_persistent_buffer_capacity_includes_active_encoder_output() -> None:
     )
 
 
-def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() -> None:
+def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() -> (  # noqa: E501
+    None
+):
     worker_config = replace(TEST_WORKER_CONFIG, model_dtype="float32")
-    layout = build_worker_layout(TEST_MODEL, worker_config, image_processor=image_processor())
+    layout = build_worker_layout(
+        TEST_MODEL, worker_config, image_processor=image_processor()
+    )
     assert layout.max_latent_feature_bytes == latent_trajectory_bytes(
         1024,
         3 * 16**2,
@@ -238,7 +264,9 @@ def test_worker_worker_config_rejects_invalid_runtime_geometry(worker_config):
     "dtype,axes,message",
     [(torch.float64, (), "dtype"), (torch.float32, (0, 1), "dynamic axes")],
 )
-def test_result_publication_rejects_unrepresentable_numerical_outputs(dtype, axes, message):
+def test_result_publication_rejects_unrepresentable_numerical_outputs(
+    dtype, axes, message
+):
     from tests.python.fixtures.encoding import Model as EncodedModel
     from uniserve.model import TextEncoder
     from uniserve.tensors import OutputLayout
@@ -249,7 +277,10 @@ def test_result_publication_rejects_unrepresentable_numerical_outputs(dtype, axe
         def output_layout(self, num_tokens):
             return {
                 "conditioning": OutputLayout(
-                    (2, 3), dtype, (slice(0, 2), slice(0, 3)), variable_axes=axes
+                    (2, 3),
+                    dtype,
+                    (slice(0, 2), slice(0, 3)),
+                    variable_axes=axes,
                 )
             }
 
@@ -269,7 +300,9 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     from uniserve_worker.runtime.buffer_pool import BufferPool
 
     model = EncodedModel(Config(hidden_size=7))
-    config = WorkerConfig(device="cpu", max_sequence_tokens=3, max_request_pool_size=2)
+    config = WorkerConfig(
+        device="cpu", max_sequence_tokens=3, max_request_pool_size=2
+    )
     info = build_worker_layout(
         model,
         config,
@@ -298,7 +331,9 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
                 )
                 binding = arena.bind(
                     product,
-                    BufferAllocation(product.buffer_id, offset, product.max_bytes),
+                    BufferAllocation(
+                        product.buffer_id, offset, product.max_bytes
+                    ),
                     device="cpu",
                     dtype=torch.float32,
                     shape=shape,
@@ -308,7 +343,10 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
                 offset += ((product.max_bytes + 255) // 256) * 256
         for binding, expected in bindings:
             torch.testing.assert_close(
-                binding.tensor, torch.full_like(binding.tensor, expected), rtol=0, atol=0
+                binding.tensor,
+                torch.full_like(binding.tensor, expected),
+                rtol=0,
+                atol=0,
             )
     finally:
         for binding, _expected in bindings:
@@ -316,7 +354,9 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
         arena.close()
 
 
-def test_cuda_capacity_query_failure_is_not_an_empty_budget(monkeypatch) -> None:
+def test_cuda_capacity_query_failure_is_not_an_empty_budget(
+    monkeypatch,
+) -> None:
     from uniserve_worker.bootstrap.capacity import device_total_bytes
 
     def unavailable(_device):
@@ -363,7 +403,9 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
     entries = {
         "encode": ComponentConfig((2,)),
         "predict": ComponentConfig((1,)),
-        "decode": ComponentConfig((1, 3), distribution="temporal_units", units_per_rank=2),
+        "decode": ComponentConfig(
+            (1, 3), distribution="temporal_units", units_per_rank=2
+        ),
         "assemble": ComponentConfig((0,)),
     }
     group = Communicator((0, 1, 2, 3), rank)
@@ -375,8 +417,12 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
             DeviceMesh(
                 ranks=config.ranks,
                 rank=rank,
-                shape=tuple(size for _, size in config.parallel_config.dimensions),
-                axes=tuple(axis for axis, _ in config.parallel_config.dimensions),
+                shape=tuple(
+                    size for _, size in config.parallel_config.dimensions
+                ),
+                axes=tuple(
+                    axis for axis, _ in config.parallel_config.dimensions
+                ),
             )
             if config.distribution is None and rank in config.ranks
             else None,
@@ -386,10 +432,18 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
         if name in worker_entries
     }
     outputs = {
-        "encode": (OutputInfo("embedding", DType.F32, ShapeBound((StaticDim(128),))),),
-        "predict": (OutputInfo("latents", DType.F32, ShapeBound((StaticDim(256),))),),
+        "encode": (
+            OutputInfo("embedding", DType.F32, ShapeBound((StaticDim(128),))),
+        ),
+        "predict": (
+            OutputInfo("latents", DType.F32, ShapeBound((StaticDim(256),))),
+        ),
         "decode": (
-            OutputInfo("frames", DType.F32, ShapeBound((DeviceDim(20), StaticDim(streamed_width)))),
+            OutputInfo(
+                "frames",
+                DType.F32,
+                ShapeBound((DeviceDim(20), StaticDim(streamed_width))),
+            ),
         ),
     }
     components = {
@@ -421,7 +475,10 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
         },
     }[worker_entries]
     assert local_product_storage_bytes(
-        outputs, bindings=bindings, pipeline_components=components, max_unresolved_ops=2
+        outputs,
+        bindings=bindings,
+        pipeline_components=components,
+        max_unresolved_ops=2,
     ) == expected.get(rank, 0)
     # A horizon beyond the complete trajectory never reserves extra units.
     expected_full = {
@@ -435,10 +492,17 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
         ("predict",): {1: 1536},
         ("decode",): {1: 1024 + full_bytes, 3: 1024 + full_bytes},
         ("assemble",): {0: import_bytes},
-        ("decode", "assemble"): {0: full_bytes, 1: 1024 + full_bytes, 3: 1024 + full_bytes},
+        ("decode", "assemble"): {
+            0: full_bytes,
+            1: 1024 + full_bytes,
+            3: 1024 + full_bytes,
+        },
     }[worker_entries]
     assert local_product_storage_bytes(
-        outputs, bindings=bindings, pipeline_components=components, max_unresolved_ops=8
+        outputs,
+        bindings=bindings,
+        pipeline_components=components,
+        max_unresolved_ops=8,
     ) == expected_full.get(rank, 0)
 
 

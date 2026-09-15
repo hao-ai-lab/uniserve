@@ -29,7 +29,7 @@ class Attention(nn.Module):
         inner = config.num_attention_heads * config.head_dim
         self.projection = MergedColumnParallelLinear(
             config.hidden_size,
-            {name: inner for name in ("q", "k", "v", "gate")},
+            dict.fromkeys(("q", "k", "v", "gate"), inner),
             branch_width=config.head_dim,
             bias=False,
         )
@@ -52,23 +52,39 @@ class Attention(nn.Module):
             or num_query_tokens % 64
             or num_query_tokens > num_tokens
         ):
-            raise ValueError("H3 attention requires complete query and key tiles")
+            raise ValueError(
+                "H3 attention requires complete query and key tiles"
+            )
 
         # VSA addresses keys and queries in 64-token tiles; each query tile
         # attends to `selected` of the key tiles after sparsification.
-        heads = self.projection.projections["q"].weight.shape[0] // self.head_dim
+        heads = (
+            self.projection.projections["q"].weight.shape[0] // self.head_dim
+        )
         queries, keys = num_query_tokens // 64, num_tokens // 64
         selected = max(1, math.ceil((1 - self.sparsity) * keys))
         return {
-            "attention_output": BufferConfig((num_query_tokens, heads, self.head_dim), dtype),
+            "attention_output": BufferConfig(
+                (num_query_tokens, heads, self.head_dim), dtype
+            ),
             "tile_scores": BufferConfig((heads, queries, keys), torch.float32),
             "block_counts": BufferConfig((heads, queries), torch.int32),
             "block_indices": BufferConfig((heads, queries, keys), torch.int32),
-            "pooled_query": BufferConfig((queries, heads, self.head_dim), torch.float32),
-            "pooled_key": BufferConfig((keys, heads, self.head_dim), torch.float32),
-            "pooled_value": BufferConfig((keys, heads, self.head_dim), torch.float32),
-            "compressed_tiles": BufferConfig((heads, queries, self.head_dim), torch.float32),
-            "topk_indices": BufferConfig((heads, queries, selected), torch.int32),
+            "pooled_query": BufferConfig(
+                (queries, heads, self.head_dim), torch.float32
+            ),
+            "pooled_key": BufferConfig(
+                (keys, heads, self.head_dim), torch.float32
+            ),
+            "pooled_value": BufferConfig(
+                (keys, heads, self.head_dim), torch.float32
+            ),
+            "compressed_tiles": BufferConfig(
+                (heads, queries, self.head_dim), torch.float32
+            ),
+            "topk_indices": BufferConfig(
+                (heads, queries, selected), torch.int32
+            ),
         }
 
     @torch.inference_mode()
@@ -89,7 +105,11 @@ class Attention(nn.Module):
             ):
                 # Each branch is [tokens, heads, head_dim].
                 q, k, v, gate = (
-                    values[name].view(-1, values[name].shape[-1] // self.head_dim, self.head_dim)
+                    values[name].view(
+                        -1,
+                        values[name].shape[-1] // self.head_dim,
+                        self.head_dim,
+                    )
                     for name in ("q", "k", "v", "gate")
                 )
                 q, k = qk_norm_rope(
@@ -109,12 +129,15 @@ class Attention(nn.Module):
         distribution = self.projection.projections["q"].output_distribution
         context = distribution.mesh.get_group(distribution.shard_axes(0))
 
-        # Video-domain query tiles owned by this rank: this rank's contiguous
-        # tile range intersected with the video tiles behind the text/audio prefix.
+        # Video-domain query tiles owned by this rank: this rank's
+        # contiguous tile range intersected with the video tiles behind the
+        # text/audio prefix.
         query_tiles = batch.padded_tokens // (64 * context.size)
         start = context.rank * query_tiles
         video_queries = max(
-            0, min(start + query_tiles, batch.valid_tiles) - max(start, batch.prefix_tiles)
+            0,
+            min(start + query_tiles, batch.valid_tiles)
+            - max(start, batch.prefix_tiles),
         )
         selected = max(1, math.ceil((1 - self.sparsity) * batch.video_tiles))
 
@@ -122,7 +145,9 @@ class Attention(nn.Module):
         # shared flat top-k workspace.
         heads = workspace["attention_output"].shape[1]
         shape = (heads, video_queries, selected)
-        topk = workspace["topk_indices"].view(-1)[: math.prod(shape)].view(shape)
+        topk = (
+            workspace["topk_indices"].view(-1)[: math.prod(shape)].view(shape)
+        )
         buffers = vsa.Workspace(
             **{
                 name: workspace[name]
@@ -142,11 +167,16 @@ class Attention(nn.Module):
         attended = self.vsa.forward_chunks(
             project(), batch, selected_tiles=selected, workspace=buffers
         )
-        flattened = ((interval, value.flatten(1)) for interval, value in attended)
+        flattened = (
+            (interval, value.flatten(1)) for interval, value in attended
+        )
         yield from self.output.forward_chunks(flattened)
 
     def forward(self, hidden, cos, sin, inputs, *, workspace):
         outputs = tuple(
-            value for _, value in self.forward_chunks(hidden, cos, sin, inputs, workspace=workspace)
+            value
+            for _, value in self.forward_chunks(
+                hidden, cos, sin, inputs, workspace=workspace
+            )
         )
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)

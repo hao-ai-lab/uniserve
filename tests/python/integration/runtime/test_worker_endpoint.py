@@ -63,7 +63,9 @@ def test_endpoint_scope_closes_and_preserves_body_error(failing_scope):
     except RuntimeError as error:
         assert error is failure
     else:
-        assert not failing_scope, "endpoint scope suppressed the startup exception"
+        assert not failing_scope, (
+            "endpoint scope suppressed the startup exception"
+        )
     assert endpoint.closed
     with WorkerIpcEndpoint(service, max_payload=65536) as replacement:
         assert replacement.try_recv() is None
@@ -136,10 +138,14 @@ def test_worker_preserves_a_caller_owned_process_group(tmp_path, failure):
     from uniserve_worker.foundation.errors import WorkerError, WorkerErrorCode
     from uniserve_worker.worker import Worker
 
-    dist.init_process_group("gloo", init_method=f"file://{tmp_path}/world", rank=0, world_size=1)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path}/world", rank=0, world_size=1
+    )
     try:
         if failure == "model_loading":
-            with pytest.raises(FileNotFoundError, match="modular_model_index.json"):
+            with pytest.raises(
+                FileNotFoundError, match="modular_model_index.json"
+            ):
                 Worker.from_config(_model_config("borrowed-world", tmp_path))
         elif failure == "process_world":
             with pytest.raises(WorkerError, match="rank/world_size") as raised:
@@ -181,11 +187,18 @@ def _owned_world(rank, directory):
                 use_stub_model=False,
                 model=ModelLaunchConfig(directory, {}),
             )
-            with pytest.raises(FileNotFoundError, match="modular_model_index.json"):
+            with pytest.raises(
+                FileNotFoundError, match="modular_model_index.json"
+            ):
                 Worker.from_config(config)
         elif failure == "execution_setup":
-            config = replace(config, data_plane=replace(config.data_plane, publication_backends=()))
-            with pytest.raises(WorkerError, match="publication backends must be unique"):
+            config = replace(
+                config,
+                data_plane=replace(config.data_plane, publication_backends=()),
+            )
+            with pytest.raises(
+                WorkerError, match="publication backends must be unique"
+            ):
                 Worker.from_config(config)
         else:
             with Worker.from_config(config):
@@ -265,7 +278,8 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
         assert raised.value is failure
         if cleanup_fails:
             assert any(
-                "CUDA context teardown reported failure" in note for note in failure.__notes__
+                "CUDA context teardown reported failure" in note
+                for note in failure.__notes__
             )
 
     with execution_worker(device="cuda:0", execution=policy) as worker:

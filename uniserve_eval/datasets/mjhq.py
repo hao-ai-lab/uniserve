@@ -21,7 +21,6 @@ class MJHQDataset(Dataset):
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
         """Select seeded prompt entries from local or downloaded metadata."""
-
         point = self.point
         path = point.dataset_path or ""
         if not (path and os.path.isfile(path)):

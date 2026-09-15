@@ -15,26 +15,41 @@ from uniserve_models.loading import load_model, read_config
 
 @torch.inference_mode()
 def decode_video(
-    checkpoint: str, latents: torch.Tensor, *, frames: int, device: str = "cuda:0"
+    checkpoint: str,
+    latents: torch.Tensor,
+    *,
+    frames: int,
+    device: str = "cuda:0",
 ) -> torch.Tensor:
-    """Return CPU uint8 [frames, 768, 1344, 3] pixels from complete H3 video rows.
+    """Return CPU pixels from complete H3 video rows.
 
-    Input is the final FP32 video modality in tile-major canonical order, with
+    Pixels are uint8 with shape [frames, 768, 1344, 3]. Input is the final
+    FP32 video modality in tile-major canonical order, with
     shape [((frames - 5) // 17 * 5 + 2) * 24 * 42, 96]. Sequence shards must
     already be joined in logical order. Frames have the form 17 * n + 5, n >= 1.
     Only the video decoder and postprocessor checkpoint modules are loaded.
     """
-
     if frames < 22 or frames % 17 != 5:
-        raise ValueError("H3 frames must be at least 22 and have the form 17 * n + 5")
+        raise ValueError(
+            "H3 frames must be at least 22 and have the form 17 * n + 5"
+        )
     expected = (((frames - 5) // 17 * 5 + 2) * 24 * 42, 96)
     if latents.dtype != torch.float32 or tuple(latents.shape) != expected:
-        raise ValueError(f"H3 video latents must be float32 with shape {expected}")
-    config = read_config(checkpoint, modules=frozenset({"video_decoder", "video_postprocessor"}))
+        raise ValueError(
+            f"H3 video latents must be float32 with shape {expected}"
+        )
+    config = read_config(
+        checkpoint, modules=frozenset({"video_decoder", "video_postprocessor"})
+    )
     model = load_model(config, device=device, precision="quality").model
     decoder, postprocessor = model.video_decoder, model.video_postprocessor
-    if not isinstance(decoder, VideoDecoder) or not isinstance(postprocessor, VideoPostprocessor):
-        raise TypeError("video reconstruction requires decoder and postprocessor capabilities")
+    if not isinstance(decoder, VideoDecoder) or not isinstance(
+        postprocessor, VideoPostprocessor
+    ):
+        raise TypeError(
+            "video reconstruction requires decoder "
+            "and postprocessor capabilities"
+        )
     requirements = postprocessor.state_buffers(frames)
     with (
         ExecutionContext(decoder) as decoding,
@@ -49,9 +64,13 @@ def decode_video(
         source = latents.to(device)
         outputs = []
         for interval in decoder.frame_slices(frames):
-            decoded = decoder_runner.decode((source,), frames=(interval,), num_frames=(frames,))
+            decoded = decoder_runner.decode(
+                (source,), frames=(interval,), num_frames=(frames,)
+            )
             if decoded[0] is None:
-                raise RuntimeError("local video reconstruction returned no tensor")
+                raise RuntimeError(
+                    "local video reconstruction returned no tensor"
+                )
             output = pixel_runner.forward(
                 decoded,
                 frames=(interval,),
@@ -74,10 +93,17 @@ def main() -> None:
     args = parser.parse_args()
     latents = torch.load(args.latents, map_location="cpu", weights_only=True)
     if not isinstance(latents, torch.Tensor):
-        raise TypeError("the latent file must contain one complete video tensor")
-    pixels = decode_video(args.checkpoint, latents, frames=args.frames, device=args.device)
+        raise TypeError(
+            "the latent file must contain one complete video tensor"
+        )
+    pixels = decode_video(
+        args.checkpoint, latents, frames=args.frames, device=args.device
+    )
     torch.save(pixels, args.output)
-    print(f"Saved {tuple(pixels.shape)} {pixels.dtype} RGB pixels to {args.output}")
+    print(
+        f"Saved {tuple(pixels.shape)} {pixels.dtype} "
+        f"RGB pixels to {args.output}"
+    )
 
 
 if __name__ == "__main__":

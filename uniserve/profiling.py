@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
-from typing import Any, Iterator
+from typing import Any
 
 from .env import flag_from_value
 
@@ -30,9 +31,13 @@ def profile_range(debug_name: str):
 
 
 @contextmanager
-def _profile_range_impl(debug_name: str, *, record: bool, nvtx: bool) -> Iterator[None]:
-    """Enter configured record-function and NVTX ranges around one code region."""
+def _profile_range_impl(
+    debug_name: str, *, record: bool, nvtx: bool
+) -> Iterator[None]:
+    """Enter configured record-function and NVTX ranges.
 
+    Around one code region.
+    """
     with ExitStack() as stack:
         if record and torch is not None:
             stack.enter_context(torch.profiler.record_function(debug_name))
@@ -44,7 +49,6 @@ def _profile_range_impl(debug_name: str, *, record: bool, nvtx: bool) -> Iterato
 
 def _torch_profiler_enabled() -> bool:
     """Return whether PyTorch autograd profiling is currently active."""
-
     if torch is None:
         return False
     enabled = getattr(torch.autograd, "_profiler_enabled", None)
@@ -53,7 +57,6 @@ def _torch_profiler_enabled() -> bool:
 
 def _nvtx_ranges_enabled() -> bool:
     """Return whether environment policy enables NVTX range emission."""
-
     if torch is None:
         return False
     if not torch.cuda.is_available():

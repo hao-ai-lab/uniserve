@@ -1,4 +1,7 @@
-"""Shared causal-language-model composition and explicit vocabulary projection."""
+"""Shared causal-language-model composition.
+
+And explicit vocabulary projection.
+"""
 
 import torch
 from torch import nn
@@ -29,12 +32,18 @@ class CausalLM(nn.Module):
             if inputs.embeddings is not None:
                 replacement = inputs.embeddings
                 hidden = torch.where(
-                    replacement.mask.reshape(-1, 1), replacement.values.to(hidden.dtype), hidden
+                    replacement.mask.reshape(-1, 1),
+                    replacement.values.to(hidden.dtype),
+                    hidden,
                 )
 
-        return self.backbone(hidden, inputs.positions, inputs.attention, routes=inputs.routes)
+        return self.backbone(
+            hidden, inputs.positions, inputs.attention, routes=inputs.routes
+        )
 
-    def compute_logits(self, hidden: torch.Tensor, *, token_indices: torch.Tensor) -> Logits | None:
+    def compute_logits(
+        self, hidden: torch.Tensor, *, token_indices: torch.Tensor
+    ) -> Logits | None:
         """Project caller-selected token rows on the final pipeline stage.
 
         Empty selections remain empty. Vocabulary columns stay local until the
@@ -44,7 +53,10 @@ class CausalLM(nn.Module):
         if pipeline.rank != pipeline.size - 1:
             return None
         if hidden.ndim != 2 or token_indices.ndim != 1:
-            raise ValueError("logits require packed hidden rows and one-dimensional token indices")
+            raise ValueError(
+                "logits require packed hidden rows and one-dimensional token "
+                "indices"
+            )
         if token_indices.dtype not in {torch.int32, torch.int64}:
             raise ValueError("token indices must be integers")
 

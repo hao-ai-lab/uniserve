@@ -111,8 +111,13 @@ class Config:
     def __post_init__(self) -> None:
         for name in ("latents_mean", "latents_std"):
             values = getattr(self, name)
-            if not isinstance(values, tuple) or len(values) != self.latent_channels:
-                raise ValueError(f"H3 {name} must describe every latent channel")
+            if (
+                not isinstance(values, tuple)
+                or len(values) != self.latent_channels
+            ):
+                raise ValueError(
+                    f"H3 {name} must describe every latent channel"
+                )
             if any(
                 not isinstance(value, (int, float))
                 or isinstance(value, bool)
@@ -136,14 +141,20 @@ class Config:
             "clip_length",
         ):
             value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+            ):
                 raise ValueError(f"H3 video {name} must be a positive integer")
         if (
             not isinstance(self.token_drop, int)
             or isinstance(self.token_drop, bool)
             or self.token_drop < 0
         ):
-            raise ValueError("H3 video token_drop must be a non-negative integer")
+            raise ValueError(
+                "H3 video token_drop must be a non-negative integer"
+            )
         for name in (
             "block_out_channels",
             "spatial_downsample_factors",
@@ -154,11 +165,15 @@ class Config:
                 not isinstance(values, tuple)
                 or not values
                 or any(
-                    not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value <= 0
                     for value in values
                 )
             ):
-                raise ValueError(f"H3 video {name} must contain positive integers")
+                raise ValueError(
+                    f"H3 video {name} must contain positive integers"
+                )
         if (
             len(
                 {
@@ -169,7 +184,9 @@ class Config:
             )
             != 1
         ):
-            raise ValueError("H3 video encoder stages must have matching widths and strides")
+            raise ValueError(
+                "H3 video encoder stages must have matching widths and strides"
+            )
         for name in (
             "norm_eps",
             "decoder_norm_eps",
@@ -184,14 +201,22 @@ class Config:
                 or value <= 0
             ):
                 raise ValueError(f"H3 video {name} must be finite and positive")
-        rotary_width = self.decoder_attention_head_dim * self.decoder_rope_dim_ratio
+        rotary_width = (
+            self.decoder_attention_head_dim * self.decoder_rope_dim_ratio
+        )
         if (
             self.decoder_rope_dim_ratio > 1
             or rotary_width != int(rotary_width)
             or int(rotary_width) % 6
         ):
-            raise ValueError("H3 video rotary width must divide into three even axes")
-        if self.spatial_padding_mode not in {"reflect", "replicate", "constant"}:
+            raise ValueError(
+                "H3 video rotary width must divide into three even axes"
+            )
+        if self.spatial_padding_mode not in {
+            "reflect",
+            "replicate",
+            "constant",
+        }:
             raise ValueError("unsupported H3 video spatial padding mode")
 
     @property
@@ -204,7 +229,7 @@ class Config:
 
 
 def _encoded_input(layer, hidden, maximum):
-    """Quantize a projection input, reusing the caller's tensor-wide amax if any."""
+    """Quantize a projection input, reusing the caller's tensor-wide amax if any."""  # noqa: E501
     quantizer = layer.input_quantizer
     if quantizer is None or isinstance(hidden, QuantizedTensor):
         return hidden
@@ -213,12 +238,14 @@ def _encoded_input(layer, hidden, maximum):
     if quantizer.axis is not None or quantizer.format == "mxfp8":
         maximum = None
     return quantizer.quantize(
-        hidden.reshape(-1, hidden.shape[-1]), distribution=layer.input_distribution, amax=maximum
+        hidden.reshape(-1, hidden.shape[-1]),
+        distribution=layer.input_distribution,
+        amax=maximum,
     )
 
 
 def _project(layer, hidden, maximum=None):
-    """Keep encoded projection bias for the VAE's FP32 affine/residual equation."""
+    """Keep encoded projection bias for the VAE's FP32 affine/residual equation."""  # noqa: E501
     if not isinstance(layer.weight, QuantizedTensor):
         return layer(hidden), None
     inputs = _encoded_input(layer, hidden, maximum)
@@ -241,28 +268,37 @@ def _project_branches(projection, hidden, maximum=None):
         }
     inputs = _encoded_input(branches[0], hidden, maximum)
     deferred = {
-        name: branch.bias if isinstance(branch.weight, QuantizedTensor) else None
+        name: branch.bias
+        if isinstance(branch.weight, QuantizedTensor)
+        else None
         for name, branch in projection.projections.items()
     }
     outputs = functional.merged_linear(
         inputs,
-        {name: branch.weight for name, branch in projection.projections.items()},
         {
-            name: None if isinstance(branch.weight, QuantizedTensor) else branch.bias
+            name: branch.weight
+            for name, branch in projection.projections.items()
+        },
+        {
+            name: None
+            if isinstance(branch.weight, QuantizedTensor)
+            else branch.bias
             for name, branch in projection.projections.items()
         },
         branch_width=projection.branch_width,
         output_dtype=hidden.dtype,
     )
     return {
-        name: value.reshape(*hidden.shape[:-1], value.shape[-1]) for name, value in outputs.items()
+        name: value.reshape(*hidden.shape[:-1], value.shape[-1])
+        for name, value in outputs.items()
     }, deferred
 
 
 def _feed_forward(mlp, hidden, maximum=None):
     projections = (*mlp.gate_up.projections.values(), mlp.down)
     if all(
-        not isinstance(projection.weight, QuantizedTensor) and projection.input_quantizer is None
+        not isinstance(projection.weight, QuantizedTensor)
+        and projection.input_quantizer is None
         for projection in projections
     ):
         # Dense projections already apply their biases before activation.
@@ -286,7 +322,11 @@ def _feed_forward(mlp, hidden, maximum=None):
         )
     )
     quantizer = mlp.down.input_quantizer
-    if quantizer is not None and quantizer.axis is None and quantizer.format != "mxfp8":
+    if (
+        quantizer is not None
+        and quantizer.axis is None
+        and quantizer.format != "mxfp8"
+    ):
         activated, maximum = value_first_swiglu_absmax(packed, bias)
     else:
         activated, maximum = value_first_swiglu(packed, bias), None
@@ -299,9 +339,16 @@ class TransformerLayer(nn.Module):
 
     def __init__(self, config: Config):
         super().__init__()
-        width = config.decoder_num_attention_heads * config.decoder_attention_head_dim
-        self.norms = nn.ModuleList(nn.RMSNorm(width, eps=config.decoder_norm_eps) for _ in range(2))
-        self.scales = nn.ParameterList(nn.Parameter(torch.empty(width)) for _ in range(2))
+        width = (
+            config.decoder_num_attention_heads
+            * config.decoder_attention_head_dim
+        )
+        self.norms = nn.ModuleList(
+            nn.RMSNorm(width, eps=config.decoder_norm_eps) for _ in range(2)
+        )
+        self.scales = nn.ParameterList(
+            nn.Parameter(torch.empty(width)) for _ in range(2)
+        )
         self.qkv = QKVParallelLinear(
             width,
             config.decoder_num_attention_heads,
@@ -321,7 +368,8 @@ class TransformerLayer(nn.Module):
         batch, sequence, _ = hidden.shape
         dim = self.qkv.head_dim
         query, key, value = (
-            projections[name].reshape(batch, sequence, -1, dim) for name in ("q", "k", "v")
+            projections[name].reshape(batch, sequence, -1, dim)
+            for name in ("q", "k", "v")
         )
         qk_rms_norm_partial_rope_(
             query,
@@ -343,7 +391,9 @@ class TransformerLayer(nn.Module):
             self.output, attended.transpose(1, 2).reshape(batch, sequence, -1)
         )
 
-        quantized = isinstance(self.mlp.gate_up.projections["gate"].weight, QuantizedTensor)
+        quantized = isinstance(
+            self.mlp.gate_up.projections["gate"].weight, QuantizedTensor
+        )
         if quantized:
             hidden, normalized, maximum = scaled_residual_rms_norm_absmax_(
                 hidden,
@@ -372,25 +422,38 @@ class TransformerLayer(nn.Module):
                 hidden, self.norms[0].weight, eps=self.norms[0].eps
             )
         else:
-            normalized = weighted_rms_norm(hidden, self.norms[0].weight, eps=self.norms[0].eps)
+            normalized = weighted_rms_norm(
+                hidden, self.norms[0].weight, eps=self.norms[0].eps
+            )
             maximum = None
-        hidden, update, bias = self._advance(hidden, normalized, cos, sin, maximum)
-        return scaled_residual_(hidden, update, self.scales[1], update_bias=bias)
+        hidden, update, bias = self._advance(
+            hidden, normalized, cos, sin, maximum
+        )
+        return scaled_residual_(
+            hidden, update, self.scales[1], update_bias=bias
+        )
 
 
 class Transformer(nn.Module):
-    """Decode latent tokens and register tokens into spatiotemporal RGB patches."""
+    """Decode latent tokens and register tokens into spatiotemporal RGB patches."""  # noqa: E501
 
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        width = config.decoder_num_attention_heads * config.decoder_attention_head_dim
+        width = (
+            config.decoder_num_attention_heads
+            * config.decoder_attention_head_dim
+        )
         self.input = Linear(config.latent_channels, width)
         self.register_tokens = nn.Parameter(
             torch.empty(1, config.decoder_num_register_tokens, width)
         )
         self.position = RotaryEmbedding(
-            int(config.decoder_attention_head_dim * config.decoder_rope_dim_ratio) // 3,
+            int(
+                config.decoder_attention_head_dim
+                * config.decoder_rope_dim_ratio
+            )
+            // 3,
             theta=config.decoder_rope_theta,
         )
         self.layers = nn.ModuleList(
@@ -398,25 +461,39 @@ class Transformer(nn.Module):
         )
         self.norm = nn.LayerNorm(width, eps=config.decoder_norm_eps)
         self.output = Linear(
-            width, config.out_channels * config.temporal_compression * config.spatial_compression**2
+            width,
+            config.out_channels
+            * config.temporal_compression
+            * config.spatial_compression**2,
         )
 
     def forward(self, latents):
         # [B, C, T, H, W] latents become [B, T*H*W, C] token rows.
         batch, channels, frames, height, width = latents.shape
         hidden = self.input(
-            latents.permute(0, 2, 3, 4, 1).reshape(batch, frames * height * width, channels)
+            latents.permute(0, 2, 3, 4, 1).reshape(
+                batch, frames * height * width, channels
+            )
         )
         compute_dtype = hidden.dtype
         # FP32 register parameters promote the residual stream. The fused
         # normalizations separately select the activation compute dtype.
         # One trailing zero slot completes the checkpoint's token rows.
         registers = self.register_tokens.expand(batch, -1, -1)
-        hidden = torch.cat((hidden, registers, torch.zeros_like(hidden[:, :1])), dim=1)
+        hidden = torch.cat(
+            (hidden, registers, torch.zeros_like(hidden[:, :1])), dim=1
+        )
 
         # Cell-center coordinates in [-1, 1) along each spatiotemporal axis.
         axes = tuple(
-            2.0 * (torch.arange(0.5, size, device=hidden.device, dtype=torch.float32) / size) - 1.0
+            2.0
+            * (
+                torch.arange(
+                    0.5, size, device=hidden.device, dtype=torch.float32
+                )
+                / size
+            )
+            - 1.0
             for size in (frames, height, width)
         )
         positions = (
@@ -425,7 +502,9 @@ class Transformer(nn.Module):
             .unsqueeze(0)
             .expand(batch, -1, -1)
         )
-        suffix = positions.new_zeros((batch, self.config.decoder_num_register_tokens + 1, 3))
+        suffix = positions.new_zeros(
+            (batch, self.config.decoder_num_register_tokens + 1, 3)
+        )
         positions = torch.cat((positions, suffix), dim=1)
         cos, sin = self.position(
             positions * (2.0 * math.pi),
@@ -445,9 +524,13 @@ class Transformer(nn.Module):
                 hidden, first.norms[0].weight, eps=first.norms[0].eps
             )
         else:
-            normalized = weighted_rms_norm(hidden, first.norms[0].weight, eps=first.norms[0].eps)
+            normalized = weighted_rms_norm(
+                hidden, first.norms[0].weight, eps=first.norms[0].eps
+            )
             maximum = None
-        hidden, update, bias = first._advance(hidden, normalized, cos, sin, maximum)
+        hidden, update, bias = first._advance(
+            hidden, normalized, cos, sin, maximum
+        )
         previous = first
         # Keep the unrounded residual sum available to the next normalization.
         for layer in self.layers[1:]:
@@ -470,7 +553,9 @@ class Transformer(nn.Module):
                     eps=layer.norms[0].eps,
                 )
                 maximum = None
-            hidden, update, bias = layer._advance(hidden, normalized, cos, sin, maximum)
+            hidden, update, bias = layer._advance(
+                hidden, normalized, cos, sin, maximum
+            )
             previous = layer
 
         if isinstance(self.output.weight, QuantizedTensor):
@@ -520,14 +605,16 @@ class Decoder(SpatialDecoder):
             overlap_width=64,
         )
         self.config = config
-        self.post_quant_conv = nn.Conv3d(config.latent_channels, config.latent_channels, 1)
+        self.post_quant_conv = nn.Conv3d(
+            config.latent_channels, config.latent_channels, 1
+        )
 
     def forward(self, latents):
         return self.decoder(self.post_quant_conv(latents))
 
 
 class Model(LatentDecoder):
-    """Denormalize one native temporal segment, decode tiles, and crop its pad."""
+    """Denormalize one native temporal segment, decode tiles, and crop its pad."""  # noqa: E501
 
     def __init__(self, config: Config, *, frame_size: image.Config):
         if (
@@ -536,8 +623,9 @@ class Model(LatentDecoder):
         ):
             raise ValueError("video raster must align with spatial compression")
         self.frame_size = frame_size
-        # A clip covers `span` latent frames; cropping `token_drop` frames per
-        # clip leaves consecutive native windows sharing `overlap` latent frames.
+        # A clip covers `span` latent frames; cropping `token_drop` frames
+        # per clip leaves consecutive native windows sharing `overlap`
+        # latent frames.
         span = math.ceil(config.clip_length / config.temporal_compression)
         overlap = (-config.token_drop) % span
         super().__init__(
@@ -549,12 +637,12 @@ class Model(LatentDecoder):
                 frame_size.height // config.spatial_compression,
                 frame_size.width // config.spatial_compression,
             ),
-            mean=torch.tensor(config.latents_mean, dtype=torch.float32, device="cpu").view(
-                1, config.latent_channels, 1, 1, 1
-            ),
-            std=torch.tensor(config.latents_std, dtype=torch.float32, device="cpu").view(
-                1, config.latent_channels, 1, 1, 1
-            ),
+            mean=torch.tensor(
+                config.latents_mean, dtype=torch.float32, device="cpu"
+            ).view(1, config.latent_channels, 1, 1, 1),
+            std=torch.tensor(
+                config.latents_std, dtype=torch.float32, device="cpu"
+            ).view(1, config.latent_channels, 1, 1, 1),
         )
 
     @property
@@ -570,7 +658,9 @@ class Model(LatentDecoder):
             decoded = super().forward(latents)
         # The VAE left-pads each clip to a multiple of its temporal compression;
         # crop those leading frames from the decoded timeline.
-        padding = (-self.decoder.config.clip_length) % self.decoder.config.temporal_compression
+        padding = (
+            -self.decoder.config.clip_length
+        ) % self.decoder.config.temporal_compression
         return decoded[:, :, padding:].to(torch.float16).contiguous()
 
 
@@ -588,7 +678,9 @@ def assignments(model: Decoder | Model, reader):
             _, _, index, kind, *parts = name.split(".")
             prefix = f"decoder.transformer_blocks.{index}."
             if kind == "norms":
-                source = prefix + f"norm{int(parts[0]) + 1}." + ".".join(parts[1:])
+                source = (
+                    prefix + f"norm{int(parts[0]) + 1}." + ".".join(parts[1:])
+                )
             elif kind == "scales":
                 source = prefix + f"scale{int(parts[0]) + 1}"
             elif kind == "qkv":
@@ -616,11 +708,16 @@ def assignments(model: Decoder | Model, reader):
         region = None
         if branch is not None:
             if value.shape[0] % 2:
-                raise ValueError("video feed-forward checkpoint must contain two equal branches")
+                raise ValueError(
+                    "video feed-forward checkpoint must contain "
+                    "two equal branches"
+                )
             width = value.shape[0] // 2
             region = (
                 slice(branch * width, (branch + 1) * width),
                 *(slice(0, size) for size in value.shape[1:]),
             )
-        assignments.append(weights.Assignment(parameter, value, source_slice=region))
+        assignments.append(
+            weights.Assignment(parameter, value, source_slice=region)
+        )
     return tuple(assignments)

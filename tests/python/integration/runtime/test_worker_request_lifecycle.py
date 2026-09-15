@@ -36,9 +36,15 @@ pytestmark = pytest.mark.integration
 
 @pytest.mark.parametrize(
     ("device", "warm_start"),
-    (("cpu", False), ("cpu", True), pytest.param("cuda:0", True, marks=pytest.mark.gpu)),
+    (
+        ("cpu", False),
+        ("cpu", True),
+        pytest.param("cuda:0", True, marks=pytest.mark.gpu),
+    ),
 )
-def test_independent_product_work_preserves_request_progress(device, warm_start) -> None:
+def test_independent_product_work_preserves_request_progress(
+    device, warm_start
+) -> None:
     from dataclasses import replace
 
     from uniserve_worker.protocol.operation import Bounds, ScheduledRequest
@@ -158,7 +164,8 @@ def test_retained_encoder_product_outlives_its_producer_request(
             retained_buffers=(product.buffer_id,),
         )
         assert finalized_report(
-            producer, producer.submit(execution_run(run_id=2, commands=(finish,)))
+            producer,
+            producer.submit(execution_run(run_id=2, commands=(finish,))),
         ).done
 
         template = ar_params(92, block_ids=(1,))
@@ -200,18 +207,27 @@ def test_retained_encoder_product_outlives_its_producer_request(
             consumed = finalized_report(consumer, consumer.submit(batch))
         assert consumed.completions[0].status is OpStatus.OK
         assert consumed.completions[0].kv_visible_len == 2
-        assert consumed.completions[0].committed_tokens == (expected_successor(1007),)
+        assert consumed.completions[0].committed_tokens == (
+            expected_successor(1007),
+        )
 
-        read = producer.tensor_store.consume(product, consumer_op_id=ComputationId(2, 0))
-        freed = producer.submit(execution_run(run_id=4, commands=(Free(product.buffer_id),)))
+        read = producer.tensor_store.consume(
+            product, consumer_op_id=ComputationId(2, 0)
+        )
+        freed = producer.submit(
+            execution_run(run_id=4, commands=(Free(product.buffer_id),))
+        )
         assert not freed.complete
         producer.tensor_store.complete_reads((read,))
         freed = finalized_report(producer, freed)
         assert freed.done
         with pytest.raises(WorkerError):
-            producer.tensor_store.consume(product, consumer_op_id=ComputationId(3, 0))
+            producer.tensor_store.consume(
+                product, consumer_op_id=ComputationId(3, 0)
+            )
         assert finalized_report(
-            producer, producer.submit(execution_run(run_id=5, commands=(finish,)))
+            producer,
+            producer.submit(execution_run(run_id=5, commands=(finish,))),
         ).done
     finally:
         if consumer is not producer:
@@ -220,7 +236,7 @@ def test_retained_encoder_product_outlives_its_producer_request(
 
 
 @pytest.mark.parametrize("retirement", ("free", "finish"))
-def test_command_acknowledgement_waits_for_readers_without_delaying_other_results(
+def test_command_acknowledgement_waits_for_readers_without_delaying_other_results(  # noqa: E501
     retirement: str,
 ) -> None:
     worker = execution_worker(pipeline_depth=2)
@@ -247,7 +263,9 @@ def test_command_acknowledgement_waits_for_readers_without_delaying_other_result
         record_completion(operation, produced)
 
         product = operation.token_output
-        read = worker.tensor_store.consume(product, consumer_op_id=ComputationId(2, 0))
+        read = worker.tensor_store.consume(
+            product, consumer_op_id=ComputationId(2, 0)
+        )
         command = (
             Finish(
                 admission.request_key,
@@ -296,7 +314,9 @@ def test_command_acknowledgement_waits_for_readers_without_delaying_other_result
                     assert response["kind"] == "error"
                     assert response["code"] == "InvalidDescriptor"
                     self.submit({"kind": "poll", "run_id": 3, "call_id": 4})
-                    self.submit({"kind": "submit", "run": later_run, "call_id": 3})
+                    self.submit(
+                        {"kind": "submit", "run": later_run, "call_id": 3}
+                    )
                 elif response.get("call_id") == 3:
                     result = response["result"]
                     assert result["done"]
@@ -310,13 +330,21 @@ def test_command_acknowledgement_waits_for_readers_without_delaying_other_result
 
         endpoint = Endpoint(({"kind": "submit", "run": batch, "call_id": 1},))
         worker.bind(endpoint).run()
-        assert [response["call_id"] for response in endpoint.responses] == [1, 2, 3, 4, 5]
+        assert [response["call_id"] for response in endpoint.responses] == [
+            1,
+            2,
+            3,
+            4,
+            5,
+        ]
         assert endpoint.responses[-1]["kind"] == "ok"
     finally:
         worker.close()
 
 
-def test_cancelled_admission_cannot_publish_over_a_reused_request_slot() -> None:
+def test_cancelled_admission_cannot_publish_over_a_reused_request_slot() -> (
+    None
+):
     worker = execution_worker()
     admission = ar_params(89, block_ids=(0,))
     operation = token_operation(
@@ -337,7 +365,9 @@ def test_cancelled_admission_cannot_publish_over_a_reused_request_slot() -> None
         finish = Finish(
             admission.request_key,
         )
-        finalized_report(worker, worker.submit(execution_run(run_id=2, commands=(finish,))))
+        finalized_report(
+            worker, worker.submit(execution_run(run_id=2, commands=(finish,)))
+        )
         template = ar_params(90, block_ids=(1,))
         replacement = NewRequest(
             template.request_key,
@@ -345,7 +375,9 @@ def test_cancelled_admission_cannot_publish_over_a_reused_request_slot() -> None
             generation=template.generation,
         )
         bind_request_allocation(
-            replacement.request_key, request_pool_idx=replacement.request_pool_idx, page_ids=(1,)
+            replacement.request_key,
+            request_pool_idx=replacement.request_pool_idx,
+            page_ids=(1,),
         )
         next_operation = token_operation(
             replacement.request_key,
@@ -428,7 +460,9 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
         ),
     )
     assert closed_report.completions[0].status is OpStatus.ERROR
-    assert closed_report.completions[0].error_code is ErrorCode.INVALID_OPERATION
+    assert (
+        closed_report.completions[0].error_code is ErrorCode.INVALID_OPERATION
+    )
 
     active_decode = token_operation(
         active_admission.request_key,
@@ -544,7 +578,9 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
         ),
     )
     assert retired_report.completions[0].status is OpStatus.ERROR
-    assert retired_report.completions[0].error_code is ErrorCode.INVALID_OPERATION
+    assert (
+        retired_report.completions[0].error_code is ErrorCode.INVALID_OPERATION
+    )
     worker.close()
 
 
@@ -556,7 +592,8 @@ def test_finish_of_uninstalled_admission_allows_slot_reuse() -> None:
     )
     for run_id in (1, 2):
         report = finalized_report(
-            worker, worker.submit(execution_run(run_id=run_id, commands=(finish,)))
+            worker,
+            worker.submit(execution_run(run_id=run_id, commands=(finish,))),
         )
         assert report.done
 

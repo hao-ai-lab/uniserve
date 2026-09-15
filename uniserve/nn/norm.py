@@ -19,11 +19,16 @@ class RMSNorm(nn.Module):
     ) -> None:
         super().__init__()
         if hidden_size < 1 or eps <= 0:
-            raise ValueError("RMS normalization requires positive width and epsilon")
+            raise ValueError(
+                "RMS normalization requires positive width and epsilon"
+            )
         self.weight = nn.Parameter(
-            torch.ones(hidden_size, device=device, dtype=dtype), requires_grad=False
+            torch.ones(hidden_size, device=device, dtype=dtype),
+            requires_grad=False,
         )
         self.eps = eps
 
-    def forward(self, x: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, *, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         return functional.rms_norm(x, self.weight, self.eps, out=out)

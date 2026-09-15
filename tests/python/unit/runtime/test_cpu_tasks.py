@@ -39,10 +39,14 @@ def test_submitted_task_retains_capacity_until_actual_completion() -> None:
         pool.close()
 
 
-def test_close_cancels_unsubmitted_dependency_and_drains_submitted_work() -> None:
+def test_close_cancels_unsubmitted_dependency_and_drains_submitted_work() -> (
+    None
+):
     pool = CpuPool(capacity=2, workers=1)
     predecessor = pool.reserve()
-    successor = pool.reserve().configure(lambda: 2, dependencies=(predecessor.promise,))
+    successor = pool.reserve().configure(
+        lambda: 2, dependencies=(predecessor.promise,)
+    )
     successor.submit_if_ready()
     # Closing must cancel pending promises outside the admission lock: a running
     # dependent can then fail and release its capacity while shutdown waits.

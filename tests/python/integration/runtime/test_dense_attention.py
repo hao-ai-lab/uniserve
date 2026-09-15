@@ -35,7 +35,13 @@ def test_dense_attention_preserves_heads_masks_and_graph_inputs(
 ):
     device = torch.device("cuda", 0)
     torch.manual_seed(723)
-    batch, rows, query_heads, kv_heads, width = 2 if rank == 4 else 1, 97, 8, 2, 128
+    batch, rows, query_heads, kv_heads, width = (
+        2 if rank == 4 else 1,
+        97,
+        8,
+        2,
+        128,
+    )
     if layout in ("interleaved", "strided_columns"):
         projected = torch.randn(
             (
@@ -51,13 +57,23 @@ def test_dense_attention_preserves_heads_masks_and_graph_inputs(
             projected = projected[..., ::2]
         q, k, v = (
             value.transpose(1, 2)
-            for value in projected.split((query_heads, kv_heads, kv_heads), dim=2)
+            for value in projected.split(
+                (query_heads, kv_heads, kv_heads), dim=2
+            )
         )
     else:
-        q = torch.randn((batch, query_heads, rows, width), device=device, dtype=dtype)
-        k = torch.randn((batch, kv_heads, rows, width), device=device, dtype=dtype)
+        q = torch.randn(
+            (batch, query_heads, rows, width), device=device, dtype=dtype
+        )
+        k = torch.randn(
+            (batch, kv_heads, rows, width), device=device, dtype=dtype
+        )
         v = torch.randn_like(k)
-    mask = torch.ones(rows, rows, device=device, dtype=torch.bool).tril() if masked else None
+    mask = (
+        torch.ones(rows, rows, device=device, dtype=torch.bool).tril()
+        if masked
+        else None
+    )
     attention = Attention(query_heads, kv_heads, width)
     inputs = DenseInput(causal=not masked, mask=mask)
 
@@ -83,10 +99,14 @@ def test_dense_attention_preserves_heads_masks_and_graph_inputs(
     tolerance = 2e-5 if dtype == torch.float32 else 2e-2
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream(device))
-    with ExecutionContext(attention, attention=provider, stream=stream) as context:
+    with ExecutionContext(
+        attention, attention=provider, stream=stream
+    ) as context:
         context.prepare(None)
         actual = execute()
-        torch.testing.assert_close(actual, reference(), rtol=tolerance, atol=tolerance)
+        torch.testing.assert_close(
+            actual, reference(), rtol=tolerance, atol=tolerance
+        )
         with CUDAGraph(context=context) as graph:
             graph.capture(execute)
             q.mul_(0.5)
@@ -94,4 +114,6 @@ def test_dense_attention_preserves_heads_masks_and_graph_inputs(
             if mask is not None:
                 mask[:, ::3] = False
             actual = graph.replay()
-            torch.testing.assert_close(actual, reference(), rtol=tolerance, atol=tolerance)
+            torch.testing.assert_close(
+                actual, reference(), rtol=tolerance, atol=tolerance
+            )

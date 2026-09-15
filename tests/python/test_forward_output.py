@@ -1,4 +1,7 @@
-"""Owned model outputs preserve logical values after producer storage is reused."""
+"""Owned model outputs preserve logical values.
+
+Values stay preserved after producer storage is reused.
+"""
 
 import torch
 
@@ -22,10 +25,16 @@ def test_forward_output_clone_preserves_ragged_shapes_dtypes_and_owned_values():
             value.add_(1)
     for iteration, copied in enumerate(retained):
         for actual, original in zip(copied.values, expected, strict=True):
-            torch.testing.assert_close(actual, original + iteration, rtol=0, atol=0)
+            torch.testing.assert_close(
+                actual, original + iteration, rtol=0, atol=0
+            )
     retained[0].values[0].fill_(-1)
-    torch.testing.assert_close(retained[0].values[1], expected[1], rtol=0, atol=0)
-    torch.testing.assert_close(retained[1].values[0], expected[0] + 1, rtol=0, atol=0)
+    torch.testing.assert_close(
+        retained[0].values[1], expected[1], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        retained[1].values[0], expected[0] + 1, rtol=0, atol=0
+    )
 
 
 def test_forward_output_clone_preserves_empty_output():

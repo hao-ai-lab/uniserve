@@ -15,7 +15,11 @@ from uniserve.math import ceil_div
 from uniserve.model import CausalLM, PatchEncoder, VideoPostprocessor
 from uniserve.runtime.device import canonical_device, device_memory_budget
 from uniserve.tensors import BufferConfig
-from uniserve_models.processing import FeatureLayout, ImageProcessor, PatchTransform
+from uniserve_models.processing import (
+    FeatureLayout,
+    ImageProcessor,
+    PatchTransform,
+)
 
 from ..config import WorkerConfig
 from ..execution.input_buffers import InputBufferConfig
@@ -44,10 +48,15 @@ DEFAULT_BLOCK_SIZE = 64
 
 
 def input_buffer_config(
-    model: nn.Module, config: WorkerConfig, *, processor: ImageProcessor | None = None
+    model: nn.Module,
+    config: WorkerConfig,
+    *,
+    processor: ImageProcessor | None = None,
 ) -> InputBufferConfig:
-    """Size staging for the admitted text span plus one atomic image or CFG operation."""
+    """Size staging for the admitted text span.
 
+    Staging also covers one atomic image or CFG operation.
+    """
     text = capability(model, CausalLM)
     if text is None:
         raise ValueError("text input staging requires a causal language model")
@@ -55,12 +64,18 @@ def input_buffer_config(
     max_rows = min(
         config.max_request_pool_size,
         config.max_batch_operations,
-        *(lane.max_batch_operations or config.max_batch_operations for lane in config.lanes),
+        *(
+            lane.max_batch_operations or config.max_batch_operations
+            for lane in config.lanes
+        ),
     )
     max_tokens = (
         min(
             config.max_batch_tokens,
-            *(lane.max_batch_tokens or config.max_batch_tokens for lane in config.lanes),
+            *(
+                lane.max_batch_tokens or config.max_batch_tokens
+                for lane in config.lanes
+            ),
         )
         if config.lanes
         else config.max_batch_tokens
@@ -100,15 +115,18 @@ def input_buffer_config(
         # Text and diffusion use separate homogeneous calls on this lane.
         max_tokens=max(text_tokens, flow_tokens),
         max_text_tokens=text_tokens,
-        max_blocks_per_row=max(1, ceil_div(config.max_sequence_tokens, config.block_size)),
+        max_blocks_per_row=max(
+            1, ceil_div(config.max_sequence_tokens, config.block_size)
+        ),
         hidden_size=text.backbone.hidden_size,
-        embedding_dtype=getattr(torch, config.model_dtype.removeprefix("torch.")),
+        embedding_dtype=getattr(
+            torch, config.model_dtype.removeprefix("torch.")
+        ),
     )
 
 
 def vision_tokens(model: nn.Module, processor: ImageProcessor | None) -> int:
     """Bound feature rows from the actual image transform and encoder stride."""
-
     encoder = capability(model, PatchEncoder)
     if encoder is None or processor is None or processor.vit is None:
         return 0
@@ -136,13 +154,16 @@ def tensor_slot_capacity(
     may increase when fewer slots allow more in-flight outputs per request,
     so ranks agree on feasible counts rather than reducing local maxima.
     """
-
-    bytes_per_slot = sum(field.nbytes for field in schema.values() if not field.host)
+    bytes_per_slot = sum(
+        field.nbytes for field in schema.values() if not field.host
+    )
     if minimum < 1 or maximum < minimum:
         raise ValueError("request tensor capacity requires valid slot bounds")
 
     candidates = range(minimum, maximum + 1)
-    requirements = [count * bytes_per_slot + auxiliary_bytes(count) for count in candidates]
+    requirements = [
+        count * bytes_per_slot + auxiliary_bytes(count) for count in candidates
+    ]
     agreed = torch.tensor(
         [required <= available_bytes for required in requirements],
         dtype=torch.int32,
@@ -150,28 +171,35 @@ def tensor_slot_capacity(
     )
     group.all_reduce(agreed, op="min")
 
-    feasible = [count for count, fits in zip(candidates, agreed.cpu().tolist()) if fits]
+    feasible = [
+        count for count, fits in zip(candidates, agreed.cpu().tolist()) if fits
+    ]
     if feasible:
         return feasible[-1]
 
     raise RuntimeError(
         "insufficient device memory for a common request tensor slot count: "
-        f"candidate range {minimum}..{maximum}, local requirements {requirements}, "
-        f"{available_bytes} bytes available"
+        f"candidate range {minimum}..{maximum}, local requirements "
+        f"{requirements}, {available_bytes} bytes available"
     )
 
 
 def request_tensor_window(pipeline_depth: int, request_slots: int) -> int:
-    """Return the output horizon after reserving one pipeline slot per request."""
+    """Return the output horizon for requests.
 
+    One pipeline slot is reserved per request.
+    """
     if request_slots < 1 or pipeline_depth < 3 * request_slots:
-        raise ValueError("request tensor pipeline requires two unresolved outputs per slot")
+        raise ValueError(
+            "request tensor pipeline requires two unresolved outputs per slot"
+        )
     return pipeline_depth // request_slots - 1
 
 
-def product_storage_bytes(entry_outputs: Mapping[str, tuple[OutputInfo, ...]]) -> int:
-    """Size one logical product set using the runtime's 256-byte allocation alignment."""
-
+def product_storage_bytes(
+    entry_outputs: Mapping[str, tuple[OutputInfo, ...]],
+) -> int:
+    """Size one logical product set using the 256-byte allocation alignment."""
     return sum(
         ((output.max_bytes + 255) // 256) * 256
         for outputs in entry_outputs.values()
@@ -182,8 +210,10 @@ def product_storage_bytes(entry_outputs: Mapping[str, tuple[OutputInfo, ...]]) -
 def active_latent_capacity_tokens(
     per_image_tokens: int, concurrency_token_budget: int | None
 ) -> int:
-    """Reserve at least one image worth of latent tokens within a concurrency budget."""
+    """Reserve at least one image worth of latent tokens.
 
+    The reservation is bounded by the concurrency token budget.
+    """
     per_image = max(0, int(per_image_tokens))
     if per_image == 0:
         return 0
@@ -199,7 +229,7 @@ def local_product_storage_bytes(
     pipeline_components: Mapping[PipelineStage, str],
     max_unresolved_ops: int,
 ) -> int:
-    """Size persistent products from placement, consumers and the output horizon.
+    """Size persistent products from placement, consumers and output horizon.
 
     Producers and remote consumers each need a complete logical allocation:
     disjoint regions may subsequently be imported into that allocation. A
@@ -207,7 +237,6 @@ def local_product_storage_bytes(
     units. Non-streaming results retain their declared capacity until their
     consumers finish. Alignment follows BufferPool's allocation rules.
     """
-
     if max_unresolved_ops < 1:
         raise ValueError("product storage requires a positive output horizon")
 
@@ -227,7 +256,10 @@ def local_product_storage_bytes(
             consumers.setdefault(source, set()).add(destination)
     streamed = {
         component
-        for stage in (PipelineStage.VIDEO_DECODING, PipelineStage.VIDEO_ENCODING)
+        for stage in (
+            PipelineStage.VIDEO_DECODING,
+            PipelineStage.VIDEO_ENCODING,
+        )
         if (component := pipeline_components.get(stage)) is not None
     }
     total = 0
@@ -235,7 +267,8 @@ def local_product_storage_bytes(
         producer = bindings.get(entry)
         if bindings:
             produces = (
-                producer is not None and producer.process_group.global_rank in producer.output_ranks
+                producer is not None
+                and producer.process_group.global_rank in producer.output_ranks
             )
             consumes = any(
                 consumer in bindings and bindings[consumer].owns
@@ -254,7 +287,9 @@ def local_product_storage_bytes(
             if entry in streamed:
                 dims = output.shape_bound.dims
                 if not dims or not isinstance(dims[0], DeviceDim):
-                    raise ValueError("streamed products require a bounded leading unit axis")
+                    raise ValueError(
+                        "streamed products require a bounded leading unit axis"
+                    )
                 max_units = dims[0].bound
                 # Remote producers have no placement in this worker's rank
                 # namespace. Cover the complete imported extent, including
@@ -263,8 +298,13 @@ def local_product_storage_bytes(
                     group_bytes = size // max_units
                     live_groups = max_units
                 else:
-                    group_bytes = size // max_units * min(max_units, units_per_operation)
-                    live_groups = min(ceil_div(max_units, units_per_operation), max_unresolved_ops)
+                    group_bytes = (
+                        size // max_units * min(max_units, units_per_operation)
+                    )
+                    live_groups = min(
+                        ceil_div(max_units, units_per_operation),
+                        max_unresolved_ops,
+                    )
                 size = live_groups * ceil_div(group_bytes, 256) * 256
             total += ceil_div(size, 256) * 256
 
@@ -273,7 +313,7 @@ def local_product_storage_bytes(
 
 @dataclass(frozen=True)
 class RuntimeKVCapacity:
-    """Resolved KV token and page capacity within the assigned physical budget."""
+    """Resolved KV token and page capacity within the physical budget."""
 
     block_size: int
     bytes_per_token: int
@@ -286,8 +326,10 @@ def latent_trajectory_bytes(
     latent_width: int,
     dtype_bytes: int,
 ) -> int:
-    """Calculate storage for one latent trajectory from unit count, width, and element size."""
+    """Calculate storage for one latent trajectory.
 
+    Storage is derived from unit count, width, and element size.
+    """
     units = int(latent_units)
     width = int(latent_width)
     element_bytes = int(dtype_bytes)
@@ -304,8 +346,10 @@ def latent_pool_capacity_bytes(
     latent_width: int,
     dtype_bytes: int,
 ) -> int:
-    """Calculate double-buffered latent pages, step storage, page tables, and timestep metadata."""
+    """Calculate double-buffered latent pool storage.
 
+    Covers latent pages, step storage, page tables, and timestep metadata.
+    """
     slots = int(request_pool_size)
     pages = int(num_pages)
     units = int(page_units)
@@ -314,7 +358,8 @@ def latent_pool_capacity_bytes(
     if min(slots, units, width, element_bytes) < 1 or pages < 2:
         raise ValueError("latent pool dimensions are invalid")
 
-    # One page stays reserved as the sentinel; only usable pages hold trajectories.
+    # One page stays reserved as the sentinel; only usable pages hold
+    # trajectories.
     usable_pages = pages - 1
     storage = 2 * pages * units * width * element_bytes
     step_buffer = usable_pages * units * width * element_bytes
@@ -325,7 +370,10 @@ def latent_pool_capacity_bytes(
 
 @dataclass(frozen=True, slots=True)
 class ArenaCapacity:
-    """Budgets latent storage, device products, transfers, and CPU tasks for one worker arena."""
+    """Budgets latent storage, device products, transfers, and CPU tasks.
+
+    All budgets are for one worker arena.
+    """
 
     latent_pool_bytes: int
     tensor_store: int
@@ -336,8 +384,10 @@ class ArenaCapacity:
 
 
 def operation_window(pipeline_depth: int, max_operations: int) -> int:
-    """Bound simultaneously live operations by pipeline depth and per-batch capacity."""
+    """Bound simultaneously live operations.
 
+    The bound follows pipeline depth and per-batch capacity.
+    """
     depth = int(pipeline_depth)
     operations = int(max_operations)
     if depth < 1 or operations < 1:
@@ -351,8 +401,7 @@ def request_tensor_arena_capacity(
     pipeline_depth: int,
     product_bytes_per_request: int,
 ) -> ArenaCapacity:
-    """Bound public product, relay and transfer storage for fixed request tensors."""
-
+    """Bound product, relay and transfer storage for fixed request tensors."""
     depth = int(pipeline_depth)
     max_operations = int(worker_config.max_batch_operations)
     state_slots = int(worker_config.max_request_pool_size)
@@ -370,7 +419,8 @@ def request_tensor_arena_capacity(
         latent_pool_bytes=0,
         tensor_store=tensor_store,
         device_product_bytes=(
-            device_product_capacity_bytes(tensor_store, 1, max_value_bytes=1) + relay_bytes
+            device_product_capacity_bytes(tensor_store, 1, max_value_bytes=1)
+            + relay_bytes
         ),
         transfer_bytes=max(1, state_slots * product_bytes_per_request),
         transfer_tickets=max(1, min(slots, _MAX_TRANSFER_ENTRIES)),
@@ -395,8 +445,10 @@ def model_arena_capacity(
     bindings: Mapping[str, ModelEntry] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> ArenaCapacity:
-    """Derive device-product, transfer, latent, and CPU arena bounds from worker settings."""
+    """Derive arena bounds from worker settings.
 
+    Covers device-product, transfer, latent, and CPU arenas.
+    """
     depth = int(pipeline_depth)
     payload_bytes = int(completion_payload_bytes)
     max_operations = int(worker_config.max_batch_operations)
@@ -405,7 +457,9 @@ def model_arena_capacity(
 
     slots = depth * max_operations
     if state_buffers is None:
-        state_buffers = media_state_buffers(model, bindings or {}, worker_config)
+        state_buffers = media_state_buffers(
+            model, bindings or {}, worker_config
+        )
 
     if capability(model, VideoPostprocessor) is not None or state_buffers:
         return request_tensor_arena_capacity(
@@ -415,7 +469,9 @@ def model_arena_capacity(
                 resolve_outputs(model, worker_config),
                 bindings=bindings or {},
                 pipeline_components=media_components(model),
-                max_unresolved_ops=request_tensor_window(depth, request_pool_size),
+                max_unresolved_ops=request_tensor_window(
+                    depth, request_pool_size
+                ),
             ),
         )
 
@@ -432,7 +488,9 @@ def model_arena_capacity(
             "float32": 4,
         }.get(str(worker_config.model_dtype).removeprefix("torch.").lower())
         if dtype_bytes is None:
-            raise ValueError(f"unsupported latent dtype {worker_config.model_dtype!r}")
+            raise ValueError(
+                f"unsupported latent dtype {worker_config.model_dtype!r}"
+            )
         latent_pool_bytes = latent_pool_capacity_bytes(
             request_pool_size=int(request_pool_size),
             num_pages=int(num_latent_pages),
@@ -453,7 +511,9 @@ def model_arena_capacity(
         1,
     )
 
-    device_product_slots = slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
+    device_product_slots = (
+        slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
+    )
     tensor_store = _DEVICE_PRODUCTS_PER_OPERATION * device_product_slots
     device_count = len(
         {
@@ -471,7 +531,10 @@ def model_arena_capacity(
     )
     device_product_bytes += (
         (int(request_pool_size) + 1)
-        * (operation_window(depth, max_operations) + _REQUEST_RELAY_RETIREMENT_LANES)
+        * (
+            operation_window(depth, max_operations)
+            + _REQUEST_RELAY_RETIREMENT_LANES
+        )
         * _REQUEST_RELAY_ROW_BYTES
         * device_count
     )
@@ -499,21 +562,26 @@ def derive_num_blocks(
     :data:`DEFAULT_NUM_BLOCKS_FALLBACK`) is used. The result is at least
     ``floor`` (default 1).
     """
-
     block = int(block_size)
     if block <= 0:
         raise ValueError("block_size must be positive")
     min_blocks = max(1, int(floor))
     if kv_token_capacity is None or int(kv_token_capacity) <= 0:
-        blocks = DEFAULT_NUM_BLOCKS_FALLBACK if default_blocks is None else int(default_blocks)
+        blocks = (
+            DEFAULT_NUM_BLOCKS_FALLBACK
+            if default_blocks is None
+            else int(default_blocks)
+        )
     else:
         blocks = int(kv_token_capacity) // block
     return max(min_blocks, blocks)
 
 
 def device_total_bytes(device: str | torch.device) -> int:
-    """Return CUDA capacity, propagating device errors so an unknown budget cannot become zero."""
+    """Return CUDA capacity for a device.
 
+    Device errors propagate so an unknown budget cannot become zero.
+    """
     target = torch.device(device)
     if target.type != "cuda":
         return 0
@@ -533,15 +601,21 @@ def derive_runtime_kv_capacity(
     resident_copies: int = 1,
     co_resident_blocks: int = 0,
 ) -> RuntimeKVCapacity:
-    """Size one physical KV pool from explicit tokens or a host-owned byte grant.
+    """Size one KV pool from explicit tokens or a host-owned byte grant.
 
-    Fixed-capacity callers supply their page count. Automatic CUDA sizing requires
-    a granted budget; CPU capacity uses its declared default page policy.
+    Fixed-capacity callers supply their page count. Automatic CUDA sizing
+    requires a granted budget; CPU capacity uses its declared default page
+    policy.
     """
-
     block = int(block_size)
     token_bytes = int(bytes_per_token)
-    if block < 1 or token_bytes < 1 or floor < 1 or resident_copies < 1 or co_resident_blocks < 0:
+    if (
+        block < 1
+        or token_bytes < 1
+        or floor < 1
+        or resident_copies < 1
+        or co_resident_blocks < 0
+    ):
         raise ValueError("KV capacity dimensions must be positive")
     if available_bytes is not None and available_bytes < 0:
         raise ValueError("KV memory grant must not be negative")
@@ -551,19 +625,32 @@ def derive_runtime_kv_capacity(
             raise ValueError("configured KV token capacity must be positive")
         blocks = derive_num_blocks(block, kv_token_capacity, floor=floor)
     elif available_bytes is not None:
-        blocks = (available_bytes // (block * token_bytes) - co_resident_blocks) // resident_copies
+        blocks = (
+            available_bytes // (block * token_bytes) - co_resident_blocks
+        ) // resident_copies
         if blocks < floor:
-            raise ValueError("device memory grant cannot hold the required KV pool")
+            raise ValueError(
+                "device memory grant cannot hold the required KV pool"
+            )
     elif device is not None and torch.device(device).type == "cuda":
-        raise ValueError("automatic CUDA KV sizing requires a host memory grant")
+        raise ValueError(
+            "automatic CUDA KV sizing requires a host memory grant"
+        )
     else:
-        blocks = derive_num_blocks(block, None, default_blocks=default_blocks, floor=floor)
+        blocks = derive_num_blocks(
+            block, None, default_blocks=default_blocks, floor=floor
+        )
 
     if (
         available_bytes is not None
-        and (resident_copies * blocks + co_resident_blocks) * block * token_bytes > available_bytes
+        and (resident_copies * blocks + co_resident_blocks)
+        * block
+        * token_bytes
+        > available_bytes
     ):
-        raise ValueError("configured KV storage exceeds the device memory grant")
+        raise ValueError(
+            "configured KV storage exceeds the device memory grant"
+        )
 
     return RuntimeKVCapacity(
         block_size=block,
@@ -598,8 +685,10 @@ def resolve_request_capacity(
     bindings: Mapping[str, ModelEntry] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> WorkerConfig:
-    """Fit request tensors and their product arenas within the rank's fixed memory grant."""
+    """Fit request tensors within the rank's fixed memory grant.
 
+    Product arenas are fitted together with the request tensors.
+    """
     if canonical_device(worker_config.device).type == "cuda":
         available, _free = device_memory_budget(
             worker_config.device, worker_config.kv_memory_fraction
@@ -613,20 +702,26 @@ def resolve_request_capacity(
 
         if capability(model, VideoPostprocessor) is not None or schema:
             if capacity_group is None:
-                raise unsupported_setup("request tensor sizing requires its rank group")
+                raise unsupported_setup(
+                    "request tensor sizing requires its rank group"
+                )
 
             def auxiliary_bytes(count: int) -> int:
                 capacity_config = replace(
                     worker_config,
                     max_request_pool_size=count,
-                    max_batch_operations=min(count, worker_config.max_batch_operations),
+                    max_batch_operations=min(
+                        count, worker_config.max_batch_operations
+                    ),
                     max_batch_tokens=min(count, worker_config.max_batch_tokens),
                 )
                 product_bytes = local_product_storage_bytes(
                     resolve_outputs(model, worker_config),
                     bindings=bindings or {},
                     pipeline_components=media_components(model),
-                    max_unresolved_ops=request_tensor_window(pipeline_depth, count),
+                    max_unresolved_ops=request_tensor_window(
+                        pipeline_depth, count
+                    ),
                 )
                 arena = request_tensor_arena_capacity(
                     capacity_config,
@@ -638,7 +733,9 @@ def resolve_request_capacity(
             slots = tensor_slot_capacity(
                 schema,
                 capacity_group,
-                maximum=min(worker_config.max_request_pool_size, pipeline_depth // 3),
+                maximum=min(
+                    worker_config.max_request_pool_size, pipeline_depth // 3
+                ),
                 minimum=worker_config.min_request_pool_size,
                 available_bytes=available,
                 auxiliary_bytes=auxiliary_bytes,
@@ -646,7 +743,9 @@ def resolve_request_capacity(
             worker_config = replace(
                 worker_config,
                 max_request_pool_size=slots,
-                max_batch_operations=min(slots, worker_config.max_batch_operations),
+                max_batch_operations=min(
+                    slots, worker_config.max_batch_operations
+                ),
                 max_batch_tokens=min(slots, worker_config.max_batch_tokens),
             )
     return worker_config
@@ -655,24 +754,29 @@ def resolve_request_capacity(
 def decode_context_blocks(
     model: nn.Module, worker_config: WorkerConfig, pool: CacheManager | None
 ) -> int:
-    """Return the maximum paged-decode context blocks supported by this worker."""
-
+    """Return the max paged-decode context blocks supported by this worker."""
     if capability(model, CausalLM) is None:
         return 0
     max_tokens = worker_config.max_sequence_tokens
     if max_tokens < 1:
         return 0
-    blocks = (max_tokens + int(worker_config.block_size) - 1) // int(worker_config.block_size)
+    blocks = (max_tokens + int(worker_config.block_size) - 1) // int(
+        worker_config.block_size
+    )
     if pool is None:
         return 0
     return min(blocks, max(0, int(pool.info.num_blocks) - 1))
 
 
 def check_startup_memory(
-    worker_config: WorkerConfig, product_capacity_bytes: int, tensor_store: TensorStore
+    worker_config: WorkerConfig,
+    product_capacity_bytes: int,
+    tensor_store: TensorStore,
 ) -> None:
-    """Check resident startup allocations and reserved products against device grants."""
+    """Check resident startup allocations against device grants.
 
+    Reserved products are checked as well.
+    """
     # Warmup may retain backend plans and graph pools in addition to the
     # explicit arenas. Readiness requires that these resident allocations
     # leave room for every still-lazy public product within the same grant.
@@ -688,11 +792,16 @@ def check_startup_memory(
     for device in devices:
         if canonical_device(device).type != "cuda":
             continue
-        available, free = device_memory_budget(device, worker_config.kv_memory_fraction)
+        available, free = device_memory_budget(
+            device, worker_config.kv_memory_fraction
+        )
         total = device_total_bytes(device)
         remaining = max(0, product_bytes - tensor_store.resident_bytes(device))
-        if remaining > available or total - free > int(total * worker_config.kv_memory_fraction):
+        if remaining > available or total - free > int(
+            total * worker_config.kv_memory_fraction
+        ):
             raise unsupported_setup(
-                f"initialized runtime on {device} exceeds its static memory grant: "
-                f"{total - free} resident bytes and {remaining} reserved product bytes"
+                f"initialized runtime on {device} exceeds its static memory "
+                f"grant: {total - free} resident bytes and {remaining} "
+                f"reserved product bytes"
             )

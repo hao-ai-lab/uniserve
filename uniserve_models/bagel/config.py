@@ -42,15 +42,22 @@ class TransformerConfig:
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"BAGEL {name} must be a positive integer")
 
-        if self.num_attention_heads % self.num_key_value_heads or self.head_dim % 2:
-            raise ValueError("BAGEL requires compatible GQA heads and even rotary dimensions")
+        if (
+            self.num_attention_heads % self.num_key_value_heads
+            or self.head_dim % 2
+        ):
+            raise ValueError(
+                "BAGEL requires compatible GQA heads and even rotary dimensions"
+            )
         if type(self.qk_norm) is not bool:
             raise ValueError("BAGEL QK normalization must be boolean")
         if any(
-            not math.isfinite(value) or value <= 0 for value in (self.rms_norm_eps, self.rope_theta)
+            not math.isfinite(value) or value <= 0
+            for value in (self.rms_norm_eps, self.rope_theta)
         ):
             raise ValueError(
-                "BAGEL normalization epsilon and rotary theta must be finite and positive"
+                "BAGEL normalization epsilon and rotary theta must be "
+                "finite and positive"
             )
 
 
@@ -69,7 +76,9 @@ class Config:
     def __post_init__(self):
         for value in (self.start_of_image_id, self.end_of_image_id):
             if type(value) is not int or not 0 <= value < self.text.vocab_size:
-                raise ValueError("BAGEL image marker IDs must lie within its vocabulary")
+                raise ValueError(
+                    "BAGEL image marker IDs must lie within its vocabulary"
+                )
         if self.start_of_image_id == self.end_of_image_id:
             raise ValueError("BAGEL image markers must be distinct")
 
@@ -77,7 +86,9 @@ class Config:
             type(value) is not int or value < 1
             for value in (self.latent_patch_size, self.max_latent_size)
         ):
-            raise ValueError("BAGEL latent patches and learned grid size must be positive")
+            raise ValueError(
+                "BAGEL latent patches and learned grid size must be positive"
+            )
         if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
             raise ValueError("BAGEL timestep shift must be finite and positive")
 
@@ -89,7 +100,6 @@ def read_config(root: Path, io: loading.Config) -> Config:
     The learned latent position grid is read from the checkpoint header, so its
     table must be a square grid whose width matches the text hidden size.
     """
-
     raw = json.loads((root / "config.json").read_text())
 
     towers = []
@@ -102,14 +112,22 @@ def read_config(root: Path, io: loading.Config) -> Config:
     text, vision, latent = towers
 
     heads, hidden = text["num_attention_heads"], text["hidden_size"]
-    if type(heads) is not int or heads < 1 or ("head_dim" not in text and hidden % heads):
-        raise ValueError("BAGEL checkpoint requires compatible text width and heads")
+    if (
+        type(heads) is not int
+        or heads < 1
+        or ("head_dim" not in text and hidden % heads)
+    ):
+        raise ValueError(
+            "BAGEL checkpoint requires compatible text width and heads"
+        )
 
     with checkpoint_sources[0].resolve(root, io=io).open(io=io) as reader:
         shape = reader.get("latent_pos_embed.pos_embed").shape
     side = math.isqrt(shape[0])
     if len(shape) != 2 or shape[1] != hidden or side * side != shape[0]:
-        raise ValueError("BAGEL latent position table must be a square grid at text width")
+        raise ValueError(
+            "BAGEL latent position table must be a square grid at text width"
+        )
 
     return Config(
         TransformerConfig(

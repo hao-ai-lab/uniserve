@@ -26,7 +26,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from uniserve import _slices
 from uniserve.runtime import EventPool
 
-from ..foundation.errors import invalid_descriptor, resource_error, unsupported_setup
+from ..foundation.errors import (
+    invalid_descriptor,
+    resource_error,
+    unsupported_setup,
+)
 from ..foundation.shared_memory import allocate_shared_memory
 from ..protocol.transfer import (
     CudaIpcTransfer,
@@ -64,40 +68,38 @@ class TransportKind(StrEnum):
 TRANSPORTS = tuple(kind.value for kind in TransportKind)
 
 
-def _dtype_to_str(dtype: "torch.dtype") -> str:
+def _dtype_to_str(dtype: torch.dtype) -> str:
     """Encode a torch dtype as its unqualified transport name."""
-
     return str(dtype).removeprefix("torch.")
 
 
-def _dtype_from_str(name: str) -> "torch.dtype":
+def _dtype_from_str(name: str) -> torch.dtype:
     """Resolve a transport dtype name to a torch dtype."""
-
     import torch
 
     return getattr(torch, name)
 
 
-def _nbytes(tensor: "torch.Tensor | tuple[torch.Tensor, ...]") -> int:
+def _nbytes(tensor: torch.Tensor | tuple[torch.Tensor, ...]) -> int:
     """Return the physical byte size of a tensor view."""
-
     spans = tensor if isinstance(tensor, tuple) else (tensor,)
     return sum(int(span.numel() * span.element_size()) for span in spans)
 
 
 def _read_destination(
     locator: Locator,
-    device: "torch.device",
-    destination: "torch.Tensor | tuple[torch.Tensor, ...] | None",
+    device: torch.device,
+    destination: torch.Tensor | tuple[torch.Tensor, ...] | None,
     region: tuple[slice, ...] | None = None,
-) -> "torch.Tensor | tuple[torch.Tensor, ...]":
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Validate exact read bounds and writable, disjoint destination spans."""
-
     import torch
 
     region = region or tuple(
         slice(start, start + extent)
-        for start, extent in zip((0,) * len(locator.shape), locator.shape, strict=True)
+        for start, extent in zip(
+            (0,) * len(locator.shape), locator.shape, strict=True
+        )
     )
     if not _slices.within(region, locator.shape):
         raise invalid_descriptor("read region exceeds the published view")
@@ -105,16 +107,21 @@ def _read_destination(
     if destination is None:
         return torch.empty(_slices.shape(region), dtype=dtype, device=device)
     validate_destination(
-        destination, shape=_slices.shape(region), dtype=locator.dtype, device=device
+        destination,
+        shape=_slices.shape(region),
+        dtype=locator.dtype,
+        device=device,
     )
     return destination
 
 
 def _publication_views(
-    tensor: "torch.Tensor | tuple[torch.Tensor, ...]", offset: tuple[int, ...] | None
-) -> tuple["torch.Tensor | tuple[torch.Tensor, ...]", tuple[int, ...], tuple[int, ...]]:
-    """Validate ordered first-axis spans and retain their exact immutable views."""
-
+    tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    offset: tuple[int, ...] | None,
+) -> tuple[
+    torch.Tensor | tuple[torch.Tensor, ...], tuple[int, ...], tuple[int, ...]
+]:
+    """Validate ordered first-axis spans and retain their immutable views."""
     spans = tensor if isinstance(tensor, tuple) else (tensor,)
     if not spans:
         raise invalid_descriptor("publication has no source spans")
@@ -127,12 +134,18 @@ def _publication_views(
         or any(size < 1 for size in span.shape)
         for span in spans
     ):
-        raise invalid_descriptor("publication spans disagree on their representation")
+        raise invalid_descriptor(
+            "publication spans disagree on their representation"
+        )
 
     shape = (sum(int(span.shape[0]) for span in spans), *first.shape[1:])
     value = (0,) * len(shape) if offset is None else offset
-    if len(value) != len(shape) or any(not isinstance(start, int) or start < 0 for start in value):
-        raise invalid_descriptor("publication offset does not match its tensor shape")
+    if len(value) != len(shape) or any(
+        not isinstance(start, int) or start < 0 for start in value
+    ):
+        raise invalid_descriptor(
+            "publication offset does not match its tensor shape"
+        )
 
     # Detach so autograd metadata never reaches readers of the published view.
     source = tuple(span.detach() for span in spans)
@@ -140,23 +153,24 @@ def _publication_views(
 
 
 def _copy_pairs(
-    source: "torch.Tensor | tuple[torch.Tensor, ...]",
-    destination: "torch.Tensor | tuple[torch.Tensor, ...]",
+    source: torch.Tensor | tuple[torch.Tensor, ...],
+    destination: torch.Tensor | tuple[torch.Tensor, ...],
 ):
-    """Walk two first-axis partitions together without constructing a packed tensor.
+    """Walk two first-axis partitions together without packing into one tensor.
 
     Yields (target, value) view pairs whose first-axis lengths match, splitting
     at span boundaries on both sides. Both partitions must cover the same
     logical first-axis length.
     """
-
     sources = source if isinstance(source, tuple) else (source,)
     targets = destination if isinstance(destination, tuple) else (destination,)
     source_index = target_index = 0
     source_start = target_start = 0
     while source_index < len(sources) and target_index < len(targets):
         value, target = sources[source_index], targets[target_index]
-        count = min(value.shape[0] - source_start, target.shape[0] - target_start)
+        count = min(
+            value.shape[0] - source_start, target.shape[0] - target_start
+        )
         yield (
             target[target_start : target_start + count],
             value[source_start : source_start + count],
@@ -170,11 +184,13 @@ def _copy_pairs(
             target_index += 1
             target_start = 0
     if source_index != len(sources) or target_index != len(targets):
-        raise invalid_descriptor("transfer partitions have different logical lengths")
+        raise invalid_descriptor(
+            "transfer partitions have different logical lengths"
+        )
 
 
 class Transport(ABC):
-    """Bounded physical publications and asynchronous reads owned by one endpoint."""
+    """Bounded physical publications and asynchronous reads per endpoint."""
 
     name: ClassVar[str]
     source: WorkerEndpoint
@@ -186,11 +202,11 @@ class Transport(ABC):
     @abstractmethod
     def publish(
         self,
-        tensor: "torch.Tensor | tuple[torch.Tensor, ...]",
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
     ) -> Locator:
-        """Expose a descriptor and producer fence for an owned immutable version.
+        """Expose a descriptor and producer fence for an immutable version.
 
         The allocation owner must retain the published range, without writes,
         until publication_retirement() completes after release(). Keeping a
@@ -202,11 +218,11 @@ class Transport(ABC):
         self,
         locator: Locator,
         *,
-        device: "torch.device",
-        destination: "torch.Tensor | tuple[torch.Tensor, ...] | None" = None,
+        device: torch.device,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
         region: tuple[slice, ...] | None = None,
-    ) -> "TransferTicket":
-        """Read into one tensor or ordered first-axis spans on the destination device.
+    ) -> TransferTicket:
+        """Read into one tensor or ordered first-axis spans on the device.
 
         Spans must be writable, disjoint and cover the exact requested region
         without dtype conversion. Backend layout restrictions are checked before
@@ -215,12 +231,19 @@ class Transport(ABC):
         """
 
     @abstractmethod
-    def release(self, locator: Locator) -> concurrent.futures.Future[None] | None:
+    def release(
+        self, locator: Locator
+    ) -> concurrent.futures.Future[None] | None:
         """Retire a publication after its physical readers release ownership."""
 
     @abstractmethod
-    def publication_retirement(self, locator: Locator) -> concurrent.futures.Future[None]:
-        """Observe physical ownership completion without revoking the publication."""
+    def publication_retirement(
+        self, locator: Locator
+    ) -> concurrent.futures.Future[None]:
+        """Observe physical ownership completion.
+
+        The publication is not revoked.
+        """
 
     @abstractmethod
     def close(self) -> None:
@@ -232,12 +255,14 @@ class Transport(ABC):
 
 
 # Address-space lookup shares existing owners; it does not own their lifetimes.
-_endpoints: weakref.WeakValueDictionary[str, Transport] = weakref.WeakValueDictionary()
+_endpoints: weakref.WeakValueDictionary[str, Transport] = (
+    weakref.WeakValueDictionary()
+)
 _endpoint_lock = threading.Lock()
 
 
 class TransferTicket:
-    """One bounded read, available once its consuming stream can wait on a fence.
+    """One read, available once its consuming stream can wait on a fence.
 
     Descriptor readiness does not imply device completion. The transport keeps
     physical source and mapping leases until its copy has actually completed.
@@ -254,7 +279,9 @@ class TransferTicket:
         # and destination storage. Resources whose completion could not be
         # drained stay listed in _unretired and block retirement forever.
         self._unretired: tuple[object, ...] = ()
-        self._retirement: concurrent.futures.Future[None] = concurrent.futures.Future()
+        self._retirement: concurrent.futures.Future[None] = (
+            concurrent.futures.Future()
+        )
         self._work: concurrent.futures.Future[None] | None = None
 
         # Borrowed-view consumption: streams that received the views and the
@@ -268,28 +295,38 @@ class TransferTicket:
         # Stream-readiness result: destination views plus the device fence a
         # consumer must wait on before touching them.
         self._future: concurrent.futures.Future[
-            tuple[torch.Tensor | tuple[torch.Tensor, ...], torch.cuda.Event | None]
+            tuple[
+                torch.Tensor | tuple[torch.Tensor, ...], torch.cuda.Event | None
+            ]
         ] = concurrent.futures.Future()
 
     def ready(self) -> bool:
-        """Query whether result() can establish stream access without a host wait."""
+        """Query whether result() can establish stream access.
 
+        No host wait is needed.
+        """
         return self._future.done()
 
     def retired(self) -> bool:
-        """Query whether the backend has stopped all access to the read's storage."""
-
+        """Query whether the backend stopped access to the read's storage."""
         return self._retirement.done()
 
     def retirement_ready(self) -> bool:
-        """Require known physical completion before an allocation can be acknowledged free."""
+        """Require known physical completion first.
 
+        Only then can an allocation be acknowledged free.
+        """
         if self._unretired:
-            raise resource_error("transfer physical completion is unknown") from self._error
+            raise resource_error(
+                "transfer physical completion is unknown"
+            ) from self._error
         return self.retired()
 
     def add_retirement_callback(self, callback: Any) -> None:
-        """Notify allocation owners after physical access and acknowledgement finish."""
+        """Notify allocation owners after access finishes.
+
+        Both physical access and acknowledgement must finish first.
+        """
 
         def notify(_future: concurrent.futures.Future[None]) -> None:
             nonlocal callback
@@ -301,8 +338,7 @@ class TransferTicket:
         self._retirement.add_done_callback(notify)
 
     def cancel(self) -> None:
-        """Revoke consumption while retaining storage until an active read retires."""
-
+        """Revoke consumption while retaining storage until the read retires."""
         with self._state_lock:
             self._cancelled = True
             if self._error is None:
@@ -315,7 +351,6 @@ class TransferTicket:
 
     def _require_active(self) -> None:
         """Stop a cancelled read before it opens or copies source storage."""
-
         with self._state_lock:
             if self._cancelled:
                 assert self._error is not None
@@ -325,10 +360,9 @@ class TransferTicket:
         self._retirement.set_result(None)
 
     def result(
-        self, stream: "torch.cuda.Stream | None" = None
-    ) -> "torch.Tensor | tuple[torch.Tensor, ...]":
-        """Return the destination views and order all reads on the consumer stream."""
-
+        self, stream: torch.cuda.Stream | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Return destination views and order reads on the consumer stream."""
         if not self.ready():
             raise RuntimeError("transfer ticket was observed before readiness")
         if self._error is not None:
@@ -342,9 +376,13 @@ class TransferTicket:
 
             spans = value if isinstance(value, tuple) else (value,)
             device = spans[0].device
-            consumer = torch.cuda.current_stream(device) if stream is None else stream
+            consumer = (
+                torch.cuda.current_stream(device) if stream is None else stream
+            )
             if consumer.device != device:
-                raise invalid_descriptor("transfer consumer stream is on another device")
+                raise invalid_descriptor(
+                    "transfer consumer stream is on another device"
+                )
             consumer.wait_event(event)
             for span in spans:
                 span.record_stream(consumer)
@@ -355,12 +393,11 @@ class TransferTicket:
         return value
 
     def close(self) -> None:
-        """End a borrowed-view read after work already submitted by its consumers.
+        """End a borrowed-view read after work submitted by its consumers.
 
         Records one fence on every consumer stream observed by result(); the
         source grant returns only after all of those fences complete.
         """
-
         if self._consumer_release is None or self._closed:
             return
         self._closed = True
@@ -377,13 +414,14 @@ class TransferTicket:
         self._consumer_events = tuple(events)
 
         if events:
-            self._events.defer_release(events, self, completed=self.events_released)
+            self._events.defer_release(
+                events, self, completed=self.events_released
+            )
         else:
             self.events_released()
 
     def events_released(self) -> None:
-        """Return the source grant after every borrowed-view consumer has completed."""
-
+        """Return source grant after every borrowed-view consumer completed."""
         release = self._consumer_release
         self._consumer_release = None
         self._consumer_streams.clear()
@@ -394,14 +432,13 @@ class TransferTicket:
 
     def _drain_consumers(self) -> None:
         """Drain borrowed-view fences during transport shutdown."""
-
         self.close()
         for event in self._consumer_events:
             event.synchronize()
         self._events.reap()
 
     def add_done_callback(self, callback: Any) -> None:
-        """Notify the owner when stream access or an error becomes observable."""
+        """Notify the owner when stream access or an error is observable."""
 
         def notify(_future: object) -> None:
             nonlocal callback
@@ -414,12 +451,16 @@ class TransferTicket:
 
     def _complete(
         self,
-        value: "torch.Tensor | tuple[torch.Tensor, ...]",
-        event: "torch.cuda.Event | None" = None,
+        value: torch.Tensor | tuple[torch.Tensor, ...],
+        event: torch.cuda.Event | None = None,
     ) -> None:
         with self._state_lock:
             if event is not None:
-                device = value[0].device if isinstance(value, tuple) else value.device
+                device = (
+                    value[0].device
+                    if isinstance(value, tuple)
+                    else value.device
+                )
                 self._events.retain(event, device)
                 self._event = event
             # Cancellation may already have exposed an error. The backend still
@@ -428,8 +469,10 @@ class TransferTicket:
                 self._future.set_result((value, event))
 
     def _fail(self, error: BaseException) -> bool:
-        """Preserve failures after stream readiness as well as submission failures."""
+        """Preserve failures after stream readiness.
 
+        Submission failures are preserved as well.
+        """
         with self._state_lock:
             late = self._future.done() and self._future.exception() is None
             self._error = error
@@ -438,8 +481,7 @@ class TransferTicket:
             return late
 
     def _retain_failed_read(self, *resources: object) -> None:
-        """Keep allocations whose physical device access could not be drained."""
-
+        """Keep allocations whose device access could not be drained."""
         self._unretired = resources
 
     def __del__(self) -> None:
@@ -453,7 +495,6 @@ class TransferCapacity:
 
     def __init__(self, byte_capacity: int, ticket_capacity: int) -> None:
         """Initialize reservations against a fixed positive capacity."""
-
         self.capacity = int(byte_capacity)
         self.ticket_capacity = int(ticket_capacity)
         if min(self.capacity, self.ticket_capacity) < 1:
@@ -463,8 +504,7 @@ class TransferCapacity:
         self._lock = threading.Lock()
 
     def acquire(self, amount: int) -> None:
-        """Reserve bytes if capacity is available, otherwise report backpressure."""
-
+        """Reserve bytes if capacity is available, else report backpressure."""
         value = int(amount)
         if value < 0:
             raise ValueError("transfer byte reservation must not be negative")
@@ -472,17 +512,19 @@ class TransferCapacity:
             projected = self.used + value
             if projected > self.capacity:
                 raise resource_error(
-                    f"transfer byte capacity is exhausted ({projected}>{self.capacity})"
+                    f"transfer byte capacity is exhausted "
+                    f"({projected}>{self.capacity})"
                 )
             self.used = projected
 
     def release(self, amount: int) -> None:
         """Return bytes after the physical owner releases its allocation."""
-
         value = int(amount)
         with self._lock:
             if value < 0 or value > self.used:
-                raise RuntimeError("transfer byte release exceeds the live reservation")
+                raise RuntimeError(
+                    "transfer byte release exceeds the live reservation"
+                )
             self.used -= value
 
 
@@ -492,7 +534,6 @@ _SHM_LIBC.shm_open.restype = ctypes.c_int
 
 def _open_shared_memory(name: str, size: int) -> mmap.mmap:
     """Open an existing shared-memory segment and validate its declared size."""
-
     canonical_name = name if name.startswith("/") else f"/{name}"
     descriptor = _SHM_LIBC.shm_open(canonical_name.encode(), os.O_RDONLY)
     if descriptor < 0:
@@ -510,7 +551,10 @@ def _open_shared_memory(name: str, size: int) -> mmap.mmap:
 
 
 class _BoundedTransferPool:
-    """Bounds asynchronous transfer count and aggregate bytes for one transport backend."""
+    """Bounds asynchronous transfers for one transport backend.
+
+    Both transfer count and aggregate bytes are bounded.
+    """
 
     def __init__(
         self,
@@ -520,8 +564,7 @@ class _BoundedTransferPool:
         name: str,
         event_pool: EventPool,
     ) -> None:
-        """Create a worker pool governed by shared byte and entry reservations."""
-
+        """Create a worker pool governed by byte and entry reservations."""
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=workers,
             thread_name_prefix=name,
@@ -536,8 +579,10 @@ class _BoundedTransferPool:
         self._read_streams: dict[tuple[int, str], torch.cuda.Stream] = {}
 
     def set_completion_wake(self, wake: Any) -> None:
-        """Install the controller callback invoked after an asynchronous transfer finishes."""
+        """Install the controller callback for transfer completion.
 
+        The callback is invoked after an asynchronous transfer finishes.
+        """
         self._completion_wake = wake
 
     def submit(
@@ -545,10 +590,9 @@ class _BoundedTransferPool:
         operation: Any,
         *args: Any,
         nbytes: int,
-        destination: "torch.Tensor | tuple[torch.Tensor, ...] | None" = None,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
     ) -> TransferTicket:
-        """Reserve a physical read and retain the caller's destination stream."""
-
+        """Reserve a read and retain the caller's destination stream."""
         import torch
 
         with self._lock:
@@ -556,7 +600,9 @@ class _BoundedTransferPool:
                 raise self._error
 
         if not self._entries.acquire(blocking=False):
-            raise resource_error("asynchronous transfer ticket capacity is exhausted")
+            raise resource_error(
+                "asynchronous transfer ticket capacity is exhausted"
+            )
         try:
             self._bytes.acquire(nbytes)
         except BaseException:
@@ -565,9 +611,15 @@ class _BoundedTransferPool:
 
         ticket = TransferTicket(self._events)
         if destination is not None:
-            first = destination[0] if isinstance(destination, tuple) else destination
+            first = (
+                destination[0]
+                if isinstance(destination, tuple)
+                else destination
+            )
             if first.is_cuda:
-                ticket._destination_stream = torch.cuda.current_stream(first.device)
+                ticket._destination_stream = torch.cuda.current_stream(
+                    first.device
+                )
 
         def run() -> None:
             import torch
@@ -598,7 +650,11 @@ class _BoundedTransferPool:
                 self._entries.release()
                 ticket._retire()
             if work.cancelled():
-                ticket._fail(resource_error("transfer read was cancelled before submission"))
+                ticket._fail(
+                    resource_error(
+                        "transfer read was cancelled before submission"
+                    )
+                )
 
         if self._completion_wake is not None:
             ticket.add_done_callback(self._completion_wake)
@@ -617,16 +673,20 @@ class _BoundedTransferPool:
     def copy(
         self,
         ticket: TransferTicket,
-        source: "torch.Tensor | tuple[torch.Tensor, ...]",
-        destination: "torch.Tensor | tuple[torch.Tensor, ...]",
-        producer: "torch.cuda.Event | None" = None,
+        source: torch.Tensor | tuple[torch.Tensor, ...],
+        destination: torch.Tensor | tuple[torch.Tensor, ...],
+        producer: torch.cuda.Event | None = None,
     ) -> None:
-        """Copy into a reserved view and retain all storage through device completion."""
+        """Copy into a reserved view.
 
+        All storage is retained through device completion.
+        """
         import torch
 
         ticket._require_active()
-        spans = destination if isinstance(destination, tuple) else (destination,)
+        spans = (
+            destination if isinstance(destination, tuple) else (destination,)
+        )
         pairs = tuple(_copy_pairs(source, destination))
         device = spans[0].device
 
@@ -646,9 +706,10 @@ class _BoundedTransferPool:
         completed = None
         try:
             with torch.cuda.device(device), torch.cuda.stream(stream):
-                # The caller may still be initializing or consuming this backing.
-                # Establish its handoff before exposing copy readiness, so a later
-                # caller wait on our completion cannot create a dependency cycle.
+                # The caller may still be initializing or consuming this
+                # backing. Establish its handoff before exposing copy
+                # readiness, so a later caller wait on our completion cannot
+                # create a dependency cycle.
                 if ticket._destination_stream is not None:
                     stream.wait_stream(ticket._destination_stream)
                     ticket._destination_stream = None
@@ -675,12 +736,13 @@ class _BoundedTransferPool:
             try:
                 stream.synchronize()
             except BaseException:
-                ticket._retain_failed_read(destination, source, producer, completed, stream)
+                ticket._retain_failed_read(
+                    destination, source, producer, completed, stream
+                )
                 raise
 
     def close(self) -> None:
-        """Drain reads and report any failure following consumable completion."""
-
+        """Drain reads and report failure following consumable completion."""
         self._executor.shutdown(wait=True, cancel_futures=False)
         self._read_streams.clear()
         if self._error is not None:
@@ -689,14 +751,16 @@ class _BoundedTransferPool:
 
 @dataclass(slots=True)
 class _LocalSource:
-    tensor: "torch.Tensor | tuple[torch.Tensor, ...]"
-    event: "torch.cuda.Event | None"
+    tensor: torch.Tensor | tuple[torch.Tensor, ...]
+    event: torch.cuda.Event | None
     capacity: TransferCapacity
     locator: Locator
     readers: int = 0
     released: bool = False
     reclaiming: bool = False
-    retirement: concurrent.futures.Future[None] = field(default_factory=concurrent.futures.Future)
+    retirement: concurrent.futures.Future[None] = field(
+        default_factory=concurrent.futures.Future
+    )
 
     def events_released(self) -> None:
         self.capacity.release(_nbytes(self.tensor))
@@ -716,7 +780,6 @@ class LocalTransport(Transport):
         source: WorkerEndpoint | None = None,
     ) -> None:
         """Create a process-local tensor table with bounded retained bytes."""
-
         self.source = source or WorkerEndpoint.local()
         self._table: dict[int, _LocalSource] = {}
         self._borrowed: weakref.WeakSet[TransferTicket] = weakref.WeakSet()
@@ -737,32 +800,46 @@ class LocalTransport(Transport):
         )
 
     def endpoint(self) -> str:
-        """Expose the process-unique registry endpoint encoded into local locators."""
-
+        """Expose the process-unique endpoint encoded into local locators."""
         return self._endpoint
 
-    def publication_retirement(self, locator: Locator) -> concurrent.futures.Future[None]:
-        """Retain the same allocation ownership used by local copies and borrowed views."""
+    def publication_retirement(
+        self, locator: Locator
+    ) -> concurrent.futures.Future[None]:
+        """Retain the allocation ownership shared by local operations.
 
+        Local copies and borrowed views use the same ownership.
+        """
         if locator.source != self.source:
-            raise invalid_descriptor("local publication belongs to another rank incarnation")
+            raise invalid_descriptor(
+                "local publication belongs to another rank incarnation"
+            )
         handle = locator.transport
-        if not isinstance(handle, LocalTransfer) or handle.endpoint != self._endpoint:
-            raise invalid_descriptor("local publication belongs to another endpoint")
+        if (
+            not isinstance(handle, LocalTransfer)
+            or handle.endpoint != self._endpoint
+        ):
+            raise invalid_descriptor(
+                "local publication belongs to another endpoint"
+            )
         with self._lock:
             source = self._table.get(handle.key)
             if source is None or locator != source.locator:
-                raise invalid_descriptor("local publication changed its registered view")
+                raise invalid_descriptor(
+                    "local publication changed its registered view"
+                )
             return source.retirement
 
     def publish(
         self,
-        tensor: "torch.Tensor | tuple[torch.Tensor, ...]",
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
     ) -> Locator:
-        """Register a detached tensor in the in-process endpoint table and return its locator."""
+        """Register a detached tensor in the in-process endpoint table.
 
+        Return its locator.
+        """
         t, shape, offset = _publication_views(tensor, offset)
         first = t[0] if isinstance(t, tuple) else t
         self._events.reap()
@@ -780,7 +857,9 @@ class LocalTransport(Transport):
         with self._lock:
             # Drop table entries whose physical ownership already completed.
             self._table = {
-                key: source for key, source in self._table.items() if not source.retirement.done()
+                key: source
+                for key, source in self._table.items()
+                if not source.retirement.done()
             }
             key = self._next
             self._next += 1
@@ -804,8 +883,8 @@ class LocalTransport(Transport):
         self,
         locator: Locator,
         *,
-        device: "torch.device",
-        destination: "torch.Tensor | tuple[torch.Tensor, ...] | None" = None,
+        device: torch.device,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
         region: tuple[slice, ...] | None = None,
     ) -> TransferTicket:
         """Borrow or copy from a verified publisher in this address space.
@@ -814,33 +893,47 @@ class LocalTransport(Transport):
         owns copy capacity; a borrowed view retains its producer's event pool
         until consumer completion returns the source grant.
         """
-
         handle = locator.transport
         if (
             not isinstance(handle, LocalTransfer)
             or locator.source.node != self.source.node
             or locator.source.address_space != self.source.address_space
         ):
-            raise invalid_descriptor("local locator belongs to another address space")
+            raise invalid_descriptor(
+                "local locator belongs to another address space"
+            )
 
         with _endpoint_lock:
             owner = _endpoints.get(handle.endpoint)
-        if not isinstance(owner, LocalTransport) or owner.source != locator.source:
-            raise invalid_descriptor("local publication belongs to another rank incarnation")
+        if (
+            not isinstance(owner, LocalTransport)
+            or owner.source != locator.source
+        ):
+            raise invalid_descriptor(
+                "local publication belongs to another rank incarnation"
+            )
 
         with owner._lock:
             source = owner._table.get(handle.key)
             if source is None or source.released:
-                raise invalid_descriptor("local publication is no longer registered")
+                raise invalid_descriptor(
+                    "local publication is no longer registered"
+                )
             tensor, event = source.tensor, source.event
             first = tensor[0] if isinstance(tensor, tuple) else tensor
             if device != first.device:
-                raise invalid_descriptor("local binding requires the source device")
+                raise invalid_descriptor(
+                    "local binding requires the source device"
+                )
             if locator != source.locator:
-                raise invalid_descriptor("local locator changed its registered view")
+                raise invalid_descriptor(
+                    "local locator changed its registered view"
+                )
             if region is not None:
                 if not _slices.within(region, locator.shape):
-                    raise invalid_descriptor("read region exceeds the published view")
+                    raise invalid_descriptor(
+                        "read region exceeds the published view"
+                    )
                 tensor = region_view(tensor, region)
             target = (
                 None
@@ -861,20 +954,26 @@ class LocalTransport(Transport):
                     nbytes=locator.nbytes,
                     destination=target,
                 )
-                ticket.add_retirement_callback(lambda: owner._release_reader(source))
+                ticket.add_retirement_callback(
+                    lambda: owner._release_reader(source)
+                )
                 return ticket
 
             # Borrow path: no copy. The source views themselves are handed out
             # and the reader count drops when every consumer stream completes.
             if not self._borrow_slots.acquire(blocking=False):
-                raise resource_error("local borrowed-view ticket capacity is exhausted")
+                raise resource_error(
+                    "local borrowed-view ticket capacity is exhausted"
+                )
             try:
                 ticket = TransferTicket(owner._events)
                 if self._completion_wake is not None:
                     ticket.add_done_callback(self._completion_wake)
                     ticket.add_retirement_callback(self._completion_wake)
                 ticket._complete(tensor, event)
-                ticket._consumer_release = lambda: self._finish_borrow(owner, source)
+                ticket._consumer_release = lambda: self._finish_borrow(
+                    owner, source
+                )
                 self._borrowed.add(ticket)
             except BaseException:
                 self._borrow_slots.release()
@@ -889,7 +988,9 @@ class LocalTransport(Transport):
             source.readers -= 1
             self._reclaim(source)
 
-    def _finish_borrow(self, owner: LocalTransport, source: _LocalSource) -> None:
+    def _finish_borrow(
+        self, owner: LocalTransport, source: _LocalSource
+    ) -> None:
         owner._release_reader(source)
         self._borrow_slots.release()
 
@@ -900,16 +1001,29 @@ class LocalTransport(Transport):
         if source.event is None:
             source.events_released()
         else:
-            self._events.defer_release((source.event,), source, completed=source.events_released)
+            self._events.defer_release(
+                (source.event,), source, completed=source.events_released
+            )
 
-    def release(self, locator: Locator) -> concurrent.futures.Future[None] | None:
-        """Revoke new local reads while retaining existing copies and borrowed views."""
+    def release(
+        self, locator: Locator
+    ) -> concurrent.futures.Future[None] | None:
+        """Revoke new local reads.
 
+        Existing copies and borrowed views are retained.
+        """
         if locator.source != self.source:
-            raise invalid_descriptor("local publication belongs to another rank incarnation")
+            raise invalid_descriptor(
+                "local publication belongs to another rank incarnation"
+            )
         handle = locator.transport
-        if not isinstance(handle, LocalTransfer) or handle.endpoint != self._endpoint:
-            raise invalid_descriptor("local release belongs to another endpoint")
+        if (
+            not isinstance(handle, LocalTransfer)
+            or handle.endpoint != self._endpoint
+        ):
+            raise invalid_descriptor(
+                "local release belongs to another endpoint"
+            )
         with self._lock:
             source = self._table.get(handle.key)
             if source is None:
@@ -919,7 +1033,9 @@ class LocalTransport(Transport):
             if not source.retirement.done() and source.event is not None:
                 self._events.schedule_completion_wake(
                     (
-                        source.tensor[0] if isinstance(source.tensor, tuple) else source.tensor
+                        source.tensor[0]
+                        if isinstance(source.tensor, tuple)
+                        else source.tensor
                     ).device,
                     source.event,
                 )
@@ -927,7 +1043,6 @@ class LocalTransport(Transport):
 
     def close(self) -> None:
         """Release every tensor registered under this local endpoint."""
-
         try:
             self._reads.close()
         finally:
@@ -943,7 +1058,9 @@ class LocalTransport(Transport):
                     source.event.synchronize()
                     self._events.reap()
                 if not source.retirement.done():
-                    raise resource_error("local source retains unfinished physical readers")
+                    raise resource_error(
+                        "local source retains unfinished physical readers"
+                    )
                 source.retirement.result()
             self._table.clear()
             with _endpoint_lock:
@@ -956,12 +1073,12 @@ class _ShmSource:
 
     shm: Any
     nbytes: int
-    host: "torch.Tensor | tuple[torch.Tensor, ...] | None" = None
+    host: torch.Tensor | tuple[torch.Tensor, ...] | None = None
     signal: Any = None
 
 
 class ShmTransport(Transport):
-    """Shared-memory publication with producer readiness and physical reader grants."""
+    """Shared-memory publication with producer readiness and reader grants."""
 
     name = "shm"
 
@@ -980,14 +1097,20 @@ class ShmTransport(Transport):
             drain=lambda source: None,
         )
         self.source = source or WorkerEndpoint.local()
-        self._publication_queue: queue.Queue[tuple[Locator, _ShmSource] | None] = queue.Queue()
-        self._publication_control_rx, self._publication_control_tx = socket.socketpair()
+        self._publication_queue: queue.Queue[
+            tuple[Locator, _ShmSource] | None
+        ] = queue.Queue()
+        self._publication_control_rx, self._publication_control_tx = (
+            socket.socketpair()
+        )
         self._publication_control_rx.setblocking(False)
         self._publication_control_tx.setblocking(False)
         self._completion_wake: Any = None
         self._closed = False
         self._publication_worker = threading.Thread(
-            target=self._complete_publications, name="uniserve-shm-publication", daemon=True
+            target=self._complete_publications,
+            name="uniserve-shm-publication",
+            daemon=True,
         )
         self._publication_worker.start()
         self._reads = _BoundedTransferPool(
@@ -1000,14 +1123,18 @@ class ShmTransport(Transport):
     def endpoint(self) -> str:
         return self._publications.name
 
-    def publication_retirement(self, locator: Locator) -> concurrent.futures.Future[None]:
+    def publication_retirement(
+        self, locator: Locator
+    ) -> concurrent.futures.Future[None]:
         return self._publications.retirement(locator)
 
     def set_completion_wake(self, wake: Any) -> None:
         self._completion_wake = wake
         self._reads.set_completion_wake(wake)
 
-    def _reclaim(self, source: _ShmSource, retirement: concurrent.futures.Future[None]) -> None:
+    def _reclaim(
+        self, source: _ShmSource, retirement: concurrent.futures.Future[None]
+    ) -> None:
         source.shm.close()
         try:
             source.shm.unlink()
@@ -1016,7 +1143,9 @@ class ShmTransport(Transport):
         self._bytes.release(source.nbytes)
         retirement.set_result(None)
 
-    def _queue_publication(self, item: tuple[Locator, _ShmSource] | None) -> None:
+    def _queue_publication(
+        self, item: tuple[Locator, _ShmSource] | None
+    ) -> None:
         self._publication_queue.put(item)
         try:
             self._publication_control_tx.send(b"P")
@@ -1024,8 +1153,7 @@ class ShmTransport(Transport):
             pass
 
     def _complete_publications(self) -> None:
-        """Publish completed host bytes without waiting in the Worker request thread."""
-
+        """Publish completed host bytes without waiting in the Worker thread."""
         import torch
 
         selector = selectors.DefaultSelector()
@@ -1052,7 +1180,9 @@ class ShmTransport(Transport):
                             if item is None:
                                 closing = True
                             else:
-                                selector.register(item[1].signal, selectors.EVENT_READ, item)
+                                selector.register(
+                                    item[1].signal, selectors.EVENT_READ, item
+                                )
                         continue
 
                     # A stream signal fired: the device-to-host DMA is done,
@@ -1077,7 +1207,9 @@ class ShmTransport(Transport):
                         source.host = None
                         source.signal = None
                     self._publications.complete(
-                        locator, error=failure, producer_completed=device_completed
+                        locator,
+                        error=failure,
+                        producer_completed=device_completed,
                     )
                     if self._completion_wake is not None:
                         self._completion_wake()
@@ -1086,12 +1218,11 @@ class ShmTransport(Transport):
 
     def publish(
         self,
-        tensor: "torch.Tensor | tuple[torch.Tensor, ...]",
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
     ) -> Locator:
-        """Register bounded source storage before exposing its readiness descriptor."""
-
+        """Register source storage before exposing its readiness descriptor."""
         import torch
 
         source, shape, offset = _publication_views(tensor, offset)
@@ -1106,19 +1237,25 @@ class ShmTransport(Transport):
             shm = allocate_shared_memory(max(1, nbytes))
             buffer = shm.buf
             if buffer is None:
-                raise RuntimeError("shared-memory publication has no writable buffer")
+                raise RuntimeError(
+                    "shared-memory publication has no writable buffer"
+                )
 
             if first.is_cuda:
                 # Device bytes move through a pinned staging buffer; the
                 # stream signal marks the DMA complete on the worker thread.
                 from .._uniserve_ipc import StreamSignal
 
-                host = torch.empty(shape, dtype=first.dtype, device="cpu", pin_memory=True)
+                host = torch.empty(
+                    shape, dtype=first.dtype, device="cpu", pin_memory=True
+                )
                 signal = StreamSignal()
             else:
                 host = None
                 signal = None
-                packed = torch.frombuffer(buffer, dtype=first.dtype).reshape(shape)
+                packed = torch.frombuffer(buffer, dtype=first.dtype).reshape(
+                    shape
+                )
                 for target, value in _copy_pairs(source, packed):
                     target.copy_(value)
                 del packed, target, value
@@ -1136,7 +1273,9 @@ class ShmTransport(Transport):
                 offset=offset,
                 device=str(first.device),
             )
-            self._publications.publish(locator, publication, pending=first.is_cuda)
+            self._publications.publish(
+                locator, publication, pending=first.is_cuda
+            )
             registered = True
 
             if first.is_cuda:
@@ -1172,17 +1311,21 @@ class ShmTransport(Transport):
         self,
         ticket: TransferTicket,
         locator: Locator,
-        device: "torch.device",
-        destination: "torch.Tensor | tuple[torch.Tensor, ...] | None",
+        device: torch.device,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None,
         region: tuple[slice, ...] | None,
     ) -> None:
-        """Hold host bytes through source retirement and asynchronous destination copying."""
+        """Hold host bytes through source retirement.
 
+        The bytes are held through asynchronous destination copying as well.
+        """
         import torch
 
         handle = locator.transport
         if not isinstance(handle, PosixShmTransfer):
-            raise invalid_descriptor("shared-memory read requires a shared-memory locator")
+            raise invalid_descriptor(
+                "shared-memory read requires a shared-memory locator"
+            )
         connection, _descriptor = open_reader(locator)
         failure: BaseException | None = None
         try:
@@ -1209,10 +1352,15 @@ class ShmTransport(Transport):
                     raise
             finally:
                 connection.close()
-        source = torch.frombuffer(buf, dtype=_dtype_from_str(locator.dtype)).reshape(locator.shape)
+        source = torch.frombuffer(
+            buf, dtype=_dtype_from_str(locator.dtype)
+        ).reshape(locator.shape)
         if device.type == "cuda":
-            # The read ticket retains this bounded pinned buffer until DMA retires.
-            pinned = torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
+            # The read ticket retains this bounded pinned buffer until DMA
+            # retires.
+            pinned = torch.empty(
+                source.shape, dtype=source.dtype, pin_memory=True
+            )
             pinned.copy_(source)
             source = pinned
 
@@ -1225,14 +1373,18 @@ class ShmTransport(Transport):
         self,
         locator: Locator,
         *,
-        device: "torch.device",
-        destination: "torch.Tensor | tuple[torch.Tensor, ...] | None" = None,
+        device: torch.device,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
         region: tuple[slice, ...] | None = None,
     ) -> TransferTicket:
         if locator.source.node != self.source.node:
-            raise invalid_descriptor("shared-memory transport requires the source node")
+            raise invalid_descriptor(
+                "shared-memory transport requires the source node"
+            )
         target = (
-            None if destination is None else _read_destination(locator, device, destination, region)
+            None
+            if destination is None
+            else _read_destination(locator, device, destination, region)
         )
         return self._reads.submit(
             self._read_tensor,
@@ -1244,9 +1396,13 @@ class ShmTransport(Transport):
             destination=target,
         )
 
-    def release(self, locator: Locator) -> concurrent.futures.Future[None] | None:
+    def release(
+        self, locator: Locator
+    ) -> concurrent.futures.Future[None] | None:
         if not isinstance(locator.transport, PosixShmTransfer):
-            raise invalid_descriptor("shared-memory release requires a shared-memory locator")
+            raise invalid_descriptor(
+                "shared-memory release requires a shared-memory locator"
+            )
         return self._publications.release(locator)
 
     def close(self) -> None:
@@ -1264,10 +1420,10 @@ class ShmTransport(Transport):
 
 @dataclass(slots=True)
 class _CudaSource:
-    """Retain physical publication bytes through the producer's final device access."""
+    """Retain publication bytes through the producer's final device access."""
 
-    tensor: "torch.Tensor | tuple[torch.Tensor, ...]"
-    event: "torch.cuda.Event"
+    tensor: torch.Tensor | tuple[torch.Tensor, ...]
+    event: torch.cuda.Event
     nbytes: int
     capacity: TransferCapacity
     descriptor: int
@@ -1282,7 +1438,7 @@ class _CudaSource:
 
 
 class CudaIpcTransport(Transport):
-    """CUDA mapping and asynchronous copies protected by physical reader grants."""
+    """CUDA mapping and asynchronous copies protected by reader grants."""
 
     name = "cuda_ipc"
 
@@ -1328,17 +1484,23 @@ class CudaIpcTransport(Transport):
     def endpoint(self) -> str:
         return self._publications.name
 
-    def publication_retirement(self, locator: Locator) -> concurrent.futures.Future[None]:
+    def publication_retirement(
+        self, locator: Locator
+    ) -> concurrent.futures.Future[None]:
         return self._publications.retirement(locator)
 
     def set_completion_wake(self, wake: Any) -> None:
         self._reads.set_completion_wake(wake)
 
     def _reclaim(
-        self, source: _CudaSource, retirement: concurrent.futures.Future[None] | None = None
+        self,
+        source: _CudaSource,
+        retirement: concurrent.futures.Future[None] | None = None,
     ) -> None:
         source.retirement = retirement
-        self._events.defer_release((source.event,), source, completed=source.events_released)
+        self._events.defer_release(
+            (source.event,), source, completed=source.events_released
+        )
 
     def _drain(self, source: _CudaSource) -> None:
         source.event.synchronize()
@@ -1346,12 +1508,14 @@ class CudaIpcTransport(Transport):
 
     def publish(
         self,
-        tensor: "torch.Tensor | tuple[torch.Tensor, ...]",
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
     ) -> Locator:
-        """Export an immutable source and retain capacity until its producer fence retires."""
+        """Export an immutable source and retain capacity.
 
+        Capacity is retained until its producer fence retires.
+        """
         import torch
         from uniserve_kernel.peer_memory import empty, export_fd
 
@@ -1359,13 +1523,18 @@ class CudaIpcTransport(Transport):
         spans = source if isinstance(source, tuple) else (source,)
         first = spans[0]
         if not first.is_cuda:
-            raise invalid_descriptor("cuda_ipc transport requires a CUDA tensor")
+            raise invalid_descriptor(
+                "cuda_ipc transport requires a CUDA tensor"
+            )
         if any(
-            span.untyped_storage().data_ptr() != first.untyped_storage().data_ptr()
+            span.untyped_storage().data_ptr()
+            != first.untyped_storage().data_ptr()
             or span.stride() != first.stride()
             for span in spans
         ):
-            raise invalid_descriptor("CUDA IPC publication spans require one allocation and stride")
+            raise invalid_descriptor(
+                "CUDA IPC publication spans require one allocation and stride"
+            )
         if self._failed_publication is not None:
             raise self._failed_publication[0]
 
@@ -1397,13 +1566,17 @@ class CudaIpcTransport(Transport):
             event = self._events.acquire(first.device, interprocess=True)
             self._events.retain(event, first.device)
             self._events.record(event, first.device)
-            publication = _CudaSource(source, event, nbytes, self._bytes, descriptor, copied_source)
+            publication = _CudaSource(
+                source, event, nbytes, self._bytes, descriptor, copied_source
+            )
 
             # Run-length encode first-axis span lengths so the importer can
             # rebuild every span view without a per-span locator entry.
             length_runs = tuple(
                 (length, sum(1 for _ in values))
-                for length, values in groupby(int(span.shape[0]) for span in spans)
+                for length, values in groupby(
+                    int(span.shape[0]) for span in spans
+                )
             )
             locator = Locator(
                 source=self.source,
@@ -1412,7 +1585,8 @@ class CudaIpcTransport(Transport):
                     publication_id=uuid.uuid4().hex,
                     storage_size_bytes=storage_size,
                     storage_offsets_bytes=tuple(
-                        storage_offset + span.data_ptr() - first.data_ptr() for span in spans
+                        storage_offset + span.data_ptr() - first.data_ptr()
+                        for span in spans
                     ),
                     span_lengths=tuple(length for length, _ in length_runs),
                     span_counts=tuple(count for _, count in length_runs),
@@ -1442,7 +1616,12 @@ class CudaIpcTransport(Transport):
                     if event is not None:
                         self._events.defer_release((event,), source)
                 except BaseException as error:
-                    self._failed_publication = (error, source, event, copied_source)
+                    self._failed_publication = (
+                        error,
+                        source,
+                        event,
+                        copied_source,
+                    )
                     raise
                 self._bytes.release(nbytes)
             raise
@@ -1451,29 +1630,43 @@ class CudaIpcTransport(Transport):
         self,
         locator: Locator,
         *,
-        device: "torch.device",
-        destination: "torch.Tensor | tuple[torch.Tensor, ...] | None" = None,
+        device: torch.device,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
         region: tuple[slice, ...] | None = None,
     ) -> TransferTicket:
         if locator.source.node != self.source.node:
-            raise invalid_descriptor("CUDA IPC transport requires the source node")
+            raise invalid_descriptor(
+                "CUDA IPC transport requires the source node"
+            )
         if not isinstance(locator.transport, CudaIpcTransfer):
-            raise invalid_descriptor("CUDA IPC read requires a CUDA IPC locator")
+            raise invalid_descriptor(
+                "CUDA IPC read requires a CUDA IPC locator"
+            )
         if device.type != "cuda":
-            raise invalid_descriptor("CUDA IPC destination must be a CUDA device")
+            raise invalid_descriptor(
+                "CUDA IPC destination must be a CUDA device"
+            )
         target = (
-            None if destination is None else _read_destination(locator, device, destination, region)
+            None
+            if destination is None
+            else _read_destination(locator, device, destination, region)
         )
         return self._reads.submit(
-            self._read, locator, device, target, region, nbytes=locator.nbytes, destination=target
+            self._read,
+            locator,
+            device,
+            target,
+            region,
+            nbytes=locator.nbytes,
+            destination=target,
         )
 
     def _read(
         self,
         ticket: TransferTicket,
         locator: Locator,
-        device: "torch.device",
-        destination: "torch.Tensor | tuple[torch.Tensor, ...] | None",
+        device: torch.device,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None,
         region: tuple[slice, ...] | None,
     ) -> None:
         import torch
@@ -1488,24 +1681,41 @@ class CudaIpcTransport(Transport):
         failure: BaseException | None = None
         try:
             ticket._require_active()
-            destination = _read_destination(locator, device, destination, region)
+            destination = _read_destination(
+                locator, device, destination, region
+            )
             with torch.cuda.device(device):
                 if locator.source.address_space == self.source.address_space:
                     # Same address space: borrow the owner's registered tensor
                     # and producer fence directly; no IPC mapping is needed.
                     with _endpoint_lock:
                         owner = _endpoints.get(handle.endpoint)
-                    if not isinstance(owner, CudaIpcTransport) or owner.source != locator.source:
-                        raise invalid_descriptor("CUDA publication has no live local owner")
+                    if (
+                        not isinstance(owner, CudaIpcTransport)
+                        or owner.source != locator.source
+                    ):
+                        raise invalid_descriptor(
+                            "CUDA publication has no live local owner"
+                        )
                     publication = owner._publications.source(locator)
                     mapped = publication.tensor
                     event = publication.event
                 else:
-                    prototype = destination[0] if isinstance(destination, tuple) else destination
+                    prototype = (
+                        destination[0]
+                        if isinstance(destination, tuple)
+                        else destination
+                    )
                     itemsize = prototype.element_size()
-                    if any(offset % itemsize for offset in handle.storage_offsets_bytes):
-                        raise invalid_descriptor("CUDA IPC span offset is not element aligned")
-                    # One mapping owns every span; tensor views share its deleter.
+                    if any(
+                        offset % itemsize
+                        for offset in handle.storage_offsets_bytes
+                    ):
+                        raise invalid_descriptor(
+                            "CUDA IPC span offset is not element aligned"
+                        )
+                    # One mapping owns every span; tensor views share its
+                    # deleter.
                     allocation = import_fd(
                         prototype,
                         descriptor,
@@ -1529,7 +1739,9 @@ class CudaIpcTransport(Transport):
                         )
                     )
                     del allocation
-                    event = torch.cuda.Event.from_ipc_handle(device, handle.ready_event_handle)
+                    event = torch.cuda.Event.from_ipc_handle(
+                        device, handle.ready_event_handle
+                    )
                 if region is not None:
                     mapped = region_view(mapped, region)
                 self._reads.copy(ticket, mapped, destination, event)
@@ -1556,14 +1768,22 @@ class CudaIpcTransport(Transport):
                 os.close(descriptor)
                 connection.close()
 
-    def release(self, locator: Locator) -> concurrent.futures.Future[None] | None:
+    def release(
+        self, locator: Locator
+    ) -> concurrent.futures.Future[None] | None:
         if not isinstance(locator.transport, CudaIpcTransfer):
-            raise invalid_descriptor("CUDA IPC release requires a CUDA IPC locator")
+            raise invalid_descriptor(
+                "CUDA IPC release requires a CUDA IPC locator"
+            )
         retirement = self._publications.release(locator)
         if retirement is not None and not retirement.done():
             source = self._publications.source(locator)
             self._events.schedule_completion_wake(
-                (source.tensor[0] if isinstance(source.tensor, tuple) else source.tensor).device,
+                (
+                    source.tensor[0]
+                    if isinstance(source.tensor, tuple)
+                    else source.tensor
+                ).device,
                 source.event,
             )
         return retirement
@@ -1588,7 +1808,6 @@ def make_transport(
     source: WorkerEndpoint | None = None,
 ) -> Transport:
     """Construct one bounded physical backend for a standalone endpoint."""
-
     return make_transports(
         (str(name),),
         byte_capacity=byte_capacity,
@@ -1606,14 +1825,19 @@ def make_transports(
     event_pool: EventPool,
     source: WorkerEndpoint | None = None,
 ) -> dict[str, Transport]:
-    """Construct explicitly configured backends against one rank resource budget."""
-
+    """Construct configured backends against one rank resource budget."""
     if not names or len(set(names)) != len(names):
-        raise invalid_descriptor("transport bindings must be nonempty and unique")
+        raise invalid_descriptor(
+            "transport bindings must be nonempty and unique"
+        )
     if any(name not in TRANSPORTS for name in names):
-        raise invalid_descriptor(f"unknown transport binding; expected names from {TRANSPORTS}")
+        raise invalid_descriptor(
+            f"unknown transport binding; expected names from {TRANSPORTS}"
+        )
     if min(byte_capacity, ticket_capacity) < 1:
-        raise unsupported_setup("transport byte and ticket capacities must be positive")
+        raise unsupported_setup(
+            "transport byte and ticket capacities must be positive"
+        )
     capacity = TransferCapacity(byte_capacity, ticket_capacity)
     endpoint = source or WorkerEndpoint.local()
     constructors: Mapping[str, Callable[..., Transport]] = {
@@ -1648,9 +1872,10 @@ def publish_tensor(
     A partial failure revokes all preceding locations. Each backend continues
     to retain the source until its submitted device work and readers retire.
     """
-
     if not transports:
-        raise unsupported_setup("tensor publication requires a configured transport")
+        raise unsupported_setup(
+            "tensor publication requires a configured transport"
+        )
     locations: list[Locator] = []
     try:
         for transport in transports.values():

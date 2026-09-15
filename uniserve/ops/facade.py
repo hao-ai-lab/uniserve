@@ -17,14 +17,17 @@ from uniserve.ops.requests import (
     RmsNormReq,
     SiluAndMulReq,
 )
-from uniserve.ops.rms import add_rms_norm_dispatcher, qk_norm_dispatcher, rms_norm_dispatcher
+from uniserve.ops.rms import (
+    add_rms_norm_dispatcher,
+    qk_norm_dispatcher,
+    rms_norm_dispatcher,
+)
 from uniserve.ops.rope import qk_norm_rope_dispatcher, rope_dispatcher
 from uniserve.ops.silu import silu_and_mul_dispatcher
 
 
 def rms_norm(hidden_states, weight, eps: float, *, override: str | None = None):
     """Normalize the final hidden dimension with a selected RMSNorm provider."""
-
     return rms_norm_dispatcher().run(
         RmsNormReq(hidden_states, weight, float(eps)), override=override
     )
@@ -44,21 +47,25 @@ def add_rms_norm(
     ``in_place`` allows an eligible provider to reuse caller-owned storage for
     the combined residual.
     """
-
     return add_rms_norm_dispatcher().run(
-        AddRmsNormReq(hidden_states, residual, weight, float(eps), bool(in_place)),
+        AddRmsNormReq(
+            hidden_states, residual, weight, float(eps), bool(in_place)
+        ),
         override=override,
     )
 
 
 def silu_and_mul(x, y=None, *, override: str | None = None):
-    """Apply SiLU gating to packed halves or to explicit gate and value tensors."""
+    """Apply SiLU gating to packed or explicit operands.
 
+    Apply SiLU gating to packed halves or to explicit gate and value tensors.
+    """
     if y is not None:
         import torch
 
         # Providers consume one tensor whose final dimension is laid out as
-        # ``[gate, value]``; concatenate explicit operands into that representation.
+        # ``[gate, value]``; concatenate explicit operands into that
+        # representation.
         x = torch.cat((x, y), dim=-1)
 
     return silu_and_mul_dispatcher().run(SiluAndMulReq(x), override=override)
@@ -75,7 +82,6 @@ def qk_norm(
     override: str | None = None,
 ):
     """RMS-normalize query and key tensors as one vector or independent axes."""
-
     req: QKNormReq | MultiAxisQKNormReq
     if axis_dims is None:
         req = QKNormReq(q, k, q_weight, k_weight, float(eps))
@@ -117,7 +123,6 @@ def qk_norm_rope(
     multi-axis request. In-place execution is available for the single-axis
     request when supported by the selected provider.
     """
-
     req: QKNormRopeReq | MultiAxisQKNormRopeReq
     if axis_dims is None:
         # Single-axis requests carry ordinary weight and factor tensors.
@@ -137,7 +142,9 @@ def qk_norm_rope(
         # Multi-axis requests preserve each feature partition's weights and
         # factor tables for group-aware provider planning.
         if in_place:
-            raise ValueError("in-place qk_norm_rope does not support multi-axis requests")
+            raise ValueError(
+                "in-place qk_norm_rope does not support multi-axis requests"
+            )
 
         req = MultiAxisQKNormRopeReq(
             q,
@@ -148,7 +155,9 @@ def qk_norm_rope(
             tuple(cos),
             tuple(sin),
             float(eps),
-            () if identity_axes is None else tuple(int(v) for v in identity_axes),
+            ()
+            if identity_axes is None
+            else tuple(int(v) for v in identity_axes),
             position_ids,
             int(unsqueeze_dim),
         )
@@ -158,5 +167,4 @@ def qk_norm_rope(
 
 def rope(x, cos, sin, *, override: str | None = None):
     """Apply packed rotary factors through the selected RoPE provider."""
-
     return rope_dispatcher().run(PackedRopeReq(x, cos, sin), override=override)

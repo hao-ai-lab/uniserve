@@ -49,7 +49,8 @@ _EXPORTS: dict[str, str] = {
     "VocabParallelEmbedding": "linear",
 }
 
-# The literal export list remains visible to static tooling without eager imports.
+# The literal export list remains visible to static tooling without eager
+# imports.
 __all__ = [
     "AttentionBlock",
     "ResidualBlock",
@@ -83,13 +84,15 @@ __all__ = [
     "get_act_fn",
 ]
 
-# Lazy resolution and the advertised public surface must describe the same names.
+# Lazy resolution and the advertised public surface must describe the same
+# names.
 assert set(__all__) == set(_EXPORTS), sorted(set(__all__) ^ set(_EXPORTS))
 
 
 def __getattr__(name: str):
-    """Resolve a lazily exported neural-network symbol from its owning module."""
-
+    """Resolve a lazily exported neural-network symbol from its owning
+    module.
+    """  # noqa: D205
     submodule = _EXPORTS.get(name)
     if submodule is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -101,11 +104,12 @@ def __getattr__(name: str):
 
 def __dir__() -> list[str]:
     """List eager globals and all supported lazy exports."""
-
     return sorted(set(globals()) | set(_EXPORTS))
 
 
-if TYPE_CHECKING:  # Expose concrete definitions to type checkers without importing at runtime.
+if (
+    TYPE_CHECKING
+):  # Expose concrete definitions to type checkers without importing at runtime.
     from uniserve.nn.activation import GELUAndMul, SiLUAndMul, get_act_fn
     from uniserve.nn.attention import Attention
     from uniserve.nn.linear import (

@@ -24,9 +24,17 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu]
 @pytest.mark.parametrize(
     ("description", "model_env"),
     [
-        pytest.param("qwen3", "UNISERVE_QWEN3_MODEL", marks=pytest.mark.model("qwen3")),
-        pytest.param("bagel", "UNISERVE_BAGEL_MODEL", marks=pytest.mark.model("bagel")),
-        pytest.param("sensenova", "UNISERVE_SENSENOVA_MODEL", marks=pytest.mark.model("sensenova")),
+        pytest.param(
+            "qwen3", "UNISERVE_QWEN3_MODEL", marks=pytest.mark.model("qwen3")
+        ),
+        pytest.param(
+            "bagel", "UNISERVE_BAGEL_MODEL", marks=pytest.mark.model("bagel")
+        ),
+        pytest.param(
+            "sensenova",
+            "UNISERVE_SENSENOVA_MODEL",
+            marks=pytest.mark.model("sensenova"),
+        ),
     ],
 )
 @pytest.mark.parametrize("parallel_axis", ["tensor", "pipeline", "sequence"])
@@ -45,7 +53,10 @@ def test_ordered_bindings_generate_outputs(
     )
     worker_config = {
         "id": "model",
-        "ranks": [{"node": "localhost", "device": f"cuda:{device}"} for device in (3, 1)],
+        "ranks": [
+            {"node": "localhost", "device": f"cuda:{device}"}
+            for device in (3, 1)
+        ],
         "entries": {"model": {"ranks": [1, 0], "parallel_config": parallel}},
         "queue_depth": 2,
     }
@@ -89,7 +100,9 @@ def test_ordered_bindings_generate_outputs(
             f"{base_url}/v1/chat/completions",
             json={
                 "model": description,
-                "messages": [{"role": "user", "content": "Name a primary color."}],
+                "messages": [
+                    {"role": "user", "content": "Name a primary color."}
+                ],
                 "temperature": 0,
                 "max_completion_tokens": 8,
             },
@@ -115,11 +128,17 @@ def test_ordered_bindings_generate_outputs(
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": "Describe the dominant color."},
+                                {
+                                    "type": "text",
+                                    "text": "Describe the dominant color.",
+                                },
                                 {
                                     "type": "image_url",
                                     "image_url": {
-                                        "url": f"data:image/png;base64,{tiny_input_png_b64()}"
+                                        "url": (
+                                            "data:image/png;base64,"
+                                            f"{tiny_input_png_b64()}"
+                                        )
                                     },
                                 },
                             ],
@@ -133,7 +152,9 @@ def test_ordered_bindings_generate_outputs(
             image_to_text.raise_for_status()
             image_result = image_to_text.json()
             image_message = image_result["choices"][0]["message"]
-            assert image_message.get("content") or image_message.get("reasoning_content")
+            assert image_message.get("content") or image_message.get(
+                "reasoning_content"
+            )
             assert 1 <= image_result["usage"]["completion_tokens"] <= 8
 
             generated = httpx.post(

@@ -13,7 +13,6 @@ def allocate_shared_memory(size: int) -> shared_memory.SharedMemory:
     Reserving tmpfs pages avoids an uncatchable SIGBUS from a later copy when
     the shared-memory filesystem is full.
     """
-
     if size < 1:
         raise ValueError("shared-memory capacity must be positive")
 

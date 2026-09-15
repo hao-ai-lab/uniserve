@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Literal
 import torch
 from torch.distributed.tensor import Partial, Replicate, Shard
 
-from .tensor import QuantizedTensor, ScaleLayout, _FP8Tensor, _MXFP8Tensor, _NVFP4Tensor
+from .tensor import (
+    QuantizedTensor,
+    ScaleLayout,
+    _FP8Tensor,
+    _MXFP8Tensor,
+    _NVFP4Tensor,
+)
 
 if TYPE_CHECKING:
     from uniserve.distributed import Distribution
@@ -35,38 +41,64 @@ class Quantizer:
         if self.axis is not None and (
             type(self.axis) is not int or self.axis != 0 or self.format != "fp8"
         ):
-            raise ValueError("only FP8 supports the retained statistical axis zero")
+            raise ValueError(
+                "only FP8 supports the retained statistical axis zero"
+            )
 
     def _shape(self, shape, dtype):
         """Reject logical shapes and dtypes this encoding cannot represent."""
-        if not isinstance(shape, tuple) or any(type(size) is not int or size < 0 for size in shape):
-            raise ValueError("quantized shape must contain nonnegative integer extents")
-        if dtype not in {torch.float16, torch.bfloat16, torch.float32, torch.float64}:
-            raise ValueError("quantized tensors require a logical floating-point dtype")
+        if not isinstance(shape, tuple) or any(
+            type(size) is not int or size < 0 for size in shape
+        ):
+            raise ValueError(
+                "quantized shape must contain nonnegative integer extents"
+            )
+        if dtype not in {
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        }:
+            raise ValueError(
+                "quantized tensors require a logical floating-point dtype"
+            )
         if self.axis == 0 and not shape:
             raise ValueError("axis zero requires a non-scalar tensor")
         if self.format != "fp8":
             block = 32 if self.format == "mxfp8" else 16
             if len(shape) < 2 or shape[-1] % block:
-                raise ValueError(f"{self.format} requires complete aligned K{block} blocks")
+                raise ValueError(
+                    f"{self.format} requires complete aligned K{block} blocks"
+                )
 
     def _statistics_shape(self, shape):
-        """Return the FP32 amax shape for a logical shape under this quantizer."""
+        """Return the FP32 amax shape for a logical shape.
+
+        Under this quantizer.
+        """
         if self.format == "mxfp8":
             return (*shape[:-1], shape[-1] // 32, 1)
         if self.axis == 0:
             return (shape[0], *((1,) * (len(shape) - 1)))
         return ()
 
-    def _distribution(self, shape: tuple[int, ...], distribution: Distribution | None) -> None:
+    def _distribution(
+        self, shape: tuple[int, ...], distribution: Distribution | None
+    ) -> None:
         """Reject placements incompatible with logical-domain statistics."""
         if distribution is None:
             return
         for placement in distribution.placements:
             if isinstance(placement, Partial):
-                raise ValueError("partial tensors must be reduced before quantization")
-            if isinstance(placement, Shard) and not -len(shape) <= placement.dim < len(shape):
-                raise ValueError("shard dimension is outside the logical tensor")
+                raise ValueError(
+                    "partial tensors must be reduced before quantization"
+                )
+            if isinstance(placement, Shard) and not -len(
+                shape
+            ) <= placement.dim < len(shape):
+                raise ValueError(
+                    "shard dimension is outside the logical tensor"
+                )
 
     def amax(
         self,
@@ -75,24 +107,33 @@ class Quantizer:
         distribution: Distribution | None = None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Reduce to the FP32 maximum magnitude over the logical statistical domain.
+        """Reduce to the FP32 maximum magnitude.
 
-        Sharded reduction axes are all-reduced across the owning mesh group.
-        ``out`` borrows caller storage with the statistical shape.
+        Over the logical statistical domain. Sharded reduction axes are
+        all-reduced across the owning mesh group. ``out`` borrows caller
+        storage with the statistical shape.
         """
         self._shape(tuple(x.shape), x.dtype)
         self._distribution(tuple(x.shape), distribution)
         shape = self._statistics_shape(tuple(x.shape))
         if out is not None and (
-            out.shape != shape or out.dtype != torch.float32 or out.device != x.device
+            out.shape != shape
+            or out.dtype != torch.float32
+            or out.device != x.device
         ):
-            raise ValueError("amax output must match the statistical shape, FP32 dtype and device")
+            raise ValueError(
+                "amax output must match the statistical shape, FP32 dtype "
+                "and device"
+            )
         if isinstance(x, QuantizedTensor):
             x = x.dequantize(dtype=torch.float32)
 
         if self.format == "mxfp8":
             maximum = (
-                x.float().reshape(*x.shape[:-1], x.shape[-1] // 32, 32).abs().amax(-1, keepdim=True)
+                x.float()
+                .reshape(*x.shape[:-1], x.shape[-1] // 32, 32)
+                .abs()
+                .amax(-1, keepdim=True)
             )
         elif not x.numel():
             maximum = torch.zeros(shape, dtype=torch.float32, device=x.device)
@@ -110,7 +151,9 @@ class Quantizer:
                 distribution.mesh.axes, distribution.placements, strict=True
             ):
                 if isinstance(placement, Partial):
-                    raise ValueError("partial tensors must be reduced before quantization")
+                    raise ValueError(
+                        "partial tensors must be reduced before quantization"
+                    )
                 if not isinstance(placement, Shard):
                     continue
                 dim = placement.dim % x.ndim
@@ -125,13 +168,16 @@ class Quantizer:
                     # group. Including exact replicas leaves max unchanged.
                     replicated = {
                         name
-                        for name, part in zip(mesh.axes, distribution.placements, strict=True)
+                        for name, part in zip(
+                            mesh.axes, distribution.placements, strict=True
+                        )
                         if isinstance(part, Replicate)
                     }
                     candidates = [
                         axes
                         for axes in mesh._groups
-                        if axis in axes and set(axes).difference({axis}).issubset(replicated)
+                        if axis in axes
+                        and set(axes).difference({axis}).issubset(replicated)
                     ]
                     if candidates:
                         selected = min(candidates, key=len)
@@ -146,10 +192,11 @@ class Quantizer:
         amax: torch.Tensor | None = None,
         out: QuantizedTensor | None = None,
     ) -> QuantizedTensor:
-        """Encode a logical floating tensor into this quantizer's representation.
+        """Encode a logical floating tensor.
 
-        An input already encoded with the same quantizer is returned or repacked
-        without recomputing scales. ``amax`` borrows caller-computed statistics;
+        Into this quantizer's representation. An input already encoded with
+        the same quantizer is returned or repacked without recomputing
+        scales. ``amax`` borrows caller-computed statistics;
         ``out`` borrows caller-owned encoding storage.
         """
         self._shape(tuple(x.shape), x.dtype)
@@ -170,29 +217,45 @@ class Quantizer:
             or out.device != x.device
         ):
             raise ValueError(
-                "quantization output must match encoding, statistical axis, shape, dtype and device"
+                "quantization output must match encoding, statistical axis, "
+                "shape, dtype and device"
             )
         if amax is not None and (
             amax.shape != self._statistics_shape(tuple(x.shape))
             or amax.dtype != torch.float32
             or amax.device != x.device
         ):
-            raise ValueError("amax must match the logical statistical shape, FP32 dtype and device")
+            raise ValueError(
+                "amax must match the logical statistical shape, FP32 dtype "
+                "and device"
+            )
 
         # Row-wise FP8 with computed scales takes the fused single-kernel path.
-        if self.format == "fp8" and self.axis == 0 and amax is None and x.ndim == 2:
+        if (
+            self.format == "fp8"
+            and self.axis == 0
+            and amax is None
+            and x.ndim == 2
+        ):
             reduced_axes = (
                 ()
                 if distribution is None
                 else tuple(
                     axis
                     for axis, placement in zip(
-                        distribution.mesh.axes, distribution.placements, strict=True
+                        distribution.mesh.axes,
+                        distribution.placements,
+                        strict=True,
                     )
-                    if isinstance(placement, Shard) and placement.dim % x.ndim == 1
+                    if isinstance(placement, Shard)
+                    and placement.dim % x.ndim == 1
                 )
             )
-            if not reduced_axes and x.is_cuda and x.dtype in {torch.float16, torch.bfloat16}:
+            if (
+                not reduced_axes
+                and x.is_cuda
+                and x.dtype in {torch.float16, torch.bfloat16}
+            ):
                 from ._fp8 import rowwise
 
                 target = (
@@ -210,12 +273,16 @@ class Quantizer:
         layout = ScaleLayout.LINEAR if out is None else out.scale_layout
         if self.format == "fp8":
             scale = amax.clamp_min(1e-12) / 448.0
-            values = (x.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            values = (
+                (x.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            )
             fields = {"values": values, "scale": scale}
         else:
             fields = self._encode_blocks(x, amax, layout)
 
-        result = self.from_tensors(fields, shape=tuple(x.shape), dtype=x.dtype, scale_layout=layout)
+        result = self.from_tensors(
+            fields, shape=tuple(x.shape), dtype=x.dtype, scale_layout=layout
+        )
         if out is None:
             return result
         for name, value in result.buffers().items():
@@ -223,8 +290,13 @@ class Quantizer:
         return out
 
     def _encode_blocks(self, x, maximum, layout):
-        if not x.is_cuda or torch.cuda.get_device_capability(x.device) < (10, 0):
-            raise RuntimeError(f"{self.format} conversion requires an SM100-class CUDA device")
+        if not x.is_cuda or torch.cuda.get_device_capability(x.device) < (
+            10,
+            0,
+        ):
+            raise RuntimeError(
+                f"{self.format} conversion requires an SM100-class CUDA device"
+            )
         import flashinfer
 
         # Block encoders operate on a flattened [rows, K] matrix.
@@ -234,7 +306,9 @@ class Quantizer:
         if not matrix.numel():
             result = self.empty(tuple(x.shape), dtype=x.dtype, device=x.device)
             if self.format == "nvfp4":
-                result.buffers()["tensor_scale"].copy_(maximum.clamp_min(1e-12) / (448.0 * 6.0))
+                result.buffers()["tensor_scale"].copy_(
+                    maximum.clamp_min(1e-12) / (448.0 * 6.0)
+                )
             return dict(result.repack(scale_layout=layout).buffers())
 
         if self.format == "mxfp8" and maximum is not None:
@@ -244,7 +318,9 @@ class Quantizer:
             bits = scaled.view(torch.int32)
             exponent = (bits >> 23) & 255
             fraction = bits & 0x7FFFFF
-            increment = torch.where(exponent == 0, fraction > 0x400000, fraction != 0)
+            increment = torch.where(
+                exponent == 0, fraction > 0x400000, fraction != 0
+            )
             scales = (
                 (exponent + increment)
                 .clamp_max(254)
@@ -255,7 +331,11 @@ class Quantizer:
             # [rows, K // 32, 32] value blocks, one E8M0 scale per block
             blocks = matrix.float().reshape(rows, x.shape[-1] // 32, 32)
             values = (
-                torch.where(maximum.reshape(rows, -1, 1) > 0, blocks / decoded.unsqueeze(-1), 0.0)
+                torch.where(
+                    maximum.reshape(rows, -1, 1) > 0,
+                    blocks / decoded.unsqueeze(-1),
+                    0.0,
+                )
                 .clamp(-448.0, 448.0)
                 .to(torch.float8_e4m3fn)
             )
@@ -288,7 +368,9 @@ class Quantizer:
             sfLayout=flashinfer.SfLayout.layout_128x4
             if layout is ScaleLayout.SWIZZLED_128X4
             else flashinfer.SfLayout.layout_linear,
-            backend="cuda" if layout is ScaleLayout.SWIZZLED_128X4 else "cute-dsl",
+            backend="cuda"
+            if layout is ScaleLayout.SWIZZLED_128X4
+            else "cute-dsl",
             enable_pdl=False,
         )
         scales = (
@@ -303,15 +385,23 @@ class Quantizer:
         }
 
     def empty(
-        self, shape: tuple[int, ...], *, dtype: torch.dtype, device: torch.device | str
+        self,
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+        device: torch.device | str,
     ) -> QuantizedTensor:
         """Allocate uninitialized encoding buffers for a logical tensor."""
         self._shape(shape, dtype)
         if self.format == "fp8":
             fields = {
-                "values": torch.empty(shape, dtype=torch.float8_e4m3fn, device=device),
+                "values": torch.empty(
+                    shape, dtype=torch.float8_e4m3fn, device=device
+                ),
                 "scale": torch.empty(
-                    self._statistics_shape(shape), dtype=torch.float32, device=device
+                    self._statistics_shape(shape),
+                    dtype=torch.float32,
+                    device=device,
                 ),
             }
         else:
@@ -328,7 +418,9 @@ class Quantizer:
                 (rows, shape[-1] // block), dtype=torch.uint8, device=device
             )
             if block == 16:
-                fields["tensor_scale"] = torch.empty((), dtype=torch.float32, device=device)
+                fields["tensor_scale"] = torch.empty(
+                    (), dtype=torch.float32, device=device
+                )
 
         return self.from_tensors(fields, shape=shape, dtype=dtype)
 
@@ -352,9 +444,12 @@ class Quantizer:
             else {"values", "scale"}
         )
         if set(tensors) != keys:
-            raise ValueError(f"{self.format} encoding requires exactly {sorted(keys)}")
+            raise ValueError(
+                f"{self.format} encoding requires exactly {sorted(keys)}"
+            )
         if any(
-            not isinstance(value, torch.Tensor) or isinstance(value, QuantizedTensor)
+            not isinstance(value, torch.Tensor)
+            or isinstance(value, QuantizedTensor)
             for value in tensors.values()
         ):
             raise TypeError("encoding buffers must be ordinary tensors")
@@ -366,16 +461,26 @@ class Quantizer:
             raise ValueError("unsupported scale layout for this encoding")
 
         values = tensors["values"]
-        value_shape = (*shape[:-1], shape[-1] // 2) if self.format == "nvfp4" else shape
-        value_dtype = torch.uint8 if self.format == "nvfp4" else torch.float8_e4m3fn
+        value_shape = (
+            (*shape[:-1], shape[-1] // 2) if self.format == "nvfp4" else shape
+        )
+        value_dtype = (
+            torch.uint8 if self.format == "nvfp4" else torch.float8_e4m3fn
+        )
         if values.shape != value_shape or values.dtype != value_dtype:
-            raise ValueError("encoded values disagree with the logical shape or format dtype")
+            raise ValueError(
+                "encoded values disagree with the logical shape or format dtype"
+            )
 
         if self.format == "fp8":
             scale = tensors["scale"]
-            if scale.dtype != torch.float32 or scale.shape != self._statistics_shape(shape):
+            if (
+                scale.dtype != torch.float32
+                or scale.shape != self._statistics_shape(shape)
+            ):
                 raise ValueError(
-                    "FP8 scale must match the retained statistical axis and FP32 dtype"
+                    "FP8 scale must match the retained statistical axis and "
+                    "FP32 dtype"
                 )
             cls = _FP8Tensor
         else:
@@ -393,7 +498,8 @@ class Quantizer:
                 or not scales.is_contiguous()
             ):
                 raise ValueError(
-                    "block scale shape, dtype or strides disagree with its physical layout"
+                    "block scale shape, dtype or strides disagree with its "
+                    "physical layout"
                 )
             if block == 16 and (
                 tensors["tensor_scale"].dtype != torch.float32
@@ -402,12 +508,21 @@ class Quantizer:
                 raise ValueError("NVFP4 tensor scale must be an FP32 scalar")
             cls = _MXFP8Tensor if block == 32 else _NVFP4Tensor
 
-        return cls(tensors, shape=shape, dtype=dtype, quantizer=self, scale_layout=scale_layout)
+        return cls(
+            tensors,
+            shape=shape,
+            dtype=dtype,
+            quantizer=self,
+            scale_layout=scale_layout,
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class QuantizationConfig:
-    """The independently selected encodings of linear weights and activations."""
+    """The independently selected encodings of linear weights.
+
+    And activations.
+    """
 
     weight: Quantizer
     activation: Quantizer

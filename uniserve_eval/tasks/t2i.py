@@ -21,7 +21,10 @@ class T2ITask(BenchmarkTask):
     """Builds image-generation requests and validates decoded outputs."""
 
     name: ClassVar[TaskName] = TaskName.T2I
-    allowed_endpoints: ClassVar[tuple[str, ...]] = (CHAT_COMPLETIONS, IMAGES_GENERATIONS)
+    allowed_endpoints: ClassVar[tuple[str, ...]] = (
+        CHAT_COMPLETIONS,
+        IMAGES_GENERATIONS,
+    )
     default_endpoint: ClassVar[str] = CHAT_COMPLETIONS
     default_stream: ClassVar[bool] = False
     accepts_image: ClassVar[bool] = True
@@ -29,7 +32,6 @@ class T2ITask(BenchmarkTask):
 
     def build_request(self, example: Example) -> TaskRequest:
         """Build a request for the selected chat or image endpoint."""
-
         count = int(self.point.image.image_count or 0)
         if self.point.endpoint == IMAGES_GENERATIONS:
             payload: dict[str, object] = {
@@ -50,9 +52,10 @@ class T2ITask(BenchmarkTask):
         self.apply_text_sampling(payload)
         return TaskRequest(self.point.endpoint, payload, stream=False)
 
-    def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
+    def validate_output(
+        self, records: Sequence[RequestRecord]
+    ) -> ValidationResult:
         """Check image integrity and exact configured output count."""
-
         count = int(self.point.image.image_count or 0)
         checks = self.image_integrity_checks(records)
         checks["exact_image_count"] = bool(records) and all(
@@ -63,6 +66,8 @@ class T2ITask(BenchmarkTask):
             checks=checks,
             statistics={
                 "completed_images": total_images,
-                "images_per_request": total_images / len(records) if records else 0.0,
+                "images_per_request": total_images / len(records)
+                if records
+                else 0.0,
             },
         )

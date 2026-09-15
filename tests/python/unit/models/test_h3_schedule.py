@@ -20,15 +20,21 @@ def test_fixed_modality_endpoints():
         ("audio", (1.0, 0.9, 0.75, 0.5, 0.0)),
     ):
         sigma = torch.tensor(expected, dtype=torch.float32)
-        torch.testing.assert_close(schedules[name].sigmas, sigma, rtol=0, atol=0)
-        torch.testing.assert_close(schedules[name].timesteps, 1.0 - sigma, rtol=0, atol=0)
+        torch.testing.assert_close(
+            schedules[name].sigmas, sigma, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            schedules[name].timesteps, 1.0 - sigma, rtol=0, atol=0
+        )
         assert schedules[name].coordinates == pytest.approx(
             tuple(1.0 - value for value in expected)
         )
         assert schedules[name].num_steps == 4
 
 
-@pytest.mark.parametrize("steps,shift", [(1, None), (2, None), (3, None), (5, None), (4, 1.0)])
+@pytest.mark.parametrize(
+    "steps,shift", [(1, None), (2, None), (3, None), (5, None), (4, 1.0)]
+)
 def test_rejects_untrained_schedule(steps, shift):
     with torch.device("meta"):
         model = Denoiser(TransformerConfig(), DiffusionConfig())

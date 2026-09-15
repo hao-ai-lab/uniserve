@@ -10,13 +10,18 @@ from .image import ImageBuilder
 
 
 class U1Builder(ImageBuilder):
-    """Construct SenseNova U1's denoising inputs and per-step image conditioning."""
+    """Construct SenseNova U1's denoising inputs and per-step image.
+
+    conditioning.
+    """
 
     @property
     def max_tokens(self):
         return self.denoiser.config.max_image_seq_len
 
-    def bind(self, *, samples, sizes, timesteps, positions, attention, step_index):
+    def bind(
+        self, *, samples, sizes, timesteps, positions, attention, step_index
+    ):
         """Assemble one denoising step's typed input from resident tensors."""
         images = []
         for sample, size in zip(samples, sizes, strict=True):
@@ -36,19 +41,24 @@ class U1Builder(ImageBuilder):
                 device=sample.device,
                 dtype=torch.int64,
             )
-            scale = sample.new_tensor([self.denoiser.noise_scale.scale(sample.shape[0])])
+            scale = sample.new_tensor(
+                [self.denoiser.noise_scale.scale(sample.shape[0])]
+            )
             images.append(ImageConditioning(pixels, grid, scale))
 
         return DenoiserInput(
             latents={
                 "image": tuple(
-                    LatentInput(value, time) for value, time in zip(samples, timesteps, strict=True)
+                    LatentInput(value, time)
+                    for value, time in zip(samples, timesteps, strict=True)
                 )
             },
             sizes=sizes,
             step_index=step_index,
             positions=positions,
-            sequence_lengths=tuple(self.sequence_length(size) for size in sizes),
+            sequence_lengths=tuple(
+                self.sequence_length(size) for size in sizes
+            ),
             attention=attention,
             images=tuple(images),
         )

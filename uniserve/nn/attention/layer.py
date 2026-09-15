@@ -1,4 +1,6 @@
-"""Numerical attention layers borrowing context-bound operators and prefix state."""
+"""Numerical attention layers borrowing context-bound operators and prefix
+state.
+"""  # noqa: D205
 
 from __future__ import annotations
 
@@ -32,15 +34,22 @@ class Attention(nn.Module):
         cache_name: str | None = None,
     ):
         super().__init__()
-        if min(num_heads, num_kv_heads, head_dim) < 1 or num_heads % num_kv_heads:
-            raise ValueError("attention requires positive compatible query and KV heads")
+        if (
+            min(num_heads, num_kv_heads, head_dim) < 1
+            or num_heads % num_kv_heads
+        ):
+            raise ValueError(
+                "attention requires positive compatible query and KV heads"
+            )
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.scale = head_dim**-0.5 if scale is None else scale
         if not math.isfinite(self.scale):
             raise ValueError("attention scale must be finite")
-        if cache_name is not None and (not isinstance(cache_name, str) or not cache_name):
+        if cache_name is not None and (
+            not isinstance(cache_name, str) or not cache_name
+        ):
             raise ValueError("cache names must identify a numerical layer path")
         self.cache_name = cache_name
         self._local_heads = num_heads
@@ -64,27 +73,37 @@ class Attention(nn.Module):
         Under Ulysses the token shard is exchanged for this rank's head shard
         before compute and restored to token layout afterwards.
         """
-
         if out is not None and (
-            out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
+            out.shape != q.shape
+            or out.dtype != q.dtype
+            or out.device != q.device
         ):
-            raise ValueError("attention output must match the local query representation")
+            raise ValueError(
+                "attention output must match the local query representation"
+            )
 
         group = self._exchange.group
         operator = _binding.attention.get().get(id(self))
         if self._context is not None:
             if operator is None:
-                raise RuntimeError("context attention requires an active ExecutionContext")
+                raise RuntimeError(
+                    "context attention requires an active ExecutionContext"
+                )
             destination = torch.empty_like(q) if out is None else out
             return operator(q, k, v, batch, scale=self.scale, out=destination)
         if group.size == 1:
             return self._compute(operator, q, k, v, batch, out)
 
         if isinstance(batch, DenseInput) or q.ndim != 3:
-            raise ValueError("Ulysses attention requires explicit packed sequence lengths")
+            raise ValueError(
+                "Ulysses attention requires explicit packed sequence lengths"
+            )
         if batch.queries.num_tokens is None:
             if operator is None:
-                raise RuntimeError("device-only Ulysses lengths require an active ExecutionContext")
+                raise RuntimeError(
+                    "device-only Ulysses lengths require an active "
+                    "ExecutionContext"
+                )
             batch = operator.sequence_inputs(batch)
         partition = _TokenShard(batch.queries.num_tokens, group)
         if partition.num_tokens == 0:
@@ -93,10 +112,12 @@ class Attention(nn.Module):
         # Token shard -> this rank's head shard, over the padded common layout.
         storage = _binding.attention_storage.get().get(id(self))
         query, key, value = (
-            self._exchange.heads(partition.pad(tensor), storage=storage, role=role)[
-                : partition.num_tokens
-            ]
-            for role, tensor in zip(("query", "key", "value"), (q, k, v), strict=True)
+            self._exchange.heads(
+                partition.pad(tensor), storage=storage, role=role
+            )[: partition.num_tokens]
+            for role, tensor in zip(
+                ("query", "key", "value"), (q, k, v), strict=True
+            )
         )
         result = self._compute(operator, query, key, value, batch, None)
 
@@ -107,32 +128,45 @@ class Attention(nn.Module):
             padded = result.new_zeros((physical_tokens, *result.shape[1:]))
             padded[: partition.num_tokens].copy_(result)
             result = padded
-        result = self._exchange.tokens(result, storage=storage)[: partition.count]
+        result = self._exchange.tokens(result, storage=storage)[
+            : partition.count
+        ]
         return functional._result(result, out)
 
     def _compute(self, operator, q, k, v, batch, out):
         if q.shape[1] != self._local_heads or k.shape[-1] != self.head_dim:
-            raise ValueError("attention projections do not match the bound head partition")
+            raise ValueError(
+                "attention projections do not match the bound head partition"
+            )
 
         if operator is None:
             if isinstance(batch, SegmentedInput) or (
-                isinstance(batch, PagedInput) and batch.write_indices is not None
+                isinstance(batch, PagedInput)
+                and batch.write_indices is not None
             ):
-                raise RuntimeError("cached attention requires an active ExecutionContext")
-            return functional.attention(q, k, v, batch, scale=self.scale, out=out)
+                raise RuntimeError(
+                    "cached attention requires an active ExecutionContext"
+                )
+            return functional.attention(
+                q, k, v, batch, scale=self.scale, out=out
+            )
         destination = torch.empty_like(q) if out is None else out
         return operator(q, k, v, batch, scale=self.scale, out=destination)
 
-    def update_cache(self, k: torch.Tensor, v: torch.Tensor, *, indices: torch.Tensor) -> None:
-        """Write one global token view without scheduling or committing a request.
+    def update_cache(
+        self, k: torch.Tensor, v: torch.Tensor, *, indices: torch.Tensor
+    ) -> None:
+        """Write one global token view without scheduling or committing a
+        request.
 
         With Ulysses, each rank supplies its local token interval and TP-local
         heads. The same exchange as forward produces this rank's cache heads.
-        """
-
+        """  # noqa: D205
         operator = _binding.attention.get().get(id(self))
         if operator is None:
-            raise RuntimeError("cache writes require an active ExecutionContext")
+            raise RuntimeError(
+                "cache writes require an active ExecutionContext"
+            )
 
         if self._context is not None:
             operator.update_cache(k, v, indices=indices)
@@ -144,9 +178,9 @@ class Attention(nn.Module):
                 return
             storage = _binding.attention_storage.get().get(id(self))
             k, v = (
-                self._exchange.heads(partition.pad(tensor), storage=storage, role=role)[
-                    : partition.num_tokens
-                ]
+                self._exchange.heads(
+                    partition.pad(tensor), storage=storage, role=role
+                )[: partition.num_tokens]
                 for role, tensor in (("key", k), ("value", v))
             )
 

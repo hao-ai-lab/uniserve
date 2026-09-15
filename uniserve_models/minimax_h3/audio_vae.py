@@ -27,7 +27,11 @@ class Config:
     decoder_kernel_sizes: tuple[int, ...] = (9, 9, 4, 4, 4, 4, 4)
     num_attention_heads: int = 8
     resblock_kernel_sizes: tuple[int, ...] = (3, 7, 11)
-    resblock_dilation_sizes: tuple[tuple[int, ...], ...] = ((1, 3, 5), (1, 3, 5), (1, 3, 5))
+    resblock_dilation_sizes: tuple[tuple[int, ...], ...] = (
+        (1, 3, 5),
+        (1, 3, 5),
+        (1, 3, 5),
+    )
     latents_mean: tuple[float, ...] = (
         -0.020211687488382354,
         0.3876466479950502,
@@ -100,8 +104,13 @@ class Config:
     def __post_init__(self) -> None:
         for name in ("latents_mean", "latents_std"):
             values = getattr(self, name)
-            if not isinstance(values, tuple) or len(values) != self.latent_channels:
-                raise ValueError(f"H3 {name} must describe every latent channel")
+            if (
+                not isinstance(values, tuple)
+                or len(values) != self.latent_channels
+            ):
+                raise ValueError(
+                    f"H3 {name} must describe every latent channel"
+                )
             if any(
                 not isinstance(value, (int, float))
                 or isinstance(value, bool)
@@ -120,7 +129,11 @@ class Config:
             "num_attention_heads",
         ):
             value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+            ):
                 raise ValueError(f"H3 audio {name} must be a positive integer")
         for name in (
             "encoder_rates",
@@ -133,43 +146,62 @@ class Config:
                 not isinstance(values, tuple)
                 or not values
                 or any(
-                    not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value <= 0
                     for value in values
                 )
             ):
-                raise ValueError(f"H3 audio {name} must contain positive integers")
+                raise ValueError(
+                    f"H3 audio {name} must contain positive integers"
+                )
 
         if len(self.decoder_rates) != len(self.decoder_kernel_sizes):
-            raise ValueError("H3 audio decoder rates and kernels must have matching stages")
+            raise ValueError(
+                "H3 audio decoder rates and kernels must have matching stages"
+            )
         if not isinstance(self.resblock_dilation_sizes, tuple) or len(
             self.resblock_dilation_sizes
         ) != len(self.resblock_kernel_sizes):
-            raise ValueError("H3 audio residual kernels and dilations must have matching stages")
+            raise ValueError(
+                "H3 audio residual kernels and dilations "
+                "must have matching stages"
+            )
         if any(
             not isinstance(row, tuple)
             or not row
             or any(
-                not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in row
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+                for value in row
             )
             for row in self.resblock_dilation_sizes
         ):
-            raise ValueError("H3 audio residual dilations must contain positive integers")
+            raise ValueError(
+                "H3 audio residual dilations must contain positive integers"
+            )
         if self.latent_dim % self.num_attention_heads:
-            raise ValueError("H3 audio latent width must be divisible by attention heads")
+            raise ValueError(
+                "H3 audio latent width must be divisible by attention heads"
+            )
 
 
 class Model(LatentDecoder):
     """Invert audio latent statistics and reconstruct interleaved stereo PCM."""
 
     def __init__(self, config: Config):
-        from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (
+        from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (  # noqa: E501
             MiniMaxH3AudioBigVGANDecoder,
         )
 
         decoder = nn.Sequential(
             OrderedDict(
                 (
-                    ("input", nn.Conv1d(config.latent_channels, config.latent_dim, 1)),
+                    (
+                        "input",
+                        nn.Conv1d(config.latent_channels, config.latent_dim, 1),
+                    ),
                     (
                         "network",
                         MiniMaxH3AudioBigVGANDecoder(
@@ -191,23 +223,27 @@ class Model(LatentDecoder):
             for name, value in tuple(module.named_buffers(recurse=False)):
                 if name not in module._non_persistent_buffers_set:
                     delattr(module, name)
-                    module.register_parameter(name, nn.Parameter(value, requires_grad=False))
+                    module.register_parameter(
+                        name, nn.Parameter(value, requires_grad=False)
+                    )
         super().__init__(
             decoder,
             latent_shape=(2, config.latent_channels, None),
-            mean=torch.tensor(config.latents_mean, dtype=torch.float32, device="cpu").view(
-                1, config.latent_channels, 1
-            ),
-            std=torch.tensor(config.latents_std, dtype=torch.float32, device="cpu").view(
-                1, config.latent_channels, 1
-            ),
+            mean=torch.tensor(
+                config.latents_mean, dtype=torch.float32, device="cpu"
+            ).view(1, config.latent_channels, 1),
+            std=torch.tensor(
+                config.latents_std, dtype=torch.float32, device="cpu"
+            ).view(1, config.latent_channels, 1),
         )
         self.config = config
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
         decoded = super().forward(latents).float()
         if decoded.ndim != 3 or decoded.shape[:2] != (2, 1):
-            raise RuntimeError("audio decoder must produce two mono channel timelines")
+            raise RuntimeError(
+                "audio decoder must produce two mono channel timelines"
+            )
         # [stereo, samples] float waveforms become [samples, 2] int16 PCM.
         return (
             decoded[:, 0]

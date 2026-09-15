@@ -34,7 +34,9 @@ def test_text_ignore_eos_requires_fixed_length_and_server_usage() -> None:
         sampling=SamplingConfig(ignore_eos=True, stream=True),
     )
     task = TextTask(point)
-    request = task.build_request(Example(id="row", prompt="hello", output_len=8))
+    request = task.build_request(
+        Example(id="row", prompt="hello", output_len=8)
+    )
     assert request.stream is True
     assert request.payload["max_completion_tokens"] == 8
     assert request.payload["ignore_eos"] is True

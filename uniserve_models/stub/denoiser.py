@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import torch
 
-from uniserve.diffusion import AdditiveGuidance, EulerSolver, NoiseScale, make_schedule
+from uniserve.diffusion import (
+    AdditiveGuidance,
+    EulerSolver,
+    NoiseScale,
+    make_schedule,
+)
 from uniserve.model import (
     ImageDenoiser,
     TransformerDecoder,
@@ -41,8 +46,12 @@ class Denoiser(ImageDenoiser):
             )
         }
 
-    def make_guidance(self, *, text_scale, image_scale, interval, renorm, renorm_min):
-        return AdditiveGuidance(text_scale, image_scale, interval, renorm, renorm_min)
+    def make_guidance(
+        self, *, text_scale, image_scale, interval, renorm, renorm_min
+    ):
+        return AdditiveGuidance(
+            text_scale, image_scale, interval, renorm, renorm_min
+        )
 
     def forward(self, inputs: DenoiserInput, *, state, constants, workspace):
         if set(inputs.latents) != {"image"}:
@@ -64,14 +73,25 @@ class Denoiser(ImageDenoiser):
         # The prediction is exactly zero; only the shape must match each
         # latent's canonical patch grid.
         outputs = []
-        for latent, size in zip(inputs.latents["image"], inputs.sizes, strict=True):
+        for latent, size in zip(
+            inputs.latents["image"], inputs.sizes, strict=True
+        ):
             shape = self.latent_shape("image", size)
             if tuple(latent.tensor.shape) != shape:
-                raise ValueError("simulation latents must match their canonical image patches")
+                raise ValueError(
+                    "simulation latents must match their canonical "
+                    "image patches"
+                )
             outputs.append(
                 TensorOutput(
-                    torch.zeros_like(latent.tensor, dtype=self.prediction_dtype),
-                    OutputLayout(shape, self.prediction_dtype, tuple(slice(0, n) for n in shape)),
+                    torch.zeros_like(
+                        latent.tensor, dtype=self.prediction_dtype
+                    ),
+                    OutputLayout(
+                        shape,
+                        self.prediction_dtype,
+                        tuple(slice(0, n) for n in shape),
+                    ),
                 )
             )
         return {"image": tuple(outputs)}

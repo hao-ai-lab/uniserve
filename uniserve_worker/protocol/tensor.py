@@ -28,7 +28,6 @@ class DType(StrEnum):
     @property
     def element_bytes(self) -> int:
         """Width of one scalar in the logical representation."""
-
         return {
             DType.U8: 1,
             DType.I32: 4,
@@ -49,7 +48,10 @@ class StaticDim:
 
 @dataclass(frozen=True, slots=True)
 class DeviceDim:
-    """Bounds one tensor dimension whose live extent is selected on the device."""
+    """Bounds one tensor dimension.
+
+    The live extent is selected on the device.
+    """
 
     bound: int
 
@@ -64,26 +66,34 @@ class ShapeBound:
     dims: tuple[DimBound, ...] = ()
 
     def __post_init__(self) -> None:
-        """Normalize dimensions and reject empty or non-positive shape bounds."""
+        """Normalize dimensions.
 
+        Rejects empty or non-positive shape bounds.
+        """
         device_dims = sum(1 for dim in self.dims if isinstance(dim, DeviceDim))
         if device_dims > 1:
-            raise invalid_descriptor("a shape bound carries more than one device-actual dimension")
-        if any((dim.extent if isinstance(dim, StaticDim) else dim.bound) < 1 for dim in self.dims):
+            raise invalid_descriptor(
+                "a shape bound carries more than one device-actual dimension"
+            )
+        if any(
+            (dim.extent if isinstance(dim, StaticDim) else dim.bound) < 1
+            for dim in self.dims
+        ):
             raise invalid_descriptor("a shape bound contains a zero extent")
 
     @property
     def max_elements(self) -> int:
         """Multiply static extents and the maximum device-selected extent."""
-
         elements = 1
         for dim in self.dims:
             elements *= dim.extent if isinstance(dim, StaticDim) else dim.bound
         return elements
 
     def contains_shape(self, shape: tuple[int, ...]) -> bool:
-        """Check tensor bounds; a single dynamic dimension denotes flat capacity."""
+        """Check tensor bounds.
 
+        A single dynamic dimension denotes flat capacity.
+        """
         if any(extent < 1 for extent in shape):
             return False
         elements = math.prod(shape)
@@ -92,36 +102,52 @@ class ShapeBound:
         if len(self.dims) == 1 and isinstance(self.dims[0], DeviceDim):
             return elements <= self.dims[0].bound
         return len(shape) == len(self.dims) and all(
-            extent == bound.extent if isinstance(bound, StaticDim) else extent <= bound.bound
+            extent == bound.extent
+            if isinstance(bound, StaticDim)
+            else extent <= bound.bound
             for extent, bound in zip(shape, self.dims, strict=True)
         )
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "shape_bound") -> ShapeBound:
-        """Parse static and device-selected dimension bounds from the wire schema."""
+    def from_mapping(
+        cls, value: object, where: str = "shape_bound"
+    ) -> ShapeBound:
+        """Parse static and device-selected dimension bounds.
 
+        Reads the bounds from the wire schema.
+        """
         data = _map(value, where)
         dims: list[DimBound] = []
-        for index, item in enumerate(_seq(data.get("dims", ()), f"{where}.dims")):
+        for index, item in enumerate(
+            _seq(data.get("dims", ()), f"{where}.dims")
+        ):
             kind, payload = _tagged(item, f"{where}.dims[{index}]")
             if kind == "static":
-                dims.append(StaticDim(_uint(payload, f"{where}.dims[{index}].value")))
+                dims.append(
+                    StaticDim(_uint(payload, f"{where}.dims[{index}].value"))
+                )
             elif kind == "device":
                 inner = _map(payload, f"{where}.dims[{index}].value")
-                dims.append(DeviceDim(_uint(inner.get("max"), f"{where}.dims[{index}].value.max")))
+                dims.append(
+                    DeviceDim(
+                        _uint(
+                            inner.get("max"), f"{where}.dims[{index}].value.max"
+                        )
+                    )
+                )
             else:
-                raise invalid_descriptor(f"{where}.dims[{index}] has unknown variant {kind!r}")
+                raise invalid_descriptor(
+                    f"{where}.dims[{index}] has unknown variant {kind!r}"
+                )
         return cls(tuple(dims))
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize ordered dimension bounds into tagged wire variants."""
-
         return {"dims": [_dim_to_mapping(dim) for dim in self.dims]}
 
 
 def _dim_to_mapping(dim: DimBound) -> dict[str, object]:
     """Encode a static or symbolic dimension bound for the wire format."""
-
     if isinstance(dim, StaticDim):
         return {"kind": "static", "value": dim.extent}
     return {"kind": "device", "value": {"max": dim.bound}}
@@ -129,7 +155,10 @@ def _dim_to_mapping(dim: DimBound) -> dict[str, object]:
 
 @dataclass(frozen=True, slots=True)
 class OutputInfo:
-    """Name and bounded representation of an entry result before request binding."""
+    """Name and bounded representation of an entry result.
+
+    Applies before request binding.
+    """
 
     name: str
     dtype: DType
@@ -142,23 +171,24 @@ class OutputInfo:
     @property
     def max_bytes(self) -> int:
         """Maximum physical storage required by this Tensor result."""
-
         return self.shape_bound.max_elements * self.dtype.element_bytes
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "output_info") -> OutputInfo:
+    def from_mapping(
+        cls, value: object, where: str = "output_info"
+    ) -> OutputInfo:
         """Parse a named result description with its dtype and shape bound."""
-
         data = _map(value, where)
         return cls(
             name=_str(data.get("name"), f"{where}.name"),
             dtype=DType(_str(data.get("dtype"), f"{where}.dtype")),
-            shape_bound=ShapeBound.from_mapping(data.get("shape_bound"), f"{where}.shape_bound"),
+            shape_bound=ShapeBound.from_mapping(
+                data.get("shape_bound"), f"{where}.shape_bound"
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize the result description for IPC."""
-
         return {
             "name": self.name,
             "dtype": self.dtype.value,
@@ -183,15 +213,18 @@ class TensorRef:
 
     def __post_init__(self) -> None:
         """Validate allocation generation and bounded tensor capacity."""
-
         if self.generation < 1:
-            raise invalid_descriptor("product reference has no logical generation")
+            raise invalid_descriptor(
+                "product reference has no logical generation"
+            )
         self.shape_bound.__post_init__()
 
     @property
     def buffer_id(self) -> identity.BufferId:
-        """Borrow the immutable storage identity shared by this reference's consumers."""
+        """Borrow the immutable storage identity.
 
+        The identity is shared by this reference's consumers.
+        """
         buffer_id = self._buffer_id
         if buffer_id is None:
             buffer_id = identity.BufferId(
@@ -205,14 +238,17 @@ class TensorRef:
 
     @property
     def max_bytes(self) -> int:
-        """Return the maximum physical bytes allowed by this product’s shape and dtype."""
+        """Return the maximum physical bytes allowed.
 
+        The bound derives from this product’s shape and dtype.
+        """
         return self.shape_bound.max_elements * self.dtype.element_bytes
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "tensor_ref") -> TensorRef:
+    def from_mapping(
+        cls, value: object, where: str = "tensor_ref"
+    ) -> TensorRef:
         """Parse and validate a typed logical product and its storage bounds."""
-
         reference = _fast_tensor_ref(value)
         if reference is not None:
             return reference
@@ -224,15 +260,18 @@ class TensorRef:
             producer_op_id=identity.ComputationId.from_mapping(
                 data.get("producer_op_id"), f"{where}.producer_op_id"
             ),
-            output_index=_uint(data.get("output_index"), f"{where}.output_index"),
+            output_index=_uint(
+                data.get("output_index"), f"{where}.output_index"
+            ),
             generation=_uint(data.get("generation"), f"{where}.generation"),
             dtype=_enum(DType, data.get("dtype"), f"{where}.dtype"),
-            shape_bound=ShapeBound.from_mapping(data.get("shape_bound"), f"{where}.shape_bound"),
+            shape_bound=ShapeBound.from_mapping(
+                data.get("shape_bound"), f"{where}.shape_bound"
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize the complete logical product description for IPC."""
-
         return {
             "request_key": self.request_key.to_mapping(),
             "producer_op_id": self.producer_op_id.to_mapping(),
@@ -248,7 +287,6 @@ def _interned_shape_bound(
     encoded_dims: tuple[tuple[bool, int], ...],
 ) -> ShapeBound:
     """Reuse an immutable shape bound for an already encoded dimension tuple."""
-
     # Dimensions arrive pre-validated by _fast_shape_bound, so construction
     # bypasses __post_init__ to keep interning a pure allocation.
     shape = object.__new__(ShapeBound)
@@ -264,8 +302,10 @@ def _interned_shape_bound(
 
 
 def _fast_shape_bound(value: object) -> ShapeBound | None:
-    """Decode a trusted compact shape-bound mapping without generic schema dispatch."""
+    """Decode a trusted compact shape-bound mapping.
 
+    Bypasses generic schema dispatch.
+    """
     if type(value) is not dict:
         return None
     raw_dims = value.get("dims", ())
@@ -273,7 +313,8 @@ def _fast_shape_bound(value: object) -> ShapeBound | None:
     if kind is not list and kind is not tuple:
         return None
 
-    # Each dim is encoded as (is_device_dim, extent) for the interning cache key.
+    # Each dim is encoded as (is_device_dim, extent) for the interning
+    # cache key.
     dims: list[tuple[bool, int]] = []
     device_dims = 0
     for item in raw_dims:
@@ -303,8 +344,10 @@ def _fast_shape_bound(value: object) -> ShapeBound | None:
 
 
 def _fast_tensor_ref(value: object) -> TensorRef | None:
-    """Decode a trusted compact product reference and its optional tensor bound."""
+    """Decode a trusted compact product reference.
 
+    Also decodes its optional tensor bound.
+    """
     if type(value) is not dict:
         return None
 
@@ -350,7 +393,6 @@ def _fast_tensor_ref(value: object) -> TensorRef | None:
 
 def _fast_tensor_refs(value: object) -> tuple[TensorRef, ...] | None:
     """Decode a trusted sequence of compact product references."""
-
     kind = type(value)
     if kind is not list and kind is not tuple:
         return None

@@ -22,7 +22,6 @@ def _backbone_names(backbone: Transformer):
     ``_mot_gen`` suffix. QK norms split into temporal and spatial (``_hw``)
     checkpoint tensors. Only layers resident on this pipeline rank appear.
     """
-
     names = {
         "embedding.weight": "embed_tokens.weight",
         "norm.text.weight": "norm.weight",
@@ -38,7 +37,11 @@ def _backbone_names(backbone: Transformer):
 
         if kind in ("input_norms", "post_attention_norms"):
             target = (
-                ("input_layernorm" if kind == "input_norms" else "post_attention_layernorm")
+                (
+                    "input_layernorm"
+                    if kind == "input_norms"
+                    else "post_attention_layernorm"
+                )
                 + suffix
                 + "."
                 + tail
@@ -50,7 +53,10 @@ def _backbone_names(backbone: Transformer):
                 target = f"self_attn.{parts[2]}_proj{suffix}.{parts[3]}"
             else:
                 spatial = "_hw" if parts[1] == "1" else ""
-                target = f"self_attn.{'q' if parts[0] == 'query_norm' else 'k'}_norm{spatial}{suffix}.{parts[2]}"
+                target = (
+                    f"self_attn.{'q' if parts[0] == 'query_norm' else 'k'}"
+                    f"_norm{spatial}{suffix}.{parts[2]}"
+                )
         elif kind == "mlps":
             tail = (
                 tail.replace("gate_up.projections.gate", "gate_proj")
@@ -63,11 +69,14 @@ def _backbone_names(backbone: Transformer):
 
         names[path] = f"layers.{index}.{target}"
 
-    return {target: "language_model.model." + source for target, source in names.items()}
+    return {
+        target: "language_model.model." + source
+        for target, source in names.items()
+    }
 
 
 def _mapped(module, names, *, nonresident=frozenset()):
-    """Build a primary-source mapping that skips tensors absent from the file."""
+    """Build a primary-source mapping that skips tensors absent from the file."""  # noqa: E501
 
     def map_weights(reader):
         available = frozenset(reader.names())
@@ -81,14 +90,15 @@ def _mapped(module, names, *, nonresident=frozenset()):
         module,
         "primary",
         map_weights,
-        frozenset(name for name, _ in module.named_parameters() if name in names),
+        frozenset(
+            name for name, _ in module.named_parameters() if name in names
+        ),
         nonresident=nonresident,
     )
 
 
 def checkpoint_mappings(model: Model):
     """Assign every resident module its checkpoint tensors per pipeline rank."""
-
     backbone = model.text.backbone
     names = _backbone_names(backbone)
 
@@ -108,7 +118,10 @@ def checkpoint_mappings(model: Model):
         nonresident.add("language_model.model.embed_tokens.weight")
     if backbone.norm is None:
         nonresident.update(
-            ("language_model.model.norm.weight", "language_model.model.norm_mot_gen.weight")
+            (
+                "language_model.model.norm.weight",
+                "language_model.model.norm_mot_gen.weight",
+            )
         )
 
     # A tied head reads the embedding tensor instead of a separate lm_head.
@@ -132,14 +145,18 @@ def checkpoint_mappings(model: Model):
         denoiser_names.update(
             {
                 f"{path}.{name}": prefix + name
-                for name, _ in model.denoiser.get_submodule(path).named_parameters()
+                for name, _ in model.denoiser.get_submodule(
+                    path
+                ).named_parameters()
             }
         )
     if model.denoiser.noise_embedding is not None:
+        projection = model.denoiser.noise_embedding.projection
         denoiser_names.update(
             {
-                "noise_embedding.projection." + name: "fm_modules.noise_scale_embedder.mlp." + name
-                for name, _ in model.denoiser.noise_embedding.projection.named_parameters()
+                "noise_embedding.projection."
+                + name: "fm_modules.noise_scale_embedder.mlp." + name
+                for name, _ in projection.named_parameters()
             }
         )
 
@@ -154,16 +171,20 @@ def checkpoint_mappings(model: Model):
             source = name.removeprefix("head.")
         else:
             source = name.removeprefix("head.")
-            source = source.replace("time_embedding.projection.", "time_embed.mlp.")
+            source = source.replace(
+                "time_embedding.projection.", "time_embed.mlp."
+            )
             source = source.replace("input.", "input_proj.")
             source = source.replace("blocks.", "res_blocks.")
             source = (
-                source.replace(".norm.", ".in_ln.") if source.startswith("res_blocks.") else source
+                source.replace(".norm.", ".in_ln.")
+                if source.startswith("res_blocks.")
+                else source
             )
             source = source.replace(".modulation.", ".adaLN_modulation.")
-            source = source.replace("output.projection.", "final_layer.linear.").replace(
-                "output.", "final_layer."
-            )
+            source = source.replace(
+                "output.projection.", "final_layer.linear."
+            ).replace("output.", "final_layer.")
             source = "net." + source
         denoiser_names["prediction." + name] = "fm_modules.fm_head." + source
     components.append(_mapped(model.denoiser, denoiser_names))

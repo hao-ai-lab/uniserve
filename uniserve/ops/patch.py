@@ -26,15 +26,18 @@ if triton is not None:
         frames: tl.constexpr,
         height: tl.constexpr,
         width: tl.constexpr,
-        PATCH_FRAMES: tl.constexpr,
-        PATCH_HEIGHT: tl.constexpr,
-        PATCH_WIDTH: tl.constexpr,
-        CHANNELS: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
-        BLOCK: tl.constexpr,
+        PATCH_FRAMES: tl.constexpr,  # noqa: N803
+        PATCH_HEIGHT: tl.constexpr,  # noqa: N803
+        PATCH_WIDTH: tl.constexpr,  # noqa: N803
+        CHANNELS: tl.constexpr,  # noqa: N803
+        HAS_BIAS: tl.constexpr,  # noqa: N803
+        BLOCK: tl.constexpr,  # noqa: N803
     ):
-        """Unpack decoder patch channels into planar channel-major video coordinates."""
+        """Unpack decoder patch channels into video coordinates.
 
+        Unpack decoder patch channels into planar channel-major video
+        coordinates.
+        """
         offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         mask = offsets < elements
 
@@ -45,8 +48,8 @@ if triton is not None:
         output_volume: tl.constexpr = output_frames * output_spatial
         output_channels: tl.constexpr = CHANNELS * output_volume
 
-        # Decompose a planar output offset into [batch, channel, frame, row, col]
-        # coordinates of the unpacked video.
+        # Decompose a planar output offset into [batch, channel, frame,
+        # row, col] coordinates of the unpacked video.
         batch = offsets // output_channels
         remainder = offsets - batch * output_channels
         channel = remainder // output_volume
@@ -66,16 +69,24 @@ if triton is not None:
         inner_column = output_column - patch_column * PATCH_WIDTH
         patch = (frame * height + patch_row) * width + patch_column
         patch_channel = (
-            ((channel * PATCH_FRAMES + temporal_patch) * PATCH_HEIGHT + inner_row) * PATCH_WIDTH
+            (
+                (channel * PATCH_FRAMES + temporal_patch) * PATCH_HEIGHT
+                + inner_row
+            )
+            * PATCH_WIDTH
         ) + inner_column
 
         # Source tokens are [batch, patch, channel-major patch volume].
         source_offsets = (batch * sequence + patch) * (
             CHANNELS * PATCH_FRAMES * PATCH_HEIGHT * PATCH_WIDTH
         ) + patch_channel
-        value = tl.load(source_ptr + source_offsets, mask=mask, other=0.0).to(tl.float32)
+        value = tl.load(source_ptr + source_offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
         if HAS_BIAS:
-            value += tl.load(bias_ptr + patch_channel, mask=mask, other=0.0).to(tl.float32)
+            value += tl.load(bias_ptr + patch_channel, mask=mask, other=0.0).to(
+                tl.float32
+            )
         tl.store(output_ptr + offsets, value, mask=mask)
 
 
@@ -88,13 +99,16 @@ def unpatchify_video_tokens(
 ) -> torch.Tensor:
     """Unpack ``[batch, tokens, channels * patch volume]`` into planar video.
 
-    Grid and patch dimensions follow time, height, width order. Each token stores
-    channel-major patch elements. Trailing padded tokens are ignored. Bias is
-    accumulated in FP32 before storing the rearranged output in the source dtype.
+    Grid and patch dimensions follow time, height, width order. Each token
+    stores channel-major patch elements. Trailing padded tokens are ignored.
+    Bias is accumulated in FP32 before storing the rearranged output in the
+    source dtype.
     """
-
     if source.ndim != 3 or min(*grid_shape, *patch_shape) < 1:
-        raise ValueError("video unpacking requires positive grid/patch dimensions and token rows")
+        raise ValueError(
+            "video unpacking requires positive grid/patch dimensions and "
+            "token rows"
+        )
 
     batch, sequence, token_width = source.shape
     frames, height, width = grid_shape
@@ -102,11 +116,17 @@ def unpatchify_video_tokens(
     patch_volume = patch_frames * patch_height * patch_width
 
     if token_width % patch_volume or batch < 1:
-        raise ValueError("token width must contain a positive integral channel count")
+        raise ValueError(
+            "token width must contain a positive integral channel count"
+        )
     channels = token_width // patch_volume
     if channels < 1 or sequence < frames * height * width:
-        raise ValueError("video unpacking has fewer tokens or channels than required")
-    if bias is not None and (bias.shape != (token_width,) or bias.device != source.device):
+        raise ValueError(
+            "video unpacking has fewer tokens or channels than required"
+        )
+    if bias is not None and (
+        bias.shape != (token_width,) or bias.device != source.device
+    ):
         raise ValueError("patch bias must match the token width and device")
 
     if not (
@@ -114,24 +134,44 @@ def unpatchify_video_tokens(
         and triton_available(source.device)
         and source.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and source.is_contiguous()
-        and (bias is None or (bias.is_contiguous() and bias.dtype == source.dtype))
+        and (
+            bias is None
+            or (bias.is_contiguous() and bias.dtype == source.dtype)
+        )
     ):
         # Eager fallback: rearrange tokens with a permute instead of the kernel.
         if bias is not None:
             source = (source + bias).to(source.dtype)
         value = source[:, : frames * height * width].reshape(
-            batch, frames, height, width, channels, patch_frames, patch_height, patch_width
+            batch,
+            frames,
+            height,
+            width,
+            channels,
+            patch_frames,
+            patch_height,
+            patch_width,
         )
         return (
             value.permute(0, 4, 1, 5, 2, 6, 3, 7)
             .contiguous()
             .reshape(
-                batch, channels, frames * patch_frames, height * patch_height, width * patch_width
+                batch,
+                channels,
+                frames * patch_frames,
+                height * patch_height,
+                width * patch_width,
             )
         )
 
     output = torch.empty(
-        (batch, channels, frames * patch_frames, height * patch_height, width * patch_width),
+        (
+            batch,
+            channels,
+            frames * patch_frames,
+            height * patch_height,
+            width * patch_width,
+        ),
         dtype=source.dtype,
         device=source.device,
     )

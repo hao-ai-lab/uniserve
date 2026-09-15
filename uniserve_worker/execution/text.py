@@ -1,4 +1,7 @@
-"""Worker output selection around the public causal language-model capability."""
+"""Worker output selection around the public causal language-model.
+
+capability.
+"""
 
 from __future__ import annotations
 
@@ -29,7 +32,9 @@ class TextCall:
         # The vocabulary head may be nonresident on this pipeline stage. Its
         # actual descriptor is communicated rather than reproducing the head's
         # numerical padding/partition rule in execution.
-        descriptor = torch.empty(4, dtype=torch.int64, device=self.pipeline.device)
+        descriptor = torch.empty(
+            4, dtype=torch.int64, device=self.pipeline.device
+        )
         if last:
             vocab = model.lm_head.vocab
             descriptor.copy_(
@@ -50,24 +55,34 @@ class TextCall:
         self.vocab = VocabShard(size, slice(start, stop), padded, tensor_group)
 
     def last_logits(self, inputs: TextInput) -> ExecutionOutput:
-        """Project one final position per sequence, including discarded padding rows.
+        """Project one final position per sequence.
+
+        including discarded padding rows.
 
         A graph bucket can contain empty padding sequences. Their placeholder
         result is discarded by execution; live rows must each contain a token.
         Device offsets select positions on every replay.
         """
-
         hidden = self.model(inputs)
-        indices = (inputs.attention.queries.offsets[1:].to(torch.int64) - 1).clamp_min(0)
+        indices = (
+            inputs.attention.queries.offsets[1:].to(torch.int64) - 1
+        ).clamp_min(0)
 
         if self.pipeline.rank == self.pipeline.size - 1:
-            values = self.model.compute_logits(hidden, token_indices=indices).values
+            values = self.model.compute_logits(
+                hidden, token_indices=indices
+            ).values
         else:
             values = hidden.new_empty(
-                (inputs.batch_size, self.vocab.local_slice.stop - self.vocab.local_slice.start)
+                (
+                    inputs.batch_size,
+                    self.vocab.local_slice.stop - self.vocab.local_slice.start,
+                )
             )
         self.pipeline.broadcast(values, src=self.pipeline.size - 1)
-        return ExecutionOutput(tuple(values.split(1)), (self.vocab,) * inputs.batch_size)
+        return ExecutionOutput(
+            tuple(values.split(1)), (self.vocab,) * inputs.batch_size
+        )
 
     def __call__(
         self, inputs: TextInput, selections: tuple[TokenSelection, ...]
@@ -78,11 +93,15 @@ class TextCall:
         raw hidden states. Logit and hidden columns are computed once on the
         last pipeline stage and broadcast so every stage returns the same rows.
         """
-
         if isinstance(inputs.attention, DenseInput):
             count = inputs.input_ids.numel() // inputs.batch_size
             lengths = (count,) * inputs.batch_size
-            offsets = torch.arange(inputs.batch_size + 1, device=inputs.input_ids.device) * count
+            offsets = (
+                torch.arange(
+                    inputs.batch_size + 1, device=inputs.input_ids.device
+                )
+                * count
+            )
         else:
             lengths = inputs.attention.queries.host
             offsets = inputs.attention.queries.offsets
@@ -90,17 +109,25 @@ class TextCall:
         if len(selections) != len(lengths) or any(
             not isinstance(item, TokenSelection) for item in selections
         ):
-            raise ValueError("text output selections must align with the input sequences")
+            raise ValueError(
+                "text output selections must align with the input sequences"
+            )
 
         hidden = self.model(inputs)
         last = self.pipeline.rank == self.pipeline.size - 1
         indices = []
         logit_lengths, hidden_lengths = [], []
-        for index, (length, selection) in enumerate(zip(lengths, selections, strict=True)):
+        for index, (length, selection) in enumerate(
+            zip(lengths, selections, strict=True)
+        ):
             if selection is TokenSelection.HIDDEN:
                 hidden_lengths.append(length)
             else:
-                selected = length if selection is TokenSelection.ALL_LOGITS else min(1, length)
+                selected = (
+                    length
+                    if selection is TokenSelection.ALL_LOGITS
+                    else min(1, length)
+                )
                 logit_lengths.append(selected)
                 if selected:
                     # LAST follows live device offsets when a prefill graph
@@ -108,18 +135,27 @@ class TextCall:
                     indices.append(
                         offsets[index + 1 : index + 2].to(torch.int64) - 1
                         if selection is TokenSelection.LAST_LOGITS
-                        else torch.arange(length, device=hidden.device) + offsets[index]
+                        else torch.arange(length, device=hidden.device)
+                        + offsets[index]
                     )
 
         num_logits = sum(logit_lengths)
         logits = None
         if num_logits:
             if last:
-                token_indices = indices[0] if len(indices) == 1 else torch.cat(indices)
-                logits = self.model.compute_logits(hidden, token_indices=token_indices).values
+                token_indices = (
+                    indices[0] if len(indices) == 1 else torch.cat(indices)
+                )
+                logits = self.model.compute_logits(
+                    hidden, token_indices=token_indices
+                ).values
             else:
                 logits = hidden.new_empty(
-                    (num_logits, self.vocab.local_slice.stop - self.vocab.local_slice.start)
+                    (
+                        num_logits,
+                        self.vocab.local_slice.stop
+                        - self.vocab.local_slice.start,
+                    )
                 )
             self.pipeline.broadcast(logits, src=self.pipeline.size - 1)
         else:
@@ -140,18 +176,24 @@ class TextCall:
                     if selection is TokenSelection.HIDDEN:
                         parts.append(hidden[start : start + length])
                     start += length
-                selected_hidden = parts[0] if len(parts) == 1 else torch.cat(parts)
+                selected_hidden = (
+                    parts[0] if len(parts) == 1 else torch.cat(parts)
+                )
             else:
                 selected_hidden = hidden.new_empty(
                     (sum(hidden_lengths), self.model.backbone.hidden_size)
                 )
             if selected_hidden.numel():
-                self.pipeline.broadcast(selected_hidden, src=self.pipeline.size - 1)
+                self.pipeline.broadcast(
+                    selected_hidden, src=self.pipeline.size - 1
+                )
 
         outputs, vocabularies = [], []
         logits_rows = iter(logits.split(logit_lengths))
         hidden_rows = (
-            iter(()) if selected_hidden is None else iter(selected_hidden.split(hidden_lengths))
+            iter(())
+            if selected_hidden is None
+            else iter(selected_hidden.split(hidden_lengths))
         )
         for selection in selections:
             selected = selection is not TokenSelection.HIDDEN

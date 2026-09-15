@@ -19,7 +19,11 @@ from uniserve.nn import _binding
 from uniserve.nn.attention import Attention
 from uniserve.nn.attention.inputs import DenseInput
 from uniserve.nn.attention.vsa import BlockAttention
-from uniserve.nn.linear import ColumnParallelLinear, Linear, MergedColumnParallelLinear
+from uniserve.nn.linear import (
+    ColumnParallelLinear,
+    Linear,
+    MergedColumnParallelLinear,
+)
 from uniserve.quantization import QuantizedTensor
 from uniserve.runtime._communication import stream_collective_scope
 from uniserve.tensors import BufferConfig
@@ -36,15 +40,20 @@ def _capturing(device):
 
 
 def _representation(module, inherited):
-    for value in (*module.parameters(recurse=False), *module.buffers(recurse=False)):
+    for value in (
+        *module.parameters(recurse=False),
+        *module.buffers(recurse=False),
+    ):
         if value.is_floating_point() and not value.is_meta:
             return value.device, value.dtype
     return inherited
 
 
 def _communicators(module):
-    """Discover borrowed communication interfaces in ordinary module attributes."""
+    """Discover borrowed communication interfaces.
 
+    Discover borrowed communication interfaces in ordinary module attributes.
+    """
     groups = {}
 
     def visit(value):
@@ -74,14 +83,24 @@ class _ExchangeBuffers:
     def view(self, name, shape, like, *, offset=0):
         backing = self.tensors[name]
         # Offsets and extents are byte addresses into the flat uint8 backing.
-        start, size = offset * like.element_size(), prod(shape) * like.element_size()
-        if start < 0 or start + size > backing.numel() or backing.device != like.device:
+        start, size = (
+            offset * like.element_size(),
+            prod(shape) * like.element_size(),
+        )
+        if (
+            start < 0
+            or start + size > backing.numel()
+            or backing.device != like.device
+        ):
             raise ValueError("attention exchange exceeds its prepared capacity")
         return backing.narrow(0, start, size).view(like.dtype).view(shape)
 
 
 class _MatmulBinding:
-    """Specialize one numerical call site while retaining all borrowed backing."""
+    """Specialize one numerical call site.
+
+    Specialize one numerical call site while retaining all borrowed backing.
+    """
 
     def __init__(self, module, backend, max_rows, allocate):
         self.module, self.backend, self.max_rows = module, backend, max_rows
@@ -98,21 +117,29 @@ class _MatmulBinding:
             return previous[1]
 
         if _capturing(self._weight().device):
-            raise RuntimeError("matmul shape and representation must be prepared before capture")
+            raise RuntimeError(
+                "matmul shape and representation must be prepared before "
+                "capture"
+            )
 
-        options = dict(
-            input_dtype=dtype,
-            input_quantizer=quantizer,
-            max_rows=rows,
-            output_dtype=output_dtype,
-        )
+        options = {
+            "input_dtype": dtype,
+            "input_quantizer": quantizer,
+            "max_rows": rows,
+            "output_dtype": output_dtype,
+        }
         provider = matmul_backend.resolve(self.backend, self._weight())
         if isinstance(self.module, MergedColumnParallelLinear):
-            weights = {name: child.weight for name, child in self.module.projections.items()}
+            weights = {
+                name: child.weight
+                for name, child in self.module.projections.items()
+            }
             options["branch_width"] = self.module.branch_width
             requirements = provider.merged_workspace_buffers(weights, **options)
             workspace = self.allocate(requirements, self._weight().device)
-            operator = provider.prepare_merged(weights, **options, workspace=workspace)
+            operator = provider.prepare_merged(
+                weights, **options, workspace=workspace
+            )
         else:
             weight = self.module.weight
             requirements = provider.workspace_buffers(weight, **options)
@@ -128,23 +155,49 @@ class _MatmulBinding:
         return self.module.weight
 
     def quantize(self, x, quantizer, distribution):
-        """Encode a complete logical domain in this context's activation storage."""
+        """Encode a complete logical domain.
 
+        Encode a complete logical domain in this context's activation
+        storage.
+        """
         operator = self._prepare(x.dtype, x.dtype, quantizer, x.shape[0])
         target = operator._input_storage(x)
         return quantizer.quantize(x, distribution=distribution, out=target)
 
     def __call__(self, x, bias, *, out):
-        destination = next(iter(out.values())) if isinstance(out, Mapping) else out
+        destination = (
+            next(iter(out.values())) if isinstance(out, Mapping) else out
+        )
         quantizer = x.quantizer if isinstance(x, QuantizedTensor) else None
-        return self._prepare(x.dtype, destination.dtype, quantizer, x.shape[0])(x, bias, out=out)
+        return self._prepare(x.dtype, destination.dtype, quantizer, x.shape[0])(
+            x, bias, out=out
+        )
 
 
 class _AttentionBinding:
-    """Specialize one attention call site's operators, plans, and bound metadata."""
+    """Specialize one attention call site.
 
-    def __init__(self, module, backend, cache, size, device, dtype, allocate, context_transport):
-        self.module, self.backend, self.cache, self.size = module, backend, cache, size
+    Specialize one attention call site's operators, plans, and bound
+    metadata.
+    """
+
+    def __init__(
+        self,
+        module,
+        backend,
+        cache,
+        size,
+        device,
+        dtype,
+        allocate,
+        context_transport,
+    ):
+        self.module, self.backend, self.cache, self.size = (
+            module,
+            backend,
+            cache,
+            size,
+        )
         self.device, self.dtype, self.allocate = device, dtype, allocate
         self.operators = {}
         self._bound = set()
@@ -160,7 +213,9 @@ class _AttentionBinding:
         key = dtype, _ContextPlan.signature(batch)
         if key not in self.context_plans:
             if _capturing(self.device):
-                raise RuntimeError("prepare context attention metadata before capture")
+                raise RuntimeError(
+                    "prepare context attention metadata before capture"
+                )
             self.context_plans[key] = _ContextPlan(
                 self.module,
                 batch,
@@ -173,9 +228,12 @@ class _AttentionBinding:
 
     def prepare(self, dtype, size):
         if self.size is not None and (
-            size.num_tokens > self.size.num_tokens or size.batch_size > self.size.batch_size
+            size.num_tokens > self.size.num_tokens
+            or size.batch_size > self.size.batch_size
         ):
-            raise ValueError("attention exceeds the prepared token or batch capacity")
+            raise ValueError(
+                "attention exceeds the prepared token or batch capacity"
+            )
 
         previous = self.operators.get(dtype)
         if previous is not None and (
@@ -185,7 +243,9 @@ class _AttentionBinding:
             return previous
 
         if _capturing(self.device):
-            raise RuntimeError("attention shape and dtype must be prepared before capture")
+            raise RuntimeError(
+                "attention shape and dtype must be prepared before capture"
+            )
 
         if self.size is not None:
             size = TextSize(
@@ -193,33 +253,42 @@ class _AttentionBinding:
                 max(size.batch_size, self.size.batch_size),
             )
 
-        options = dict(
-            num_heads=self.module._local_heads,
-            num_kv_heads=self.module._local_kv_heads,
-            head_dim=self.module.head_dim,
-            dtype=dtype,
-            size=size,
-            cache=self.cache,
-        )
+        options = {
+            "num_heads": self.module._local_heads,
+            "num_kv_heads": self.module._local_kv_heads,
+            "head_dim": self.module.head_dim,
+            "dtype": dtype,
+            "size": size,
+            "cache": self.cache,
+        }
         provider = attention_backend.resolve(self.backend, device=self.device)
         requirements = provider.workspace_buffers(**options)
-        operator = provider.prepare(**options, workspace=self.allocate(requirements, self.device))
+        operator = provider.prepare(
+            **options, workspace=self.allocate(requirements, self.device)
+        )
         self.operators[dtype] = operator
         self._bound.discard(dtype)
         return operator
 
     def sequence_inputs(self, batch):
         """Resolve lengths needed to construct mathematical token partitions."""
-
-        if self.module._context is None and self.module._exchange.group.size == 1:
+        if (
+            self.module._context is None
+            and self.module._exchange.group.size == 1
+        ):
             return batch
         from .backends.attention._sequences import host_lengths
 
-        return host_lengths(batch, prepared=self.batch if _capturing(self.device) else None)
+        return host_lengths(
+            batch, prepared=self.batch if _capturing(self.device) else None
+        )
 
     def bind(self, batch):
-        """Bind numerical metadata for every prepared dtype before graph capture."""
+        """Bind numerical metadata before graph capture.
 
+        Bind numerical metadata for every prepared dtype before graph
+        capture.
+        """
         from .backends.attention._sequences import host_lengths
 
         batch = self.sequence_inputs(batch)
@@ -228,7 +297,10 @@ class _AttentionBinding:
         if not isinstance(batch, DenseInput):
             if batch.queries.num_tokens is not None:
                 self.prepare(
-                    self.dtype, TextSize(batch.queries.num_tokens, batch.queries.batch_size)
+                    self.dtype,
+                    TextSize(
+                        batch.queries.num_tokens, batch.queries.batch_size
+                    ),
                 )
             elif self.size is not None:
                 self.prepare(self.dtype, self.size)
@@ -273,9 +345,13 @@ class _AttentionBinding:
         # requiring host planning are bound explicitly before CUDA capture.
         if _capturing(q.device):
             if q.dtype not in self._bound:
-                raise RuntimeError("bind numerical attention metadata before capture")
+                raise RuntimeError(
+                    "bind numerical attention metadata before capture"
+                )
             if operator.requires_host_lengths(batch):
-                batch = host_lengths(batch, prepared=self._bound_batches[q.dtype])
+                batch = host_lengths(
+                    batch, prepared=self._bound_batches[q.dtype]
+                )
         else:
             # Eager callers may pass fresh lengths or mutate borrowed columns
             # without an explicit bind call. A previous plan for this dtype
@@ -287,13 +363,21 @@ class _AttentionBinding:
             self._bound_batches[q.dtype] = batch
 
         result = operator(
-            q, k, v, batch, scale=scale, out=out if plan is None else torch.empty_like(q)
+            q,
+            k,
+            v,
+            batch,
+            scale=scale,
+            out=out if plan is None else torch.empty_like(q),
         )
-        return result if plan is None else plan.restore(result, storage=storage, out=out)
+        return (
+            result
+            if plan is None
+            else plan.restore(result, storage=storage, out=out)
+        )
 
     def update_cache(self, k, v, *, indices):
         """Write current K/V into the bound prefix cache at physical indices."""
-
         if self.cache is None:
             raise RuntimeError("this attention layer has no bound prefix state")
 
@@ -303,9 +387,15 @@ class _AttentionBinding:
             count = indices.numel()
             if count not in self.cache_batches:
                 if _capturing(indices.device):
-                    raise RuntimeError("prepare context cache writes before capture")
-                lengths = SequenceLengths.from_lengths((count,), device=indices.device)
-                self.cache_batches[count] = VarlenInput(lengths, lengths, (False,))
+                    raise RuntimeError(
+                        "prepare context cache writes before capture"
+                    )
+                lengths = SequenceLengths.from_lengths(
+                    (count,), device=indices.device
+                )
+                self.cache_batches[count] = VarlenInput(
+                    lengths, lengths, (False,)
+                )
 
             plan = self._context_plan(self.cache_batches[count], k.dtype)
             storage = _binding.attention_storage.get().get(id(self.module))
@@ -324,7 +414,11 @@ class _AttentionBinding:
 
 
 class _VsaBinding:
-    """Own one VSA call site's plans, mutable query maps, and packed input backing."""
+    """Own one VSA call site's plans and packed input backing.
+
+    Own one VSA call site's plans, mutable query maps, and packed input
+    backing.
+    """
 
     def __init__(self, backend, allocate, scratch, shared_buffers, exchange):
         self.backend, self.allocate, self.scratch = backend, allocate, scratch
@@ -335,14 +429,22 @@ class _VsaBinding:
         key = (q.device, q.dtype, q.shape[1], q.shape[2], pattern)
         if key not in self.operators:
             if _capturing(q.device):
-                raise RuntimeError("prepare VSA numerical shapes before capture")
+                raise RuntimeError(
+                    "prepare VSA numerical shapes before capture"
+                )
             from .backends.attention import vsa
 
             provider = vsa.resolve(self.backend, device=q.device)
-            options = dict(num_heads=q.shape[1], head_dim=q.shape[2], dtype=q.dtype)
+            options = {
+                "num_heads": q.shape[1],
+                "head_dim": q.shape[2],
+                "dtype": q.dtype,
+            }
             requirements = provider.workspace_buffers(pattern, **options)
             self.operators[key] = provider.prepare(
-                pattern, **options, workspace=self.scratch(requirements, q.device)
+                pattern,
+                **options,
+                workspace=self.scratch(requirements, q.device),
             )
 
         return self.operators[key]
@@ -351,9 +453,14 @@ class _VsaBinding:
         key = (device, tuple(requirements.items()))
         if key not in self._buffers:
             if _capturing(device):
-                raise RuntimeError("prepare VSA projected input backing before capture")
+                raise RuntimeError(
+                    "prepare VSA projected input backing before capture"
+                )
             self._buffers[key] = self._shared_buffers(
-                {name: BufferConfig(shape, dtype) for name, (shape, dtype) in requirements.items()},
+                {
+                    name: BufferConfig(shape, dtype)
+                    for name, (shape, dtype) in requirements.items()
+                },
                 device,
             )
 
@@ -379,12 +486,16 @@ class _GatherPool:
         self.collective = collective
         self.buffers = []
         self.borrowed = set()
-        self.symmetric = torch.distributed.get_backend(group._require()) == "nccl"
+        self.symmetric = (
+            torch.distributed.get_backend(group._require()) == "nccl"
+        )
 
     @contextmanager
     def borrow(self, size, device, *, capacity=None):
         if device != self.group.device:
-            raise ValueError("projection exchange must use its communicator's device")
+            raise ValueError(
+                "projection exchange must use its communicator's device"
+            )
         if capacity is not None and size > capacity:
             raise ValueError("projection exchange exceeds the bound workspace")
         amount = size if capacity is None else capacity
@@ -399,11 +510,15 @@ class _GatherPool:
         )
         if buffer is None:
             if _capturing(device):
-                raise RuntimeError("prepare projection exchange backing before capture")
+                raise RuntimeError(
+                    "prepare projection exchange backing before capture"
+                )
             if self.symmetric:
                 from ._peer_memory import allocate_collective_buffer
 
-                buffer = allocate_collective_buffer((amount,), dtype=torch.uint8, device=device)
+                buffer = allocate_collective_buffer(
+                    (amount,), dtype=torch.uint8, device=device
+                )
             else:
                 buffer = torch.empty(amount, dtype=torch.uint8, device=device)
             if self.collective is not None:
@@ -439,11 +554,19 @@ class ExecutionContext(Generic[SizeT]):
         matmul="auto",
     ):
         self.module, self.stream, self.cache = module, stream, cache
-        self._attention_backend, self._vsa_backend, self._matmul_backend = attention, vsa, matmul
+        self._attention_backend, self._vsa_backend, self._matmul_backend = (
+            attention,
+            vsa,
+            matmul,
+        )
 
-        reference = next((value for value in module.parameters() if not value.is_meta), None)
+        reference = next(
+            (value for value in module.parameters() if not value.is_meta), None
+        )
         if reference is None:
-            reference = next((value for value in module.buffers() if not value.is_meta), None)
+            reference = next(
+                (value for value in module.buffers() if not value.is_meta), None
+            )
         self._device = (
             reference.device
             if reference is not None
@@ -455,9 +578,13 @@ class ExecutionContext(Generic[SizeT]):
                 else torch.device("cpu")
             )
         )
-        self._dtype = reference.dtype if reference is not None else torch.float32
+        self._dtype = (
+            reference.dtype if reference is not None else torch.float32
+        )
         if stream is not None and stream.device != self._device:
-            raise ValueError("the execution stream must belong to the root module device")
+            raise ValueError(
+                "the execution stream must belong to the root module device"
+            )
 
         self.constants = self.workspace = MappingProxyType({})
         self._allocations = []
@@ -497,7 +624,8 @@ class ExecutionContext(Generic[SizeT]):
         # GEMM work areas are consumed entirely within one operator call. The
         # provider copies its merged result into caller-owned outputs before
         # returning, so subsequent layers on this serialized context can reuse
-        # the same backing. Plans and weights retain their own call-site binding.
+        # the same backing. Plans and weights retain their own call-site
+        # binding.
         key = (device, tuple(requirements.items()))
         if key not in self._matmul_scratch:
             self._matmul_scratch[key] = self._allocate(requirements, device)
@@ -510,13 +638,20 @@ class ExecutionContext(Generic[SizeT]):
         shared = requirements.get("scratch")
         views = dict(
             self._allocate(
-                {name: item for name, item in requirements.items() if name != "scratch"}, device
+                {
+                    name: item
+                    for name, item in requirements.items()
+                    if name != "scratch"
+                },
+                device,
             )
         )
         if shared is not None:
             key = (device, shared)
             if key not in self._scratch:
-                self._scratch[key] = self._allocate({"scratch": shared}, device)["scratch"]
+                self._scratch[key] = self._allocate(
+                    {"scratch": shared}, device
+                )["scratch"]
             views["scratch"] = self._scratch[key]
         return views
 
@@ -546,11 +681,20 @@ class ExecutionContext(Generic[SizeT]):
         )
         if key not in self._vsa_transport:
             if _capturing(self._device):
-                raise RuntimeError("prepare VSA communication storage before capture")
-            from .attention_storage import allocate_context_storage, allocate_output_storage
+                raise RuntimeError(
+                    "prepare VSA communication storage before capture"
+                )
+            from .attention_storage import (
+                allocate_context_storage,
+                allocate_output_storage,
+            )
 
             outputs = allocate_output_storage(
-                (parallel,), rows=rows, heads=heads, head_dim=head_dim, dtype=dtype
+                (parallel,),
+                rows=rows,
+                heads=heads,
+                head_dim=head_dim,
+                dtype=dtype,
             )
             self._allocations.extend(outputs.allocations)
 
@@ -562,9 +706,17 @@ class ExecutionContext(Generic[SizeT]):
                 )
 
             context = allocate_context_storage(
-                (parallel,), rows=rows, heads=heads, head_dim=head_dim, dtype=dtype, block_size=64
+                (parallel,),
+                rows=rows,
+                heads=heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                block_size=64,
             )
-            self._vsa_transport[key] = outputs.views[parallel], context.get(parallel)
+            self._vsa_transport[key] = (
+                outputs.views[parallel],
+                context.get(parallel),
+            )
 
         output, context = self._vsa_transport[key]
         self._vsa_output[parallel] = output
@@ -584,7 +736,6 @@ class ExecutionContext(Generic[SizeT]):
         and ``workspace`` optionally supply caller-owned backing; when omitted,
         the required buffers are allocated and owned by this context.
         """
-
         self._open()
         self._release()
 
@@ -594,7 +745,9 @@ class ExecutionContext(Generic[SizeT]):
             try:
                 self._release()
             except BaseException as cleanup:
-                error.add_note(f"execution preparation cleanup failed: {cleanup!r}")
+                error.add_note(
+                    f"execution preparation cleanup failed: {cleanup!r}"
+                )
             raise
 
     def _prepare(self, size, *, constants, workspace):
@@ -602,20 +755,30 @@ class ExecutionContext(Generic[SizeT]):
         self._max_tokens = max_rows
 
         if self._collectives is not None:
-            from uniserve.runtime._collectives import allocate_stream_collectives
+            from uniserve.runtime._collectives import (
+                allocate_stream_collectives,
+            )
 
             pending = (
                 group
                 for group in _communicators(self.module)
-                if group.size > 1 and group._require().group_name not in self._collectives
+                if group.size > 1
+                and group._require().group_name not in self._collectives
             )
-            self._collectives.update(allocate_stream_collectives(pending, self.stream))
+            self._collectives.update(
+                allocate_stream_collectives(pending, self.stream)
+            )
 
         with self.activate():
-            for name, supplied in (("constants", constants), ("workspace", workspace)):
+            for name, supplied in (
+                ("constants", constants),
+                ("workspace", workspace),
+            ):
                 query = getattr(
                     self.module,
-                    "constant_buffers" if name == "constants" else "workspace_buffers",
+                    "constant_buffers"
+                    if name == "constants"
+                    else "workspace_buffers",
                     None,
                 )
                 requirements = {} if query is None else query(size)
@@ -639,7 +802,10 @@ class ExecutionContext(Generic[SizeT]):
 
                 if isinstance(child, (Linear, MergedColumnParallelLinear)):
                     binding = _MatmulBinding(
-                        child, self._matmul_backend, max_rows, self._matmul_workspace
+                        child,
+                        self._matmul_backend,
+                        max_rows,
+                        self._matmul_workspace,
                     )
                     if isinstance(child, MergedColumnParallelLinear):
                         self._merged[id(child)] = binding
@@ -652,12 +818,17 @@ class ExecutionContext(Generic[SizeT]):
                         )
                         self._merged[key] = binding
                         branches = tuple(child.projections.values())
-                        quantizers = {branch.input_quantizer for branch in branches}
+                        quantizers = {
+                            branch.input_quantizer for branch in branches
+                        }
                         quantizer = branches[0].input_quantizer
                     else:
                         self._operators[id(child)] = binding
                         self._operators[id(child.weight)] = binding
-                        quantizers, quantizer = {child.input_quantizer}, child.input_quantizer
+                        quantizers, quantizer = (
+                            {child.input_quantizer},
+                            child.input_quantizer,
+                        )
                     if max_rows is not None and len(quantizers) == 1:
                         binding._prepare(dtype, dtype, quantizer, max_rows)
 
@@ -671,15 +842,25 @@ class ExecutionContext(Generic[SizeT]):
                         # FP32 transport also covers encoded values plus scales.
                         amount = None
                         if max_rows is not None:
-                            rows = (max_rows + group.size - 1) // group.size * group.size
+                            rows = (
+                                (max_rows + group.size - 1)
+                                // group.size
+                                * group.size
+                            )
                             amount = 2 * rows * child.weight.shape[1] * 4
 
                         if group not in self._gather_pools:
-                            collective = (self._collectives or {}).get(group._require().group_name)
-                            self._gather_pools[group] = _GatherPool(group, collective)
+                            collective = (self._collectives or {}).get(
+                                group._require().group_name
+                            )
+                            self._gather_pools[group] = _GatherPool(
+                                group, collective
+                            )
 
                         pool = self._gather_pools[group]
-                        self._chunks[id(child)] = partial(pool.borrow, capacity=amount)
+                        self._chunks[id(child)] = partial(
+                            pool.borrow, capacity=amount
+                        )
                         if amount:
                             with pool.borrow(amount, device):
                                 pass
@@ -714,7 +895,9 @@ class ExecutionContext(Generic[SizeT]):
 
                     if isinstance(size, TextSize):
                         binding.prepare(dtype, size)
-                        self._prepare_exchange(child, size.num_tokens, device, dtype)
+                        self._prepare_exchange(
+                            child, size.num_tokens, device, dtype
+                        )
 
     def _prepare_exchange(self, layer, num_tokens, device, dtype):
         group = layer._exchange.group
@@ -742,7 +925,9 @@ class ExecutionContext(Generic[SizeT]):
         ):
             return
 
-        self._exchange[id(layer)] = _ExchangeBuffers(self._allocate(requirements, device))
+        self._exchange[id(layer)] = _ExchangeBuffers(
+            self._allocate(requirements, device)
+        )
 
     def _context_transport(self, layer, rows, dtype):
         from .attention_storage import allocate_context_storage
@@ -751,10 +936,16 @@ class ExecutionContext(Generic[SizeT]):
         if self._max_tokens is not None:
             members = parallel.context_group.size * layer._exchange.group.size
             rows = max(
-                rows, (self._max_tokens + members - 1) // members * layer._exchange.group.size
+                rows,
+                (self._max_tokens + members - 1)
+                // members
+                * layer._exchange.group.size,
             )
         self._prepare_exchange(
-            layer, rows * parallel.context_group.size, parallel.context_group.device, dtype
+            layer,
+            rows * parallel.context_group.size,
+            parallel.context_group.device,
+            dtype,
         )
 
         if parallel.context_group.size == 1 or rows == 0:
@@ -784,8 +975,11 @@ class ExecutionContext(Generic[SizeT]):
         return buffers
 
     def bind_attention(self, batch):
-        """Bind current batch metadata on every attention binding before capture."""
+        """Bind current batch metadata before capture.
 
+        Bind current batch metadata on every attention binding before
+        capture.
+        """
         self._open()
         with self.activate():
             for binding in self._attention.values():
@@ -793,8 +987,11 @@ class ExecutionContext(Generic[SizeT]):
 
     @contextmanager
     def activate(self):
-        """Enter this context's stream, collectives, transfers, and call-site bindings."""
+        """Enter this context's execution scopes.
 
+        Enter this context's stream, collectives, transfers, and call-site
+        bindings.
+        """
         self._open()
         variables = (
             (_binding.matmul, self._operators),
@@ -812,7 +1009,10 @@ class ExecutionContext(Generic[SizeT]):
             scope.enter_context(stream_collective_scope(self._collectives))
             if self._transfers is not None:
                 scope.enter_context(self._transfers.activate())
-            from uniserve.nn.attention._parallel import context_scope, output_scope
+            from uniserve.nn.attention._parallel import (
+                context_scope,
+                output_scope,
+            )
 
             scope.enter_context(output_scope(self._vsa_output))
             scope.enter_context(context_scope(self._vsa_context))
@@ -822,17 +1022,29 @@ class ExecutionContext(Generic[SizeT]):
             yield
 
     def _release(self):
-        """Retire prepared resources after the caller has ended borrowed uses."""
+        """Retire prepared resources after borrowed uses.
 
+        Retire prepared resources after the caller has ended borrowed uses.
+        """
         from .resources import close_resources
 
         try:
             close_resources(
                 *(binding.close for binding in self._attention.values()),
                 *(binding.close for binding in self._vsa.values()),
-                *(binding.close for binding in (self._collectives or {}).values()),
-                *(allocation.close for allocation in reversed(self._allocations)),
-                *((self._transfers.reset,) if self._transfers is not None else ()),
+                *(
+                    binding.close
+                    for binding in (self._collectives or {}).values()
+                ),
+                *(
+                    allocation.close
+                    for allocation in reversed(self._allocations)
+                ),
+                *(
+                    (self._transfers.reset,)
+                    if self._transfers is not None
+                    else ()
+                ),
             )
         finally:
             for values in (
@@ -859,8 +1071,10 @@ class ExecutionContext(Generic[SizeT]):
             self._max_tokens = None
 
     def close(self):
-        """Release all prepared resources; the context cannot be used afterward."""
+        """Release all prepared resources.
 
+        Release all prepared resources; the context cannot be used afterward.
+        """
         if self._closed:
             return
         self._closed = True
@@ -875,7 +1089,9 @@ class ExecutionContext(Generic[SizeT]):
 
     def __enter__(self):
         if self._entered is not None:
-            raise RuntimeError("execution context ownership cannot be entered twice")
+            raise RuntimeError(
+                "execution context ownership cannot be entered twice"
+            )
         self._entered = self.activate()
         self._entered.__enter__()
         return self

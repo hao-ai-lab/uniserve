@@ -10,7 +10,9 @@ from uniserve.runtime import paged_kv_math
 @pytest.mark.parametrize("index_dtype", (torch.int32, torch.int64))
 @pytest.mark.parametrize("column_stride", (1, 2))
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_paged_kv_write_replays_dynamic_rows_in_cuda_graph(encoded, index_dtype, column_stride):
+def test_paged_kv_write_replays_dynamic_rows_in_cuda_graph(
+    encoded, index_dtype, column_stride
+):
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(71)
     pages, page_size, heads, head_dim = 5, 4, 8, 128
@@ -50,12 +52,12 @@ def test_paged_kv_write_replays_dynamic_rows_in_cuda_graph(encoded, index_dtype,
         device=device,
         generator=generator,
     )
-    k_current = k_storage[:, 16 : 16 + row_width * column_stride : column_stride].view(
-        rows, heads, head_dim
-    )
-    v_current = v_storage[:, 24 : 24 + row_width * column_stride : column_stride].view(
-        rows, heads, head_dim
-    )
+    k_current = k_storage[
+        :, 16 : 16 + row_width * column_stride : column_stride
+    ].view(rows, heads, head_dim)
+    v_current = v_storage[
+        :, 24 : 24 + row_width * column_stride : column_stride
+    ].view(rows, heads, head_dim)
     assert not k_current.is_contiguous()
     assert not v_current.is_contiguous()
     page_ids = torch.tensor([-1, 2, 4], dtype=index_dtype, device=device)
@@ -63,7 +65,9 @@ def test_paged_kv_write_replays_dynamic_rows_in_cuda_graph(encoded, index_dtype,
 
     # Both encoded and block/offset addresses exclude only the -1 sentinel.
     locations = (
-        torch.tensor([-1, 11, 16], dtype=index_dtype, device=device) if encoded else page_ids
+        torch.tensor([-1, 11, 16], dtype=index_dtype, device=device)
+        if encoded
+        else page_ids
     )
     address_offsets = None if encoded else offsets
 
@@ -112,7 +116,9 @@ def test_paged_kv_write_replays_dynamic_rows_in_cuda_graph(encoded, index_dtype,
     page_ids.copy_(replay_page_ids)
     offsets.copy_(replay_offsets)
     if encoded:
-        locations.copy_(torch.tensor([14, -1, 19], dtype=index_dtype, device=device))
+        locations.copy_(
+            torch.tensor([14, -1, 19], dtype=index_dtype, device=device)
+        )
 
     expected_k = initial_k.clone()
     expected_v = initial_v.clone()
@@ -142,7 +148,9 @@ def test_encoded_kv_locations_preserve_unwritten_rows(device, cast):
     keys = torch.full((3, 4, 2, 3), -7, dtype=torch.bfloat16, device=device)
     values = torch.full_like(keys, -9)
     source_dtype = torch.float32 if cast else torch.bfloat16
-    source_keys = torch.arange(30, dtype=source_dtype, device=device).reshape(5, 2, 3) / 7
+    source_keys = (
+        torch.arange(30, dtype=source_dtype, device=device).reshape(5, 2, 3) / 7
+    )
     source_values = -source_keys
     locations = torch.tensor([0, -1, 4, 7, 11], device=device)
     expected_keys = keys.clone()

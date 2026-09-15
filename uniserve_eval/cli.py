@@ -10,13 +10,17 @@ from pathlib import Path
 from .config import DEFAULT_CONFIG, load_config, server_launch
 from .nsys import NsysCapture
 from .pipeline.run import run_point
-from .pipeline.setup import applied_environment, describe_launch, host_lock, prepare_launch
+from .pipeline.setup import (
+    applied_environment,
+    describe_launch,
+    host_lock,
+    prepare_launch,
+)
 from .server import ManagedServer
 
 
 def list_items(args: argparse.Namespace) -> None:
     """Print configured servers, benchmark points, and suites."""
-
     config = load_config(args.config)
     if args.section in {"all", "servers"}:
         print("[servers]")
@@ -34,7 +38,6 @@ def list_items(args: argparse.Namespace) -> None:
 
 def plan(args: argparse.Namespace) -> None:
     """Print the resolved execution plan for a benchmark selection."""
-
     config = load_config(args.config)
     points = config.selected_points(args.selection)
     rendered = []
@@ -51,7 +54,9 @@ def plan(args: argparse.Namespace) -> None:
                 "dataset": point.dataset,
                 "num_prompts": point.load.num_prompts,
                 "request_rate": (
-                    "inf" if point.load.request_rate == float("inf") else point.load.request_rate
+                    "inf"
+                    if point.load.request_rate == float("inf")
+                    else point.load.request_rate
                 ),
                 "max_concurrency": point.load.max_concurrency,
                 "metrics": [metric.as_dict() for metric in point.metrics],
@@ -62,7 +67,6 @@ def plan(args: argparse.Namespace) -> None:
 
 def run(args: argparse.Namespace) -> None:
     """Run selected points serially and stop after the first invalid result."""
-
     config = load_config(args.config)
     output_root = args.output_root or config.artifact_root
     points = config.selected_points(args.selection)
@@ -89,7 +93,12 @@ def run(args: argparse.Namespace) -> None:
                 launch_record["nsys"] = capture.describe()
             with applied_environment(launch.environment):
                 try:
-                    with ManagedServer(server, launch, log_path, timeout_s=args.launch_timeout_s):
+                    with ManagedServer(
+                        server,
+                        launch,
+                        log_path,
+                        timeout_s=args.launch_timeout_s,
+                    ):
                         result = asyncio.run(
                             run_point(
                                 server.base_url,
@@ -103,9 +112,10 @@ def run(args: argparse.Namespace) -> None:
                 finally:
                     if capture is not None:
                         capture.finalize()
+            status = "pass" if result.summary["validation"]["valid"] else "fail"
             print(
-                f"{point.name}: {'pass' if result.summary['validation']['valid'] else 'fail'} "
-                f"({result.summary['ok_count']}/{result.summary['request_count']} requests)"
+                f"{point.name}: {status} ({result.summary['ok_count']}"
+                f"/{result.summary['request_count']} requests)"
             )
             if result.summary["validation"]["valid"] is not True:
                 failures += 1
@@ -116,7 +126,6 @@ def run(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the evaluator command-line parser."""
-
     parser = argparse.ArgumentParser(prog="uniserve-eval", description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -150,7 +159,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--nsys-cuda-trace",
         choices=("cuda", "cuda-hw"),
         default="cuda",
-        help="select Nsight's software CUDA tracing or hardware tracing on supported devices",
+        help=(
+            "select Nsight's software CUDA tracing or hardware tracing "
+            "on supported devices"
+        ),
     )
     command.set_defaults(function=run)
     return parser
@@ -158,7 +170,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     """Parse command-line arguments and dispatch the selected command."""
-
     args = build_parser().parse_args()
     args.function(args)
 

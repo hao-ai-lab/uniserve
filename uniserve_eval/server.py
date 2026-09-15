@@ -26,7 +26,6 @@ class ManagedServer:
         timeout_s: float,
     ) -> None:
         """Configure the managed launch, log, and readiness deadline."""
-
         self.profile = profile
         self.launch = launch
         self.log_path = log_path
@@ -35,8 +34,7 @@ class ManagedServer:
         self.log: IO[str] | None = None
 
     def __enter__(self) -> Self:
-        """Start the server and return after its listener accepts connections."""
-
+        """Start the server and return after its listener accepts connections."""  # noqa: E501
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = self.log_path.open("w", encoding="utf-8")
         environment = dict(os.environ)
@@ -64,12 +62,10 @@ class ManagedServer:
         _traceback: TracebackType | None,
     ) -> None:
         """Terminate the server process group and close its log."""
-
         self.stop()
 
     def stop(self) -> None:
         """Terminate the server process group and release process resources."""
-
         process = self.process
         self.process = None
         if process is not None and process.poll() is None:
@@ -84,19 +80,23 @@ class ManagedServer:
             self.log = None
 
     def _wait_until_ready(self) -> None:
-        """Wait for the configured TCP listener or reports early process exit."""
-
+        """Wait for the configured TCP listener or reports early process exit."""  # noqa: E501
         deadline = time.monotonic() + self.timeout_s
         while time.monotonic() < deadline:
             if self.process is not None and self.process.poll() is not None:
                 raise RuntimeError(
-                    f"server exited with code {self.process.returncode}; see {self.log_path}"
+                    f"server exited with code {self.process.returncode}; "
+                    f"see {self.log_path}"
                 )
             try:
-                with socket.create_connection((self.profile.host, self.profile.port), timeout=1):
+                with socket.create_connection(
+                    (self.profile.host, self.profile.port), timeout=1
+                ):
                     return
             except OSError:
                 time.sleep(0.5)
         raise TimeoutError(
-            f"server did not listen on {self.profile.host}:{self.profile.port} within {self.timeout_s}s"
+            f"server did not listen on "
+            f"{self.profile.host}:{self.profile.port} "
+            f"within {self.timeout_s}s"
         )

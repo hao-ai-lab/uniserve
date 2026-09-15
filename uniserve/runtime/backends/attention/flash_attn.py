@@ -16,7 +16,11 @@ __all__ = ["Backend"]
 class _FlashOperator(_Operator):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        from flash_attn import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
+        from flash_attn import (
+            flash_attn_func,
+            flash_attn_varlen_func,
+            flash_attn_with_kvcache,
+        )
 
         self._dense_kernel = flash_attn_func
         self._varlen_kernel = flash_attn_varlen_func
@@ -30,20 +34,32 @@ class _FlashOperator(_Operator):
         if self.dtype not in {torch.float16, torch.bfloat16}:
             raise ValueError("FlashAttention requires FP16 or BF16 computation")
         if self.cache is not None and (
-            isinstance(self.cache.key, QuantizedTensor) or self.cache.block_size % 256
+            isinstance(self.cache.key, QuantizedTensor)
+            or self.cache.block_size % 256
         ):
-            raise ValueError("this FlashAttention kernel requires dense 256-token cache blocks")
+            raise ValueError(
+                "this FlashAttention kernel requires dense 256-token cache "
+                "blocks"
+            )
 
     def requires_host_lengths(self, batch):
-        return isinstance(batch, (PagedInput, VarlenInput)) and len(set(batch.causal)) > 1
+        return (
+            isinstance(batch, (PagedInput, VarlenInput))
+            and len(set(batch.causal)) > 1
+        )
 
     def __call__(self, q, k, v, batch, *, scale, out):
         if not q.is_cuda:
             raise ValueError("FlashAttention requires CUDA tensors")
         if not isinstance(batch, (DenseInput, PagedInput, VarlenInput)):
-            raise ValueError("this FlashAttention kernel does not implement visible-range masks")
+            raise ValueError(
+                "this FlashAttention kernel does not implement "
+                "visible-range masks"
+            )
         if isinstance(batch, DenseInput) and batch.mask is not None:
-            raise ValueError("this FlashAttention kernel does not implement dense masks")
+            raise ValueError(
+                "this FlashAttention kernel does not implement dense masks"
+            )
         self._validate(q, k, v, batch, out)
 
         if isinstance(batch, PagedInput) and batch.write_indices is not None:
@@ -56,9 +72,12 @@ class _FlashOperator(_Operator):
             return out.copy_(self._dense(q, k, v, batch.causal, scale))
 
         if q.ndim != 3 or (
-            batch.queries.num_tokens is not None and q.shape[0] != batch.queries.num_tokens
+            batch.queries.num_tokens is not None
+            and q.shape[0] != batch.queries.num_tokens
         ):
-            raise ValueError("packed attention rows must match the declared query lengths")
+            raise ValueError(
+                "packed attention rows must match the declared query lengths"
+            )
 
         for query_slice, key_slice, run in causal_runs(batch):
             query = q[query_slice]
@@ -66,9 +85,15 @@ class _FlashOperator(_Operator):
                 continue
 
             if isinstance(run, PagedInput):
-                key, value = (k, v) if self.cache is None else (self.cache.key, self.cache.value)
+                key, value = (
+                    (k, v)
+                    if self.cache is None
+                    else (self.cache.key, self.cache.value)
+                )
                 if key.ndim != 4 or key.shape[1] % 256:
-                    raise ValueError("paged FlashAttention requires 256-token cache blocks")
+                    raise ValueError(
+                        "paged FlashAttention requires 256-token cache blocks"
+                    )
                 result = self._paged(query, key, value, run, scale)
             else:
                 result = self._varlen_kernel(
@@ -88,8 +113,13 @@ class _FlashOperator(_Operator):
 
     def _dense(self, q, k, v, causal, scale):
         packed = q.ndim == 3
-        values = (tensor.unsqueeze(0) if packed else tensor.transpose(1, 2) for tensor in (q, k, v))
-        result = self._dense_kernel(*values, softmax_scale=scale, causal=causal, dropout_p=0.0)
+        values = (
+            tensor.unsqueeze(0) if packed else tensor.transpose(1, 2)
+            for tensor in (q, k, v)
+        )
+        result = self._dense_kernel(
+            *values, softmax_scale=scale, causal=causal, dropout_p=0.0
+        )
         return result.squeeze(0) if packed else result.transpose(1, 2)
 
     def _paged(self, q, k, v, batch, scale):
@@ -107,7 +137,11 @@ class _FlashOperator(_Operator):
                 cache_seqlens=lengths,
                 softmax_scale=scale,
                 causal=batch.causal[0],
-                **{self._table_argument: batch.block_table.indices.to(dtype=torch.int32)},
+                **{
+                    self._table_argument: batch.block_table.indices.to(
+                        dtype=torch.int32
+                    )
+                },
                 **self._paged_options,
             )
             return result.reshape_as(q)
@@ -138,7 +172,9 @@ class _FlashOperator(_Operator):
 class Backend(_Backend):
     operator_class = _FlashOperator
 
-    def workspace_buffers(self, *, num_heads, num_kv_heads, head_dim, dtype, size, cache):
+    def workspace_buffers(
+        self, *, num_heads, num_kv_heads, head_dim, dtype, size, cache
+    ):
         return {
             "lengths": BufferConfig((size.batch_size,), torch.int32),
             "offsets": BufferConfig((size.batch_size + 1,), torch.int32),

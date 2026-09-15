@@ -94,8 +94,12 @@ def test_automatic_capacity_charges_request_and_input_storage() -> None:
         max_batch_tokens=64,
     )
     small = build_worker_info(model, config)
-    larger_requests = build_worker_info(model, replace(config, max_request_pool_size=128))
-    larger_input = build_worker_info(model, replace(config, max_batch_tokens=65536))
+    larger_requests = build_worker_info(
+        model, replace(config, max_request_pool_size=128)
+    )
+    larger_input = build_worker_info(
+        model, replace(config, max_batch_tokens=65536)
+    )
     assert small.kv_cache is not None
     assert larger_requests.kv_cache is not None
     assert larger_input.kv_cache is not None
@@ -114,7 +118,10 @@ def test_explicit_pages_cannot_displace_resident_encoder_storage() -> None:
     )
     processor = image_processor()
     build_worker_info(model, config, image_processor=processor)
-    # The processor's admitted image area owns the complete resident feature bound.
-    processor = replace(processor, vit=replace(processor.vit, max_pixels=1024**3 * 16**2))
+    # The processor's admitted image area owns the complete resident feature
+    # bound.
+    processor = replace(
+        processor, vit=replace(processor.vit, max_pixels=1024**3 * 16**2)
+    )
     with pytest.raises(ValueError, match="grant"):
         build_worker_info(model, config, image_processor=processor)

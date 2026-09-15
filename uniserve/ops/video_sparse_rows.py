@@ -40,9 +40,14 @@ if triton is not None:
         chunk_rows: tl.constexpr,
         row_major: tl.constexpr,
     ):
-        """Pack interval queries and full masked K/V in the provider's physical layout."""
+        """Pack interval queries and full masked K/V.
 
-        input_offsets = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
+        Pack interval queries and full masked K/V in the provider's
+        physical layout.
+        """
+        input_offsets = (
+            tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+        ).to(tl.int64)
         row_offsets = row_start + input_offsets
         head = tl.program_id(1)
         columns = tl.arange(0, width)
@@ -51,14 +56,26 @@ if triton is not None:
         # K/V rows past a tile's valid size are masked out, leaving zeros in
         # the packed buffer for the attention provider to ignore.
         valid_rows = tl.load(
-            valid_sizes + row_offsets // tile_rows, mask=input_offsets < input_rows, other=0
+            valid_sizes + row_offsets // tile_rows,
+            mask=input_offsets < input_rows,
+            other=0,
         )
-        key_mask = row_mask & ((row_offsets % tile_rows)[:, None] < valid_rows[:, None])
+        key_mask = row_mask & (
+            (row_offsets % tile_rows)[:, None] < valid_rows[:, None]
+        )
 
         if row_major:
-            destination = row_offsets[:, None] * heads * width + head * width + columns[None, :]
+            destination = (
+                row_offsets[:, None] * heads * width
+                + head * width
+                + columns[None, :]
+            )
         else:
-            destination = head * rows * width + row_offsets[:, None] * width + columns[None, :]
+            destination = (
+                head * rows * width
+                + row_offsets[:, None] * width
+                + columns[None, :]
+            )
 
         query_values = tl.load(
             query
@@ -97,15 +114,29 @@ if triton is not None:
         interval_row = owner * count + local_row % chunk_rows
 
         if row_major:
-            query_destination = interval_offset + interval_row * heads * width + head * width
+            query_destination = (
+                interval_offset + interval_row * heads * width + head * width
+            )
         else:
             query_destination = (
-                interval_offset + head * owners * count * width + interval_row * width
+                interval_offset
+                + head * owners * count * width
+                + interval_row * width
             )
 
-        tl.store(packed + query_destination[:, None] + columns, query_values, mask=row_mask)
-        tl.store(packed + component_size + destination, key_values, mask=row_mask)
-        tl.store(packed + 2 * component_size + destination, value_values, mask=row_mask)
+        tl.store(
+            packed + query_destination[:, None] + columns,
+            query_values,
+            mask=row_mask,
+        )
+        tl.store(
+            packed + component_size + destination, key_values, mask=row_mask
+        )
+        tl.store(
+            packed + 2 * component_size + destination,
+            value_values,
+            mask=row_mask,
+        )
 
     @triton.jit
     def _compose_rows_kernel(
@@ -123,8 +154,9 @@ if triton is not None:
         block_rows: tl.constexpr,
     ):
         """Fuse the attention result with trained compression."""
-
-        row_offsets = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
+        row_offsets = (
+            tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+        ).to(tl.int64)
         head = tl.program_id(1)
         columns = tl.arange(0, width)
         mask = row_offsets[:, None] < rows
@@ -137,7 +169,10 @@ if triton is not None:
             other=0.0,
         ).to(tl.float32)
         gate_values = tl.load(
-            gate + row_offsets[:, None] * gate_stride_row + head * gate_stride_head + columns,
+            gate
+            + row_offsets[:, None] * gate_stride_row
+            + head * gate_stride_head
+            + columns,
             mask=mask,
             other=0.0,
         ).to(tl.float32)
@@ -152,7 +187,10 @@ if triton is not None:
 
         values = attended_values + gate_values * compressed_values
         tl.store(
-            output + row_offsets[:, None] * tl.num_programs(1) * width + head * width + columns,
+            output
+            + row_offsets[:, None] * tl.num_programs(1) * width
+            + head * width
+            + columns,
             values,
             mask=mask,
         )
@@ -179,14 +217,22 @@ if triton is not None:
         start_row: tl.constexpr,
         global_rows: tl.constexpr,
     ):
-        """Compose sparse outputs and route local heads into row-owner shards."""
+        """Compose sparse outputs and route local heads.
 
-        row_offsets = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
+        Compose sparse outputs and route local heads into row-owner shards.
+        """
+        row_offsets = (
+            tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+        ).to(tl.int64)
 
         # row_offsets enumerate (destination shard, local row) pairs; gate and
         # compressed rows are indexed by the owning shard's global row.
         local_row_offsets = row_offsets % local_rows
-        global_row_offsets = row_offsets // local_rows * owner_rows + start_row + local_row_offsets
+        global_row_offsets = (
+            row_offsets // local_rows * owner_rows
+            + start_row
+            + local_row_offsets
+        )
 
         head = tl.program_id(1)
         columns = tl.arange(0, width)
@@ -254,16 +300,21 @@ def pack_sparse_input_rows(
     (3, heads, rows, width) for flattened BSR. Queries use owner-interval
     order within their component; K/V retain global row order.
     """
-
     assert triton is not None
     input_rows, heads, width = (int(size) for size in query.shape)
 
     if packed is None:
-        shape = (3, input_rows, heads, width) if row_major else (3, heads, input_rows, width)
+        shape = (
+            (3, input_rows, heads, width)
+            if row_major
+            else (3, heads, input_rows, width)
+        )
         packed = torch.empty(shape, dtype=query.dtype, device=query.device)
 
     rows = packed.shape[1 if row_major else 2]
-    expected_shape = (3, rows, heads, width) if row_major else (3, heads, rows, width)
+    expected_shape = (
+        (3, rows, heads, width) if row_major else (3, heads, rows, width)
+    )
     if (
         query.shape != key.shape
         or query.shape != value.shape
@@ -277,7 +328,9 @@ def pack_sparse_input_rows(
         or rows % owners
         or (chunk_rows is not None and chunk_rows < 1)
     ):
-        raise ValueError("sparse input rows must fit matching packed owner storage")
+        raise ValueError(
+            "sparse input rows must fit matching packed owner storage"
+        )
 
     block_rows = 8
     _pack_masked_qkv_kernel[(triton.cdiv(input_rows, block_rows), heads)](
@@ -318,12 +371,14 @@ def compose_attention(
     owner_rows: int | None = None,
     start_row: int = 0,
 ) -> None:
-    """Fuse trained compression into masked attention and route complete head rows.
+    """Fuse trained compression into masked attention.
+
+    Fuse trained compression into masked attention and route complete head
+    rows.
 
     Numerical providers own key validity and softmax normalization. Composition
     accumulates in FP32 before writing the destination dtype.
     """
-
     assert triton is not None
     heads, rows, width = (int(size) for size in attended.shape[1:])
     block_rows = 8

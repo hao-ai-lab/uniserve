@@ -13,12 +13,15 @@ __all__ = [
 
 
 def patchify(image: torch.Tensor, patch_size: int) -> torch.Tensor:
-    """Convert ``(C,H,W)`` pixels into flattened patch rows in packed vision order."""
-
+    """Convert ``(C,H,W)`` pixels into flattened patch rows in packed vision
+    order.
+    """  # noqa: D205
     p = int(patch_size)
     c, h, w = image.shape
     if h % p != 0 or w % p != 0:
-        raise ValueError(f"image shape {(c, h, w)} is not divisible by patch size {p}")
+        raise ValueError(
+            f"image shape {(c, h, w)} is not divisible by patch size {p}"
+        )
     image = image.reshape(c, h // p, p, w // p, p)
     image = torch.einsum("chpwq->hwpqc", image)
     return image.reshape(-1, p * p * c)
@@ -27,12 +30,16 @@ def patchify(image: torch.Tensor, patch_size: int) -> torch.Tensor:
 def patchify_batch(
     images: torch.Tensor, patch_size: int, *, channel_first: bool = False
 ) -> torch.Tensor:
-    """Convert ``(N,3,H,W)`` images into ``(N,L,patch_size**2*3)`` patch rows."""
-
+    """Convert ``(N,3,H,W)`` images into ``(N,L,patch_size**2*3)`` patch
+    rows.
+    """  # noqa: D205
     p = int(patch_size)
     batch, channels, height, width = images.shape
     if height % p != 0 or width % p != 0:
-        raise ValueError(f"image shape {(batch, channels, height, width)} is not divisible by {p}")
+        raise ValueError(
+            f"image shape {(batch, channels, height, width)} is not "
+            f"divisible by {p}"
+        )
     h = height // p
     w = width // p
     x = images.reshape(batch, channels, h, p, w, p)
@@ -54,10 +61,10 @@ def unpatchify_batch(
     """Convert ``(N,L,patch_size**2*C)`` patch rows back to ``(N,C,H,W)``.
 
     ``channels`` defaults to ``3`` (RGB) but can be set explicitly for latent
-    folds (e.g. VAE latents with ``vae_z_channels`` channels); when omitted it is
-    inferred from the patch-row width so the channel count is named in one place.
+    folds (e.g. VAE latents with ``vae_z_channels`` channels); when omitted
+    it is inferred from the patch-row width so the channel count is named in
+    one place.
     """
-
     p = int(patch_size)
     if channels is None:
         c = int(patches.shape[-1]) // (p * p)
@@ -85,7 +92,6 @@ def build_abs_positions_from_grid_hw(
     from a static tensor shape, so no value is read back from ``grid_hw`` and
     the reduction stays capturable inside a CUDA graph.
     """
-
     device = device or grid_hw.device
     grid_hw = grid_hw.to(device)
     batch = grid_hw.shape[0]

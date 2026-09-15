@@ -2,7 +2,13 @@
 
 from .attention import Attention
 from .conditioning import Conditioner, RefinerBlock, TokenRefiner
-from .config import Config, DiffusionConfig, TransformerConfig, config_sources, read_config
+from .config import (
+    Config,
+    DiffusionConfig,
+    TransformerConfig,
+    config_sources,
+    read_config,
+)
 from .decoding import AudioDecoder, VideoDecoder
 from .denoiser import Denoiser
 from .encoder import TextEncoder, TextEncoderConfig

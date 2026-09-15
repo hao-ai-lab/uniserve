@@ -1,4 +1,7 @@
-"""Compose one numerical denoiser invocation with solver update and PP feedback."""
+"""Compose one numerical denoiser invocation.
+
+Includes the solver update and PP feedback.
+"""
 
 from __future__ import annotations
 
@@ -37,25 +40,44 @@ class DenoisingStep(Generic[InputT, SizeT]):
     def __call__(self) -> Mapping[str, tuple[torch.Tensor, ...]]:
         index = self.inputs.step_index
         names = self.denoiser.modalities
-        if set(self.inputs.latents) != set(names) or set(self.schedules) != set(names):
-            raise ValueError("denoising inputs and schedules must cover the declared modalities")
-        if any(not 0 <= index < schedule.num_steps for schedule in self.schedules.values()):
-            raise ValueError("denoising requires an evaluation index within every schedule")
+        if set(self.inputs.latents) != set(names) or set(self.schedules) != set(
+            names
+        ):
+            raise ValueError(
+                "denoising inputs and schedules must cover the declared "
+                "modalities"
+            )
+        if any(
+            not 0 <= index < schedule.num_steps
+            for schedule in self.schedules.values()
+        ):
+            raise ValueError(
+                "denoising requires an evaluation index within every schedule"
+            )
 
         predictions = self.denoiser(
-            self.inputs, state=self.state, constants=self.constants, workspace=self.workspace
+            self.inputs,
+            state=self.state,
+            constants=self.constants,
+            workspace=self.workspace,
         )
         if set(predictions) != set(names):
-            raise ValueError("denoising predictions must cover the declared modalities")
+            raise ValueError(
+                "denoising predictions must cover the declared modalities"
+            )
 
         samples = {}
         for name in names:
             schedule = self.schedules[name]
             values = self.inputs.latents[name]
             if len(predictions[name]) != len(values):
-                raise ValueError("denoising predictions must align with the input samples")
+                raise ValueError(
+                    "denoising predictions must align with the input samples"
+                )
             samples[name] = tuple(value.tensor for value in values)
-            for latent, prediction in zip(values, predictions[name], strict=True):
+            for latent, prediction in zip(
+                values, predictions[name], strict=True
+            ):
                 if prediction is None:
                     continue
                 sample = latent.tensor
@@ -64,7 +86,10 @@ class DenoisingStep(Generic[InputT, SizeT]):
                 if tuple(sample.shape) == prediction.layout.shape:
                     sample = sample[prediction.layout.local_slice]
                 if sample.shape != prediction.tensor.shape:
-                    raise ValueError("prediction shard and sample storage have incompatible shapes")
+                    raise ValueError(
+                        "prediction shard and sample storage have "
+                        "incompatible shapes"
+                    )
                 self.denoiser.solver.step_(
                     prediction.tensor,
                     sample,

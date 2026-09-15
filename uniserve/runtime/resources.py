@@ -6,8 +6,11 @@ from collections.abc import Callable
 
 
 def close_resources(*actions: Callable[[], object]) -> None:
-    """Attempt every ordered release, raising the first failure with later failures noted."""
+    """Attempt every ordered release.
 
+    Attempt every ordered release, raising the first failure with later
+    failures noted.
+    """
     failure: BaseException | None = None
     for action in actions:
         try:

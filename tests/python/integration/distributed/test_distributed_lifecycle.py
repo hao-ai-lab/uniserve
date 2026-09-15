@@ -1,4 +1,7 @@
-"""Distributed construction scopes preserve ownership and the original failure."""
+"""Distributed construction scopes preserve ownership.
+
+They also preserve the original failure.
+"""
 
 import pytest
 import torch
@@ -41,7 +44,10 @@ def _construction_scope(rank, directory):
             except RuntimeError as error:
                 assert error is failure
                 if outcome == "cleanup_error":
-                    assert any("distributed teardown failed" in note for note in error.__notes__)
+                    assert any(
+                        "distributed teardown failed" in note
+                        for note in error.__notes__
+                    )
             else:
                 assert outcome == "success"
 

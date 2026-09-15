@@ -1,4 +1,7 @@
-"""Sharded worker selection and output retention preserve dense logit results."""
+"""Sharded worker selection preserves dense logit results.
+
+So does output retention.
+"""
 
 from pathlib import Path
 
@@ -9,7 +12,11 @@ from torch import nn
 
 from uniserve.distributed import DeviceMesh
 from uniserve.model import TextSize, VocabShard
-from uniserve.runtime import CUDAGraph, ExecutionContext, initialize_process_groups
+from uniserve.runtime import (
+    CUDAGraph,
+    ExecutionContext,
+    initialize_process_groups,
+)
 from uniserve.sampling import greedy
 from uniserve_worker.execution.batch import ExecutionOutput
 
@@ -28,7 +35,8 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
     ) as environment:
         meshes = tuple(
             environment.bind(
-                DeviceMesh(ranks=ranks, shape=(2,), axes=("tp",), rank=rank), device=device
+                DeviceMesh(ranks=ranks, shape=(2,), axes=("tp",), rank=rank),
+                device=device,
             )
             for ranks in ((0, 1), (1, 0))
         )
@@ -39,10 +47,15 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
                 group = mesh.get_group("tp")
                 for size in (65, 37):
                     vocab = VocabShard(
-                        size, slice(group.rank * 64, (group.rank + 1) * 64), 128, group
+                        size,
+                        slice(group.rank * 64, (group.rank + 1) * 64),
+                        128,
+                        group,
                     )
                     for dtype in (torch.bfloat16, torch.float16, torch.float32):
-                        full = torch.full((6, 128), -2.0, device=device, dtype=dtype)
+                        full = torch.full(
+                            (6, 128), -2.0, device=device, dtype=dtype
+                        )
                         full[:, size:] = 100
                         full[0, :size] = -1
                         full[1, size - 1] = 3
@@ -51,10 +64,15 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
                         full[4, (3, size - 1)] = float("nan")
                         full[5, (8, size - 1)] = float("inf")
                         local = full[:, vocab.local_slice].contiguous()
-                        projected = ExecutionOutput((local[:2], local[2:]), (vocab, vocab))
-                        continuous = torch.arange(15, device=device, dtype=dtype).reshape(3, 5)
+                        projected = ExecutionOutput(
+                            (local[:2], local[2:]), (vocab, vocab)
+                        )
+                        continuous = torch.arange(
+                            15, device=device, dtype=dtype
+                        ).reshape(3, 5)
                         mixed = ExecutionOutput(
-                            (local[:2], continuous, local[2:]), (vocab, None, vocab)
+                            (local[:2], continuous, local[2:]),
+                            (vocab, None, vocab),
                         )
                         retained = mixed.clone()
                         expected_retained = full[:, :size].clone()
@@ -66,7 +84,9 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
                         module.register_buffer("logits", local)
                         module.mesh = mesh
                         with ExecutionContext(module, stream=stream) as context:
-                            context.prepare(TextSize(num_tokens=6, batch_size=6))
+                            context.prepare(
+                                TextSize(num_tokens=6, batch_size=6)
+                            )
                             stream.wait_stream(current)
                             with context.activate():
                                 greedy(local, vocab)
@@ -84,15 +104,23 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
                                     stream.wait_stream(current)
                                     values, tokens = graph.replay()
                                     current.wait_stream(stream)
-                                    expected_values, expected_tokens = full[:, :size].max(dim=-1)
+                                    expected_values, expected_tokens = full[
+                                        :, :size
+                                    ].max(dim=-1)
                                     torch.testing.assert_close(
-                                        values, expected_values, rtol=0, atol=0, equal_nan=True
+                                        values,
+                                        expected_values,
+                                        rtol=0,
+                                        atol=0,
+                                        equal_nan=True,
                                     )
                                     torch.testing.assert_close(
                                         tokens, expected_tokens, rtol=0, atol=0
                                     )
                                     torch.testing.assert_close(
-                                        torch.cat(projected.materialize().values),
+                                        torch.cat(
+                                            projected.materialize().values
+                                        ),
                                         full[:, :size],
                                         rtol=0,
                                         atol=0,
@@ -100,17 +128,31 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
                                     )
                                 saved = retained.materialize().values
                                 torch.testing.assert_close(
-                                    saved[0], expected_retained[:2], rtol=0, atol=0, equal_nan=True
+                                    saved[0],
+                                    expected_retained[:2],
+                                    rtol=0,
+                                    atol=0,
+                                    equal_nan=True,
                                 )
-                                torch.testing.assert_close(saved[1], continuous - 1, rtol=0, atol=0)
                                 torch.testing.assert_close(
-                                    saved[2], expected_retained[2:], rtol=0, atol=0, equal_nan=True
+                                    saved[1], continuous - 1, rtol=0, atol=0
+                                )
+                                torch.testing.assert_close(
+                                    saved[2],
+                                    expected_retained[2:],
+                                    rtol=0,
+                                    atol=0,
+                                    equal_nan=True,
                                 )
                                 current.synchronize()
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two CUDA devices are required")
-def test_vocabulary_selection_and_materialization_preserve_dense_results(tmp_path: Path):
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="two CUDA devices are required"
+)
+def test_vocabulary_selection_and_materialization_preserve_dense_results(
+    tmp_path: Path,
+):
     mp.spawn(
         _run_vocabulary_selection,
         ((tmp_path / "rendezvous").as_uri(),),

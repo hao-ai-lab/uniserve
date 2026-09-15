@@ -79,7 +79,9 @@ class _MisalignedOutputModel(Model):
         self.misaligned = False
         self.failure_delay_cycles = 0
 
-    def compute_logits(self, hidden: torch.Tensor, *, token_indices: torch.Tensor) -> Logits:
+    def compute_logits(
+        self, hidden: torch.Tensor, *, token_indices: torch.Tensor
+    ) -> Logits:
         output = super().compute_logits(hidden, token_indices=token_indices)
         if self.misaligned:
             if self.failure_delay_cycles:
@@ -99,7 +101,11 @@ def _publish_conditioning(
     finalized_report(
         worker,
         worker.submit(
-            execution_run(run_id=run_id, admissions=(admission,), operations=(publication,))
+            execution_run(
+                run_id=run_id,
+                admissions=(admission,),
+                operations=(publication,),
+            )
         ),
     )
     return product
@@ -124,7 +130,9 @@ def _prepare_media(
         seed=seed,
         image_index=image_index,
     )
-    report = worker.submit(execution_run(run_id=run_id, operations=(preparation,)))
+    report = worker.submit(
+        execution_run(run_id=run_id, operations=(preparation,))
+    )
     report = finalized_report(worker, report)
     assert report.completions[0].status is OpStatus.OK
     return latent, record_completion(preparation, report)
@@ -166,8 +174,10 @@ def _prepare_decode(
 
 
 def _media_bytes(record: RequestOutput) -> bytes:
-    """Claim the public shared-memory output and consume its encoded image bytes."""
+    """Claim the public shared-memory output.
 
+    The output's encoded image bytes are consumed.
+    """
     from multiprocessing.shared_memory import SharedMemory
 
     output = record.media_output
@@ -195,7 +205,9 @@ def _finalized_artifact(
         predecessor=observation.op_id,
         latent=latent,
     )
-    report = worker.submit(execution_run(run_id=run_id, operations=(operation,), commands=()))
+    report = worker.submit(
+        execution_run(run_id=run_id, operations=(operation,), commands=())
+    )
     report = finalized_report(worker, report)
     assert report.completions[0].status is OpStatus.OK
     return _media_bytes(report.completions[0])
@@ -247,7 +259,9 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
         ),
     )
 
-    assert decoded.completions[0].committed_tokens == (expected_successor(first_token),)
+    assert decoded.completions[0].committed_tokens == (
+        expected_successor(first_token),
+    )
     assert decoded.completions[0].kv_visible_len == 3
     assert decoded.completions[0].position == 3
 
@@ -291,13 +305,19 @@ def test_text_extension_rejects_missing_input_tokens() -> None:
     operation = replace(operation, input_token_ids=())
     report = finalized_report(
         worker,
-        worker.submit(execution_run(run_id=1, admissions=(admission,), operations=(operation,))),
+        worker.submit(
+            execution_run(
+                run_id=1, admissions=(admission,), operations=(operation,)
+            )
+        ),
     )
     assert report.completions[0].status is OpStatus.ERROR
     assert report.completions[0].error_code is ErrorCode.INVALID_OPERATION
 
 
-def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent() -> None:
+def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent() -> (  # noqa: E501
+    None
+):
     worker = execution_worker(pipeline_depth=2)
     admission = ar_params(9, block_ids=(0,))
     predecessor = token_operation(
@@ -397,8 +417,12 @@ def test_decode_reuses_the_published_request_page_table() -> None:
         pytest.param("cuda:0", "shared", True, 1, None, marks=pytest.mark.gpu),
         pytest.param("cuda:0", "split", True, 1, None, marks=pytest.mark.gpu),
         pytest.param("cuda:0", "split", False, 1, None, marks=pytest.mark.gpu),
-        pytest.param("cuda:0", "default", False, 2, "cuda:1", marks=pytest.mark.gpu),
-        pytest.param("cuda:0", "default", True, 2, "cuda:1", marks=pytest.mark.gpu),
+        pytest.param(
+            "cuda:0", "default", False, 2, "cuda:1", marks=pytest.mark.gpu
+        ),
+        pytest.param(
+            "cuda:0", "default", True, 2, "cuda:1", marks=pytest.mark.gpu
+        ),
     ],
 )
 def test_independent_token_and_flow_match_homogeneous_results(
@@ -436,7 +460,9 @@ def test_independent_token_and_flow_match_homogeneous_results(
     ):
         # Each numerical domain uses its own call while sharing request storage.
         sequence_admission = ar_params(1, block_ids=(0,))
-        flow_admission = umm_params(2, ImageParams(steps=steps, height=16, width=16, seed=29))
+        flow_admission = umm_params(
+            2, ImageParams(steps=steps, height=16, width=16, seed=29)
+        )
         mixed_conditioning = _publish_conditioning(
             mixed, flow_admission, op_id=ComputationId(10, 0), run_id=1
         )
@@ -525,7 +551,10 @@ def test_independent_token_and_flow_match_homogeneous_results(
             mixed_result.completions[0].committed_tokens
             == sequence_result.completions[0].committed_tokens
         )
-        assert mixed_result.completions[0].position == sequence_result.completions[0].position
+        assert (
+            mixed_result.completions[0].position
+            == sequence_result.completions[0].position
+        )
         assert (
             mixed_result.completions[0].kv_visible_len
             == sequence_result.completions[0].kv_visible_len
@@ -538,9 +567,13 @@ def test_independent_token_and_flow_match_homogeneous_results(
             mixed_result.completions[0].num_completed_steps
             == sequence_result.completions[0].num_completed_steps
         )
-        assert mixed_result.completions[1].position == flow_result.completions[0].position
         assert (
-            mixed_result.completions[1].kv_visible_len == flow_result.completions[0].kv_visible_len
+            mixed_result.completions[1].position
+            == flow_result.completions[0].position
+        )
+        assert (
+            mixed_result.completions[1].kv_visible_len
+            == flow_result.completions[0].kv_visible_len
         )
         assert (
             mixed_result.completions[1].kv_computed_len
@@ -569,11 +602,17 @@ def test_independent_token_and_flow_match_homogeneous_results(
         )
 
 
-def test_next_image_can_start_before_the_previous_artifact_is_observed() -> None:
+def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
+    None
+):
     worker = execution_worker(pipeline_depth=3)
-    admission = umm_params(12, ImageParams(steps=1, height=16, width=16, seed=29, max_images=2))
+    admission = umm_params(
+        12, ImageParams(steps=1, height=16, width=16, seed=29, max_images=2)
+    )
     try:
-        conditioning = _publish_conditioning(worker, admission, op_id=ComputationId(1, 0), run_id=1)
+        conditioning = _publish_conditioning(
+            worker, admission, op_id=ComputationId(1, 0), run_id=1
+        )
         initial, prepared = _prepare_media(
             worker,
             admission,
@@ -590,7 +629,9 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> None
             latent=initial,
             steps=1,
         )
-        stepped = worker.submit(execution_run(run_id=3, operations=(step,), commands=()))
+        stepped = worker.submit(
+            execution_run(run_id=3, operations=(step,), commands=())
+        )
         stepped = finalized_report(worker, stepped)
         accepted = record_completion(step, stepped)
         finalize = diffusion_finalize_operation(
@@ -599,7 +640,9 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> None
             predecessor=accepted.op_id,
             latent=latent,
         )
-        first_image = worker.submit(execution_run(run_id=4, operations=(finalize,), commands=()))
+        first_image = worker.submit(
+            execution_run(run_id=4, operations=(finalize,), commands=())
+        )
         initial, prepared = _prepare_media(
             worker,
             admission,
@@ -614,7 +657,9 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> None
         first_report = first_image
         assert first_report.completions[0].status is OpStatus.OK
         first_png = _media_bytes(first_report.completions[0])
-        with Image.open(io.BytesIO(base64.b64decode(first_png, validate=True))) as image:
+        with Image.open(
+            io.BytesIO(base64.b64decode(first_png, validate=True))
+        ) as image:
             assert image.size == (16, 16)
         step, latent = diffusion_step_operation(
             admission.request_key,
@@ -624,7 +669,9 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> None
             latent=initial,
             steps=1,
         )
-        stepped = worker.submit(execution_run(run_id=6, operations=(step,), commands=()))
+        stepped = worker.submit(
+            execution_run(run_id=6, operations=(step,), commands=())
+        )
         stepped = finalized_report(worker, stepped)
         second_png = _finalized_artifact(
             worker,
@@ -634,7 +681,9 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> None
             op_id=ComputationId(7, 0),
             run_id=7,
         )
-        with Image.open(io.BytesIO(base64.b64decode(second_png, validate=True))) as image:
+        with Image.open(
+            io.BytesIO(base64.b64decode(second_png, validate=True))
+        ) as image:
             assert image.size == (16, 16)
     finally:
         worker.close()
@@ -690,13 +739,18 @@ def test_computation_identity_preserves_homogeneous_decode():
         ),
     )
 
-    assert tuple(record.committed_tokens for record in decoded.completions) == tuple(
-        (expected_successor(expected_successor(token)),) for token in last_tokens
+    assert tuple(
+        record.committed_tokens for record in decoded.completions
+    ) == tuple(
+        (expected_successor(expected_successor(token)),)
+        for token in last_tokens
     )
 
 
 @pytest.mark.gpu
-def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> None:
+def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> (
+    None
+):
     model = _MisalignedOutputModel().to("cuda:0")
     worker = execution_worker(
         model,
@@ -746,14 +800,18 @@ def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> No
         failed = finalized_report(worker, failed)
         assert failed.completions[0].status is OpStatus.ERROR
         assert failed.completions[0].error_code is ErrorCode.COMPUTE_ERROR
-        assert not worker.kv_cache.retirement_ready(requests=(admission.request_key,))
+        assert not worker.kv_cache.retirement_ready(
+            requests=(admission.request_key,)
+        )
         with pytest.raises(WorkerError, match="executing producer or consumer"):
             worker.kv_cache.zero_pages(0, (5,))
 
         worker.runner.synchronize()
         torch.cuda.current_stream("cuda:0").synchronize()
         worker.device_events.reap()
-        assert worker.kv_cache.retirement_ready(requests=(admission.request_key,))
+        assert worker.kv_cache.retirement_ready(
+            requests=(admission.request_key,)
+        )
         worker.kv_cache.zero_pages(0, (5,))
     finally:
         worker.close()
@@ -787,7 +845,9 @@ def test_output_validation_failure_discards_all_candidate_state():
         mode=ForwardMode.DECODE,
         tokens=(expected_successor(13),),
     )
-    retry_batch = execution_run(run_id=13, admissions=(), operations=(retry,), input_products=())
+    retry_batch = execution_run(
+        run_id=13, admissions=(), operations=(retry,), input_products=()
+    )
     model.misaligned = True
     failed = worker.submit(retry_batch)
 
@@ -812,14 +872,20 @@ def test_output_validation_failure_discards_all_candidate_state():
             )
         ),
     )
-    assert result.completions[0].committed_tokens == (expected_successor(expected_successor(13)),)
+    assert result.completions[0].committed_tokens == (
+        expected_successor(expected_successor(13)),
+    )
     assert result.completions[0].kv_visible_len == 3
 
 
-def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact():
+def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact():  # noqa: E501
     worker = execution_worker(block_size=4)
-    admission = umm_params(5, ImageParams(steps=2, height=64, width=64, seed=29))
-    conditioning = _publish_conditioning(worker, admission, op_id=ComputationId(40, 0), run_id=12)
+    admission = umm_params(
+        5, ImageParams(steps=2, height=64, width=64, seed=29)
+    )
+    conditioning = _publish_conditioning(
+        worker, admission, op_id=ComputationId(40, 0), run_id=12
+    )
     latent, preparation_observation = _prepare_media(
         worker,
         admission,
@@ -870,7 +936,8 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         steps=2,
     )
     recovered = finalized_report(
-        worker, worker.submit(execution_run(run_id=16, operations=(replacement,)))
+        worker,
+        worker.submit(execution_run(run_id=16, operations=(replacement,))),
     )
     assert recovered.completions[0].status is OpStatus.OK
     assert recovered.completions[0].num_completed_steps == 2
@@ -972,7 +1039,9 @@ def test_mixed_lane_descriptor_failure_preserves_the_other_domain_candidate():
         ),
     )
 
-    by_request = {record.request_key.request_id: record for record in report.completions}
+    by_request = {
+        record.request_key.request_id: record for record in report.completions
+    }
     assert by_request[61].status is OpStatus.OK
     assert by_request[62].status is OpStatus.ERROR
     assert by_request[62].error_code is ErrorCode.INVALID_OPERATION
@@ -980,11 +1049,15 @@ def test_mixed_lane_descriptor_failure_preserves_the_other_domain_candidate():
 
 
 def test_initial_flow_noise_is_stable_across_operation_schedules():
-    admission = umm_params(5, ImageParams(steps=1, height=16, width=16, seed=29))
+    admission = umm_params(
+        5, ImageParams(steps=1, height=16, width=16, seed=29)
+    )
     artifacts: list[bytes] = []
     for op_id in (41, 109):
         worker = execution_worker()
-        conditioning = _publish_conditioning(worker, admission, op_id=ComputationId(1, 0), run_id=1)
+        conditioning = _publish_conditioning(
+            worker, admission, op_id=ComputationId(1, 0), run_id=1
+        )
         latent, preparation_observation = _prepare_media(
             worker,
             admission,
@@ -1055,7 +1128,9 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
                 cfg_img_scale=cfg_img_scale,
             ),
         )
-        conditioning = _publish_conditioning(worker, admission, op_id=ComputationId(1, 0), run_id=1)
+        conditioning = _publish_conditioning(
+            worker, admission, op_id=ComputationId(1, 0), run_id=1
+        )
         latent, observation = _prepare_media(
             worker,
             admission,
@@ -1107,8 +1182,12 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
     assert run(4) == run(1)
 
 
-@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
-def test_non_power_of_two_context_capacity_accepts_prefill_and_decode(device: str) -> None:
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
+)
+def test_non_power_of_two_context_capacity_accepts_prefill_and_decode(
+    device: str,
+) -> None:
     model = Model().to(device)
     worker = execution_worker(
         model,
@@ -1228,12 +1307,16 @@ def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
 
 
 def test_flow_run_results_cumulative_denoise_step_in_latent_len():
-    # The ordered-observation validator matches latent_len against the cumulative
-    # denoise step (start_step + step_count), not a constant token count, so two
-    # single-step quanta must report 1 then 2.
+    # The ordered-observation validator matches latent_len against the
+    # cumulative denoise step (start_step + step_count), not a constant token
+    # count, so two single-step quanta must report 1 then 2.
     worker = execution_worker()
-    admission = umm_params(2, ImageParams(steps=2, height=16, width=16, seed=29))
-    conditioning = _publish_conditioning(worker, admission, op_id=ComputationId(1, 0), run_id=1)
+    admission = umm_params(
+        2, ImageParams(steps=2, height=16, width=16, seed=29)
+    )
+    conditioning = _publish_conditioning(
+        worker, admission, op_id=ComputationId(1, 0), run_id=1
+    )
     initial_latent, preparation_observation = _prepare_media(
         worker,
         admission,
@@ -1286,10 +1369,15 @@ def test_flow_run_results_cumulative_denoise_step_in_latent_len():
     assert second_report.completions[0].num_completed_steps == 2
 
 
-def test_trajectory_advances_across_many_generations_and_rejects_a_stale_reference():
+def test_trajectory_advances_across_many_generations_and_rejects_a_stale_reference(  # noqa: E501
+):
     worker = execution_worker()
-    admission = umm_params(71, ImageParams(steps=50, height=16, width=16, seed=29))
-    conditioning = _publish_conditioning(worker, admission, op_id=ComputationId(1, 0), run_id=1)
+    admission = umm_params(
+        71, ImageParams(steps=50, height=16, width=16, seed=29)
+    )
+    conditioning = _publish_conditioning(
+        worker, admission, op_id=ComputationId(1, 0), run_id=1
+    )
     current, observation = _prepare_media(
         worker,
         admission,
@@ -1340,12 +1428,15 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
         latent=stale,
         steps=1,
     )
-    stale_report = worker.submit(execution_run(run_id=54, operations=(stale_operation,)))
+    stale_report = worker.submit(
+        execution_run(run_id=54, operations=(stale_operation,))
+    )
     stale_report = finalized_report(worker, stale_report)
     assert stale_report.completions[0].status is OpStatus.ERROR
 
 
-def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thread_wait() -> None:
+def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thread_wait(  # noqa: E501
+) -> None:
     producer = execution_worker(transfer_backends=("shm",))
     consumer = execution_worker(transfer_backends=("shm",))
     admission = ar_params(73, block_ids=(0,))
@@ -1414,7 +1505,9 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
         consumer.close()
 
 
-def test_free_preserves_another_requests_feature_with_the_same_generation() -> None:
+def test_free_preserves_another_requests_feature_with_the_same_generation() -> (
+    None
+):
     worker = execution_worker(transfer_backends=("shm",))
     admissions = (ar_params(93, block_ids=(0,)), ar_params(94, block_ids=(1,)))
     image = io.BytesIO()
@@ -1441,9 +1534,15 @@ def test_free_preserves_another_requests_feature_with_the_same_generation() -> N
                 )
             ),
         )
-        assert all(completion.status is OpStatus.OK for completion in produced.completions)
+        assert all(
+            completion.status is OpStatus.OK
+            for completion in produced.completions
+        )
         worker.submit(
-            execution_run(run_id=2, commands=(Free(operations[0].encoder_output.buffer_id),))
+            execution_run(
+                run_id=2,
+                commands=(Free(operations[0].encoder_output.buffer_id),),
+            )
         )
         visual = visual_state_operation(
             admissions[1].request_key,
@@ -1461,7 +1560,9 @@ def test_free_preserves_another_requests_feature_with_the_same_generation() -> N
         worker.close()
 
 
-def test_cross_stage_device_product_transfer_preserves_generation_and_value() -> None:
+def test_cross_stage_device_product_transfer_preserves_generation_and_value() -> (  # noqa: E501
+    None
+):
     producer = execution_worker(transfer_backends=("shm",))
     consumer = execution_worker(transfer_backends=("shm",))
     admission = ar_params(77, block_ids=(0,))
@@ -1485,7 +1586,9 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
         )
         observation = record_completion(extend, extended)
         source = extend.token_output
-        transferred = replace(source, producer_op_id=ComputationId(2, 0), generation=901)
+        transferred = replace(
+            source, producer_op_id=ComputationId(2, 0), generation=901
+        )
         transfer = ScheduledRequest(
             request_key=admission.request_key,
             op_id=ComputationId(2, 0),
@@ -1569,13 +1672,21 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         operations=(original,),
     )
     source = original.encoder_output
-    output = replace(source, producer_op_id=ComputationId(2, 0), generation=2, dtype=output_dtype)
+    output = replace(
+        source,
+        producer_op_id=ComputationId(2, 0),
+        generation=2,
+        dtype=output_dtype,
+    )
     transfer = ScheduledRequest(
         request_key=admission.request_key,
         op_id=ComputationId(2, 0),
         predecessor=root_parent(admission),
         kind=TransferMode.TENSOR,
-        bounds=Bounds(max_transfer_bytes=source.max_bytes, max_latent_bytes=output.max_bytes),
+        bounds=Bounds(
+            max_transfer_bytes=source.max_bytes,
+            max_latent_bytes=output.max_bytes,
+        ),
         vision_input=source,
         encoder_output=output,
     )
@@ -1583,7 +1694,8 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
     try:
         finalized_report(worker, worker.submit(initial))
         report = finalized_report(
-            worker, worker.submit(execution_run(run_id=2, operations=(transfer,)))
+            worker,
+            worker.submit(execution_run(run_id=2, operations=(transfer,))),
         )
         if output_dtype is not source.dtype:
             assert report.completions[0].status is OpStatus.ERROR
@@ -1592,10 +1704,15 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
 
         assert isinstance(handle, EncoderTransferValue)
         locator = handle.tensor.locations[0]
-        ticket = worker.transports[locator.backend].fetch(locator, device=torch.device("cpu"))
+        ticket = worker.transports[locator.backend].fetch(
+            locator, device=torch.device("cpu")
+        )
         expected = ticket.result().clone()
         finalized_report(
-            worker, worker.submit(execution_run(run_id=3, commands=(Free(source.buffer_id),)))
+            worker,
+            worker.submit(
+                execution_run(run_id=3, commands=(Free(source.buffer_id),))
+            ),
         )
 
         replacement = encoded_operation(ComputationId(3, 0), (192, 160, 32))
@@ -1604,7 +1721,9 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
             operations=(replacement,),
         )
         source_allocation = next(
-            item for item in initial.buffer_allocations if item.buffer == source.buffer_id
+            item
+            for item in initial.buffer_allocations
+            if item.buffer == source.buffer_id
         )
         reuse = replace(
             reuse,
@@ -1618,7 +1737,9 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         finalized_report(worker, worker.submit(reuse))
         torch.testing.assert_close(ticket.result(), expected, rtol=0, atol=0)
 
-        released = worker.submit(execution_run(run_id=5, commands=(Free(output.buffer_id),)))
+        released = worker.submit(
+            execution_run(run_id=5, commands=(Free(output.buffer_id),))
+        )
         assert not released.complete
         ticket.close()
         released = finalized_report(worker, released)
@@ -1630,7 +1751,9 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
 
 
 @pytest.mark.parametrize("backend", ("local", "shm"))
-@pytest.mark.parametrize("dtype", (DType.BF16, DType.F32, DType.I32, DType.I64, DType.I16))
+@pytest.mark.parametrize(
+    "dtype", (DType.BF16, DType.F32, DType.I32, DType.I64, DType.I16)
+)
 def test_tensor_entry_input_preserves_values_through_output_release(
     backend: str,
     dtype: DType,
@@ -1680,10 +1803,14 @@ def test_tensor_entry_input_preserves_values_through_output_release(
     if dtype is DType.I16:
         expected[0] = torch.tensor([-32768, -1, 0, 32767], dtype=storage_dtype)
     elif dtype is DType.I32:
-        expected[0] = torch.tensor([-(1 << 31), -1, 0, (1 << 31) - 1], dtype=storage_dtype)
+        expected[0] = torch.tensor(
+            [-(1 << 31), -1, 0, (1 << 31) - 1], dtype=storage_dtype
+        )
     elif dtype is DType.I64:
         # Preserve signed values and high bits used by device continuation data.
-        expected[0] = torch.tensor([-(1 << 63), -1, 1 << 40, (1 << 63) - 1], dtype=storage_dtype)
+        expected[0] = torch.tensor(
+            [-(1 << 63), -1, 1 << 40, (1 << 63) - 1], dtype=storage_dtype
+        )
     location = producer.publish(expected)
     payload = TensorPublication(
         product=source,
@@ -1717,12 +1844,16 @@ def test_tensor_entry_input_preserves_values_through_output_release(
 
         assert isinstance(descriptor, DeviceProductTransferValue)
         locator = descriptor.tensor.locations[0]
-        reader = worker.transports[backend].fetch(locator, device=torch.device("cpu"))
+        reader = worker.transports[backend].fetch(
+            locator, device=torch.device("cpu")
+        )
         ready = Event()
         reader.add_done_callback(ready.set)
         assert ready.wait(5)
         torch.testing.assert_close(reader.result(), expected, rtol=0, atol=0)
-        released = worker.submit(execution_run(run_id=2, commands=(Free(output.buffer_id),)))
+        released = worker.submit(
+            execution_run(run_id=2, commands=(Free(output.buffer_id),))
+        )
         torch.testing.assert_close(reader.result(), expected, rtol=0, atol=0)
         reader.close()
         released = finalized_report(worker, released)
@@ -1736,10 +1867,14 @@ def test_tensor_entry_input_preserves_values_through_output_release(
         events.close()
 
 
-def test_cross_stage_completion_predicate_preserves_device_continuation() -> None:
+def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
+    None
+):
     producer = execution_worker(transfer_backends=("shm",))
     consumer = execution_worker(transfer_backends=("shm",))
-    generation = umm_params(79, ImageParams(steps=1, height=16, width=16, seed=31))
+    generation = umm_params(
+        79, ImageParams(steps=1, height=16, width=16, seed=31)
+    )
     admission = NewRequest(
         generation.request_key,
         request_pool_idx=generation.request_pool_idx,
@@ -1763,11 +1898,14 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> Non
             seed=31,
         )
         transitioned = finalized_report(
-            producer, producer.submit(execution_run(run_id=2, operations=(preparation,)))
+            producer,
+            producer.submit(execution_run(run_id=2, operations=(preparation,))),
         )
         preparation_observation = record_completion(preparation, transitioned)
         source = preparation.completion_output
-        transferred = replace(source, producer_op_id=ComputationId(3, 0), generation=903)
+        transferred = replace(
+            source, producer_op_id=ComputationId(3, 0), generation=903
+        )
         transfer = ScheduledRequest(
             request_key=admission.request_key,
             op_id=ComputationId(3, 0),
@@ -1788,7 +1926,9 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> Non
             ),
         )
         payload = next(
-            product for product in transfer_report.products if product.product == transferred
+            product
+            for product in transfer_report.products
+            if product.product == transferred
         )
         consume = token_operation(
             admission.request_key,
@@ -1828,8 +1968,12 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
 ) -> None:
     producer = execution_worker(transfer_backends=("shm",))
     consumer = execution_worker(transfer_backends=("shm",))
-    admission = umm_params(75, ImageParams(steps=1, height=height, width=height, seed=29))
-    conditioning = _publish_conditioning(producer, admission, op_id=ComputationId(1, 0), run_id=1)
+    admission = umm_params(
+        75, ImageParams(steps=1, height=height, width=height, seed=29)
+    )
+    conditioning = _publish_conditioning(
+        producer, admission, op_id=ComputationId(1, 0), run_id=1
+    )
     initial_latent, preparation_observation = _prepare_media(
         producer,
         admission,
@@ -1862,7 +2006,9 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
     flow_observation = record_completion(flow, produced)
     exported_latent = final_latent
     if publication == "transfer":
-        exported_latent = replace(final_latent, producer_op_id=ComputationId(4, 0), generation=904)
+        exported_latent = replace(
+            final_latent, producer_op_id=ComputationId(4, 0), generation=904
+        )
         transfer = ScheduledRequest(
             request_key=admission.request_key,
             op_id=ComputationId(4, 0),
@@ -1876,15 +2022,22 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
             latent_output=exported_latent,
         )
         exported = finalized_report(
-            producer, producer.submit(execution_run(run_id=4, operations=(transfer,), commands=()))
+            producer,
+            producer.submit(
+                execution_run(run_id=4, operations=(transfer,), commands=())
+            ),
         )
         assert exported.completions[0].status is OpStatus.OK
         transferred = tuple(
-            product for product in exported.products if product.product == exported_latent
+            product
+            for product in exported.products
+            if product.product == exported_latent
         )
     else:
         transferred = tuple(
-            product for product in produced.products if product.product == final_latent
+            product
+            for product in produced.products
+            if product.product == final_latent
         )
     assert len(transferred) == 1
 
@@ -1893,23 +2046,32 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
 
         descriptor = transferred[0].value
         tensor = descriptor.tensor
-        source_value = torch.empty(tensor.shape, dtype=getattr(torch, tensor.dtype))
+        source_value = torch.empty(
+            tensor.shape, dtype=getattr(torch, tensor.dtype)
+        )
         tickets = fetch_tensor(
             tensor,
             source_value,
             bindings={
-                (location.source, location.backend): producer.transports[location.backend]
+                (location.source, location.backend): producer.transports[
+                    location.backend
+                ]
                 for location in tensor.locations
             },
         )
         deadline = time.monotonic() + 5.0
-        while not all(ticket.ready() for ticket in tickets) and time.monotonic() < deadline:
+        while (
+            not all(ticket.ready() for ticket in tickets)
+            and time.monotonic() < deadline
+        ):
             time.sleep(0.001)
         for ticket in tickets:
             ticket.result()
         axis = 0 if source_value.shape[0] > 1 else 1
         first, second = source_value.chunk(2, dim=axis)
-        offset = tuple(first.shape[axis] if index == axis else 0 for index in range(2))
+        offset = tuple(
+            first.shape[axis] if index == axis else 0 for index in range(2)
+        )
         locations = (
             producer.transports["shm"].publish(first),
             producer.transports["shm"].publish(second, offset=offset),
@@ -1918,7 +2080,10 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
             replace(
                 transferred[0],
                 value=replace(
-                    descriptor, tensor=TensorTransfer(shape=tensor.shape, locations=locations)
+                    descriptor,
+                    tensor=TensorTransfer(
+                        shape=tensor.shape, locations=locations
+                    ),
                 ),
             ),
         )
@@ -1947,7 +2112,11 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
     batch = replace(
         batch,
         latent_params=tuple(
-            replace(allocation, page_table=tuple(reversed(allocation.page_table)), start_step=1)
+            replace(
+                allocation,
+                page_table=tuple(reversed(allocation.page_table)),
+                start_step=1,
+            )
             for allocation in batch.latent_params
         ),
     )
@@ -2026,7 +2195,8 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
 
 
 @pytest.mark.parametrize(
-    ("transfer_image", "encoding_fails"), ((False, False), (True, False), (False, True))
+    ("transfer_image", "encoding_fails"),
+    ((False, False), (True, False), (False, True)),
 )
 def test_resident_image_materialization_preserves_the_decoded_artifact(
     transfer_image: bool,
@@ -2035,10 +2205,13 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
 ) -> None:
     worker = execution_worker(transfer_backends=("shm",))
     admission = umm_params(
-        76, ImageParams(steps=1, height=16, width=16, seed=31, retain_images=True)
+        76,
+        ImageParams(steps=1, height=16, width=16, seed=31, retain_images=True),
     )
     try:
-        conditioning = _publish_conditioning(worker, admission, op_id=ComputationId(1, 0), run_id=1)
+        conditioning = _publish_conditioning(
+            worker, admission, op_id=ComputationId(1, 0), run_id=1
+        )
         latent, observation = _prepare_media(
             worker,
             admission,
@@ -2075,7 +2248,9 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
         image = decode.image_output
         assert image is not None
         if transfer_image:
-            moved = replace(image, producer_op_id=ComputationId(5, 0), generation=500)
+            moved = replace(
+                image, producer_op_id=ComputationId(5, 0), generation=500
+            )
             transfer = ScheduledRequest(
                 request_key=admission.request_key,
                 op_id=moved.producer_op_id,
@@ -2086,13 +2261,19 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
                 image_output=moved,
             )
             transferred = finalized_report(
-                worker, worker.submit(execution_run(run_id=5, operations=(transfer,)))
+                worker,
+                worker.submit(execution_run(run_id=5, operations=(transfer,))),
             )
             assert transferred.completions[0].status is OpStatus.OK
             descriptor = transferred.products[0].value
             assert isinstance(descriptor, DeviceProductTransferValue)
-            # RGB reconstruction preserves the signed [-1, 1] numerical contract.
-            assert (descriptor.height, descriptor.width, descriptor.value_range) == (
+            # RGB reconstruction preserves the signed [-1, 1] numerical
+            # contract.
+            assert (
+                descriptor.height,
+                descriptor.width,
+                descriptor.value_range,
+            ) == (
                 16,
                 16,
                 "signed_unit",
@@ -2115,7 +2296,8 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             # and completion buffer rather than replacing the worker's owners.
             monkeypatch.setattr(Image.Image, "save", fail_encoding)
         result = finalized_report(
-            worker, worker.submit(execution_run(run_id=6, operations=(materialize,)))
+            worker,
+            worker.submit(execution_run(run_id=6, operations=(materialize,))),
         )
         completion = result.completions[0]
         if encoding_fails:
@@ -2138,7 +2320,9 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         understanding.request_key,
         request_pool_idx=understanding.request_pool_idx,
         generation=understanding.generation,
-        image=ImageParams(steps=2, height=16, width=16, seed=29, retain_images=True),
+        image=ImageParams(
+            steps=2, height=16, width=16, seed=29, retain_images=True
+        ),
     )
     extend = token_operation(
         admission.request_key,
@@ -2211,11 +2395,15 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         )
     )
     deadline = time.monotonic() + 5.0
-    while not diffusion_finalize_report.complete and time.monotonic() < deadline:
+    while (
+        not diffusion_finalize_report.complete and time.monotonic() < deadline
+    ):
         worker.advance()
         time.sleep(0.001)
     assert diffusion_finalize_report.complete
-    diffusion_finalize_report = finalized_report(worker, diffusion_finalize_report)
+    diffusion_finalize_report = finalized_report(
+        worker, diffusion_finalize_report
+    )
     assert diffusion_finalize_report.completions[0].kv_visible_len == 2
 
     encode = encode_operation(
@@ -2229,7 +2417,9 @@ def test_generated_feedback_commits_absolute_visual_token_state():
     encode_report = finalized_report(
         worker,
         worker.submit(
-            execution_run(run_id=6, admissions=(), operations=(encode,), input_products=())
+            execution_run(
+                run_id=6, admissions=(), operations=(encode,), input_products=()
+            )
         ),
     )
     assert encode_report.completions[0].kv_visible_len == 2
@@ -2337,8 +2527,12 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         assert image.size == (16, 16)
 
 
-@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
-def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_independent_work(device):
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
+)
+def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_independent_work(  # noqa: E501
+    device,
+):
     import hashlib
     import json
     import socket
@@ -2362,9 +2556,15 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         if device.startswith("cuda")
         else (),
     )
-    worker = execution_worker(transfer_backends=("shm",), device=device, execution=policy)
-    admission = umm_params(76, ImageParams(steps=3, height=16, width=16, seed=29))
-    conditioning = _publish_conditioning(worker, admission, op_id=ComputationId(1, 0), run_id=1)
+    worker = execution_worker(
+        transfer_backends=("shm",), device=device, execution=policy
+    )
+    admission = umm_params(
+        76, ImageParams(steps=3, height=16, width=16, seed=29)
+    )
+    conditioning = _publish_conditioning(
+        worker, admission, op_id=ComputationId(1, 0), run_id=1
+    )
     initial, observation = _prepare_media(
         worker,
         admission,
@@ -2392,7 +2592,9 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         ),
     )
     payload = next(
-        product.value for product in first_report.products if product.product == first_latent
+        product.value
+        for product in first_report.products
+        if product.product == first_latent
     )
 
     locator = payload.tensor.locations[0].to_mapping()
@@ -2402,7 +2604,8 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
     key = hashlib.sha256(locator["name"].encode()).digest()
     prepared = None
     try:
-        # This host consumer holds a real publication grant across semantic Free.
+        # This host consumer holds a real publication grant across semantic
+        # Free.
         with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as reader:
             reader.settimeout(5)
             reader.connect("\0" + locator["endpoint"])
@@ -2473,7 +2676,9 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
             finally:
                 reader.sendall(b"A")
                 assert reader.recv(1) == b"D"
-            assert woke.wait(5), "retired source read did not wake the bank writer"
+            assert woke.wait(5), (
+                "retired source read did not wake the bank writer"
+            )
         assert prepared.inputs_ready()
         prepared = finalized_report(worker, prepared)
         report = prepared
@@ -2485,16 +2690,21 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
 
 def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
     """A received Free must progress while computation waits for its storage."""
-
     from concurrent.futures import ThreadPoolExecutor
 
     from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
     from uniserve_worker.protocol.output import BatchOutput
 
-    with execution_worker(transfer_backends=("shm",), pipeline_depth=2) as worker:
+    with execution_worker(
+        transfer_backends=("shm",), pipeline_depth=2
+    ) as worker:
         worker.warmup()
-        admission = umm_params(76, ImageParams(steps=3, height=16, width=16, seed=29))
-        conditioning = _publish_conditioning(worker, admission, op_id=ComputationId(1, 0), run_id=1)
+        admission = umm_params(
+            76, ImageParams(steps=3, height=16, width=16, seed=29)
+        )
+        conditioning = _publish_conditioning(
+            worker, admission, op_id=ComputationId(1, 0), run_id=1
+        )
         latent, observation = _prepare_media(
             worker,
             admission,
@@ -2519,7 +2729,9 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
                     execution_run(
                         run_id=op_id,
                         operations=(operation,),
-                        commands=() if op_id == 3 else (Free(retained.buffer_id),),
+                        commands=()
+                        if op_id == 3
+                        else (Free(retained.buffer_id),),
                     )
                 ),
             )
@@ -2539,7 +2751,8 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
         release = execution_run(run_id=6, commands=(Free(retained.buffer_id),))
         endpoint = QueuedWorkerIpc(
             tuple(
-                {"kind": "submit", "call_id": run.run_id, "run": run} for run in (waiting, release)
+                {"kind": "submit", "call_id": run.run_id, "run": run}
+                for run in (waiting, release)
             )
         )
         worker.bind(endpoint)
@@ -2557,13 +2770,16 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
                 assert responses[6]["kind"] == "result", responses[6]
                 assert BatchOutput.from_mapping(responses[6]["result"]).done
             finally:
-                # Failure cleanup sends the same valid release through IPC, allowing
-                # the serving thread to leave its storage wait before it is joined.
+                # Failure cleanup sends the same valid release through IPC,
+                # allowing the serving thread to leave its storage wait
+                # before it is joined.
                 endpoint.submit(
                     {
                         "kind": "submit",
                         "call_id": 99,
-                        "run": execution_run(run_id=99, commands=(Free(retained.buffer_id),)),
+                        "run": execution_run(
+                            run_id=99, commands=(Free(retained.buffer_id),)
+                        ),
                     }
                 )
                 endpoint.submit({"kind": "close", "call_id": 7})
@@ -2587,7 +2803,11 @@ def test_full_binding_returns_current_decode_tokens(warmup):
             worker.warmup()
         admission = ar_params(1, block_ids=(0,))
         decode, observation = _prepare_decode(
-            worker, admission, op_id=ComputationId(1, 0), run_id=1, tokens=(3, 4)
+            worker,
+            admission,
+            op_id=ComputationId(1, 0),
+            run_id=1,
+            tokens=(3, 4),
         )
         result = finalized_report(
             worker,
@@ -2606,7 +2826,9 @@ def test_full_binding_returns_current_decode_tokens(warmup):
 
 
 @pytest.mark.gpu
-def test_failed_capture_preserves_error_through_worker_scope_and_reconstruction(monkeypatch):
+def test_failed_capture_preserves_error_through_worker_scope_and_reconstruction(
+    monkeypatch,
+):
     from uniserve.runtime.cuda_graph import CUDAGraphError
 
     policy = WorkerConfig(
@@ -2627,7 +2849,9 @@ def test_failed_capture_preserves_error_through_worker_scope_and_reconstruction(
 
     with monkeypatch.context() as patch:
         patch.setattr(torch.cuda.CUDAGraph, "capture_end", failed_capture)
-        with pytest.raises(CUDAGraphError, match="CUDA capture completion failed") as raised:
+        with pytest.raises(
+            CUDAGraphError, match="CUDA capture completion failed"
+        ) as raised:
             with execution_worker(device="cuda:0", execution=policy) as worker:
                 worker.warmup()
         assert raised.value.__cause__ is failure
@@ -2635,7 +2859,11 @@ def test_failed_capture_preserves_error_through_worker_scope_and_reconstruction(
         worker.warmup()
         admission = ar_params(1, block_ids=(0,))
         decode, observation = _prepare_decode(
-            worker, admission, op_id=ComputationId(1, 0), run_id=1, tokens=(3, 4)
+            worker,
+            admission,
+            op_id=ComputationId(1, 0),
+            run_id=1,
+            tokens=(3, 4),
         )
         result = finalized_report(
             worker,

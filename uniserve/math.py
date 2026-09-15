@@ -27,7 +27,6 @@ def bucketed_length(value: int) -> int:
     stay consistent with the tensors indexed by it: a bound and the tensor whose
     width the kernel checks against that bound have to be bucketed together.
     """
-
     count = int(value)
     if count <= 1:
         return max(0, count)

@@ -30,15 +30,23 @@ class EntryPoint:
     def __post_init__(self):
         if not self.method or self.stage not in {"all", "first", "last"}:
             raise ValueError(
-                "entry points require a method and a valid pipeline participation stage"
+                "entry points require a method and a valid pipeline "
+                "participation stage"
             )
-        if len(set(self.groups)) != len(self.groups) or any(not name for name in self.groups):
-            raise ValueError("entry-point communication axes must be distinct nonempty names")
+        if len(set(self.groups)) != len(self.groups) or any(
+            not name for name in self.groups
+        ):
+            raise ValueError(
+                "entry-point communication axes must be distinct nonempty names"
+            )
 
 
 @dataclass(frozen=True, slots=True)
 class EmbeddingReplacement:
-    """Precomputed embeddings spliced in place of token embeddings where ``mask`` is set."""
+    """Precomputed embeddings spliced in place of token embeddings.
+
+    Where ``mask`` is set.
+    """
 
     values: torch.Tensor
     mask: torch.Tensor
@@ -70,8 +78,12 @@ class VisionInput:
     grid_shapes: tuple[tuple[int, int] | None, ...]
 
     def __post_init__(self):
-        if len(self.images) != len(self.grids) or len(self.images) != len(self.grid_shapes):
-            raise ValueError("vision tensors and grid descriptions must align by sample")
+        if len(self.images) != len(self.grids) or len(self.images) != len(
+            self.grid_shapes
+        ):
+            raise ValueError(
+                "vision tensors and grid descriptions must align by sample"
+            )
 
     @property
     def batch_size(self) -> int:
@@ -96,10 +108,19 @@ class DenoiserInput(Generic[SizeT]):
 
     def __post_init__(self):
         if type(self.step_index) is not int or self.step_index < 0:
-            raise ValueError("denoiser step index must be a nonnegative integer")
-        if any(not name or len(values) != len(self.sizes) for name, values in self.latents.items()):
-            raise ValueError("latent modalities must align with the numerical sample sizes")
-        object.__setattr__(self, "latents", MappingProxyType(dict(self.latents)))
+            raise ValueError(
+                "denoiser step index must be a nonnegative integer"
+            )
+        if any(
+            not name or len(values) != len(self.sizes)
+            for name, values in self.latents.items()
+        ):
+            raise ValueError(
+                "latent modalities must align with the numerical sample sizes"
+            )
+        object.__setattr__(
+            self, "latents", MappingProxyType(dict(self.latents))
+        )
 
     @property
     def batch_size(self) -> int:
@@ -114,5 +135,10 @@ class TextSize:
     batch_size: int
 
     def __post_init__(self):
-        if any(type(value) is not int or value < 0 for value in (self.num_tokens, self.batch_size)):
-            raise ValueError("text sizes require nonnegative token and sequence counts")
+        if any(
+            type(value) is not int or value < 0
+            for value in (self.num_tokens, self.batch_size)
+        ):
+            raise ValueError(
+                "text sizes require nonnegative token and sequence counts"
+            )

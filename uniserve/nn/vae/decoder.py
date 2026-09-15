@@ -24,9 +24,12 @@ class LatentDecoder(nn.Module):
     ):
         super().__init__()
         if not latent_shape or any(
-            size is not None and (type(size) is not int or size < 1) for size in latent_shape
+            size is not None and (type(size) is not int or size < 1)
+            for size in latent_shape
         ):
-            raise ValueError("latent dimensions must be positive integers or None")
+            raise ValueError(
+                "latent dimensions must be positive integers or None"
+            )
         if mean.is_meta or std.is_meta or mean.shape != std.shape:
             raise ValueError("latent statistics require real matching tensors")
         if (
@@ -34,7 +37,10 @@ class LatentDecoder(nn.Module):
             or not bool(torch.isfinite(std).all())
             or not bool((std > 0).all())
         ):
-            raise ValueError("latent statistics must be finite with positive standard deviations")
+            raise ValueError(
+                "latent statistics must be finite with positive standard "
+                "deviations"
+            )
         self.decoder, self.latent_shape = decoder, latent_shape
         self.register_buffer("mean", mean.float(), persistent=False)
         self.register_buffer("std", std.float(), persistent=False)
@@ -42,11 +48,21 @@ class LatentDecoder(nn.Module):
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
         if latents.ndim != len(self.latent_shape) or any(
             size is not None and size != actual
-            for size, actual in zip(self.latent_shape, latents.shape, strict=True)
+            for size, actual in zip(
+                self.latent_shape, latents.shape, strict=True
+            )
         ):
-            raise ValueError(f"decoder latent shape must match {self.latent_shape}")
-        if latents.device != self.mean.device or self.std.device != latents.device:
-            raise ValueError("latent values and normalization statistics must share their device")
+            raise ValueError(
+                f"decoder latent shape must match {self.latent_shape}"
+            )
+        if (
+            latents.device != self.mean.device
+            or self.std.device != latents.device
+        ):
+            raise ValueError(
+                "latent values and normalization statistics must share "
+                "their device"
+            )
 
         from .spatial import SpatialDecoder
 

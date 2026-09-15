@@ -55,18 +55,25 @@ def test_loaded_audio_statistics_and_interleaved_pcm_match_diffusers(tmp_path):
     model = loading.load_model(
         audio_vae.Model,
         config,
-        checkpoint=(checkpoint.Config().resolve(tmp_path, io=loading.Config()),),
+        checkpoint=(
+            checkpoint.Config().resolve(tmp_path, io=loading.Config()),
+        ),
         mapping=mapping,
         device="cpu",
         weights=weights.Config(dtype=torch.float32),
     ).model
     latents = torch.randn(2, 2, 16).bfloat16()
-    normalized = latents.float() * torch.tensor(config.latents_std).view(1, 2, 1) + torch.tensor(
-        config.latents_mean
-    ).view(1, 2, 1)
+    normalized = latents.float() * torch.tensor(config.latents_std).view(
+        1, 2, 1
+    ) + torch.tensor(config.latents_mean).view(1, 2, 1)
     with torch.no_grad():
         decoded = reference.decode(normalized).sample
-        expected = (decoded[:, 0].T.clamp(-1, 1) * 32767).round().to(torch.int16).contiguous()
+        expected = (
+            (decoded[:, 0].T.clamp(-1, 1) * 32767)
+            .round()
+            .to(torch.int16)
+            .contiguous()
+        )
         actual = model(latents)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert actual.shape == (32, 2)

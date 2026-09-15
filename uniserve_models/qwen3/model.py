@@ -17,7 +17,8 @@ class Model(CausalLM):
 
     def __init__(self, config: Config):
         super().__init__(
-            Transformer(config), VocabParallelHead(config.hidden_size, config.vocab_size)
+            Transformer(config),
+            VocabParallelHead(config.hidden_size, config.vocab_size),
         )
         self.config = config
 

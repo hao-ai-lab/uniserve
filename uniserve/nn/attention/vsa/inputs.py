@@ -26,10 +26,15 @@ class Pattern:
             or not self.row_counts
             or not self.row_counts[0]
             or any(
-                not isinstance(row, tuple) or len(row) != len(self.row_counts[0])
+                not isinstance(row, tuple)
+                or len(row) != len(self.row_counts[0])
                 for row in self.row_counts
             )
-            or any(type(count) is not int or count < 1 for row in self.row_counts for count in row)
+            or any(
+                type(count) is not int or count < 1
+                for row in self.row_counts
+                for count in row
+            )
             or not 0 <= self.dense_prefix_tiles <= len(self.row_counts[0])
             or self.dense_key_tiles < 0
             or any(
@@ -38,28 +43,43 @@ class Pattern:
                 for count in row[: self.dense_prefix_tiles]
             )
         ):
-            raise ValueError("VSA pattern has invalid tile counts or dense visibility")
+            raise ValueError(
+                "VSA pattern has invalid tile counts or dense visibility"
+            )
 
     def counts(
-        self, *, num_heads: int, query_tiles: int, index_width: int, out: torch.Tensor
+        self,
+        *,
+        num_heads: int,
+        query_tiles: int,
+        index_width: int,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         if (
             len(self.row_counts) not in (1, num_heads)
             or len(self.row_counts[0]) != query_tiles
-            or any(count > index_width for row in self.row_counts for count in row)
+            or any(
+                count > index_width for row in self.row_counts for count in row
+            )
             or out.shape != (num_heads, query_tiles)
             or out.dtype != torch.int32
         ):
-            raise ValueError("VSA pattern does not match the requested block-map dimensions")
+            raise ValueError(
+                "VSA pattern does not match the requested block-map dimensions"
+            )
         out.copy_(
-            torch.tensor(self.row_counts, device="cpu", dtype=torch.int32).expand(num_heads, -1)
+            torch.tensor(
+                self.row_counts, device="cpu", dtype=torch.int32
+            ).expand(num_heads, -1)
         )
         return out
 
 
 @dataclass(frozen=True, slots=True)
 class BlockInput:
-    """Per-head selected key-block indices over the declared query-tile domain."""
+    """Per-head selected key-block indices over the declared query-tile
+    domain.
+    """  # noqa: D205
 
     pattern: Pattern
     block_indices: torch.Tensor
@@ -75,19 +95,27 @@ class BlockInput:
             or self.query_tile_offset < 0
             or any(
                 value.dtype != torch.int32
-                for value in (self.block_indices, self.block_counts, self.valid_sizes)
+                for value in (
+                    self.block_indices,
+                    self.block_counts,
+                    self.valid_sizes,
+                )
             )
             or len(self.pattern.row_counts[0]) != self.block_counts.shape[1]
-            or len(self.pattern.row_counts) not in (1, self.block_counts.shape[0])
+            or len(self.pattern.row_counts)
+            not in (1, self.block_counts.shape[0])
         ):
             raise ValueError(
-                "VSA block input requires matching tile counts and int32 index tensors"
+                "VSA block input requires matching tile counts and int32 "
+                "index tensors"
             )
 
 
 @dataclass(frozen=True, slots=True)
 class Input:
-    """Dense tile-64 prefix and video domains that selection and compression share."""
+    """Dense tile-64 prefix and video domains that selection and compression
+    share.
+    """  # noqa: D205
 
     padded_tokens: int
     prefix_tiles: int
@@ -119,10 +147,17 @@ class Input:
                 )
             )
         ):
-            raise ValueError("VSA input requires complete tile-64 prefix and video index domains")
+            raise ValueError(
+                "VSA input requires complete tile-64 prefix and video index "
+                "domains"
+            )
 
     def pattern(
-        self, query_tiles: int, *, selected_tiles: int, query_tile_offset: int = 0
+        self,
+        query_tiles: int,
+        *,
+        selected_tiles: int,
+        query_tile_offset: int = 0,
     ) -> Pattern:
         """Key-tile counts per query tile for a window of the token domain.
 
@@ -130,11 +165,19 @@ class Input:
         dense prefix plus their selected video tiles; trailing padding tiles
         attend to a single tile so their count stays positive.
         """
-
-        if not 1 <= selected_tiles <= self.video_tiles or query_tiles < 1 or query_tile_offset < 0:
-            raise ValueError("VSA selection requires positive bounded video and query tile counts")
+        if (
+            not 1 <= selected_tiles <= self.video_tiles
+            or query_tiles < 1
+            or query_tile_offset < 0
+        ):
+            raise ValueError(
+                "VSA selection requires positive bounded video and query "
+                "tile counts"
+            )
         if query_tile_offset + query_tiles > self.padded_tokens // 64:
-            raise ValueError("VSA query tiles exceed their complete token domain")
+            raise ValueError(
+                "VSA query tiles exceed their complete token domain"
+            )
 
         counts = tuple(
             self.valid_tiles
@@ -142,7 +185,9 @@ class Input:
             else self.prefix_tiles + selected_tiles
             if tile < self.valid_tiles
             else 1
-            for tile in range(query_tile_offset, query_tile_offset + query_tiles)
+            for tile in range(
+                query_tile_offset, query_tile_offset + query_tiles
+            )
         )
         return Pattern(
             (counts,),
@@ -153,7 +198,9 @@ class Input:
 
 @dataclass(frozen=True, slots=True)
 class Workspace:
-    """Borrow scratch for tile pooling, selection, compression and fine attention."""
+    """Borrow scratch for tile pooling, selection, compression and fine
+    attention.
+    """  # noqa: D205
 
     attention_output: torch.Tensor
     tile_scores: torch.Tensor

@@ -8,7 +8,12 @@ import pytest
 import torch
 from PIL import Image
 
-from uniserve_models.processing import ImageProcessor, PatchTransform, StrideResize, TowerTransform
+from uniserve_models.processing import (
+    ImageProcessor,
+    PatchTransform,
+    StrideResize,
+    TowerTransform,
+)
 from uniserve_worker.execution.image_input import prepare_image
 from uniserve_worker.protocol.operation import PipelineStage
 
@@ -16,9 +21,15 @@ from uniserve_worker.protocol.operation import PipelineStage
 @pytest.mark.parametrize("normalization", ("signed_unit", "imagenet"))
 @pytest.mark.parametrize("patches", (False, True))
 @pytest.mark.parametrize(
-    "device,dtype", (("cpu", "float32"), pytest.param("cuda:0", "bfloat16", marks=pytest.mark.gpu))
+    "device,dtype",
+    (
+        ("cpu", "float32"),
+        pytest.param("cuda:0", "bfloat16", marks=pytest.mark.gpu),
+    ),
 )
-def test_encoded_pixels_match_channel_normalization(normalization, patches, device, dtype):
+def test_encoded_pixels_match_channel_normalization(
+    normalization, patches, device, dtype
+):
     # Include every byte value in each RGB channel. Geometry already satisfies
     # both tower policies, so the expected values do not depend on a resizer.
     raw = (np.arange(24 * 32 * 3).reshape(24, 32, 3) % 256).astype(np.uint8)
@@ -30,7 +41,9 @@ def test_encoded_pixels_match_channel_normalization(normalization, patches, devi
         if patches
         else TowerTransform(StrideResize(32, 24, 1, 24 * 32), normalization)
     )
-    processor = ImageProcessor(vit=transform, staging_dtype=getattr(torch, dtype))
+    processor = ImageProcessor(
+        vit=transform, staging_dtype=getattr(torch, dtype)
+    )
 
     result = prepare_image(
         processor,
@@ -39,7 +52,9 @@ def test_encoded_pixels_match_channel_normalization(normalization, patches, devi
         device=torch.device(device),
     )
 
-    expected = torch.from_numpy(raw).permute(2, 0, 1).contiguous().float() / 255.0
+    expected = (
+        torch.from_numpy(raw).permute(2, 0, 1).contiguous().float() / 255.0
+    )
     if normalization == "signed_unit":
         expected = (expected - 0.5) / 0.5
     else:
@@ -55,7 +70,9 @@ def test_encoded_pixels_match_channel_normalization(normalization, patches, devi
                 for x in range(0, 32, 4)
             ]
         )
-        assert result.grid is not None and result.grid.cpu().tolist() == [[6, 8]]
+        assert result.grid is not None and result.grid.cpu().tolist() == [
+            [6, 8]
+        ]
         assert result.grid_shape == (6, 8)
     assert (result.height, result.width) == (24, 32)
     torch.testing.assert_close(

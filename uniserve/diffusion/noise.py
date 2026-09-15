@@ -28,7 +28,10 @@ class NoiseScale:
             not math.isfinite(value) or value <= 0
             for value in (self.value, self.base_tokens, self.maximum)
         ):
-            raise ValueError("noise scale, token baseline and maximum must be finite and positive")
+            raise ValueError(
+                "noise scale, token baseline and maximum must be finite and "
+                "positive"
+            )
 
     def scale(self, tokens: int) -> float:
         if type(tokens) is not int or tokens < 1:
@@ -41,14 +44,19 @@ class NoiseScale:
         return min(value, self.maximum)
 
 
-def normal_noise(seeds: tuple[int, ...], *, out: tuple[torch.Tensor, ...]) -> None:
-    """Draw each seed's modalities in tuple order without changing the global RNG.
+def normal_noise(
+    seeds: tuple[int, ...], *, out: tuple[torch.Tensor, ...]
+) -> None:
+    """Draw each seed's modalities in tuple order.
 
-    Outputs have a common native draw device and retain their complete sample
-    dimensions. Callers choose CPU or CUDA storage and perform any subsequent
-    distribution after the draw; splitting a draw changes its random sequence.
+    Without changing the global RNG. Outputs have a common native draw device
+    and retain their complete sample dimensions. Callers choose CPU or CUDA
+    storage and perform any subsequent distribution after the draw; splitting
+    a draw changes its random sequence.
     """
-    if not isinstance(seeds, tuple) or any(type(seed) is not int for seed in seeds):
+    if not isinstance(seeds, tuple) or any(
+        type(seed) is not int for seed in seeds
+    ):
         raise TypeError("noise seeds must be a tuple of integers")
     if not isinstance(out, tuple) or not out:
         raise ValueError("normal noise requires at least one output modality")
@@ -57,16 +65,22 @@ def normal_noise(seeds: tuple[int, ...], *, out: tuple[torch.Tensor, ...]) -> No
         tensor.ndim < 1
         or tensor.shape[0] != len(seeds)
         or tensor.device != device
-        or tensor.dtype not in {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+        or tensor.dtype
+        not in {torch.float16, torch.bfloat16, torch.float32, torch.float64}
         for tensor in out
     ):
-        raise ValueError("noise outputs must align with seeds on one native draw device")
+        raise ValueError(
+            "noise outputs must align with seeds on one native draw device"
+        )
     for index, seed in enumerate(seeds):
         generator = torch.Generator(device=device).manual_seed(seed)
         for tensor in out:
             # A complete native draw precedes copying into possibly strided
             # borrowed storage. Its shape and dtype fix RNG consumption.
             values = torch.randn(
-                tensor.shape[1:], dtype=tensor.dtype, device=device, generator=generator
+                tensor.shape[1:],
+                dtype=tensor.dtype,
+                device=device,
+                generator=generator,
             )
             tensor[index].copy_(values)

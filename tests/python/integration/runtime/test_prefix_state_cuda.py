@@ -75,7 +75,9 @@ def test_state_updates_replay_addresses_and_first_write_scales(quantized):
         num_blocks=3,
         block_size=4,
         device="cuda",
-        quantization={"attention": Quantizer("fp8", axis=0) if quantized else None},
+        quantization={
+            "attention": Quantizer("fp8", axis=0) if quantized else None
+        },
     )
     state = cache.state("attention")
     key = torch.tensor(
@@ -121,8 +123,13 @@ def test_state_updates_replay_addresses_and_first_write_scales(quantized):
             expected[slot] = source
         actual_key, actual_value = state.read((0, 1, 2), start=0, length=12)
         torch.testing.assert_close(actual_key.cpu(), expected, rtol=0, atol=0)
-        torch.testing.assert_close(actual_value.cpu(), -expected, rtol=0, atol=0)
-        flags = [any(slot >= 0 and slot // 4 == block for slot in slots) for block in range(3)]
+        torch.testing.assert_close(
+            actual_value.cpu(), -expected, rtol=0, atol=0
+        )
+        flags = [
+            any(slot >= 0 and slot // 4 == block for slot in slots)
+            for block in range(3)
+        ]
         assert state.initialized["key"].tolist() == flags
         assert state.initialized["value"].tolist() == flags
     if quantized:
@@ -134,6 +141,8 @@ def test_state_updates_replay_addresses_and_first_write_scales(quantized):
         graph.replay()
         torch.cuda.synchronize()
         assert state.key.buffers()["scale"][0].item() == 8.0
-        torch.testing.assert_close(state.read((0,), start=0, length=1)[0], original, rtol=0, atol=0)
+        torch.testing.assert_close(
+            state.read((0,), start=0, length=1)[0], original, rtol=0, atol=0
+        )
     graph.reset()
     cache.close()

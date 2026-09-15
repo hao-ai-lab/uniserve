@@ -50,7 +50,12 @@ from .config import ComponentConfig
 from .inputs import capability, image_builder, media_builder
 from .worker_info import EntryInfo, WorkerInfo
 
-__all__ = ["WorkerLayout", "build_worker_info", "build_worker_layout", "configuration_identity"]
+__all__ = [
+    "WorkerLayout",
+    "build_worker_info",
+    "build_worker_layout",
+    "configuration_identity",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,11 +91,10 @@ def configuration_identity(
 ) -> str:
     """Identify resolved params, numerical storage, operators, and shape bounds.
 
-    This describes resolved execution dimensions and numerical policy, not a hash
-    of weight contents. Graph and arena objects retain their own lifetimes and
-    cannot be reused by a differently initialized worker.
+    This describes resolved execution dimensions and numerical policy, not
+    a hash of weight contents. Graph and arena objects retain their own
+    lifetimes and cannot be reused by a differently initialized worker.
     """
-
     numerical = {
         name: asdict(value.quantizer)
         for name, value in model.named_parameters()
@@ -105,8 +109,9 @@ def configuration_identity(
             layout.input_config.embedding_dtype
         )
 
-    # The observed grant changes with transient allocations and other processes.
-    # Resolved capacities live in layout; free bytes are not an execution identity.
+    # The observed grant changes with transient allocations and other
+    # processes. Resolved capacities live in layout; free bytes are not an
+    # execution identity.
     execution_config = asdict(worker_config)
     execution_config.pop("pool_memory_bytes")
 
@@ -114,10 +119,14 @@ def configuration_identity(
         {
             "worker_config": execution_config,
             "layout": layout_description,
-            "components": {name: component.to_dict() for name, component in components},
+            "components": {
+                name: component.to_dict() for name, component in components
+            },
             "entry_outputs": {
                 name: [output.to_mapping() for output in outputs]
-                for name, outputs in resolve_outputs(model, worker_config).items()
+                for name, outputs in resolve_outputs(
+                    model, worker_config
+                ).items()
             },
             "attention": attention_identity,
             "model": f"{type(model).__module__}.{type(model).__qualname__}",
@@ -149,7 +158,6 @@ def build_worker_info(
     endpoint: WorkerEndpoint | None = None,
 ) -> WorkerInfo:
     """Build the post-load worker capacity handshake."""
-
     return build_worker_layout(
         model,
         worker_config,
@@ -178,13 +186,13 @@ def build_worker_layout(
     bindings: Mapping[str, ModelEntry] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> WorkerLayout:
-    """Resolve resource dimensions and the exact capacity report used by the worker.
+    """Resolve resource dimensions and the capacity report used by the worker.
 
-    Model dimensions determine storage reservations. Admission additionally obeys
-    the configured operation set and every lane's bounds; these restrictions do
-    not shrink the storage needed by warmup and graph capture.
+    Model dimensions determine storage reservations. Admission additionally
+    obeys the configured operation set and every lane's bounds; these
+    restrictions do not shrink the storage needed by warmup and graph
+    capture.
     """
-
     if queue_depth <= 0:
         raise unsupported_setup("worker pipeline depth must be positive")
 
@@ -196,15 +204,21 @@ def build_worker_layout(
         supported_ops = supported_ops & allowed_work_variants
 
     if not supported_ops:
-        raise unsupported_setup("worker model implements none of the requested work variants")
+        raise unsupported_setup(
+            "worker model implements none of the requested work variants"
+        )
 
     model_name = (
-        f"{type(model).__module__}.{type(model).__qualname__}" if model_name is None else model_name
+        f"{type(model).__module__}.{type(model).__qualname__}"
+        if model_name is None
+        else model_name
     )
     endpoint = endpoint or WorkerEndpoint.local(rank=int(worker_config.rank))
 
     if state_buffers is None:
-        state_buffers = media_state_buffers(model, bindings or {}, worker_config)
+        state_buffers = media_state_buffers(
+            model, bindings or {}, worker_config
+        )
 
     # Media workers hold fixed request tensors; token workers size paged KV,
     # latent pools, and text staging instead.
@@ -231,35 +245,45 @@ def build_worker_layout(
             capacity_group=capacity_group,
         )
 
-    # A shared admission limit must be safe on every eligible lane. Keep it in
-    # the layout so runtime allocation and the IPC handshake read the same value.
+    # A shared admission limit must be safe on every eligible lane. Keep it
+    # in the layout so runtime allocation and the IPC handshake read the
+    # same value.
     max_operations = layout.info.max_batch_ops
     max_tokens = layout.info.max_batch_tokens
 
     for lane in worker_config.lanes:
-        max_operations = min(max_operations, lane.max_batch_operations or max_operations)
+        max_operations = min(
+            max_operations, lane.max_batch_operations or max_operations
+        )
         max_tokens = min(max_tokens, lane.max_batch_tokens or max_tokens)
 
     outputs = resolve_outputs(model, worker_config)
     info = replace(
         layout.info,
-        supported_ops=tuple(code for code in COMPUTATIONS if code in supported_ops),
+        supported_ops=tuple(
+            code for code in COMPUTATIONS if code in supported_ops
+        ),
         transfer_backends=transfer_backends,
         max_batch_ops=max_operations,
         max_batch_tokens=max_tokens,
         encoder_cache_entries=layout.encoder_cache_entries,
-        encoder_entry_bytes=max(layout.max_latent_feature_bytes, layout.max_vision_feature_bytes)
+        encoder_entry_bytes=max(
+            layout.max_latent_feature_bytes, layout.max_vision_feature_bytes
+        )
         if layout.encoder_cache_entries
         else 0,
         components=tuple(
-            EntryInfo(name, entry, outputs.get(name, ())) for name, entry in components
+            EntryInfo(name, entry, outputs.get(name, ()))
+            for name, entry in components
         ),
     )
     layout = replace(layout, info=info)
 
     # Hash the final advertised limits and component bindings, excluding the
     # process incarnation and the identity field itself.
-    identity = configuration_identity(model, worker_config, layout, components, attention_identity)
+    identity = configuration_identity(
+        model, worker_config, layout, components, attention_identity
+    )
 
     return replace(layout, info=replace(info, configuration_id=identity))
 
@@ -275,14 +299,17 @@ def _token_worker_layout(
     endpoint: WorkerEndpoint,
     capacity_group: Communicator | None,
 ) -> WorkerLayout:
-    """Size token inputs, paged KV, and latent storage before admission limits."""
-
+    """Size token inputs, paged KV, and latent storage before admission."""
     encoder_cache_entries = (
-        worker_config.encoder_cache_entries if image_processor is not None else 0
+        worker_config.encoder_cache_entries
+        if image_processor is not None
+        else 0
     )
     text = capability(model, CausalLM)
     owns_kv = text is not None
-    cache = None if text is None else cache_info(text, worker_config, num_blocks=1)
+    cache = (
+        None if text is None else cache_info(text, worker_config, num_blocks=1)
+    )
     bytes_per_token = 0 if cache is None else cache.bytes_per_token
 
     flow = image_builder(model)
@@ -296,10 +323,14 @@ def _token_worker_layout(
     )
     latent_page_units = int(worker_config.block_size) if flow is not None else 0
     num_latent_pages = (
-        ceil_div(requested_latent_units, latent_page_units) + 1 if flow is not None else 0
+        ceil_div(requested_latent_units, latent_page_units) + 1
+        if flow is not None
+        else 0
     )
     latent_width = (
-        flow.denoiser.latent_channels * flow.denoiser.patch_size**2 if flow is not None else 0
+        flow.denoiser.latent_channels * flow.denoiser.patch_size**2
+        if flow is not None
+        else 0
     )
     model_dtype_bytes = _model_dtype_bytes(worker_config.model_dtype)
     latent_pool_bytes = (
@@ -323,43 +354,60 @@ def _token_worker_layout(
     else:
         stride = vision.patch_size * vision.downsample
         feature = vision.output_layout(image.Config(stride, stride))["features"]
-        max_vision_feature_bytes = max_vit_grid_tokens * feature.shape[1] * feature.dtype.itemsize
+        max_vision_feature_bytes = (
+            max_vit_grid_tokens * feature.shape[1] * feature.dtype.itemsize
+        )
     max_latent_feature_bytes = (
-        0 if flow is None else flow.max_tokens * latent_width * model_dtype_bytes
+        0
+        if flow is None
+        else flow.max_tokens * latent_width * model_dtype_bytes
     )
 
     capacity = None
-    unresolved_window = operation_window(int(queue_depth), int(worker_config.max_batch_operations))
+    unresolved_window = operation_window(
+        int(queue_depth), int(worker_config.max_batch_operations)
+    )
     buffer_pool_bytes = (encoder_cache_entries + 1) * max(
         max_latent_feature_bytes, max_vision_feature_bytes
     )
     # Standalone encoders also publish persistent tensors. Their declared
     # products retain one bounded allocation per resident request.
-    buffer_pool_bytes += worker_config.max_request_pool_size * product_storage_bytes(
-        resolve_outputs(model, worker_config)
+    buffer_pool_bytes += (
+        worker_config.max_request_pool_size
+        * product_storage_bytes(resolve_outputs(model, worker_config))
     )
 
-    arena_args = dict(
-        pipeline_depth=int(queue_depth),
-        completion_payload_bytes=int(completion_payload_bytes),
-        request_pool_size=int(worker_config.max_request_pool_size),
-        num_latent_pages=num_latent_pages,
-        latent_page_units=latent_page_units,
-        latent_width=latent_width,
-        max_latent_feature_bytes=max_latent_feature_bytes,
-        max_vision_feature_bytes=max_vision_feature_bytes,
-        bytes_per_token=bytes_per_token,
-    )
+    arena_args = {
+        "pipeline_depth": int(queue_depth),
+        "completion_payload_bytes": int(completion_payload_bytes),
+        "request_pool_size": int(worker_config.max_request_pool_size),
+        "num_latent_pages": num_latent_pages,
+        "latent_page_units": latent_page_units,
+        "latent_width": latent_width,
+        "max_latent_feature_bytes": max_latent_feature_bytes,
+        "max_vision_feature_bytes": max_vision_feature_bytes,
+        "bytes_per_token": bytes_per_token,
+    }
     arena = model_arena_capacity(
-        model, worker_config, num_blocks=0, bindings=None, state_buffers=None, **arena_args
+        model,
+        worker_config,
+        num_blocks=0,
+        bindings=None,
+        state_buffers=None,
+        **arena_args,
     )
     input_config = (
-        input_buffer_config(model, worker_config, processor=image_processor) if owns_kv else None
+        input_buffer_config(model, worker_config, processor=image_processor)
+        if owns_kv
+        else None
     )
 
     devices = tuple(
         dict.fromkeys(
-            (worker_config.device, worker_config.generation_device or worker_config.device)
+            (
+                worker_config.device,
+                worker_config.generation_device or worker_config.device,
+            )
         )
     )
     # Every device has its own persistent and product backing. Request tables
@@ -367,13 +415,19 @@ def _token_worker_layout(
     fixed_bytes = dict.fromkeys(
         devices, buffer_pool_bytes + arena.device_product_bytes // len(devices)
     )
-    fixed_bytes[worker_config.generation_device or worker_config.device] += latent_pool_bytes
+    fixed_bytes[worker_config.generation_device or worker_config.device] += (
+        latent_pool_bytes
+    )
 
     if text is not None:
         assert cache is not None and input_config is not None
-        input_bytes = sum(field.nbytes for field in input_config.buffers().values())
+        input_bytes = sum(
+            field.nbytes for field in input_config.buffers().values()
+        )
         for device in devices:
-            fixed_bytes[device] += input_bytes * max(1, len(worker_config.lanes))
+            fixed_bytes[device] += input_bytes * max(
+                1, len(worker_config.lanes)
+            )
 
         schemas = (
             BlockTables.buffers(
@@ -417,15 +471,21 @@ def _token_worker_layout(
         # minimum keeps every member within its own memory grant.
         if capacity_group is not None and capacity_group.size > 1:
             pages = torch.tensor(
-                capacity.num_blocks, dtype=torch.int64, device=capacity_group.device
+                capacity.num_blocks,
+                dtype=torch.int64,
+                device=capacity_group.device,
             )
             capacity_group.all_reduce(pages, op="min")
             blocks = int(pages.item())
             capacity = replace(
-                capacity, num_blocks=blocks, token_capacity=blocks * capacity.block_size
+                capacity,
+                num_blocks=blocks,
+                token_capacity=blocks * capacity.block_size,
             )
 
-    supported_ops = tuple(code for code in COMPUTATIONS if code in supported_operations(model))
+    supported_ops = tuple(
+        code for code in COMPUTATIONS if code in supported_operations(model)
+    )
     info = WorkerInfo(
         model_name=model_name,
         endpoint=endpoint,
@@ -465,7 +525,9 @@ def _token_worker_layout(
         latent_width=latent_width,
         latent_dtype=worker_config.model_dtype if flow is not None else "",
         latent_downsample=flow.denoiser.downsample if flow is not None else 1,
-        max_vae_grid_tokens=flow.max_tokens + flow.framing if flow is not None else 0,
+        max_vae_grid_tokens=flow.max_tokens + flow.framing
+        if flow is not None
+        else 0,
         max_vit_grid_tokens=max_vit_grid_tokens,
         max_latent_feature_bytes=max_latent_feature_bytes,
         max_vision_feature_bytes=max_vision_feature_bytes,
@@ -490,7 +552,6 @@ def _request_tensor_worker_layout(
     bindings: Mapping[str, ModelEntry] | None,
 ) -> WorkerLayout:
     """Describe request tensors, products, and persistent capacity."""
-
     slots = int(worker_config.max_request_pool_size)
     depth = int(queue_depth)
     unresolved_window = request_tensor_window(depth, slots)
@@ -501,7 +562,9 @@ def _request_tensor_worker_layout(
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),
-        supported_ops=tuple(code for code in COMPUTATIONS if code in supported_operations(model)),
+        supported_ops=tuple(
+            code for code in COMPUTATIONS if code in supported_operations(model)
+        ),
         queue_depth=depth,
         max_batch_ops=max_operations,
         max_batch_tokens=max_operations,
@@ -509,7 +572,8 @@ def _request_tensor_worker_layout(
         kv_cache=None,
         latent_page_units=0,
         latent_pages=0,
-        buffer_pool_bytes=slots * product_storage_bytes(resolve_outputs(model, worker_config)),
+        buffer_pool_bytes=slots
+        * product_storage_bytes(resolve_outputs(model, worker_config)),
         max_unresolved_ops=unresolved_window,
         pipeline_components=dict(media_components(model)),
         num_inference_steps=media_builder(model, worker_config).num_steps,
@@ -560,7 +624,6 @@ def _request_tensor_worker_layout(
 
 def _model_dtype_bytes(dtype: str) -> int:
     """Return the byte width of a supported model activation dtype."""
-
     width = {
         "float16": 2,
         "bfloat16": 2,
@@ -578,7 +641,6 @@ def _kv_residency_shape(
     co_resident_bytes: int,
 ) -> tuple[int, int]:
     """Describe the single KV pool and co-resident fixed allocations."""
-
     block_size = int(worker_config.block_size)
     padding_blocks = graph_padding_block_count(block_size)
     # Captured executables are held for the worker's lifetime, so they occupy

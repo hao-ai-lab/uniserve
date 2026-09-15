@@ -30,7 +30,11 @@ def test_multimodal_noise_uses_one_cpu_generator_in_declared_order():
 
 def test_sampling_draw_is_stable_and_coordinate_scoped() -> None:
     key = sampling_key(
-        41, engine_id=3, request_id=7, request_epoch=2, draw_layout=DRAW_LAYOUT_TARGET
+        41,
+        engine_id=3,
+        request_id=7,
+        request_epoch=2,
+        draw_layout=DRAW_LAYOUT_TARGET,
     )
     draw = sampling_uniform(key, 19, processor_stage=1, draw_index=5)
 
@@ -63,10 +67,18 @@ def test_sampling_draw_is_stable_and_coordinate_scoped() -> None:
 
 def test_draw_layout_separates_proposal_and_target_spaces() -> None:
     target = sampling_key(
-        41, engine_id=3, request_id=7, request_epoch=2, draw_layout=DRAW_LAYOUT_TARGET
+        41,
+        engine_id=3,
+        request_id=7,
+        request_epoch=2,
+        draw_layout=DRAW_LAYOUT_TARGET,
     )
     proposal = sampling_key(
-        41, engine_id=3, request_id=7, request_epoch=2, draw_layout=DRAW_LAYOUT_PROPOSAL
+        41,
+        engine_id=3,
+        request_id=7,
+        request_epoch=2,
+        draw_layout=DRAW_LAYOUT_PROPOSAL,
     )
 
     assert target != proposal

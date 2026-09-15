@@ -17,20 +17,28 @@ from . import Operator as _Operator
 
 
 def _paged(value, table, length):
-    """Gather one sequence's live prefix pages into compact [length, heads, dim] form.
+    """Gather one sequence's live prefix pages.
+
+    Gather one sequence's live prefix pages into compact [length, heads,
+    dim] form.
 
     The cache backing is [blocks, tokens, heads, dim]; per-block FP8 state is
     dequantized during the gather.
     """
-
     if value.ndim != 4 or length < 0:
-        raise ValueError("paged attention requires [blocks, tokens, heads, dim] backing")
+        raise ValueError(
+            "paged attention requires [blocks, tokens, heads, dim] backing"
+        )
     if length == 0:
-        return torch.empty((0, *value.shape[2:]), dtype=value.dtype, device=value.device)
+        return torch.empty(
+            (0, *value.shape[2:]), dtype=value.dtype, device=value.device
+        )
 
     count = (length + value.shape[1] - 1) // value.shape[1]
     if table.numel() < count:
-        raise ValueError("block table does not cover the requested key sequence")
+        raise ValueError(
+            "block table does not cover the requested key sequence"
+        )
 
     indices = table[:count].to(device=value.device, dtype=torch.int64)
     if isinstance(value, QuantizedTensor):
@@ -38,7 +46,10 @@ def _paged(value, table, length):
             raise ValueError("paged SDPA requires dense or per-block FP8 state")
         fields = value.buffers()
         encoded = (
-            fields["values"].view(torch.uint8).index_select(0, indices).view(torch.float8_e4m3fn)
+            fields["values"]
+            .view(torch.uint8)
+            .index_select(0, indices)
+            .view(torch.float8_e4m3fn)
         )
         scales = fields["scale"].index_select(0, indices)
         gathered = (encoded.float() * scales).to(value.dtype)
@@ -60,7 +71,11 @@ def _dense(q, k, v, *, causal, scale, mask=None):
         if causal and (mask is not None or q.shape[-2] != k.shape[-2]):
             # SDPA's is_causal assumes square Q/K alignment and no custom mask;
             # fold causality into an explicit visibility mask otherwise.
-            query_positions = torch.arange(q.shape[-2], device=q.device) + k.shape[-2] - q.shape[-2]
+            query_positions = (
+                torch.arange(q.shape[-2], device=q.device)
+                + k.shape[-2]
+                - q.shape[-2]
+            )
             key_positions = torch.arange(k.shape[-2], device=q.device)
             visible = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
             if mask is None:
@@ -73,7 +88,8 @@ def _dense(q, k, v, *, causal, scale, mask=None):
 
         if mask is not None:
             mask = mask.to(
-                device=q.device, dtype=q.dtype if mask.dtype.is_floating_point else torch.bool
+                device=q.device,
+                dtype=q.dtype if mask.dtype.is_floating_point else torch.bool,
             )
 
         result = F.scaled_dot_product_attention(
@@ -95,7 +111,6 @@ def _state(q, k, v, *, scale, allowed):
     visibility mask shared across heads. A fully masked row yields NaN
     probabilities, which nan_to_num resets to zero output with -inf LSE.
     """
-
     if k.shape[0] == 0:
         return torch.zeros_like(q), torch.full(
             q.shape[:2], -torch.inf, dtype=torch.float32, device=q.device
@@ -103,7 +118,10 @@ def _state(q, k, v, *, scale, allowed):
 
     copies = q.shape[1] // k.shape[1]
     if copies > 1:
-        k, v = k.repeat_interleave(copies, dim=1), v.repeat_interleave(copies, dim=1)
+        k, v = (
+            k.repeat_interleave(copies, dim=1),
+            v.repeat_interleave(copies, dim=1),
+        )
 
     scores = torch.einsum("qhd,khd->qhk", q.float(), k.float()) * scale
     if allowed is not None:
@@ -115,19 +133,22 @@ def _state(q, k, v, *, scale, allowed):
 
 
 def _merge(first, second):
-    """Combine two (output, lse) partial attention states with online softmax."""
+    """Combine two partial attention states.
 
+    Combine two (output, lse) partial attention states with online softmax.
+    """
     a, alse = first
     b, blse = second
     maximum = torch.logaddexp(alse, blse)
     aweight = torch.exp(alse - maximum).nan_to_num(0)
     bweight = torch.exp(blse - maximum).nan_to_num(0)
-    return (a.float() * aweight.unsqueeze(-1) + b.float() * bweight.unsqueeze(-1)).to(a.dtype)
+    return (
+        a.float() * aweight.unsqueeze(-1) + b.float() * bweight.unsqueeze(-1)
+    ).to(a.dtype)
 
 
 def _page_capacity(value, table, length):
     """Gather fixed backing while ignoring table entries beyond live lengths."""
-
     blocks = torch.arange(table.numel(), device=table.device)
     table = torch.where(blocks * value.shape[1] < length, table, 0)
     return _paged(value, table, table.numel() * value.shape[1])
@@ -140,7 +161,6 @@ def _captured(q, k, v, batch, cache, scale):
     provider evaluates fixed-capacity SDPA domains and masks each sequence's
     live query/key interval. Native providers handle large packed workloads.
     """
-
     query_indices = torch.arange(q.shape[0], device=q.device)
     key_indices = torch.arange(k.shape[0], device=k.device)
     output = torch.zeros_like(q)
@@ -163,7 +183,10 @@ def _captured(q, k, v, batch, cache, scale):
                 + (query_count if isinstance(batch, PagedInput) else 0)
             )
             table = batch.block_table.indices[row]
-            keys, values = (_page_capacity(tensor, table, key_count) for tensor in (key, value))
+            keys, values = (
+                _page_capacity(tensor, table, key_count)
+                for tensor in (key, value)
+            )
             local_key = torch.arange(keys.shape[0], device=q.device)
         else:
             keys, values = k, v
@@ -179,7 +202,10 @@ def _captured(q, k, v, batch, cache, scale):
 
         allowed = queries[:, None] & valid_keys[None, :]
         if isinstance(batch, (PagedInput, VarlenInput)) and batch.causal[row]:
-            allowed &= local_key[None, :] <= (local_query + key_count - query_count)[:, None]
+            allowed &= (
+                local_key[None, :]
+                <= (local_query + key_count - query_count)[:, None]
+            )
         elif isinstance(batch, VisibleInput) and not batch.fully_visible:
             ends = batch.visible_end[row]
             visible = ends[local_query.clamp(0, ends.numel() - 1)]
@@ -206,7 +232,9 @@ def _captured(q, k, v, batch, cache, scale):
                 _state(q, keys, values, scale=scale, allowed=allowed),
             )
         else:
-            result = _dense(q, keys, values, causal=False, scale=scale, mask=allowed)
+            result = _dense(
+                q, keys, values, causal=False, scale=scale, mask=allowed
+            )
         # Different sequences have disjoint query intervals. Fully masked
         # rows are zero, so combining them preserves each sequence's result.
         output.add_(torch.where(queries[:, None, None], result, 0))
@@ -217,19 +245,31 @@ class _TorchOperator(_Operator):
     def __call__(self, q, k, v, batch, *, scale, out):
         self._validate(q, k, v, batch, out)
 
-        if isinstance(batch, (PagedInput, SegmentedInput)) and batch.write_indices is not None:
+        if (
+            isinstance(batch, (PagedInput, SegmentedInput))
+            and batch.write_indices is not None
+        ):
             self.update_cache(k, v, indices=batch.write_indices)
 
         if isinstance(batch, DenseInput):
-            return out.copy_(_dense(q, k, v, causal=batch.causal, scale=scale, mask=batch.mask))
+            return out.copy_(
+                _dense(
+                    q, k, v, causal=batch.causal, scale=scale, mask=batch.mask
+                )
+            )
 
         if q.ndim != 3 or (
-            batch.queries.num_tokens is not None and q.shape[0] != batch.queries.num_tokens
+            batch.queries.num_tokens is not None
+            and q.shape[0] != batch.queries.num_tokens
         ):
-            raise ValueError("packed attention rows must match their declared token lengths")
+            raise ValueError(
+                "packed attention rows must match their declared token lengths"
+            )
 
         if isinstance(batch, SegmentedInput) and self.cache is None:
-            raise RuntimeError("segmented attention requires bound prefix state")
+            raise RuntimeError(
+                "segmented attention requires bound prefix state"
+            )
 
         if q.is_cuda and torch.cuda.is_current_stream_capturing():
             return out.copy_(_captured(q, k, v, batch, self.cache, scale))
@@ -240,25 +280,47 @@ class _TorchOperator(_Operator):
 
             if isinstance(batch, VarlenInput):
                 key_count = batch.keys.host[row]
-                keys, values = k[kstart : kstart + key_count], v[kstart : kstart + key_count]
-                result = _dense(query, keys, values, causal=batch.causal[row], scale=scale)
+                keys, values = (
+                    k[kstart : kstart + key_count],
+                    v[kstart : kstart + key_count],
+                )
+                result = _dense(
+                    query, keys, values, causal=batch.causal[row], scale=scale
+                )
                 kstart += key_count
             elif isinstance(batch, PagedInput):
-                key, value = (k, v) if self.cache is None else (self.cache.key, self.cache.value)
+                key, value = (
+                    (k, v)
+                    if self.cache is None
+                    else (self.cache.key, self.cache.value)
+                )
                 key_count = batch.prefixes.host[row] + count
                 keys = _paged(key, batch.block_table.indices[row], key_count)
-                values = _paged(value, batch.block_table.indices[row], key_count)
-                result = _dense(query, keys, values, causal=batch.causal[row], scale=scale)
+                values = _paged(
+                    value, batch.block_table.indices[row], key_count
+                )
+                result = _dense(
+                    query, keys, values, causal=batch.causal[row], scale=scale
+                )
             elif isinstance(batch, VisibleInput):
                 key_count = batch.keys.host[row]
                 if batch.block_table is None:
-                    keys, values = k[kstart : kstart + key_count], v[kstart : kstart + key_count]
+                    keys, values = (
+                        k[kstart : kstart + key_count],
+                        v[kstart : kstart + key_count],
+                    )
                 else:
                     key, value = (
-                        (k, v) if self.cache is None else (self.cache.key, self.cache.value)
+                        (k, v)
+                        if self.cache is None
+                        else (self.cache.key, self.cache.value)
                     )
-                    keys = _paged(key, batch.block_table.indices[row], key_count)
-                    values = _paged(value, batch.block_table.indices[row], key_count)
+                    keys = _paged(
+                        key, batch.block_table.indices[row], key_count
+                    )
+                    values = _paged(
+                        value, batch.block_table.indices[row], key_count
+                    )
                 allowed = (
                     None
                     if batch.fully_visible
@@ -267,12 +329,18 @@ class _TorchOperator(_Operator):
                         < batch.visible_end[row, :count].unsqueeze(1)
                     )
                 )
-                result = _dense(query, keys, values, causal=False, scale=scale, mask=allowed)
+                result = _dense(
+                    query, keys, values, causal=False, scale=scale, mask=allowed
+                )
                 kstart += key_count
             elif isinstance(batch, SegmentedInput):
                 prefix = batch.prefixes.host[row]
-                keys = _paged(self.cache.key, batch.block_table.indices[row], prefix)
-                values = _paged(self.cache.value, batch.block_table.indices[row], prefix)
+                keys = _paged(
+                    self.cache.key, batch.block_table.indices[row], prefix
+                )
+                values = _paged(
+                    self.cache.value, batch.block_table.indices[row], prefix
+                )
                 allowed = (
                     None
                     if batch.fully_visible_current

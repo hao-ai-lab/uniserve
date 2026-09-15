@@ -22,8 +22,10 @@ def _sample_top_k_tensor(
     min_p: torch.Tensor,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample row-wise top-k candidates with temperature and probability filters."""
+    """Sample row-wise top-k candidates.
 
+    With temperature and probability filters.
+    """
     work = logits.float()
     # Zero temperature preserves finite logits for filtering; it later selects
     # the first sorted candidate deterministically.
@@ -41,14 +43,16 @@ def _sample_top_k_tensor(
     )
 
     # Nucleus filtering retains the candidate that first crosses top-p, while
-    # min-p is measured relative to the maximum candidate probability in log space.
+    # min-p is measured relative to the maximum candidate probability in log
+    # space.
     cumulative = torch.softmax(candidates, dim=-1).cumsum(dim=-1)
     over = cumulative > top_p.unsqueeze(1)
     drop = torch.cat((torch.zeros_like(over[:, :1]), over[:, :-1]), dim=1)
     candidates = torch.where(drop, float("-inf"), candidates)
     min_threshold = candidates[:, 0] + torch.log(min_p)
     candidates = torch.where(
-        (min_p.unsqueeze(1) <= 0.0) | (candidates >= min_threshold.unsqueeze(1)),
+        (min_p.unsqueeze(1) <= 0.0)
+        | (candidates >= min_threshold.unsqueeze(1)),
         candidates,
         float("-inf"),
     )
@@ -83,7 +87,10 @@ def _sample_top_k_tensor(
 
 @lru_cache(maxsize=256)
 def _compiled_sampling(top_k: int) -> _SamplingKernel:
-    """Compile and cache the fixed-top-k sampling specialization for one k value."""
+    """Compile and cache the fixed-top-k sampling specialization.
+
+    For one k value.
+    """
 
     def kernel(
         logits: torch.Tensor,
@@ -122,13 +129,16 @@ def sample_top_k(
     ``parameters`` is a floating [rows, 3] matrix of temperature, top-p,
     and min-p. The caller routes penalty-bearing rows to the general sampler.
     """
-
     if logits.ndim != 2 or draws.shape != logits.shape[:1]:
         raise ValueError("top-k sampling draws must align with logits rows")
     if parameters.shape != (logits.shape[0], 3):
-        raise ValueError("top-k sampling requires temperature, top-p, and min-p columns")
+        raise ValueError(
+            "top-k sampling requires temperature, top-p, and min-p columns"
+        )
     if not 0 < int(top_k) <= 128 or int(top_k) >= int(logits.shape[1]):
-        raise ValueError("top-k sampling requires an exact top-k candidate bound")
+        raise ValueError(
+            "top-k sampling requires an exact top-k candidate bound"
+        )
     args = (
         logits,
         draws,

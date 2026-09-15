@@ -30,22 +30,38 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
 
 def _assert_media_values_close(actual: bytes, expected: bytes) -> None:
     """Compare decoded media within the BF16 model-composition error budget."""
-
     for kind in ("video", "audio"):
-        with av.open(io.BytesIO(actual)) as observed, av.open(io.BytesIO(expected)) as reference:
+        with (
+            av.open(io.BytesIO(actual)) as observed,
+            av.open(io.BytesIO(expected)) as reference,
+        ):
             for frame, wanted in zip_longest(
                 observed.decode(**{kind: 0}), reference.decode(**{kind: 0})
             ):
-                assert frame is not None and wanted is not None, f"{kind}: frame count mismatch"
-                assert frame.time == wanted.time, f"{kind}: presentation time mismatch"
+                assert frame is not None and wanted is not None, (
+                    f"{kind}: frame count mismatch"
+                )
+                assert frame.time == wanted.time, (
+                    f"{kind}: presentation time mismatch"
+                )
                 if kind == "video":
-                    values = frame.to_ndarray(format="rgb24").astype(np.float32) / 255
-                    reference_values = wanted.to_ndarray(format="rgb24").astype(np.float32) / 255
+                    values = (
+                        frame.to_ndarray(format="rgb24").astype(np.float32)
+                        / 255
+                    )
+                    reference_values = (
+                        wanted.to_ndarray(format="rgb24").astype(np.float32)
+                        / 255
+                    )
                 else:
                     values = frame.to_ndarray()
                     reference_values = wanted.to_ndarray()
                 np.testing.assert_allclose(
-                    values, reference_values, rtol=2e-2, atol=2e-2, equal_nan=False
+                    values,
+                    reference_values,
+                    rtol=2e-2,
+                    atol=2e-2,
+                    equal_nan=False,
                 )
 
 
@@ -78,7 +94,10 @@ def test_component_bindings_release_cancelled_requests(
 ) -> None:
     model_value = os.environ.get("UNISERVE_H3_MODEL")
     if not model_value or not Path(model_value).is_dir():
-        pytest.fail("UNISERVE_H3_MODEL must name the FastH3 Preview v0.2 checkpoint directory")
+        pytest.fail(
+            "UNISERVE_H3_MODEL must name the FastH3 Preview v0.2 checkpoint "
+            "directory"
+        )
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     worker_config = {
@@ -100,11 +119,16 @@ def test_component_bindings_release_cancelled_requests(
         degree = {"local": 1, "ulysses2": 2, "ulysses4": 4}[parallel_kind]
         ranks = list(range(degree))
         sequence = (
-            {"kind": "local"} if degree == 1 else {"kind": "ulysses", "ulysses_degree": degree}
+            {"kind": "local"}
+            if degree == 1
+            else {"kind": "ulysses", "ulysses_degree": degree}
         )
         worker_config = {
             "devices": [3, 1, 2, 0][:degree],
-            "denoiser": {"ranks": ranks, "parallel_config": {"sequence_parallel": sequence}},
+            "denoiser": {
+                "ranks": ranks,
+                "parallel_config": {"sequence_parallel": sequence},
+            },
             "text_encoder": {
                 "ranks": ranks,
                 "parallel_config": {"tensor_parallel_size": degree},
@@ -120,12 +144,17 @@ def test_component_bindings_release_cancelled_requests(
     elif parallel_kind in ("pipeline2", "pipeline4"):
         degree = 2 if parallel_kind == "pipeline2" else 4
         worker_config["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
-        worker_config["denoiser"]["parallel_config"] = {"pipeline_parallel_size": degree}
+        worker_config["denoiser"]["parallel_config"] = {
+            "pipeline_parallel_size": degree
+        }
     elif parallel_kind in ("gather2", "gather4"):
         degree = 2 if parallel_kind == "gather2" else 4
         worker_config["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
         worker_config["denoiser"]["parallel_config"] = {
-            "sequence_parallel": {"kind": "allgather", "allgather_degree": degree}
+            "sequence_parallel": {
+                "kind": "allgather",
+                "allgather_degree": degree,
+            }
         }
     elif parallel_kind in ("ring2", "ring4"):
         degree = 4 if parallel_kind == "ring4" else 2
@@ -166,24 +195,33 @@ def test_component_bindings_release_cancelled_requests(
     elif parallel_kind in ("tensor2", "tensor4"):
         degree = 2 if parallel_kind == "tensor2" else 4
         worker_config["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
-        worker_config["denoiser"]["parallel_config"] = {"tensor_parallel_size": degree}
+        worker_config["denoiser"]["parallel_config"] = {
+            "tensor_parallel_size": degree
+        }
     else:
         raise ValueError(f"unsupported H3 test layout {parallel_kind!r}")
     devices = worker_config.pop("devices")
     groups = {
         "whole": [tuple(worker_config)],
         "split": [(name,) for name in worker_config],
-        "mixed": [("denoiser", "text_encoder"), ("video_decoder", "audio_decoder", "output")],
+        "mixed": [
+            ("denoiser", "text_encoder"),
+            ("video_decoder", "audio_decoder", "output"),
+        ],
     }[grouping]
     workers = []
     owners = {}
     for names in groups:
-        members = sorted({rank for name in names for rank in worker_config[name]["ranks"]})
+        members = sorted(
+            {rank for name in names for rank in worker_config[name]["ranks"]}
+        )
         worker_id = names[0]
         entries = {
             name: {
                 **worker_config[name],
-                "ranks": [members.index(rank) for rank in worker_config[name]["ranks"]],
+                "ranks": [
+                    members.index(rank) for rank in worker_config[name]["ranks"]
+                ],
             }
             for name in names
         }
@@ -191,13 +229,14 @@ def test_component_bindings_release_cancelled_requests(
             {
                 "id": worker_id,
                 "ranks": [
-                    {"node": "localhost", "device": f"cuda:{devices[rank]}"} for rank in members
+                    {"node": "localhost", "device": f"cuda:{devices[rank]}"}
+                    for rank in members
                 ],
                 "entries": entries,
                 "queue_depth": 6,
             }
         )
-        owners.update({name: worker_id for name in names})
+        owners.update(dict.fromkeys(names, worker_id))
     edges = {
         (owners[source], owners[destination])
         for source, destination in (
@@ -225,7 +264,10 @@ def test_component_bindings_release_cancelled_requests(
         "--workers",
         json.dumps(workers),
         "--transfer",
-        ",".join(f"{source}->{destination}=cuda_ipc" for source, destination in sorted(edges)),
+        ",".join(
+            f"{source}->{destination}=cuda_ipc"
+            for source, destination in sorted(edges)
+        ),
         "--pipeline-depth",
         "6",
         "--max-batch",
@@ -255,7 +297,14 @@ def test_component_bindings_release_cancelled_requests(
             video=replace(point.video, seconds=seconds, prompt_tokens=tokens),
         )
         prompt = MiniMaxH3Dataset(case).load(tokenizer)[0].prompt
-        payloads.append({"model": "MiniMax-H3", "prompt": prompt, "seconds": seconds, "seed": 1000})
+        payloads.append(
+            {
+                "model": "MiniMax-H3",
+                "prompt": prompt,
+                "seconds": seconds,
+                "seed": 1000,
+            }
+        )
     with server_process(
         command,
         base_url,
@@ -278,9 +327,12 @@ def test_component_bindings_release_cancelled_requests(
             assert media.frame_count == frames
             assert (media.width, media.height) == (1344, 768)
             assert (media.audio_channels, media.audio_sample_rate) == (2, 32000)
-            (tmp_path / f"{payload['seconds']}s.mp4").write_bytes(response.content)
+            (tmp_path / f"{payload['seconds']}s.mp4").write_bytes(
+                response.content
+            )
             print(
-                f"{parallel_kind}/{precision}: {payload['seconds']}s complete media passed",
+                f"{parallel_kind}/{precision}: {payload['seconds']}s "
+                "complete media passed",
                 flush=True,
             )
 
@@ -289,7 +341,9 @@ def test_component_bindings_release_cancelled_requests(
             with httpx.Client(timeout=httpx.Timeout(30, read=0.2)) as client:
                 with pytest.raises(httpx.ReadTimeout):
                     client.post(f"{base_url}/v1/videos/sync", json=payload)
-            response = httpx.post(f"{base_url}/v1/videos/sync", json=payload, timeout=600)
+            response = httpx.post(
+                f"{base_url}/v1/videos/sync", json=payload, timeout=600
+            )
             response.raise_for_status()
             media = inspect_video_bytes(
                 response.content, declared_mime=response.headers["content-type"]
@@ -298,13 +352,21 @@ def test_component_bindings_release_cancelled_requests(
             assert (media.audio_channels, media.audio_sample_rate) == (2, 32000)
 
 
-def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> None:
-    """Exercise async ownership and reuse through the HTTP contract on one deployment."""
+def test_video_jobs_retain_content_and_cancel_active_work(
+    tmp_path: Path,
+) -> None:
+    """Exercise async ownership and reuse through the HTTP contract.
+
+    The exercise runs on one deployment.
+    """
     import time
 
     model = os.environ.get("UNISERVE_H3_MODEL")
     if not model or not Path(model).is_dir():
-        pytest.fail("UNISERVE_H3_MODEL must name the supported full FastH3 VSA checkpoint")
+        pytest.fail(
+            "UNISERVE_H3_MODEL must name the supported full FastH3 VSA "
+            "checkpoint"
+        )
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
     command = [
@@ -336,7 +398,9 @@ def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> Non
         pytest.fail("video did not complete within the request deadline")
 
     with (
-        server_process(command, base, tmp_path / "video-jobs.log", timeout_s=900),
+        server_process(
+            command, base, tmp_path / "video-jobs.log", timeout_s=900
+        ),
         httpx.Client(base_url=base, timeout=600) as client,
     ):
         caps = client.get("/v1/capabilities").json()
@@ -348,7 +412,8 @@ def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> Non
             {"seconds": 16},
         ):
             response = client.post(
-                "/v1/videos", json={"model": "FastH3", "prompt": "A river", **payload}
+                "/v1/videos",
+                json={"model": "FastH3", "prompt": "A river", **payload},
             )
             assert response.status_code == 400
         payload = {
@@ -358,7 +423,8 @@ def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> Non
             "seed": 1001,
         }
         response = client.post(
-            "/v1/videos", files={name: (None, str(value)) for name, value in payload.items()}
+            "/v1/videos",
+            files={name: (None, str(value)) for name, value in payload.items()},
         )
         response.raise_for_status()
         job_id = response.json()["id"]
@@ -366,11 +432,15 @@ def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> Non
         assert job["seconds"] == 5 and job["actual_seconds"] == 124 / 24
         assert job["completed_steps"] == job["total_steps"] == 4
         assert job["expires_at"] > job["completed_at"]
-        assert job_id in {item["id"] for item in client.get("/v1/videos").json()["data"]}
+        assert job_id in {
+            item["id"] for item in client.get("/v1/videos").json()["data"]
+        }
         first = client.get(f"/v1/videos/{job_id}/content")
         second = client.get(f"/v1/videos/{job_id}/content")
         assert first.content == second.content
-        media = inspect_video_bytes(first.content, declared_mime=first.headers["content-type"])
+        media = inspect_video_bytes(
+            first.content, declared_mime=first.headers["content-type"]
+        )
         assert media.frame_count == 124 and media.audio_channels == 2
         assert client.delete(f"/v1/videos/{job_id}").json()["deleted"]
         assert client.get(f"/v1/videos/{job_id}/content").status_code == 404
@@ -381,11 +451,16 @@ def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> Non
             {**payload, "seed": 1010},
             {
                 **payload,
-                "prompt": "A train crosses a bridge at sunrise, with birds singing.",
+                "prompt": (
+                    "A train crosses a bridge at sunrise, with birds singing."
+                ),
                 "seed": 1011,
             },
         ]
-        ids = [client.post("/v1/videos", json=item).json()["id"] for item in concurrent]
+        ids = [
+            client.post("/v1/videos", json=item).json()["id"]
+            for item in concurrent
+        ]
         for item, concurrent_id in zip(concurrent, ids, strict=True):
             completed(client, concurrent_id)
             content = client.get(f"/v1/videos/{concurrent_id}/content")
@@ -393,7 +468,8 @@ def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> Non
             isolated.raise_for_status()
             _assert_media_values_close(content.content, isolated.content)
 
-        # Cancel more requests than the two resident slots, including a genuinely active job.
+        # Cancel more requests than the two resident slots, including a
+        # genuinely active job.
         for seed in range(3):
             active = client.post(
                 "/v1/videos", json={**payload, "seconds": 15, "seed": seed}
@@ -407,11 +483,15 @@ def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> Non
                 time.sleep(0.05)
             else:
                 pytest.fail("job never reached execution")
-            queued = client.post("/v1/videos", json={**payload, "seed": seed + 100}).json()["id"]
+            queued = client.post(
+                "/v1/videos", json={**payload, "seed": seed + 100}
+            ).json()["id"]
             assert client.delete(f"/v1/videos/{active}").status_code == 200
             assert client.delete(f"/v1/videos/{queued}").status_code == 200
             assert client.get(f"/v1/videos/{active}").status_code == 404
-        reused = client.post("/v1/videos", json={**payload, "seed": 1002}).json()["id"]
+        reused = client.post(
+            "/v1/videos", json={**payload, "seed": 1002}
+        ).json()["id"]
         completed(client, reused)
         assert client.get(f"/v1/videos/{reused}/content").status_code == 200
         sync = client.post("/v1/videos/sync", json={**payload, "seed": 1003})
@@ -427,7 +507,9 @@ def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> Non
     # Keep the exact checkpoint, capacity, prompt and seed from the full run.
     command[-1] = "off"
     with (
-        server_process(command, base, tmp_path / "video-eager.log", timeout_s=900),
+        server_process(
+            command, base, tmp_path / "video-eager.log", timeout_s=900
+        ),
         httpx.Client(base_url=base, timeout=600) as client,
     ):
         eager = client.post("/v1/videos/sync", json=payload)

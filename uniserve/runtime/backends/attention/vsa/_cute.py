@@ -21,7 +21,7 @@ try:  # pragma: no cover - worker_config-only CUDA provider.
     )
     from cutlass.cute.runtime import from_dlpack as _dlpack_converter
 
-    from ._sm100_kernel import SparseAttentionSm100 as _sm100_kernel_type
+    from ._sm100_kernel import SparseAttentionSm100
 except BaseException as error:  # pragma: no cover
     _IMPORT_ERROR = error
     _cuda_driver = None
@@ -34,15 +34,18 @@ else:  # pragma: no cover
     _cute = _cute_module
     _from_dlpack = _dlpack_converter
     _requires_int64_kv_strides = _stride_validator
-    _kernel_type = _sm100_kernel_type
+    _kernel_type = SparseAttentionSm100
 
 _EXECUTORS: dict[tuple[object, ...], Callable[..., None]] = {}
 _SOFTMAX_SCALE = 1.0 / math.sqrt(128)
 
 
 def available(device: torch.device | None = None) -> bool:
-    """Return whether the CuTe kernel can compile for the requested SM100 device."""
+    """Check CuTe kernel compilation support.
 
+    Return whether the CuTe kernel can compile for the requested SM100
+    device.
+    """
     if (
         _cute is None
         or _from_dlpack is None
@@ -57,21 +60,23 @@ def available(device: torch.device | None = None) -> bool:
 
 def import_error() -> BaseException | None:
     """Return the exception that prevented CuTe kernel registration, if any."""
-
     return _IMPORT_ERROR
 
 
 def should_use(*, rows: int, prefix_tiles: int) -> bool:
     """Select shapes whose measured provider boundary favors CuTe."""
-
     return int(rows) <= 65_536 or int(prefix_tiles) <= 64
 
 
 def _dynamic_tensor(tensor: torch.Tensor, assumed_align: int = 16) -> Any:
-    """Wrap a tensor as a CuTe dynamic-layout argument with declared alignment."""
+    """Wrap a tensor as a CuTe argument.
 
+    Wrap a tensor as a CuTe dynamic-layout argument with declared alignment.
+    """
     if _from_dlpack is None:
-        raise RuntimeError("CuTe tensor ingress is unavailable") from _IMPORT_ERROR
+        raise RuntimeError(
+            "CuTe tensor ingress is unavailable"
+        ) from _IMPORT_ERROR
     return _from_dlpack(
         tensor.detach(),
         assumed_align=assumed_align,
@@ -80,8 +85,11 @@ def _dynamic_tensor(tensor: torch.Tensor, assumed_align: int = 16) -> Any:
 
 
 def _tensor_abi_key(tensor: torch.Tensor) -> tuple[object, ...]:
-    """Describe a tensor's device, dtype, shape, and stride for kernel specialization."""
+    """Describe a tensor's kernel ABI.
 
+    Describe a tensor's device, dtype, shape, and stride for kernel
+    specialization.
+    """
     leading_dim = tensor.ndim - 1
     return (
         tensor.dtype,
@@ -104,8 +112,11 @@ def _compile_key(
     lse: torch.Tensor | None,
     allow_empty_blocks: bool,
 ) -> tuple[object, ...]:
-    """Build the CuTe kernel specialization key from tensor layouts and stride mode."""
+    """Build a CuTe kernel specialization key.
 
+    Build the CuTe kernel specialization key from tensor layouts and
+    stride mode.
+    """
     device_index = query.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
@@ -157,10 +168,15 @@ def _compile(
     lse: torch.Tensor | None,
     allow_empty_blocks: bool,
 ) -> Callable[..., None]:
-    """Compile and cache the block-sparse CuTe kernel for one concrete tensor shape."""
+    """Compile a block-sparse CuTe kernel.
 
+    Compile and cache the block-sparse CuTe kernel for one concrete
+    tensor shape.
+    """
     if _cute is None or _kernel_type is None:
-        raise RuntimeError("CuTe sparse video attention is unavailable") from _IMPORT_ERROR
+        raise RuntimeError(
+            "CuTe sparse video attention is unavailable"
+        ) from _IMPORT_ERROR
 
     kernel = _kernel_type(
         head_dim=128,
@@ -205,28 +221,53 @@ def _validate(
     valid_sizes: torch.Tensor,
     lse: torch.Tensor | None,
 ) -> None:
-    """Validate tensor ranks, dtypes, shapes, devices, and block-index bounds."""
+    """Validate CuTe kernel inputs.
 
+    Validate tensor ranks, dtypes, shapes, devices, and block-index bounds.
+    """
     if key.shape != value.shape or key.shape[1:] != query.shape[1:]:
-        raise ValueError("CuTe sparse attention requires matching K/V and Q/K head dimensions")
+        raise ValueError(
+            "CuTe sparse attention requires matching K/V and Q/K head "
+            "dimensions"
+        )
     if query.ndim != 3 or query.shape[1] < 1 or query.shape[2] != 128:
-        raise ValueError("CuTe sparse attention requires [sequence, heads, 128] Q/K/V")
-    if any(t.dtype != torch.bfloat16 for t in (query, key, value)) or not query.is_cuda:
+        raise ValueError(
+            "CuTe sparse attention requires [sequence, heads, 128] Q/K/V"
+        )
+    if (
+        any(t.dtype != torch.bfloat16 for t in (query, key, value))
+        or not query.is_cuda
+    ):
         raise ValueError("CuTe sparse attention requires CUDA BF16 Q/K/V")
     if any(tensor.device != query.device for tensor in (key, value, output)):
-        raise ValueError("CuTe sparse attention tensors must share one CUDA device")
+        raise ValueError(
+            "CuTe sparse attention tensors must share one CUDA device"
+        )
     if (
         output.shape != query.shape
         or output.dtype not in (torch.bfloat16, torch.float32)
         or not output.is_contiguous()
     ):
-        raise ValueError("CuTe sparse attention output must be contiguous BF16/FP32 with Q's shape")
+        raise ValueError(
+            "CuTe sparse attention output must be contiguous BF16/FP32 "
+            "with Q's shape"
+        )
     if any(tensor.stride(-1) != 1 for tensor in (query, key, value, output)):
-        raise ValueError("CuTe sparse attention requires a contiguous head dimension")
-    if any(stride % 8 for tensor in (query, key, value, output) for stride in tensor.stride()[:-1]):
-        raise ValueError("CuTe sparse attention strides must preserve 16-byte alignment")
+        raise ValueError(
+            "CuTe sparse attention requires a contiguous head dimension"
+        )
+    if any(
+        stride % 8
+        for tensor in (query, key, value, output)
+        for stride in tensor.stride()[:-1]
+    ):
+        raise ValueError(
+            "CuTe sparse attention strides must preserve 16-byte alignment"
+        )
     if any(tensor.data_ptr() % 16 for tensor in (query, key, value, output)):
-        raise ValueError("CuTe sparse attention pointers must be 16-byte aligned")
+        raise ValueError(
+            "CuTe sparse attention pointers must be 16-byte aligned"
+        )
 
     rows = int(query.shape[0])
     if rows % 64 or key.shape[0] % 64:
@@ -247,7 +288,9 @@ def _validate(
         or tensor.data_ptr() % 16
         for tensor in (block_indices, block_counts, valid_sizes)
     ):
-        raise ValueError("CuTe sparse attention metadata must be aligned contiguous int32")
+        raise ValueError(
+            "CuTe sparse attention metadata must be aligned contiguous int32"
+        )
 
     if lse is not None and (
         lse.shape != (query.shape[1], rows)
@@ -255,7 +298,10 @@ def _validate(
         or lse.device != query.device
         or not lse.is_contiguous()
     ):
-        raise ValueError("CuTe sparse attention LSE must be contiguous FP32 [heads, query rows]")
+        raise ValueError(
+            "CuTe sparse attention LSE must be contiguous FP32 "
+            "[heads, query rows]"
+        )
 
 
 def block_sparse_attention(
@@ -277,9 +323,10 @@ def block_sparse_attention(
     LSE stores the natural logarithm of each fine-attention normalizer. Empty
     key partitions produce zero output and negative-infinite LSE.
     """
-
     if not available(query.device):
-        raise RuntimeError("CuTe sparse video attention is unavailable") from _IMPORT_ERROR
+        raise RuntimeError(
+            "CuTe sparse video attention is unavailable"
+        ) from _IMPORT_ERROR
     _validate(
         query,
         key,
@@ -302,7 +349,9 @@ def block_sparse_attention(
         lse_bhq = None if lse is None else lse.unsqueeze(0)
 
         if _requires_int64_kv_strides is None:
-            raise RuntimeError("CuTe sparse video attention stride validation is unavailable")
+            raise RuntimeError(
+                "CuTe sparse video attention stride validation is unavailable"
+            )
         use_int64_kv_strides = bool(_requires_int64_kv_strides(k_bhsd, v_bhsd))
 
         cache_key = _compile_key(
@@ -321,7 +370,8 @@ def block_sparse_attention(
         if executor is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    "CuTe sparse video attention was not compiled before graph capture"
+                    "CuTe sparse video attention was not compiled before "
+                    "graph capture"
                 )
             executor = _compile(
                 q_bhsd,
@@ -338,7 +388,9 @@ def block_sparse_attention(
             _EXECUTORS[cache_key] = executor
 
         if _cuda_driver is None:
-            raise RuntimeError("CUDA driver bindings are unavailable") from _IMPORT_ERROR
+            raise RuntimeError(
+                "CUDA driver bindings are unavailable"
+            ) from _IMPORT_ERROR
         executor(
             q_bhsd.detach(),
             k_bhsd.detach(),

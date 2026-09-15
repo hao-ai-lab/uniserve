@@ -16,11 +16,35 @@ pytestmark = pytest.mark.unit
 @pytest.mark.parametrize(
     "source,positive,negative,tokens,expected",
     [
-        (BranchSource.CONDITIONING, " positive ", "negative", (), ((1, 3, 2, 5), False)),
+        (
+            BranchSource.CONDITIONING,
+            " positive ",
+            "negative",
+            (),
+            ((1, 3, 2, 5), False),
+        ),
         (BranchSource.CONDITIONING, "  ", "negative", (), ((), True)),
-        (BranchSource.NEGATIVE_OR_START, "positive", " negative ", (), ((1, 4, 2, 6), False)),
-        (BranchSource.NEGATIVE_OR_START, "positive", "negative", (9, 8), ((9, 8), False)),
-        (BranchSource.START, "positive", "negative", (9, 8), ((1, 2, 6), False)),
+        (
+            BranchSource.NEGATIVE_OR_START,
+            "positive",
+            " negative ",
+            (),
+            ((1, 4, 2, 6), False),
+        ),
+        (
+            BranchSource.NEGATIVE_OR_START,
+            "positive",
+            "negative",
+            (9, 8),
+            ((9, 8), False),
+        ),
+        (
+            BranchSource.START,
+            "positive",
+            "negative",
+            (9, 8),
+            ((1, 2, 6), False),
+        ),
     ],
 )
 def test_prefix_selection_preserves_framing_and_explicit_negative_tokens(
@@ -37,7 +61,9 @@ def test_prefix_selection_preserves_framing_and_explicit_negative_tokens(
     }
     backend = Tokenizer(WordLevel(vocabulary, unk_token="[UNK]"))
     backend.pre_tokenizer = Whitespace()
-    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]"
+    )
     prompt = FlowPrompt(
         user_prefix="user ",
         user_suffix=" assistant ",
@@ -58,7 +84,8 @@ def test_prefix_selection_preserves_framing_and_explicit_negative_tokens(
     )
 
 
-def test_unframed_model_reuses_conditioning_and_rejects_positive_prompt_overrides():
+def test_unframed_model_reuses_conditioning_and_rejects_positive_prompt_overrides(  # noqa: E501
+):
     prompt = None
     assert resolve_prefix(
         prompt,

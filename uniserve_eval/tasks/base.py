@@ -39,39 +39,39 @@ class BenchmarkTask:
 
     def __init__(self, point: BenchmarkPoint) -> None:
         """Bind the task adapter to a resolved benchmark point."""
-
         self.point = point
 
     def build_request(self, example: Example) -> TaskRequest:
         """Construct the endpoint request for one normalized example."""
-
         raise NotImplementedError
 
     def validate(self, records: Sequence[RequestRecord]) -> ValidationResult:
         """Combine request-level checks with task-specific output checks."""
-
         common = ValidationResult(
             checks={
-                "declared_request_count": len(records) == self.point.load.num_prompts,
+                "declared_request_count": len(records)
+                == self.point.load.num_prompts,
                 "all_requests_succeeded": bool(records)
                 and all(record.success for record in records),
             },
             statistics={
                 "request_count": len(records),
-                "successful_requests": sum(record.success for record in records),
+                "successful_requests": sum(
+                    record.success for record in records
+                ),
             },
         )
         return common.merged(self.validate_output(records))
 
-    def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
+    def validate_output(
+        self, records: Sequence[RequestRecord]
+    ) -> ValidationResult:
         """Validate output properties specific to the task."""
-
         return ValidationResult(checks={"observable_output": bool(records)})
 
     @classmethod
     def check_endpoint(cls, endpoint: str | None, context: str) -> str:
         """Resolve and validate an endpoint supported by the task."""
-
         chosen = endpoint if endpoint is not None else cls.default_endpoint
         if not isinstance(chosen, str) or chosen not in cls.allowed_endpoints:
             allowed = ", ".join(cls.allowed_endpoints)
@@ -81,11 +81,12 @@ class BenchmarkTask:
     @classmethod
     def check_question(cls, question: Any, context: str) -> str | None:
         """Validate an optional dataset question against task capabilities."""
-
         if question is None:
             return None
         if not cls.accepts_question:
-            raise ValueError(f"{context}.question is not valid for task {cls.name.value}")
+            raise ValueError(
+                f"{context}.question is not valid for task {cls.name.value}"
+            )
         if not isinstance(question, str) or not question:
             raise ValueError(f"{context}.question must be a non-empty string")
         return question
@@ -93,15 +94,21 @@ class BenchmarkTask:
     @classmethod
     def check_image(cls, image: ImageConfig, context: str) -> None:
         """Validate explicit image-count settings against the task contract."""
-
-        if cls.image_count is ImageCountRule.REQUIRED and image.image_count is None:
+        if (
+            cls.image_count is ImageCountRule.REQUIRED
+            and image.image_count is None
+        ):
             raise ValueError(f"{context} requires image.image_count")
-        if cls.image_count is ImageCountRule.FORBIDDEN and image.image_count is not None:
-            raise ValueError(f"{context} does not declare a per-request image count")
+        if (
+            cls.image_count is ImageCountRule.FORBIDDEN
+            and image.image_count is not None
+        ):
+            raise ValueError(
+                f"{context} does not declare a per-request image count"
+            )
 
     def apply_text_sampling(self, payload: dict[str, Any]) -> None:
         """Add configured text-sampling fields to an endpoint payload."""
-
         sampling = self.point.sampling
         payload["temperature"] = sampling.temperature
         payload["top_p"] = sampling.top_p
@@ -120,14 +127,17 @@ class BenchmarkTask:
             payload["seed"] = sampling.sampling_seed
         payload.update(sampling.extra_body)
 
-    def image_fields(self, example: Example, *, include_count: bool) -> dict[str, Any]:
+    def image_fields(
+        self, example: Example, *, include_count: bool
+    ) -> dict[str, Any]:
         """Resolve image settings by applying per-example overrides."""
-
         image = self.point.image
         width = example.width if example.width is not None else image.width
         height = example.height if example.height is not None else image.height
         steps = example.steps if example.steps is not None else image.steps
-        seed = example.seed if example.seed is not None else self.point.load.seed
+        seed = (
+            example.seed if example.seed is not None else self.point.load.seed
+        )
         payload: dict[str, Any] = {"seed": int(seed)}
         if include_count and image.image_count is not None:
             payload["num_images"] = image.image_count
@@ -150,9 +160,10 @@ class BenchmarkTask:
             payload["resolution"] = str(example.aspect_ratio)
         return payload
 
-    def apply_image_generations_fields(self, payload: dict[str, Any], example: Example) -> None:
+    def apply_image_generations_fields(
+        self, payload: dict[str, Any], example: Example
+    ) -> None:
         """Map resolved image settings onto the image-generations schema."""
-
         rendered = self.image_fields(example, include_count=False)
         width = rendered.get("width")
         height = rendered.get("height")
@@ -172,7 +183,6 @@ class BenchmarkTask:
 
     def input_image_data_url(self, example: Example) -> str:
         """Build a validated embedded data URL for an example image."""
-
         image_b64 = example.input_image_b64
         if not isinstance(image_b64, str) or not image_b64:
             raise ValueError("input image row has no base64 payload")
@@ -181,11 +191,14 @@ class BenchmarkTask:
             raise ValueError("input image row has an invalid MIME type")
         return f"data:{mime};base64,{image_b64}"
 
-    def image_integrity_checks(self, records: Sequence[RequestRecord]) -> dict[str, bool]:
+    def image_integrity_checks(
+        self, records: Sequence[RequestRecord]
+    ) -> dict[str, bool]:
         """Check decoded image counts and configured output geometry."""
-
         image = self.point.image
-        decoded_counts = all(record.images == len(record.decoded_images) for record in records)
+        decoded_counts = all(
+            record.images == len(record.decoded_images) for record in records
+        )
         dimensions = all(
             (image.width is None or decoded.width == image.width)
             and (image.height is None or decoded.height == image.height)
@@ -199,15 +212,14 @@ class BenchmarkTask:
 
     def server_usage_ok(self, records: Sequence[RequestRecord]) -> bool:
         """Report whether every request uses server-reported token counts."""
-
         return bool(records) and all(
-            record.output_len_source == "server_usage" and record.prompt_len_source == "server_usage"
+            record.output_len_source == "server_usage"
+            and record.prompt_len_source == "server_usage"
             for record in records
         )
 
     def fixed_output_length_ok(self, records: Sequence[RequestRecord]) -> bool:
         """Report whether every completion reaches its requested token limit."""
-
         return bool(records) and all(
             record.requested_output_len > 0
             and record.output_len == record.requested_output_len

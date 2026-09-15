@@ -37,7 +37,6 @@ def stage_text(
     slots: tuple[int, ...] | None = None,
 ) -> InputBatch:
     """Use serving's staging and attention preparation with numerical inputs."""
-
     rows = len(tokens)
     lengths = tuple(len(value) for value in tokens)
     prefixes = (0,) * rows if prefixes is None else prefixes
@@ -92,15 +91,23 @@ def prepare_prefill(
     shapes: tuple[PrefillShape, ...],
 ) -> None:
     """Capture each selected physical token/row bucket in footprint order."""
-
     for shape in sorted(
         shapes,
-        key=lambda item: (item.token_bucket * item.row_bucket, item.token_bucket),
+        key=lambda item: (
+            item.token_bucket * item.row_bucket,
+            item.token_bucket,
+        ),
         reverse=True,
     ):
         # One row holds the long prompt; the remaining live rows hold one token.
-        lengths = (shape.token_bucket - shape.live_rows + 1, *(1,) * (shape.live_rows - 1))
-        counts = tuple(ceil_div(length, runner.worker_config.block_size) for length in lengths)
+        lengths = (
+            shape.token_bucket - shape.live_rows + 1,
+            *(1,) * (shape.live_rows - 1),
+        )
+        counts = tuple(
+            ceil_div(length, runner.worker_config.block_size)
+            for length in lengths
+        )
 
         with runner.kv_cache.startup_pages(sum(counts)) as scratch:
             pages = tuple(
@@ -124,8 +131,10 @@ def prepare_decode(
     buffers: InputBuffers,
     forward: Callable[[InputBatch], ExecutionOutput],
 ) -> None:
-    """Prepare valid one-token prefixes, then capture each decode batch bucket."""
+    """Prepare valid one-token prefixes.
 
+    then capture each decode batch bucket.
+    """
     row_counts = (
         tuple(reversed(runner.decode_shapes[entry]))
         if runner.worker_config.graph_policy != "off"

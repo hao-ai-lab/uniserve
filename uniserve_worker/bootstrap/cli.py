@@ -12,19 +12,24 @@ from .config import SUPPORTED_OP_GROUPS, WorkerProcessArgs
 
 def _json_object(value: str) -> dict[str, object]:
     """Parse a command-line JSON object and reject non-object values."""
-
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError as error:
-        raise argparse.ArgumentTypeError(f"invalid JSON: {error.msg}") from error
+        raise argparse.ArgumentTypeError(
+            f"invalid JSON: {error.msg}"
+        ) from error
     if not isinstance(parsed, dict):
-        raise argparse.ArgumentTypeError("quantization config must be a JSON object")
+        raise argparse.ArgumentTypeError(
+            "quantization config must be a JSON object"
+        )
     return parsed
 
 
 def create_worker_cli_parser() -> argparse.ArgumentParser:
-    """Build the worker CLI parser with launch, params, resource, execution, and loading options."""
+    """Build the worker CLI parser.
 
+    Options cover launch, params, resource, execution, and loading.
+    """
     parser = argparse.ArgumentParser()
 
     # Service identity and IPC transport bounds.
@@ -39,7 +44,10 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--supported-ops",
         default=",".join(SUPPORTED_OP_GROUPS),
-        help="comma-separated computation capability groups assigned to this pool",
+        help=(
+            "comma-separated computation capability groups "
+            "assigned to this pool"
+        ),
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -86,7 +94,9 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
 
     # Batching and KV pool bounds.
     parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
-    parser.add_argument("--max-batch-operations", type=int, default=DEFAULT_MAX_BATCH_OPS)
+    parser.add_argument(
+        "--max-batch-operations", type=int, default=DEFAULT_MAX_BATCH_OPS
+    )
     parser.add_argument("--max-batch-tokens", type=int, required=True)
     parser.add_argument("--kv-token-capacity", type=int, default=None)
     parser.add_argument("--kv-cache-dtype", default=None)
@@ -119,11 +129,16 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         "--lane",
         action="append",
         default=[],
-        help="repeatable JSON lane descriptor with lane_id, sm_budget, and domains",
+        help=(
+            "repeatable JSON lane descriptor with lane_id, sm_budget, "
+            "and domains"
+        ),
     )
 
     # CUDA graph capture policy.
-    parser.add_argument("--graph-policy", choices=("off", "auto", "full"), default="auto")
+    parser.add_argument(
+        "--graph-policy", choices=("off", "auto", "full"), default="auto"
+    )
     parser.add_argument("--decode-graph-batch-sizes", default=None)
     parser.add_argument(
         "--prefill-cuda-graph",
@@ -175,8 +190,10 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
 def parse_worker_args(
     arguments: Sequence[str] | None = None,
 ) -> WorkerProcessArgs:
-    """Parse CLI arguments and return their validated worker-process configuration."""
+    """Parse CLI arguments.
 
+    Return their validated worker-process configuration.
+    """
     parser = create_worker_cli_parser()
     namespace = parser.parse_args(arguments)
     try:

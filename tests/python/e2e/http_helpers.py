@@ -26,28 +26,41 @@ def find_free_port() -> int:
 
 def require_uniserve_binary() -> Path:
     configured = os.environ.get("UNISERVE_BINARY")
-    path = Path(configured) if configured else Path.cwd() / "target" / "debug" / "uniserve"
+    path = (
+        Path(configured)
+        if configured
+        else Path.cwd() / "target" / "debug" / "uniserve"
+    )
     if not path.exists():
-        raise FileNotFoundError(f"{path} does not exist; run `cargo build -p uniserve` first")
+        raise FileNotFoundError(
+            f"{path} does not exist; run `cargo build -p uniserve` first"
+        )
     return path
 
 
-def wait_health(base_url: str, process: subprocess.Popen[str], timeout_s: float) -> None:
+def wait_health(
+    base_url: str, process: subprocess.Popen[str], timeout_s: float
+) -> None:
     deadline = time.monotonic() + timeout_s
     last_error: str | None = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError(f"server exited early with code {process.returncode}")
+            raise RuntimeError(
+                f"server exited early with code {process.returncode}"
+            )
         try:
             response = httpx.get(f"{base_url}/health", timeout=2.0)
             if response.status_code == 200:
                 return
-            last_error = f"health returned {response.status_code}: {response.text[:200]}"
+            last_error = (
+                f"health returned {response.status_code}: {response.text[:200]}"
+            )
         except Exception as error:  # noqa: BLE001 - readiness polling reports the last failure.
             last_error = f"{type(error).__name__}: {error}"
         time.sleep(1.0)
     raise TimeoutError(
-        f"server did not become healthy within {timeout_s}s; last error: {last_error}"
+        f"server did not become healthy within {timeout_s}s; last error: "
+        f"{last_error}"
     )
 
 
@@ -98,9 +111,14 @@ def server_process(
 
 
 def post_sse(
-    base_url: str, endpoint: str, payload: dict[str, Any], timeout_s: float = 600.0
+    base_url: str,
+    endpoint: str,
+    payload: dict[str, Any],
+    timeout_s: float = 600.0,
 ) -> list[dict[str, Any]]:
-    with httpx.stream("POST", f"{base_url}{endpoint}", json=payload, timeout=timeout_s) as response:
+    with httpx.stream(
+        "POST", f"{base_url}{endpoint}", json=payload, timeout=timeout_s
+    ) as response:
         response.raise_for_status()
         return list(iter_sse_events(response.iter_lines()))
 

@@ -56,8 +56,11 @@ if triton is not None:
         head_dim: tl.constexpr,
         pipeline_stages: tl.constexpr,
     ):
-        """Apply a head-wise sparse block map using online softmax accumulation."""
+        """Apply a head-wise sparse block map.
 
+        Apply a head-wise sparse block map using online softmax
+        accumulation.
+        """
         query_program = tl.program_id(0)
         head = tl.program_id(1)
         query_rows_offset = query_program * block_m + tl.arange(0, block_m)
@@ -78,10 +81,14 @@ if triton is not None:
         normalizer_max = tl.full((block_m,), -float("inf"), tl.float32)
         normalizer_sum = tl.zeros((block_m,), tl.float32)
         accumulator = tl.zeros((block_m, head_dim), tl.float32)
-        selected_count = tl.load(block_counts + head * counts_stride_head + query_tile)
+        selected_count = tl.load(
+            block_counts + head * counts_stride_head + query_tile
+        )
         selected_count = tl.minimum(selected_count, selected_width)
 
-        for selected_offset in tl.range(0, selected_count, num_stages=pipeline_stages):
+        for selected_offset in tl.range(
+            0, selected_count, num_stages=pipeline_stages
+        ):
             key_tile = tl.load(
                 block_indices
                 + head * indices_stride_head
@@ -145,17 +152,22 @@ if triton is not None:
 
 
 def available(device: torch.device | None = None) -> bool:
-    """Return whether Triton can compile kernels for the requested CUDA device."""
+    """Return whether Triton can compile kernels.
 
+    Return whether Triton can compile kernels for the requested CUDA device.
+    """
     if triton is None or not torch.cuda.is_available():
         return False
-    selected = device if device is not None else torch.device("cuda", torch.cuda.current_device())
+    selected = (
+        device
+        if device is not None
+        else torch.device("cuda", torch.cuda.current_device())
+    )
     return triton_available(selected)
 
 
 def import_error() -> BaseException | None:
     """Return the error that prevented Triton registration, if any."""
-
     return _IMPORT_ERROR
 
 
@@ -169,21 +181,40 @@ def _validate_attention(
     valid_sizes: torch.Tensor,
 ) -> None:
     """Validate the public sparse-attention tensors and metadata."""
-
     if query.ndim != 3 or query.shape[1] < 1 or query.shape[2] != _HEAD_DIM:
-        raise ValueError("Triton sparse attention requires [sequence, heads, 128] Q/K/V")
+        raise ValueError(
+            "Triton sparse attention requires [sequence, heads, 128] Q/K/V"
+        )
     if key.shape != value.shape or key.shape[1:] != query.shape[1:]:
-        raise ValueError("Triton sparse attention requires matching K/V and Q/K head dimensions")
+        raise ValueError(
+            "Triton sparse attention requires matching K/V and Q/K head "
+            "dimensions"
+        )
     if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
         raise ValueError("Triton sparse attention requires BF16 Q/K/V")
-    if not query.is_cuda or any(tensor.device != query.device for tensor in (key, value, output)):
-        raise ValueError("Triton sparse attention tensors must share one CUDA device")
-    if output.shape != query.shape or output.dtype != query.dtype or not output.is_contiguous():
-        raise ValueError("Triton sparse attention output must be contiguous BF16 with Q's shape")
+    if not query.is_cuda or any(
+        tensor.device != query.device for tensor in (key, value, output)
+    ):
+        raise ValueError(
+            "Triton sparse attention tensors must share one CUDA device"
+        )
+    if (
+        output.shape != query.shape
+        or output.dtype != query.dtype
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            "Triton sparse attention output must be contiguous BF16 with "
+            "Q's shape"
+        )
     if any(tensor.stride(-1) != 1 for tensor in (query, key, value, output)):
-        raise ValueError("Triton sparse attention requires a contiguous head dimension")
+        raise ValueError(
+            "Triton sparse attention requires a contiguous head dimension"
+        )
     if query.shape[0] % _TILE or key.shape[0] % _TILE:
-        raise ValueError("Triton sparse attention rows must be a multiple of 64")
+        raise ValueError(
+            "Triton sparse attention rows must be a multiple of 64"
+        )
 
     query_tiles = query.shape[0] // _TILE
     if (
@@ -193,17 +224,26 @@ def _validate_attention(
         or block_counts.shape != (query.shape[1], query_tiles)
         or valid_sizes.shape != (key.shape[0] // _TILE,)
     ):
-        raise ValueError("Triton sparse attention metadata does not match Q/K/V")
+        raise ValueError(
+            "Triton sparse attention metadata does not match Q/K/V"
+        )
     if any(
-        tensor.dtype != torch.int32 or tensor.device != query.device or not tensor.is_contiguous()
+        tensor.dtype != torch.int32
+        or tensor.device != query.device
+        or not tensor.is_contiguous()
         for tensor in (block_indices, block_counts, valid_sizes)
     ):
-        raise ValueError("Triton sparse attention metadata must be contiguous CUDA int32")
+        raise ValueError(
+            "Triton sparse attention metadata must be contiguous CUDA int32"
+        )
 
 
 def _launch_config(device: torch.device) -> tuple[int, int, int]:
-    """Choose the resident query tile and software pipeline for one architecture."""
+    """Choose the resident query tile and pipeline.
 
+    Choose the resident query tile and software pipeline for one
+    architecture.
+    """
     major, _minor = torch.cuda.get_device_capability(device)
     # Returns (block_m, num_warps, pipeline_stages); Hopper sustains the
     # deeper pipeline, other architectures use the conservative pairing.
@@ -224,9 +264,10 @@ def block_sparse_attention(
     scale: float = _SOFTMAX_SCALE,
 ) -> torch.Tensor:
     """Evaluate a mutable head-wise block map without host-side planning."""
-
     if not available(query.device):
-        raise RuntimeError("Triton sparse video attention is unavailable") from _IMPORT_ERROR
+        raise RuntimeError(
+            "Triton sparse video attention is unavailable"
+        ) from _IMPORT_ERROR
     _validate_attention(
         query,
         key,

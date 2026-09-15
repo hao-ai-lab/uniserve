@@ -31,7 +31,10 @@ class Schedule:
             or not isinstance(self.coordinates, tuple)
             or any(not math.isfinite(value) for value in self.coordinates)
         ):
-            raise ValueError("schedules require aligned FP32 endpoints and analytical coordinates")
+            raise ValueError(
+                "schedules require aligned FP32 endpoints and analytical "
+                "coordinates"
+            )
 
     @property
     def num_steps(self) -> int:
@@ -51,13 +54,23 @@ def make_schedule(
     The network time follows direction. Sigma decreases from one to zero for
     either direction, and is computed from the materialized FP32 network time.
     """
-    if type(steps) is not int or steps < 1 or not math.isfinite(shift) or shift <= 0:
+    if (
+        type(steps) is not int
+        or steps < 1
+        or not math.isfinite(shift)
+        or shift <= 0
+    ):
         raise ValueError("schedule steps and shift must be positive")
-    if direction not in {"ascending", "descending"} or shift_domain not in {"time", "sigma"}:
+    if direction not in {"ascending", "descending"} or shift_domain not in {
+        "time",
+        "sigma",
+    }:
         raise ValueError("unknown schedule direction or shift domain")
     coordinates = []
     for index in range(steps + 1):
-        value = index / steps if direction == "ascending" else 1.0 - index / steps
+        value = (
+            index / steps if direction == "ascending" else 1.0 - index / steps
+        )
         if shift != 1:
             # The shift formula operates on the increasing coordinate; shifting
             # in the sigma domain mirrors the time coordinate into it.
@@ -67,4 +80,8 @@ def make_schedule(
         coordinates.append(value)
 
     times = torch.tensor(coordinates, dtype=torch.float32, device=device)
-    return Schedule(times, times if direction == "descending" else 1.0 - times, tuple(coordinates))
+    return Schedule(
+        times,
+        times if direction == "descending" else 1.0 - times,
+        tuple(coordinates),
+    )

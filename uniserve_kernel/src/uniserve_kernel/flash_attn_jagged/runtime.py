@@ -1,4 +1,4 @@
-"""Bind the installed CuTe attention runtime and UniServe's visible-range mask."""
+"""Bind the installed CuTe attention runtime and the visible-range mask."""
 
 from flash_attn.cute.interface import _flash_attn_fwd as flash_attn_fwd
 

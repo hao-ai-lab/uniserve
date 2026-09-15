@@ -8,22 +8,26 @@ from ..types import Example
 from .base import Dataset
 
 _PROMPT = (
-    "integrated_multimodal_description: [Shot 1] A 9-second 16:9 widescreen educational "
-    "documentary tutorial in clean paper-textured motion-graphics design, following one "
-    "illustrated paper-craft instructor at a neatly gridded tabletop. The instructor places "
-    "a coral square of paper on the grid, aligns its corners, and folds it diagonally into a "
-    'sharp crease; a Japanese title card reading "折り紙ランタン" appears at the upper left, '
-    'while a thin animated guide line and the label "谷折り" appear beside the crease. The '
-    "overhead camera makes a measured push-in as the instructor smooths the fold, with small "
-    "geometric accents tracking the paper edges. [Shot 2] At 00:04.500, the same instructor "
-    "unfolds the paper, rotates it a quarter turn, and presses the intersecting creases into a "
-    "compact lantern shape; the camera cuts to a close three-quarter tabletop view and makes a "
-    "short lateral track to reveal the dimensional form. Animated arrows trace the final fold, "
-    'and the Japanese completion card "完成" settles along the lower edge as the instructor '
-    "places the lantern in a small cardboard tray. overall_soundscape: Close ASMR foley records "
-    "the paper's dry flex and crisp crease, fingertip taps on the matte work surface, and a soft "
-    "sleeve rustle, with a quiet studio room tone underneath. A small cardboard tray clicks when "
-    "the instructor sets the finished lantern down, while gentle breathing remains audible. "
+    "integrated_multimodal_description: [Shot 1] A 9-second 16:9 widescreen "
+    "educational documentary tutorial in clean paper-textured motion-graphics "
+    "design, following one illustrated paper-craft instructor at a neatly "
+    "gridded tabletop. The instructor places a coral square of paper on the "
+    "grid, aligns its corners, and folds it diagonally into a sharp crease; "
+    'a Japanese title card reading "折り紙ランタン" appears at the upper left, '
+    'while a thin animated guide line and the label "谷折り" appear beside '
+    "the crease. The overhead camera makes a measured push-in as the "
+    "instructor smooths the fold, with small geometric accents tracking the "
+    "paper edges. [Shot 2] At 00:04.500, the same instructor unfolds the "
+    "paper, rotates it a quarter turn, and presses the intersecting creases "
+    "into a compact lantern shape; the camera cuts to a close three-quarter "
+    "tabletop view and makes a short lateral track to reveal the dimensional "
+    "form. Animated arrows trace the final fold, and the Japanese completion "
+    'card "完成" settles along the lower edge as the instructor places the '
+    "lantern in a small cardboard tray. overall_soundscape: Close ASMR foley "
+    "records the paper's dry flex and crisp crease, fingertip taps on the "
+    "matte work surface, and a soft sleeve rustle, with a quiet studio room "
+    "tone underneath. A small cardboard tray clicks when the instructor sets "
+    "the finished lantern down, while gentle breathing remains audible. "
     "non_diegetic_music: N/A"
 )
 _SEED = 1000
@@ -37,15 +41,17 @@ class MiniMaxH3Dataset(Dataset):
     requires_tokenizer = True
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
-        """Construct repeated examples whose decoded prompt has the target length."""
-
+        """Construct repeated examples whose decoded prompt has the target length."""  # noqa: E501
         if tokenizer is None:
-            raise ValueError("MiniMax H3 benchmark prompt synthesis requires its tokenizer")
+            raise ValueError(
+                "MiniMax H3 benchmark prompt synthesis requires its tokenizer"
+            )
         target = int(self.point.video.prompt_tokens)
         base_ids = list(tokenizer.encode(_PROMPT, add_special_tokens=False))
         filler_ids = list(
             tokenizer.encode(
-                " A coherent continuation preserves the scene, motion, lighting, and sound.",
+                " A coherent continuation preserves the scene, motion, "
+                "lighting, and sound.",
                 add_special_tokens=False,
             )
         )
@@ -62,7 +68,8 @@ class MiniMaxH3Dataset(Dataset):
         measured = tokenizer.encode(prompt, add_special_tokens=False)
         if len(measured) != target:
             raise ValueError(
-                f"MiniMax H3 synthesized prompt measured {len(measured)} tokens, expected {target}"
+                f"MiniMax H3 synthesized prompt measured {len(measured)} "
+                f"tokens, expected {target}"
             )
         return [
             Example(

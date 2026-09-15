@@ -13,7 +13,10 @@ from ..foundation.errors import resource_error
 
 
 class MediaBuffers:
-    """Bounded pinned captures shared by bounded video decode implementations."""
+    """Bounded pinned captures shared by bounded video decode implementations.
+
+    Video and audio slots are leased from independent fixed free queues.
+    """
 
     def __init__(
         self,
@@ -25,8 +28,10 @@ class MediaBuffers:
         frame_rate: int,
         audio_rate: int,
     ) -> None:
-        """Allocate bounded video and audio tensors with independent free-slot queues."""
+        """Allocate bounded video and audio tensors.
 
+        Each tensor kind has an independent free-slot queue.
+        """
         self.video_capacity = int(state_slots) * int(unresolved_window)
         self.audio_capacity = int(state_slots)
         if min(self.video_capacity, self.audio_capacity) < 1:
@@ -35,11 +40,20 @@ class MediaBuffers:
         # One slot holds one decode round: packed RGB24 pixels for video, or
         # the clip's stereo int16 samples (2 channels x 2 bytes) for audio.
         video_bytes = (
-            int(max_video_frames_per_round) * int(video.frame.height) * int(video.frame.width) * 3
+            int(max_video_frames_per_round)
+            * int(video.frame.height)
+            * int(video.frame.width)
+            * 3
         )
-        audio_bytes = round(int(video.num_frames) * int(audio_rate) / int(frame_rate)) * 2 * 2
+        audio_bytes = (
+            round(int(video.num_frames) * int(audio_rate) / int(frame_rate))
+            * 2
+            * 2
+        )
         if min(video_bytes, audio_bytes) < 1:
-            raise ValueError("video output-ring media capacities must be positive")
+            raise ValueError(
+                "video output-ring media capacities must be positive"
+            )
 
         self._video_storage = tuple(
             torch.empty(video_bytes, dtype=torch.uint8, pin_memory=True)
@@ -55,9 +69,8 @@ class MediaBuffers:
         self._audio_free = list(range(self.audio_capacity - 1, -1, -1))
         self._lock = RLock()
 
-    def reserve(self, kind: str) -> "MediaLease":
+    def reserve(self, kind: str) -> MediaLease:
         """Lease an unused video or audio output slot from the fixed ring."""
-
         if kind not in {"video", "audio"}:
             raise ValueError(f"unknown video output-ring kind {kind!r}")
         with self._lock:
@@ -69,16 +82,16 @@ class MediaBuffers:
 
     def _storage(self, kind: str, index: int) -> torch.Tensor:
         """Return backing storage for one typed output-ring slot."""
-
         values = self._video_storage if kind == "video" else self._audio_storage
         return values[int(index)]
 
     def _release(self, kind: str, index: int) -> None:
         """Return a typed output-ring slot to its free queue."""
-
         with self._lock:
             free = self._video_free if kind == "video" else self._audio_free
-            capacity = self.video_capacity if kind == "video" else self.audio_capacity
+            capacity = (
+                self.video_capacity if kind == "video" else self.audio_capacity
+            )
             if int(index) in free or not 0 <= int(index) < capacity:
                 raise RuntimeError("video output-ring ownership is invalid")
             free.append(int(index))
@@ -86,7 +99,6 @@ class MediaBuffers:
     @property
     def used(self) -> tuple[int, int]:
         """Return the number of output-ring slots currently leased."""
-
         with self._lock:
             return (
                 self.video_capacity - len(self._video_free),
@@ -95,13 +107,15 @@ class MediaBuffers:
 
 
 class MediaLease:
-    """Grants exclusive access to one video output slot until immediate or deferred release."""
+    """Grants exclusive access to one video output slot.
+
+    The access lasts until immediate or deferred release.
+    """
 
     __slots__ = ("_ring", "kind", "index", "_released")
 
     def __init__(self, ring: MediaBuffers, kind: str, index: int) -> None:
         """Take exclusive ownership of one typed output-ring slot."""
-
         self._ring = ring
         self.kind = kind
         self.index = int(index)
@@ -109,23 +123,30 @@ class MediaLease:
 
     @property
     def storage(self) -> torch.Tensor:
-        """Expose the leased output tensor while this ring slot remains owned."""
+        """Expose the leased output tensor while this ring slot remains owned.
 
+        Access after release raises an error.
+        """
         if self._released:
-            raise RuntimeError("video output-ring storage was accessed after release")
+            raise RuntimeError(
+                "video output-ring storage was accessed after release"
+            )
         return self._ring._storage(self.kind, self.index)
 
     def release(self) -> None:
         """Return this output slot to the ring exactly once."""
-
         if self._released:
             return
         self._released = True
         self._ring._release(self.kind, self.index)
 
-    def defer_until_ready(self, completion: concurrent.futures.Future[None]) -> None:
-        """Keep this output slot leased until its existing device fence completes."""
+    def defer_until_ready(
+        self, completion: concurrent.futures.Future[None]
+    ) -> None:
+        """Keep this output slot leased.
 
+        The lease ends when its existing device fence completes.
+        """
         if self._released:
             return
         if completion.done():

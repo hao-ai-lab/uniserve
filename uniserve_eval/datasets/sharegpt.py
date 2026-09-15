@@ -15,14 +15,13 @@ SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
 
 
 class ShareGPTDataset(Dataset):
-    """Selects tokenized prompts and target lengths from ShareGPT conversations."""
+    """Selects tokenized prompts and target lengths from ShareGPT conversations."""  # noqa: E501
 
     name: ClassVar[str] = "sharegpt"
     requires_tokenizer: ClassVar[bool] = True
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
         """Return seeded, non-empty prompt and completion pairs."""
-
         if tokenizer is None:
             raise ValueError("dataset 'sharegpt' requires a tokenizer")
         point = self.point
@@ -47,8 +46,12 @@ class ShareGPTDataset(Dataset):
         ]
         dataset = [
             (
-                data.get("conversations", data.get("conversation", []))[0]["value"],
-                data.get("conversations", data.get("conversation", []))[1]["value"],
+                data.get("conversations", data.get("conversation", []))[0][
+                    "value"
+                ],
+                data.get("conversations", data.get("conversation", []))[1][
+                    "value"
+                ],
             )
             for data in dataset
         ]
@@ -77,7 +80,6 @@ class ShareGPTDataset(Dataset):
 
 def _is_file_valid_json(path: str) -> bool:
     """Report whether a path names a readable JSON document."""
-
     if not path or not os.path.isfile(path):
         return False
     try:

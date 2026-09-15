@@ -18,7 +18,9 @@ class Config:
 
 class Residual(nn.Module):
     def forward(self, hidden, residual, positions, attention):
-        return hidden, torch.zeros_like(hidden) if residual is None else residual
+        return hidden, torch.zeros_like(
+            hidden
+        ) if residual is None else residual
 
 
 class DenseAttention(nn.Module):
@@ -28,7 +30,9 @@ class DenseAttention(nn.Module):
 
     def forward(self, values):
         batch, tokens, heads, width = values.shape
-        lengths = SequenceLengths.from_lengths((tokens,) * batch, device=values.device)
+        lengths = SequenceLengths.from_lengths(
+            (tokens,) * batch, device=values.device
+        )
         inputs = VarlenInput(lengths, lengths, (False,) * batch)
         packed = values.reshape(-1, heads, width)
         return self.attention(packed, packed, packed, inputs).reshape_as(values)
@@ -41,10 +45,15 @@ class Model(nn.Module):
         embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         with torch.no_grad():
             embedding.weight.copy_(
-                torch.arange(config.vocab_size * config.hidden_size).reshape_as(embedding.weight)
+                torch.arange(config.vocab_size * config.hidden_size).reshape_as(
+                    embedding.weight
+                )
             )
         self.text_encoder = TextEncoder(
-            TransformerDecoder(embedding, nn.ModuleDict({"0": Residual()}), nn.Identity()), (0,)
+            TransformerDecoder(
+                embedding, nn.ModuleDict({"0": Residual()}), nn.Identity()
+            ),
+            (0,),
         )
         self.conditioner = Encoder(nn.Linear(4, 2, bias=False))
         with torch.no_grad():

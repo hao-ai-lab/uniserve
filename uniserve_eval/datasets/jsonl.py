@@ -32,7 +32,6 @@ class JsonlDataset(Dataset):
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
         """Read normalized rows up to the benchmark's declared count."""
-
         point = self.point
         if not point.dataset_path:
             raise ValueError("dataset 'jsonl' requires dataset_path")
@@ -45,11 +44,20 @@ class JsonlDataset(Dataset):
                 if not isinstance(raw, dict):
                     raise ValueError(f"jsonl row {line_no} must be an object")
                 if "id" not in raw or "prompt" not in raw:
-                    raise ValueError(f"jsonl row {line_no} requires id and prompt")
+                    raise ValueError(
+                        f"jsonl row {line_no} requires id and prompt"
+                    )
                 if ("width" in raw) != ("height" in raw):
-                    raise ValueError(f"jsonl row {line_no} must provide width and height together")
+                    raise ValueError(
+                        f"jsonl row {line_no} must provide width "
+                        f"and height together"
+                    )
                 fields = {key: raw[key] for key in _OPTIONAL if key in raw}
-                rows.append(Example(id=str(raw["id"]), prompt=str(raw["prompt"]), **fields))
+                rows.append(
+                    Example(
+                        id=str(raw["id"]), prompt=str(raw["prompt"]), **fields
+                    )
+                )
                 if len(rows) == point.load.num_prompts:
                     break
         return rows

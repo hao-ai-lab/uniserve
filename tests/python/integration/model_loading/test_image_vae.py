@@ -36,8 +36,12 @@ def _checkpoint(root):
     # Serialize the independently initialized model in the FLUX source format.
     tensors = {}
     for name, value in reference.state_dict().items():
-        name = re.sub(r"down_blocks\.(\d+)\.resnets\.(\d+)", r"down.\1.block.\2", name)
-        name = re.sub(r"down_blocks\.(\d+)\.downsamplers\.0", r"down.\1.downsample", name)
+        name = re.sub(
+            r"down_blocks\.(\d+)\.resnets\.(\d+)", r"down.\1.block.\2", name
+        )
+        name = re.sub(
+            r"down_blocks\.(\d+)\.downsamplers\.0", r"down.\1.downsample", name
+        )
         name = re.sub(
             r"up_blocks\.(\d+)\.resnets\.(\d+)",
             lambda match: f"up.{1 - int(match[1])}.block.{match[2]}",
@@ -49,12 +53,18 @@ def _checkpoint(root):
             name,
         )
         name = re.sub(
-            r"mid_block\.resnets\.(\d+)", lambda match: f"mid.block_{int(match[1]) + 1}", name
+            r"mid_block\.resnets\.(\d+)",
+            lambda match: f"mid.block_{int(match[1]) + 1}",
+            name,
         )
-        name = name.replace("conv_shortcut", "nin_shortcut").replace("conv_norm_out", "norm_out")
+        name = name.replace("conv_shortcut", "nin_shortcut").replace(
+            "conv_norm_out", "norm_out"
+        )
         if "mid_block.attentions.0" in name:
             name = name.replace("mid_block.attentions.0", "mid.attn_1")
-            name = name.replace("group_norm", "norm").replace("to_out.0", "proj_out")
+            name = name.replace("group_norm", "norm").replace(
+                "to_out.0", "proj_out"
+            )
             for branch in ("q", "k", "v"):
                 name = name.replace(f"to_{branch}", branch)
             if value.ndim == 2:
@@ -70,7 +80,9 @@ def test_posterior_and_reconstruction_match_flux_checkpoint(tmp_path):
     model = loading.load_model(
         vae.Model,
         config,
-        checkpoint=(checkpoint.Config("vae").resolve(tmp_path, io=loading.Config()),),
+        checkpoint=(
+            checkpoint.Config("vae").resolve(tmp_path, io=loading.Config()),
+        ),
         mapping=lambda model: (
             weights.ModuleMapping(
                 model,
@@ -85,11 +97,17 @@ def test_posterior_and_reconstruction_match_flux_checkpoint(tmp_path):
     pixels = torch.randn(2, 3, 8, 12)
     with torch.no_grad():
         posterior = reference.encode(pixels).latent_dist
-        expected = 0.5 * (posterior.sample(torch.Generator().manual_seed(8)) - 0.25)
-        latents = model.encode(pixels, generator=torch.Generator().manual_seed(8))
+        expected = 0.5 * (
+            posterior.sample(torch.Generator().manual_seed(8)) - 0.25
+        )
+        latents = model.encode(
+            pixels, generator=torch.Generator().manual_seed(8)
+        )
         torch.testing.assert_close(latents, expected, rtol=1e-5, atol=1e-6)
         reconstructed = reference.decode(latents / 0.5 + 0.25).sample
-        torch.testing.assert_close(model.decode(latents), reconstructed, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            model.decode(latents), reconstructed, rtol=1e-5, atol=1e-6
+        )
         torch.testing.assert_close(
             model(pixels, generator=torch.Generator().manual_seed(8)),
             reconstructed,
@@ -108,12 +126,17 @@ def test_posterior_and_reconstruction_match_flux_checkpoint(tmp_path):
             scale=0.5,
             shift=0.25,
         )
-        patches = codec.encode(pixels, generator=torch.Generator().manual_seed(8))
+        patches = codec.encode(
+            pixels, generator=torch.Generator().manual_seed(8)
+        )
         restored = codec.unpatchify(patches, image.Config(8, 12))
         torch.testing.assert_close(restored, latents.bfloat16(), rtol=0, atol=0)
         expected_pixels = (
             reference.decode(restored.float() / 0.5 + 0.25).sample * 0.5 + 0.5
         ).clamp(0, 1)
         torch.testing.assert_close(
-            codec.decode(patches, image.Config(8, 12)), expected_pixels, rtol=1e-5, atol=1e-6
+            codec.decode(patches, image.Config(8, 12)),
+            expected_pixels,
+            rtol=1e-5,
+            atol=1e-6,
         )

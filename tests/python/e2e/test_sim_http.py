@@ -80,7 +80,10 @@ def serving_lifecycle_metrics(text: str) -> dict[str, float]:
 def _control_ids_from_tokenizer_json(model: Path) -> dict[str, int]:
     tokenizer_path = model / "tokenizer.json"
     if not tokenizer_path.is_file():
-        pytest.fail(f"configured SenseNova checkpoint has no tokenizer.json: {tokenizer_path}")
+        pytest.fail(
+            f"configured SenseNova checkpoint has no tokenizer.json: "
+            f"{tokenizer_path}"
+        )
     payload = json.loads(tokenizer_path.read_text(encoding="utf-8"))
     control_ids = {
         str(token["content"]): int(token["id"])
@@ -88,7 +91,8 @@ def _control_ids_from_tokenizer_json(model: Path) -> dict[str, int]:
         if isinstance(token, dict) and token.get("content") in CONTROL_TOKENS
     }
     assert set(control_ids) == set(CONTROL_TOKENS), (
-        f"frontend tokenizer.json must define both SenseNova image controls; got {control_ids}"
+        "frontend tokenizer.json must define both SenseNova image controls; "
+        f"got {control_ids}"
     )
     return control_ids
 
@@ -96,11 +100,18 @@ def _control_ids_from_tokenizer_json(model: Path) -> dict[str, int]:
 def _control_ids_from_added_tokens(model: Path) -> dict[str, int]:
     path = model / "added_tokens.json"
     if not path.is_file():
-        pytest.fail(f"configured SenseNova checkpoint has no added_tokens.json: {path}")
+        pytest.fail(
+            f"configured SenseNova checkpoint has no added_tokens.json: {path}"
+        )
     payload = json.loads(path.read_text(encoding="utf-8"))
-    control_ids = {token: int(payload[token]) for token in CONTROL_TOKENS if token in payload}
+    control_ids = {
+        token: int(payload[token])
+        for token in CONTROL_TOKENS
+        if token in payload
+    }
     assert set(control_ids) == set(CONTROL_TOKENS), (
-        f"worker added_tokens.json must define both SenseNova image controls; got {control_ids}"
+        "worker added_tokens.json must define both SenseNova image controls; "
+        f"got {control_ids}"
     )
     return control_ids
 
@@ -108,7 +119,10 @@ def _control_ids_from_added_tokens(model: Path) -> dict[str, int]:
 def _control_ids_from_tokenizer_config(model: Path) -> dict[str, int]:
     path = model / "tokenizer_config.json"
     if not path.is_file():
-        pytest.fail(f"configured SenseNova checkpoint has no tokenizer_config.json: {path}")
+        pytest.fail(
+            f"configured SenseNova checkpoint has no tokenizer_config.json: "
+            f"{path}"
+        )
     payload = json.loads(path.read_text(encoding="utf-8"))
     decoder = payload.get("added_tokens_decoder", {})
     control_ids = {
@@ -117,13 +131,17 @@ def _control_ids_from_tokenizer_config(model: Path) -> dict[str, int]:
         if isinstance(entry, dict) and entry.get("content") in CONTROL_TOKENS
     }
     assert set(control_ids) == set(CONTROL_TOKENS), (
-        f"worker tokenizer_config.json must define both SenseNova image controls; got {control_ids}"
+        "worker tokenizer_config.json must define both SenseNova image "
+        f"controls; got {control_ids}"
     )
     return control_ids
 
 
 def active_sensenova_control_ids(model: Path) -> dict[str, int]:
-    """Assert frontend and worker loaders resolve the active image controls alike."""
+    """Assert frontend and worker loaders resolve the active image controls.
+
+    The resolution must be alike on both loaders.
+    """
     frontend_ids = _control_ids_from_tokenizer_json(model)
     added_token_ids = _control_ids_from_added_tokens(model)
     tokenizer_config_ids = _control_ids_from_tokenizer_config(model)
@@ -137,11 +155,15 @@ def active_sensenova_control_ids(model: Path) -> dict[str, int]:
         trust_remote_code=False,
     )
     worker_ids = {
-        token: int(worker_tokenizer.convert_tokens_to_ids(token)) for token in CONTROL_TOKENS
+        token: int(worker_tokenizer.convert_tokens_to_ids(token))
+        for token in CONTROL_TOKENS
     }
 
-    assert frontend_ids == added_token_ids == tokenizer_config_ids == worker_ids, (
-        "active SenseNova checkpoint has divergent server/worker image-control IDs: "
+    assert (
+        frontend_ids == added_token_ids == tokenizer_config_ids == worker_ids
+    ), (
+        "active SenseNova checkpoint has divergent server/worker "
+        "image-control IDs: "
         f"frontend={frontend_ids}, added_tokens={added_token_ids}, "
         f"tokenizer_config={tokenizer_config_ids}, worker={worker_ids}"
     )
@@ -161,7 +183,9 @@ def chat_sse_text(events: list[dict[str, object]]) -> str:
             if not isinstance(choice, dict):
                 continue
             delta = choice.get("delta")
-            if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+            if isinstance(delta, dict) and isinstance(
+                delta.get("content"), str
+            ):
                 chunks.append(str(delta["content"]))
     return "".join(chunks)
 
@@ -172,7 +196,9 @@ def chat_sse_finish(events: list[dict[str, object]]) -> str | None:
         if not isinstance(choices, list):
             continue
         for choice in choices:
-            if isinstance(choice, dict) and isinstance(choice.get("finish_reason"), str):
+            if isinstance(choice, dict) and isinstance(
+                choice.get("finish_reason"), str
+            ):
                 return str(choice["finish_reason"])
     return None
 
@@ -187,8 +213,14 @@ def chat_sse_images(events: list[dict[str, object]]) -> list[dict[str, object]]:
             if not isinstance(choice, dict):
                 continue
             delta = choice.get("delta")
-            if isinstance(delta, dict) and isinstance(delta.get("images"), list):
-                images.extend(image for image in delta["images"] if isinstance(image, dict))
+            if isinstance(delta, dict) and isinstance(
+                delta.get("images"), list
+            ):
+                images.extend(
+                    image
+                    for image in delta["images"]
+                    if isinstance(image, dict)
+                )
     return images
 
 
@@ -232,7 +264,9 @@ def configured_sim_server(
         "--log-stats",
         "false",
     ]
-    with server_process(args, base_url, tmp_path / "uniserve-sim.log", timeout_s=180) as _:
+    with server_process(
+        args, base_url, tmp_path / "uniserve-sim.log", timeout_s=180
+    ) as _:
         yield base_url
 
 
@@ -294,7 +328,10 @@ def test_qwen3_public_chat_funnel(tmp_path: Path):
             timeout=60,
         )
         assert unsupported_image_output.status_code == 400
-        assert "image_output" in unsupported_image_output.json()["error"]["message"]
+        assert (
+            "image_output"
+            in unsupported_image_output.json()["error"]["message"]
+        )
 
         unsupported_image_input = httpx.post(
             f"{base_url}/v1/chat/completions",
@@ -308,7 +345,10 @@ def test_qwen3_public_chat_funnel(tmp_path: Path):
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:image/png;base64,{tiny_input_png_b64()}"
+                                    "url": (
+                                        "data:image/png;base64,"
+                                        f"{tiny_input_png_b64()}"
+                                    )
                                 },
                             },
                         ],
@@ -318,7 +358,9 @@ def test_qwen3_public_chat_funnel(tmp_path: Path):
             timeout=60,
         )
         assert unsupported_image_input.status_code == 400
-        assert "image_input" in unsupported_image_input.json()["error"]["message"]
+        assert (
+            "image_input" in unsupported_image_input.json()["error"]["message"]
+        )
 
 
 def test_bagel_public_funnels(tmp_path: Path):
@@ -377,7 +419,10 @@ def test_bagel_public_funnels(tmp_path: Path):
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:image/png;base64,{tiny_input_png_b64()}"
+                                    "url": (
+                                        "data:image/png;base64,"
+                                        f"{tiny_input_png_b64()}"
+                                    )
                                 },
                             },
                         ],
@@ -416,7 +461,9 @@ def test_bagel_public_funnels(tmp_path: Path):
 def test_sim_http_configured_routes_and_evaluator(tmp_path: Path):
     # CPU simulation emits deterministic text and image fixtures through the
     # configured HTTP, scheduler, generation-event, and geometry behavior.
-    image_start_id = active_sensenova_control_ids(active_sensenova_model())["<img>"]
+    image_start_id = active_sensenova_control_ids(active_sensenova_model())[
+        "<img>"
+    ]
     with sim_server(tmp_path) as base_url:
         health_response = httpx.get(f"{base_url}/health", timeout=30)
         health_response.raise_for_status()
@@ -444,7 +491,10 @@ def test_sim_http_configured_routes_and_evaluator(tmp_path: Path):
             timeout=30,
         )
         assert unknown_chat_control.status_code == 400
-        assert unknown_chat_control.json()["error"]["type"] == "invalid_request_error"
+        assert (
+            unknown_chat_control.json()["error"]["type"]
+            == "invalid_request_error"
+        )
 
         unknown_image_control = httpx.post(
             f"{base_url}/v1/images/generations",
@@ -452,7 +502,10 @@ def test_sim_http_configured_routes_and_evaluator(tmp_path: Path):
             timeout=30,
         )
         assert unknown_image_control.status_code == 400
-        assert unknown_image_control.json()["error"]["type"] == "invalid_request_error"
+        assert (
+            unknown_image_control.json()["error"]["type"]
+            == "invalid_request_error"
+        )
 
         # The deterministic model emits EOS after eight tokens; this request
         # exercises EOS completion through the runtime.
@@ -463,7 +516,12 @@ def test_sim_http_configured_routes_and_evaluator(tmp_path: Path):
                 "model": "SenseNova-U1",
                 "stream": True,
                 "stream_options": {"include_usage": True},
-                "messages": [{"role": "user", "content": "Say hello from the sim backend."}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Say hello from the sim backend.",
+                    }
+                ],
                 "modalities": ["text"],
                 "max_completion_tokens": 16,
             },
@@ -531,7 +589,10 @@ def test_sim_http_configured_routes_and_evaluator(tmp_path: Path):
                 "messages": [
                     {
                         "role": "user",
-                        "content": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate.",
+                        "content": (
+                            "Generate a travel guide covering Sonoma, "
+                            "Sequoia, Tahoe, and the Golden Gate."
+                        ),
                     }
                 ],
                 "max_completion_tokens": 8,
@@ -557,12 +618,19 @@ def test_sim_http_configured_routes_and_evaluator(tmp_path: Path):
                         "content": [
                             {
                                 "type": "text",
-                                "text": "Use the input image as a color reference for a California travel image.",
+                                "text": (
+                                    "Use the input image as a color "
+                                    "reference for a California travel "
+                                    "image."
+                                ),
                             },
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:image/png;base64,{tiny_input_png_b64()}"
+                                    "url": (
+                                        "data:image/png;base64,"
+                                        f"{tiny_input_png_b64()}"
+                                    )
                                 },
                             },
                         ],
@@ -598,7 +666,10 @@ def test_sim_http_configured_routes_and_evaluator(tmp_path: Path):
                 {
                     "id": "sensenova-interleave",
                     "task": "interleave",
-                    "prompt": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate.",
+                    "prompt": (
+                        "Generate a travel guide covering Sonoma, Sequoia, "
+                        "Tahoe, and the Golden Gate."
+                    ),
                 }
             )
             + "\n",

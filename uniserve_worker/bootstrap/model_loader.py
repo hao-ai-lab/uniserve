@@ -13,18 +13,30 @@ from torch import nn
 
 from uniserve.loading import weights
 from uniserve.model import CausalLM, Denoiser, ImageDecoder, VideoDecoder
-from uniserve.nn.attention import AttentionParallelConfig, ContextParallelConfig, Ulysses
+from uniserve.nn.attention import (
+    AttentionParallelConfig,
+    ContextParallelConfig,
+    Ulysses,
+)
 from uniserve.nn.vae.patch import PatchAutoencoder
 from uniserve.quantization import QuantizationConfig, Quantizer
 from uniserve_models import loading as models
-from uniserve_models.processing import FlowPrompt, ImageProcessor, load_tokenizer
+from uniserve_models.processing import (
+    FlowPrompt,
+    ImageProcessor,
+    load_tokenizer,
+)
 from uniserve_models.stub import image_processor
 
 from ..config import WorkerConfig
 from ..execution.model_entry import ModelEntry
 from ..foundation.errors import unsupported_setup
 from ..runtime.results import resolve_outputs
-from .components import bind_components, describe_components, validate_components
+from .components import (
+    bind_components,
+    describe_components,
+    validate_components,
+)
 from .config import ComponentConfig, WorkerProcessArgs
 
 logger = logging.getLogger(__name__)
@@ -42,21 +54,29 @@ class WorkerModel:
 
 
 def prepare_worker_model(config: WorkerProcessArgs) -> models.Config | None:
-    """Resolve the resident checkpoint closure before creating process groups."""
+    """Resolve the resident checkpoint closure.
 
+    The closure is resolved before creating process groups.
+    """
     if config.use_stub_model:
         return None
 
     launch = config.model
     if launch is None:
-        raise RuntimeError("validated model worker is missing model configuration")
+        raise RuntimeError(
+            "validated model worker is missing model configuration"
+        )
 
     # A meta-device skeleton is enough to validate placement and select the
     # modules this rank must read from the checkpoint.
-    metadata = models.read_config(launch.path, io=config.load, modules=frozenset())
+    metadata = models.read_config(
+        launch.path, io=config.load, modules=frozenset()
+    )
     with torch.device("meta"):
         model = metadata.model_class(metadata.model)
-    declared = validate_components(model, dict(config.components), entries=metadata.entry_points)
+    declared = validate_components(
+        model, dict(config.components), entries=metadata.entry_points
+    )
 
     resident = frozenset(
         call.path
@@ -67,13 +87,15 @@ def prepare_worker_model(config: WorkerProcessArgs) -> models.Config | None:
     source = models.read_config(launch.path, io=config.load, modules=resident)
 
     return replace(
-        source, weights=_weight_config(source, launch.quantization_config, config.execution)
+        source,
+        weights=_weight_config(
+            source, launch.quantization_config, config.execution
+        ),
     )
 
 
 def _weight_config(source, options, execution) -> weights.Config:
     """Translate launch precision selectors into the public loading value."""
-
     unknown = options.keys() - {
         "mode",
         "quant_method",
@@ -82,9 +104,13 @@ def _weight_config(source, options, execution) -> weights.Config:
         "kv_cache_dtype",
     }
     if unknown:
-        raise ValueError(f"quantization_config has unknown fields {sorted(unknown)}")
+        raise ValueError(
+            f"quantization_config has unknown fields {sorted(unknown)}"
+        )
     if "mode" in options and "quant_method" in options:
-        raise ValueError("precision mode and quant_method are mutually exclusive")
+        raise ValueError(
+            "precision mode and quant_method are mutually exclusive"
+        )
 
     selected = options.get("mode", options.get("quant_method"))
     components = options.get("components", {})
@@ -96,14 +122,22 @@ def _weight_config(source, options, execution) -> weights.Config:
         factory = getattr(package, "weight_config", None)
         if factory is None:
             raise ValueError(
-                "this model exposes complete precision presets without component selectors"
+                "this model exposes complete precision presets "
+                "without component selectors"
             )
-        result = factory(preset="default" if selected is None else selected, **components)
+        result = factory(
+            preset="default" if selected is None else selected, **components
+        )
     elif selected is None:
         result = source.weights
     elif selected in source.precisions:
         result = source.precisions[selected]
-    elif "quant_method" in options and selected in {"unquantized", "fp8", "mxfp8", "nvfp4"}:
+    elif "quant_method" in options and selected in {
+        "unquantized",
+        "fp8",
+        "mxfp8",
+        "nvfp4",
+    }:
         quantizer = (
             None
             if selected == "unquantized"
@@ -112,14 +146,21 @@ def _weight_config(source, options, execution) -> weights.Config:
         result = replace(
             source.weights,
             quantization={
-                "": None if quantizer is None else QuantizationConfig(quantizer, quantizer)
+                "": None
+                if quantizer is None
+                else QuantizationConfig(quantizer, quantizer)
             },
         )
     else:
-        raise ValueError(f"unknown precision {selected!r}; choose from {tuple(source.precisions)}")
+        raise ValueError(
+            f"unknown precision {selected!r}; "
+            f"choose from {tuple(source.precisions)}"
+        )
 
     ignored = options.get("ignored_layers", ())
-    if not isinstance(ignored, (tuple, list)) or any(not isinstance(path, str) for path in ignored):
+    if not isinstance(ignored, (tuple, list)) or any(
+        not isinstance(path, str) for path in ignored
+    ):
         raise TypeError("ignored_layers must contain numerical module paths")
 
     return replace(
@@ -130,17 +171,22 @@ def _weight_config(source, options, execution) -> weights.Config:
 
 
 def attention_parallel(component: ComponentConfig) -> AttentionParallelConfig:
-    """Translate process degree declarations into mathematical attention axes."""
-
+    """Translate degree declarations into mathematical attention axes."""
     sequence = component.parallel_config.sequence_parallel
-    heads = Ulysses() if sequence.kind in {"ulysses", "hybrid", "attention2d"} else None
+    heads = (
+        Ulysses()
+        if sequence.kind in {"ulysses", "hybrid", "attention2d"}
+        else None
+    )
     context = None
     if sequence.kind == "allgather":
         context = ContextParallelConfig(gather_axis="cp")
     elif sequence.kind in {"ring", "hybrid"}:
         context = ContextParallelConfig(peer_axis="cp")
     elif sequence.kind == "attention2d":
-        context = ContextParallelConfig(gather_axis="cp_col", peer_axis="cp_row")
+        context = ContextParallelConfig(
+            gather_axis="cp_col", peer_axis="cp_row"
+        )
     return AttentionParallelConfig(heads=heads, context=context)
 
 
@@ -151,21 +197,28 @@ def load_worker_model(
     source: models.Config | None,
 ) -> WorkerModel:
     """Materialize selected modules and attach borrowed capability methods."""
-
     if config.use_stub_model:
         from uniserve_models.stub import Model
 
         model = Model().to(config.execution.device)
-        for path, device in (_devices(model, config.execution.generation_device) or {}).items():
+        for path, device in (
+            _devices(model, config.execution.generation_device) or {}
+        ).items():
             model.get_submodule(path).to(device)
         bind_components(model, bindings)
         return WorkerModel(
             model,
-            replace(config.execution, attention_backend="torch", encoder_cache_entries=1024),
+            replace(
+                config.execution,
+                attention_backend="torch",
+                encoder_cache_entries=1024,
+            ),
             image_processor=image_processor(),
         )
     if config.model is None or source is None:
-        raise RuntimeError("validated model worker is missing model configuration")
+        raise RuntimeError(
+            "validated model worker is missing model configuration"
+        )
 
     with torch.device("meta"):
         description = source.model_class(source.model)
@@ -182,7 +235,8 @@ def load_worker_model(
             path
             for path in paths
             if not any(
-                parent != path and (not parent or path.startswith(parent + ".")) for parent in paths
+                parent != path and (not parent or path.startswith(parent + "."))
+                for parent in paths
             )
         }
         for path in sorted(roots):
@@ -199,7 +253,9 @@ def load_worker_model(
     model = loaded.model
     bind_components(model, bindings, entries=source.entry_points)
 
-    worker_config = loaded_worker_config(model, config.execution, config.ipc.pipeline_depth)
+    worker_config = loaded_worker_config(
+        model, config.execution, config.ipc.pipeline_depth
+    )
     override = config.model.quantization_config.get("kv_cache_dtype")
     if override is not None:
         worker_config = replace(worker_config, kv_cache_dtype=override)
@@ -218,9 +274,10 @@ def load_worker_model(
     )
 
 
-def _devices(model: nn.Module, generation_device: str | None) -> Mapping[str, str] | None:
-    """Place the flow route and denoiser-specific modules on the selected device."""
-
+def _devices(
+    model: nn.Module, generation_device: str | None
+) -> Mapping[str, str] | None:
+    """Place the flow route and denoiser modules on the selected device."""
     if generation_device is None:
         return None
     text_modules = {
@@ -249,7 +306,9 @@ def _devices(model: nn.Module, generation_device: str | None) -> Mapping[str, st
         if id(module) in placed
     }
     if not paths:
-        raise unsupported_setup("generation device requires a model with a distinct flow route")
+        raise unsupported_setup(
+            "generation device requires a model with a distinct flow route"
+        )
     return paths
 
 
@@ -257,12 +316,12 @@ def loaded_worker_config(
     model: nn.Module, config: WorkerConfig, pipeline_depth: int
 ) -> WorkerConfig:
     """Resolve media request slots from the worker's publication lifetime."""
-
     if any(isinstance(module, VideoDecoder) for module in model.modules()):
         state_slots = min(config.max_batch_operations, pipeline_depth // 3)
         if state_slots < 2:
             raise unsupported_setup(
-                "resident media execution requires two slots with two unresolved outputs each"
+                "resident media execution requires two slots with "
+                "two unresolved outputs each"
             )
         config = replace(
             config,

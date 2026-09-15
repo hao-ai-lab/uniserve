@@ -19,10 +19,11 @@ def _plan_workspace(wrapper: Any) -> Iterator[None]:
     allocation plus allocator stream tracking protects both reuse and teardown
     while allowing CPU planning to continue asynchronously.
     """
-
     from uniserve_kernel.peer_memory import record_host_usage
 
-    source = torch.empty_like(wrapper._pin_memory_int_workspace_buffer, pin_memory=True)
+    source = torch.empty_like(
+        wrapper._pin_memory_int_workspace_buffer, pin_memory=True
+    )
     wrapper._pin_memory_int_workspace_buffer = source
     try:
         yield
@@ -32,7 +33,11 @@ def _plan_workspace(wrapper: Any) -> Iterator[None]:
 
 @dataclass(frozen=True)
 class _FastDecodePlanDefaults:
-    """Captures dtype and split-KV defaults required by FlashInfer fast decode planning."""
+    """Capture fast decode planning defaults.
+
+    Captures dtype and split-KV defaults required by FlashInfer fast decode
+    planning.
+    """
 
     q_data_type: torch.dtype | str
     kv_data_type: torch.dtype | str
@@ -42,7 +47,11 @@ class _FastDecodePlanDefaults:
 
 @dataclass(frozen=True)
 class _FastDecodePlanImports:
-    """Holds resolved FlashInfer helpers required to construct sequence metadata."""
+    """Hold resolved FlashInfer helpers.
+
+    Holds resolved FlashInfer helpers required to construct sequence
+    metadata.
+    """
 
     get_range_buf: Callable[..., torch.Tensor]
     get_seq_lens: Callable[..., torch.Tensor]
@@ -50,7 +59,10 @@ class _FastDecodePlanImports:
 
 @dataclass(frozen=True)
 class _FastDecodePlanHostTensors:
-    """Holds CPU planning tensors derived from device-resident decode metadata."""
+    """Hold CPU planning tensors.
+
+    Holds CPU planning tensors derived from device-resident decode metadata.
+    """
 
     qo_indptr: torch.Tensor
     indptr: torch.Tensor
@@ -83,12 +95,15 @@ def _fast_decode_plan_with_cpu_metadata(
     global_override_last_page_len_cpu: torch.Tensor | None = None,
 ) -> bool:
     """Plan decode with explicit CPU indptr and last-page metadata overrides."""
-
-    imports = _fast_decode_plan_imports(wrapper, global_override_last_page_len_cpu)
+    imports = _fast_decode_plan_imports(
+        wrapper, global_override_last_page_len_cpu
+    )
     if imports is None or global_override_last_page_len_cpu is None:
         return False
     cached_module = getattr(wrapper, "_cached_module", None)
-    if cached_module is None or not callable(getattr(cached_module, "plan", None)):
+    if cached_module is None or not callable(
+        getattr(cached_module, "plan", None)
+    ):
         return False
 
     defaults = _fast_decode_plan_defaults(
@@ -132,7 +147,6 @@ def _fast_decode_plan_imports(
     global_override_last_page_len_cpu: torch.Tensor | None,
 ) -> _FastDecodePlanImports | None:
     """Resolve planner internals required for CPU-metadata decode planning."""
-
     if not bool(getattr(wrapper, "use_tensor_cores", False)):
         return None
     if global_override_last_page_len_cpu is None:
@@ -152,8 +166,11 @@ def _fast_decode_plan_defaults(
     logits_soft_cap: float | None,
     fixed_split_size: int | None,
 ) -> _FastDecodePlanDefaults:
-    """Normalize optional dtype, soft-cap, and split-KV settings for fast planning."""
+    """Normalize fast planning settings.
 
+    Normalize optional dtype, soft-cap, and split-KV settings for fast
+    planning.
+    """
     if data_type is not None:
         q_data_type = data_type if q_data_type is None else q_data_type
         kv_data_type = data_type if kv_data_type is None else kv_data_type
@@ -195,8 +212,11 @@ def _apply_fast_plan_overrides(
     global_override_indptr_cpu: torch.Tensor | None,
     global_override_last_page_len_cpu: torch.Tensor,
 ) -> None:
-    """Bind reusable metadata buffers, invoke the cached planner, and stamp scalar settings."""
+    """Invoke the cached planner with bound metadata.
 
+    Bind reusable metadata buffers, invoke the cached planner, and stamp
+    scalar settings.
+    """
     is_graph = bool(getattr(wrapper, "is_cuda_graph_enabled", False))
     _prepare_fast_decode_plan_buffers(
         wrapper,
@@ -260,8 +280,11 @@ def _fast_decode_plan_host_tensors(
     non_blocking: bool,
     is_graph: bool,
 ) -> _FastDecodePlanHostTensors:
-    """Prepare pinned host indptr and KV-length tensors required by the fast planner."""
+    """Prepare pinned host planning tensors.
 
+    Prepare pinned host indptr and KV-length tensors required by the fast
+    planner.
+    """
     qo_indptr_host = _prepare_fast_decode_qo_indptr(
         wrapper,
         indptr,
@@ -271,7 +294,9 @@ def _fast_decode_plan_host_tensors(
         is_graph=is_graph,
     )
     indptr_host = _cpu_int32_tensor(
-        global_override_indptr_cpu if global_override_indptr_cpu is not None else indptr.cpu()
+        global_override_indptr_cpu
+        if global_override_indptr_cpu is not None
+        else indptr.cpu()
     )
     last_page_len_host = _cpu_int32_tensor(global_override_last_page_len_cpu)
     return _FastDecodePlanHostTensors(
@@ -298,8 +323,11 @@ def _invoke_fast_decode_plan(
     disable_split_kv: bool,
     is_graph: bool,
 ) -> None:
-    """Invoke the cached decode planner with normalized host metadata and split settings."""
+    """Invoke the cached decode planner.
 
+    Invoke the cached decode planner with normalized host metadata and
+    split settings.
+    """
     with _wrapper_device_context(wrapper):
         wrapper._plan_info = cached_module.plan(
             *_fast_decode_plan_args(
@@ -329,10 +357,14 @@ def _prepare_fast_decode_plan_buffers(
     batch_size: int,
     is_graph: bool,
 ) -> None:
-    """Bind reusable page metadata tensors to the wrapper before fast planning."""
+    """Bind reusable page metadata tensors.
 
+    Bind reusable page metadata tensors to the wrapper before fast planning.
+    """
     if is_graph:
-        fixed_batch_size = int(getattr(wrapper, "_fixed_batch_size", batch_size))
+        fixed_batch_size = int(
+            getattr(wrapper, "_fixed_batch_size", batch_size)
+        )
         if batch_size != fixed_batch_size:
             raise ValueError(
                 "The batch size should be fixed in cudagraph mode, the runtime "
@@ -342,7 +374,8 @@ def _prepare_fast_decode_plan_buffers(
         indices_buffer = getattr(wrapper, "_paged_kv_indices_buf", None)
         if indices_buffer is not None and len(indices) > len(indices_buffer):
             raise ValueError(
-                "The size of indices should be less than or equal to the allocated buffer"
+                "The size of indices should be less than or equal to the "
+                "allocated buffer"
             )
         return
     wrapper._paged_kv_indptr_buf = indptr
@@ -360,7 +393,6 @@ def _prepare_fast_decode_qo_indptr(
     is_graph: bool,
 ) -> torch.Tensor:
     """Build the fixed one-query-per-row host indptr used by decode planning."""
-
     qo_indptr_host = get_range_buf(batch_size + 1, "cpu")
     if not is_graph:
         wrapper._qo_indptr_buf = qo_indptr_host.to(
@@ -372,7 +404,6 @@ def _prepare_fast_decode_qo_indptr(
 
 def _cpu_int32_tensor(tensor: torch.Tensor) -> torch.Tensor:
     """Copy plan metadata to contiguous CPU int32 storage."""
-
     if tensor.device.type == "cpu" and tensor.dtype == torch.int32:
         return tensor
     return tensor.to(device="cpu", dtype=torch.int32)
@@ -394,12 +425,14 @@ def _fast_decode_plan_args(
     disable_split_kv: bool,
     is_graph: bool,
 ) -> list[Any]:
-    """Assemble the ordered low-level argument tuple for the installed decode planner.
+    """Assemble the planner argument tuple.
+
+    Assemble the ordered low-level argument tuple for the installed decode
+    planner.
 
     The positional order mirrors the cached FlashInfer decode module's plan()
     signature and is fixed by the installed FlashInfer build.
     """
-
     args = [
         wrapper._float_workspace_buffer,
         wrapper._int_workspace_buffer,
@@ -435,7 +468,6 @@ def _stamp_fast_decode_plan_scalars(
     rope_theta: float | None,
 ) -> None:
     """Write normalized scalar attention settings onto the planner wrapper."""
-
     wrapper._pos_encoding_mode = pos_encoding_mode
     wrapper._window_left = window_left
     wrapper._logits_soft_cap = logits_soft_cap
@@ -445,8 +477,11 @@ def _stamp_fast_decode_plan_scalars(
 
 
 def _wrapper_device_context(wrapper: Any):
-    """Return the wrapper device context or a no-op context when none is declared."""
+    """Return the wrapper device context.
 
+    Return the wrapper device context or a no-op context when none is
+    declared.
+    """
     raw_device = getattr(wrapper, "device", None)
     if raw_device is None:
         return nullcontext()

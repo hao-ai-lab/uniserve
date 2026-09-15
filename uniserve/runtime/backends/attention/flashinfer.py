@@ -1,4 +1,8 @@
-"""FlashInfer attention with explicit host planning and graph-stable page metadata."""
+"""FlashInfer attention with host planning and graph-stable metadata.
+
+FlashInfer attention with explicit host planning and graph-stable page
+metadata.
+"""
 
 from dataclasses import dataclass
 from itertools import accumulate
@@ -19,14 +23,20 @@ from uniserve.tensors import BufferConfig
 
 from . import Backend as _Backend
 from . import Operator as _Operator
-from ._flashinfer_plan import _fast_decode_plan_with_cpu_metadata, _plan_workspace
+from ._flashinfer_plan import (
+    _fast_decode_plan_with_cpu_metadata,
+    _plan_workspace,
+)
 
 __all__ = ["Backend", "Config"]
 
 
 @dataclass(frozen=True)
 class Config:
-    """FlashInfer workspace, kernel families, split-KV policy and host planning."""
+    """FlashInfer kernel and planning configuration.
+
+    FlashInfer workspace, kernel families, split-KV policy and host planning.
+    """
 
     workspace_size: int = 512 * 1024 * 1024
     use_tensor_core: bool | None = None
@@ -56,7 +66,12 @@ def _tensor_cores(config, num_heads, num_kv_heads):
 
 @triton.jit
 def _page_indices(
-    table, counts, indptr, indices, row_stride: tl.constexpr, column_stride: tl.constexpr
+    table,
+    counts,
+    indptr,
+    indices,
+    row_stride: tl.constexpr,
+    column_stride: tl.constexpr,
 ):
     # Copy one sequence's live page IDs into the compact CSR `indices` array
     # that native wrappers consume; `indptr` delimits each sequence's segment.
@@ -67,13 +82,19 @@ def _page_indices(
 
     for tile in range(tl.cdiv(count, 256)):
         offset = tile * 256 + columns
-        values = tl.load(table + row * row_stride + offset * column_stride, offset < count, other=0)
+        values = tl.load(
+            table + row * row_stride + offset * column_stride,
+            offset < count,
+            other=0,
+        )
         tl.store(indices + start + offset, values, offset < count)
 
 
 def _host(values):
-    """Build a pinned int32 CPU tensor for a non-blocking plan metadata upload."""
+    """Build a pinned int32 CPU tensor.
 
+    Build a pinned int32 CPU tensor for a non-blocking plan metadata upload.
+    """
     return torch.tensor(values, dtype=torch.int32, pin_memory=True)
 
 
@@ -94,10 +115,16 @@ class _PagePlan:
         self.capacity = table.indices.numel()
 
         with torch.inference_mode(False):
-            self.query_offsets = torch.empty(count + 1, dtype=torch.int32, device=self.device)
+            self.query_offsets = torch.empty(
+                count + 1, dtype=torch.int32, device=self.device
+            )
             self.indptr = torch.empty_like(self.query_offsets)
-            self.indices = torch.empty(max(1, self.capacity), dtype=torch.int32, device=self.device)
-            self.last = torch.empty(count, dtype=torch.int32, device=self.device)
+            self.indices = torch.empty(
+                max(1, self.capacity), dtype=torch.int32, device=self.device
+            )
+            self.last = torch.empty(
+                count, dtype=torch.int32, device=self.device
+            )
             self.counts = torch.empty_like(self.last)
 
             if custom:
@@ -105,13 +132,19 @@ class _PagePlan:
                 # query rows, including byte padding between sequences.
                 bits = sum(queries) * table.indices.shape[1] * table.block_size
                 self.mask = torch.empty(
-                    (bits + 7) // 8 + count, dtype=torch.uint8, device=self.device
+                    (bits + 7) // 8 + count,
+                    dtype=torch.uint8,
+                    device=self.device,
                 )
                 self.mask_offsets = torch.empty_like(self.query_offsets)
                 self.key_offsets = torch.empty_like(self.query_offsets)
-                self.causal = torch.empty(count, dtype=torch.int32, device=self.device)
+                self.causal = torch.empty(
+                    count, dtype=torch.int32, device=self.device
+                )
             else:
-                self.mask = self.mask_offsets = self.key_offsets = self.causal = None
+                self.mask = self.mask_offsets = self.key_offsets = (
+                    self.causal
+                ) = None
             if decode:
                 self.wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                     owner.workspace["scratch"],
@@ -142,40 +175,51 @@ class _PagePlan:
     def bind(self, owner, queries, keys, table, *, causal):
         # Host page counts and last-page lengths come from declared lengths;
         # physical page IDs are refreshed on device by fill().
-        counts = tuple((length + table.block_size - 1) // table.block_size for length in keys)
+        counts = tuple(
+            (length + table.block_size - 1) // table.block_size
+            for length in keys
+        )
         indptr = _host(tuple(accumulate(counts, initial=0)))
-        last = _host(tuple((length - 1) % table.block_size + 1 if length else 0 for length in keys))
+        last = _host(
+            tuple(
+                (length - 1) % table.block_size + 1 if length else 0
+                for length in keys
+            )
+        )
 
         self.counts.copy_(_host(counts), non_blocking=True)
         self.indptr.copy_(indptr, non_blocking=True)
         self.last.copy_(last, non_blocking=True)
         self.fill(table)
 
-        options = dict(
-            q_data_type=owner.dtype,
-            kv_data_type=owner.dtype,
-            non_blocking=True,
-            fixed_split_size=(
+        options = {
+            "q_data_type": owner.dtype,
+            "kv_data_type": owner.dtype,
+            "non_blocking": True,
+            "fixed_split_size": (
                 owner.config.decode_split_tile_size
                 if self.decode
                 else owner.config.prefill_split_tile_size
             ),
-            disable_split_kv=owner.config.disable_split_kv,
-        )
+            "disable_split_kv": owner.config.disable_split_kv,
+        }
         with _plan_workspace(self.wrapper):
             if self.decode:
-                if owner.config.fast_decode_plan and _fast_decode_plan_with_cpu_metadata(
-                    self.wrapper,
-                    self.indptr,
-                    self.indices[: sum(counts)],
-                    self.last,
-                    owner.num_heads,
-                    owner.num_kv_heads,
-                    owner.head_dim,
-                    table.block_size,
-                    global_override_indptr_cpu=indptr,
-                    global_override_last_page_len_cpu=last,
-                    **options,
+                if (
+                    owner.config.fast_decode_plan
+                    and _fast_decode_plan_with_cpu_metadata(
+                        self.wrapper,
+                        self.indptr,
+                        self.indices[: sum(counts)],
+                        self.last,
+                        owner.num_heads,
+                        owner.num_kv_heads,
+                        owner.head_dim,
+                        table.block_size,
+                        global_override_indptr_cpu=indptr,
+                        global_override_last_page_len_cpu=last,
+                        **options,
+                    )
                 ):
                     return
                 self.wrapper.plan(
@@ -207,16 +251,21 @@ class _PagePlan:
         if self.mask is not None:
             byte_offsets = tuple(
                 accumulate(
-                    ((q * k + 7) // 8 for q, k in zip(queries, keys, strict=True)), initial=0
+                    (
+                        (q * k + 7) // 8
+                        for q, k in zip(queries, keys, strict=True)
+                    ),
+                    initial=0,
                 )
             )
             self.mask_offsets.copy_(_host(byte_offsets), non_blocking=True)
-            self.key_offsets.copy_(_host(tuple(accumulate(keys, initial=0))), non_blocking=True)
+            self.key_offsets.copy_(
+                _host(tuple(accumulate(keys, initial=0))), non_blocking=True
+            )
             self.causal.copy_(_host(causal), non_blocking=True)
 
     def fill(self, table):
         """Refresh device page IDs from the current block table."""
-
         if self.counts.numel():
             _page_indices[(self.counts.numel(),)](
                 table.indices,
@@ -227,7 +276,18 @@ class _PagePlan:
                 table.indices.stride(1),
             )
 
-    def run(self, query, key, value, table, *, scale, out=None, lse=False, visible=None):
+    def run(
+        self,
+        query,
+        key,
+        value,
+        table,
+        *,
+        scale,
+        out=None,
+        lse=False,
+        visible=None,
+    ):
         self.fill(table)
 
         if self.mask is not None:
@@ -246,7 +306,9 @@ class _PagePlan:
         # The native run consumes this scalar; all shape-dependent planning is
         # performed by bind, outside capture. The caller owns its score scale.
         self.wrapper._sm_scale = scale
-        return self.wrapper.run(query.contiguous(), (key, value), out=out, return_lse=lse)
+        return self.wrapper.run(
+            query.contiguous(), (key, value), out=out, return_lse=lse
+        )
 
 
 @triton.jit
@@ -267,12 +329,15 @@ def _ragged_mask(
     byte = tl.program_id(0) * 128 + tl.arange(0, 128)
     total = tl.load(mask_offsets + count)
     if tl.program_id(0) * 128 < total:
-        # Binary-search the sequence owning each mask byte; offsets are monotone.
+        # Binary-search the sequence owning each mask byte; offsets are
+        # monotone.
         low = tl.full((128,), 0, tl.int32)
         high = tl.full((128,), count, tl.int32)
         for _ in range((count + 1).bit_length()):
             middle = (low + high) // 2
-            end = tl.load(mask_offsets + middle + 1, middle < count, other=0x7FFFFFFF)
+            end = tl.load(
+                mask_offsets + middle + 1, middle < count, other=0x7FFFFFFF
+            )
             advance = byte >= end
             low = tl.where(advance, middle + 1, low)
             high = tl.where(advance, high, middle)
@@ -282,11 +347,16 @@ def _ragged_mask(
         qlen = tl.load(query_offsets + row + 1) - tl.load(query_offsets + row)
         klen = tl.load(key_offsets + row + 1) - tl.load(key_offsets + row)
 
-        # Each byte packs eight consecutive keys of one query row, little-endian.
+        # Each byte packs eight consecutive keys of one query row,
+        # little-endian.
         bit = (byte[:, None] - begin[:, None]) * 8 + tl.arange(0, 8)[None, :]
         query = bit // tl.maximum(klen[:, None], 1)
         key = bit % tl.maximum(klen[:, None], 1)
-        valid = (byte[:, None] < total) & (query < qlen[:, None]) & (klen[:, None] > 0)
+        valid = (
+            (byte[:, None] < total)
+            & (query < qlen[:, None])
+            & (klen[:, None] > 0)
+        )
 
         if use_visible:
             limit = tl.load(
@@ -298,7 +368,8 @@ def _ragged_mask(
         else:
             is_causal = tl.load(causal + row)
             allowed = valid & (
-                (is_causal[:, None] == 0) | (key <= query + klen[:, None] - qlen[:, None])
+                (is_causal[:, None] == 0)
+                | (key <= query + klen[:, None] - qlen[:, None])
             )
 
         value = tl.sum(allowed.to(tl.int32) << tl.arange(0, 8)[None, :], axis=1)
@@ -314,14 +385,26 @@ class _RaggedPlan:
         self.count = len(batch.queries.host)
         device = owner.workspace["scratch"].device
         with torch.inference_mode(False):
-            self.query_offsets = torch.empty(self.count + 1, dtype=torch.int32, device=device)
+            self.query_offsets = torch.empty(
+                self.count + 1, dtype=torch.int32, device=device
+            )
             self.key_offsets = torch.empty_like(self.query_offsets)
-            self.mask_offsets = torch.empty_like(self.query_offsets) if custom else None
+            self.mask_offsets = (
+                torch.empty_like(self.query_offsets) if custom else None
+            )
             # Preserve capacity when the same total Q/K rows are repartitioned.
-            capacity = (batch.queries.num_tokens * batch.keys.num_tokens + 7) // 8 + self.count
-            self.mask = torch.empty(capacity, dtype=torch.uint8, device=device) if custom else None
+            capacity = (
+                batch.queries.num_tokens * batch.keys.num_tokens + 7
+            ) // 8 + self.count
+            self.mask = (
+                torch.empty(capacity, dtype=torch.uint8, device=device)
+                if custom
+                else None
+            )
             self.causal = (
-                torch.empty(self.count, dtype=torch.int32, device=device) if custom else None
+                torch.empty(self.count, dtype=torch.int32, device=device)
+                if custom
+                else None
             )
         self.wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             owner.workspace["scratch"],
@@ -335,7 +418,11 @@ class _RaggedPlan:
 
     def bind(self, owner, batch):
         queries, keys = batch.queries.host, batch.keys.host
-        causal = batch.causal if isinstance(batch, VarlenInput) else (False,) * self.count
+        causal = (
+            batch.causal
+            if isinstance(batch, VarlenInput)
+            else (False,) * self.count
+        )
         with _plan_workspace(self.wrapper):
             self.wrapper.plan(
                 _host(tuple(accumulate(queries, initial=0))),
@@ -357,7 +444,11 @@ class _RaggedPlan:
             # whole byte; install those explicit offsets after native planning.
             offsets = tuple(
                 accumulate(
-                    ((q * k + 7) // 8 for q, k in zip(queries, keys, strict=True)), initial=0
+                    (
+                        (q * k + 7) // 8
+                        for q, k in zip(queries, keys, strict=True)
+                    ),
+                    initial=0,
                 )
             )
             self.mask_offsets.copy_(_host(offsets), non_blocking=True)
@@ -365,7 +456,9 @@ class _RaggedPlan:
 
     def run(self, q, k, v, batch, *, scale, out=None, lse=False):
         if self.mask is not None:
-            visible = batch.visible_end if isinstance(batch, VisibleInput) else None
+            visible = (
+                batch.visible_end if isinstance(batch, VisibleInput) else None
+            )
             _ragged_mask[(triton.cdiv(self.mask.numel(), 128),)](
                 self.query_offsets,
                 self.key_offsets,
@@ -380,7 +473,11 @@ class _RaggedPlan:
             )
         self.wrapper._sm_scale = scale
         return self.wrapper.run(
-            q.contiguous(), k.contiguous(), v.contiguous(), out=out, return_lse=lse
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            out=out,
+            return_lse=lse,
         )
 
 
@@ -390,17 +487,25 @@ class _FlashInfer(_Operator):
         self.config = config
         import flashinfer
 
-        if self.dtype not in {torch.float16, torch.bfloat16} or self.head_dim not in {
+        if self.dtype not in {
+            torch.float16,
+            torch.bfloat16,
+        } or self.head_dim not in {
             64,
             128,
             256,
             512,
         }:
             raise ValueError(
-                "FlashInfer requires FP16/BF16 queries with head dimensions 64, 128, 256 or 512"
+                "FlashInfer requires FP16/BF16 queries with head "
+                "dimensions 64, 128, 256 or 512"
             )
-        if self.cache is not None and isinstance(self.cache.key, QuantizedTensor):
-            raise ValueError("FlashInfer does not consume per-block FP8 prefix scales")
+        if self.cache is not None and isinstance(
+            self.cache.key, QuantizedTensor
+        ):
+            raise ValueError(
+                "FlashInfer does not consume per-block FP8 prefix scales"
+            )
         self._single = flashinfer.single_prefill_with_kv_cache
         self._merge = flashinfer.merge_state
         self._plans = {}
@@ -425,7 +530,9 @@ class _FlashInfer(_Operator):
         )
         plan = self._plans.get(signature)
         if plan is None:
-            plan = _PagePlan(self, queries=queries, table=table, decode=decode, custom=custom)
+            plan = _PagePlan(
+                self, queries=queries, table=table, decode=decode, custom=custom
+            )
             self._plans[signature] = plan
         plan.bind(self, queries, keys, table, causal=causal)
         return plan
@@ -442,7 +549,9 @@ class _FlashInfer(_Operator):
             batch.queries.num_tokens,
             batch.keys.num_tokens,
             custom,
-            batch.causal[0] if isinstance(batch, VarlenInput) and not custom else False,
+            batch.causal[0]
+            if isinstance(batch, VarlenInput) and not custom
+            else False,
         )
         plan = self._plans.get(signature)
         if plan is None:
@@ -464,7 +573,10 @@ class _FlashInfer(_Operator):
             self._ragged = self._ragged_plan(batch)
         elif isinstance(batch, PagedInput):
             lengths = tuple(
-                a + b for a, b in zip(batch.prefixes.host, batch.queries.host, strict=True)
+                a + b
+                for a, b in zip(
+                    batch.prefixes.host, batch.queries.host, strict=True
+                )
             )
             self._paged = self._page_plan(
                 batch.queries.host,
@@ -483,7 +595,9 @@ class _FlashInfer(_Operator):
             )
         elif isinstance(batch, SegmentedInput):
             if self.cache is None:
-                raise RuntimeError("segmented attention requires bound prefix state")
+                raise RuntimeError(
+                    "segmented attention requires bound prefix state"
+                )
             self._paged = self._page_plan(
                 batch.queries.host,
                 batch.prefixes.host,
@@ -504,14 +618,22 @@ class _FlashInfer(_Operator):
         if causal and mask is not None:
             # Fold causality into the custom mask; single_prefill accepts only
             # one of the two.
-            rows = torch.arange(q.shape[0], device=q.device) + k.shape[0] - q.shape[0]
+            rows = (
+                torch.arange(q.shape[0], device=q.device)
+                + k.shape[0]
+                - q.shape[0]
+            )
             columns = torch.arange(k.shape[0], device=q.device)
             mask = mask & (columns[None] <= rows[:, None])
             causal = False
 
         if not k.shape[0]:
             result = torch.zeros_like(q)
-            return (result, torch.full(q.shape[:2], -torch.inf, device=q.device)) if lse else result
+            return (
+                (result, torch.full(q.shape[:2], -torch.inf, device=q.device))
+                if lse
+                else result
+            )
 
         return self._single(
             q.contiguous(),
@@ -527,7 +649,10 @@ class _FlashInfer(_Operator):
     def __call__(self, q, k, v, batch, *, scale, out):
         self._validate(q, k, v, batch, out)
 
-        if isinstance(batch, (PagedInput, SegmentedInput)) and batch.write_indices is not None:
+        if (
+            isinstance(batch, (PagedInput, SegmentedInput))
+            and batch.write_indices is not None
+        ):
             self.update_cache(k, v, indices=batch.write_indices)
 
         if not q.numel():
@@ -537,7 +662,16 @@ class _FlashInfer(_Operator):
             if batch.mask is not None and batch.mask.dtype != torch.bool:
                 raise ValueError("FlashInfer custom masks must be boolean")
             if q.ndim == 3:
-                out.copy_(self._dense(q, k, v, scale=scale, causal=batch.causal, mask=batch.mask))
+                out.copy_(
+                    self._dense(
+                        q,
+                        k,
+                        v,
+                        scale=scale,
+                        causal=batch.causal,
+                        mask=batch.mask,
+                    )
+                )
             else:
                 for row in range(q.shape[0]):
                     mask = batch.mask
@@ -555,10 +689,18 @@ class _FlashInfer(_Operator):
                     )
             return out
         if isinstance(batch, SegmentedInput):
-            # Merge the current-window and prefix partial states with online softmax.
-            current = self._ragged.run(q, k, v, self._current, scale=scale, lse=True)
+            # Merge the current-window and prefix partial states with
+            # online softmax.
+            current = self._ragged.run(
+                q, k, v, self._current, scale=scale, lse=True
+            )
             prefix = self._paged.run(
-                q, self.cache.key, self.cache.value, batch.block_table, scale=scale, lse=True
+                q,
+                self.cache.key,
+                self.cache.value,
+                batch.block_table,
+                scale=scale,
+                lse=True,
             )
             result, _ = self._merge(*current, *prefix)
             out.copy_(result)
@@ -567,14 +709,22 @@ class _FlashInfer(_Operator):
         if self._ragged is not None:
             return self._ragged.run(q, k, v, batch, scale=scale, out=out)
 
-        key, value = (k, v) if self.cache is None else (self.cache.key, self.cache.value)
+        key, value = (
+            (k, v) if self.cache is None else (self.cache.key, self.cache.value)
+        )
         visible = (
             batch.visible_end
             if isinstance(batch, VisibleInput) and not batch.fully_visible
             else None
         )
         return self._paged.run(
-            q, key, value, batch.block_table, scale=scale, out=out, visible=visible
+            q,
+            key,
+            value,
+            batch.block_table,
+            scale=scale,
+            out=out,
+            visible=visible,
         )
 
     def close(self):
@@ -590,7 +740,9 @@ class Backend(_Backend):
         self.config = config
 
     def workspace_buffers(self, **kwargs):
-        return {"scratch": BufferConfig((self.config.workspace_size,), torch.uint8)}
+        return {
+            "scratch": BufferConfig((self.config.workspace_size,), torch.uint8)
+        }
 
     def prepare(self, **kwargs):
         return self.operator_class(config=self.config, **kwargs)

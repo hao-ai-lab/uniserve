@@ -12,7 +12,10 @@ from uniserve.sampling import SamplingParams
 from uniserve.tensors import adjacent_view
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.execution.sampling import TokenSelection
-from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.foundation.errors import (
+    invalid_descriptor,
+    unsupported_setup,
+)
 from uniserve_worker.protocol.operation import (
     DrawLayout,
     ForwardMode,
@@ -29,7 +32,12 @@ from .batch_state import BatchState
 from .output import capture_logprobs
 from .rows import ForwardRow
 from .sample import broadcast_selection
-from .sampling import SamplerOutput, SamplerRow, SamplingMetadata, sample_columns
+from .sampling import (
+    SamplerOutput,
+    SamplerRow,
+    SamplingMetadata,
+    sample_columns,
+)
 
 if TYPE_CHECKING:
     from uniserve.distributed.mesh import Communicator
@@ -51,15 +59,22 @@ def prepare_forward(
     model_runner: ModelRunner,
     decode_state: DecodeState | None,
 ) -> ForwardRow:
-    """Pack autoregressive extension, decode, or verification work into model-forward rows."""
+    """Pack autoregressive extension, decode.
 
-    request = state.pending_output(completion_group, operation.request_key.request_id)
+    or verification work into model-forward rows.
+    """
+    request = state.pending_output(
+        completion_group, operation.request_key.request_id
+    )
     if request.request.sampling is None:
-        raise invalid_descriptor("sequence operation has no admitted sampling state")
+        raise invalid_descriptor(
+            "sequence operation has no admitted sampling state"
+        )
 
     mode = operation.kind if isinstance(operation.kind, ForwardMode) else None
     if mode is ForwardMode.PREFILL and (
-        operation.vision_input is not None or operation.latent_feature_input is not None
+        operation.vision_input is not None
+        or operation.latent_feature_input is not None
     ):
         return _prepare_visual(
             operation,
@@ -76,7 +91,11 @@ def prepare_forward(
     current: int | torch.Tensor
     if mode is ForwardMode.PREFILL:
         if operation.predicate is not None and not operation.input_token_ids:
-            tokens = (resolve_decode_token(operation, request, decode_state=decode_state),)
+            tokens = (
+                resolve_decode_token(
+                    operation, request, decode_state=decode_state
+                ),
+            )
         else:
             tokens = operation.input_token_ids
         if not tokens:
@@ -84,14 +103,17 @@ def prepare_forward(
 
         sampling = require_sampling(request)
         scores_prompt = bool(
-            sampling.return_prompt_logprobs or int(sampling.n_prompt_logprobs) > 0
+            sampling.return_prompt_logprobs
+            or int(sampling.n_prompt_logprobs) > 0
         )
         task = token_task(
             operation,
             request,
             tokens,
             tuple(range(start, start + len(tokens))),
-            TokenSelection.ALL_LOGITS if scores_prompt else TokenSelection.LAST_LOGITS,
+            TokenSelection.ALL_LOGITS
+            if scores_prompt
+            else TokenSelection.LAST_LOGITS,
             request_tables=request_tables,
         )
     elif mode is ForwardMode.DECODE:
@@ -110,7 +132,11 @@ def prepare_forward(
             request,
             None
             if indexed
-            else (resolve_decode_token(operation, request, decode_state=decode_state),),
+            else (
+                resolve_decode_token(
+                    operation, request, decode_state=decode_state
+                ),
+            ),
             None if indexed else (start,),
             TokenSelection.LAST_LOGITS,
             request_tables=request_tables,
@@ -118,13 +144,16 @@ def prepare_forward(
         )
     else:
         if operation.predicate is not None:
-            current = resolve_decode_token(operation, request, decode_state=decode_state)
+            current = resolve_decode_token(
+                operation, request, decode_state=decode_state
+            )
             draft = operation.input_token_ids
         else:
             input_tokens = operation.input_token_ids
             if len(input_tokens) < 2:
                 raise invalid_descriptor(
-                    "fixed-parent verification requires current and draft tokens"
+                    "fixed-parent verification requires current and draft "
+                    "tokens"
                 )
             current = int(input_tokens[0])
             draft = input_tokens[1:]
@@ -154,13 +183,20 @@ def prepare_sampling(
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> SamplingMetadata | PendingOutput:
-    """Convert token-model outputs into sampling work, prompt log probabilities, or direct outcomes."""
+    """Convert token-model outputs into sampling work, prompt log probabilities.
 
-    request = state.pending_output(completion_group, operation.request_key.request_id)
+    or direct outcomes.
+    """
+    request = state.pending_output(
+        completion_group, operation.request_key.request_id
+    )
     start = int(operations.require_progress(request).logical_position)
     mode = operation.kind
 
-    if operation.vision_input is not None or operation.latent_feature_input is not None:
+    if (
+        operation.vision_input is not None
+        or operation.latent_feature_input is not None
+    ):
         return _prepare_visual_sampling(
             operation,
             completion_group,
@@ -176,7 +212,13 @@ def prepare_sampling(
     logits = output
     if mode is ForwardMode.PREFILL:
         count = task.query_tokens
-        commit_kv(task, count, request, request_tables=request_tables, decode_state=decode_state)
+        commit_kv(
+            task,
+            count,
+            request,
+            request_tables=request_tables,
+            decode_state=decode_state,
+        )
         if operation.token_output is None:
             return token_outcome(
                 operation,
@@ -249,16 +291,23 @@ def publish_sample(
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> PendingOutput:
-    """Publish sampled tokens, speculative selections, and request runtime transitions."""
+    """Publish sampled tokens, speculative selections.
 
-    request = state.pending_output(completion_group, operation.request_key.request_id)
+    and request runtime transitions.
+    """
+    request = state.pending_output(
+        completion_group, operation.request_key.request_id
+    )
     start = int(operations.require_progress(request).logical_position)
     mode = operation.kind
     if sample_work is None and mode is not ForwardMode.DECODE:
         raise RuntimeError("only captured decode may omit sampling inputs")
     penalty_base = None if sample_work is None else sample_work.penalty_base
 
-    if operation.vision_input is not None or operation.latent_feature_input is not None:
+    if (
+        operation.vision_input is not None
+        or operation.latent_feature_input is not None
+    ):
         request.projected_progress = replace(
             operations.require_progress(request),
             rng_counter=operations.require_progress(request).rng_counter + (1),
@@ -288,7 +337,10 @@ def publish_sample(
     if mode in (ForwardMode.PREFILL, ForwardMode.DECODE):
         if mode is ForwardMode.PREFILL:
             parameters = require_sampling(request)
-            if parameters.return_prompt_logprobs or int(parameters.n_prompt_logprobs) > 0:
+            if (
+                parameters.return_prompt_logprobs
+                or int(parameters.n_prompt_logprobs) > 0
+            ):
                 request.prompt_logprob_ranges = prompt_logprob_details(
                     request,
                     start,
@@ -334,7 +386,9 @@ def publish_sample(
         if device_selected is None:
             accepted_device = sampled.accepted_draft_count
             if accepted_device is None:
-                raise RuntimeError("speculative sampling lost its selected point")
+                raise RuntimeError(
+                    "speculative sampling lost its selected point"
+                )
             device_selected = accepted_device.to(dtype=torch.int32) + 1
 
         request.runtime_cache_length = device_selected + int(task.seq_len)
@@ -344,7 +398,8 @@ def publish_sample(
             penalty_base=penalty_base,
             logical_position=device_selected + start,
             sampling_position=(
-                device_selected + int(operations.require_progress(request).rng_counter)
+                device_selected
+                + int(operations.require_progress(request).rng_counter)
             ),
             decode_state=decode_state,
         )
@@ -352,11 +407,17 @@ def publish_sample(
         request.draft_tokens = draft
         request.terminal_prefix = sample_work.terminal_draft_prefix
         request.base_logical_position = start
-        request.base_rng_counter = operations.require_progress(request).rng_counter
+        request.base_rng_counter = operations.require_progress(
+            request
+        ).rng_counter
         request.base_kv_visible = initialized - task.query_tokens
         request.initialized_kv = initialized
         return token_outcome(
-            operation, completion_group, tokens=0, request_tables=request_tables, state=state
+            operation,
+            completion_group,
+            tokens=0,
+            request_tables=request_tables,
+            state=state,
         )
 
 
@@ -370,13 +431,18 @@ def _prepare_visual(
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
 ) -> ForwardRow:
-    """Resolve image features and interleave them with prompt tokens for model execution."""
+    """Resolve image features and interleave them with prompt tokens for model.
 
+    execution.
+    """
     reference = operation.vision_input or operation.latent_feature_input
     if reference is None or (
-        operation.vision_input is not None and operation.latent_feature_input is not None
+        operation.vision_input is not None
+        and operation.latent_feature_input is not None
     ):
-        raise invalid_descriptor("visual extend requires exactly one feature tensor")
+        raise invalid_descriptor(
+            "visual extend requires exactly one feature tensor"
+        )
     read = tensor_store.consume(
         reference,
         consumer_op_id=operation.op_id,
@@ -385,7 +451,9 @@ def _prepare_visual(
     request.feature_reads.append(read)
     metadata = read.metadata
     if not isinstance(metadata, FeatureMetadata):
-        raise invalid_descriptor("visual input requires encoder feature metadata")
+        raise invalid_descriptor(
+            "visual input requires encoder feature metadata"
+        )
 
     position = int(operations.require_progress(request).logical_position)
     close_image = operation.completion_output is not None
@@ -418,7 +486,9 @@ def _prepare_visual(
         )
 
     if task.query_tokens > int(operation.bounds.max_tokens):
-        raise invalid_descriptor("image state query span exceeds the operation token bound")
+        raise invalid_descriptor(
+            "image state query span exceeds the operation token bound"
+        )
     return task
 
 
@@ -434,13 +504,21 @@ def _prepare_visual_sampling(
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> SamplingMetadata | PendingOutput:
-    """Publish encoded visual features and update the request feature reference."""
+    """Publish encoded visual features and update the request feature.
 
-    request = state.pending_output(completion_group, operation.request_key.request_id)
+    reference.
+    """
+    request = state.pending_output(
+        completion_group, operation.request_key.request_id
+    )
 
     value = output if operation.vision_input is not None else None
     commit_kv(
-        task, task.query_tokens, request, request_tables=request_tables, decode_state=decode_state
+        task,
+        task.query_tokens,
+        request,
+        request_tables=request_tables,
+        decode_state=decode_state,
     )
 
     if operation.token_output is not None:
@@ -453,7 +531,9 @@ def _prepare_visual_sampling(
             completion_group,
             positions=(
                 int(operations.require_progress(request).logical_position)
-                + max(1, 1 if generation is None else int(generation.rope_advance)),
+                + max(
+                    1, 1 if generation is None else int(generation.rope_advance)
+                ),
             ),
             request_pool_index=request_pool_index,
             decode_state=decode_state,
@@ -477,15 +557,20 @@ def _finish_visual(
     image_builder: ImageBuilder | None,
     request_tables: BlockTables | None,
 ) -> PendingOutput:
-    """Finalize visual feature publication and advance the encode operation state."""
+    """Finalize visual feature publication and advance the encode operation.
 
-    request = state.pending_output(completion_group, operation.request_key.request_id)
+    state.
+    """
+    request = state.pending_output(
+        completion_group, operation.request_key.request_id
+    )
     position = int(operations.require_progress(request).logical_position)
     if operation.completion_output is not None:
         flow = image_builder
         request.projected_progress = replace(
             operations.require_progress(request),
-            logical_position=position + max(1, 1 if flow is None else int(flow.rope_advance)),
+            logical_position=position
+            + max(1, 1 if flow is None else int(flow.rope_advance)),
         )
     elif operation.vision_input is not None:
         request.projected_progress = replace(
@@ -505,8 +590,10 @@ def graph_decode_samples(
     sampling_group: Communicator | None,
     request_pool_indices: torch.Tensor,
 ) -> tuple[SamplerRow, ...] | None:
-    """Validate and synchronize graph selections before common token publication."""
+    """Validate and synchronize graph selections before common token.
 
+    publication.
+    """
     if output is None:
         return None
     count = len(operations)
@@ -526,14 +613,19 @@ def graph_decode_samples(
     if (
         count == 0
         or any(len(values) != count for values in columns)
-        or any(value is None or int(value.numel()) != count for value in vectors)
-        or int(output.completion.numel()) != sampling.SAMPLING_COMPLETION_FIELDS * count
+        or any(
+            value is None or int(value.numel()) != count for value in vectors
+        )
+        or int(output.completion.numel())
+        != sampling.SAMPLING_COMPLETION_FIELDS * count
     ):
         return None
 
     finish_sets: list[tuple[int, ...]] = []
     forced: list[bool] = []
-    for operation, request, task in zip(operations, requests, tasks, strict=True):
+    for operation, request, task in zip(
+        operations, requests, tasks, strict=True
+    ):
         parameters = request.request.sampling
         sampling_state = operation.sampling_state or SamplingState()
         finish_token_ids = (
@@ -542,7 +634,12 @@ def graph_decode_samples(
             else sampling_state.finish_token_ids
             if not request.request.finish_token_ids
             else tuple(
-                sorted({*request.request.finish_token_ids, *sampling_state.finish_token_ids})
+                sorted(
+                    {
+                        *request.request.finish_token_ids,
+                        *sampling_state.finish_token_ids,
+                    }
+                )
             )
         )
 
@@ -561,7 +658,8 @@ def graph_decode_samples(
             or request.transition_write is not None
             or task.decode_predicate is None
             or not task.decode_predicate_tagged
-            or bool(sampling_state.force_finish) != bool(task.decode_force_finish)
+            or bool(sampling_state.force_finish)
+            != bool(task.decode_force_finish)
             or write is None
         ):
             return None
@@ -575,17 +673,24 @@ def graph_decode_samples(
         # same terminal policy as eager sampling without selecting those logits
         # again; new continuation tensors preserve the borrowed graph storage.
         finish = sampling.sampled_finish_values(
-            tuple(finish_sets), tuple(forced), output.tokens, output.valid & output.active
+            tuple(finish_sets),
+            tuple(forced),
+            output.tokens,
+            output.valid & output.active,
         )
         continuation = output.valid & output.active & ~finish
         output = replace(
             output,
             finish=finish,
             continuation=continuation,
-            tagged_tokens=sampling.tagged_token_values(output.tokens, continuation),
+            tagged_tokens=sampling.tagged_token_values(
+                output.tokens, continuation
+            ),
         )
     return tuple(
-        output.row(index, request_pool_index=request_pool_indices[index : index + 1])
+        output.row(
+            index, request_pool_index=request_pool_indices[index : index + 1]
+        )
         for index in range(count)
     )
 
@@ -601,16 +706,19 @@ def prompt_logprob_details(
     decode_state: DecodeState | None,
 ) -> tuple[tuple[int, int, int], ...]:
     """Create per-position log-probability rows for a prompt logits tensor."""
-
     # logits is [num_tokens, vocab]; each token is scored by the logits of the
     # preceding position.
     tokens = tokens.reshape(-1).to(device=logits.device, dtype=torch.long)
     if logits.ndim != 2 or int(logits.shape[0]) != int(tokens.numel()):
-        raise invalid_descriptor("prompt scoring logits do not align with input tokens")
+        raise invalid_descriptor(
+            "prompt scoring logits do not align with input tokens"
+        )
 
     states = decode_state
     if states is None:
-        raise unsupported_setup("prompt scoring has no request-indexed runtime state")
+        raise unsupported_setup(
+            "prompt scoring has no request-indexed runtime state"
+        )
     slot = int(request.request.request_pool_idx)
 
     if start == 0:
@@ -620,7 +728,9 @@ def prompt_logprob_details(
         # Continued prompts prepend the carried-over logits of the last token
         # of the previous chunk so its first token is also scored.
         if not operations.require_progress(request).prompt_logits_ready:
-            raise invalid_descriptor("continued prompt scoring has no preceding logits")
+            raise invalid_descriptor(
+                "continued prompt scoring has no preceding logits"
+            )
         pending = request.runtime_prompt_logits
         if pending is None:
             pending = states.prompt_logits[slot]
@@ -672,19 +782,29 @@ def token_outcome(
     committed_tokens: tuple[int, ...] = (),
     request_tables: BlockTables | None,
 ) -> PendingOutput:
-    """Stage request progress and pending payloads for one autoregressive completion."""
+    """Stage request progress and pending payloads for one autoregressive.
 
+    completion.
+    """
     if request is None:
-        request = state.pending_output(completion_group, operation.request_key.request_id)
+        request = state.pending_output(
+            completion_group, operation.request_key.request_id
+        )
 
     cache = operations.cache_coordinates(request, tables=request_tables)
     initialized = cache[2]
     if request.draft_tokens is None:
         published_length = request.runtime_cache_length
         if published_length is None:
-            published_length = int(task.seq_len) + int(tokens) if task is not None else cache[2]
+            published_length = (
+                int(task.seq_len) + int(tokens)
+                if task is not None
+                else cache[2]
+            )
         if isinstance(published_length, torch.Tensor):
-            raise RuntimeError("dynamic KV length requires a speculative selection")
+            raise RuntimeError(
+                "dynamic KV length requires a speculative selection"
+            )
         visible_value = int(published_length)
         initialized = visible_value
     else:
@@ -705,7 +825,9 @@ def token_outcome(
             if logical_position is None
             else logical_position
         ),
-        rng_counter=progress.rng_counter if rng_counter is None else rng_counter,
+        rng_counter=progress.rng_counter
+        if rng_counter is None
+        else rng_counter,
         kv_visible_len=visible_value,
         kv_computed_len=initialized,
     )
@@ -728,8 +850,10 @@ def token_task(
     request_indexed_decode: bool = False,
     request_tables: BlockTables | None,
 ) -> ForwardRow:
-    """Build one staged autoregressive forward row from request runtime and token coordinates."""
+    """Build one staged autoregressive forward row from request runtime and.
 
+    token coordinates.
+    """
     if request_indexed_decode:
         if (
             operation.kind is not ForwardMode.DECODE
@@ -737,7 +861,8 @@ def token_task(
             or positions is not None
         ):
             raise invalid_descriptor(
-                "indexed decode borrows its token and position from request state"
+                "indexed decode borrows its token and position from request "
+                "state"
             )
         token_values = None
         position_values = None
@@ -752,7 +877,9 @@ def token_task(
         token_values = (
             token_ids[0].reshape(1)
             if len(token_ids) == 1 and isinstance(token_ids[0], torch.Tensor)
-            else torch.tensor(tuple(int(value) for value in token_ids), dtype=torch.long)
+            else torch.tensor(
+                tuple(int(value) for value in token_ids), dtype=torch.long
+            )
         )
         position_values = (
             positions.reshape(-1)
@@ -765,7 +892,9 @@ def token_task(
     cache = operations.cache_coordinates(request, tables=request_tables)
     visible = cache[2] if seq_len is None else int(seq_len)
     if visible != cache[2]:
-        raise invalid_descriptor("token row visibility disagrees with operation metadata")
+        raise invalid_descriptor(
+            "token row visibility disagrees with operation metadata"
+        )
     return ForwardRow(
         forward_mode=cast(ForwardMode, operation.kind),
         token_ids=token_values,
@@ -777,8 +906,12 @@ def token_task(
         write_kv=True,
         causal=True,
         request_indexed_decode=request_indexed_decode,
-        decode_predicate=None if predicate_value is None else predicate_value[0],
-        decode_predicate_tagged=False if predicate_value is None else predicate_value[1],
+        decode_predicate=None
+        if predicate_value is None
+        else predicate_value[0],
+        decode_predicate_tagged=False
+        if predicate_value is None
+        else predicate_value[1],
         decode_force_finish=bool(sampling_state.force_finish),
     )
 
@@ -792,8 +925,10 @@ def commit_kv(
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> None:
-    """Advance computed KV length and optionally publish the updated request runtime."""
+    """Advance computed KV length and optionally publish the updated request.
 
+    runtime.
+    """
     count = int(tokens)
     if count < 0 or count > task.query_tokens:
         raise RuntimeError("KV commit count is outside the task query span")
@@ -819,21 +954,29 @@ def resolve_decode_token(
     *,
     decode_state: DecodeState | None,
 ) -> int | torch.Tensor:
-    """Resolve one decode input token from an explicit value or device relay product."""
+    """Resolve one decode input token from an explicit value or device relay.
 
+    product.
+    """
     if operation.predicate is not None:
         predicate = request.predicate
         if predicate is None:
-            raise invalid_descriptor("device token continuation is not registered")
+            raise invalid_descriptor(
+                "device token continuation is not registered"
+            )
         states = decode_state
         if states is None:
-            raise unsupported_setup("device continuation has no request runtime state")
+            raise unsupported_setup(
+                "device continuation has no request runtime state"
+            )
         slot = int(request.request.request_pool_idx)
         return states.future_input_tokens[slot, :1]
 
     tokens = operation.input_token_ids
     if not tokens:
-        raise invalid_descriptor("last-sampled token source has no committed token")
+        raise invalid_descriptor(
+            "last-sampled token source has no committed token"
+        )
     return int(tokens[0])
 
 
@@ -847,8 +990,10 @@ def publish_runtime_sample(
     decode_increment: bool = False,
     decode_state: DecodeState | None,
 ) -> None:
-    """Bind one operation's selection for the group's later device state update."""
+    """Bind one operation's selection for the group's later device state.
 
+    update.
+    """
     if decode_state is None:
         return
     request.sampled = sample
@@ -866,18 +1011,24 @@ def publish_token_products(
     state: BatchState,
     tensor_store: TensorStore,
 ) -> None:
-    """Publish numerical token and transition columns through their storage owner.
+    """Publish numerical token and transition columns through their storage.
+
+    owner.
 
     Rows retain their numerical batches. Token publication reads their selected
-    spans directly; variable transition payloads retain their own tensor layouts.
+    spans directly; variable transition payloads retain their own tensor
+    layouts.
     """
-
     for transitions in (True, False):
         writes: list[TensorRecord] = []
         selected: list[SamplerRow] = []
         for operation, sample in zip(operations, samples, strict=True):
-            request = state.pending_output(completion_group, operation.request_key.request_id)
-            write = request.transition_write if transitions else request.token_write
+            request = state.pending_output(
+                completion_group, operation.request_key.request_id
+            )
+            write = (
+                request.transition_write if transitions else request.token_write
+            )
             if write is not None:
                 writes.append(write)
                 selected.append(sample)
@@ -888,7 +1039,9 @@ def publish_token_products(
         if transitions:
             values = tuple(sample.transition for sample in selected)
             if any(value is None for value in values):
-                raise RuntimeError("sampling result lost a declared transition output")
+                raise RuntimeError(
+                    "sampling result lost a declared transition output"
+                )
             tensors = tuple(cast(torch.Tensor, value) for value in values)
             values = adjacent_view(tensors)
             if values is None:
@@ -910,8 +1063,10 @@ def build_sampling_metadata(
     draft_token_ids: tuple[int, ...] = (),
     decode_state: DecodeState | None,
 ) -> SamplingMetadata:
-    """Build sampling rows, penalties, RNG coordinates, predicates, and device-product bindings."""
+    """Build sampling rows, penalties, RNG coordinates, predicates.
 
+    and device-product bindings.
+    """
     parameters = require_sampling(request)
     sampling_state = operation.sampling_state or SamplingState()
     allowed_token_ids = (
@@ -938,15 +1093,23 @@ def build_sampling_metadata(
     rng = operation.rng
     if float(parameters.temperature) > 0.0:
         if rng is None or rng.draw_layout is not DrawLayout.TARGET_SAMPLING:
-            raise invalid_descriptor("stochastic sampling requires target-sampling RNG coordinates")
+            raise invalid_descriptor(
+                "stochastic sampling requires target-sampling RNG coordinates"
+            )
         if int(rng.seed) != int(parameters.seed or 0):
-            raise invalid_descriptor("operation RNG seed disagrees with admitted sampling")
+            raise invalid_descriptor(
+                "operation RNG seed disagrees with admitted sampling"
+            )
         expected_positions = tuple(
-            range(int(rng.semantic_index_base), int(rng.semantic_index_base) + len(positions))
+            range(
+                int(rng.semantic_index_base),
+                int(rng.semantic_index_base) + len(positions),
+            )
         )
         if positions != expected_positions:
             raise invalid_descriptor(
-                "sampling positions disagree with registered semantic RNG coordinates"
+                "sampling positions disagree with registered semantic RNG "
+                "coordinates"
             )
 
     rng_seed = 0 if rng is None else int(rng.seed)
@@ -966,7 +1129,9 @@ def build_sampling_metadata(
     # rows is [len(positions), vocab]; a single position arrives as 1-D logits.
     rows = logits.reshape(1, -1) if logits.ndim == 1 else logits
     if rows.ndim != 2 or int(rows.shape[0]) != len(positions):
-        raise invalid_descriptor("sampling task positions do not align with its logits")
+        raise invalid_descriptor(
+            "sampling task positions do not align with its logits"
+        )
     vocab = int(rows.shape[1])
 
     uses_penalties = (
@@ -975,12 +1140,16 @@ def build_sampling_metadata(
         or parameters.presence_penalty != 0.0
     )
     penalty_base = (
-        _request_penalty_base(request, vocab, rows.device, decode_state=decode_state)
+        _request_penalty_base(
+            request, vocab, rows.device, decode_state=decode_state
+        )
         if uses_penalties
         else None
     )
     penalty_view = (
-        None if penalty_base is None else _candidate_penalty_counts(request, penalty_base)
+        None
+        if penalty_base is None
+        else _candidate_penalty_counts(request, penalty_base)
     )
 
     forced_token_ids = parameters.forced_token_ids
@@ -1009,7 +1178,9 @@ def build_sampling_metadata(
         )
         penalty_counts.append(row_counts)
         allowed.append(row_allowed)
-        uniform_draws.append(sampling_uniform(draw_key, int(position)) if stochastic else 0.0)
+        uniform_draws.append(
+            sampling_uniform(draw_key, int(position)) if stochastic else 0.0
+        )
 
     device_greedy = (
         not draft_token_ids
@@ -1022,9 +1193,17 @@ def build_sampling_metadata(
     else:
         # Upload semantic Philox draws once; no device observation is needed to
         # construct the operation's RNG coordinates or filtering parameters.
-        draws = torch.tensor(uniform_draws, dtype=torch.float32, device=rows.device)
+        draws = torch.tensor(
+            uniform_draws, dtype=torch.float32, device=rows.device
+        )
         parameter_values = torch.tensor(
-            [(float(parameters.temperature), float(parameters.top_p), float(parameters.min_p))]
+            [
+                (
+                    float(parameters.temperature),
+                    float(parameters.top_p),
+                    float(parameters.min_p),
+                )
+            ]
             * len(positions),
             dtype=torch.float32,
             device=rows.device,
@@ -1033,7 +1212,11 @@ def build_sampling_metadata(
     predicate_value = request.predicate
     finish_set = set(finish_token_ids)
     terminal_draft_prefix = next(
-        (index + 1 for index, token_id in enumerate(draft_token_ids) if token_id in finish_set),
+        (
+            index + 1
+            for index, token_id in enumerate(draft_token_ids)
+            if token_id in finish_set
+        ),
         None,
     )
     return SamplingMetadata(
@@ -1051,7 +1234,9 @@ def build_sampling_metadata(
         terminal_draft_prefix=terminal_draft_prefix,
         return_transition=request.transition_write is not None,
         predicate=None if predicate_value is None else predicate_value[0],
-        tagged_predicate=False if predicate_value is None else predicate_value[1],
+        tagged_predicate=False
+        if predicate_value is None
+        else predicate_value[1],
         request_pool_index=request_pool_index,
         penalty_base=penalty_base,
     )
@@ -1065,7 +1250,6 @@ def _request_penalty_base(
     decode_state: DecodeState | None,
 ) -> torch.Tensor:
     """Return the fixed request-indexed committed penalty-count row."""
-
     states = decode_state
     if states is None:
         raise RuntimeError("token sampling has no request runtime-state owner")
@@ -1076,9 +1260,13 @@ def _request_penalty_base(
     return states.penalty_counts[int(request.request.request_pool_idx)]
 
 
-def _candidate_penalty_counts(request: PendingOutput, committed: torch.Tensor) -> torch.Tensor:
-    """Include a selected token that has not yet reached committed penalty storage."""
+def _candidate_penalty_counts(
+    request: PendingOutput, committed: torch.Tensor
+) -> torch.Tensor:
+    """Include a selected token that has not yet reached committed penalty.
 
+    storage.
+    """
     sampled = request.sampled
     if sampled is None:
         return committed
@@ -1086,17 +1274,22 @@ def _candidate_penalty_counts(request: PendingOutput, committed: torch.Tensor) -
     # Strip the continuation tag bit; the token counts only when its row is
     # both valid and predicate-active.
     counts = committed.clone()
-    token = sampled.tokens.reshape(-1)[:1].bitwise_and(sampling.TOKEN_VALUE_MASK)
-    weight = (sampled.valid.reshape(-1)[:1] & sampled.active.reshape(-1)[:1]).to(dtype=counts.dtype)
+    token = sampled.tokens.reshape(-1)[:1].bitwise_and(
+        sampling.TOKEN_VALUE_MASK
+    )
+    weight = (
+        sampled.valid.reshape(-1)[:1] & sampled.active.reshape(-1)[:1]
+    ).to(dtype=counts.dtype)
     counts.scatter_add_(0, token.to(dtype=torch.int64), weight)
     return counts
 
 
 def require_sampling(request: PendingOutput) -> SamplingParams:
     """Return the sampling parameters required by an autoregressive request."""
-
     if request.request.sampling is None:
-        raise invalid_descriptor("sequence execution requires admitted sampling parameters")
+        raise invalid_descriptor(
+            "sequence execution requires admitted sampling parameters"
+        )
     return request.request.sampling
 
 

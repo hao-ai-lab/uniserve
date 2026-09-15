@@ -59,14 +59,20 @@ def _checkpoint(root):
         ("time_embedder.mlp.0", 32, 256),
         ("time_embedder.mlp.2", 32, 32),
     ):
-        state[prefix + ".weight"] = (torch.randn(out_features, in_features) * 0.02).bfloat16()
+        state[prefix + ".weight"] = (
+            torch.randn(out_features, in_features) * 0.02
+        ).bfloat16()
         state[prefix + ".bias"] = (torch.randn(out_features) * 0.01).bfloat16()
-    state["latent_pos_embed.pos_embed"] = (torch.randn(16, 32) * 0.02).bfloat16()
+    state["latent_pos_embed.pos_embed"] = (
+        torch.randn(16, 32) * 0.02
+    ).bfloat16()
     # Declared, unselected vision fields can coexist in the same primary file.
     state["vit_pos_embed.pos_embed"] = torch.randn(16, 32).bfloat16()
     save_file(state, root / "ema.safetensors")
     config = bagel.Config(
-        bagel.TransformerConfig(32, 48, 2, 4, 2, 37, 1e-6, 1_000_000.0, 8, True, 64),
+        bagel.TransformerConfig(
+            32, 48, 2, 4, 2, 37, 1e-6, 1_000_000.0, 8, True, 64
+        ),
         siglip.Config(2, 8, 3, siglip.TransformerConfig(32, 4, 48, 1, 1e-6)),
         vae.Config(8, 3, 2, 32, 3, (1, 1), 1, 2, 0.5, 0.25),
         35,
@@ -84,9 +90,9 @@ def _load(root, config):
         bagel.Model,
         config,
         checkpoint=(
-            checkpoint.Config("primary", filenames=("ema.safetensors",)).resolve(
-                root, io=loading.Config()
-            ),
+            checkpoint.Config(
+                "primary", filenames=("ema.safetensors",)
+            ).resolve(root, io=loading.Config()),
         ),
         mapping=bagel.checkpoint_mappings,
         device="cpu",
@@ -102,8 +108,12 @@ def test_text_prefill_decode_and_zero_query_match_qwen_equations(tmp_path):
     tokens = torch.tensor([1, 4, 8, 3])
     with torch.no_grad():
         expected = reference(tokens[None]).logits[0]
-    with PrefixCache(model.text.cache_config, num_blocks=1, block_size=4, device="cpu") as cache:
-        with ExecutionContext(model.text, cache=cache, attention="torch") as context:
+    with PrefixCache(
+        model.text.cache_config, num_blocks=1, block_size=4, device="cpu"
+    ) as cache:
+        with ExecutionContext(
+            model.text, cache=cache, attention="torch"
+        ) as context:
             context.prepare(TextSize(4, 1))
             for start, stop in ((0, 3), (3, 4), (4, 4)):
                 batch = PagedInput.from_blocks(
@@ -115,11 +125,17 @@ def test_text_prefill_decode_and_zero_query_match_qwen_equations(tmp_path):
                     device="cpu",
                 )
                 context.bind_attention(batch)
-                hidden = model.text(TextInput(tokens[start:stop], torch.arange(start, stop), batch))
+                hidden = model.text(
+                    TextInput(
+                        tokens[start:stop], torch.arange(start, stop), batch
+                    )
+                )
                 actual = model.text.compute_logits(
                     hidden, token_indices=torch.arange(stop - start)
                 ).gather()
-                torch.testing.assert_close(actual, expected[start:stop], rtol=2e-2, atol=2e-3)
+                torch.testing.assert_close(
+                    actual, expected[start:stop], rtol=2e-2, atol=2e-3
+                )
 
 
 def test_image_markers_use_text_expert_and_flow_preserves_residual(tmp_path):
@@ -132,7 +148,9 @@ def test_image_markers_use_text_expert_and_flow_preserves_residual(tmp_path):
     sample = torch.empty((4, 8), dtype=torch.bfloat16)
     factory.initialize(size, seed=71, out=sample)
     expected_noise = torch.randn(
-        (4, 8), generator=torch.Generator().manual_seed(71), dtype=torch.bfloat16
+        (4, 8),
+        generator=torch.Generator().manual_seed(71),
+        dtype=torch.bfloat16,
     )
     torch.testing.assert_close(sample, expected_noise, rtol=0, atol=0)
     timestep = torch.tensor(0.5)
@@ -148,21 +166,34 @@ def test_image_markers_use_text_expert_and_flow_preserves_residual(tmp_path):
     before = sample.clone()
     # GLIDE time features and the checkpoint's zero-update flow residual give
     # an independent closed form for the denoiser prediction, including casts.
-    frequencies = torch.exp(-torch.log(torch.tensor(10000.0)) * torch.arange(128) / 128)
+    frequencies = torch.exp(
+        -torch.log(torch.tensor(10000.0)) * torch.arange(128) / 128
+    )
     angles = timestep * frequencies
     time = torch.cat((angles.cos(), angles.sin())).bfloat16().expand(4, -1)
-    time = F.linear(time, state["time_embedder.mlp.0.weight"], state["time_embedder.mlp.0.bias"])
     time = F.linear(
-        F.silu(time), state["time_embedder.mlp.2.weight"], state["time_embedder.mlp.2.bias"]
+        time,
+        state["time_embedder.mlp.0.weight"],
+        state["time_embedder.mlp.0.bias"],
+    )
+    time = F.linear(
+        F.silu(time),
+        state["time_embedder.mlp.2.weight"],
+        state["time_embedder.mlp.2.bias"],
     )
     hidden = F.linear(sample, state["vae2llm.weight"], state["vae2llm.bias"])
     hidden = hidden + time + state["latent_pos_embed.pos_embed"][[0, 1, 4, 5]]
     normalized = (
-        hidden.float() * torch.rsqrt(hidden.float().square().mean(-1, keepdim=True) + 1e-6)
+        hidden.float()
+        * torch.rsqrt(hidden.float().square().mean(-1, keepdim=True) + 1e-6)
     ).bfloat16()
-    expected = F.linear(normalized, state["llm2vae.weight"], state["llm2vae.bias"])
+    expected = F.linear(
+        normalized, state["llm2vae.weight"], state["llm2vae.bias"]
+    )
     with torch.no_grad():
-        prediction = model.denoiser(inputs, state={}, constants={}, workspace={})["image"][0]
+        prediction = model.denoiser(
+            inputs, state={}, constants={}, workspace={}
+        )["image"][0]
     torch.testing.assert_close(prediction.tensor, expected, rtol=0, atol=0)
     torch.testing.assert_close(sample, before, rtol=0, atol=0)
     assert prediction.layout.shape == sample.shape

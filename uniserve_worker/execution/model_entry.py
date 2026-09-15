@@ -24,9 +24,13 @@ from uniserve.runtime import ExecutionContext
 TensorOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
 
 
-def capture_required(missing: bool, groups: tuple[Communicator, ...], device: torch.device) -> bool:
-    """Coordinate first-use work over the actual numerical communication groups."""
+def capture_required(
+    missing: bool, groups: tuple[Communicator, ...], device: torch.device
+) -> bool:
+    """Coordinate first-use work over the actual numerical communication.
 
+    groups.
+    """
     if not groups:
         return missing
     decision = torch.tensor(int(missing), dtype=torch.int32, device=device)
@@ -74,8 +78,12 @@ class ModelEntry:
     cuda_stream: CUDAStream | None = None
 
     def __post_init__(self) -> None:
-        if any(rank not in self.process_group.ranks for rank in self.config.ranks):
-            raise ValueError(f"entry {self.name} members lie outside its Worker")
+        if any(
+            rank not in self.process_group.ranks for rank in self.config.ranks
+        ):
+            raise ValueError(
+                f"entry {self.name} members lie outside its Worker"
+            )
 
         if self.config.distribution is None:
             if (self.mesh is not None) != self.owns:
@@ -85,7 +93,9 @@ class ModelEntry:
                 or tuple(zip(self.mesh.axes, self.mesh.shape))
                 != self.config.parallel_config.dimensions
             ):
-                raise ValueError(f"entry {self.name} mesh disagrees with configuration")
+                raise ValueError(
+                    f"entry {self.name} mesh disagrees with configuration"
+                )
 
         if self.mesh is not None:
             if not self.groups:
@@ -110,7 +120,10 @@ class ModelEntry:
         if config.distribution is not None:
             return config.ranks
 
-        width = config.parallel_config.world_size // config.parallel_config.pipeline_parallel_size
+        width = (
+            config.parallel_config.world_size
+            // config.parallel_config.pipeline_parallel_size
+        )
         return config.ranks[:width]
 
     @property

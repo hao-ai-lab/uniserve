@@ -20,7 +20,9 @@ def _agree_capacity(rank, rendezvous):
         backend="gloo",
         init_method=rendezvous,
     ) as environment:
-        schema = {} if rank == 0 else {"state": BufferConfig((4,), torch.float32)}
+        schema = (
+            {} if rank == 0 else {"state": BufferConfig((4,), torch.float32)}
+        )
         # The stateless owner fits three 100-byte product/arena reservations;
         # the stateful owner fits four complete 112-byte reservations.
         capacity = tensor_slot_capacity(
@@ -34,16 +36,25 @@ def _agree_capacity(rank, rendezvous):
         assert capacity == 3
 
         # Both owners must reject admission when either cannot fit the minimum.
-        with pytest.raises(RuntimeError, match="common request tensor slot count"):
+        with pytest.raises(
+            RuntimeError, match="common request tensor slot count"
+        ):
             tensor_slot_capacity(
                 schema,
                 environment.process_group,
                 maximum=4,
                 minimum=2,
                 available_bytes=199 if rank == 0 else 448,
-                auxiliary_bytes=lambda slots: slots * (100 if rank == 0 else 96),
+                auxiliary_bytes=lambda slots: (
+                    slots * (100 if rank == 0 else 96)
+                ),
             )
 
 
 def test_request_capacity_includes_stateless_owners(tmp_path):
-    mp.spawn(_agree_capacity, ((tmp_path / "rendezvous").as_uri(),), nprocs=2, join=True)
+    mp.spawn(
+        _agree_capacity,
+        ((tmp_path / "rendezvous").as_uri(),),
+        nprocs=2,
+        join=True,
+    )

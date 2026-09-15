@@ -30,7 +30,11 @@ from uniserve.ops.requests import (
     RmsNormReq,
     SiluAndMulReq,
 )
-from uniserve.ops.rope import apply_rotary_emb, apply_rotary_pos_emb, rotate_half
+from uniserve.ops.rope import (
+    apply_rotary_emb,
+    apply_rotary_pos_emb,
+    rotate_half,
+)
 from uniserve.ops.silu import (
     silu_and_mul_fp8,
     value_first_swiglu,

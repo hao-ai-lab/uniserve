@@ -34,7 +34,7 @@ class FeatureLayout(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class FeatureInjection:
-    """Defines how encoder features replace or frame tokens in the language sequence."""
+    """Defines how encoder features replace or frame tokens in the language sequence."""  # noqa: E501
 
     layout: FeatureLayout
     positions: PositionLayout
@@ -46,7 +46,7 @@ class FeatureInjection:
 
 @dataclass(frozen=True, slots=True)
 class PatchTransform:
-    """Defines patch sizing, pixel bounds, downsampling, and normalization for a vision tower."""
+    """Defines patch sizing, pixel bounds, downsampling, and normalization for a vision tower."""  # noqa: E501
 
     patch_size: int
     downsample_ratio: float
@@ -57,7 +57,7 @@ class PatchTransform:
 
 @dataclass(frozen=True, slots=True)
 class StrideResize:
-    """Defines bounded aspect-preserving image resizing aligned to a spatial stride."""
+    """Defines bounded aspect-preserving image resizing aligned to a spatial stride."""  # noqa: E501
 
     max_size: int
     min_size: int
@@ -75,7 +75,7 @@ class TowerTransform:
 
 @dataclass(frozen=True, slots=True)
 class ImageProcessor:
-    """Defines ViT and VAE transforms, staging dtype, and language-sequence feature injection."""
+    """Defines ViT and VAE transforms, staging dtype, and language-sequence feature injection."""  # noqa: E501
 
     vit: PatchTransform | TowerTransform | None = None
     vae: TowerTransform | None = None
@@ -84,9 +84,10 @@ class ImageProcessor:
 
     def __post_init__(self) -> None:
         """Require at least one image transform for the caller."""
-
         if self.vit is None and self.vae is None:
-            raise ValueError("image processor must implement at least one transform")
+            raise ValueError(
+                "image processor must implement at least one transform"
+            )
 
 
 __all__ = [
@@ -106,7 +107,7 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FlowPrompt:
-    """Immutable caller-owned framing for one classifier-free-guidance prefix."""
+    """Immutable caller-owned framing for one classifier-free-guidance prefix."""  # noqa: E501
 
     user_prefix: str
     user_suffix: str
@@ -118,13 +119,20 @@ class FlowPrompt:
     system_suffix: str = ""
     add_special_tokens: bool = True
 
-    def encode(self, tokenizer: Any, *, text: str, conditioned: bool) -> tuple[int, ...]:
-        """Frame and tokenize either the conditioned or unconditional diffusion prompt."""
-
+    def encode(
+        self, tokenizer: Any, *, text: str, conditioned: bool
+    ) -> tuple[int, ...]:
+        """Frame and tokenize either the conditioned or unconditional diffusion prompt."""  # noqa: E501
         if tokenizer is None:
-            raise ValueError("the configured generation prompt requires a tokenizer")
+            raise ValueError(
+                "the configured generation prompt requires a tokenizer"
+            )
 
-        append = self.conditioned_append if conditioned else self.unconditional_append
+        append = (
+            self.conditioned_append
+            if conditioned
+            else self.unconditional_append
+        )
         framed = (
             self.system_prefix
             + self.system_message
@@ -137,7 +145,9 @@ class FlowPrompt:
         )
         return tuple(
             int(value)
-            for value in tokenizer.encode(framed, add_special_tokens=self.add_special_tokens)
+            for value in tokenizer.encode(
+                framed, add_special_tokens=self.add_special_tokens
+            )
         )
 
 
@@ -145,26 +155,36 @@ def resolve_input_tokens(
     processor: ImageProcessor | None, tokenizer: Any | None
 ) -> ImageProcessor | None:
     """Resolve model-specific input token identities from tokenizer metadata."""
-
     if processor is None or processor.feature_injection is None:
         return processor
     injection = processor.feature_injection
 
     updates: dict[str, int] = {}
-    for token_field, id_field in (("start_token", "start_token_id"), ("end_token", "end_token_id")):
+    for token_field, id_field in (
+        ("start_token", "start_token_id"),
+        ("end_token", "end_token_id"),
+    ):
         token = getattr(injection, token_field)
         token_id = getattr(injection, id_field)
         if token_id is not None or token is None:
             continue
         if tokenizer is None:
-            raise ValueError(f"model input declaration requires tokenizer resolution for {token!r}")
+            raise ValueError(
+                f"model input declaration requires tokenizer resolution "
+                f"for {token!r}"
+            )
         resolved = tokenizer.convert_tokens_to_ids(token)
         if (
             resolved is None
             or int(resolved) < 0
-            or (resolved == tokenizer.unk_token_id and token != tokenizer.unk_token)
+            or (
+                resolved == tokenizer.unk_token_id
+                and token != tokenizer.unk_token
+            )
         ):
-            raise ValueError(f"tokenizer does not define declared token {token!r}")
+            raise ValueError(
+                f"tokenizer does not define declared token {token!r}"
+            )
         updates[id_field] = int(resolved)
 
     if not updates:
@@ -178,8 +198,7 @@ def resolve_input_tokens(
 
 
 def load_tokenizer(path: Path):
-    """Load a caller-owned tokenizer from a resolved local checkpoint directory."""
-
+    """Load a caller-owned tokenizer from a resolved local checkpoint directory."""  # noqa: E501
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(

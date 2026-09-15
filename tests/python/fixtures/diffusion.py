@@ -6,7 +6,11 @@ from typing import Literal
 import torch
 from torch import nn
 
-from uniserve.diffusion import CleanSampleEulerSolver, EulerSolver, make_schedule
+from uniserve.diffusion import (
+    CleanSampleEulerSolver,
+    EulerSolver,
+    make_schedule,
+)
 from uniserve.model import Denoiser, DenoiserInput
 from uniserve.nn import Linear
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
@@ -30,7 +34,9 @@ class LinearDenoiser(Denoiser[DenoiserInput[Size], Size]):
         super().__init__(
             modalities=modalities,
             prediction_dtype=torch.float32,
-            solver=CleanSampleEulerSolver() if solver == "clean_sample_euler" else EulerSolver(),
+            solver=CleanSampleEulerSolver()
+            if solver == "clean_sample_euler"
+            else EulerSolver(),
         )
         self.offset_scale = nn.Parameter(torch.ones(()), requires_grad=False)
         self.projection = Linear(1, 1, bias=False)
@@ -67,20 +73,29 @@ class LinearDenoiser(Denoiser[DenoiserInput[Size], Size]):
     def prepare_constants(self, size, *, out):
         out["offset"].fill_(size.offset)
 
-    def forward(self, inputs: DenoiserInput[Size], *, state, constants, workspace):
+    def forward(
+        self, inputs: DenoiserInput[Size], *, state, constants, workspace
+    ):
         result = {}
         for name in self.modalities:
             outputs = []
             for latent in inputs.latents[name]:
-                prediction = self.projection(latent.tensor.unsqueeze(-1)).squeeze(-1)
+                prediction = self.projection(
+                    latent.tensor.unsqueeze(-1)
+                ).squeeze(-1)
                 prediction = (
-                    prediction.to(latent.tensor.device) + constants["offset"] * self.offset_scale
+                    prediction.to(latent.tensor.device)
+                    + constants["offset"] * self.offset_scale
                 )
                 shape = tuple(prediction.shape)
                 outputs.append(
                     TensorOutput(
                         prediction,
-                        OutputLayout(shape, prediction.dtype, tuple(slice(0, n) for n in shape)),
+                        OutputLayout(
+                            shape,
+                            prediction.dtype,
+                            tuple(slice(0, n) for n in shape),
+                        ),
                     )
                 )
             result[name] = tuple(outputs)

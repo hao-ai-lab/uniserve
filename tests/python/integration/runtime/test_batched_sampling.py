@@ -1,4 +1,6 @@
-"""Model-runner integration for round-level sampling tasks through the real forward.
+"""Model-runner integration for round-level sampling tasks.
+
+The integration runs through the real forward.
 
 Sampling is device postprocessing inside the token modes, so inline rows from
 one submission round share a single batched sampling task, and a verifier
@@ -57,7 +59,11 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
         predecessor=root_parent(first),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
-        rng=Rng(seed=71, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
+        rng=Rng(
+            seed=71,
+            semantic_index_base=2,
+            draw_layout=DrawLayout.TARGET_SAMPLING,
+        ),
     )
     second_op = token_operation(
         second.request_key,
@@ -66,7 +72,11 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
         logprobs=True,
-        rng=Rng(seed=71, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
+        rng=Rng(
+            seed=71,
+            semantic_index_base=2,
+            draw_layout=DrawLayout.TARGET_SAMPLING,
+        ),
     )
 
     result = finalized_report(
@@ -80,17 +90,27 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
         ),
     )
 
-    assert result.completions[0].committed_tokens == result.completions[1].committed_tokens
+    assert (
+        result.completions[0].committed_tokens
+        == result.completions[1].committed_tokens
+    )
 
 
-@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
+)
 def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
     with execution_worker(device=device) as worker:
-        # The middle request asks for scores. Compatible sampling rows therefore
-        # remain interleaved in operation order, with distinct tokens in every row.
+        # The middle request asks for scores. Compatible sampling rows
+        # therefore remain interleaved in operation order, with distinct
+        # tokens in every row.
         admissions = (
             ar_params(21, block_ids=(0,)),
-            ar_params(22, block_ids=(1,), sampling=SamplingParams(return_logprobs=True)),
+            ar_params(
+                22,
+                block_ids=(1,),
+                sampling=SamplingParams(return_logprobs=True),
+            ),
             ar_params(23, block_ids=(2,)),
         )
         prompt_ends = (4, 5, 6)
@@ -115,7 +135,11 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
                 ),
             )
             completion = report.completions[0]
-            assert (completion.position, completion.kv_visible_len, completion.kv_computed_len) == (
+            assert (
+                completion.position,
+                completion.kv_visible_len,
+                completion.kv_computed_len,
+            ) == (
                 2,
                 2,
                 2,
@@ -124,7 +148,9 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
 
         decode_ops = []
         commits = []
-        for index, (admission, (extend, report)) in enumerate(zip(admissions, primed, strict=True)):
+        for index, (admission, (extend, report)) in enumerate(
+            zip(admissions, primed, strict=True)
+        ):
             observation = record_completion(extend, report)
             operation = token_operation(
                 admission.request_key,
@@ -149,18 +175,26 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
             ),
         )
 
-        for completion, prompt_end in zip(result.completions, prompt_ends, strict=True):
+        for completion, prompt_end in zip(
+            result.completions, prompt_ends, strict=True
+        ):
             assert completion.committed_tokens == (
                 expected_successor(expected_successor(prompt_end)),
             )
-            assert (completion.position, completion.kv_visible_len, completion.kv_computed_len) == (
+            assert (
+                completion.position,
+                completion.kv_visible_len,
+                completion.kv_computed_len,
+            ) == (
                 3,
                 3,
                 3,
             )
 
 
-def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> None:
+def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> (
+    None
+):
     worker = execution_worker()
     first = ar_params(24, block_ids=(3,))
     second_base = ar_params(25, block_ids=(4,))
@@ -169,7 +203,9 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> Non
     second = NewRequest(
         second_base.request_key,
         request_pool_idx=second_base.request_pool_idx,
-        generation=replace(second_base.generation, finish_token_ids=(expected,)),
+        generation=replace(
+            second_base.generation, finish_token_ids=(expected,)
+        ),
     )
     first_op = token_operation(
         first.request_key,
@@ -210,9 +246,12 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> Non
 def test_verify_commits_every_accepted_position() -> None:
     worker = execution_worker()
     admission = ar_params(
-        4, block_ids=(3,), sampling=SamplingParams(return_logprobs=True, n_logprobs=2, seed=31)
+        4,
+        block_ids=(3,),
+        sampling=SamplingParams(return_logprobs=True, n_logprobs=2, seed=31),
     )
-    # Prime the request, then carry its selected token explicitly with the draft.
+    # Prime the request, then carry its selected token explicitly with the
+    # draft.
     extend = token_operation(
         admission.request_key,
         op_id=ComputationId(1, 0),
@@ -225,7 +264,10 @@ def test_verify_commits_every_accepted_position() -> None:
         worker,
         worker.submit(
             execution_run(
-                run_id=1, admissions=(admission,), operations=(extend,), input_products=()
+                run_id=1,
+                admissions=(admission,),
+                operations=(extend,),
+                input_products=(),
             )
         ),
     )
@@ -261,11 +303,15 @@ def test_verify_commits_every_accepted_position() -> None:
         "cpu",
         pytest.param(
             "cuda:0",
-            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is required"
+            ),
         ),
     ],
 )
-def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(device: str) -> None:
+def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
+    device: str,
+) -> None:
     worker = execution_worker(device=device, pipeline_depth=2)
     admission = ar_params(5, block_ids=(4,))
     extend = token_operation(
@@ -294,7 +340,9 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(dev
         tokens=(prime.completions[0].committed_tokens[0], 900, 901),
     )
 
-    result = finalized_report(worker, worker.submit(execution_run(run_id=2, operations=(verify,))))
+    result = finalized_report(
+        worker, worker.submit(execution_run(run_id=2, operations=(verify,)))
+    )
     successor = replace(
         token_operation(
             admission.request_key,
@@ -310,7 +358,9 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(dev
     # The decode must use the accepted prefix rather than the initialized tail.
     successor_batch = replace(
         execution_run(run_id=3, operations=(successor,)),
-        seq_lens=(len(extend.input_token_ids) + len(verify.input_token_ids) + 1,),
+        seq_lens=(
+            len(extend.input_token_ids) + len(verify.input_token_ids) + 1,
+        ),
     )
     following = finalized_report(worker, worker.submit(successor_batch))
 
@@ -328,13 +378,17 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(dev
     assert following.completions[0].kv_visible_len == 4
 
 
-def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> None:
+def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> (
+    None
+):
     worker = execution_worker()
     base = ar_params(6, block_ids=(5,))
     admission = NewRequest(
         base.request_key,
         request_pool_idx=base.request_pool_idx,
-        generation=replace(cast(GenerationParams, base.generation), finish_token_ids=(1001,)),
+        generation=replace(
+            cast(GenerationParams, base.generation), finish_token_ids=(1001,)
+        ),
     )
     extend = token_operation(
         admission.request_key,
@@ -383,7 +437,9 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
     admission = ar_params(
         31,
         block_ids=(7,),
-        sampling=SamplingParams(return_prompt_logprobs=True, n_prompt_logprobs=2),
+        sampling=SamplingParams(
+            return_prompt_logprobs=True, n_prompt_logprobs=2
+        ),
     )
     first = token_operation(
         admission.request_key,
@@ -429,8 +485,14 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
 
     assert tuple(position[0][0] for position in first_positions) == (4,)
     assert tuple(position[0][0] for position in second_positions) == (5, 6)
-    assert all(position[0][2] >= 1 for position in (*first_positions, *second_positions))
-    assert all(position[0][1] <= 0.0 for position in (*first_positions, *second_positions))
+    assert all(
+        position[0][2] >= 1
+        for position in (*first_positions, *second_positions)
+    )
+    assert all(
+        position[0][1] <= 0.0
+        for position in (*first_positions, *second_positions)
+    )
 
 
 def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
@@ -464,7 +526,9 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         tokens=(5, 6),
         logprobs=True,
     )
-    invalid = replace(invalid, bounds=replace(invalid.bounds, max_completion_bytes=1))
+    invalid = replace(
+        invalid, bounds=replace(invalid.bounds, max_completion_bytes=1)
+    )
     failed = finalized_report(
         worker,
         worker.submit(

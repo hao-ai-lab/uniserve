@@ -13,7 +13,7 @@ from uniserve.nn.attention import AttentionInput, DenseInput
 
 @dataclass(frozen=True)
 class ImageConditioning:
-    """Borrow the complete noisy NCHW image, input patch grid and noise scale."""
+    """Borrow the complete noisy NCHW image, input patch grid and noise scale."""  # noqa: E501
 
     pixels: torch.Tensor
     grid: torch.Tensor
@@ -27,7 +27,8 @@ class ImageConditioning:
             or self.noise_scale.numel() != 1
         ):
             raise ValueError(
-                "SenseNova image conditioning requires one NCHW RGB image, grid and scalar noise scale"
+                "SenseNova image conditioning requires one NCHW RGB image, "
+                "grid and scalar noise scale"
             )
 
 
@@ -50,15 +51,25 @@ class DenoiserInput(NumericalDenoiserInput[image.Config]):
             len(values) != self.batch_size
             for values in (self.images, self.positions, self.sequence_lengths)
         ):
-            raise ValueError("SenseNova image conditioning and positions must align with samples")
+            raise ValueError(
+                "SenseNova image conditioning and positions "
+                "must align with samples"
+            )
         if any(
             position.shape != (3, count)
-            for position, count in zip(self.positions, self.sequence_lengths, strict=True)
+            for position, count in zip(
+                self.positions, self.sequence_lengths, strict=True
+            )
         ):
-            raise ValueError("SenseNova image positions must cover three axes per image token")
+            raise ValueError(
+                "SenseNova image positions must cover three axes "
+                "per image token"
+            )
         if (
             not isinstance(self.attention, DenseInput)
             and self.attention.queries.host is not None
             and self.attention.queries.host != self.sequence_lengths
         ):
-            raise ValueError("SenseNova attention lengths must match its image sequences")
+            raise ValueError(
+                "SenseNova attention lengths must match its image sequences"
+            )

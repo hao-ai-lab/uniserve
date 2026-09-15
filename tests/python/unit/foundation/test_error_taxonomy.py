@@ -5,16 +5,20 @@ from __future__ import annotations
 import pytest
 
 from uniserve.runtime import EventPoolError
-from uniserve_worker.foundation.errors import WorkerError, WorkerErrorCode, classify
+from uniserve_worker.foundation.errors import (
+    WorkerError,
+    WorkerErrorCode,
+    classify,
+)
 from uniserve_worker.protocol.identity import ComputationId
 
 pytestmark = pytest.mark.unit
 
 
-# Message variants that the production text/heuristic matcher actually treats as
-# CUDA OOM (case-insensitive substring match against "out of memory", "cuda oom",
-# "cublas_status_alloc_failed"). The cuBLAS allocation-failure string is the
-# load-bearing "incl. cuBLAS variant" case.
+# Message variants that the production text/heuristic matcher actually
+# treats as CUDA OOM (case-insensitive substring match against "out of
+# memory", "cuda oom", "cublas_status_alloc_failed"). The cuBLAS
+# allocation-failure string is the load-bearing "incl. cuBLAS variant" case.
 OOM_MESSAGE_VARIANTS = [
     "CUDA out of memory. Tried to allocate 2.00 GiB (GPU 0; 39.59 GiB total)",
     "CUDA error: out of memory",
@@ -57,7 +61,7 @@ def test_oom_detection_walks_class_hierarchy_for_subclasses():
     class OutOfMemoryError(RuntimeError):
         pass
 
-    class DeviceAllocFailure(OutOfMemoryError):
+    class DeviceAllocFailure(OutOfMemoryError):  # noqa: N818  # deliberate taxonomy name
         pass
 
     err = classify(DeviceAllocFailure("alloc denied"))
@@ -75,7 +79,9 @@ def test_generic_runtime_error_classifies_as_compute_error():
 
 
 def test_event_pool_error_classifies_as_fatal_invariant_violation():
-    err = classify(EventPoolError("device event reference accounting is invalid"))
+    err = classify(
+        EventPoolError("device event reference accounting is invalid")
+    )
 
     assert err.code == WorkerErrorCode.INVARIANT_VIOLATION
     assert err.retryable is False
@@ -85,7 +91,8 @@ def test_event_pool_error_classifies_as_fatal_invariant_violation():
 @pytest.mark.parametrize(
     "message",
     [
-        "CUDNN_STATUS_ALLOC_FAILED",  # cuDNN alloc failure is NOT matched as OOM
+        # cuDNN alloc failure is NOT matched as OOM
+        "CUDNN_STATUS_ALLOC_FAILED",
         "cudnn allocation failed",
         "cudaMalloc returned an error",
         "failed to allocate device buffer",
@@ -102,7 +109,11 @@ def test_non_matching_allocation_messages_are_compute_error(message):
 def test_fatal_cuda_marker_takes_precedence_over_oom_in_same_message():
     # Rule ordering is load-bearing: a context-corrupting CUDA fault is FATAL
     # even when the same message also mentions "out of memory".
-    err = classify(RuntimeError("an illegal memory access was encountered; CUDA out of memory"))
+    err = classify(
+        RuntimeError(
+            "an illegal memory access was encountered; CUDA out of memory"
+        )
+    )
 
     assert err.code == WorkerErrorCode.FATAL_WORKER_FAILURE
     assert err.fatal is True
@@ -135,15 +146,19 @@ def test_to_mapping_emits_canonical_error_context():
     assert snapshot["route"] == "language"
     assert snapshot["operations"] == [
         {
-            "request_key": {"engine_id": 5, "request_id": 42, "request_epoch": 3},
+            "request_key": {
+                "engine_id": 5,
+                "request_id": 42,
+                "request_epoch": 3,
+            },
             "op_id": {"batch_id": 7, "request_index": 0},
         }
     ]
 
 
 def test_to_mapping_coerces_truthy_flags_to_bool():
-    # to_mapping normalizes retryable/fatal through bool(): non-bool truthy/falsey
-    # inputs surface on the snapshot as real booleans.
+    # to_mapping normalizes retryable/fatal through bool(): non-bool
+    # truthy/falsey inputs surface on the snapshot as real booleans.
     snapshot = WorkerError(
         code=WorkerErrorCode.RESOURCE_ERROR,
         message="m",

@@ -56,12 +56,14 @@ logger = logging.getLogger(__name__)
 
 def _completion_error_code(code: WorkerErrorCode) -> ErrorCode:
     """Map internal failure classes to their completion-wire error codes."""
-
     if code == WorkerErrorCode.RESOURCE_ERROR:
         return ErrorCode.RESOURCE_EXHAUSTED
     if code == WorkerErrorCode.COMPUTE_ERROR:
         return ErrorCode.COMPUTE_ERROR
-    if code in {WorkerErrorCode.INVARIANT_VIOLATION, WorkerErrorCode.FATAL_WORKER_FAILURE}:
+    if code in {
+        WorkerErrorCode.INVARIANT_VIOLATION,
+        WorkerErrorCode.FATAL_WORKER_FAILURE,
+    }:
         return ErrorCode.INTERNAL
     return ErrorCode.INVALID_OPERATION
 
@@ -93,10 +95,11 @@ def execute_batch(
     Startup propagates computation errors; service execution reports nonfatal
     errors per completion group so independent work can still complete.
     """
-
     batch = state.batch
     if not state.inputs_ready():
-        raise RuntimeError("prepared execution was observed before transfer readiness")
+        raise RuntimeError(
+            "prepared execution was observed before transfer readiness"
+        )
 
     predicate_values = state.predicate_values()
     started = time.perf_counter_ns()
@@ -104,11 +107,13 @@ def execute_batch(
     required_predicates = {
         operations.operation_identity(operation)
         for operation in batch.operations
-        if operation.predicate is not None and operation.predicate.dtype is DType.U8
+        if operation.predicate is not None
+        and operation.predicate.dtype is DType.U8
     }
     if required_predicates != set(predicate_values):
         raise invalid_descriptor(
-            "completion-predicated operations require exact prepared predicate values"
+            "completion-predicated operations require exact prepared predicate "
+            "values"
         )
 
     if not batch.operations:
@@ -232,7 +237,9 @@ def execute_batch(
 
     if propagate_errors and execution_errors:
         first_group = next(
-            completion_group for completion_group in groups if completion_group in execution_errors
+            completion_group
+            for completion_group in groups
+            if completion_group in execution_errors
         )
         classified = _classify_group_failure(
             first_group,
@@ -357,8 +364,10 @@ def _classify_group_failure(
     phase: str,
     state: BatchState,
 ) -> WorkerError:
-    """Classify a pre-publication completion group failure with complete operation and route context."""
+    """Classify a pre-publication completion group failure with complete.
 
+    operation and route context.
+    """
     scheduled = tuple(
         (
             int(operation.request_key.engine_id),
@@ -396,8 +405,10 @@ def _published_group_failure(
     *,
     state: BatchState,
 ) -> WorkerError:
-    """Classify a post-visibility publication failure as a fatal invariant violation."""
+    """Classify a post-visibility publication failure as a fatal invariant.
 
+    violation.
+    """
     scheduled = tuple(
         (
             int(operation.request_key.engine_id),
@@ -409,7 +420,10 @@ def _published_group_failure(
     )
     classified = WorkerError(
         code=WorkerErrorCode.INVARIANT_VIOLATION,
-        message=f"completion_group publication failed after visibility began: {error}",
+        message=(
+            f"completion_group publication failed after visibility "
+            f"began: {error}"
+        ),
         fatal=True,
         phase="completion group publication",
         route=str(0),
@@ -425,12 +439,15 @@ def _log_group_failure(
     *,
     cause: BaseException | None = None,
 ) -> None:
-    """Log a classified completion group failure with traceback only for diagnostic error classes."""
+    """Log a classified completion group failure with traceback only for.
 
+    diagnostic error classes.
+    """
     capture_trace = should_capture_trace(error.code)
     log = logger.error if capture_trace else logger.warning
     log(
-        "completion group failed: %s [code=%s group_id=%s route=%s operations=%s]",
+        "completion group failed: %s [code=%s group_id=%s route=%s "
+        "operations=%s]",
         error.message,
         error.code,
         completion_group,
@@ -460,8 +477,10 @@ def _error_outputs(
     forward_stats: ForwardStats,
     request_pool: RequestPool,
 ) -> None:
-    """Record final errors at the owning completion boundary without accepting progress."""
+    """Record final errors at the owning completion boundary without accepting.
 
+    progress.
+    """
     completion_code = _completion_error_code(error.code)
     records: list[RequestOutput] = []
     for operation in state.group_operations(completion_group):
@@ -486,9 +505,15 @@ def _error_outputs(
             timing_counters=TimingCounters(),
             kind=operation.kind,
             position=(0 if runtime is None else int(runtime.logical_position)),
-            kv_visible_len=(0 if runtime is None else int(runtime.kv_visible_len)),
-            kv_computed_len=(0 if runtime is None else int(runtime.kv_computed_len)),
-            num_completed_steps=(0 if runtime is None else int(runtime.flow_step)),
+            kv_visible_len=(
+                0 if runtime is None else int(runtime.kv_visible_len)
+            ),
+            kv_computed_len=(
+                0 if runtime is None else int(runtime.kv_computed_len)
+            ),
+            num_completed_steps=(
+                0 if runtime is None else int(runtime.flow_step)
+            ),
             committed_tokens=(),
             finish_flags=FinishFlags(),
         )

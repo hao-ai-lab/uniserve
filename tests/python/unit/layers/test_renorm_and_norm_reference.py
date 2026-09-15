@@ -16,19 +16,26 @@ pytestmark = pytest.mark.unit
 def _combine(base, conditioned, scale, renorm, minimum=0.0):
     guidance = AdditiveGuidance(scale, 1.0, (0.0, 1.0), renorm, minimum)
     schedule = make_schedule(
-        1, shift=1.0, direction="descending", shift_domain="time", device=base.device
+        1,
+        shift=1.0,
+        direction="descending",
+        shift_domain="time",
+        device=base.device,
     )
     return guidance.combine(
-        {Branch.TEXT_UNCONDITIONAL: base, Branch.CONDITIONED: conditioned}, schedule, 0
+        {Branch.TEXT_UNCONDITIONAL: base, Branch.CONDITIONED: conditioned},
+        schedule,
+        0,
     )
 
 
 # --- shared references ------------------------------------------------------
 
 
-def _rms_reference(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _rms_reference(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
     """FP32 statistics and affine transform with an activation output cast."""
-
     in_dtype = x.dtype
     xf = x.to(torch.float32)
     variance = xf.pow(2).mean(-1, keepdim=True)
@@ -36,9 +43,13 @@ def _rms_reference(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.T
     return (weight.float() * xf).to(in_dtype)
 
 
-def _guided_two_branch(base: torch.Tensor, cond: torch.Tensor, scale: float) -> torch.Tensor:
-    """Pre-renorm guided velocity for the two-branch ``base + scale*(cond-base)`` form."""
+def _guided_two_branch(
+    base: torch.Tensor, cond: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """Pre-renorm guided velocity for the two-branch form.
 
+    The two-branch form is ``base + scale*(cond-base)``.
+    """
     return base + scale * (cond - base)
 
 
@@ -80,7 +91,9 @@ def test_renorm_rescale_blends_channel_matched_with_raw_guided():
     scale = 3.0
     guided = _guided_two_branch(base, cond, scale)
     eps = torch.finfo(guided.dtype).eps
-    matched = _match_norm_reference(guided, cond, dims=(guided.ndim - 1,), minimum=0.0, eps=eps)
+    matched = _match_norm_reference(
+        guided, cond, dims=(guided.ndim - 1,), minimum=0.0, eps=eps
+    )
     expected = 0.7 * matched + 0.3 * guided
 
     out = _combine(base, cond, scale, Renorm.RESCALE)
@@ -123,7 +136,8 @@ def test_renorm_min_clamps_reference_norm_up_disabling_downscale():
 
     # The default match downscales (strictly different from raw guided)...
     assert not torch.allclose(out_default, guided)
-    # ...while the large floor disables the downscale, returning guided unchanged.
+    # ...while the large floor disables the downscale, returning guided
+    # unchanged.
     torch.testing.assert_close(out_clamped, guided)
 
 
@@ -139,8 +153,10 @@ def test_guidance_rejects_an_unrecognized_renormalization():
 
 
 def test_rmsnorm_module_forward_matches_reference_with_unit_weight_cpu():
-    """The default unit-weight RMSNorm module preserves normalized CPU values."""
+    """The default unit-weight RMSNorm module.
 
+    The module preserves normalized CPU values.
+    """
     torch.manual_seed(8)
     hidden = 64
     module = RMSNorm(hidden)  # default weight is all-ones
@@ -154,11 +170,15 @@ def test_rmsnorm_module_forward_matches_reference_with_unit_weight_cpu():
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA RMSNorm needs a device")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA RMSNorm needs a device"
+)
 def test_rmsnorm_matches_fp32_reference_on_cuda():
     torch.manual_seed(10)
     hidden = 512
-    weight = torch.randn(hidden, device="cuda", dtype=torch.float32).contiguous()
+    weight = torch.randn(
+        hidden, device="cuda", dtype=torch.float32
+    ).contiguous()
     x = torch.randn(16, hidden, device="cuda", dtype=torch.float32).contiguous()
 
     with torch.no_grad():
@@ -176,17 +196,29 @@ def test_rmsnorm_preserves_normalization_and_residual_values(device, dtype):
     generator = torch.Generator(device=device).manual_seed(181)
     module = RMSNorm(128, 1e-5, device=device).to(dtype)
     with torch.no_grad():
-        module.weight.copy_(torch.randn((128,), generator=generator, device=device))
-        values = torch.randn((3, 5, 128), generator=generator, device=device).to(dtype)
-        residual = torch.randn(values.shape, generator=generator, device=device).to(dtype)
+        module.weight.copy_(
+            torch.randn((128,), generator=generator, device=device)
+        )
+        values = torch.randn(
+            (3, 5, 128), generator=generator, device=device
+        ).to(dtype)
+        residual = torch.randn(
+            values.shape, generator=generator, device=device
+        ).to(dtype)
         expected = torch.nn.functional.rms_norm(
             values.float(), (128,), weight=module.weight.float(), eps=1e-5
         ).to(dtype)
-        torch.testing.assert_close(module(values), expected, rtol=2e-2, atol=2e-2)
-        normalized, combined = functional.add_rms_norm(values, residual, module.weight, module.eps)
+        torch.testing.assert_close(
+            module(values), expected, rtol=2e-2, atol=2e-2
+        )
+        normalized, combined = functional.add_rms_norm(
+            values, residual, module.weight, module.eps
+        )
         expected_sum = values + residual
         expected_normalized = torch.nn.functional.rms_norm(
             expected_sum.float(), (128,), weight=module.weight.float(), eps=1e-5
         ).to(dtype)
         torch.testing.assert_close(combined, expected_sum, rtol=0, atol=0)
-        torch.testing.assert_close(normalized, expected_normalized, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(
+            normalized, expected_normalized, rtol=2e-2, atol=2e-2
+        )

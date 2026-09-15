@@ -42,14 +42,21 @@ class _Embedding(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones((), dtype=torch.bfloat16), requires_grad=False)
+        self.weight = nn.Parameter(
+            torch.ones((), dtype=torch.bfloat16), requires_grad=False
+        )
 
     def forward(self, tokens):
         # Three base-128 digits recover the ID losslessly below 128**3, plus a
         # constant bias digit, so the head can invert features back to tokens.
         return (
             torch.stack(
-                (tokens % 128, tokens // 128 % 128, tokens // 16384, torch.ones_like(tokens)),
+                (
+                    tokens % 128,
+                    tokens // 128 % 128,
+                    tokens // 16384,
+                    torch.ones_like(tokens),
+                ),
                 dim=-1,
             ).to(self.weight.dtype)
             * self.weight
@@ -61,7 +68,9 @@ class _Head(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.vocab = VocabShard(_VOCAB_SIZE, slice(0, _VOCAB_SIZE), _VOCAB_SIZE, Communicator())
+        self.vocab = VocabShard(
+            _VOCAB_SIZE, slice(0, _VOCAB_SIZE), _VOCAB_SIZE, Communicator()
+        )
 
     def forward(self, hidden):
         # Invert the embedding's base-128 digits back into the input token ID.
@@ -74,7 +83,9 @@ class _Head(nn.Module):
         targets = torch.where(tokens == 1000, 1001, targets)
         targets = torch.where(tokens == 1001, STUB_IMG_START_TOKEN_ID, targets)
         targets = torch.where(tokens == STUB_IMG_START_TOKEN_ID, 1002, targets)
-        targets = torch.where((tokens >= 1002) & (tokens < 1007), tokens + 1, targets)
+        targets = torch.where(
+            (tokens >= 1002) & (tokens < 1007), tokens + 1, targets
+        )
         targets = torch.where(tokens == 1007, STUB_EOS_TOKEN_ID, targets)
 
         # ±16 logits make argmax sampling pick the cycle's successor token.
@@ -83,12 +94,16 @@ class _Head(nn.Module):
 
 
 class _Layer(nn.Module):
-    """Preserve features while publishing zero scalar K/V at supplied indices."""
+    """Preserve features while publishing zero scalar K/V at supplied indices."""  # noqa: E501
 
     def __init__(self):
         super().__init__()
-        self.scale = nn.Parameter(torch.zeros((), dtype=torch.bfloat16), requires_grad=False)
-        self.attention = Attention(1, 1, 1, cache_name="backbone.layers.0.attention")
+        self.scale = nn.Parameter(
+            torch.zeros((), dtype=torch.bfloat16), requires_grad=False
+        )
+        self.attention = Attention(
+            1, 1, 1, cache_name="backbone.layers.0.attention"
+        )
 
     def forward(self, hidden, residual, positions, attention):
         values = hidden.new_zeros((hidden.shape[0], 1, 1)) + self.scale
@@ -96,8 +111,12 @@ class _Layer(nn.Module):
             isinstance(attention, (PagedInput, SegmentedInput))
             and attention.write_indices is not None
         ):
-            self.attention.update_cache(values, values, indices=attention.write_indices)
-        return hidden, torch.zeros_like(hidden) if residual is None else residual
+            self.attention.update_cache(
+                values, values, indices=attention.write_indices
+            )
+        return hidden, torch.zeros_like(
+            hidden
+        ) if residual is None else residual
 
 
 class _Vision(nn.Module):
@@ -108,9 +127,15 @@ class _Vision(nn.Module):
         self.patch_size = patch_size
 
     def forward(self, pixels, grids, grid_shapes):
-        patches = patchify(pixels, patch_size=self.patch_size) if pixels.ndim == 4 else pixels
+        patches = (
+            patchify(pixels, patch_size=self.patch_size)
+            if pixels.ndim == 4
+            else pixels
+        )
         return (
-            patches.reshape(-1, patches.shape[-1]).mean(-1, keepdim=True).expand(-1, _HIDDEN_SIZE)
+            patches.reshape(-1, patches.shape[-1])
+            .mean(-1, keepdim=True)
+            .expand(-1, _HIDDEN_SIZE)
         )
 
 
@@ -119,7 +144,9 @@ class _Scale(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones((), dtype=torch.bfloat16), requires_grad=False)
+        self.weight = nn.Parameter(
+            torch.ones((), dtype=torch.bfloat16), requires_grad=False
+        )
 
     def forward(self, pixels):
         return pixels * self.weight
@@ -137,7 +164,9 @@ class Model(CausalLM):
     """Compose deterministic text, vision, latent and image capabilities."""
 
     def __init__(self, config: Config = Config()):
-        backbone = TransformerDecoder(_Embedding(), nn.ModuleDict({"0": _Layer()}), nn.Identity())
+        backbone = TransformerDecoder(
+            _Embedding(), nn.ModuleDict({"0": _Layer()}), nn.Identity()
+        )
         super().__init__(backbone, _Head())
         self.config = config
 

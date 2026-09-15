@@ -118,7 +118,14 @@ markers = [
 ]
 
 [tool.ruff]
-line-length = 100
+# Enforces the Google Python Style Guide
+# (https://google.github.io/styleguide/pyguide.html) on all project Python
+# modules: 80-column line limit (guide section 3.4), Google docstring
+# convention, and PEP 8 naming. Where the guide and the previous project
+# configuration disagreed, the guide wins; resolutions are recorded in
+# specs/python-style.md. The `refs/` reference checkouts keep their own
+# per-repository style enforcement (see refs/TensorRT-LLM/pyproject.toml).
+line-length = 80
 target-version = "py311"
 extend-exclude = [
     "refs",
@@ -127,8 +134,23 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]
-ignore = ["E501"]
+select = ["E", "W", "F", "I", "D", "N", "C4", "UP"]
+ignore = [
+    # Docstring presence is not retroactively enforced (the same resolution
+    # TensorRT-LLM uses); the format of every existing docstring is checked.
+    "D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107", "D417",
+    # Rules incompatible with the Google docstring convention; mirrors the set
+    # ruff disables when only `convention = "google"` drives the selection.
+    "D203", "D204", "D213", "D215", "D400", "D401", "D404", "D406", "D407",
+    "D408", "D409", "D413",
+    # `import torch.nn.functional as F` is the established PyTorch alias
+    # convention; the Google guide does not prohibit it. pep8-naming's blanket
+    # ban on uppercase aliases conflicts with it, so the alias case is waived.
+    "N812",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.mypy]
 # Use the invoking Python version so installed dependency stubs match CI's runtime.

@@ -1,11 +1,17 @@
-"""ScheduledRequest identities and scalar bounds derived from logical execution state."""
+"""ScheduledRequest identities and scalar bounds derived from logical execution.
+
+state.
+"""
 
 from __future__ import annotations
 
 from dataclasses import replace
 
 from uniserve_worker.execution.output import PendingOutput
-from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.foundation.errors import (
+    invalid_descriptor,
+    unsupported_setup,
+)
 from uniserve_worker.protocol.operation import OpStatus, ScheduledRequest
 from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.runtime.block_tables import BlockTables
@@ -17,13 +23,16 @@ from .rows import OperationIdentity
 
 def output_generations(operation: ScheduledRequest) -> tuple[int, ...]:
     """List logical generations in descriptor output order."""
-
-    return tuple(int(reference.generation) for reference in operation.tensor_outputs())
+    return tuple(
+        int(reference.generation) for reference in operation.tensor_outputs()
+    )
 
 
 def require_progress(output: PendingOutput) -> RequestProgress:
-    """Require real request progress for a state-consuming numerical operation."""
+    """Require real request progress for a state-consuming numerical.
 
+    operation.
+    """
     progress = output.projected_progress
     if progress is None:
         raise invalid_descriptor("operation does not consume request progress")
@@ -31,8 +40,10 @@ def require_progress(output: PendingOutput) -> RequestProgress:
 
 
 def input_progress(output: PendingOutput) -> RequestProgress | None:
-    """Read the stable predecessor, preferring actual acceptance when it is known."""
+    """Read the stable predecessor.
 
+    preferring actual acceptance when it is known.
+    """
     predecessor = output.predecessor
     if isinstance(predecessor, PendingOutput):
         return predecessor.accepted_progress or predecessor.projected_progress
@@ -46,8 +57,10 @@ def execution_runtime(
     flow_step: int | None = None,
     computed_len: int | None = None,
 ) -> RequestProgress | None:
-    """Project actual state consumers without constructing progress for stateless work."""
+    """Project actual state consumers without constructing progress for.
 
+    stateless work.
+    """
     progress = request.projected_progress
     if progress is None:
         return None
@@ -74,8 +87,10 @@ def cache_coordinates(
     tables: BlockTables | None,
     group_id: int = 0,
 ) -> tuple[int, int, int, int]:
-    """Resolve the request slot, cache group, accepted prefix and physical token capacity."""
+    """Resolve the request slot, cache group.
 
+    accepted prefix and physical token capacity.
+    """
     slot = int(request.request.request_pool_idx)
     # Scheduler columns may reserve the full unobserved verifier prefix.
     # The request state owns the accepted extent used by numerical consumers.
@@ -89,13 +104,17 @@ def cache_coordinates(
     capacity = pool.allocated_length(slot)
 
     if visible > capacity:
-        raise invalid_descriptor("operation visibility exceeds scheduler block table")
+        raise invalid_descriptor(
+            "operation visibility exceeds scheduler block table"
+        )
     return slot, int(group_id), visible, capacity
 
 
 def operation_identity(operation: ScheduledRequest) -> OperationIdentity:
-    """Form the completion group-local identity from request generation and operation id."""
+    """Form the completion group-local identity from request generation and.
 
+    operation id.
+    """
     return operation.request_key, operation.op_id
 
 
@@ -105,9 +124,13 @@ def _predicated_outcome(
     *,
     state: BatchState,
 ) -> PendingOutput:
-    """Construct an inactive outcome while preserving declared product generations."""
+    """Construct an inactive outcome while preserving declared product.
 
-    request = state.pending_output(completion_group, operation.request_key.request_id)
+    generations.
+    """
+    request = state.pending_output(
+        completion_group, operation.request_key.request_id
+    )
     request.status = OpStatus.PREDICATED
     request.projected_progress = execution_runtime(request, None)
     request.finish_flags = FinishFlags()

@@ -6,7 +6,10 @@ from queue import Empty, Full, Queue
 
 
 class QueuedWorkerIpc:
-    """Deliver requests, responses and latched wake signals between test threads."""
+    """Deliver requests, responses and latched wake signals.
+
+    Delivery happens between test threads.
+    """
 
     def __init__(self, requests: tuple[dict[str, object], ...] = ()) -> None:
         self.closed = False

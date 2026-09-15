@@ -18,7 +18,9 @@ class Encoder(nn.Module):
         super().__init__()
         self.encoder = siglip.Encoder(config.vision)
         self.connector = MLPConnector(
-            config.vision.encoder.hidden_size, config.text.hidden_size, config.connector_act
+            config.vision.encoder.hidden_size,
+            config.text.hidden_size,
+            config.connector_act,
         )
         side = config.vision.image_size // config.vision.patch_size
         self.position = PositionEmbedding((side, side), config.text.hidden_size)
@@ -29,4 +31,6 @@ class Encoder(nn.Module):
         columns, rows = build_abs_positions_from_grid_hw(
             grids, total=sum(height * width for height, width in grid_shapes)
         )
-        return features + self.position(rows * self.position.grid_size[1] + columns)
+        return features + self.position(
+            rows * self.position.grid_size[1] + columns
+        )

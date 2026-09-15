@@ -1,9 +1,9 @@
 """Channel-scaled residuals and normalization with FP32 affine accumulation.
 
 Projection bias, residual sums, normalization statistics and learned affine
-transforms stay in FP32 until the output dtype boundary. RMS variants update the
-residual storage in place while normalizing the unrounded sum. Magnitude variants
-measure the stored output.
+transforms stay in FP32 until the output dtype boundary. RMS variants update
+the residual storage in place while normalizing the unrounded sum. Magnitude
+variants measure the stored output.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ except ImportError:
 
 def _output_dtype(value: torch.Tensor) -> torch.dtype:
     """Return the dtype CUDA autocast would produce for ``value``."""
-
     return (
         torch.get_autocast_dtype("cuda")
         if value.is_cuda and torch.is_autocast_enabled("cuda")
@@ -34,14 +33,20 @@ def _output_dtype(value: torch.Tensor) -> torch.dtype:
 
 def _fused_rows(value: torch.Tensor, *vectors: torch.Tensor | None) -> bool:
     """Validate channel vectors and select contiguous bounded CUDA rows."""
-
     if value.ndim < 1 or value.numel() == 0 or not value.is_floating_point():
-        raise ValueError("normalization requires nonempty floating activation rows")
+        raise ValueError(
+            "normalization requires nonempty floating activation rows"
+        )
 
     width = int(value.shape[-1])
     for vector in vectors:
-        if vector is not None and (vector.numel() != width or vector.device != value.device):
-            raise ValueError("normalization vectors must match the activation width and device")
+        if vector is not None and (
+            vector.numel() != width or vector.device != value.device
+        ):
+            raise ValueError(
+                "normalization vectors must match the activation width and "
+                "device"
+            )
 
     # A single Triton block reduces each row, so the width is bounded by one
     # block's register footprint.
@@ -62,23 +67,27 @@ if triton is not None:
         weight_ptr,
         output_ptr,
         eps,
-        WIDTH: tl.constexpr,
-        BLOCK: tl.constexpr,
+        WIDTH: tl.constexpr,  # noqa: N803
+        BLOCK: tl.constexpr,  # noqa: N803
     ):
         """Normalize one activation row and apply its learned scale."""
-
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
 
-        hidden = tl.load(hidden_ptr + row * WIDTH + columns, mask=columns < WIDTH, other=0.0).to(
-            tl.float32
-        )
-        weight = tl.load(weight_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
+        hidden = tl.load(
+            hidden_ptr + row * WIDTH + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+        weight = tl.load(
+            weight_ptr + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
 
-        # Reduction and scaling stay in fp32; the store casts to the output dtype.
+        # Reduction and scaling stay in fp32; the store casts to the output
+        # dtype.
         inverse_rms = tl.rsqrt(tl.sum(hidden * hidden, axis=0) / WIDTH + eps)
         tl.store(
-            output_ptr + row * WIDTH + columns, hidden * inverse_rms * weight, mask=columns < WIDTH
+            output_ptr + row * WIDTH + columns,
+            hidden * inverse_rms * weight,
+            mask=columns < WIDTH,
         )
 
     @triton.jit
@@ -88,28 +97,38 @@ if triton is not None:
         output_ptr,
         partials_ptr,
         eps,
-        WIDTH: tl.constexpr,
-        BLOCK: tl.constexpr,
+        WIDTH: tl.constexpr,  # noqa: N803
+        BLOCK: tl.constexpr,  # noqa: N803
     ):
-        """Normalize one row while publishing its output magnitude for reduction."""
+        """Normalize one row and publish its output magnitude.
 
+        Normalize one row while publishing its output magnitude for
+        reduction.
+        """
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
 
-        hidden = tl.load(hidden_ptr + row * WIDTH + columns, mask=columns < WIDTH, other=0.0).to(
-            tl.float32
-        )
-        weight = tl.load(weight_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
+        hidden = tl.load(
+            hidden_ptr + row * WIDTH + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+        weight = tl.load(
+            weight_ptr + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
 
         inverse_rms = tl.rsqrt(tl.sum(hidden * hidden, axis=0) / WIDTH + eps)
         output = (hidden * inverse_rms * weight).to(output_ptr.dtype.element_ty)
-        tl.store(output_ptr + row * WIDTH + columns, output, mask=columns < WIDTH)
+        tl.store(
+            output_ptr + row * WIDTH + columns, output, mask=columns < WIDTH
+        )
 
         # ``partials_ptr`` collects one magnitude per row; ``finish_absmax``
         # reduces them to the published scalar after the launch.
         tl.store(
             partials_ptr + row,
-            tl.max(tl.where(columns < WIDTH, tl.abs(output.to(tl.float32)), 0.0), axis=0),
+            tl.max(
+                tl.where(columns < WIDTH, tl.abs(output.to(tl.float32)), 0.0),
+                axis=0,
+            ),
         )
 
     @triton.jit
@@ -121,32 +140,45 @@ if triton is not None:
         weight_ptr,
         output_ptr,
         eps,
-        HAS_UPDATE_BIAS: tl.constexpr,
-        WIDTH: tl.constexpr,
-        BLOCK: tl.constexpr,
+        HAS_UPDATE_BIAS: tl.constexpr,  # noqa: N803
+        WIDTH: tl.constexpr,  # noqa: N803
+        BLOCK: tl.constexpr,  # noqa: N803
     ):
         """Update a residual row in place and emit its RMS-normalized value."""
-
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
         offsets = row * WIDTH + columns
 
-        hidden = tl.load(hidden_ptr + offsets, mask=columns < WIDTH, other=0.0).to(tl.float32)
-        update = tl.load(update_ptr + offsets, mask=columns < WIDTH, other=0.0).to(tl.float32)
+        hidden = tl.load(
+            hidden_ptr + offsets, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+        update = tl.load(
+            update_ptr + offsets, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
         if HAS_UPDATE_BIAS:
-            update += tl.load(update_bias_ptr + columns, mask=columns < WIDTH, other=0.0).to(
-                tl.float32
-            )
-        scale = tl.load(scale_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
+            update += tl.load(
+                update_bias_ptr + columns, mask=columns < WIDTH, other=0.0
+            ).to(tl.float32)
+        scale = tl.load(
+            scale_ptr + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
 
         residual = hidden + update * scale
-        inverse_rms = tl.rsqrt(tl.sum(residual * residual, axis=0) / WIDTH + eps)
-        weight = tl.load(weight_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
+        inverse_rms = tl.rsqrt(
+            tl.sum(residual * residual, axis=0) / WIDTH + eps
+        )
+        weight = tl.load(
+            weight_ptr + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
 
         # The residual stream is written back before its normalized projection
         # is rounded into the output dtype.
         tl.store(hidden_ptr + offsets, residual, mask=columns < WIDTH)
-        tl.store(output_ptr + offsets, residual * inverse_rms * weight, mask=columns < WIDTH)
+        tl.store(
+            output_ptr + offsets,
+            residual * inverse_rms * weight,
+            mask=columns < WIDTH,
+        )
 
     @triton.jit
     def _scaled_residual_rms_norm_absmax_kernel(
@@ -158,34 +190,52 @@ if triton is not None:
         output_ptr,
         partials_ptr,
         eps,
-        HAS_UPDATE_BIAS: tl.constexpr,
-        WIDTH: tl.constexpr,
-        BLOCK: tl.constexpr,
+        HAS_UPDATE_BIAS: tl.constexpr,  # noqa: N803
+        WIDTH: tl.constexpr,  # noqa: N803
+        BLOCK: tl.constexpr,  # noqa: N803
     ):
-        """Fuse residual update, RMS normalization, and rowwise magnitude capture."""
+        """Fuse residual update, RMS normalization, and magnitude capture.
 
+        Fuse residual update, RMS normalization, and rowwise magnitude
+        capture.
+        """
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
         offsets = row * WIDTH + columns
 
-        hidden = tl.load(hidden_ptr + offsets, mask=columns < WIDTH, other=0.0).to(tl.float32)
-        update = tl.load(update_ptr + offsets, mask=columns < WIDTH, other=0.0).to(tl.float32)
+        hidden = tl.load(
+            hidden_ptr + offsets, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+        update = tl.load(
+            update_ptr + offsets, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
         if HAS_UPDATE_BIAS:
-            update += tl.load(update_bias_ptr + columns, mask=columns < WIDTH, other=0.0).to(
-                tl.float32
-            )
-        scale = tl.load(scale_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
+            update += tl.load(
+                update_bias_ptr + columns, mask=columns < WIDTH, other=0.0
+            ).to(tl.float32)
+        scale = tl.load(
+            scale_ptr + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
 
         residual = hidden + update * scale
-        inverse_rms = tl.rsqrt(tl.sum(residual * residual, axis=0) / WIDTH + eps)
-        weight = tl.load(weight_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
-        output = (residual * inverse_rms * weight).to(output_ptr.dtype.element_ty)
+        inverse_rms = tl.rsqrt(
+            tl.sum(residual * residual, axis=0) / WIDTH + eps
+        )
+        weight = tl.load(
+            weight_ptr + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+        output = (residual * inverse_rms * weight).to(
+            output_ptr.dtype.element_ty
+        )
 
         tl.store(hidden_ptr + offsets, residual, mask=columns < WIDTH)
         tl.store(output_ptr + offsets, output, mask=columns < WIDTH)
         tl.store(
             partials_ptr + row,
-            tl.max(tl.where(columns < WIDTH, tl.abs(output.to(tl.float32)), 0.0), axis=0),
+            tl.max(
+                tl.where(columns < WIDTH, tl.abs(output.to(tl.float32)), 0.0),
+                axis=0,
+            ),
         )
 
     @triton.jit
@@ -195,23 +245,30 @@ if triton is not None:
         update_bias_ptr,
         scale_ptr,
         elements,
-        HAS_UPDATE_BIAS: tl.constexpr,
-        WIDTH: tl.constexpr,
-        BLOCK: tl.constexpr,
+        HAS_UPDATE_BIAS: tl.constexpr,  # noqa: N803
+        WIDTH: tl.constexpr,  # noqa: N803
+        BLOCK: tl.constexpr,  # noqa: N803
     ):
         """Apply a channel-scaled update to the residual stream."""
-
         # Flat element offsets address ``hidden``/``update``; the channel index
         # selects the per-channel scale and optional bias.
         offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         mask = offsets < elements
         columns = offsets % WIDTH
 
-        hidden = tl.load(hidden_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        update = tl.load(update_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        hidden = tl.load(hidden_ptr + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        update = tl.load(update_ptr + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
         if HAS_UPDATE_BIAS:
-            update += tl.load(update_bias_ptr + columns, mask=mask, other=0.0).to(tl.float32)
-        scale = tl.load(scale_ptr + columns, mask=mask, other=0.0).to(tl.float32)
+            update += tl.load(
+                update_bias_ptr + columns, mask=mask, other=0.0
+            ).to(tl.float32)
+        scale = tl.load(scale_ptr + columns, mask=mask, other=0.0).to(
+            tl.float32
+        )
 
         tl.store(hidden_ptr + offsets, hidden + update * scale, mask=mask)
 
@@ -225,33 +282,49 @@ if triton is not None:
         bias_ptr,
         output_ptr,
         eps,
-        HAS_UPDATE_BIAS: tl.constexpr,
-        WIDTH: tl.constexpr,
-        BLOCK: tl.constexpr,
+        HAS_UPDATE_BIAS: tl.constexpr,  # noqa: N803
+        WIDTH: tl.constexpr,  # noqa: N803
+        BLOCK: tl.constexpr,  # noqa: N803
     ):
         """Fuse a scaled residual update with layer normalization."""
-
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
         offsets = row * WIDTH + columns
 
-        hidden = tl.load(hidden_ptr + offsets, mask=columns < WIDTH, other=0.0).to(tl.float32)
-        update = tl.load(update_ptr + offsets, mask=columns < WIDTH, other=0.0).to(tl.float32)
+        hidden = tl.load(
+            hidden_ptr + offsets, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+        update = tl.load(
+            update_ptr + offsets, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
         if HAS_UPDATE_BIAS:
-            update += tl.load(update_bias_ptr + columns, mask=columns < WIDTH, other=0.0).to(
-                tl.float32
-            )
-        scale = tl.load(scale_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
+            update += tl.load(
+                update_bias_ptr + columns, mask=columns < WIDTH, other=0.0
+            ).to(tl.float32)
+        scale = tl.load(
+            scale_ptr + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
 
         residual = hidden + update * scale
         mean = tl.sum(residual, axis=0) / WIDTH
-        # Masked lanes center to zero so they contribute nothing to the variance.
+        # Masked lanes center to zero so they contribute nothing to the
+        # variance.
         centered = tl.where(columns < WIDTH, residual - mean, 0.0)
-        inverse_std = tl.rsqrt(tl.sum(centered * centered, axis=0) / WIDTH + eps)
-        weight = tl.load(weight_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
-        bias = tl.load(bias_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
+        inverse_std = tl.rsqrt(
+            tl.sum(centered * centered, axis=0) / WIDTH + eps
+        )
+        weight = tl.load(
+            weight_ptr + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+        bias = tl.load(bias_ptr + columns, mask=columns < WIDTH, other=0.0).to(
+            tl.float32
+        )
 
-        tl.store(output_ptr + offsets, centered * inverse_std * weight + bias, mask=columns < WIDTH)
+        tl.store(
+            output_ptr + offsets,
+            centered * inverse_std * weight + bias,
+            mask=columns < WIDTH,
+        )
 
     @triton.jit
     def _scaled_residual_layer_norm_absmax_kernel(
@@ -264,43 +337,65 @@ if triton is not None:
         output_ptr,
         partials_ptr,
         eps,
-        HAS_UPDATE_BIAS: tl.constexpr,
-        WIDTH: tl.constexpr,
-        BLOCK: tl.constexpr,
+        HAS_UPDATE_BIAS: tl.constexpr,  # noqa: N803
+        WIDTH: tl.constexpr,  # noqa: N803
+        BLOCK: tl.constexpr,  # noqa: N803
     ):
-        """Compute fused residual layer normalization and rowwise output magnitude."""
+        """Compute fused residual layer norm and output magnitude.
 
+        Compute fused residual layer normalization and rowwise output
+        magnitude.
+        """
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
         offsets = row * WIDTH + columns
 
-        hidden = tl.load(hidden_ptr + offsets, mask=columns < WIDTH, other=0.0).to(tl.float32)
-        update = tl.load(update_ptr + offsets, mask=columns < WIDTH, other=0.0).to(tl.float32)
+        hidden = tl.load(
+            hidden_ptr + offsets, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+        update = tl.load(
+            update_ptr + offsets, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
         if HAS_UPDATE_BIAS:
-            update += tl.load(update_bias_ptr + columns, mask=columns < WIDTH, other=0.0).to(
-                tl.float32
-            )
-        scale = tl.load(scale_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
+            update += tl.load(
+                update_bias_ptr + columns, mask=columns < WIDTH, other=0.0
+            ).to(tl.float32)
+        scale = tl.load(
+            scale_ptr + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
 
         residual = hidden + update * scale
         mean = tl.sum(residual, axis=0) / WIDTH
-        # Masked lanes center to zero so they contribute nothing to the variance.
+        # Masked lanes center to zero so they contribute nothing to the
+        # variance.
         centered = tl.where(columns < WIDTH, residual - mean, 0.0)
-        inverse_std = tl.rsqrt(tl.sum(centered * centered, axis=0) / WIDTH + eps)
-        weight = tl.load(weight_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
-        bias = tl.load(bias_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
-        output = (centered * inverse_std * weight + bias).to(output_ptr.dtype.element_ty)
+        inverse_std = tl.rsqrt(
+            tl.sum(centered * centered, axis=0) / WIDTH + eps
+        )
+        weight = tl.load(
+            weight_ptr + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+        bias = tl.load(bias_ptr + columns, mask=columns < WIDTH, other=0.0).to(
+            tl.float32
+        )
+        output = (centered * inverse_std * weight + bias).to(
+            output_ptr.dtype.element_ty
+        )
 
         tl.store(output_ptr + offsets, output, mask=columns < WIDTH)
         tl.store(
             partials_ptr + row,
-            tl.max(tl.where(columns < WIDTH, tl.abs(output.to(tl.float32)), 0.0), axis=0),
+            tl.max(
+                tl.where(columns < WIDTH, tl.abs(output.to(tl.float32)), 0.0),
+                axis=0,
+            ),
         )
 
 
-def weighted_rms_norm(hidden: torch.Tensor, weight: torch.Tensor, *, eps: float) -> torch.Tensor:
+def weighted_rms_norm(
+    hidden: torch.Tensor, weight: torch.Tensor, *, eps: float
+) -> torch.Tensor:
     """Apply weighted RMS normalization with CPU and Triton execution paths."""
-
     if not _fused_rows(hidden, weight):
         normalized = hidden.float() * torch.rsqrt(
             hidden.float().pow(2).mean(-1, keepdim=True) + eps
@@ -309,7 +404,9 @@ def weighted_rms_norm(hidden: torch.Tensor, weight: torch.Tensor, *, eps: float)
 
     # Under CUDA autocast the kernel writes the autocast dtype directly.
     output_dtype = (
-        torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else hidden.dtype
+        torch.get_autocast_dtype("cuda")
+        if torch.is_autocast_enabled("cuda")
+        else hidden.dtype
     )
     output = torch.empty_like(hidden, dtype=output_dtype)
     rows = hidden.numel() // int(hidden.shape[-1])
@@ -333,13 +430,14 @@ def weighted_rms_norm_absmax(
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return normalized activation rows and their global absolute maximum."""
-
     if not _fused_rows(hidden, weight):
         output = weighted_rms_norm(hidden, weight, eps=eps)
         return output, output.abs().amax()
 
     output_dtype = (
-        torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else hidden.dtype
+        torch.get_autocast_dtype("cuda")
+        if torch.is_autocast_enabled("cuda")
+        else hidden.dtype
     )
     output = torch.empty_like(hidden, dtype=output_dtype)
     rows = hidden.numel() // int(hidden.shape[-1])
@@ -367,16 +465,23 @@ def scaled_residual_rms_norm_(
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Update the residual stream in place and return ``(residual, normalized)``.
+    """Update the residual stream in place.
+
+    Update the residual stream in place and return ``(residual,
+    normalized)``.
 
     ``hidden`` is overwritten with the fp32 residual sum rounded to its own
     dtype; the second return value carries its RMS-normalized, weighted form.
     """
-
     if hidden.shape != update.shape or hidden.device != update.device:
-        raise ValueError("scaled residual operands must have the same shape and device")
+        raise ValueError(
+            "scaled residual operands must have the same shape and device"
+        )
 
-    if not _fused_rows(hidden, scale, weight, update_bias) or not update.is_contiguous():
+    if (
+        not _fused_rows(hidden, scale, weight, update_bias)
+        or not update.is_contiguous()
+    ):
         biased_update = update.float()
         if update_bias is not None:
             biased_update = biased_update + update_bias.float()
@@ -384,11 +489,15 @@ def scaled_residual_rms_norm_(
         residual = hidden.float() + biased_update * scale.float()
         hidden.copy_(residual)
 
-        normalized = residual * torch.rsqrt(residual.square().mean(-1, keepdim=True) + eps)
+        normalized = residual * torch.rsqrt(
+            residual.square().mean(-1, keepdim=True) + eps
+        )
         return hidden, (normalized * weight.float()).to(_output_dtype(update))
 
     output_dtype = (
-        torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else update.dtype
+        torch.get_autocast_dtype("cuda")
+        if torch.is_autocast_enabled("cuda")
+        else update.dtype
     )
     output = torch.empty_like(hidden, dtype=output_dtype)
     rows = hidden.numel() // int(hidden.shape[-1])
@@ -418,16 +527,23 @@ def scaled_residual_rms_norm_absmax_(
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Update a residual in place and return normalized values with their magnitude.
+    """Update a residual in place.
+
+    Update a residual in place and return normalized values with their
+    magnitude.
 
     Returns ``(residual, normalized, absmax)`` where ``absmax`` is a scalar of
     the normalized output's dtype.
     """
-
     if hidden.shape != update.shape or hidden.device != update.device:
-        raise ValueError("scaled residual operands must have the same shape and device")
+        raise ValueError(
+            "scaled residual operands must have the same shape and device"
+        )
 
-    if not _fused_rows(hidden, scale, weight, update_bias) or not update.is_contiguous():
+    if (
+        not _fused_rows(hidden, scale, weight, update_bias)
+        or not update.is_contiguous()
+    ):
         hidden, output = scaled_residual_rms_norm_(
             hidden,
             update,
@@ -439,7 +555,9 @@ def scaled_residual_rms_norm_absmax_(
         return hidden, output, output.abs().amax()
 
     output_dtype = (
-        torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else update.dtype
+        torch.get_autocast_dtype("cuda")
+        if torch.is_autocast_enabled("cuda")
+        else update.dtype
     )
     output = torch.empty_like(hidden, dtype=output_dtype)
     rows = hidden.numel() // int(hidden.shape[-1])
@@ -469,11 +587,15 @@ def scaled_residual_(
     update_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Add a channel-scaled, optionally biased update to ``hidden`` in place."""
-
     if hidden.shape != update.shape or hidden.device != update.device:
-        raise ValueError("scaled residual operands must have the same shape and device")
+        raise ValueError(
+            "scaled residual operands must have the same shape and device"
+        )
 
-    if not _fused_rows(hidden, scale, update_bias) or not update.is_contiguous():
+    if (
+        not _fused_rows(hidden, scale, update_bias)
+        or not update.is_contiguous()
+    ):
         biased_update = update.float()
         if update_bias is not None:
             biased_update = biased_update + update_bias.float()
@@ -512,23 +634,33 @@ def scaled_residual_layer_norm(
     Unlike the RMS variants, ``hidden`` is not updated in place; only the
     normalized projection is returned.
     """
-
     if hidden.shape != update.shape or hidden.device != update.device:
-        raise ValueError("scaled residual operands must have the same shape and device")
+        raise ValueError(
+            "scaled residual operands must have the same shape and device"
+        )
 
-    if not _fused_rows(hidden, scale, weight, bias, update_bias) or not update.is_contiguous():
+    if (
+        not _fused_rows(hidden, scale, weight, bias, update_bias)
+        or not update.is_contiguous()
+    ):
         biased_update = update.float()
         if update_bias is not None:
             biased_update = biased_update + update_bias.float()
 
         residual = hidden.float() + biased_update * scale.float()
         normalized = F.layer_norm(
-            residual, (int(hidden.shape[-1]),), weight.float(), bias.float(), eps
+            residual,
+            (int(hidden.shape[-1]),),
+            weight.float(),
+            bias.float(),
+            eps,
         )
         return normalized.to(_output_dtype(update))
 
     output_dtype = (
-        torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else update.dtype
+        torch.get_autocast_dtype("cuda")
+        if torch.is_autocast_enabled("cuda")
+        else update.dtype
     )
     output = torch.empty_like(hidden, dtype=output_dtype)
     rows = hidden.numel() // int(hidden.shape[-1])
@@ -560,12 +692,20 @@ def scaled_residual_layer_norm_absmax(
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return fused residual layer normalization and its global absolute maximum."""
+    """Return fused residual layer normalization and its absmax.
 
+    Return fused residual layer normalization and its global absolute
+    maximum.
+    """
     if hidden.shape != update.shape or hidden.device != update.device:
-        raise ValueError("scaled residual operands must have the same shape and device")
+        raise ValueError(
+            "scaled residual operands must have the same shape and device"
+        )
 
-    if not _fused_rows(hidden, scale, weight, bias, update_bias) or not update.is_contiguous():
+    if (
+        not _fused_rows(hidden, scale, weight, bias, update_bias)
+        or not update.is_contiguous()
+    ):
         output = scaled_residual_layer_norm(
             hidden,
             update,
@@ -578,7 +718,9 @@ def scaled_residual_layer_norm_absmax(
         return output, output.abs().amax()
 
     output_dtype = (
-        torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else update.dtype
+        torch.get_autocast_dtype("cuda")
+        if torch.is_autocast_enabled("cuda")
+        else update.dtype
     )
     output = torch.empty_like(hidden, dtype=output_dtype)
     rows = hidden.numel() // int(hidden.shape[-1])

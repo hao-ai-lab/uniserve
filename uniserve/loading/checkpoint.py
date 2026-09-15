@@ -26,7 +26,10 @@ from .config import Config as IOConfig
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Declare one source directory or ordered alternative checkpoint filenames."""
+    """Declare one source directory.
+
+    Or ordered alternative checkpoint filenames.
+    """
 
     name: str = "primary"
     directory: str = ""
@@ -40,7 +43,9 @@ class Config:
         for value in (self.directory, *self.filenames):
             path = PurePosixPath(value)
             if path.is_absolute() or ".." in path.parts:
-                raise ValueError("checkpoint sources must stay inside their root")
+                raise ValueError(
+                    "checkpoint sources must stay inside their root"
+                )
 
     def resolve(self, root: Path, *, io: IOConfig) -> Source:
         """Locate this source's files under root and return a resolved Source.
@@ -49,7 +54,6 @@ class Config:
         selects shards, then any matching weight files. ignore_patterns are
         matched against root-relative paths.
         """
-
         root = Path(root)
         directory = root / self.directory
         available = frozenset(
@@ -62,7 +66,9 @@ class Config:
                 for pattern in io.ignore_patterns
             )
         )
-        files = tuple(sorted(path for path in available if path.parent == directory))
+        files = tuple(
+            sorted(path for path in available if path.parent == directory)
+        )
         formats = ("safetensors", "pt") if io.format == "auto" else (io.format,)
         suffixes = {"safetensors": {".safetensors"}, "pt": {".pt", ".bin"}}
 
@@ -72,14 +78,19 @@ class Config:
                     directory / name
                     for name in self.filenames
                     if directory / name in files
-                    and any(Path(name).suffix in suffixes[format] for format in formats)
+                    and any(
+                        Path(name).suffix in suffixes[format]
+                        for format in formats
+                    )
                 ),
                 None,
             )
             if chosen is None:
                 if io.mode == "dummy":
                     return Source(self.name, root, (), self.prefix)
-                raise FileNotFoundError(f"source {self.name!r} requires one of {self.filenames!r}")
+                raise FileNotFoundError(
+                    f"source {self.name!r} requires one of {self.filenames!r}"
+                )
             return Source(self.name, root, (chosen,), self.prefix)
 
         # Training-state files shipped in published checkpoints are not weights.
@@ -91,23 +102,35 @@ class Config:
             "scaler.pt",
         }
         for format in formats:
-            pattern = "*.safetensors.index.json" if format == "safetensors" else "*.bin.index.json"
+            pattern = (
+                "*.safetensors.index.json"
+                if format == "safetensors"
+                else "*.bin.index.json"
+            )
             indexes = tuple(path for path in files if path.match(pattern))
             if len(indexes) > 1:
-                raise ValueError(f"source {self.name!r} has multiple {format} indexes")
+                raise ValueError(
+                    f"source {self.name!r} has multiple {format} indexes"
+                )
             if indexes:
                 mapping = json.loads(indexes[0].read_text()).get("weight_map")
                 if not isinstance(mapping, dict) or not mapping:
-                    raise ValueError("checkpoint index requires a nonempty weight_map")
+                    raise ValueError(
+                        "checkpoint index requires a nonempty weight_map"
+                    )
                 names = sorted(set(mapping.values()))
                 for name in names:
                     relative = PurePosixPath(name)
                     if relative.is_absolute() or ".." in relative.parts:
-                        raise ValueError("checkpoint index paths must stay inside their directory")
+                        raise ValueError(
+                            "checkpoint index paths must stay inside their "
+                            "directory"
+                        )
                 selected = tuple(directory / name for name in names)
                 if any(path not in available for path in selected):
                     raise FileNotFoundError(
-                        "checkpoint index references a missing or excluded shard"
+                        "checkpoint index references a missing or excluded "
+                        "shard"
                     )
                 return Source(self.name, root, selected, self.prefix)
             selected = tuple(
@@ -135,25 +158,34 @@ class Source:
 
     def __post_init__(self):
         object.__setattr__(self, "root", Path(self.root))
-        object.__setattr__(self, "files", tuple(Path(path) for path in self.files))
+        object.__setattr__(
+            self, "files", tuple(Path(path) for path in self.files)
+        )
         if not self.name or len(set(self.files)) != len(self.files):
-            raise ValueError("checkpoint source requires a name and unique files")
+            raise ValueError(
+                "checkpoint source requires a name and unique files"
+            )
         for path in self.files:
             if not path.is_file():
                 raise FileNotFoundError(path)
 
     def open(self, *, io: IOConfig) -> Reader:
         """Verify integrity and encoding, then open a reader for the IO mode."""
-
         _checksums(self, io.checksum_manifest)
         suffixes = {path.suffix for path in self.files}
         supported = (
             {".safetensors", ".pt", ".bin"}
             if io.format == "auto"
-            else ({".safetensors"} if io.format == "safetensors" else {".pt", ".bin"})
+            else (
+                {".safetensors"}
+                if io.format == "safetensors"
+                else {".pt", ".bin"}
+            )
         )
         if not suffixes.issubset(supported):
-            raise ValueError("checkpoint files disagree with the selected file encoding")
+            raise ValueError(
+                "checkpoint files disagree with the selected file encoding"
+            )
 
         if io.mode == "dummy":
             return _DummyReader(self, io)
@@ -163,11 +195,16 @@ class Source:
             return _SafetensorsReader(self, io)
         if suffixes.issubset({".pt", ".bin"}):
             return _TorchReader(self, io)
-        raise ValueError("one checkpoint source must use a single file encoding")
+        raise ValueError(
+            "one checkpoint source must use a single file encoding"
+        )
 
 
 class Weight(ABC):
-    """Borrow tensor metadata and read native rectangular slices from a source."""
+    """Borrow tensor metadata and read native rectangular slices.
+
+    From a source.
+    """
 
     name: str
     shape: tuple[int, ...]
@@ -175,7 +212,10 @@ class Weight(ABC):
 
     @abstractmethod
     def read(self, region: tuple[slice, ...] | None = None) -> torch.Tensor:
-        """Read the complete value or an explicit nonnegative rectangular slice."""
+        """Read the complete value.
+
+        Or an explicit nonnegative rectangular slice.
+        """
 
 
 def _region(shape, region):
@@ -227,8 +267,13 @@ class FP8Weight(Weight):
     dtype: torch.dtype = torch.bfloat16
 
     def __post_init__(self):
-        if self.values.dtype != torch.float8_e4m3fn or self.scale.dtype != torch.float32:
-            raise ValueError("FP8 checkpoint values and scales must be E4M3FN and FP32")
+        if (
+            self.values.dtype != torch.float8_e4m3fn
+            or self.scale.dtype != torch.float32
+        ):
+            raise ValueError(
+                "FP8 checkpoint values and scales must be E4M3FN and FP32"
+            )
         Quantizer("fp8", axis=self.axis)
         expected = (
             ()
@@ -236,7 +281,10 @@ class FP8Weight(Weight):
             else (self.values.shape[0], *((1,) * (len(self.values.shape) - 1)))
         )
         if self.scale.shape != expected:
-            raise ValueError("checkpoint scale shape must match its logical statistical domain")
+            raise ValueError(
+                "checkpoint scale shape must match its logical statistical "
+                "domain"
+            )
 
     @property
     def name(self):
@@ -250,7 +298,9 @@ class FP8Weight(Weight):
         region = _region(self.shape, region)
         values = self.values.read(region)
         scale = self.scale.read(
-            None if self.axis is None else (region[0], *(slice(0, 1) for _ in self.shape[1:]))
+            None
+            if self.axis is None
+            else (region[0], *(slice(0, 1) for _ in self.shape[1:]))
         )
         return Quantizer("fp8", axis=self.axis).from_tensors(
             {"values": values.contiguous(), "scale": scale.contiguous()},
@@ -261,7 +311,10 @@ class FP8Weight(Weight):
 
 @dataclass(frozen=True, slots=True)
 class _ScaleWeight(Weight):
-    """Interpret singleton or vector checkpoint scales in their logical domain."""
+    """Interpret singleton or vector checkpoint scales.
+
+    In their logical domain.
+    """
 
     source: Weight
     shape: tuple[int, ...]
@@ -319,14 +372,20 @@ class Reader:
         count = self.io.num_threads or (1 if self.io.mmap else 8)
         with ThreadPoolExecutor(max_workers=count) as executor:
             indexes = executor.map(self._index, self.source.files)
-            for path, (metadata, state) in zip(self.source.files, indexes, strict=True):
+            for path, (metadata, state) in zip(
+                self.source.files, indexes, strict=True
+            ):
                 if state is not None and not isinstance(self, _LayeredReader):
                     self._states[path] = state
                 for name, shape, dtype in metadata:
                     logical = self.source.prefix + name
                     if logical in self._weights:
-                        raise ValueError(f"duplicate checkpoint tensor {logical!r}")
-                    self._weights[logical] = _FileWeight(logical, shape, dtype, self, logical)
+                        raise ValueError(
+                            f"duplicate checkpoint tensor {logical!r}"
+                        )
+                    self._weights[logical] = _FileWeight(
+                        logical, shape, dtype, self, logical
+                    )
                     self._locations[logical] = (path, name)
         self._weights = dict(sorted(self._weights.items()))
 
@@ -334,19 +393,34 @@ class Reader:
         # FP8Weight views. The scale's element count selects its statistical
         # domain: one element is per-tensor, one per leading row is per-row.
         for name, value in tuple(self._weights.items()):
-            if value.dtype != torch.float8_e4m3fn or not name.endswith(".weight"):
+            if value.dtype != torch.float8_e4m3fn or not name.endswith(
+                ".weight"
+            ):
                 continue
-            scale = self._weights.get(name.removesuffix(".weight") + ".weight_scale")
+            scale = self._weights.get(
+                name.removesuffix(".weight") + ".weight_scale"
+            )
             if scale is None:
-                raise ValueError(f"FP8 checkpoint {name!r} requires its weight_scale tensor")
+                raise ValueError(
+                    f"FP8 checkpoint {name!r} requires its weight_scale tensor"
+                )
             count = math.prod(scale.shape)
             if count == 1:
                 axis, shape = None, ()
-            elif count == value.shape[0] and all(size == 1 for size in scale.shape[1:]):
-                axis, shape = 0, (value.shape[0], *((1,) * (len(value.shape) - 1)))
+            elif count == value.shape[0] and all(
+                size == 1 for size in scale.shape[1:]
+            ):
+                axis, shape = (
+                    0,
+                    (value.shape[0], *((1,) * (len(value.shape) - 1))),
+                )
             else:
-                raise ValueError(f"FP8 checkpoint {name!r} has an unsupported scale domain")
-            self._weights[name] = FP8Weight(value, _ScaleWeight(scale, shape), axis)
+                raise ValueError(
+                    f"FP8 checkpoint {name!r} has an unsupported scale domain"
+                )
+            self._weights[name] = FP8Weight(
+                value, _ScaleWeight(scale, shape), axis
+            )
 
     def _index(self, path):
         raise NotImplementedError
@@ -374,7 +448,10 @@ class Reader:
 
 
 class _SafetensorsReader(Reader):
-    """Read indexed safetensors slices using scoped mappings or decoded files."""
+    """Read indexed safetensors slices.
+
+    Using scoped mappings or decoded files.
+    """
 
     def _index(self, path):
         with safe_open(path, framework="pt", device="cpu") as handle:
@@ -397,7 +474,9 @@ class _SafetensorsReader(Reader):
                     safe_open(path, framework="pt", device="cpu")
                 )
             value = self._files[path].get_slice(name)
-            return value[region] if region else self._files[path].get_tensor(name)
+            return (
+                value[region] if region else self._files[path].get_tensor(name)
+            )
 
         if path not in self._states:
             self._states[path] = load_safetensors(path.read_bytes())
@@ -410,7 +489,8 @@ class _TorchReader(Reader):
     def _index(self, path):
         state = _load_torch(path, self.io.mmap)
         return tuple(
-            (name, tuple(value.shape), value.dtype) for name, value in sorted(state.items())
+            (name, tuple(value.shape), value.dtype)
+            for name, value in sorted(state.items())
         ), state
 
     def _read(self, logical, region):
@@ -451,7 +531,9 @@ class _DummyReader(Reader):
 
     def _open(self):
         if not self.source.files:
-            raise ValueError("dummy source reads require checkpoint tensor metadata")
+            raise ValueError(
+                "dummy source reads require checkpoint tensor metadata"
+            )
         super()._open()
 
     def _index(self, path):
@@ -464,7 +546,8 @@ class _DummyReader(Reader):
         with FakeTensorMode():
             state = _load_torch(path, self.io.mmap)
         return tuple(
-            (name, tuple(value.shape), value.dtype) for name, value in sorted(state.items())
+            (name, tuple(value.shape), value.dtype)
+            for name, value in sorted(state.items())
         ), None
 
     def _read(self, logical, region):
@@ -472,7 +555,9 @@ class _DummyReader(Reader):
         weight = self._weights[logical]
         raw = weight.values if isinstance(weight, FP8Weight) else weight
 
-        seed = int.from_bytes(hashlib.sha256(logical.encode()).digest()[:8], "little")
+        seed = int.from_bytes(
+            hashlib.sha256(logical.encode()).digest()[:8], "little"
+        )
         generator = torch.Generator(device="cpu").manual_seed(seed)
         value = torch.empty(raw.shape, dtype=torch.float32)
         if raw.dtype.is_floating_point:
@@ -526,11 +611,17 @@ def _dtype(name):
 
 def _load_torch(path, mmap):
     value = torch.load(path, map_location="cpu", weights_only=True, mmap=mmap)
-    if isinstance(value, Mapping) and isinstance(value.get("state_dict"), Mapping):
+    if isinstance(value, Mapping) and isinstance(
+        value.get("state_dict"), Mapping
+    ):
         value = value["state_dict"]
     if not isinstance(value, Mapping):
         raise TypeError(f"checkpoint {path} requires a tensor mapping")
-    return {name: tensor for name, tensor in value.items() if isinstance(tensor, torch.Tensor)}
+    return {
+        name: tensor
+        for name, tensor in value.items()
+        if isinstance(tensor, torch.Tensor)
+    }
 
 
 def _advise(path, kind):
@@ -542,7 +633,6 @@ def _advise(path, kind):
 
 def _checksums(source, manifest):
     """Verify every source file against a sha256 manifest, when one is given."""
-
     if manifest is None:
         return
     value = json.loads(manifest.read_text())

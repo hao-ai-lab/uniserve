@@ -29,7 +29,9 @@ def test_source_validation_rejects_conflicting_stage_declarations():
         validate_components(
             model,
             {"encoder": ComponentConfig((0,))},
-            entries={"": (EntryPoint("encode"), EntryPoint("encode", stage="last"))},
+            entries={
+                "": (EntryPoint("encode"), EntryPoint("encode", stage="last"))
+            },
             paths={"encoder": "encode"},
         )
 
@@ -44,6 +46,9 @@ def test_component_requires_explicit_placement():
         validate_components(
             model,
             {"first": ComponentConfig((0,)), "second": ComponentConfig((0,))},
-            entries={path: (EntryPoint("encode"),) for path in ("first", "second", "conditioner")},
+            entries={
+                path: (EntryPoint("encode"),)
+                for path in ("first", "second", "conditioner")
+            },
             paths={"first": "first.encode", "second": "second.encode"},
         )

@@ -23,10 +23,9 @@ if triton is not None:
         scale_ptr,
         input_row_stride,
         width: tl.constexpr,
-        BLOCK: tl.constexpr,
+        BLOCK: tl.constexpr,  # noqa: N803
     ):
         """Quantize one BF16 activation row and publish its E4M3 scale."""
-
         # One program per row; each program publishes one max-abs E4M3 scale.
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
@@ -49,8 +48,10 @@ if triton is not None:
 
 
 def rowwise(x: torch.Tensor, values: torch.Tensor, scale: torch.Tensor) -> bool:
-    """Encode eligible BF16/FP16 rows using the existing single-kernel formula."""
+    """Encode eligible BF16/FP16 rows.
 
+    Using the existing single-kernel formula.
+    """
     if not (
         triton is not None
         and x.is_cuda

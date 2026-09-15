@@ -3,7 +3,6 @@
 import pytest
 import torch
 import torch.multiprocessing as mp
-
 from torch.distributed.tensor import Replicate, Shard
 
 from uniserve.distributed import DeviceMesh, Distribution
@@ -15,20 +14,38 @@ pytestmark = pytest.mark.integration
 
 def _communicate(rank, rendezvous):
     with initialize_process_groups(
-        rank=rank, local_rank=rank, world_size=2, device="cpu", init_method=rendezvous
+        rank=rank,
+        local_rank=rank,
+        world_size=2,
+        device="cpu",
+        init_method=rendezvous,
     ) as owner:
         mesh = owner.bind(
-            DeviceMesh(ranks=(1, 0), shape=(2, 1), axes=("tensor", "replica"), rank=rank),
+            DeviceMesh(
+                ranks=(1, 0),
+                shape=(2, 1),
+                axes=("tensor", "replica"),
+                rank=rank,
+            ),
             device="cpu",
         )
-        group = mesh.submesh(("replica", "tensor")).get_group(("replica", "tensor"))
+        group = mesh.submesh(("replica", "tensor")).get_group(
+            ("replica", "tensor")
+        )
         assert group.global_rank == rank
         assert group.rank == 1 - rank
-        value = torch.arange(6, dtype=torch.float32).view(2, 3) + group.rank * 10
+        value = (
+            torch.arange(6, dtype=torch.float32).view(2, 3) + group.rank * 10
+        )
         peers = [
-            torch.arange(6, dtype=torch.float32).view(2, 3) + member * 10 for member in range(2)
+            torch.arange(6, dtype=torch.float32).view(2, 3) + member * 10
+            for member in range(2)
         ]
-        for op, expected in (("sum", peers[0] + peers[1]), ("min", peers[0]), ("max", peers[1])):
+        for op, expected in (
+            ("sum", peers[0] + peers[1]),
+            ("min", peers[0]),
+            ("max", peers[1]),
+        ):
             out = torch.empty_like(value)
             assert group.all_reduce(value, op=op, out=out) is out
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
@@ -59,16 +76,25 @@ def _communicate(rank, rendezvous):
         source = torch.arange(3, dtype=torch.float32) + group.rank * 10
         exchanged = torch.empty_like(source)
         assert (
-            group.all_to_all(source, input_splits=splits, output_splits=splits, out=exchanged)
+            group.all_to_all(
+                source, input_splits=splits, output_splits=splits, out=exchanged
+            )
             is exchanged
         )
-        expected = torch.tensor([0.0, 10.0, 11.0] if group.rank == 0 else [1.0, 2.0, 12.0])
+        expected = torch.tensor(
+            [0.0, 10.0, 11.0] if group.rank == 0 else [1.0, 2.0, 12.0]
+        )
         torch.testing.assert_close(exchanged, expected, rtol=0, atol=0)
         received = torch.empty_like(value)
         assert (
-            group.send_recv(value, dst=1 - group.rank, src=1 - group.rank, out=received) is received
+            group.send_recv(
+                value, dst=1 - group.rank, src=1 - group.rank, out=received
+            )
+            is received
         )
-        torch.testing.assert_close(received, peers[1 - group.rank], rtol=0, atol=0)
+        torch.testing.assert_close(
+            received, peers[1 - group.rank], rtol=0, atol=0
+        )
         if group.rank == 0:
             group.send(value, dst=1)
         else:
@@ -77,7 +103,9 @@ def _communicate(rank, rendezvous):
 
         # K shards must share per-token statistics. An empty token shard still
         # participates in tensor-wide maxima for the same logical source.
-        source = torch.tensor([[1.0, 2.0], [3.0, 4.0]]) * (100 if group.rank else 1)
+        source = torch.tensor([[1.0, 2.0], [3.0, 4.0]]) * (
+            100 if group.rank else 1
+        )
         per_token = Quantizer("fp8", axis=0)
         distribution = Distribution(mesh, (Shard(1), Replicate()))
         torch.testing.assert_close(
@@ -86,7 +114,11 @@ def _communicate(rank, rendezvous):
             rtol=0,
             atol=0,
         )
-        source = torch.empty((0, 2)) if group.rank == 0 else torch.tensor([[1.0, 200.0]])
+        source = (
+            torch.empty((0, 2))
+            if group.rank == 0
+            else torch.tensor([[1.0, 200.0]])
+        )
         distribution = Distribution(mesh, (Shard(0), Replicate()))
         torch.testing.assert_close(
             Quantizer("fp8").amax(source, distribution=distribution),
@@ -97,4 +129,6 @@ def _communicate(rank, rendezvous):
 
 
 def test_collectives_preserve_values_and_outputs(tmp_path):
-    mp.spawn(_communicate, args=((tmp_path / "world").as_uri(),), nprocs=2, join=True)
+    mp.spawn(
+        _communicate, args=((tmp_path / "world").as_uri(),), nprocs=2, join=True
+    )

@@ -24,7 +24,9 @@ def test_runtime_suites_cover_declared_workloads() -> None:
         "bagel-uniserve-i2t-c32",
         "bagel-uniserve-t2i-c32",
     )
-    assert tuple((metric.name, metric.direction) for metric in points[3].metrics) == (
+    assert tuple(
+        (metric.name, metric.direction) for metric in points[3].metrics
+    ) == (
         ("mean_ttft_ms", "lower"),
         ("mean_tpot_ms", "lower"),
         ("image_latency_ms.mean", "lower"),
@@ -42,7 +44,9 @@ def test_runtime_suites_cover_declared_workloads() -> None:
     assert all(point.load.warmup_requests == 1 for point in formal_points)
 
 
-def test_serving_runtime_suite_exposes_stream_and_image_latency_metrics() -> None:
+def test_serving_runtime_suite_exposes_stream_and_image_latency_metrics() -> (
+    None
+):
     config = load_config()
     points = config.selected_points("serving-runtime")
     assert tuple(point.name for point in points) == (
@@ -59,7 +63,9 @@ def test_serving_runtime_suite_exposes_stream_and_image_latency_metrics() -> Non
     )
 
 
-def test_fast_h3_server_topology_accepts_environment_override(monkeypatch) -> None:
+def test_fast_h3_server_topology_accepts_environment_override(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("UNISERVE_H3_WORKER_RANKS", "2")
     monkeypatch.setenv("UNISERVE_H3_CUDA_VISIBLE_DEVICES", "0,1")
     monkeypatch.setenv("UNISERVE_H3_MEM_FRACTION", "0.99")
@@ -102,13 +108,18 @@ output_throughput = "higher"
         load_config(config)
 
 
-def test_runtime_artifact_launch_uses_its_python_package(tmp_path: Path) -> None:
+def test_runtime_artifact_launch_uses_its_python_package(
+    tmp_path: Path,
+) -> None:
     config_path = tmp_path / "profiles.toml"
     config_path.write_text(
         """
 [servers.local]
 port = 8000
-command = ["target/release/uniserve", "serve", "model", "--worker-python", ".venv/bin/python"]
+command = [
+    "target/release/uniserve", "serve", "model", "--worker-python",
+    ".venv/bin/python",
+]
 
 [benchmarks.point]
 server = "local"
@@ -152,5 +163,7 @@ output_throughput = "higher"
 
     assert plan["server_command"][0] == str(executable.absolute())
     worker_python = plan["server_command"].index("--worker-python") + 1
-    assert plan["server_command"][worker_python] == str((ROOT / ".venv/bin/python").absolute())
+    assert plan["server_command"][worker_python] == str(
+        (ROOT / ".venv/bin/python").absolute()
+    )
     assert plan["server_working_directory"] == str(runtime_root)

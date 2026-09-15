@@ -40,24 +40,35 @@ from uniserve_worker.protocol.operation import (
     TransferMode,
 )
 from uniserve_worker.protocol.output import BatchOutput
-from uniserve_worker.protocol.transfer import KvTransfer, Locator, PosixShmTransfer
+from uniserve_worker.protocol.transfer import (
+    KvTransfer,
+    Locator,
+    PosixShmTransfer,
+)
 
 
 def _read_request(locator: Locator) -> bytes:
-    """Encode a host reader's registration request at the external SHM boundary."""
+    """Encode a host reader's registration request.
 
+    The request is encoded at the external SHM boundary.
+    """
     assert isinstance(locator.transport, PosixShmTransfer)
-    descriptor = json.dumps(locator.to_mapping(), sort_keys=True, separators=(",", ":"))
+    descriptor = json.dumps(
+        locator.to_mapping(), sort_keys=True, separators=(",", ":")
+    )
     return (
         hashlib.sha256(locator.transport.name.encode()).digest()
         + hashlib.sha256(descriptor.encode()).digest()
     )
 
 
-def test_kv_install_waits_for_storage_and_input_without_blocking_independent_work() -> None:
+def test_kv_install_waits_for_storage_and_input_without_blocking_independent_work(  # noqa: E501
+) -> None:
     with (
         execution_worker(transfer_backends=("shm",)) as producer,
-        execution_worker(transfer_backends=("shm",), pipeline_depth=3) as worker,
+        execution_worker(
+            transfer_backends=("shm",), pipeline_depth=3
+        ) as worker,
     ):
         incoming = ar_params(45, block_ids=(0,))
         admission = ar_params(44, block_ids=(0,))
@@ -97,7 +108,11 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 )
                 published = finalized_report(
                     owner,
-                    owner.submit(execution_run(run_id=2, operations=(publication,), commands=())),
+                    owner.submit(
+                        execution_run(
+                            run_id=2, operations=(publication,), commands=()
+                        )
+                    ),
                 )
                 publications.append(published.completions[0].kv_output)
                 commits.append(observation)
@@ -108,13 +123,19 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
             old_locator = resident.tensors[0].locations[0]
             assert isinstance(old_locator.transport, PosixShmTransfer)
 
-            # The external publisher owns real SHM bytes, but gates permission to
-            # read them so storage retirement and input completion remain distinct.
+            # The external publisher owns real SHM bytes, but gates
+            # permission to read them so storage retirement and input
+            # completion remain distinct.
             tensors = tuple(
                 replace(
                     tensor,
                     locations=tuple(
-                        replace(locator, transport=replace(locator.transport, endpoint=endpoint))
+                        replace(
+                            locator,
+                            transport=replace(
+                                locator.transport, endpoint=endpoint
+                            ),
+                        )
                         for locator in tensor.locations
                     ),
                 )
@@ -122,10 +143,14 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
             )
             incoming_payload = replace(source, tensors=tensors)
             requests = {
-                _read_request(locator) for tensor in tensors for locator in tensor.locations
+                _read_request(locator)
+                for tensor in tensors
+                for locator in tensor.locations
             }
             with (
-                socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener,
+                socket.socket(
+                    socket.AF_UNIX, socket.SOCK_SEQPACKET
+                ) as listener,
                 socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as reader,
                 ThreadPoolExecutor(max_workers=2) as executor,
             ):
@@ -142,7 +167,8 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                             pending.remove(connection.recv(128))
                             accepted.set()
                             assert grant.wait(10), (
-                                "publisher was never permitted to expose its bytes"
+                                "publisher was never permitted to expose "
+                                "its bytes"
                             )
                             connection.sendall(b"G")
                             assert connection.recv(1) == b"A"
@@ -186,7 +212,10 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     ),
                 )
                 ipc = QueuedWorkerIpc(
-                    tuple({"kind": "submit", "call_id": run.run_id, "run": run} for run in runs)
+                    tuple(
+                        {"kind": "submit", "call_id": run.run_id, "run": run}
+                        for run in runs
+                    )
                 )
                 worker.bind(ipc)
                 serving = executor.submit(serve)
@@ -204,7 +233,9 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     response = ipc.receive()
                     assert response["call_id"] == 3, response
                     assert BatchOutput.from_mapping(response["result"]).done
-                    assert accepted.wait(5), "retiring storage did not start the dependent read"
+                    assert accepted.wait(5), (
+                        "retiring storage did not start the dependent read"
+                    )
                     grant.set()
 
                     # No new IPC request drives this transition: the completed
@@ -219,9 +250,13 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                         expected = producer.kv_cache.cache.state(layer).read(
                             (1,), start=0, length=2
                         )
-                        actual = worker.kv_cache.cache.state(layer).read((1,), start=0, length=2)
+                        actual = worker.kv_cache.cache.state(layer).read(
+                            (1,), start=0, length=2
+                        )
                         for left, right in zip(actual, expected, strict=True):
-                            torch.testing.assert_close(left, right, rtol=0, atol=0)
+                            torch.testing.assert_close(
+                                left, right, rtol=0, atol=0
+                            )
                 finally:
                     grant.set()
                     if reader_held:
@@ -260,10 +295,14 @@ def _installation_operation(
     )
 
 
-def _installation_allocation(operation: ScheduledRequest, length: int) -> dict[str, object]:
+def _installation_allocation(
+    operation: ScheduledRequest, length: int
+) -> dict[str, object]:
     request_pool_idx = int(operation.request_key.request_id) + 1
     return {
-        "block_tables": (BlockTable(request_pool_idx, 0, (1,), max(1, int(length))),),
+        "block_tables": (
+            BlockTable(request_pool_idx, 0, (1,), max(1, int(length))),
+        ),
         "new_cache_pages": (CachePageAllocation(request_pool_idx, 0, (1,)),),
     }
 
@@ -470,7 +509,10 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             predecessor=observation.op_id,
         )
         repeated = finalized_report(
-            producer, producer.submit(execution_run(run_id=4, operations=(repeated_publication,)))
+            producer,
+            producer.submit(
+                execution_run(run_id=4, operations=(repeated_publication,))
+            ),
         )
         repeated_install, repeated_installed = _installation_operation(
             admission,
@@ -530,7 +572,9 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         released_consumer.close()
 
 
-def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> None:
+def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> (  # noqa: E501
+    None
+):
     producer = execution_worker(transfer_backends=("shm",))
     consumer = execution_worker(transfer_backends=("shm",))
     admission = ar_params(43, block_ids=(0,))
@@ -559,7 +603,11 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
         published = (
             finalized_report(
                 producer,
-                producer.submit(execution_run(run_id=2, operations=(publication,), commands=())),
+                producer.submit(
+                    execution_run(
+                        run_id=2, operations=(publication,), commands=()
+                    )
+                ),
             )
             .completions[0]
             .kv_output
@@ -569,11 +617,17 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
         first = snapshot.tensors[0].locations[0]
         assert isinstance(first.transport, PosixShmTransfer)
         missing = replace(
-            first, transport=replace(first.transport, name="uniserve-missing-transfer-segment")
+            first,
+            transport=replace(
+                first.transport, name="uniserve-missing-transfer-segment"
+            ),
         )
         broken = replace(
             snapshot,
-            tensors=(replace(snapshot.tensors[0], locations=(missing,)), *snapshot.tensors[1:]),
+            tensors=(
+                replace(snapshot.tensors[0], locations=(missing,)),
+                *snapshot.tensors[1:],
+            ),
         )
         payload = broken
         installation, _installed = _installation_operation(

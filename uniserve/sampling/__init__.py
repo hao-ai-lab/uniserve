@@ -11,7 +11,10 @@ from .top_k import sample_top_k
 
 @dataclass(frozen=True, slots=True)
 class SamplingParams:
-    """Configure token sampling, penalties, constraints, and log probabilities."""
+    """Configure token sampling, penalties, constraints.
+
+    And log probabilities.
+    """
 
     temperature: float = 0.0
     top_k: int = 0
@@ -68,7 +71,9 @@ class SamplingParams:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
-        if self.seed is not None and (type(self.seed) is not int or self.seed < 0):
+        if self.seed is not None and (
+            type(self.seed) is not int or self.seed < 0
+        ):
             raise ValueError("seed must be a nonnegative integer")
 
 

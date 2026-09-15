@@ -47,8 +47,12 @@ class CUDAStream:
         self._parent = parent
         self._closed = False
         self._event_cursor = 0
-        self._ingress_events = tuple(torch.cuda.Event(blocking=False) for _ in range(event_slots))
-        self._output_events = tuple(torch.cuda.Event(blocking=False) for _ in range(event_slots))
+        self._ingress_events = tuple(
+            torch.cuda.Event(blocking=False) for _ in range(event_slots)
+        )
+        self._output_events = tuple(
+            torch.cuda.Event(blocking=False) for _ in range(event_slots)
+        )
 
     @property
     def full_device(self) -> bool:
@@ -56,39 +60,52 @@ class CUDAStream:
 
     def verify(self) -> None:
         """Verify that the native stream retains its configured SM partition."""
-
         if self.green is None:
             return
 
         cu = driver()
-        associated = cuda_value(cu.cuStreamGetGreenCtx(self.raw_stream), "query stream context")
+        associated = cuda_value(
+            cu.cuStreamGetGreenCtx(self.raw_stream), "query stream context"
+        )
         if int(associated) != int(self.green):
             raise CUDAError("stream is detached from its Green Context")
 
         resource = cuda_value(
-            cu.cuGreenCtxGetDevResource(self.green, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM),
+            cu.cuGreenCtxGetDevResource(
+                self.green, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+            ),
             "query Green Context SM resource",
         )
         if int(resource.sm.smCount) != self.sm_count:
             raise CUDAError("Green Context SM resource changed after startup")
 
     def wait(self, producer: torch.cuda.Stream) -> None:
-        """Order this stream after a producer without allocating per-operation events."""
+        """Order this stream after a producer.
 
+        Order this stream after a producer without allocating per-operation
+        events.
+        """
         if int(producer.cuda_stream) == int(self.stream.cuda_stream):
             return
-        event = self._ingress_events[self._event_cursor % len(self._ingress_events)]
+        event = self._ingress_events[
+            self._event_cursor % len(self._ingress_events)
+        ]
         event.record(producer)
         self.stream.wait_event(event)
 
     def record(self) -> torch.cuda.Event | None:
-        """Return a producer fence only when the caller needs a cross-stream join."""
+        """Return a producer fence when a cross-stream join is needed.
 
+        Return a producer fence only when the caller needs a cross-stream
+        join.
+        """
         current = torch.cuda.current_stream(self.device)
         if int(current.cuda_stream) == int(self.stream.cuda_stream):
             return None
 
-        event = self._output_events[self._event_cursor % len(self._output_events)]
+        event = self._output_events[
+            self._event_cursor % len(self._output_events)
+        ]
         self._event_cursor += 1
         event.record(self.stream)
         return event
@@ -102,7 +119,6 @@ class CUDAStream:
         The parent must outlive its forks, including their captured graphs.
         Forking a partition borrows its context and does not acquire any SMs.
         """
-
         raw = None
         if self.green is None:
             stream = torch.cuda.Stream(device=self.device)
@@ -110,7 +126,9 @@ class CUDAStream:
             cu = driver()
             raw = cuda_value(
                 cu.cuGreenCtxStreamCreate(
-                    self.green, int(cu.CUstream_flags.CU_STREAM_NON_BLOCKING), self.stream.priority
+                    self.green,
+                    int(cu.CUstream_flags.CU_STREAM_NON_BLOCKING),
+                    self.stream.priority,
                 ),
                 "create computation stream in existing partition",
             )
@@ -134,8 +152,11 @@ class CUDAStream:
             raise
 
     def close(self) -> None:
-        """Drain submitted accesses before releasing native streams and contexts."""
+        """Drain submitted accesses.
 
+        Drain submitted accesses before releasing native streams and
+        contexts.
+        """
         if self._closed:
             return
         self._closed = True
@@ -173,7 +194,6 @@ def partition_streams(
     event_slots: int | tuple[int, ...] = 2,
 ) -> tuple[CUDAStream, ...]:
     """Realize exact, disjoint Green Context resources from one split tree."""
-
     if not sm_counts:
         return ()
 
@@ -186,16 +206,24 @@ def partition_streams(
         slot_counts = (event_slots,) * len(sm_counts)
     else:
         slot_counts = event_slots
-    if len(slot_counts) != len(sm_counts) or any(count < 1 for count in slot_counts):
+    if len(slot_counts) != len(sm_counts) or any(
+        count < 1 for count in slot_counts
+    ):
         raise CUDAError("each CUDA stream requires a positive event-slot count")
 
     torch.cuda.init()
-    index = device.index if device.index is not None else torch.cuda.current_device()
+    index = (
+        device.index
+        if device.index is not None
+        else torch.cuda.current_device()
+    )
     cu = driver()
     cuda_status(cu.cuInit(0), "initialize CUDA driver")
     cuda_device = cuda_value(cu.cuDeviceGet(index), "resolve CUDA device")
     full = cuda_value(
-        cu.cuDeviceGetDevResource(cuda_device, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM),
+        cu.cuDeviceGetDevResource(
+            cuda_device, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+        ),
         "query device SM resource",
     )
 
@@ -203,7 +231,8 @@ def partition_streams(
     available = int(full.sm.smCount)
     if requested > available:
         raise CUDAError(
-            f"lane SM budgets require {requested} SMs but the device exposes {available}"
+            f"lane SM budgets require {requested} SMs but the device "
+            f"exposes {available}"
         )
 
     acquisition = ExitStack()
@@ -227,11 +256,17 @@ def partition_streams(
                 lane_resource = current_resource
                 remainder = None
             else:
-                lane_resource, remainder = _split_one(cu, current_resource, requested_count)
+                lane_resource, remainder = _split_one(
+                    cu, current_resource, requested_count
+                )
 
-            lane_green = _green_from_resources(cu, cuda_device, (lane_resource,))
+            lane_green = _green_from_resources(
+                cu, cuda_device, (lane_resource,)
+            )
             acquisition.callback(_destroy_context, lane_green)
-            context = cuda_value(cu.cuCtxFromGreenCtx(lane_green), "resolve lane context")
+            context = cuda_value(
+                cu.cuCtxFromGreenCtx(lane_green), "resolve lane context"
+            )
             raw_stream = cuda_value(
                 cu.cuGreenCtxStreamCreate(
                     lane_green, int(cu.CUstream_flags.CU_STREAM_NON_BLOCKING), 0
@@ -243,10 +278,17 @@ def partition_streams(
             resolved = _green_resource(cu, lane_green)
             sm_count = int(resolved.sm.smCount)
             if sm_count != requested_count:
-                raise CUDAError(f"CUDA stream received {sm_count} SMs, expected {requested_count}")
-            associated = cuda_value(cu.cuStreamGetGreenCtx(raw_stream), "query lane origin stream")
+                raise CUDAError(
+                    f"CUDA stream received {sm_count} SMs, "
+                    f"expected {requested_count}"
+                )
+            associated = cuda_value(
+                cu.cuStreamGetGreenCtx(raw_stream), "query lane origin stream"
+            )
             if int(associated) != int(lane_green):
-                raise CUDAError("lane origin stream has the wrong Green Context")
+                raise CUDAError(
+                    "lane origin stream has the wrong Green Context"
+                )
 
             realized.append(
                 CUDAStream(
@@ -255,17 +297,23 @@ def partition_streams(
                     green=lane_green,
                     context=context,
                     raw_stream=raw_stream,
-                    stream=torch.cuda.ExternalStream(int(raw_stream), device=device),
+                    stream=torch.cuda.ExternalStream(
+                        int(raw_stream), device=device
+                    ),
                     event_slots=slots,
                 )
             )
 
             if remainder is not None:
-                remainder_green = _green_from_resources(cu, cuda_device, (remainder,))
+                remainder_green = _green_from_resources(
+                    cu, cuda_device, (remainder,)
+                )
                 partitions.callback(_destroy_context, remainder_green)
                 current_resource = _green_resource(cu, remainder_green)
         if sum(item.sm_count for item in realized) != requested:
-            raise CUDAError("lane SM resources do not form the configured disjoint total")
+            raise CUDAError(
+                "lane SM resources do not form the configured disjoint total"
+            )
 
         partitions.close()
     except BaseException as error:
@@ -281,7 +329,6 @@ def partition_streams(
 
 def _split_one(cu: Any, resource: Any, count: int) -> tuple[Any, Any]:
     """Split one resource between green and default execution lanes."""
-
     result = cu.cuDevSmResourceSplitByCount(1, resource, 0, int(count))
     cuda_status(result, "split SM resource")
     groups, group_count, remainder = result[1], int(result[2]), result[3]
@@ -289,13 +336,17 @@ def _split_one(cu: Any, resource: Any, count: int) -> tuple[Any, Any]:
         raise CUDAError("CUDA could not realize the requested SM resource")
     group = groups[0]
     if int(group.sm.smCount) != int(count):
-        raise CUDAError(f"CUDA rounded an exact SM request from {count} to {int(group.sm.smCount)}")
+        raise CUDAError(
+            f"CUDA rounded an exact SM request from {count} to "
+            f"{int(group.sm.smCount)}"
+        )
     return group, remainder
 
 
-def _green_from_resources(cu: Any, device: Any, resources: tuple[Any, ...]) -> Any:
+def _green_from_resources(
+    cu: Any, device: Any, resources: tuple[Any, ...]
+) -> Any:
     """Construct a green context from split device resources when supported."""
-
     descriptor = cuda_value(
         cu.cuDevResourceGenerateDesc(list(resources), len(resources)),
         "generate Green Context resource descriptor",
@@ -312,9 +363,10 @@ def _green_from_resources(cu: Any, device: Any, resources: tuple[Any, ...]) -> A
 
 def _green_resource(cu: Any, green: Any) -> Any:
     """Extract the green-partition handle returned by a CUDA split operation."""
-
     return cuda_value(
-        cu.cuGreenCtxGetDevResource(green, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM),
+        cu.cuGreenCtxGetDevResource(
+            green, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+        ),
         "query Green Context SM resource",
     )
 

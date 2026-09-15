@@ -7,7 +7,13 @@ from torch import nn
 
 from uniserve.loading import weights
 from uniserve.model import Encoder
-from uniserve.nn import GatedMLP, Linear, QKVParallelLinear, RMSNorm, RowParallelLinear
+from uniserve.nn import (
+    GatedMLP,
+    Linear,
+    QKVParallelLinear,
+    RMSNorm,
+    RowParallelLinear,
+)
 from uniserve.nn.attention import Attention, DenseInput
 
 from .config import TransformerConfig
@@ -35,10 +41,14 @@ class RefinerBlock(nn.Module):
             bias=False,
         )
         self.attention = Attention(
-            config.num_attention_heads, config.num_attention_heads, config.head_dim
+            config.num_attention_heads,
+            config.num_attention_heads,
+            config.head_dim,
         )
         self.output = RowParallelLinear(
-            config.num_attention_heads * config.head_dim, config.hidden_size, bias=False
+            config.num_attention_heads * config.head_dim,
+            config.hidden_size,
+            bias=False,
         )
         self.mlp = GatedMLP(config.hidden_size, config.intermediate_size)
 
@@ -47,7 +57,8 @@ class RefinerBlock(nn.Module):
         batch, tokens, _ = hidden.shape
         projections = self.qkv(self.norms[0](hidden))
         q, k, v = (
-            projections[name].reshape(batch, tokens, -1, self.head_dim) for name in ("q", "k", "v")
+            projections[name].reshape(batch, tokens, -1, self.head_dim)
+            for name in ("q", "k", "v")
         )
         q, k = self.norms[2](q), self.norms[3](k)
 
@@ -57,17 +68,21 @@ class RefinerBlock(nn.Module):
             v.transpose(1, 2),
             DenseInput(causal=False, mask=None),
         )
-        hidden = hidden + self.output(attended.transpose(1, 2).reshape(batch, tokens, -1))
+        hidden = hidden + self.output(
+            attended.transpose(1, 2).reshape(batch, tokens, -1)
+        )
         return hidden + self.mlp(self.norms[1](hidden))
 
 
 class TokenRefiner(nn.Module):
-    """Project Qwen features, refine their document, and normalize the result."""
+    """Project Qwen features, refine their document, and normalize the result."""  # noqa: E501
 
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.input = Linear(config.text_dim, config.hidden_size)
-        self.blocks = nn.ModuleList(RefinerBlock(config) for _ in range(config.num_refiner_layers))
+        self.blocks = nn.ModuleList(
+            RefinerBlock(config) for _ in range(config.num_refiner_layers)
+        )
         self.norm = RMSNorm(config.hidden_size, config.norm_eps)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -99,23 +114,32 @@ class Conditioner(Encoder[tuple[torch.Tensor, ...]]):
 
 def assignments(model: Conditioner, reader):
     """Map the checkpoint's dense refiner and value-first SwiGLU matrices."""
-
     refiner = model.refiner
     for name, parameter in refiner.input.named_parameters():
-        yield weights.Assignment(parameter, reader.get(f"context_embedder.{name}"))
-    yield weights.Assignment(refiner.norm.weight, reader.get("token_refiner.final_norm.weight"))
+        yield weights.Assignment(
+            parameter, reader.get(f"context_embedder.{name}")
+        )
+    yield weights.Assignment(
+        refiner.norm.weight, reader.get("token_refiner.final_norm.weight")
+    )
 
     for index, block in enumerate(refiner.blocks):
         prefix = f"token_refiner.refiner_blocks.{index}"
         for name, norm in zip(
-            ("norm1", "norm2", "attn.norm_q", "attn.norm_k"), block.norms, strict=True
+            ("norm1", "norm2", "attn.norm_q", "attn.norm_k"),
+            block.norms,
+            strict=True,
         ):
-            yield weights.Assignment(norm.weight, reader.get(f"{prefix}.{name}.weight"))
+            yield weights.Assignment(
+                norm.weight, reader.get(f"{prefix}.{name}.weight")
+            )
         for name, projection in block.qkv.projections.items():
             yield weights.Assignment(
                 projection.weight, reader.get(f"{prefix}.attn.to_{name}.weight")
             )
-        yield weights.Assignment(block.output.weight, reader.get(f"{prefix}.attn.to_out.0.weight"))
+        yield weights.Assignment(
+            block.output.weight, reader.get(f"{prefix}.attn.to_out.0.weight")
+        )
 
         # The fused checkpoint rows store the value branch first, gate second.
         source = reader.get(f"{prefix}.ff.net.0.proj.weight")
@@ -124,6 +148,11 @@ def assignments(model: Conditioner, reader):
             yield weights.Assignment(
                 block.mlp.gate_up.projections[name].weight,
                 source,
-                source_slice=(slice(begin, begin + width), slice(0, source.shape[1])),
+                source_slice=(
+                    slice(begin, begin + width),
+                    slice(0, source.shape[1]),
+                ),
             )
-        yield weights.Assignment(block.mlp.down.weight, reader.get(f"{prefix}.ff.net.2.weight"))
+        yield weights.Assignment(
+            block.mlp.down.weight, reader.get(f"{prefix}.ff.net.2.weight")
+        )

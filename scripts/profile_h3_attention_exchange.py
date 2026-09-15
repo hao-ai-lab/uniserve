@@ -7,7 +7,10 @@ import torch
 import torch.distributed as dist
 
 from uniserve.distributed import DeviceMesh
-from uniserve.ops.video_sparse import compose_to_head_shards, unpack_add_compression
+from uniserve.ops.video_sparse import (
+    compose_to_head_shards,
+    unpack_add_compression,
+)
 from uniserve.runtime import TensorBuffers, initialize_process_groups
 from uniserve.tensors import BufferConfig
 from uniserve_worker.bootstrap.config import ParallelConfig, SequenceConfig
@@ -22,7 +25,9 @@ def main() -> None:
     dist.init_process_group("nccl", pg_options=options, device_id=device)
     world = dist.get_world_size()
     if world != 4:
-        raise RuntimeError("the H3 attention exchange profile requires four ranks")
+        raise RuntimeError(
+            "the H3 attention exchange profile requires four ranks"
+        )
 
     local_rows = 10_944
     global_rows = local_rows * world
@@ -78,7 +83,9 @@ def main() -> None:
             {
                 "denoiser": (
                     tuple(range(world)),
-                    ParallelConfig(sequence_parallel=SequenceConfig("ulysses", (world,))),
+                    ParallelConfig(
+                        sequence_parallel=SequenceConfig("ulysses", (world,))
+                    ),
                 )
             }
         ).items()
@@ -94,8 +101,14 @@ def main() -> None:
             bound_meshes[mesh_name] = bound_mesh
     mesh = bound_meshes["denoiser"]
     group = mesh.get_group("ulysses")
-    schema = {"output": BufferConfig((local_rows, global_heads, width), torch.bfloat16)}
-    workspace = TensorBuffers.allocate(schema, device=device, symmetric={"output": group})
+    schema = {
+        "output": BufferConfig(
+            (local_rows, global_heads, width), torch.bfloat16
+        )
+    }
+    workspace = TensorBuffers.allocate(
+        schema, device=device, symmetric={"output": group}
+    )
     local = workspace.view(schema)["output"]
 
     def collective_fence() -> None:
@@ -138,7 +151,9 @@ def main() -> None:
             function()  # type: ignore[operator]
         return graph
 
-    def time_graph(graph: torch.cuda.CUDAGraph, iterations: int = 20) -> list[float]:
+    def time_graph(
+        graph: torch.cuda.CUDAGraph, iterations: int = 20
+    ) -> list[float]:
         for _ in range(5):
             graph.replay()
         torch.cuda.synchronize(device)
@@ -150,7 +165,9 @@ def main() -> None:
             graph.replay()
         end.record()
         end.synchronize()
-        local = torch.tensor([start.elapsed_time(end) / iterations / 48], device=device)
+        local = torch.tensor(
+            [start.elapsed_time(end) / iterations / 48], device=device
+        )
         gathered = [torch.empty_like(local) for _ in range(world)]
         dist.all_gather(gathered, local)
         return [float(value.item()) for value in gathered]
@@ -176,7 +193,8 @@ def main() -> None:
                     "candidate_ms": candidate_times,
                     "candidate_second_graph_ms": candidate_times_2,
                     "candidate_first_graph_replay_ms": candidate_times_3,
-                    "slowest_speedup": max(baseline_times) / max(candidate_times),
+                    "slowest_speedup": max(baseline_times)
+                    / max(candidate_times),
                     "correct": correctness,
                 }
             ),

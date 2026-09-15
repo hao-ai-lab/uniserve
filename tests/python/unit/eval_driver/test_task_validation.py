@@ -28,7 +28,9 @@ def _image(width: int = 2, height: int = 3):
     return inspect_image_bytes(buffer.getvalue())
 
 
-def _metric(path: str = "images_per_second", direction: str = "higher") -> MetricDefinition:
+def _metric(
+    path: str = "images_per_second", direction: str = "higher"
+) -> MetricDefinition:
     return MetricDefinition(tuple(path.split(".")), direction)  # type: ignore[arg-type]
 
 
@@ -109,4 +111,7 @@ def test_interleave_sends_no_count_and_checks_point_average() -> None:
 
     multimodal.images = 2
     multimodal.decoded_images = [image, image]
-    assert task.validate([text_only, multimodal]).checks["minimum_average_images"] is False
+    assert (
+        task.validate([text_only, multimodal]).checks["minimum_average_images"]
+        is False
+    )

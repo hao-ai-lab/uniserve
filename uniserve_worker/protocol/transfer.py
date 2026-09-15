@@ -19,9 +19,10 @@ MAX_TRANSFER_HANDLE_BYTES = 64 * 1024
 class WorkerEndpoint:
     """A rank incarnation and its actual host address space.
 
-    Worker and rank names survive restarts. Incarnation identifies this loaded
-    rank; address_space identifies its process, independently of Worker grouping.
-    Backend publication addresses and storage generations remain in Locator.
+    Worker and rank names survive restarts. Incarnation identifies this
+    loaded rank; address_space identifies its process, independently of
+    Worker grouping. Backend publication addresses and storage generations
+    remain in Locator.
     """
 
     worker_id: str
@@ -32,7 +33,6 @@ class WorkerEndpoint:
 
     def __post_init__(self) -> None:
         """Validate that every component of the endpoint identity is present."""
-
         if (
             not self.worker_id
             or self.rank < 0
@@ -44,28 +44,38 @@ class WorkerEndpoint:
 
     @classmethod
     def local(cls, worker_id: str = "worker", rank: int = 0) -> WorkerEndpoint:
-        """Identify a new rank in this process, including after a process fork."""
+        """Identify a new rank in this process.
 
+        Applies after a process fork as well.
+        """
         import socket
 
-        return cls(worker_id, rank, socket.gethostname(), _address_space, uuid.uuid4().hex)
+        return cls(
+            worker_id,
+            rank,
+            socket.gethostname(),
+            _address_space,
+            uuid.uuid4().hex,
+        )
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "endpoint") -> WorkerEndpoint:
+    def from_mapping(
+        cls, value: object, where: str = "endpoint"
+    ) -> WorkerEndpoint:
         """Parse a complete worker endpoint identity from the wire schema."""
-
         data = _map(value, where)
         return cls(
             worker_id=_str(data.get("worker_id"), f"{where}.worker_id"),
             rank=_uint(data.get("rank"), f"{where}.rank"),
             node=_str(data.get("node"), f"{where}.node"),
-            address_space=_str(data.get("address_space"), f"{where}.address_space"),
+            address_space=_str(
+                data.get("address_space"), f"{where}.address_space"
+            ),
             incarnation=_str(data.get("incarnation"), f"{where}.incarnation"),
         )
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize the endpoint identity for IPC."""
-
         return {
             "worker_id": self.worker_id,
             "rank": self.rank,
@@ -99,21 +109,22 @@ class LocalTransfer:
 
     def __post_init__(self) -> None:
         """Validate the process-local endpoint and registry key."""
-
         if not self.endpoint or self.key < 0:
             raise invalid_descriptor("local transfer handle is invalid")
 
 
 @dataclass(frozen=True, slots=True)
 class PosixShmTransfer:
-    """Identifies shared-memory storage and the endpoint that grants ready reads."""
+    """Identifies shared-memory storage.
+
+    Also identifies the endpoint that grants ready reads.
+    """
 
     endpoint: str
     name: str
 
     def __post_init__(self) -> None:
         """Validate the shared-memory name and publishing endpoint."""
-
         if not self.endpoint or not self.name:
             raise invalid_descriptor("shared-memory transfer handle is invalid")
 
@@ -138,7 +149,6 @@ class CudaIpcTransfer:
 
     def __post_init__(self) -> None:
         """Validate native CUDA handles and the declared allocation bounds."""
-
         if (
             not self.endpoint
             or len(self.publication_id) != 32
@@ -148,7 +158,8 @@ class CudaIpcTransfer:
             or sum(self.span_counts) != len(self.storage_offsets_bytes)
             or any(count < 1 for count in self.span_counts)
             or any(
-                not 0 <= offset < self.storage_size_bytes for offset in self.storage_offsets_bytes
+                not 0 <= offset < self.storage_size_bytes
+                for offset in self.storage_offsets_bytes
             )
             or any(length < 1 for length in self.span_lengths)
             or any(stride < 0 for stride in self.tensor_stride)
@@ -157,12 +168,17 @@ class CudaIpcTransfer:
             raise invalid_descriptor("CUDA IPC transfer handle is incomplete")
 
 
-TransferTransport: TypeAlias = LocalTransfer | PosixShmTransfer | CudaIpcTransfer
+TransferTransport: TypeAlias = (
+    LocalTransfer | PosixShmTransfer | CudaIpcTransfer
+)
 
 
 @dataclass(frozen=True, slots=True)
 class Locator:
-    """Describes a typed tensor view and the transport-specific handle that owns its storage."""
+    """Describes a typed tensor view and its transport-specific handle.
+
+    The handle owns the view's storage.
+    """
 
     source: WorkerEndpoint
     transport: TransferTransport
@@ -175,7 +191,6 @@ class Locator:
     @property
     def backend(self) -> str:
         """Return the mechanism that owns this physical publication."""
-
         if isinstance(self.transport, LocalTransfer):
             return "local"
         if isinstance(self.transport, PosixShmTransfer):
@@ -183,8 +198,10 @@ class Locator:
         return "cuda_ipc"
 
     def __post_init__(self) -> None:
-        """Validate tensor shape and ensure the handle matches its transport kind."""
+        """Validate tensor shape and handle kind.
 
+        Ensures the handle matches its transport kind.
+        """
         if (
             self.nbytes < 1
             or not self.dtype
@@ -194,23 +211,34 @@ class Locator:
             or len(self.offset) != len(self.shape)
             or any(start < 0 for start in self.offset)
         ):
-            raise invalid_descriptor("transfer locator has invalid tensor bounds")
+            raise invalid_descriptor(
+                "transfer locator has invalid tensor bounds"
+            )
         if isinstance(self.transport, CudaIpcTransfer) and (
             len(self.transport.tensor_stride) != len(self.shape)
             or sum(
                 length * count
                 for length, count in zip(
-                    self.transport.span_lengths, self.transport.span_counts, strict=True
+                    self.transport.span_lengths,
+                    self.transport.span_counts,
+                    strict=True,
                 )
             )
             != self.shape[0]
         ):
-            raise invalid_descriptor("CUDA IPC physical spans do not match its shape")
+            raise invalid_descriptor(
+                "CUDA IPC physical spans do not match its shape"
+            )
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "transfer locator") -> Locator:
-        """Parse a tensor locator and validate its transport handle, shape, dtype, and byte bounds."""
+    def from_mapping(
+        cls, value: object, where: str = "transfer locator"
+    ) -> Locator:
+        """Parse a tensor locator and validate it.
 
+        Validation covers the transport handle, shape, dtype, and byte
+        bounds.
+        """
         data = _map(value, where)
         kind = _str(data.get("transport"), f"{where}.transport")
 
@@ -227,25 +255,40 @@ class Locator:
         elif kind == "cuda_ipc":
             transport = CudaIpcTransfer(
                 endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
-                publication_id=_str(data.get("publication_id"), f"{where}.publication_id"),
+                publication_id=_str(
+                    data.get("publication_id"), f"{where}.publication_id"
+                ),
                 storage_size_bytes=_uint(
-                    data.get("storage_size_bytes"), f"{where}.storage_size_bytes"
+                    data.get("storage_size_bytes"),
+                    f"{where}.storage_size_bytes",
                 ),
                 storage_offsets_bytes=tuple(
-                    _ints(data.get("storage_offsets_bytes"), f"{where}.storage_offsets_bytes")
+                    _ints(
+                        data.get("storage_offsets_bytes"),
+                        f"{where}.storage_offsets_bytes",
+                    )
                 ),
-                span_lengths=tuple(_ints(data.get("span_lengths"), f"{where}.span_lengths")),
-                span_counts=tuple(_ints(data.get("span_counts"), f"{where}.span_counts")),
-                tensor_stride=tuple(_ints(data.get("tensor_stride"), f"{where}.tensor_stride")),
+                span_lengths=tuple(
+                    _ints(data.get("span_lengths"), f"{where}.span_lengths")
+                ),
+                span_counts=tuple(
+                    _ints(data.get("span_counts"), f"{where}.span_counts")
+                ),
+                tensor_stride=tuple(
+                    _ints(data.get("tensor_stride"), f"{where}.tensor_stride")
+                ),
                 ready_event_handle=_bytes(
-                    data.get("ready_event_handle"), f"{where}.ready_event_handle"
+                    data.get("ready_event_handle"),
+                    f"{where}.ready_event_handle",
                 ),
             )
         else:
             raise invalid_descriptor(f"{where}.transport is invalid")
 
         return cls(
-            source=WorkerEndpoint.from_mapping(data.get("source"), f"{where}.source"),
+            source=WorkerEndpoint.from_mapping(
+                data.get("source"), f"{where}.source"
+            ),
             transport=transport,
             nbytes=_uint(data.get("nbytes"), f"{where}.nbytes"),
             dtype=_str(data.get("dtype"), f"{where}.dtype"),
@@ -255,8 +298,10 @@ class Locator:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode the tensor shape and transport-specific handle as a wire mapping."""
+        """Encode the tensor shape and transport-specific handle.
 
+        Produces a wire mapping.
+        """
         output: dict[str, object] = {
             "source": self.source.to_mapping(),
             "nbytes": self.nbytes,
@@ -268,7 +313,11 @@ class Locator:
 
         transport = self.transport
         if isinstance(transport, LocalTransfer):
-            output.update(transport="local", endpoint=transport.endpoint, key=transport.key)
+            output.update(
+                transport="local",
+                endpoint=transport.endpoint,
+                key=transport.key,
+            )
         elif isinstance(transport, PosixShmTransfer):
             output.update(
                 transport="posix_shm",
@@ -295,18 +344,27 @@ class TensorTransfer:
     """Actual logical tensor shape and its immutable physical locations.
 
     Locations can be shards or equivalent replicas. They need not cover the
-    whole value until a consumer binds its required region. All coordinates are
-    in logical element order; a backend's native strides describe physical order.
+    whole value until a consumer binds its required region. All coordinates
+    are in logical element order; a backend's native strides describe
+    physical order.
     """
 
     shape: tuple[int, ...]
     locations: tuple[Locator, ...]
 
     def __post_init__(self) -> None:
-        """Validate that every location is a consistent region of the logical tensor."""
+        """Validate location consistency.
 
-        if not self.shape or any(extent < 1 for extent in self.shape) or not self.locations:
-            raise invalid_descriptor("tensor transfer has no shape or locations")
+        Every location must be a consistent region of the logical tensor.
+        """
+        if (
+            not self.shape
+            or any(extent < 1 for extent in self.shape)
+            or not self.locations
+        ):
+            raise invalid_descriptor(
+                "tensor transfer has no shape or locations"
+            )
 
         # The first location fixes the element byte width; every location must
         # share its dtype, stay inside the logical shape, and occupy exactly
@@ -314,7 +372,9 @@ class TensorTransfer:
         first = self.locations[0]
         elements = math.prod(first.shape)
         if first.nbytes % elements or first.nbytes < elements:
-            raise invalid_descriptor("tensor transfer has an invalid element size")
+            raise invalid_descriptor(
+                "tensor transfer has an invalid element size"
+            )
 
         element_bytes = first.nbytes // elements
         for location in self.locations:
@@ -343,13 +403,17 @@ class TensorTransfer:
         return math.prod(self.shape) * (first.nbytes // math.prod(first.shape))
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "tensor transfer") -> TensorTransfer:
+    def from_mapping(
+        cls, value: object, where: str = "tensor transfer"
+    ) -> TensorTransfer:
         data = _map(value, where)
         return cls(
             shape=tuple(_uints(data.get("shape"), f"{where}.shape")),
             locations=tuple(
                 Locator.from_mapping(item, f"{where}.locations[{index}]")
-                for index, item in enumerate(_seq(data.get("locations"), f"{where}.locations"))
+                for index, item in enumerate(
+                    _seq(data.get("locations"), f"{where}.locations")
+                )
             ),
         )
 
@@ -362,7 +426,10 @@ class TensorTransfer:
 
 @dataclass(frozen=True, slots=True)
 class EncoderTransferValue:
-    """Describes the media shape, payload encoding, and transferred encoder features."""
+    """Describes the media shape and payload encoding.
+
+    Also describes the transferred encoder features.
+    """
 
     height: int
     width: int
@@ -372,7 +439,10 @@ class EncoderTransferValue:
 
 @dataclass(frozen=True, slots=True)
 class DeviceProductTransferValue:
-    """Describes the media shape, numeric range, and transferred device product."""
+    """Describes the media shape and numeric range.
+
+    Also describes the transferred device product.
+    """
 
     height: int
     width: int
@@ -382,7 +452,10 @@ class DeviceProductTransferValue:
 
 @dataclass(frozen=True, slots=True)
 class KvTransfer:
-    """Describes a versioned KV extent, its page locators, and source-to-destination buffer relation."""
+    """Describes a versioned KV extent and its page locators.
+
+    Also describes the source-to-destination buffer relation.
+    """
 
     tensors: tuple[TensorTransfer, ...]
     source: identity.BufferId
@@ -395,27 +468,44 @@ class KvTransfer:
     page_size: int
 
     def __post_init__(self) -> None:
-        """Validate the exact KV source, installed base and represented extent."""
+        """Validate the exact KV source.
 
-        if not self.destination or self.base_extent < 0 or self.published_extent < self.base_extent:
-            raise invalid_descriptor("KV publication extent or destination is invalid")
+        Also validates the installed base and represented extent.
+        """
+        if (
+            not self.destination
+            or self.base_extent < 0
+            or self.published_extent < self.base_extent
+        ):
+            raise invalid_descriptor(
+                "KV publication extent or destination is invalid"
+            )
         if self.base is None and self.base_extent != 0:
-            raise invalid_descriptor("KV publication base identity disagrees with its extent")
+            raise invalid_descriptor(
+                "KV publication base identity disagrees with its extent"
+            )
         if (
             self.group_id < 0
             or self.page_size < 1
-            or self.compute_dtype not in {"float16", "bfloat16", "float32", "float64"}
+            or self.compute_dtype
+            not in {"float16", "bfloat16", "float32", "float64"}
         ):
-            raise invalid_descriptor("KV publication storage identity is invalid")
+            raise invalid_descriptor(
+                "KV publication storage identity is invalid"
+            )
 
         suffix = self.published_extent - self.base_extent
         if not suffix:
             if self.tensors:
-                raise invalid_descriptor("empty KV suffix carries physical tensors")
+                raise invalid_descriptor(
+                    "empty KV suffix carries physical tensors"
+                )
             return
 
         if len(self.tensors) not in {2, 3}:
-            raise invalid_descriptor("KV publication requires raw keys, values and optional scales")
+            raise invalid_descriptor(
+                "KV publication requires raw keys, values and optional scales"
+            )
 
         # Key and value tensors are [suffix tokens, layers, heads, head dim].
         key, value = self.tensors[:2]
@@ -424,13 +514,24 @@ class KvTransfer:
             or key.shape[0] != suffix
             or value.shape != key.shape
             or value.dtype != key.dtype
-            or key.dtype not in {"float16", "bfloat16", "float32", "float64", "float8_e4m3fn"}
+            or key.dtype
+            not in {
+                "float16",
+                "bfloat16",
+                "float32",
+                "float64",
+                "float8_e4m3fn",
+            }
         ):
-            raise invalid_descriptor("KV publication has invalid token, layer, or head bounds")
+            raise invalid_descriptor(
+                "KV publication has invalid token, layer, or head bounds"
+            )
 
         quantized = key.dtype == "float8_e4m3fn"
         if (len(self.tensors) == 3) != quantized:
-            raise invalid_descriptor("KV publication scale presence disagrees with its storage")
+            raise invalid_descriptor(
+                "KV publication scale presence disagrees with its storage"
+            )
 
         if quantized:
             scales = self.tensors[2]
@@ -445,7 +546,9 @@ class KvTransfer:
                 or scales.shape[:3] != (pages, 2, key.shape[1])
                 or key.shape[2] % scales.shape[3]
             ):
-                raise invalid_descriptor("KV publication scales disagree with its source pages")
+                raise invalid_descriptor(
+                    "KV publication scales disagree with its source pages"
+                )
 
     @property
     def scale_head_size(self) -> int:
@@ -455,40 +558,51 @@ class KvTransfer:
         logical head axis uniformly; each locator identifies the producer's
         actual group, including replicated full-cache representations.
         """
-
-        return self.tensors[0].shape[2] // self.tensors[2].shape[3] if len(self.tensors) == 3 else 0
+        return (
+            self.tensors[0].shape[2] // self.tensors[2].shape[3]
+            if len(self.tensors) == 3
+            else 0
+        )
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "kv_transfer") -> KvTransfer:
+    def from_mapping(
+        cls, value: object, where: str = "kv_transfer"
+    ) -> KvTransfer:
         """Decode source identity and physical cache representation."""
-
         data = _map(value, where)
         raw_base = data.get("base")
         return cls(
             tensors=tuple(
                 TensorTransfer.from_mapping(item, f"{where}.tensors[{index}]")
-                for index, item in enumerate(_seq(data.get("tensors"), f"{where}.tensors"))
+                for index, item in enumerate(
+                    _seq(data.get("tensors"), f"{where}.tensors")
+                )
             ),
-            source=identity.BufferId.from_mapping(data.get("source"), f"{where}.source"),
+            source=identity.BufferId.from_mapping(
+                data.get("source"), f"{where}.source"
+            ),
             destination=_str(data.get("destination"), f"{where}.destination"),
             base=(
                 None
                 if raw_base is None
                 else identity.BufferId.from_mapping(raw_base, f"{where}.base")
             ),
-            base_extent=_uint(data.get("base_extent", 0), f"{where}.base_extent"),
+            base_extent=_uint(
+                data.get("base_extent", 0), f"{where}.base_extent"
+            ),
             published_extent=_uint(
                 data.get("published_extent", 0),
                 f"{where}.published_extent",
             ),
             group_id=_uint(data.get("group_id", 0), f"{where}.group_id"),
-            compute_dtype=_str(data.get("compute_dtype"), f"{where}.compute_dtype"),
+            compute_dtype=_str(
+                data.get("compute_dtype"), f"{where}.compute_dtype"
+            ),
             page_size=_uint(data.get("page_size"), f"{where}.page_size"),
         )
 
     def to_mapping(self) -> dict[str, object]:
         """Encode the cache publication without a generic product envelope."""
-
         return {
             "tensors": [tensor.to_mapping() for tensor in self.tensors],
             "source": self.source.to_mapping(),
@@ -503,20 +617,24 @@ class KvTransfer:
 
     def encoded_size_bound(self) -> int:
         """Bound all page and scale locators and publication metadata."""
-
         size = (
             _tensor_transfers_size(self.tensors)
             + len(self.destination.encode())
             + len(self.compute_dtype.encode())
         )
         if size > MAX_TRANSFER_HANDLE_BYTES:
-            raise invalid_descriptor("KV transfer exceeds its descriptor byte bound")
+            raise invalid_descriptor(
+                "KV transfer exceeds its descriptor byte bound"
+            )
         return size
 
 
 @dataclass(frozen=True, slots=True)
 class LatentTransferValue:
-    """Describes a denoising step and media shape for transferred latent storage."""
+    """Describes transferred latent storage.
+
+    Carries a denoising step and media shape.
+    """
 
     height: int
     width: int
@@ -525,7 +643,9 @@ class LatentTransferValue:
     tensor: TensorTransfer
 
 
-TransferValue: TypeAlias = EncoderTransferValue | DeviceProductTransferValue | LatentTransferValue
+TransferValue: TypeAlias = (
+    EncoderTransferValue | DeviceProductTransferValue | LatentTransferValue
+)
 
 
 def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
@@ -535,8 +655,9 @@ def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
     tags, lengths), not exact wire sizes; only string and list lengths are
     measured from the values themselves.
     """
-
-    locators = tuple(location for tensor in tensors for location in tensor.locations)
+    locators = tuple(
+        location for tensor in tensors for location in tensor.locations
+    )
     size = 512 + sum(64 + 8 * len(tensor.shape) for tensor in tensors)
 
     for locator in locators:
@@ -555,7 +676,11 @@ def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
         if isinstance(transport, LocalTransfer):
             size += len(transport.endpoint.encode()) + 16
         elif isinstance(transport, PosixShmTransfer):
-            size += len(transport.endpoint.encode()) + len(transport.name.encode()) + 16
+            size += (
+                len(transport.endpoint.encode())
+                + len(transport.name.encode())
+                + 16
+            )
         else:
             size += (
                 len(transport.endpoint.encode())

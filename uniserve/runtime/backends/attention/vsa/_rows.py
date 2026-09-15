@@ -8,19 +8,25 @@ from dataclasses import dataclass, field
 import torch
 
 from uniserve.nn.attention.vsa.inputs import Pattern
-from uniserve.ops.video_sparse_rows import compose_attention, pack_sparse_input_rows
+from uniserve.ops.video_sparse_rows import (
+    compose_attention,
+    pack_sparse_input_rows,
+)
 
 _TILE = 64
 
 
 @dataclass
 class _Rows:
-    """Own selected query maps for one serialized row-wise attention execution."""
+    """Own selected query maps for one row-wise attention execution.
+
+    Own selected query maps for one serialized row-wise attention execution.
+    """
 
     fine_attention: Callable[..., torch.Tensor]
-    plans: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = field(
-        default_factory=dict
-    )
+    plans: dict[
+        tuple[object, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = field(default_factory=dict)
 
     def prepare(
         self,
@@ -39,13 +45,16 @@ class _Rows:
         chunk_rows: int,
         packed: torch.Tensor | None = None,
     ) -> Callable[[slice, tuple[torch.Tensor, ...]], None]:
-        """Produce paired owner intervals against the complete selected key domain.
+        """Produce paired owner intervals.
 
-        Counts and indices are read from current device metadata on every call.
-        Each numerical launch finishes using scratch before its epilogue writes
-        transport destinations; downstream consumers may then reuse that scratch.
+        Produce paired owner intervals against the complete selected key
+        domain.
+
+        Counts and indices are read from current device metadata on every
+        call. Each numerical launch finishes using scratch before its
+        epilogue writes transport destinations; downstream consumers may
+        then reuse that scratch.
         """
-
         # The row path reads the live device block maps on every call, so the
         # static pattern carries no information here.
         del pattern
@@ -59,13 +68,22 @@ class _Rows:
             or chunk_rows < _TILE
             or chunk_rows % _TILE
         ):
-            raise ValueError("sparse row production requires tile-aligned equal QKV intervals")
+            raise ValueError(
+                "sparse row production requires tile-aligned equal QKV "
+                "intervals"
+            )
 
         rows, heads, width = query.shape
         owner_rows = rows // owners
         if packed is None:
             packed = pack_sparse_input_rows(
-                query, key, value, valid_sizes, owners=owners, chunk_rows=chunk_rows, row_major=True
+                query,
+                key,
+                value,
+                valid_sizes,
+                owners=owners,
+                chunk_rows=chunk_rows,
+                row_major=True,
             )
         if (
             packed.shape != (3, rows, heads, width)
@@ -73,7 +91,10 @@ class _Rows:
             or packed.device != query.device
             or not packed.is_contiguous()
         ):
-            raise ValueError("prepared sparse rows must match the complete row-major QKV layout")
+            raise ValueError(
+                "prepared sparse rows must match the complete row-major "
+                "QKV layout"
+            )
 
         def produce(interval: slice, outputs: tuple[torch.Tensor, ...]) -> None:
             start, stop = interval.start, interval.stop
@@ -91,7 +112,10 @@ class _Rows:
                     for output in outputs
                 )
             ):
-                raise ValueError("sparse row destinations must match the prepared owner interval")
+                raise ValueError(
+                    "sparse row destinations must match the prepared owner "
+                    "interval"
+                )
 
             signature = (
                 query.device,
@@ -105,7 +129,9 @@ class _Rows:
             plan = self.plans.get(signature)
             if plan is None:
                 if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("prepare VSA query intervals before graph capture")
+                    raise RuntimeError(
+                        "prepare VSA query intervals before graph capture"
+                    )
 
                 # Map each owner's packed local tiles onto its own query tiles
                 # in the full row domain: owner stride owner_rows, offset start.
@@ -121,7 +147,9 @@ class _Rows:
                         device=query.device,
                         dtype=torch.int32,
                     ),
-                    torch.empty((heads, tiles), device=query.device, dtype=torch.int32),
+                    torch.empty(
+                        (heads, tiles), device=query.device, dtype=torch.int32
+                    ),
                 )
                 self.plans[signature] = plan
 
@@ -130,11 +158,21 @@ class _Rows:
             torch.index_select(mask_block_count, 1, selected, out=counts)
 
             elements = owners * count * heads * width
-            packed_query = packed[0].view(-1).narrow(0, start * owners * heads * width, elements)
+            packed_query = (
+                packed[0]
+                .view(-1)
+                .narrow(0, start * owners * heads * width, elements)
+            )
             packed_query = packed_query.view(owners * count, heads, width)
             output = attention_output.view(-1)[:elements].view_as(packed_query)
             attended = self.fine_attention(
-                packed_query, packed[1], packed[2], output, indices, counts, valid_sizes
+                packed_query,
+                packed[1],
+                packed[2],
+                output,
+                indices,
+                counts,
+                valid_sizes,
             )
             compose_attention(
                 attended,

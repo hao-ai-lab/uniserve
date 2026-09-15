@@ -18,7 +18,10 @@ from uniserve.distributed.mesh import Communicator
 
 @dataclass(frozen=True)
 class SymmetricMemory:
-    """Runtime-owned allocation with peer views ordered by logical membership."""
+    """Runtime-owned allocation with ordered peer views.
+
+    Runtime-owned allocation with peer views ordered by logical membership.
+    """
 
     coordinator: Communicator
     local: torch.Tensor
@@ -35,9 +38,10 @@ class SymmetricMemory:
 
     def fence(self, input: torch.Tensor, output: torch.Tensor) -> None:
         """Publish arrival on the allocation's group with stream ordering."""
-
         if tuple(input.shape) != (1,) or tuple(output.shape) != (self.size,):
-            raise ValueError("symmetric-memory fence buffers do not match group membership")
+            raise ValueError(
+                "symmetric-memory fence buffers do not match group membership"
+            )
         self.coordinator._all_gather_into_tensor(output, input)
 
 
@@ -55,10 +59,16 @@ class PeerTensor:
     global_tensor: torch.Tensor
 
     def fence(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        """Order owner publication or reader completion on the current stream."""
+        """Order publication or reader completion.
 
-        if tuple(input.shape) != (1,) or tuple(output.shape) != (self.coordinator.size,):
-            raise ValueError("peer-memory fence buffers do not match group membership")
+        Order owner publication or reader completion on the current stream.
+        """
+        if tuple(input.shape) != (1,) or tuple(output.shape) != (
+            self.coordinator.size,
+        ):
+            raise ValueError(
+                "peer-memory fence buffers do not match group membership"
+            )
         self.coordinator._all_gather_into_tensor(output, input)
 
 
@@ -68,14 +78,16 @@ def allocate_peer_tensor(
     *,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Allocate one physical shard and map ordered peers into one virtual tensor.
+    """Allocate one physical shard.
+
+    Allocate one physical shard and map ordered peers into one virtual
+    tensor.
 
     POSIX descriptors are transferred through Unix-domain sockets using the
     standard SCM_RIGHTS protocol. The existing process group exchanges socket
     addresses and validates matching shapes and a shared host before any
     descriptor transfer. All setup finishes before CUDA graph capture.
     """
-
     from uniserve_kernel.peer_memory import allocate
 
     allocation = allocate(shape, dtype=dtype, device=group.device)
@@ -88,19 +100,32 @@ def allocate_peer_tensor(
             address = os.path.join(directory, "memory.sock")
             with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as channel:
                 channel.bind(address)
-                channel.settimeout(dist.constants.default_pg_timeout.total_seconds())
+                channel.settimeout(
+                    dist.constants.default_pg_timeout.total_seconds()
+                )
 
                 identity = (socket.gethostname(), address, shape, str(dtype))
-                identities: list[tuple[str, str, tuple[int, ...], str] | None] = [None] * group.size
-                dist.all_gather_object(identities, identity, group=group._require())
+                identities: list[
+                    tuple[str, str, tuple[int, ...], str] | None
+                ] = [None] * group.size
+                dist.all_gather_object(
+                    identities, identity, group=group._require()
+                )
                 if any(
-                    peer is None or (peer[0], peer[2], peer[3]) != (identity[0], shape, str(dtype))
+                    peer is None
+                    or (peer[0], peer[2], peer[3])
+                    != (identity[0], shape, str(dtype))
                     for peer in identities
                 ):
-                    raise ValueError("peer tensors require matching shapes on one host")
+                    raise ValueError(
+                        "peer tensors require matching shapes on one host"
+                    )
 
                 backend_ranks = sorted(group.ranks)
-                ordered = [identities[backend_ranks.index(rank)] for rank in group.ranks]
+                ordered = [
+                    identities[backend_ranks.index(rank)]
+                    for rank in group.ranks
+                ]
                 destination = ordered[(group.rank + 1) % group.size]
                 assert destination is not None
 
@@ -113,14 +138,24 @@ def allocate_peer_tensor(
                 for hop in range(1, group.size):
                     channel.sendmsg(
                         [b"v"],
-                        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [current]))],
+                        [
+                            (
+                                socket.SOL_SOCKET,
+                                socket.SCM_RIGHTS,
+                                array.array("i", [current]),
+                            )
+                        ],
                         0,
                         destination[1],
                     )
-                    _payload, received, _flags, _address = socket.recv_fds(channel, 1, 1)
+                    _payload, received, _flags, _address = socket.recv_fds(
+                        channel, 1, 1
+                    )
                     descriptors.extend(received)
                     if len(received) != 1:
-                        raise RuntimeError("peer allocation exchange requires one descriptor")
+                        raise RuntimeError(
+                            "peer allocation exchange requires one descriptor"
+                        )
                     current = received[0]
                     owner_descriptors[(group.rank - hop) % group.size] = current
 
@@ -140,7 +175,6 @@ def allocate_collective_buffer(
     Collective communicators register their own windows. Transfers do not
     require Python-visible peer tensors or a second rendezvous communicator.
     """
-
     import torch.distributed._symmetric_memory as symm_mem
 
     if symm_mem.get_backend(device) != "NCCL":
@@ -154,8 +188,10 @@ def allocate_symmetric_memory(
     *,
     dtype: torch.dtype,
 ) -> SymmetricMemory:
-    """Allocate stable peer views in logical rank order; the caller retains the handle."""
+    """Allocate stable peer views in logical rank order.
 
+    The caller retains the handle.
+    """
     peers: tuple[torch.Tensor, ...]
     if group.size == 1:
         local = torch.empty(shape, dtype=dtype, device=group.device)
@@ -163,14 +199,19 @@ def allocate_symmetric_memory(
         peers = (local,)
     else:
         if dist.get_backend(group._require()) != "nccl":
-            raise RuntimeError("symmetric peer memory requires the NCCL backend")
+            raise RuntimeError(
+                "symmetric peer memory requires the NCCL backend"
+            )
         import torch.distributed._symmetric_memory as symm_mem
 
-        local = allocate_collective_buffer(shape, dtype=dtype, device=group.device)
+        local = allocate_collective_buffer(
+            shape, dtype=dtype, device=group.device
+        )
         handle = symm_mem.rendezvous(local, group._require())
         backend_ranks = sorted(group.ranks)
         peers = tuple(
-            handle.get_buffer(backend_ranks.index(rank), shape, dtype) for rank in group.ranks
+            handle.get_buffer(backend_ranks.index(rank), shape, dtype)
+            for rank in group.ranks
         )
     workspace = SymmetricMemory(group, local, peers, handle)
     return workspace
@@ -184,11 +225,12 @@ def allocate_peer_workspace(
     row_multiple: int,
 ) -> PeerTensor:
     """Map ordered CUDA peer allocations without replicating tensor data."""
-
     from uniserve_kernel.peer_memory import allocation_granularity
 
     if not shape or any(size < 1 for size in shape) or row_multiple < 1:
-        raise ValueError("peer tensor extents and row alignment must be positive")
+        raise ValueError(
+            "peer tensor extents and row alignment must be positive"
+        )
 
     # Each rank's leading-axis shard must hold a whole number of rows while its
     # byte size stays a multiple of the VMM allocation granularity, so rows per
@@ -197,7 +239,9 @@ def allocate_peer_workspace(
     element_bytes = torch.empty((), dtype=dtype).element_size()
     row_bytes = math.prod(shape[1:]) * element_bytes
     granularity = allocation_granularity(group.device)
-    aligned_rows = math.lcm(row_multiple, granularity // math.gcd(row_bytes, granularity))
+    aligned_rows = math.lcm(
+        row_multiple, granularity // math.gcd(row_bytes, granularity)
+    )
     capacity = ((shape[0] + aligned_rows - 1) // aligned_rows) * aligned_rows
 
     global_tensor = allocate_peer_tensor(

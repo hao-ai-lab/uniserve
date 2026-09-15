@@ -5,8 +5,9 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+from collections.abc import Sequence
 from io import BytesIO
-from typing import Any, Sequence
+from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
@@ -18,7 +19,6 @@ class ImageOutputError(ValueError):
 
     def __init__(self, classifier: str) -> None:
         """Initialize the error with its external classifier."""
-
         super().__init__(classifier)
         self.classifier = classifier
 
@@ -36,7 +36,6 @@ _MIME_ALIASES = {"image/jpg": "image/jpeg", "image/x-png": "image/png"}
 
 def decode_openai_image_part(part: dict[str, Any]) -> DecodedImage:
     """Decode one embedded OpenAI-compatible image response part."""
-
     encoded: Any = part.get("b64_json")
     declared_mime: str | None = None
     if not isinstance(encoded, str) or not encoded:
@@ -55,15 +54,17 @@ def decode_openai_image_part(part: dict[str, Any]) -> DecodedImage:
     return inspect_image_bytes(payload, declared_mime=declared_mime)
 
 
-def decode_openai_image_parts(parts: Sequence[dict[str, Any]]) -> list[DecodedImage]:
+def decode_openai_image_parts(
+    parts: Sequence[dict[str, Any]],
+) -> list[DecodedImage]:
     """Decode an ordered collection of embedded image response parts."""
-
     return [decode_openai_image_part(part) for part in parts]
 
 
-def inspect_image_bytes(data: bytes, *, declared_mime: str | None = None) -> DecodedImage:
+def inspect_image_bytes(
+    data: bytes, *, declared_mime: str | None = None
+) -> DecodedImage:
     """Decode image bytes fully and return verified content metadata."""
-
     try:
         with Image.open(BytesIO(data)) as image:
             image_format = image.format
@@ -86,7 +87,10 @@ def inspect_image_bytes(data: bytes, *, declared_mime: str | None = None) -> Dec
     if not isinstance(actual_mime, str) or extension is None:
         raise ImageOutputError("response_unsupported_image_format")
     actual_mime = _normalize_mime(actual_mime)
-    if declared_mime is not None and _normalize_mime(declared_mime) != actual_mime:
+    if (
+        declared_mime is not None
+        and _normalize_mime(declared_mime) != actual_mime
+    ):
         raise ImageOutputError("response_image_mime_mismatch")
     checksum = hashlib.sha256(data).hexdigest()
     return DecodedImage(
@@ -102,7 +106,6 @@ def inspect_image_bytes(data: bytes, *, declared_mime: str | None = None) -> Dec
 
 def _parse_image_data_url(value: str) -> tuple[str, str]:
     """Split a base64 image data URL into MIME type and encoded payload."""
-
     if not value.startswith("data:") or "," not in value:
         raise ImageOutputError("response_image_payload_not_embedded")
     header, encoded = value[5:].split(",", maxsplit=1)
@@ -117,6 +120,5 @@ def _parse_image_data_url(value: str) -> tuple[str, str]:
 
 def _normalize_mime(value: str) -> str:
     """Normalize supported image MIME aliases."""
-
     mime = value.strip().lower()
     return _MIME_ALIASES.get(mime, mime)

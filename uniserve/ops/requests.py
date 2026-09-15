@@ -13,7 +13,11 @@ import torch
 
 @dataclass(frozen=True)
 class RmsNormReq:
-    """Carries an input tensor, normalization weight, and epsilon for RMS normalization."""
+    """RMS normalization request.
+
+    Carries an input tensor, normalization weight, and epsilon for RMS
+    normalization.
+    """
 
     hidden_states: torch.Tensor
     weight: torch.Tensor
@@ -22,7 +26,11 @@ class RmsNormReq:
 
 @dataclass(frozen=True)
 class AddRmsNormReq:
-    """Carries mutable input and residual tensors for fused residual addition and RMS normalization."""
+    """Fused residual-add RMS normalization request.
+
+    Carries mutable input and residual tensors for fused residual addition
+    and RMS normalization.
+    """
 
     hidden_states: torch.Tensor
     residual: torch.Tensor
@@ -40,7 +48,11 @@ class SiluAndMulReq:
 
 @dataclass(frozen=True)
 class QKNormReq:
-    """Carries query/key tensors, independent RMS weights, and epsilon for QK normalization."""
+    """QK normalization request.
+
+    Carries query/key tensors, independent RMS weights, and epsilon for QK
+    normalization.
+    """
 
     q: torch.Tensor
     k: torch.Tensor
@@ -51,7 +63,11 @@ class QKNormReq:
 
 @dataclass(frozen=True)
 class MultiAxisQKNormReq:
-    """Carries Q/K tensors and per-axis dimensions and weights for grouped normalization."""
+    """Grouped multi-axis QK normalization request.
+
+    Carries Q/K tensors and per-axis dimensions and weights for grouped
+    normalization.
+    """
 
     q: torch.Tensor
     k: torch.Tensor
@@ -66,7 +82,11 @@ QKNormRequest = QKNormReq | MultiAxisQKNormReq
 
 @dataclass(frozen=True)
 class QKNormRopeReq:
-    """Carries Q/K tensors, normalization weights, rotary tables, and interleaving policy for fused execution."""
+    """Fused QK normalization and RoPE request.
+
+    Carries Q/K tensors, normalization weights, rotary tables, and
+    interleaving policy for fused execution.
+    """
 
     q: torch.Tensor
     k: torch.Tensor
@@ -82,7 +102,11 @@ class QKNormRopeReq:
 
 @dataclass(frozen=True)
 class MultiAxisQKNormRopeReq:
-    """Carries per-axis QK normalization and rotary metadata for fused multimodal execution."""
+    """Fused multimodal multi-axis QK normalization and RoPE request.
+
+    Carries per-axis QK normalization and rotary metadata for fused
+    multimodal execution.
+    """
 
     q: torch.Tensor
     k: torch.Tensor
@@ -102,7 +126,11 @@ QKNormRopeRequest = QKNormRopeReq | MultiAxisQKNormRopeReq
 
 @dataclass(frozen=True)
 class PackedRopeReq:
-    """Carries packed Q/K tensors, rotary tables, positions, and rotary-dimension policy."""
+    """Packed RoPE request.
+
+    Carries packed Q/K tensors, rotary tables, positions, and
+    rotary-dimension policy.
+    """
 
     x: torch.Tensor
     cos: torch.Tensor

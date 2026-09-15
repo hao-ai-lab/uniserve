@@ -24,9 +24,9 @@ def rescale_blocks(
     if active:
         for start in range(0, width, tile):
             indices = start + tl.arange(0, tile)
-            value = tl.load(values + block * width + indices, indices < width, other=0.0).to(
-                tl.float32
-            )
+            value = tl.load(
+                values + block * width + indices, indices < width, other=0.0
+            ).to(tl.float32)
             decoded = (value * old).to(compute_dtype).to(tl.float32)
             encoded = tl.maximum(-448.0, tl.minimum(448.0, decoded / new))
             tl.store(values + block * width + indices, encoded, indices < width)

@@ -1,7 +1,10 @@
-"""Checkpoint normalization fixes architecture values before numerical construction."""
+"""Checkpoint normalization fixes architecture values.
 
-from dataclasses import FrozenInstanceError, asdict, replace
+The fixes apply before numerical construction.
+"""
+
 import json
+from dataclasses import FrozenInstanceError, asdict, replace
 
 import pytest
 import torch
@@ -15,7 +18,24 @@ pytestmark = pytest.mark.unit
 
 
 def _config():
-    return qwen3.Config(32, 8, 16, 1, 2, 1, 4, "silu", 1e-6, 10000.0, 128, False, False, 0, 1, 16)
+    return qwen3.Config(
+        32,
+        8,
+        16,
+        1,
+        2,
+        1,
+        4,
+        "silu",
+        1e-6,
+        10000.0,
+        128,
+        False,
+        False,
+        0,
+        1,
+        16,
+    )
 
 
 def test_loading_normalizes_immutable_architecture_fields(tmp_path):
@@ -56,12 +76,16 @@ def test_architecture_rejects_invalid_mathematics(values, message):
 @torch.inference_mode()
 def test_replacement_embeddings_preserve_tokens_and_independent_head_width():
     generator = torch.Generator().manual_seed(814)
-    model = qwen3.Model(replace(_config(), hidden_size=10, num_attention_heads=3))
+    model = qwen3.Model(
+        replace(_config(), hidden_size=10, num_attention_heads=3)
+    )
     for parameter in model.parameters():
         if parameter.ndim == 1:
             parameter.fill_(1)
         else:
-            parameter.copy_(torch.randn(parameter.shape, generator=generator) / 8)
+            parameter.copy_(
+                torch.randn(parameter.shape, generator=generator) / 8
+            )
     lengths = SequenceLengths.from_lengths((3,), device="cpu")
     attention = VarlenInput(lengths, lengths, (True,))
     ids = torch.tensor([1, 2, 3])
@@ -73,10 +97,14 @@ def test_replacement_embeddings_preserve_tokens_and_independent_head_width():
             ids,
             positions,
             attention,
-            EmbeddingReplacement(embeddings, torch.tensor([False, True, False])),
+            EmbeddingReplacement(
+                embeddings, torch.tensor([False, True, False])
+            ),
         )
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    logits = model.compute_logits(actual, token_indices=torch.tensor([2])).gather()
+    logits = model.compute_logits(
+        actual, token_indices=torch.tensor([2])
+    ).gather()
     assert logits.shape == (1, 32)
     assert torch.isfinite(logits).all()

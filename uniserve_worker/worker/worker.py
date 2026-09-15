@@ -23,11 +23,22 @@ from uniserve.profiling import profile_range
 from uniserve.quantization import Quantizer
 from uniserve.runtime import EventPool, PrefixCache
 from uniserve.runtime.device import canonical_device, device_memory_budget
-from uniserve.runtime.process_groups import ProcessGroups, initialize_process_groups
+from uniserve.runtime.process_groups import (
+    ProcessGroups,
+    initialize_process_groups,
+)
 from uniserve.runtime.resources import close_resources
 from uniserve_models.processing import FlowPrompt, ImageProcessor
-from uniserve_worker.profiling import WorkerProfiler, record_failure, worker_range_name
-from uniserve_worker.protocol.identity import BufferId, ComputationId, RequestKey
+from uniserve_worker.profiling import (
+    WorkerProfiler,
+    record_failure,
+    worker_range_name,
+)
+from uniserve_worker.protocol.identity import (
+    BufferId,
+    ComputationId,
+    RequestKey,
+)
 from uniserve_worker.protocol.operation import Computation
 
 from ..bootstrap.capacity import (
@@ -49,7 +60,12 @@ from ..execution.batch_state import BatchState
 from ..execution.model_entry import ModelEntry
 from ..execution.model_runner import ModelRunner
 from ..execution.output import OutputPool, PendingOutput
-from ..execution.prepare import capture_predicates, prepare_batch, prepare_inputs, validate_batch
+from ..execution.prepare import (
+    capture_predicates,
+    prepare_batch,
+    prepare_inputs,
+    validate_batch,
+)
 from ..execution.step import execute_batch
 from ..foundation.errors import (
     WorkerError,
@@ -83,9 +99,13 @@ logger = logging.getLogger(__name__)
 _IPC_WAIT_TIMEOUT_US = 60_000_000
 
 
-def _input_producers(batch: ScheduleBatch) -> set[tuple[RequestKey, ComputationId]]:
-    """Identify producers whose values must remain visible until input acquisition."""
+def _input_producers(
+    batch: ScheduleBatch,
+) -> set[tuple[RequestKey, ComputationId]]:
+    """Identify producers requiring extended visibility.
 
+    Their values must remain visible until input acquisition.
+    """
     sources = {
         (reference.request_key, reference.producer_op_id)
         for operation in batch.operations
@@ -103,7 +123,10 @@ def _input_producers(batch: ScheduleBatch) -> set[tuple[RequestKey, ComputationI
 
 
 class Worker:
-    """Own a model, execution resources, and an optional single-use IPC service."""
+    """Own a model and its execution resources.
+
+    Also owns an optional single-use IPC service.
+    """
 
     model: nn.Module
     worker_config: WorkerConfig
@@ -115,8 +138,10 @@ class Worker:
     _completion_wake: Callable[[], None] | None = None
 
     def __enter__(self) -> Self:
-        """Enter the owning scope for this worker's execution and service resources."""
+        """Enter the owning scope.
 
+        The scope covers this worker's execution and service resources.
+        """
         self._require_open()
         return self
 
@@ -126,24 +151,28 @@ class Worker:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Release resources without suppressing or replacing the scope's error."""
+        """Release resources on scope exit.
 
+        The scope's error is neither suppressed nor replaced.
+        """
         try:
             self.close()
         except BaseException as cleanup_error:
             if exc_value is None:
                 raise
 
-            exc_value.add_note(f"Resource cleanup also failed: {cleanup_error!r}")
+            exc_value.add_note(
+                f"Resource cleanup also failed: {cleanup_error!r}"
+            )
 
     @classmethod
     def from_config(cls, config: WorkerProcessArgs) -> Self:
         """Build a worker without numerical warmup, graph capture, or IPC I/O.
 
-        Construction failures release all resources acquired here. The returned
-        worker owns those resources until its context exits or the caller closes it.
+        Construction failures release all resources acquired here. The
+        returned worker owns those resources until its context exits or the
+        caller closes it.
         """
-
         source = prepare_worker_model(config)
 
         # Mathematical constraints are checked before physical groups exist.
@@ -163,19 +192,25 @@ class Worker:
 
         try:
             try:
-                bindings = initialize_entries(distributed, dict(config.components))
+                bindings = initialize_entries(
+                    distributed, dict(config.components)
+                )
             except ValueError as error:
                 raise unsupported_setup(str(error)) from error
 
             loaded = load_worker_model(config, bindings, source=source)
 
-            # Sampling uses the language model's TP group, independently of other
-            # components' parallel layouts. Backend selection belongs to the runner.
+            # Sampling uses the language model's TP group, independently of
+            # other components' parallel layouts. Backend selection belongs
+            # to the runner.
             model_mesh = bindings["model"].mesh if "model" in bindings else None
-            sampling_group = None if model_mesh is None else model_mesh.get_group("tp")
+            sampling_group = (
+                None if model_mesh is None else model_mesh.get_group("tp")
+            )
 
-            # The constructor owns partial execution allocations on failure. On
-            # success the worker also takes responsibility for distributed.close().
+            # The constructor owns partial execution allocations on failure.
+            # On success the worker also takes responsibility for
+            # distributed.close().
             return cls(
                 loaded.model,
                 bindings=bindings,
@@ -197,7 +232,9 @@ class Worker:
             try:
                 distributed.close()
             except BaseException as cleanup_error:
-                error.add_note(f"Resource cleanup also failed: {cleanup_error!r}")
+                error.add_note(
+                    f"Resource cleanup also failed: {cleanup_error!r}"
+                )
 
             raise
 
@@ -223,11 +260,11 @@ class Worker:
     ) -> None:
         """Allocate execution resources for an already-loaded model.
 
-        Resolve unspecified attention from worker_config. Construction performs
-        no warmup or IPC I/O, and rolls back partial resource allocations on error.
-        The caller closes the worker or uses its owning context after success.
+        Resolve unspecified attention from worker_config. Construction
+        performs no warmup or IPC I/O, and rolls back partial resource
+        allocations on error. The caller closes the worker or uses its
+        owning context after success.
         """
-
         self._closed = False
         self._run_started = False
         self._warmed_up = False
@@ -239,26 +276,34 @@ class Worker:
 
         try:
             if not isinstance(model, nn.Module):
-                raise unsupported_setup("worker model has no supported execution surface")
+                raise unsupported_setup(
+                    "worker model has no supported execution surface"
+                )
 
             if not isinstance(worker_config, WorkerConfig):
                 raise unsupported_setup("model worker requires a WorkerConfig")
 
             if pipeline_depth <= 0:
-                raise unsupported_setup("worker pipeline depth must be positive")
+                raise unsupported_setup(
+                    "worker pipeline depth must be positive"
+                )
 
             if (
                 not publication_backends
                 or len(set(publication_backends)) != len(publication_backends)
                 or not set(publication_backends).issubset(transfer_backends)
             ):
-                raise unsupported_setup("publication backends must be unique bound transports")
+                raise unsupported_setup(
+                    "publication backends must be unique bound transports"
+                )
 
             if (
                 "cuda_ipc" in transfer_backends
                 and torch.device(worker_config.device).type != "cuda"
             ):
-                raise unsupported_setup("CUDA IPC requires a CUDA worker device")
+                raise unsupported_setup(
+                    "CUDA IPC requires a CUDA worker device"
+                )
 
             self.model = model
             self.process_groups = process_groups
@@ -285,9 +330,10 @@ class Worker:
             attention = runner.attention
             self.attention = attention
 
-            # Measure the remaining grant after the runner binds persistent model
-            # inputs and workspaces. Sizing earlier would treat occupied memory as free.
-            # Request capacity is the only configuration resolved after binding.
+            # Measure the remaining grant after the runner binds persistent
+            # model inputs and workspaces. Sizing earlier would treat
+            # occupied memory as free. Request capacity is the only
+            # configuration resolved after binding.
             endpoint = WorkerEndpoint.local(worker_id, int(worker_config.rank))
 
             worker_config = resolve_request_capacity(
@@ -296,7 +342,11 @@ class Worker:
                 state_buffers=runner.state_buffers,
                 pipeline_depth=pipeline_depth,
                 bindings=bindings,
-                capacity_group=(None if process_groups is None else process_groups.process_group),
+                capacity_group=(
+                    None
+                    if process_groups is None
+                    else process_groups.process_group
+                ),
             )
             self.worker_config = worker_config
             runner.worker_config = worker_config
@@ -314,26 +364,38 @@ class Worker:
                 transfer_backends=transfer_backends,
                 components=components,
                 attention_identity=f"{type(attention).__module__}.{type(attention).__qualname__}",
-                # The scheduler's page indices are shared across all resident layer
-                # and head regions, including stages with different memory grants.
+                # The scheduler's page indices are shared across all
+                # resident layer and head regions, including stages with
+                # different memory grants.
                 capacity_group=(
-                    process_groups.process_group if process_groups is not None else sampling_group
+                    process_groups.process_group
+                    if process_groups is not None
+                    else sampling_group
                 ),
             )
 
-            # Auxiliary devices have separate grants; primary-device reservations
-            # were already included in the layout's capacity calculation.
+            # Auxiliary devices have separate grants; primary-device
+            # reservations were already included in the layout's capacity
+            # calculation.
             for device, fixed_bytes in layout.fixed_device_bytes:
-                if device == worker_config.device or canonical_device(device).type != "cuda":
+                if (
+                    device == worker_config.device
+                    or canonical_device(device).type != "cuda"
+                ):
                     continue
 
-                available, _free = device_memory_budget(device, worker_config.kv_memory_fraction)
-                reserved = fixed_bytes + graph_memory_budget_bytes(device_total_bytes(device))
+                available, _free = device_memory_budget(
+                    device, worker_config.kv_memory_fraction
+                )
+                reserved = fixed_bytes + graph_memory_budget_bytes(
+                    device_total_bytes(device)
+                )
 
                 if reserved > available:
                     raise unsupported_setup(
-                        f"runtime storage on {device} requires {reserved} bytes, "
-                        f"but its static memory grant is {available} bytes"
+                        f"runtime storage on {device} requires {reserved} "
+                        "bytes, but its static memory grant is "
+                        f"{available} bytes"
                     )
 
             self._layout = layout
@@ -348,20 +410,27 @@ class Worker:
             self.block_tables = None
             max_blocks_per_row = 0
 
-            # KV pages and request-to-token tables share group dimensions; bind them to
-            # the model only after attention compatibility has been established.
+            # KV pages and request-to-token tables share group dimensions;
+            # bind them to the model only after attention compatibility has
+            # been established.
             if cache is not None:
                 assert text is not None
                 kv_cache = info.kv_cache
                 if kv_cache is None:
-                    raise unsupported_setup("KV model worker has no KV-cache configuration")
+                    raise unsupported_setup(
+                        "KV model worker has no KV-cache configuration"
+                    )
 
                 max_blocks_per_row = max(
                     1,
-                    ceil_div(worker_config.max_sequence_tokens, int(worker_config.block_size)),
+                    ceil_div(
+                        worker_config.max_sequence_tokens,
+                        int(worker_config.block_size),
+                    ),
                 )
 
-                # Cache groups occupy consecutive ranges in the shared page pool.
+                # Cache groups occupy consecutive ranges in the shared page
+                # pool.
                 group_ranges: list[tuple[int, int]] = []
                 group_offset = 0
                 for group in kv_cache.groups:
@@ -375,8 +444,13 @@ class Worker:
                         num_blocks=kv_cache.num_blocks,
                         block_size=kv_cache.block_size,
                         device=worker_config.device,
-                        dtype=None if encoded else getattr(torch, kv_cache.dtype),
-                        quantization={name: Quantizer("fp8", axis=0) for name in cache.layers}
+                        dtype=None
+                        if encoded
+                        else getattr(torch, kv_cache.dtype),
+                        quantization={
+                            name: Quantizer("fp8", axis=0)
+                            for name in cache.layers
+                        }
                         if encoded
                         else None,
                     ),
@@ -404,7 +478,9 @@ class Worker:
                 None,
             )
             if not isinstance(torch_dtype, torch.dtype):
-                raise unsupported_setup(f"unsupported model dtype {worker_config.model_dtype!r}")
+                raise unsupported_setup(
+                    f"unsupported model dtype {worker_config.model_dtype!r}"
+                )
 
             if self.block_tables is not None:
                 assert text is not None
@@ -419,11 +495,16 @@ class Worker:
             else:
                 self.decode_state = None
 
-            # Generation state has its own page pool and may live on another device.
+            # Generation state has its own page pool and may live on
+            # another device.
             flow = image_builder(model)
-            latent_dtype = getattr(torch, str(layout.latent_dtype).removeprefix("torch."), None)
+            latent_dtype = getattr(
+                torch, str(layout.latent_dtype).removeprefix("torch."), None
+            )
             if flow is not None and not isinstance(latent_dtype, torch.dtype):
-                raise unsupported_setup(f"unsupported latent dtype {layout.latent_dtype!r}")
+                raise unsupported_setup(
+                    f"unsupported latent dtype {layout.latent_dtype!r}"
+                )
 
             if flow is None:
                 self.latent_pool = None
@@ -435,7 +516,8 @@ class Worker:
                     page_units=int(info.latent_page_units),
                     latent_width=int(layout.latent_width),
                     dtype=latent_dtype,
-                    device=worker_config.generation_device or worker_config.device,
+                    device=worker_config.generation_device
+                    or worker_config.device,
                 )
                 startup.callback(self.latent_pool.close)
 
@@ -443,10 +525,14 @@ class Worker:
                 self.latent_pool is not None
                 and self.latent_pool.persistent_bytes != arena.latent_pool_bytes
             ):
-                raise RuntimeError("latent pool allocation disagrees with its exact capacity plan")
+                raise RuntimeError(
+                    "latent pool allocation disagrees with its exact "
+                    "capacity plan"
+                )
 
-            # These bounded stores own all asynchronous products, copies, CPU tasks,
-            # and transfer lifetimes exposed by an in-flight pipeline.
+            # These bounded stores own all asynchronous products, copies,
+            # CPU tasks, and transfer lifetimes exposed by an in-flight
+            # pipeline.
             owner_devices = tuple(
                 dict.fromkeys(
                     (
@@ -461,7 +547,8 @@ class Worker:
 
             self.output_pool = OutputPool(
                 capacity=int(pipeline_depth) * int(info.max_batch_ops),
-                max_words=int(info.max_batch_ops) * (4 + (int(completion_payload_bytes) + 3) // 4),
+                max_words=int(info.max_batch_ops)
+                * (4 + (int(completion_payload_bytes) + 3) // 4),
                 event_pool=self.device_events,
             )
             startup.callback(self.output_pool.close)
@@ -469,7 +556,8 @@ class Worker:
             self.buffer_pool = BufferPool(
                 byte_capacity=int(layout.physical_buffer_pool_bytes),
                 devices=owner_devices,
-                compact=layout.physical_buffer_pool_bytes < info.buffer_pool_bytes,
+                compact=layout.physical_buffer_pool_bytes
+                < info.buffer_pool_bytes,
             )
             startup.callback(self.buffer_pool.close)
 
@@ -478,7 +566,9 @@ class Worker:
                 byte_capacity=arena.device_product_bytes,
                 entry_capacity=int(layout.encoder_cache_entries),
                 max_entry_bytes=max(
-                    1, int(layout.max_latent_feature_bytes), int(layout.max_vision_feature_bytes)
+                    1,
+                    int(layout.max_latent_feature_bytes),
+                    int(layout.max_vision_feature_bytes),
                 ),
                 devices=owner_devices,
                 request_capacity=int(info.request_slots),
@@ -495,10 +585,14 @@ class Worker:
             startup.callback(self.cpu_tasks.close)
 
             transfer_byte_capacity = int(arena.transfer_bytes)
-            if capability(model, VideoPostprocessor) is not None or runner.state_buffers:
-                # Each live request tensor reserves one credit per publication
-                # representation and one read credit on every possible remote rank.
-                # These credits bound ownership lifetimes; they allocate no storage.
+            if (
+                capability(model, VideoPostprocessor) is not None
+                or runner.state_buffers
+            ):
+                # Each live request tensor reserves one credit per
+                # publication representation and one read credit on every
+                # possible remote rank. These credits bound ownership
+                # lifetimes; they allocate no storage.
                 transfer_byte_capacity *= len(publication_backends) + max(
                     0, int(worker_config.world_size) - 1
                 )
@@ -518,7 +612,10 @@ class Worker:
             }
 
             if owns_kv:
-                assert layout.input_config is not None and self.decode_state is not None
+                assert (
+                    layout.input_config is not None
+                    and self.decode_state is not None
+                )
 
                 runner.configure_inputs(
                     input_config=layout.input_config,
@@ -561,23 +658,27 @@ class Worker:
             try:
                 startup.close()
             except BaseException as cleanup_error:
-                error.add_note(f"Resource cleanup also failed: {cleanup_error!r}")
+                error.add_note(
+                    f"Resource cleanup also failed: {cleanup_error!r}"
+                )
 
             raise
 
-        # All registered resources now belong to this Worker and its close method.
+        # All registered resources now belong to this Worker and its close
+        # method.
         startup.pop_all()
         self._init_request_scheduling()
         self._init_run_tracking()
 
     def bind(self, endpoint: WorkerIpcEndpoint) -> Self:
-        """Borrow an open endpoint and install bounded service queues and completion wakes.
+        """Borrow an open endpoint and install service state.
 
-        The caller owns the endpoint and must keep it open until the Worker scope
-        exits or close() finishes. Binding is exclusive and cannot be replaced.
-        The surrounding Worker scope owns cleanup on success or failure.
+        Installs bounded service queues and completion wakes. The caller
+        owns the endpoint and must keep it open until the Worker scope
+        exits or close() finishes. Binding is exclusive and cannot be
+        replaced. The surrounding Worker scope owns cleanup on success or
+        failure.
         """
-
         self._require_open()
 
         if self.ipc_endpoint is not None:
@@ -596,8 +697,10 @@ class Worker:
         return self
 
     def _init_request_scheduling(self) -> None:
-        """Initialize admission limits, dependency chains, and ready-request queues."""
+        """Initialize admission scheduling state.
 
+        Covers admission limits, dependency chains, and ready-request queues.
+        """
         self.pipeline_depth = max(1, int(self.info.queue_depth))
         self._next_sequence = 1
         self._transport_occupancy = 0
@@ -621,8 +724,11 @@ class Worker:
         ) or (self.sampling_group is not None and self.sampling_group.size > 1)
 
     def _init_run_tracking(self) -> None:
-        """Keep bounded in-flight work and a constant-size admission high-water mark."""
+        """Initialize run tracking state.
 
+        Keeps bounded in-flight work and a constant-size admission
+        high-water mark.
+        """
         # Physical IDs increase in transport submission order, independently of
         # logical batch IDs. Completion order does not affect admission.
         self._last_run_id = -1
@@ -635,12 +741,12 @@ class Worker:
         self._waiting_responses: dict[int, PendingResponse] = {}
 
     def run(self) -> None:
-        """Warm up and serve synchronously once, within the owner's resource scope.
+        """Warm up and serve synchronously once.
 
-        No service requests are consumed before warmup completes. Returning or
-        raising leaves resource cleanup to the surrounding Worker context.
+        Runs within the owner's resource scope. No service requests are
+        consumed before warmup completes. Returning or raising leaves
+        resource cleanup to the surrounding Worker context.
         """
-
         self._require_open()
 
         if self._run_started:
@@ -655,8 +761,10 @@ class Worker:
         self._process_requests()
 
     def _process_requests(self) -> None:
-        """Advance accepted work and deliver responses until the service drains."""
+        """Advance accepted work until the service drains.
 
+        Delivers responses as they become ready.
+        """
         endpoint = self.ipc_endpoint
         assert endpoint is not None
 
@@ -667,7 +775,8 @@ class Worker:
 
         try:
             while True:
-                # Give accepted work and ready responses priority over admission.
+                # Give accepted work and ready responses priority over
+                # admission.
                 self.device_events.reap()
 
                 if self._advance_executing_runs():
@@ -679,7 +788,8 @@ class Worker:
                 if self._launch_one_ready_request():
                     continue
 
-                # Close is acknowledged after execution and claimed responses drain.
+                # Close is acknowledged after execution and claimed
+                # responses drain.
                 if self._admission_closed:
                     self._close_completed_polls()
 
@@ -689,13 +799,17 @@ class Worker:
 
                         return
 
-                if not self._admission_closed and self._transport_occupancy < self.pipeline_depth:
+                if (
+                    not self._admission_closed
+                    and self._transport_occupancy < self.pipeline_depth
+                ):
                     request = endpoint.try_recv()
                     if request is not None:
                         self._accept(request)
                         continue
 
-                # Outstanding work needs completion wakes as well as IPC arrivals.
+                # Outstanding work needs completion wakes as well as IPC
+                # arrivals.
                 if (
                     self._pending_requests
                     or self.pending_responses
@@ -715,17 +829,24 @@ class Worker:
 
     def _dispatch(self, request: Mapping[str, Any]) -> dict[str, Any]:
         """Resolve an administrative request without transport I/O."""
-
         kind = messages.request_kind(request)
         if kind is RequestKind.INFO:
-            return messages.response(ResponseKind.INFO, info=self.info.to_mapping())
+            return messages.response(
+                ResponseKind.INFO, info=self.info.to_mapping()
+            )
         if kind is RequestKind.CLOSE:
             return messages.response(ResponseKind.OK)
-        raise invalid_descriptor(f"unsupported administrative request {kind.value!r}")
+        raise invalid_descriptor(
+            f"unsupported administrative request {kind.value!r}"
+        )
 
-    def _boxed_error(self, request: Mapping[str, Any], error: BaseException) -> dict[str, Any]:
-        """Classify an exception, record it, and encode the protocol error response."""
+    def _boxed_error(
+        self, request: Mapping[str, Any], error: BaseException
+    ) -> dict[str, Any]:
+        """Classify an exception and record it.
 
+        Also encodes the protocol error response.
+        """
         classified = (
             error
             if isinstance(error, WorkerError)
@@ -739,8 +860,10 @@ class Worker:
         return messages.error_response(classified, request)
 
     def _accept(self, request: dict[str, Any]) -> int:
-        """Assign transport order, decode the request, and link per-request dependencies."""
+        """Assign transport order and decode the request.
 
+        Also links per-request dependencies.
+        """
         # Sequence and occupancy are assigned before parsing so even malformed
         # requests produce an ordered response and release one transport slot.
         sequence = self._next_sequence
@@ -755,7 +878,9 @@ class Worker:
             # sequence position until all earlier responses have drained.
             if kind is RequestKind.CLOSE:
                 self._admission_closed = True
-                self._shutdown_response = messages.with_call_id(self._dispatch(request), request)
+                self._shutdown_response = messages.with_call_id(
+                    self._dispatch(request), request
+                )
                 return sequence
 
             run: ScheduleBatch | None = None
@@ -769,7 +894,11 @@ class Worker:
                     else -1
                 )
                 with profile_range(
-                    worker_range_name("run_decode", run_id=raw_run_id, rank=self.info.endpoint.rank)
+                    worker_range_name(
+                        "run_decode",
+                        run_id=raw_run_id,
+                        rank=self.info.endpoint.rank,
+                    )
                 ):
                     run = (
                         raw_run
@@ -779,7 +908,8 @@ class Worker:
 
                 if run.run_id <= self._last_run_id:
                     raise invalid_descriptor(
-                        f"run id {run.run_id} must exceed previously submitted id {self._last_run_id}"
+                        f"run id {run.run_id} must exceed previously "
+                        f"submitted id {self._last_run_id}"
                     )
                 self._last_run_id = run.run_id
 
@@ -789,7 +919,9 @@ class Worker:
                 # Existing readers retain storage; the command's ordinary
                 # terminal acknowledgement still waits for their completion.
                 freed = tuple(
-                    command.buffer for command in run.commands if isinstance(command, Free)
+                    command.buffer
+                    for command in run.commands
+                    if isinstance(command, Free)
                 )
                 if freed:
                     self.release_buffers(freed)
@@ -809,13 +941,15 @@ class Worker:
             predecessors = {
                 id(predecessor): predecessor
                 for request_id in requests
-                if (predecessor := self._request_tails.get(request_id)) is not None
+                if (predecessor := self._request_tails.get(request_id))
+                is not None
             }
-            # Component participants can finish the same operation at different
-            # times. Preserve the host's cooperative submission order even when
-            # a later, independent request has already satisfied its own lineage.
-            # Release at successor visibility keeps device and CPU completion
-            # overlap under the existing execution credits.
+            # Component participants can finish the same operation at
+            # different times. Preserve the host's cooperative submission
+            # order even when a later, independent request has already
+            # satisfied its own lineage. Release at successor visibility
+            # keeps device and CPU completion overlap under the existing
+            # execution credits.
             if kind is RequestKind.SUBMIT and self._preserve_collective_order:
                 if self._collective_submission_tail is not None:
                     predecessors[id(self._collective_submission_tail)] = (
@@ -837,18 +971,23 @@ class Worker:
             # Parse and admission failures enter the same ordered response queue
             # as successfully launched requests.
             self.pending_responses.append(
-                PendingResponse(sequence, requests, self._boxed_error(request, error))
+                PendingResponse(
+                    sequence, requests, self._boxed_error(request, error)
+                )
             )
         return sequence
 
     def _enqueue(self, pending: ServiceRequest) -> None:
         """Insert dependency-ready work in the caller's submission order."""
-
-        insort(self._ready_requests, pending, key=lambda request: request.sequence)
+        insort(
+            self._ready_requests, pending, key=lambda request: request.sequence
+        )
 
     def _release(self, pending: ServiceRequest) -> None:
-        """Release one completed request and wake successors whose dependencies reach zero."""
+        """Release one completed request.
 
+        Wakes successors whose dependencies reach zero.
+        """
         if pending.released:
             return
         pending.released = True
@@ -868,8 +1007,10 @@ class Worker:
         pending.successors.clear()
 
     def _launch_one_ready_request(self) -> bool:
-        """Select and launch one dependency-ready administrative or execution request."""
+        """Select and launch one dependency-ready request.
 
+        Handles administrative and execution requests.
+        """
         execution_full = len(self.inflight) >= self.pipeline_depth
         position = next(
             (
@@ -906,7 +1047,6 @@ class Worker:
 
     def _launch_admin(self, pending: ServiceRequest) -> None:
         """Dispatch an administrative request and queue its ordered response."""
-
         response = self._dispatch(pending.request)
         self.pending_responses.append(
             PendingResponse(
@@ -918,7 +1058,6 @@ class Worker:
 
     def _launch_execute(self, pending: ServiceRequest) -> None:
         """Start one accepted run and queue its first result fragment."""
-
         if pending.run is None:
             raise RuntimeError("accepted execute request lost its run")
         run = BatchState(pending.run)
@@ -929,8 +1068,10 @@ class Worker:
         self._queue_result(pending, run)
 
     def _start_execution(self, run: BatchState) -> None:
-        """Submit physical inputs and directly launch the batch when they are ready."""
+        """Submit physical inputs for the run.
 
+        Directly launches the batch when the inputs are ready.
+        """
         try:
             unsupported = tuple(
                 operation.kind
@@ -940,7 +1081,8 @@ class Worker:
             if unsupported:
                 names = sorted({value.value for value in unsupported})
                 raise invalid_descriptor(
-                    f"execution run contains work variants unsupported by this worker: {names!r}"
+                    "execution run contains work variants unsupported by "
+                    f"this worker: {names!r}"
                 )
 
             self._prepare_execution(run)
@@ -949,13 +1091,17 @@ class Worker:
                 if not run.complete:
                     self._executing_runs.append(run)
             else:
-                run.on_dependencies_ready(partial(self._preparation_completed, run))
+                run.on_dependencies_ready(
+                    partial(self._preparation_completed, run)
+                )
         except BaseException as error:
             self._fail_run(run, error)
 
     def _advance_execution(self, run: BatchState) -> bool:
-        """Execute prepared inputs on the worker thread, never from a notification callback."""
+        """Execute prepared inputs on the worker thread.
 
+        Never executes from a notification callback.
+        """
         if run.complete or run.launched:
             return True
         try:
@@ -969,15 +1115,19 @@ class Worker:
         return True
 
     def _advance_run(self, run: BatchState) -> None:
-        """Materialize complete groups and advance physical command retirement."""
+        """Materialize complete groups.
 
+        Also advances physical command retirement.
+        """
         if run.complete or not run.launched:
             return
         try:
             # CPU work is submitted by the Worker, never by a readiness query.
             for output in run.outputs:
                 parent: object = output
-                while isinstance(parent, PendingOutput) and parent.value is None:
+                while (
+                    isinstance(parent, PendingOutput) and parent.value is None
+                ):
                     for task in parent.completion_tasks:
                         task.submit_if_ready()
                     parent = parent.predecessor
@@ -987,16 +1137,28 @@ class Worker:
                     continue
                 outputs = tuple(run.outputs[index] for index in indexes)
                 if any(value is None for value in outputs):
-                    raise RuntimeError("launched batch is missing an operation output")
-                if any(isinstance(value, PendingOutput) and not value.ready() for value in outputs):
+                    raise RuntimeError(
+                        "launched batch is missing an operation output"
+                    )
+                if any(
+                    isinstance(value, PendingOutput) and not value.ready()
+                    for value in outputs
+                ):
                     continue
-                pending = tuple(value for value in outputs if isinstance(value, PendingOutput))
+                pending = tuple(
+                    value
+                    for value in outputs
+                    if isinstance(value, PendingOutput)
+                )
                 values = tuple(
-                    value.materialize() if isinstance(value, PendingOutput) else value
+                    value.materialize()
+                    if isinstance(value, PendingOutput)
+                    else value
                     for value in outputs
                 )
                 self.requests.apply_outputs(pending)
-                # Acceptance remains visible after pending rows become wire values.
+                # Acceptance remains visible after pending rows become wire
+                # values.
                 if len(pending) == len(outputs):
                     run.accepted_groups.add(group)
                 for index, value in zip(indexes, values, strict=True):
@@ -1011,19 +1173,26 @@ class Worker:
 
     def _notify_run(self, run: BatchState) -> None:
         """Release submission dependencies and wake its waiting IPC response."""
-
         if run.successors_ready:
             submission = self._run_submissions.pop(run.run_id, None)
             if submission is not None:
                 self._release(submission)
         self._run_ready(run)
 
-    def _fail_run(self, run: BatchState, error: BaseException, *, context: str = "execute") -> None:
-        """Record a classified failure, close the batch, and wake its waiting responses."""
+    def _fail_run(
+        self, run: BatchState, error: BaseException, *, context: str = "execute"
+    ) -> None:
+        """Record a classified failure and close the batch.
 
+        Also wakes its waiting responses.
+        """
         if run.complete:
             return
-        run.error = error if isinstance(error, WorkerError) else classify(error, context=context)
+        run.error = (
+            error
+            if isinstance(error, WorkerError)
+            else classify(error, context=context)
+        )
         try:
             self._close_batch(run)
         except BaseException as cleanup_error:
@@ -1033,22 +1202,27 @@ class Worker:
 
     def _launch_poll(self, pending: ServiceRequest) -> None:
         """Claim the next undelivered fragment of a previously submitted run."""
-
         run_id = messages.integer(pending.request, "run_id", RequestKind.POLL)
         run = self.inflight.get(run_id)
         if run is None or not run.awaiting_poll:
-            raise invalid_descriptor(f"poll names run {run_id} with no pending results")
+            raise invalid_descriptor(
+                f"poll names run {run_id} with no pending results"
+            )
 
         run.awaiting_poll = False
         self._queue_result(pending, run)
 
     def _queue_result(self, request: ServiceRequest, run: BatchState) -> None:
-        """Queue a Submit or Poll response when its next result fragment is ready."""
+        """Queue a Submit or Poll response.
 
+        The response is queued when its next result fragment is ready.
+        """
         pending = PendingResponse(
             request.sequence,
             request.requests | run.request_ids,
-            messages.with_call_id(messages.response(ResponseKind.RESULT), request.request),
+            messages.with_call_id(
+                messages.response(ResponseKind.RESULT), request.request
+            ),
             run,
         )
         self._advance_run(run)
@@ -1059,7 +1233,6 @@ class Worker:
 
     def _run_ready(self, run: BatchState) -> None:
         """Wake the single response waiting for this run's next fragment."""
-
         pending = self._waiting_responses.pop(run.run_id, None)
         if pending is not None:
             if self._pending_ready(pending):
@@ -1069,14 +1242,15 @@ class Worker:
 
     def _preparation_completed(self, run: BatchState) -> None:
         """Enqueue readiness before waking the IPC loop that consumes it."""
-
         self._preparation_ready.put(run)
         if self.ipc_endpoint is not None:
             self.ipc_endpoint.wake()
 
     def _advance_executing_runs(self) -> bool:
-        """Launch preparation-ready work and advance executing runs in launch order."""
+        """Launch preparation-ready work.
 
+        Also advances executing runs in launch order.
+        """
         advanced = False
         if not self._preparation_ready.empty():
             run = self._preparation_ready.get_nowait()
@@ -1086,7 +1260,9 @@ class Worker:
                     if launched:
                         self._executing_runs.append(run)
                     else:
-                        run.on_dependencies_ready(partial(self._preparation_completed, run))
+                        run.on_dependencies_ready(
+                            partial(self._preparation_completed, run)
+                        )
             advanced = True
 
         # Query every launched run: one pending host read or retirement must not
@@ -1102,33 +1278,37 @@ class Worker:
 
     def _pending_ready(self, pending: PendingResponse) -> bool:
         """Query completion without blocking the service thread."""
-
         run = pending.run
         if run is None:
             return True
         with profile_range(
-            worker_range_name("completion", run_id=run.run_id, rank=self.info.endpoint.rank)
+            worker_range_name(
+                "completion", run_id=run.run_id, rank=self.info.endpoint.rank
+            )
         ):
             return run.ready()
 
     def _send_one_ready_response(self) -> bool:
         """Send the oldest transport-ready response if one exists."""
-
         if not self.pending_responses:
             return False
         self._send_pending(self.pending_responses.popleft())
         return True
 
     def _send_pending(self, pending: PendingResponse) -> None:
-        """Serialize and send one ready response while preserving transport sequence order."""
+        """Serialize and send one ready response.
 
+        Transport sequence order is preserved.
+        """
         response = dict(pending.response)
         run = pending.run
         run_id = run.run_id if run is not None else None
 
         if run is not None:
             if run.error is not None:
-                response = messages.error_response(run.take_error(), pending.response)
+                response = messages.error_response(
+                    run.take_error(), pending.response
+                )
             else:
                 response["result"] = run.take_output()
 
@@ -1140,7 +1320,9 @@ class Worker:
 
         fatal = bool(response.get("fatal"))
         with profile_range(
-            worker_range_name("finalize_response", run_id=run_id, rank=self.info.endpoint.rank)
+            worker_range_name(
+                "finalize_response", run_id=run_id, rank=self.info.endpoint.rank
+            )
         ):
             finalized = messages.finalize_response(response)
         self._transport_respond(finalized)
@@ -1155,15 +1337,16 @@ class Worker:
 
     def _transport_respond(self, response: dict[str, Any]) -> None:
         """Send one finalized response through the bound IPC endpoint."""
-
         if self.ipc_endpoint is None:
             raise RuntimeError("worker has no bound IPC endpoint")
         with profile_range("uniserve.worker.respond"):
             self.ipc_endpoint.respond(response)
 
     def _close_completed_polls(self) -> None:
-        """Close discards unclaimed fragments after their execution safely retires."""
+        """Discard unclaimed fragments on close.
 
+        Discarding happens after their execution safely retires.
+        """
         for run_id, run in tuple(self.inflight.items()):
             if not run.awaiting_poll:
                 continue
@@ -1173,8 +1356,10 @@ class Worker:
                 self._close_batch(run)
 
     def _service_drained(self) -> bool:
-        """Return whether all accepted work and claimed responses have drained."""
+        """Return whether the service has drained.
 
+        Covers all accepted work and claimed responses.
+        """
         return (
             not self._pending_requests
             and not self.pending_responses
@@ -1184,24 +1369,27 @@ class Worker:
 
     @property
     def info(self) -> WorkerInfo:
-        """Expose immutable params, capacity, and model metadata advertised to the scheduler."""
+        """Expose immutable worker info.
 
+        Params, capacity, and model metadata advertised to the scheduler.
+        """
         return self._layout.info
 
     def _require_open(self) -> None:
         """Raise when this worker's resource scope has already been closed."""
-
         if self._closed:
             raise RuntimeError("worker is closed and cannot be reused")
 
-    def submit(self, batch: ScheduleBatch, *, propagate_errors: bool = False) -> BatchState:
-        """Accept one batch and submit available work, retaining its asynchronous state.
+    def submit(
+        self, batch: ScheduleBatch, *, propagate_errors: bool = False
+    ) -> BatchState:
+        """Accept one batch and submit available work.
 
-        Call advance to progress pending inputs, CPU work, and retirement, then
-        poll to consume wire-ready fragments. A run ID remains owned until its
-        final fragment is consumed or the Worker closes.
+        Retains the batch's asynchronous state. Call advance to progress
+        pending inputs, CPU work, and retirement, then poll to consume
+        wire-ready fragments. A run ID remains owned until its final
+        fragment is consumed or the Worker closes.
         """
-
         self._require_open()
         if batch.run_id in self.inflight:
             raise invalid_descriptor("run ID already has an in-flight batch")
@@ -1226,8 +1414,10 @@ class Worker:
         return state
 
     def advance(self) -> None:
-        """Progress physical dependencies and completed outputs on the caller thread."""
+        """Progress pending run state on the caller thread.
 
+        Covers physical dependencies and completed outputs.
+        """
         self._require_open()
         for state in tuple(self.inflight.values()):
             self._advance_execution(state)
@@ -1235,10 +1425,11 @@ class Worker:
 
     def poll(self, state: BatchState) -> BatchOutput | None:
         """Consume one ready response fragment without launching computation."""
-
         self._require_open()
         if self.inflight.get(state.run_id) is not state:
-            raise invalid_descriptor("poll names a batch no longer owned by this Worker")
+            raise invalid_descriptor(
+                "poll names a batch no longer owned by this Worker"
+            )
         if not state.ready():
             return None
 
@@ -1256,8 +1447,10 @@ class Worker:
         return output
 
     def _execute_batch(self, state: BatchState) -> None:
-        """Execute prepared numerical work and retain its physical retirement facts."""
+        """Execute prepared numerical work.
 
+        Retains the work's physical retirement facts.
+        """
         batch = state.batch
         # Cooperative ranks launch computation in the same order. Preparation
         # and host completion may overlap; neither retains old run identities.
@@ -1315,15 +1508,19 @@ class Worker:
 
     def supports_run_kind(self, kind: Computation) -> bool:
         """Return whether this worker can execute one physical run variant."""
-
         return kind in self.info.supported_ops
 
     def _prepare_execution(self, state: BatchState) -> None:
-        """Validate the batch, apply its commands, and prepare its physical inputs."""
+        """Validate the batch and apply its commands.
 
+        Also prepares the batch's physical inputs.
+        """
         batch = state.batch
         validate_batch(
-            batch, worker_info=self.info, model_runner=self.runner, config=self.worker_config
+            batch,
+            worker_info=self.info,
+            model_runner=self.runner,
+            config=self.worker_config,
         )
 
         for command in batch.commands:
@@ -1338,7 +1535,8 @@ class Worker:
                 for operation in batch.operations
                 if operation.predecessor is not None
                 and operation.predecessor.batch_id > 0
-                and (operation.request_key, operation.predecessor) not in consumed
+                and (operation.request_key, operation.predecessor)
+                not in consumed
             )
         )
         self._release_commands(batch)
@@ -1352,8 +1550,10 @@ class Worker:
         self.advance_inputs(state)
 
     def advance_inputs(self, state: BatchState) -> None:
-        """Submit ready physical reads and predicate copies without launching a model."""
+        """Submit ready physical reads and predicate copies.
 
+        Does not launch a model.
+        """
         if state.inputs_closed:
             return
         if state.inputs_submitted:
@@ -1385,18 +1585,27 @@ class Worker:
         capture_predicates(state, self.tensor_store)
 
     def _retire_commands(self, state: BatchState) -> None:
-        """Submit release work and retain the events and futures required by its acknowledgement."""
+        """Submit release work for the batch's commands.
 
+        Retains the events and futures required by its acknowledgement.
+        """
         batch = state.batch
         closed = frozenset(
-            command.request_key for command in batch.commands if isinstance(command, Finish)
+            command.request_key
+            for command in batch.commands
+            if isinstance(command, Finish)
         )
         local_closed = frozenset(
             key
             for key in closed
-            if (row := self.requests.peek(key.request_id)) is not None and row.request_key == key
+            if (row := self.requests.peek(key.request_id)) is not None
+            and row.request_key == key
         )
-        freed = frozenset(command.buffer for command in batch.commands if isinstance(command, Free))
+        freed = frozenset(
+            command.buffer
+            for command in batch.commands
+            if isinstance(command, Free)
+        )
 
         if not closed and not freed:
             state.retirement_cleaned = True
@@ -1431,7 +1640,9 @@ class Worker:
         releases = tuple(
             future
             for store in stores
-            for future in release_exports(store.exports, store.export_releases, selected)
+            for future in release_exports(
+                store.exports, store.export_releases, selected
+            )
         )
 
         if self.latent_pool is not None:
@@ -1452,11 +1663,15 @@ class Worker:
         state.retirement_exports = selected
         state.retirement_releases = releases
         # Finish includes request-state writes issued after output capture.
-        state.retirement_events = self._record_retirement_events() if closed else ()
+        state.retirement_events = (
+            self._record_retirement_events() if closed else ()
+        )
 
     def _record_retirement_events(self) -> tuple[torch.cuda.Event, ...]:
-        """Record one tracked completion event per CUDA device in the buffer pool."""
+        """Record tracked completion events.
 
+        One event per CUDA device in the buffer pool.
+        """
         events = []
         for device in self.buffer_pool.devices:
             if device.type != "cuda":
@@ -1469,8 +1684,10 @@ class Worker:
         return tuple(events)
 
     def _advance_retirement(self, state: BatchState) -> bool:
-        """Reset retired request slots only after every physical reader has finished."""
+        """Reset retired request slots.
 
+        Reset happens only after every physical reader has finished.
+        """
         self.device_events.reap()
         if not all(event.query() for event in state.retirement_events):
             return False
@@ -1486,13 +1703,19 @@ class Worker:
         freed = state.retirement_buffers
         retained = state.retained_buffers
 
-        if any(not self.requests.retirement_ready(key) for key in state.retirement_local_requests):
+        if any(
+            not self.requests.retirement_ready(key)
+            for key in state.retirement_local_requests
+        ):
             return False
         if not self.tensor_store.retirement_ready(
             buffers=freed, requests=closed, retained=retained
         ):
             return False
-        if self.latent_pool is not None and not self.latent_pool.retirement_ready(tuple(closed)):
+        if (
+            self.latent_pool is not None
+            and not self.latent_pool.retirement_ready(tuple(closed))
+        ):
             return False
         if self.kv_cache is not None and not self.kv_cache.retirement_ready(
             buffers=freed, requests=closed, retained=retained
@@ -1505,19 +1728,32 @@ class Worker:
 
         for store in (self.tensor_store, self.kv_cache, self.latent_pool):
             if store is not None:
-                forget_exports(store.exports, store.export_releases, state.retirement_exports)
+                forget_exports(
+                    store.exports,
+                    store.export_releases,
+                    state.retirement_exports,
+                )
         for key in state.retirement_local_requests:
             self.retire_request(key, retained=retained)
 
-        # Slot reset itself submits writes; their completion permits address reuse.
-        state.retirement_events = self._record_retirement_events() if closed else ()
+        # Slot reset itself submits writes; their completion permits
+        # address reuse.
+        state.retirement_events = (
+            self._record_retirement_events() if closed else ()
+        )
         state.retirement_cleaned = True
         return not state.retirement_events
 
     def _close_batch(self, state: BatchState) -> None:
-        """Cancel unresolved acceptance while real CPU and GPU readers retain storage."""
+        """Cancel unresolved acceptance.
 
-        pending = tuple(output for output in state.outputs if isinstance(output, PendingOutput))
+        Real CPU and GPU readers retain storage meanwhile.
+        """
+        pending = tuple(
+            output
+            for output in state.outputs
+            if isinstance(output, PendingOutput)
+        )
         self.requests.cancel_outputs(pending)
         if state.retirement_events:
             self.device_events.defer_release(state.retirement_events, state)
@@ -1525,8 +1761,10 @@ class Worker:
         state.close(self.tensor_store, self.latent_pool, self.kv_cache)
 
     def _execute_prepared(self, state: BatchState) -> None:
-        """Directly execute physical inputs once, releasing their preparation leases."""
+        """Directly execute physical inputs once.
 
+        Releases their preparation leases.
+        """
         self._require_open()
         if state.inputs_closed:
             raise RuntimeError("batch inputs have already been consumed")
@@ -1541,7 +1779,9 @@ class Worker:
             self._execute_batch(state)
         except BaseException as error:
             try:
-                state.close_inputs(self.tensor_store, self.latent_pool, self.kv_cache)
+                state.close_inputs(
+                    self.tensor_store, self.latent_pool, self.kv_cache
+                )
             except BaseException as cleanup_error:
                 error.add_note(f"batch input cleanup failed: {cleanup_error!r}")
             raise
@@ -1553,7 +1793,6 @@ class Worker:
         Successful warmup is retained for run(). The owner must exit the Worker
         scope if startup fails, just as for a binding or service failure.
         """
-
         self._require_open()
         if self._warmed_up:
             return
@@ -1563,18 +1802,23 @@ class Worker:
         warmup_requests(self)
         self.runner.complete_startup()
 
-        # Startup scenarios must release their requests before service admission.
+        # Startup scenarios must release their requests before service
+        # admission.
         if self.requests.request_ids():
             raise RuntimeError("startup completed with resident requests")
         self._last_collective_seq = -1
         check_startup_memory(
-            self.worker_config, self._layout.arena.device_product_bytes, self.tensor_store
+            self.worker_config,
+            self._layout.arena.device_product_bytes,
+            self.tensor_store,
         )
         self._warmed_up = True
 
     def release_buffers(self, buffers: Sequence[BufferId]) -> None:
-        """Revoke new reads immediately; storage owners retain existing readers."""
+        """Revoke new reads immediately.
 
+        Storage owners retain existing readers.
+        """
         self.tensor_store.release_buffers(buffers)
         if self.kv_cache is not None:
             self.kv_cache.release_buffers(buffers)
@@ -1584,17 +1828,25 @@ class Worker:
     def _release_predecessors(
         self, predecessors: tuple[tuple[RequestKey, ComputationId], ...]
     ) -> None:
-        """Revoke predecessor outputs after every declared consumer has acquired them."""
+        """Revoke predecessor outputs.
 
+        Revocation happens after every declared consumer has acquired them.
+        """
         self.tensor_store.release_operations(predecessors)
         if self.kv_cache is not None:
             released = self.kv_cache.release_operations(predecessors)
             self.kv_cache.release_buffers(released)
 
     def _release_commands(self, batch: ScheduleBatch) -> None:
-        """Apply Free/Finish visibility before work can wait for their reusable storage."""
+        """Apply Free/Finish visibility.
 
-        freed = {command.buffer for command in batch.commands if isinstance(command, Free)}
+        Visibility applies before work can wait for their reusable storage.
+        """
+        freed = {
+            command.buffer
+            for command in batch.commands
+            if isinstance(command, Free)
+        }
         closed = {
             command.request_key: frozenset(command.retained_buffers) - freed
             for command in batch.commands
@@ -1607,18 +1859,26 @@ class Worker:
             for store in (self.tensor_store, self.kv_cache, self.latent_pool)
             if store is not None
             for buffer in retiring_exports(
-                store.exports, requests=frozenset((request_key,)), retained=retained | freed
+                store.exports,
+                requests=frozenset((request_key,)),
+                retained=retained | freed,
             )
         )
         self.release_buffers((*freed, *closing))
 
         if self.kv_cache is not None:
             for request_key, retained in closed.items():
-                self.kv_cache.imports.cancel_requests(frozenset((request_key,)), retained=retained)
+                self.kv_cache.imports.cancel_requests(
+                    frozenset((request_key,)), retained=retained
+                )
 
-    def _release_request(self, request_id: int, retained: frozenset[BufferId]) -> None:
-        """Reset a drained request's storage while preserving independently owned products."""
+    def _release_request(
+        self, request_id: int, retained: frozenset[BufferId]
+    ) -> None:
+        """Reset a drained request's storage.
 
+        Independently owned products are preserved.
+        """
         request = self.requests.peek(request_id)
         if request is not None:
             if self.kv_cache is not None:
@@ -1640,12 +1900,15 @@ class Worker:
                 selected = tuple(
                     buffer
                     for buffer in store.exports
-                    if int(buffer.owner.request_id) == request_id and buffer not in retained
+                    if int(buffer.owner.request_id) == request_id
+                    and buffer not in retained
                 )
                 store.release_buffers(selected)
 
         if request is not None:
-            self.tensor_store.release_requests((request.request_key,), retained=retained)
+            self.tensor_store.release_requests(
+                (request.request_key,), retained=retained
+            )
         if self.media_mux is not None:
             self.media_mux.drop(request_id)
         if request is not None and self.latent_pool is not None:
@@ -1653,29 +1916,37 @@ class Worker:
 
     def drop_request(self, request_id: int) -> None:
         """Release a drained request and remove its admission from the pool."""
-
         request_id = int(request_id)
         self._release_request(request_id, frozenset())
         self.requests.drop(request_id)
 
     def retire_request(
-        self, request_key: RequestKey, *, retained: frozenset[BufferId] = frozenset()
+        self,
+        request_key: RequestKey,
+        *,
+        retained: frozenset[BufferId] = frozenset(),
     ) -> None:
-        """Retire the exact epoch after readers drain, retaining independent products."""
+        """Retire the exact epoch after readers drain.
 
+        Independent products are retained.
+        """
         request = self.requests.peek(request_key.request_id)
-        if request is None or request.request_key != request_key or request.retired:
+        if (
+            request is None
+            or request.request_key != request_key
+            or request.retired
+        ):
             return
         self._release_request(request_key.request_id, retained)
         self.requests.retire(request_key.request_id)
 
     def close(self) -> None:
-        """Idempotently drain and release owned resources; never close the borrowed IPC endpoint.
+        """Idempotently drain and release owned resources.
 
-        Every owner is given a chance to release even if another release fails.
-        Direct execution and service startup are both forbidden after closing.
+        Never closes the borrowed IPC endpoint. Every owner is given a
+        chance to release even if another release fails. Direct execution
+        and service startup are both forbidden after closing.
         """
-
         if self._closed:
             return
 
@@ -1694,11 +1965,14 @@ class Worker:
         # Stop imports and transports before releasing the storage they borrow.
         if self.kv_cache is not None:
             actions.append(self.kv_cache.imports.stop)
-        actions.extend(transport.close for transport in self.transports.values())
+        actions.extend(
+            transport.close for transport in self.transports.values()
+        )
 
         actions.append(self.output_pool.close)
-        # Producers and consumers have drained; destroy captured executables
-        # before releasing the cache, latent, and product backing they reference.
+        # Producers and consumers have drained; destroy captured
+        # executables before releasing the cache, latent, and product
+        # backing they reference.
         actions.append(self.runner.close_graphs)
         if self.kv_cache is not None:
             actions.append(self.kv_cache.close)
@@ -1751,10 +2025,17 @@ class Worker:
             )
 
     def _release_service_runs(self) -> None:
-        """Release in-flight preparations and outputs before their runtime owners close."""
+        """Release in-flight preparations and outputs.
 
+        Release happens before their runtime owners close.
+        """
         try:
-            close_resources(*(partial(self._close_batch, run) for run in self.inflight.values()))
+            close_resources(
+                *(
+                    partial(self._close_batch, run)
+                    for run in self.inflight.values()
+                )
+            )
         finally:
             self.inflight.clear()
             self._run_submissions.clear()
@@ -1775,8 +2056,10 @@ class Worker:
         wake: Callable[[], None] | None,
         wake_on_stream: Callable[[int], None] | None,
     ) -> None:
-        """Register host and CUDA-stream callbacks used to wake result polling."""
+        """Register callbacks used to wake result polling.
 
+        Covers host and CUDA-stream callbacks.
+        """
         self._completion_wake = wake
         self.device_events.set_completion_wake(wake_on_stream)
         self.cpu_tasks.set_completion_wake(wake)

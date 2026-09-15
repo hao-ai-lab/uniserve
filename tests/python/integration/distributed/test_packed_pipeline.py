@@ -1,4 +1,7 @@
-"""Multimodal capabilities preserve sequence partitions and shared prefix values."""
+"""Multimodal capabilities preserve sequence partitions.
+
+They also preserve shared prefix values.
+"""
 
 from contextlib import ExitStack
 
@@ -6,8 +9,12 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from tests.python.integration.model_loading.test_bagel import _checkpoint as bagel_checkpoint
-from tests.python.integration.model_loading.test_sensenova_u1 import _checkpoint as u1_checkpoint
+from tests.python.integration.model_loading.test_bagel import (
+    _checkpoint as bagel_checkpoint,
+)
+from tests.python.integration.model_loading.test_sensenova_u1 import (
+    _checkpoint as u1_checkpoint,
+)
 from uniserve import loading
 from uniserve.distributed import DeviceMesh
 from uniserve.loading import checkpoint, weights
@@ -20,7 +27,11 @@ from uniserve.nn.attention import (
     Ulysses,
     VarlenInput,
 )
-from uniserve.runtime import ExecutionContext, PrefixCache, initialize_process_groups
+from uniserve.runtime import (
+    ExecutionContext,
+    PrefixCache,
+    initialize_process_groups,
+)
 from uniserve_models import bagel, sensenova_u1
 from uniserve_worker.bootstrap.inputs import image_builder
 
@@ -33,23 +44,32 @@ def _load(root, architecture, config, *, mesh=None, attention=None):
     return loading.load_model(
         package.Model,
         config,
-        checkpoint=(checkpoint.Config("primary").resolve(root, io=loading.Config()),),
+        checkpoint=(
+            checkpoint.Config("primary").resolve(root, io=loading.Config()),
+        ),
         mapping=package.checkpoint_mappings,
         device="cpu",
         weights=weights.Config(),
         modules=frozenset(paths),
-        meshes=None if mesh is None else {path: mesh for path in paths},
-        attention=None if attention is None else {path: attention for path in paths},
+        meshes=None if mesh is None else dict.fromkeys(paths, mesh),
+        attention=None
+        if attention is None
+        else dict.fromkeys(paths, attention),
     ).model
 
 
 @torch.inference_mode()
 def _run(rank, rendezvous, root, architecture, config, shape, axes):
     with initialize_process_groups(
-        rank=rank, local_rank=rank, world_size=4, device="cpu", init_method=rendezvous
+        rank=rank,
+        local_rank=rank,
+        world_size=4,
+        device="cpu",
+        init_method=rendezvous,
     ) as groups:
         mesh = groups.bind(
-            DeviceMesh(ranks=(3, 1, 0, 2), shape=shape, axes=axes, rank=rank), device="cpu"
+            DeviceMesh(ranks=(3, 1, 0, 2), shape=shape, axes=axes, rank=rank),
+            device="cpu",
         )
         parallel = (
             AttentionParallelConfig(heads=Ulysses("tokens"))
@@ -64,12 +84,19 @@ def _run(rank, rendezvous, root, architecture, config, shape, axes):
         with ExitStack() as scope:
             caches = [
                 scope.enter_context(
-                    PrefixCache(item.text.cache_config, num_blocks=2, block_size=4, device="cpu")
+                    PrefixCache(
+                        item.text.cache_config,
+                        num_blocks=2,
+                        block_size=4,
+                        device="cpu",
+                    )
                 )
                 for item in (reference, model)
             ]
             contexts = [
-                scope.enter_context(ExecutionContext(item.text, cache=cache, attention="torch"))
+                scope.enter_context(
+                    ExecutionContext(item.text, cache=cache, attention="torch")
+                )
                 for item, cache in zip((reference, model), caches, strict=True)
             ]
             for context in contexts:
@@ -88,39 +115,61 @@ def _run(rank, rendezvous, root, architecture, config, shape, axes):
                     device="cpu",
                 )
                 inputs = TextInput(
-                    torch.tensor(tokens), torch.tensor(positions).expand(3, -1), batch
+                    torch.tensor(tokens),
+                    torch.tensor(positions).expand(3, -1),
+                    batch,
                 )
                 outputs = []
-                for item, context in zip((reference, model), contexts, strict=True):
+                for item, context in zip(
+                    (reference, model), contexts, strict=True
+                ):
                     with context.activate():
                         context.bind_attention(batch)
                         hidden = item.text(inputs)
                         result = item.text.compute_logits(
                             hidden, token_indices=torch.arange(len(tokens))
                         )
-                        outputs.append(None if result is None else result.gather())
+                        outputs.append(
+                            None if result is None else result.gather()
+                        )
                 if last:
-                    torch.testing.assert_close(outputs[1], outputs[0], rtol=2e-2, atol=2e-2)
+                    torch.testing.assert_close(
+                        outputs[1], outputs[0], rtol=2e-2, atol=2e-2
+                    )
                 else:
                     assert outputs[1] is None
                 prefixes = tuple(
-                    prefix + query for prefix, query in zip(prefixes, queries, strict=True)
+                    prefix + query
+                    for prefix, query in zip(prefixes, queries, strict=True)
                 )
             for name, layout in model.text.cache_config.layers.items():
                 for block, length in enumerate(prefixes):
-                    actual = caches[1].state(name).read((block,), start=0, length=length)
-                    full = caches[0].state(name).read((block,), start=0, length=length)
+                    actual = (
+                        caches[1]
+                        .state(name)
+                        .read((block,), start=0, length=length)
+                    )
+                    full = (
+                        caches[0]
+                        .state(name)
+                        .read((block,), start=0, length=length)
+                    )
                     heads = torch.tensor(layout.head_indices)
                     for value, expected in zip(actual, full, strict=True):
                         torch.testing.assert_close(
-                            value, expected.index_select(1, heads), rtol=2e-2, atol=2e-2
+                            value,
+                            expected.index_select(1, heads),
+                            rtol=2e-2,
+                            atol=2e-2,
                         )
 
         # Diffusion remains a separate homogeneous numerical call, including
         # BAGEL's text-expert markers within its mathematical image layout.
         size = image.Config(8, 8)
         factory = image_builder(reference)
-        sample = torch.empty(reference.denoiser.latent_shape("image", size), dtype=torch.bfloat16)
+        sample = torch.empty(
+            reference.denoiser.latent_shape("image", size), dtype=torch.bfloat16
+        )
         factory.initialize(size, seed=71, out=sample)
         positions = factory.positions(size, 9, device="cpu")
         count = positions.shape[-1]
@@ -141,10 +190,14 @@ def _run(rank, rendezvous, root, architecture, config, shape, axes):
                 context.prepare(TextSize(count, 1))
                 context.bind_attention(attention)
                 outputs.append(
-                    item.denoiser(inputs, state={}, constants={}, workspace={})["image"][0]
+                    item.denoiser(inputs, state={}, constants={}, workspace={})[
+                        "image"
+                    ][0]
                 )
         if last:
-            torch.testing.assert_close(outputs[1].tensor, outputs[0].tensor, rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(
+                outputs[1].tensor, outputs[0].tensor, rtol=2e-2, atol=2e-2
+            )
         else:
             assert outputs[1] is None
         torch.testing.assert_close(sample, before, rtol=0, atol=0)
@@ -152,7 +205,8 @@ def _run(rank, rendezvous, root, architecture, config, shape, axes):
 
 @pytest.mark.parametrize("architecture", ("bagel", "sensenova_u1"))
 @pytest.mark.parametrize(
-    "shape,axes", (((4,), ("tp",)), ((2, 2), ("pp", "tokens")), ((2, 2), ("tp", "tokens")))
+    "shape,axes",
+    (((4,), ("tp",)), ((2, 2), ("pp", "tokens")), ((2, 2), ("tp", "tokens"))),
 )
 def test_partitioned_multimodal_calls_preserve_logits_prefix_and_image_values(
     tmp_path, architecture, shape, axes
@@ -164,7 +218,14 @@ def test_partitioned_multimodal_calls_preserve_logits_prefix_and_image_values(
         config = reference.config
     mp.spawn(
         _run,
-        args=((tmp_path / "multimodal").as_uri(), tmp_path, architecture, config, shape, axes),
+        args=(
+            (tmp_path / "multimodal").as_uri(),
+            tmp_path,
+            architecture,
+            config,
+            shape,
+            axes,
+        ),
         nprocs=4,
         join=True,
     )

@@ -12,7 +12,6 @@ from typing import Any
 
 def _read_gpu_rows() -> list[dict[str, int]]:
     """Read one numeric telemetry row per GPU from nvidia-smi."""
-
     out = subprocess.run(
         [
             "nvidia-smi",
@@ -45,7 +44,7 @@ def _read_gpu_rows() -> list[dict[str, int]]:
 
 @dataclass
 class GpuMemorySampler:
-    """Collects periodic GPU telemetry and aggregate peaks on a background thread."""
+    """Collects periodic GPU telemetry and aggregate peaks on a background thread."""  # noqa: E501
 
     interval_s: float = 0.5
     peak_per_gpu_mib: list[int] = field(default_factory=list)
@@ -60,12 +59,10 @@ class GpuMemorySampler:
     @property
     def available(self) -> bool:
         """Report whether the nvidia-smi executable is available."""
-
         return shutil.which("nvidia-smi") is not None
 
     def start(self) -> None:
         """Start background sampling when NVIDIA telemetry is available."""
-
         if not self.available:
             return
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -73,7 +70,6 @@ class GpuMemorySampler:
 
     def stop(self) -> None:
         """Stop sampling and join the background thread."""
-
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=15)
@@ -81,7 +77,6 @@ class GpuMemorySampler:
 
     def _sample_once(self) -> None:
         """Record one telemetry snapshot and update aggregate peaks."""
-
         try:
             rows = _read_gpu_rows()
         except Exception:
@@ -91,13 +86,17 @@ class GpuMemorySampler:
         used = [row["memory_used_mib"] for row in rows]
         util = [row["utilization_gpu_pct"] for row in rows]
         if len(self.peak_per_gpu_mib) < len(used):
-            self.peak_per_gpu_mib.extend([0] * (len(used) - len(self.peak_per_gpu_mib)))
+            self.peak_per_gpu_mib.extend(
+                [0] * (len(used) - len(self.peak_per_gpu_mib))
+            )
         if len(self.peak_utilization_gpu_pct) < len(util):
             self.peak_utilization_gpu_pct.extend(
                 [0] * (len(util) - len(self.peak_utilization_gpu_pct))
             )
         for index, value in enumerate(used):
-            self.peak_per_gpu_mib[index] = max(self.peak_per_gpu_mib[index], value)
+            self.peak_per_gpu_mib[index] = max(
+                self.peak_per_gpu_mib[index], value
+            )
         for index, value in enumerate(util):
             self.peak_utilization_gpu_pct[index] = max(
                 self.peak_utilization_gpu_pct[index],
@@ -110,14 +109,12 @@ class GpuMemorySampler:
 
     def _loop(self) -> None:
         """Sample immediately and then at the configured interval."""
-
         self._sample_once()
         while not self._stop.wait(self.interval_s):
             self._sample_once()
 
     def summary(self) -> dict[str, Any] | None:
         """Return aggregate telemetry, or ``None`` when no sample succeeded."""
-
         if self.samples == 0:
             return None
         return {
@@ -125,7 +122,8 @@ class GpuMemorySampler:
             "peak_total_mib": int(self.peak_total_mib),
             "peak_single_gpu_mib": max(self.peak_per_gpu_mib, default=0),
             "peak_utilization_gpu_pct": list(self.peak_utilization_gpu_pct),
-            "mean_total_utilization_gpu_pct": self.utilization_total_pct / self.samples,
+            "mean_total_utilization_gpu_pct": self.utilization_total_pct
+            / self.samples,
             "samples": int(self.samples),
             "interval_s": self.interval_s,
         }

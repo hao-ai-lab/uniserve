@@ -1,4 +1,7 @@
-"""Numerical sampling inputs and GPU output views shared by eager and graph execution."""
+"""Numerical sampling inputs and GPU output views shared by eager and graph.
+
+execution.
+"""
 
 from __future__ import annotations
 
@@ -20,9 +23,15 @@ TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 
 # Packed integer bit patterns and row dimensions are enough to decode logprobs.
-# The tensor stays on the producing device; the output owner performs any D2H copy.
+# The tensor stays on the producing device; the output owner performs any D2H
+# copy.
 LogprobValues: TypeAlias = tuple[
-    torch.Tensor, tuple[int, ...], tuple[int, ...], tuple[tuple[int, ...], ...], int, int
+    torch.Tensor,
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[tuple[int, ...], ...],
+    int,
+    int,
 ]
 
 
@@ -65,7 +74,9 @@ class SamplingMetadata:
 
 @dataclass(frozen=True, slots=True)
 class SamplerOutput:
-    """Numerical selections with shared completion storage and optional logprob columns.
+    """Numerical selections with shared completion storage and optional logprob.
+
+    columns.
 
     Row selections retain this complete batch so device and host publication
     can consume its columns without splitting and reconstructing tensor views.
@@ -90,14 +101,19 @@ class SamplerOutput:
         request_pool_index: torch.Tensor | None = None,
         transition: torch.Tensor | None = None,
     ) -> SamplerRow:
-        """Associate one selection with its input slot and optional transition payload."""
+        """Associate one selection with its input slot and optional transition.
 
+        payload.
+        """
         if not 0 <= index < self.tokens.numel():
             raise IndexError("sampling row is outside the batch")
         return SamplerRow(self, index, request_pool_index, transition)
 
     def clone(self) -> SamplerOutput:
-        """Copy numerical outputs before reusable graph storage is overwritten."""
+        """Copy numerical outputs before reusable graph storage is.
+
+        overwritten.
+        """
 
         def copy(value: torch.Tensor | None) -> torch.Tensor | None:
             return None if value is None else value.detach().clone()
@@ -160,19 +176,23 @@ class SamplerRow:
         return None if values is None else values[self.index : self.index + 1]
 
 
-SampleColumn = Literal["tokens", "valid", "active", "continuation", "tagged_tokens"]
+SampleColumn = Literal[
+    "tokens", "valid", "active", "continuation", "tagged_tokens"
+]
 
 
 def sample_columns(
     rows: Sequence[SamplerRow], names: tuple[SampleColumn, ...]
 ) -> tuple[torch.Tensor, ...]:
-    """Read aligned columns in operation order, retaining contiguous batch spans.
+    """Read aligned columns in operation order.
+
+    retaining contiguous batch spans.
 
     A completion group may select reordered rows or combine independent sampling
-    batches. Only those discontinuities require concatenation; no storage-address
-    inspection or per-row tensor construction is needed for a contiguous span.
+    batches. Only those discontinuities require concatenation; no
+    storage-address inspection or per-row tensor construction is needed for a
+    contiguous span.
     """
-
     if not rows:
         raise ValueError("sampling columns require at least one row")
     spans: list[tuple[SamplerOutput, int, int]] = []
@@ -192,6 +212,10 @@ def sample_columns(
         parts = []
         for batch, start, end in spans:
             values = getattr(batch, name)
-            parts.append(values if start == 0 and end == values.numel() else values[start:end])
+            parts.append(
+                values
+                if start == 0 and end == values.numel()
+                else values[start:end]
+            )
         columns.append(parts[0] if len(parts) == 1 else torch.cat(parts, dim=0))
     return tuple(columns)

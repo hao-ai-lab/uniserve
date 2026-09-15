@@ -7,13 +7,15 @@ import sqlite3
 from array import array
 from bisect import bisect_right
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 _PROCESS_SHIFT = 24
 _FIELD = re.compile(r"(?:^|\s)(step|partition|request|op|work|rank)=([^\s]+)")
 _INVALID_CAPTURE = re.compile(
-    r"(?:events? (?:were )?dropped|buffer overflow|trace data is incomplete|collection was truncated)",
+    r"(?:events? (?:were )?dropped|buffer overflow|"
+    r"trace data is incomplete|collection was truncated)",
     re.IGNORECASE,
 )
 
@@ -30,7 +32,6 @@ def transform_timeline(
     NVTX containment supplies request and operation identity, while CUDA
     correlation records connect host API intervals to device activity.
     """
-
     source = Path(source)
     destination = Path(destination)
     if destination.exists():
@@ -70,7 +71,9 @@ def transform_timeline(
                 process_name=process_name,
                 rank=fields.get("rank"),
                 global_tid=global_tid,
-                thread_name=threads.get(global_tid) if global_tid is not None else None,
+                thread_name=threads.get(global_tid)
+                if global_tid is not None
+                else None,
                 start_ns=start,
                 end_ns=end,
                 name=text.split(maxsplit=1)[0] if text else "nvtx",
@@ -100,14 +103,16 @@ def transform_timeline(
 
         _enrich_nvtx(out, ranges_by_thread)
         thread_ranges = {
-            identity: _RangeIndex(ranges) for identity, ranges in ranges_by_thread.items()
+            identity: _RangeIndex(ranges)
+            for identity, ranges in ranges_by_thread.items()
         }
         process_ranges = {
-            identity: _RangeIndex(ranges) for identity, ranges in ranges_by_process.items()
+            identity: _RangeIndex(ranges)
+            for identity, ranges in ranges_by_process.items()
         }
 
-        # Runtime calls provide both CPU-side containment and the correlation keys
-        # carried by device activity records.
+        # Runtime calls provide both CPU-side containment and the
+        # correlation keys carried by device activity records.
         runtime_ids: dict[tuple[int, int], int] = {}
         for row in (
             _rows(raw, "CUPTI_ACTIVITY_KIND_RUNTIME")
@@ -117,7 +122,9 @@ def transform_timeline(
             start, end = _interval(row)
             global_tid = _optional_integer(row, "globalTid")
             global_pid, pid, process_name = _process_identity(row, processes)
-            parent = _containing(thread_ranges.get(global_tid or -1), start, end)
+            parent = _containing(
+                thread_ranges.get(global_tid or -1), start, end
+            )
             inherited = _inherited(parent)
             correlation_id = _optional_integer(row, "correlationId")
             event_id = _insert_event(
@@ -127,7 +134,9 @@ def transform_timeline(
                 process_id=pid,
                 process_name=process_name,
                 global_tid=global_tid,
-                thread_name=threads.get(global_tid) if global_tid is not None else None,
+                thread_name=threads.get(global_tid)
+                if global_tid is not None
+                else None,
                 start_ns=start,
                 end_ns=end,
                 correlation_id=correlation_id,
@@ -137,11 +146,14 @@ def transform_timeline(
             )
             _link_parent(out, parent, event_id)
             if global_pid is not None and correlation_id is not None:
-                correlation[(global_pid, correlation_id)] = (event_id, inherited)
+                correlation[(global_pid, correlation_id)] = (
+                    event_id,
+                    inherited,
+                )
                 runtime_ids[(global_pid, correlation_id)] = event_id
 
-        # Standard GPU tables share correlation, process identity, and device-idle
-        # accounting, so they pass through one insertion path.
+        # Standard GPU tables share correlation, process identity, and
+        # device-idle accounting, so they pass through one insertion path.
         standard = {
             "NVTX_EVENTS",
             "CUPTI_ACTIVITY_KIND_RUNTIME",
@@ -205,8 +217,12 @@ def transform_timeline(
             for row in _rows(raw, "OSRT_API"):
                 start, end = _interval(row)
                 global_tid = _optional_integer(row, "globalTid")
-                global_pid, pid, process_name = _process_identity(row, processes)
-                parent = _containing(thread_ranges.get(global_tid or -1), start, end)
+                global_pid, pid, process_name = _process_identity(
+                    row, processes
+                )
+                parent = _containing(
+                    thread_ranges.get(global_tid or -1), start, end
+                )
                 event_id = _insert_event(
                     out,
                     point_name=point_name,
@@ -214,7 +230,9 @@ def transform_timeline(
                     process_id=pid,
                     process_name=process_name,
                     global_tid=global_tid,
-                    thread_name=threads.get(global_tid) if global_tid is not None else None,
+                    thread_name=threads.get(global_tid)
+                    if global_tid is not None
+                    else None,
                     start_ns=start,
                     end_ns=end,
                     name=_name(row, strings, "nameId", fallback="osrt"),
@@ -223,8 +241,8 @@ def transform_timeline(
                 )
                 _link_parent(out, parent, event_id)
 
-        # Optional exporter tables are retained when their intervals can be mapped
-        # into a stable semantic category.
+        # Optional exporter tables are retained when their intervals can be
+        # mapped into a stable semantic category.
         for table in sorted(set(tables) - standard):
             upper = table.upper()
             columns = tables[table]
@@ -255,8 +273,9 @@ def transform_timeline(
                 gpu_intervals,
             )
 
-        # Capture validity is established before the completion marker is committed;
-        # consumers therefore never treat an incomplete transform as canonical.
+        # Capture validity is established before the completion marker is
+        # committed; consumers therefore never treat an incomplete transform
+        # as canonical.
         _insert_gpu_idle(out, point_name, gpu_intervals)
         _copy_diagnostics(raw, out, tables, strings, processes)
         _copy_metadata(raw, out, tables, point_name, source)
@@ -271,16 +290,21 @@ def transform_timeline(
             (_INVALID_CAPTURE.pattern,),
         ).fetchone()
         if invalid is not None:
-            raise RuntimeError(f"nsys reported an incomplete capture: {invalid[0]}")
-        out.execute("INSERT INTO metadata(key, value) VALUES('status', 'complete')")
+            raise RuntimeError(
+                f"nsys reported an incomplete capture: {invalid[0]}"
+            )
+        out.execute(
+            "INSERT INTO metadata(key, value) VALUES('status', 'complete')"
+        )
         out.commit()
 
 
 def _create_schema(db: sqlite3.Connection) -> None:
     """Create the normalized event, link, diagnostic, and metadata tables."""
-
     db.create_function(
-        "REGEXP", 2, lambda pattern, value: bool(re.search(pattern, value or "", re.I))
+        "REGEXP",
+        2,
+        lambda pattern, value: bool(re.search(pattern, value or "", re.I)),
     )
     db.executescript(
         """
@@ -332,12 +356,12 @@ def _create_schema(db: sqlite3.Connection) -> None:
 
 def _create_indexes(db: sqlite3.Connection) -> None:
     """Index the lookup dimensions used for timeline analysis."""
-
     db.executescript(
         """
         CREATE INDEX events_time ON events(start_ns, end_ns);
         CREATE INDEX events_gpu ON events(device_id, stream_id, start_ns);
-        CREATE INDEX events_operation ON events(request_id, operation_id, start_ns);
+        CREATE INDEX events_operation
+            ON events(request_id, operation_id, start_ns);
         CREATE INDEX events_correlation ON events(process_id, correlation_id);
         """
     )
@@ -356,7 +380,6 @@ def _insert_gpu_table(
     gpu_intervals: dict[int, list[tuple[int, int]]],
 ) -> None:
     """Normalize a standard CUPTI device-activity table into events."""
-
     if table not in tables:
         return
 
@@ -388,9 +411,13 @@ def _insert_gpu_table(
                 fallback="cuda_kernel",
             )
         elif category == "memcpy":
-            name = enum_copy.get(_optional_integer(row, "copyKind") or -1, "memcpy")
+            name = enum_copy.get(
+                _optional_integer(row, "copyKind") or -1, "memcpy"
+            )
         elif category == "cuda_sync":
-            name = enum_sync.get(_optional_integer(row, "syncType") or -1, "cuda_sync")
+            name = enum_sync.get(
+                _optional_integer(row, "syncType") or -1, "cuda_sync"
+            )
         else:
             name = category
 
@@ -441,7 +468,6 @@ def _insert_generic_table(
     gpu_intervals: dict[int, list[tuple[int, int]]],
 ) -> None:
     """Normalize a supported auxiliary interval table and its relationships."""
-
     for row in _rows(raw, table):
         # Prefer thread containment, then process containment, for activities
         # that do not carry a CUDA runtime correlation identifier.
@@ -468,7 +494,9 @@ def _insert_generic_table(
             process_id=pid,
             process_name=process_name,
             global_tid=global_tid,
-            thread_name=threads.get(global_tid) if global_tid is not None else None,
+            thread_name=threads.get(global_tid)
+            if global_tid is not None
+            else None,
             device_id=device,
             stream_id=_optional_integer(row, "streamId"),
             start_ns=start,
@@ -493,7 +521,11 @@ def _insert_generic_table(
         else:
             _link_parent(out, parent, event_id)
 
-        if device is not None and category in {"cuda_graph", "nccl", "cuda_activity"}:
+        if device is not None and category in {
+            "cuda_graph",
+            "nccl",
+            "cuda_activity",
+        }:
             gpu_intervals[device].append((start, end))
 
 
@@ -503,7 +535,6 @@ def _insert_gpu_idle(
     gpu_intervals: dict[int, list[tuple[int, int]]],
 ) -> None:
     """Derive idle gaps between merged device activity intervals."""
-
     for device, intervals in gpu_intervals.items():
         merged: list[list[int]] = []
         for start, end in sorted(intervals):
@@ -533,8 +564,7 @@ def _copy_diagnostics(
     strings: dict[int, str],
     processes: dict[int, tuple[int, str]],
 ) -> None:
-    """Copy profiler diagnostics with normalized severity and process identity."""
-
+    """Copy profiler diagnostics with normalized severity and process identity."""  # noqa: E501
     if "DIAGNOSTIC_EVENT" not in tables:
         return
     severity = _enum(raw, "ENUM_DIAGNOSTIC_SEVERITY_LEVEL")
@@ -545,7 +575,9 @@ def _copy_diagnostics(
             "INSERT INTO diagnostics VALUES(?, ?, ?, ?, ?)",
             (
                 _integer(row, "timestamp"),
-                severity.get(_optional_integer(row, "severity") or 0, "Unknown"),
+                severity.get(
+                    _optional_integer(row, "severity") or 0, "Unknown"
+                ),
                 sources.get(_optional_integer(row, "source") or 0, "Unknown"),
                 pid,
                 _name(row, strings, "text", fallback=""),
@@ -561,19 +593,19 @@ def _copy_metadata(
     source: Path,
 ) -> None:
     """Copy capture and export metadata plus benchmark source identity."""
-
     values = {"point_name": point_name, "source_sqlite": source.name}
     for table in ("META_DATA_CAPTURE", "META_DATA_EXPORT"):
         if table not in tables:
             continue
         for row in _rows(raw, table):
             values[f"{table.lower()}.{row['name']}"] = str(row["value"])
-    out.executemany("INSERT INTO metadata(key, value) VALUES(?, ?)", sorted(values.items()))
+    out.executemany(
+        "INSERT INTO metadata(key, value) VALUES(?, ?)", sorted(values.items())
+    )
 
 
 def _insert_event(db: sqlite3.Connection, **values: Any) -> int:
     """Insert one normalized interval and return its generated identifier."""
-
     columns = (
         "point_name",
         "category",
@@ -614,20 +646,24 @@ def _insert_event(db: sqlite3.Connection, **values: Any) -> int:
         (*row, end - start),
     )
     event_id = cursor.lastrowid
-    assert event_id is not None, "event insertion must publish its SQLite row identity"
+    assert event_id is not None, (
+        "event insertion must publish its SQLite row identity"
+    )
     return event_id
 
 
-def _link_parent(db: sqlite3.Connection, parent: dict[str, Any] | None, child: int) -> None:
+def _link_parent(
+    db: sqlite3.Connection, parent: dict[str, Any] | None, child: int
+) -> None:
     """Link an event to an optional containing NVTX range."""
-
     if parent is not None:
         _link(db, int(parent["event_id"]), child, "nvtx_contains")
 
 
-def _link(db: sqlite3.Connection, parent: int, child: int, relation: str) -> None:
+def _link(
+    db: sqlite3.Connection, parent: int, child: int, relation: str
+) -> None:
     """Insert an idempotent directed relationship between events."""
-
     db.execute(
         "INSERT OR IGNORE INTO event_links VALUES(?, ?, ?)",
         (parent, child, relation),
@@ -636,7 +672,6 @@ def _link(db: sqlite3.Connection, parent: int, child: int, relation: str) -> Non
 
 def _inherited(parent: dict[str, Any] | None) -> dict[str, Any]:
     """Extract operation identity inherited from a containing range."""
-
     if parent is None:
         return {}
     return {
@@ -654,7 +689,6 @@ def _enrich_nvtx(
     ranges_by_thread: dict[int, list[dict[str, Any]]],
 ) -> None:
     """Propagate identity through nested NVTX ranges and record containment."""
-
     fields = ("rank", "request", "step", "partition", "op", "work")
     columns = {
         "rank": "rank",
@@ -672,27 +706,43 @@ def _enrich_nvtx(
         stack: list[dict[str, Any]] = []
         for item in ordered:
             while stack and not (
-                stack[-1]["start"] <= item["start"] and stack[-1]["end"] >= item["end"]
+                stack[-1]["start"] <= item["start"]
+                and stack[-1]["end"] >= item["end"]
             ):
                 stack.pop()
             parent = stack[-1] if stack else None
             inherited = (
-                {name: parent.get(name) for name in fields if parent.get(name) is not None}
+                {
+                    name: parent.get(name)
+                    for name in fields
+                    if parent.get(name) is not None
+                }
                 if parent is not None
                 else {}
             )
             inherited.update(
-                {name: item.get(name) for name in fields if item.get(name) is not None}
+                {
+                    name: item.get(name)
+                    for name in fields
+                    if item.get(name) is not None
+                }
             )
             item.update(inherited)
             if inherited:
-                assignments = ", ".join(f"{columns[name]} = ?" for name in inherited)
+                assignments = ", ".join(
+                    f"{columns[name]} = ?" for name in inherited
+                )
                 db.execute(
                     f"UPDATE events SET {assignments} WHERE event_id = ?",
                     (*inherited.values(), item["event_id"]),
                 )
             if parent is not None:
-                _link(db, int(parent["event_id"]), int(item["event_id"]), "nvtx_contains")
+                _link(
+                    db,
+                    int(parent["event_id"]),
+                    int(item["event_id"]),
+                    "nvtx_contains",
+                )
             stack.append(item)
 
 
@@ -701,7 +751,6 @@ class _RangeIndex:
 
     def __init__(self, ranges: Iterable[dict[str, Any]]) -> None:
         """Build a max-end segment tree over start-ordered ranges."""
-
         self.items = sorted(
             ranges,
             key=lambda item: (item["start"], -item["end"], item["event_id"]),
@@ -715,14 +764,17 @@ class _RangeIndex:
         for index, item in enumerate(self.items):
             self.max_end[size + index] = int(item["end"])
         for index in range(size - 1, 0, -1):
-            self.max_end[index] = max(self.max_end[index * 2], self.max_end[index * 2 + 1])
+            self.max_end[index] = max(
+                self.max_end[index * 2], self.max_end[index * 2 + 1]
+            )
 
     def containing(self, start: int, end: int) -> dict[str, Any] | None:
         """Return the latest-starting range that contains an interval."""
-
         limit = bisect_right(self.starts, int(start))
         index = self._rightmost(1, 0, self.size, limit, int(end))
-        return None if index < 0 or index >= len(self.items) else self.items[index]
+        return (
+            None if index < 0 or index >= len(self.items) else self.items[index]
+        )
 
     def _rightmost(
         self,
@@ -733,33 +785,33 @@ class _RangeIndex:
         minimum_end: int,
     ) -> int:
         """Find the rightmost eligible leaf within a start-index limit."""
-
         if left >= limit or self.max_end[node] < minimum_end:
             return -1
         if right - left == 1:
             return left
         midpoint = (left + right) // 2
-        selected = self._rightmost(node * 2 + 1, midpoint, right, limit, minimum_end)
+        selected = self._rightmost(
+            node * 2 + 1, midpoint, right, limit, minimum_end
+        )
         if selected >= 0:
             return selected
         return self._rightmost(node * 2, left, midpoint, limit, minimum_end)
 
 
-def _containing(ranges: _RangeIndex | None, start: int, end: int) -> dict[str, Any] | None:
+def _containing(
+    ranges: _RangeIndex | None, start: int, end: int
+) -> dict[str, Any] | None:
     """Query an optional range index for an interval container."""
-
     return None if ranges is None else ranges.containing(start, end)
 
 
 def _fields(text: str) -> dict[str, str]:
     """Extract structured identity fields embedded in NVTX text."""
-
     return dict(_FIELD.findall(text))
 
 
 def _nvtx_category(text: str, marker: bool) -> str:
     """Classify an NVTX record by semantic category and interval shape."""
-
     lower = text.lower()
     if "nccl" in lower:
         return "nccl"
@@ -770,36 +822,42 @@ def _nvtx_category(text: str, marker: bool) -> str:
 
 def _tables(db: sqlite3.Connection) -> dict[str, set[str]]:
     """Return every table name and its column set."""
-
-    names = [row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    names = [
+        row[0]
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    ]
     return {
-        name: {row[1] for row in db.execute(f"PRAGMA table_info({_quote(name)})")} for name in names
+        name: {
+            row[1] for row in db.execute(f"PRAGMA table_info({_quote(name)})")
+        }
+        for name in names
     }
 
 
 def _rows(db: sqlite3.Connection, table: str) -> Iterable[sqlite3.Row]:
     """Iterate all rows from a safely quoted table."""
-
     return db.execute(f"SELECT * FROM {_quote(table)}")
 
 
 def _quote(identifier: str) -> str:
     """Quote a SQLite identifier and escape embedded quotes."""
-
     return '"' + identifier.replace('"', '""') + '"'
 
 
 def _string_ids(db: sqlite3.Connection) -> dict[int, str]:
     """Load the profiler string interning table when present."""
-
     if "StringIds" not in _tables(db):
         return {}
-    return {int(row[0]): str(row[1]) for row in db.execute("SELECT id, value FROM StringIds")}
+    return {
+        int(row[0]): str(row[1])
+        for row in db.execute("SELECT id, value FROM StringIds")
+    }
 
 
 def _processes(db: sqlite3.Connection) -> dict[int, tuple[int, str]]:
     """Map global process identifiers to local identifiers and names."""
-
     if "PROCESSES" not in _tables(db):
         return {}
     return {
@@ -808,20 +866,22 @@ def _processes(db: sqlite3.Connection) -> dict[int, tuple[int, str]]:
     }
 
 
-def _thread_names(db: sqlite3.Connection, strings: dict[int, str]) -> dict[int, str]:
+def _thread_names(
+    db: sqlite3.Connection, strings: dict[int, str]
+) -> dict[int, str]:
     """Map global thread identifiers to resolved names."""
-
     if "ThreadNames" not in _tables(db):
         return {}
     return {
         int(row[2]): strings.get(int(row[0]), str(row[0]))
-        for row in db.execute("SELECT nameId, priority, globalTid FROM ThreadNames")
+        for row in db.execute(
+            "SELECT nameId, priority, globalTid FROM ThreadNames"
+        )
     }
 
 
 def _enum(db: sqlite3.Connection, table: str) -> dict[int, str]:
     """Load a profiler enumeration table using labels when available."""
-
     if table not in _tables(db):
         return {}
     return {
@@ -834,7 +894,6 @@ def _process_identity(
     row: sqlite3.Row, processes: dict[int, tuple[int, str]]
 ) -> tuple[int | None, int | None, str | None]:
     """Resolve global, local, and named process identity for a row."""
-
     global_pid = _optional_integer(row, "globalPid")
     if global_pid is None:
         global_tid = _optional_integer(row, "globalTid", "threadId")
@@ -850,7 +909,6 @@ def _process_identity(
 
 def _interval(row: sqlite3.Row) -> tuple[int, int]:
     """Extract a non-negative interval across supported time column names."""
-
     start = _integer(row, "start", "startedAt", "timestamp")
     end = _integer(row, "end", "endedAt", default=start)
     return start, max(start, end)
@@ -858,7 +916,6 @@ def _interval(row: sqlite3.Row) -> tuple[int, int]:
 
 def _text(row: sqlite3.Row, strings: dict[int, str]) -> str:
     """Resolve inline or interned NVTX text."""
-
     value = _value(row, "text")
     if value is not None:
         return str(value)
@@ -873,7 +930,6 @@ def _name(
     fallback: str,
 ) -> str:
     """Resolve the first available inline or interned name column."""
-
     for column in columns:
         value = _value(row, column)
         if value is None:
@@ -886,25 +942,24 @@ def _name(
 
 def _integer(row: sqlite3.Row, *names: str, default: int | None = None) -> int:
     """Return a required integer across alternate column names."""
-
     value = _value(row, *names)
     if value is None:
         if default is None:
-            raise RuntimeError(f"nsys row has none of the required fields {names!r}")
+            raise RuntimeError(
+                f"nsys row has none of the required fields {names!r}"
+            )
         return int(default)
     return int(value)
 
 
 def _optional_integer(row: sqlite3.Row, *names: str) -> int | None:
     """Return an optional integer across alternate column names."""
-
     value = _value(row, *names)
     return None if value is None else int(value)
 
 
 def _value(row: sqlite3.Row, *names: str) -> Any:
     """Return the first non-null value among alternate column names."""
-
     keys = set(row.keys())
     for name in names:
         if name in keys and row[name] is not None:

@@ -41,7 +41,9 @@ class PatchAutoencoder(nn.Module):
             )
             or scale <= 0
         ):
-            raise ValueError("latent patch dimensions and scale must be positive")
+            raise ValueError(
+                "latent patch dimensions and scale must be positive"
+            )
         self.patch_size, self.latent_channels = patch_size, latent_channels
         self.latent_dtype, self.downsample = latent_dtype, downsample
         self.scale, self.shift = scale, shift
@@ -50,34 +52,43 @@ class PatchAutoencoder(nn.Module):
         self, pixels: torch.Tensor, *, generator: torch.Generator | None = None
     ) -> torch.Tensor:
         """Sample NCHW pixels into normalized latent patch rows."""
-
         if pixels.ndim != 4:
             raise ValueError("latent encoding requires NCHW pixels")
 
         dtype = next(self.encoder.parameters()).dtype
         moments = self.encoder(pixels.to(dtype))
-        latents = self.scale * (self.posterior(moments, generator=generator) - self.shift)
+        latents = self.scale * (
+            self.posterior(moments, generator=generator) - self.shift
+        )
 
         # Trim to complete latent patches before serialization.
         height = pixels.shape[-2] // self.downsample * self.patch_size
         width = pixels.shape[-1] // self.downsample * self.patch_size
-        return self.patchify(latents[:, :, :height, :width]).to(self.latent_dtype)
+        return self.patchify(latents[:, :, :height, :width]).to(
+            self.latent_dtype
+        )
 
     def patchify(self, latents: torch.Tensor) -> torch.Tensor:
         return patchify(latents, patch_size=self.patch_size)
 
-    def unpatchify(self, patches: torch.Tensor, size: image.Config) -> torch.Tensor:
+    def unpatchify(
+        self, patches: torch.Tensor, size: image.Config
+    ) -> torch.Tensor:
         latent_size = image.Config(
             size.height // self.downsample * self.patch_size,
             size.width // self.downsample * self.patch_size,
         )
         return unpatchify(
-            patches, latent_size, patch_size=self.patch_size, channels=self.latent_channels
+            patches,
+            latent_size,
+            patch_size=self.patch_size,
+            channels=self.latent_channels,
         )
 
     def decode(self, patches: torch.Tensor, size: image.Config) -> torch.Tensor:
-        """Restore patch rows to clamped [0, 1] pixels of the given image size."""
-
+        """Restore patch rows to clamped [0, 1] pixels of the given image
+        size.
+        """  # noqa: D205
         latents = self.unpatchify(patches, size)
         if latents.ndim == 3:
             latents = latents.unsqueeze(0)
@@ -100,5 +111,7 @@ class RGBDecoder(nn.Module):
         self.patch_size = patch_size
 
     def decode(self, patches: torch.Tensor, size: image.Config) -> torch.Tensor:
-        pixels = unpatchify(patches, size, patch_size=self.patch_size, channels=3)
+        pixels = unpatchify(
+            patches, size, patch_size=self.patch_size, channels=3
+        )
         return pixels.unsqueeze(0) if pixels.ndim == 3 else pixels

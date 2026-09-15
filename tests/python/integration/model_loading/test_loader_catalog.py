@@ -1,4 +1,7 @@
-"""Model discovery and checkpoint closure through the public loading boundary."""
+"""Model discovery and checkpoint closure.
+
+Both run through the public loading boundary.
+"""
 
 import json
 import shutil
@@ -75,7 +78,11 @@ def _write_input_tokenizer(root: Path, *, has_markers: bool = True) -> None:
 
 def _load(root, io=loading.Config(), precision=None):
     config = models.read_config(root, io=io)
-    options = replace(config.weights, dtype=torch.float32) if precision is None else precision
+    options = (
+        replace(config.weights, dtype=torch.float32)
+        if precision is None
+        else precision
+    )
     return models.load_model(config, device="cpu", weights=options).model
 
 
@@ -87,7 +94,9 @@ def _logits(model):
     with ExecutionContext(model, attention="torch") as context:
         context.prepare(TextSize(3, 1))
         hidden = model(TextInput(tokens, torch.arange(3), attention))
-        return model.compute_logits(hidden, token_indices=torch.arange(tokens.numel())).gather()
+        return model.compute_logits(
+            hidden, token_indices=torch.arange(tokens.numel())
+        ).gather()
 
 
 def _indexed(root, format):
@@ -95,11 +104,16 @@ def _indexed(root, format):
     names = sorted(tensors)
     shards = {}
     for index, name in enumerate(names):
-        file = f"weights-{index % 2}.{'safetensors' if format == 'safetensors' else 'bin'}"
+        file = (
+            f"weights-{index % 2}."
+            f"{'safetensors' if format == 'safetensors' else 'bin'}"
+        )
         shards.setdefault(file, {})[name] = tensors[name]
     (root / "model.safetensors").unlink()
     for name, values in shards.items():
-        (save_file if format == "safetensors" else torch.save)(values, root / name)
+        (save_file if format == "safetensors" else torch.save)(
+            values, root / name
+        )
     filename = (
         "model.safetensors.index.json"
         if format == "safetensors"
@@ -108,7 +122,13 @@ def _indexed(root, format):
     path = root / filename
     path.write_text(
         json.dumps(
-            {"weight_map": {name: file for file, values in shards.items() for name in values}}
+            {
+                "weight_map": {
+                    name: file
+                    for file, values in shards.items()
+                    for name in values
+                }
+            }
         )
     )
     return path
@@ -117,13 +137,16 @@ def _indexed(root, format):
 @pytest.mark.parametrize("mode", ("eager", "layered"))
 @pytest.mark.parametrize("format", ("safetensors", "pt"))
 @torch.inference_mode()
-def test_indexed_checkpoint_defines_the_complete_numerical_source(tmp_path, mode, format):
+def test_indexed_checkpoint_defines_the_complete_numerical_source(
+    tmp_path, mode, format
+):
     reference = _checkpoint(tmp_path)
     index = _indexed(tmp_path, format)
     # Unindexed payloads cannot alter the checkpoint selected by the index.
-    (tmp_path / ("extra.safetensors" if format == "safetensors" else "extra.bin")).write_bytes(
-        b"unused"
-    )
+    (
+        tmp_path
+        / ("extra.safetensors" if format == "safetensors" else "extra.bin")
+    ).write_bytes(b"unused")
     actual = _logits(_load(tmp_path, loading.Config(mode=mode, format=format)))
     expected = reference(torch.tensor([[1, 3, 9]])).logits[0]
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
@@ -137,7 +160,9 @@ def test_indexed_checkpoint_defines_the_complete_numerical_source(tmp_path, mode
 
 
 @pytest.mark.parametrize("has_markers", (True, False))
-def test_image_processing_metadata_has_resolved_token_identities(tmp_path, has_markers):
+def test_image_processing_metadata_has_resolved_token_identities(
+    tmp_path, has_markers
+):
     _write_input_tokenizer(tmp_path, has_markers=has_markers)
     (tmp_path / "config.json").write_text(json.dumps(_sense_config()))
     save_file({"weight": torch.ones(1)}, tmp_path / "model.safetensors")
@@ -155,7 +180,7 @@ def test_image_processing_metadata_has_resolved_token_identities(tmp_path, has_m
     assert load_tokenizer(config.tokenizer).convert_tokens_to_ids("<img>") == 1
 
 
-def test_remote_image_architecture_resolves_checkpoint_dimensions_and_transforms(
+def test_remote_image_architecture_resolves_checkpoint_dimensions_and_transforms(  # noqa: E501
     tmp_path, monkeypatch
 ):
     remote = tmp_path / "remote"
@@ -178,12 +203,20 @@ def test_remote_image_architecture_resolves_checkpoint_dimensions_and_transforms
             "patch_size": 2,
             "image_size": 8,
         },
-        "vae_config": {"ch": 32, "ch_mult": [1, 1], "downsample": 2, "z_channels": 2},
+        "vae_config": {
+            "ch": 32,
+            "ch_mult": [1, 1],
+            "downsample": 2,
+            "z_channels": 2,
+        },
         "start_of_image_id": 35,
         "end_of_image_id": 36,
     }
     (remote / "config.json").write_text(json.dumps(metadata))
-    save_file({"latent_pos_embed.pos_embed": torch.zeros(9, 32)}, remote / "ema.safetensors")
+    save_file(
+        {"latent_pos_embed.pos_embed": torch.zeros(9, 32)},
+        remote / "ema.safetensors",
+    )
 
     def download(*, repo_id, filename, revision, cache_dir):
         target = snapshot / filename
@@ -217,21 +250,32 @@ def test_unknown_modular_pipeline_fails_at_discovery(tmp_path):
 
 @pytest.mark.parametrize("origin", ("checkpoint", "caller"))
 @torch.inference_mode()
-def test_precision_selection_preserves_independent_projection_branches(tmp_path, origin):
+def test_precision_selection_preserves_independent_projection_branches(
+    tmp_path, origin
+):
     reference = _checkpoint(tmp_path)
     config = json.loads((tmp_path / "config.json").read_text())
     # Q alone stays dense. Independent K/V and gate/up statistics remain
     # meaningful even when their physical projection can be fused.
-    excluded = ("backbone.layers.0.attention.qkv.projection.projections.q", "backbone.layers.0.mlp")
+    excluded = (
+        "backbone.layers.0.attention.qkv.projection.projections.q",
+        "backbone.layers.0.mlp",
+    )
     converter = Quantizer("fp8", axis=0)
     selected = weights.Config(
         dtype=torch.float32,
-        quantization={"": QuantizationConfig(converter, converter), **dict.fromkeys(excluded)},
+        quantization={
+            "": QuantizationConfig(converter, converter),
+            **dict.fromkeys(excluded),
+        },
     )
     if origin == "checkpoint":
         config["quantization_config"] = {
             "quant_method": "fp8",
-            "ignored_layers": ["model.layers.0.self_attn.q_proj", "model.layers.0.mlp"],
+            "ignored_layers": [
+                "model.layers.0.self_attn.q_proj",
+                "model.layers.0.mlp",
+            ],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         model = _load(tmp_path)
@@ -259,7 +303,9 @@ def test_precision_selection_preserves_independent_projection_branches(tmp_path,
         torch.testing.assert_close(actual[name], expected, rtol=1e-5, atol=1e-6)
 
 
-def test_remote_snapshot_loads_only_the_closed_payload_set(tmp_path, monkeypatch):
+def test_remote_snapshot_loads_only_the_closed_payload_set(
+    tmp_path, monkeypatch
+):
     remote, snapshot = tmp_path / "remote", tmp_path / "snapshots" / ("a" * 40)
     remote.mkdir()
     reference = _checkpoint(remote)
@@ -285,12 +331,18 @@ def test_remote_snapshot_loads_only_the_closed_payload_set(tmp_path, monkeypatch
 
     monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
     monkeypatch.setattr("huggingface_hub.HfApi.list_repo_files", files)
-    io = loading.Config(revision="release", download_dir=str(tmp_path / "snapshots"))
+    io = loading.Config(
+        revision="release", download_dir=str(tmp_path / "snapshots")
+    )
     config = models.read_config("owner/model", io=io)
-    result = models.load_model(config, device="cpu", weights=weights.Config(dtype=torch.float32))
+    result = models.load_model(
+        config, device="cpu", weights=weights.Config(dtype=torch.float32)
+    )
     with torch.no_grad():
         expected = reference(torch.tensor([[1, 3, 9]])).logits[0]
-    torch.testing.assert_close(_logits(result.model), expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(
+        _logits(result.model), expected, rtol=1e-5, atol=1e-6
+    )
 
 
 def test_dummy_loading_is_deterministic_without_checkpoint_payload(tmp_path):

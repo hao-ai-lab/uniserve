@@ -41,22 +41,30 @@ class ModelRunner(Generic[ModelT, SizeT]):
     stream to the context stream without exposing stream policy to the model.
     """
 
-    def __init__(self, model: ModelT, *, context: ExecutionContext[SizeT]) -> None:
+    def __init__(
+        self, model: ModelT, *, context: ExecutionContext[SizeT]
+    ) -> None:
         if context.module is not model:
-            raise ValueError("execution context must be bound to the runner's model")
+            raise ValueError(
+                "execution context must be bound to the runner's model"
+            )
         self.model = model
         self.context = context
         self.closed = False
 
     def warmup(self, size: SizeT) -> None:
-        """Prepare numerical operators and workspace for the requested maximum size."""
+        """Prepare numerical operators and workspace.
 
+        For the requested maximum size.
+        """
         self._ensure_open()
         self.context.prepare(size)
 
     def _run(self, call: Callable[..., ResultT], *args, **kwargs) -> ResultT:
-        """Run on the bound stream and connect the result to the caller's stream."""
+        """Run on the bound stream.
 
+        Connect the result to the caller's stream.
+        """
         self._ensure_open()
         stream = self.context.stream
         caller = None
@@ -79,7 +87,6 @@ class ModelRunner(Generic[ModelT, SizeT]):
 
     def close(self) -> None:
         """Reject future calls after callers have finished borrowed outputs."""
-
         if self.closed:
             return
         self.closed = True
@@ -100,7 +107,9 @@ class ModelRunner(Generic[ModelT, SizeT]):
 class TextRunner(ModelRunner[CausalLM, TextSize]):
     """Run a causal model while binding its numerical attention input."""
 
-    def __init__(self, model: CausalLM, *, context: ExecutionContext[TextSize]) -> None:
+    def __init__(
+        self, model: CausalLM, *, context: ExecutionContext[TextSize]
+    ) -> None:
         super().__init__(model, context=context)
         self.inputs = None
 
@@ -111,14 +120,22 @@ class TextRunner(ModelRunner[CausalLM, TextSize]):
 
         return self._run(call)
 
-    def compute_logits(self, hidden: torch.Tensor, *, token_indices: torch.Tensor) -> Logits | None:
-        return self._run(self.model.compute_logits, hidden, token_indices=token_indices)
+    def compute_logits(
+        self, hidden: torch.Tensor, *, token_indices: torch.Tensor
+    ) -> Logits | None:
+        return self._run(
+            self.model.compute_logits, hidden, token_indices=token_indices
+        )
 
 
-class EncoderRunner(ModelRunner[Encoder[InputT], SizeT], Generic[InputT, SizeT]):
+class EncoderRunner(
+    ModelRunner[Encoder[InputT], SizeT], Generic[InputT, SizeT]
+):
     """Run a homogeneous encoder through prepared numerical resources."""
 
-    def encode(self, inputs: InputT, *, size: SizeT) -> tuple[torch.Tensor, ...] | None:
+    def encode(
+        self, inputs: InputT, *, size: SizeT
+    ) -> tuple[torch.Tensor, ...] | None:
         self.warmup(size)
         return self._run(self.model.encode, inputs)
 
@@ -139,7 +156,10 @@ class DenoisingRunner(
     ModelRunner[Denoiser[DenoiserInputT, SizeT], SizeT],
     Generic[DenoiserInputT, SizeT],
 ):
-    """Prepare latent state and run one denoising step without request policy."""
+    """Prepare latent state and run one denoising step.
+
+    Without request policy.
+    """
 
     def __init__(
         self,

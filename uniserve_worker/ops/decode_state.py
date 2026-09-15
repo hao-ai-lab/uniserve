@@ -13,7 +13,12 @@ except Exception:  # pragma: no cover
 if triton is not None:
 
     @triton.jit(
-        do_not_specialize=["row", "valid_cache_length", "logical_length", "sampling_position"]
+        do_not_specialize=[
+            "row",
+            "valid_cache_length",
+            "logical_length",
+            "sampling_position",
+        ]
     )
     def _reset_row_kernel(
         future_tokens_ptr,
@@ -30,8 +35,10 @@ if triton is not None:
         vocab_size: tl.constexpr,
         block_size: tl.constexpr,
     ):
-        """Reset one device runtime row while preserving its declared logical coordinates."""
+        """Reset one device runtime row.
 
+        The row's declared logical coordinates are preserved.
+        """
         offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
 
         # Row-wide spans: continuation token slots [rows, continuation_width]
@@ -50,9 +57,17 @@ if triton is not None:
         # Scalar per-row coordinates [rows]; only the first lane writes them.
         scalar = offsets == 0
         tl.store(predicates_ptr + row + offsets, 0, mask=scalar)
-        tl.store(logical_lengths_ptr + row + offsets, logical_length, mask=scalar)
-        tl.store(sampling_positions_ptr + row + offsets, sampling_position, mask=scalar)
-        tl.store(cache_lengths_ptr + row + offsets, valid_cache_length, mask=scalar)
+        tl.store(
+            logical_lengths_ptr + row + offsets, logical_length, mask=scalar
+        )
+        tl.store(
+            sampling_positions_ptr + row + offsets,
+            sampling_position,
+            mask=scalar,
+        )
+        tl.store(
+            cache_lengths_ptr + row + offsets, valid_cache_length, mask=scalar
+        )
 
     @triton.jit(do_not_specialize=["count"])
     def _publish_decode_kernel(
@@ -68,8 +83,10 @@ if triton is not None:
         continuation_width: tl.constexpr,
         block_size: tl.constexpr,
     ):
-        """Publish batched decode tokens and advance device-resident runtime coordinates."""
+        """Publish batched decode tokens.
 
+        Also advance device-resident runtime coordinates.
+        """
         offsets = tl.arange(0, block_size)
         mask = offsets < count
         indices = tl.load(indices_ptr + offsets, mask=mask, other=0)

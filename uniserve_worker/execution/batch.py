@@ -37,22 +37,31 @@ class InputBatch(Generic[InputT]):
 
     def __post_init__(self):
         if self.request_pool_indices.ndim != 1 or self.row_count < 1:
-            raise ValueError("execution requires a nonempty vector of request slots")
+            raise ValueError(
+                "execution requires a nonempty vector of request slots"
+            )
         if (
             isinstance(self.forward_mode, ForwardMode)
             and len(self.token_selections) != self.row_count
         ):
-            raise ValueError("text output selections must align with request slots")
+            raise ValueError(
+                "text output selections must align with request slots"
+            )
         if self.decode_force_finish is not None and (
             self.decode_force_finish.shape != self.request_pool_indices.shape
             or self.decode_force_finish.dtype != torch.bool
         ):
-            raise ValueError("decode completion controls must align with request slots")
+            raise ValueError(
+                "decode completion controls must align with request slots"
+            )
 
 
 @dataclass(frozen=True, slots=True)
 class ExecutionOutput:
-    """Row-aligned numerical results with execution observations and reader fences."""
+    """Row-aligned numerical results with execution observations and reader.
+
+    fences.
+    """
 
     values: tuple[torch.Tensor, ...]
     vocabularies: tuple[VocabShard | None, ...] = ()
@@ -72,9 +81,12 @@ class ExecutionOutput:
         for value, vocab in zip(self.values, self.vocabularies, strict=True):
             if vocab is not None and (
                 value.ndim != 2
-                or value.shape[-1] != vocab.local_slice.stop - vocab.local_slice.start
+                or value.shape[-1]
+                != vocab.local_slice.stop - vocab.local_slice.start
             ):
-                raise ValueError("vocabulary output rows disagree with their shard")
+                raise ValueError(
+                    "vocabulary output rows disagree with their shard"
+                )
 
         if not self.layouts:
             object.__setattr__(self, "layouts", (None,) * len(self.values))
@@ -82,12 +94,18 @@ class ExecutionOutput:
             raise ValueError("output layouts must align with execution rows")
 
     def materialize(self) -> ExecutionOutput:
-        """Gather global vocabulary rows, preserving their caller-visible shapes."""
+        """Gather global vocabulary rows.
 
+        preserving their caller-visible shapes.
+        """
         if self.output_event is not None:
             if not self.values:
-                raise RuntimeError("forward output has a fence without a producer tensor")
-            torch.cuda.current_stream(self.values[0].device).wait_event(self.output_event)
+                raise RuntimeError(
+                    "forward output has a fence without a producer tensor"
+                )
+            torch.cuda.current_stream(self.values[0].device).wait_event(
+                self.output_event
+            )
 
         if not any(self.vocabularies):
             return self
@@ -117,11 +135,15 @@ class ExecutionOutput:
             rows = (
                 torch.cat(sources, dim=0)
                 if view is None
-                else view.reshape(-1, vocab.local_slice.stop - vocab.local_slice.start)
+                else view.reshape(
+                    -1, vocab.local_slice.stop - vocab.local_slice.start
+                )
             )
             gathered = Logits(rows, vocab).gather()
             for index, value in zip(
-                indexes, gathered.split(tuple(source.shape[0] for source in sources)), strict=True
+                indexes,
+                gathered.split(tuple(source.shape[0] for source in sources)),
+                strict=True,
             ):
                 values[index] = value
         return replace(self, values=tuple(values), vocabularies=())
@@ -129,18 +151,24 @@ class ExecutionOutput:
     def clone(self) -> ExecutionOutput:
         """Own detached copies that survive reuse of the producer's storage.
 
-        Outputs on one device with one dtype share a contiguous allocation. Shapes
-        and logical tensor values are preserved independently of source strides;
-        storage remains live for as long as any returned tensor is retained.
+        Outputs on one device with one dtype share a contiguous allocation.
+        Shapes and logical tensor values are preserved independently of source
+        strides; storage remains live for as long as any returned tensor is
+        retained.
         """
-
         if self.output_event is not None:
             if not self.values:
-                raise RuntimeError("forward output has a fence without a producer tensor")
-            torch.cuda.current_stream(self.values[0].device).wait_event(self.output_event)
+                raise RuntimeError(
+                    "forward output has a fence without a producer tensor"
+                )
+            torch.cuda.current_stream(self.values[0].device).wait_event(
+                self.output_event
+            )
 
         # Tensors sharing a device and dtype copy through one flat allocation.
-        groups: dict[tuple[torch.device, torch.dtype], list[int]] = defaultdict(list)
+        groups: dict[tuple[torch.device, torch.dtype], list[int]] = defaultdict(
+            list
+        )
         for index, value in enumerate(self.values):
             groups[(value.device, value.dtype)].append(index)
 
@@ -151,7 +179,9 @@ class ExecutionOutput:
                 copied[index] = self.values[index].detach().clone()
                 continue
             sources = [self.values[index] for index in indexes]
-            storage = torch.cat(tuple(value.detach().reshape(-1) for value in sources))
+            storage = torch.cat(
+                tuple(value.detach().reshape(-1) for value in sources)
+            )
             views = storage.split(tuple(value.numel() for value in sources))
             for index, view in zip(indexes, views, strict=True):
                 copied[index] = view.reshape(self.values[index].shape)
@@ -171,7 +201,6 @@ class ExecutionOutput:
 
     def validate_for(self, batch: InputBatch) -> None:
         """Require one tensor result for every row in the originating batch."""
-
         if len(self.values) != batch.row_count:
             raise ValueError("model output count does not match forward rows")
         if any(not isinstance(value, torch.Tensor) for value in self.values):

@@ -21,15 +21,19 @@ def test_latent_decoder_preserves_float32_normalization():
         std=torch.tensor([0.5, 1.5, 2.5]).view(1, 3, 1),
     )
     source = torch.linspace(-1, 1, 12).reshape(1, 3, 4).bfloat16()
-    expected = (source.float() * decoder.std + decoder.mean) * torch.tensor([1.0, 2.0, 3.0, 4.0])
+    expected = (source.float() * decoder.std + decoder.mean) * torch.tensor(
+        [1.0, 2.0, 3.0, 4.0]
+    )
     torch.testing.assert_close(decoder(source), expected, rtol=0, atol=0)
     with pytest.raises(ValueError, match="shape"):
         decoder(source[:, :, :3])
 
 
 def test_diagonal_gaussian_disabled_returns_mean_and_halves_channels():
-    """With sampling disabled the regularizer is the deterministic mean of the
-    first channel-chunk; the channel dim is halved."""
+    """With sampling disabled the regularizer is the deterministic mean.
+
+    The output is the first channel-chunk; the channel dim is halved.
+    """
     torch.manual_seed(8)
     reg = DiagonalGaussian(sample=False)
 

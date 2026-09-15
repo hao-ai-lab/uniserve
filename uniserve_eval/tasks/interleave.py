@@ -5,7 +5,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import ClassVar
 
-from ..types import Example, RequestRecord, TaskName, TaskRequest, ValidationResult
+from ..types import (
+    Example,
+    RequestRecord,
+    TaskName,
+    TaskRequest,
+    ValidationResult,
+)
 from .base import BenchmarkTask, ImageCountRule
 
 
@@ -20,7 +26,6 @@ class InterleaveTask(BenchmarkTask):
 
     def build_request(self, example: Example) -> TaskRequest:
         """Build a chat request that streams both text and images."""
-
         max_tokens = int(
             example.max_tokens
             if example.max_tokens is not None
@@ -38,20 +43,27 @@ class InterleaveTask(BenchmarkTask):
         self.apply_text_sampling(payload)
         return TaskRequest(self.point.endpoint, payload, stream=True)
 
-    def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
+    def validate_output(
+        self, records: Sequence[RequestRecord]
+    ) -> ValidationResult:
         """Check visible text, image integrity, usage, and image frequency."""
-
         checks = self.image_integrity_checks(records)
-        checks["visible_text"] = bool(records) and all(record.generated_text for record in records)
+        checks["visible_text"] = bool(records) and all(
+            record.generated_text for record in records
+        )
         checks["server_usage"] = self.server_usage_ok(records)
         total_images = sum(record.images for record in records)
         mean_images = total_images / len(records) if records else 0.0
-        checks["minimum_average_images"] = mean_images >= self.minimum_average_images
+        checks["minimum_average_images"] = (
+            mean_images >= self.minimum_average_images
+        )
         return ValidationResult(
             checks=checks,
             statistics={
                 "completed_images": total_images,
                 "images_per_request": mean_images,
-                "zero_image_requests": sum(record.images == 0 for record in records),
+                "zero_image_requests": sum(
+                    record.images == 0 for record in records
+                ),
             },
         )

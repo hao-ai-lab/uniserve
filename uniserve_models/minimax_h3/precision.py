@@ -35,14 +35,17 @@ def weight_config(
     video_vae: str | None = None,
 ) -> weights.Config:
     """Expand a preset and independent component choices into module paths."""
-
     if preset not in _formats:
-        raise ValueError(f"unknown H3 precision {preset!r}; choose from {tuple(_formats)}")
+        raise ValueError(
+            f"unknown H3 precision {preset!r}; choose from {tuple(_formats)}"
+        )
 
     attention, mlp, text_encoder, video_vae = (
         base if override is None else override
         for base, override in zip(
-            _formats[preset], (attention, mlp, text_encoder, video_vae), strict=True
+            _formats[preset],
+            (attention, mlp, text_encoder, video_vae),
+            strict=True,
         )
     )
     selections = (
@@ -56,10 +59,13 @@ def weight_config(
             raise ValueError(f"H3 {name} requires one of {supported}")
 
     def encoded(value, *, tensorwise=False):
-        # Unquantized precisions are expressed as a plain dtype, not a Quantizer.
+        # Unquantized precisions are expressed as a plain dtype, not a
+        # Quantizer.
         if value in {"bf16", "fp16"}:
             return None
-        quantizer = Quantizer(value, axis=0 if value == "fp8" and not tensorwise else None)
+        quantizer = Quantizer(
+            value, axis=0 if value == "fp8" and not tensorwise else None
+        )
         return QuantizationConfig(quantizer, quantizer)
 
     # The decoders and the transformer's FP32 latent heads never quantize.
@@ -68,13 +74,20 @@ def weight_config(
         "video_decoder": torch.float32,
         **{
             f"denoiser.transformer.{name}": torch.float32
-            for name in ("video_input", "audio_input", "video_output", "audio_output")
+            for name in (
+                "video_input",
+                "audio_input",
+                "video_output",
+                "audio_output",
+            )
         },
     }
     quantization = {}
     for index in range(TransformerConfig().num_hidden_layers):
         path = f"denoiser.transformer.layers.{index}"
-        quantization[f"{path}.attention.projection"] = encoded(attention, tensorwise=True)
+        quantization[f"{path}.attention.projection"] = encoded(
+            attention, tensorwise=True
+        )
         quantization[f"{path}.attention.output"] = encoded(attention)
         quantization[f"{path}.mlp"] = encoded(mlp)
     quantization["text_encoder"] = encoded(text_encoder)
@@ -98,4 +111,6 @@ def weight_config(
     return weights.Config(dtypes=dtypes, quantization=quantization)
 
 
-precisions = MappingProxyType({name: weight_config(preset=name) for name in _formats})
+precisions = MappingProxyType(
+    {name: weight_config(preset=name) for name in _formats}
+)
