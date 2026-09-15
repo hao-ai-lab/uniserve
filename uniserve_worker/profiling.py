@@ -88,6 +88,7 @@ class WorkerProfiler:
         output_dir = env.get(_TORCH_PROFILE_DIR_ENV)
         if not output_dir:
             return cls(None)
+
         activities = _parse_activities(env.get(_PROFILE_ACTIVITIES_ENV, "CPU,GPU"))
         cuda_profiler = flag_from_value(env.get(_CUDA_PROFILER_ENV))
         config = WorkerProfileConfig(
@@ -161,6 +162,7 @@ class WorkerProfiler:
                 profiler = torch.profiler.profile(**kwargs)
                 profiler.start()
                 self._torch_profiler = profiler
+
             if self.config.cuda_profiler:
                 _cuda_profiler_start()
         except Exception:
@@ -186,6 +188,7 @@ class WorkerProfiler:
         try:
             if self.config.cuda_profiler:
                 _cuda_profiler_stop()
+
             if self._torch_profiler is not None:
                 self._torch_profiler.stop()
                 trace_path = self.config.output_dir / f"{trace_base}.trace.json.gz"

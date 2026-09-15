@@ -20,6 +20,8 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.nda
 
     if embed_dim % 2 != 0:
         raise ValueError("embed_dim must be even")
+
+    # Frequencies span 10000**-1 .. 10000**0 across the half-width spectrum.
     omega = np.arange(embed_dim // 2, dtype=np.float64)
     omega /= embed_dim / 2.0
     omega = 1.0 / 10000**omega

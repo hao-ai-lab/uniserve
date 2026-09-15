@@ -41,6 +41,7 @@ class State:
             raise ValueError("each state field requires its own initialization flags")
         if any(tensor.ndim == 0 for tensor in self.tensors.values()):
             raise ValueError("state tensors must retain a block dimension")
+
         count = next(iter(self.tensors.values())).shape[0]
         for name, tensor in self.tensors.items():
             if not name or "." in name or tensor.ndim == 0 or tensor.shape[0] != count:
@@ -53,10 +54,13 @@ class State:
             )
             if any(value.ndim == 0 or value.shape[0] != count for value in buffers):
                 raise ValueError("each state backing must retain the leading block dimension")
+
         object.__setattr__(self, "tensors", MappingProxyType(dict(self.tensors)))
         object.__setattr__(self, "initialized", MappingProxyType(dict(self.initialized)))
 
     def _storage(self) -> Mapping[str, torch.Tensor]:
+        """Flatten each field into its physical buffers plus its flag vector."""
+
         result = {}
         for name, tensor in self.tensors.items():
             fields = tensor.buffers() if isinstance(tensor, QuantizedTensor) else {"values": tensor}
@@ -84,6 +88,7 @@ class State:
             else tensor
             for tensor in self._storage().values()
         )
+
         vector = isinstance(source, torch.Tensor) or isinstance(target, torch.Tensor)
         if vector:
             if (
@@ -101,6 +106,7 @@ class State:
                 )
             if not source.numel():
                 return
+
             valid = ((source == -1) & (target == -1)) | (
                 (source >= 0) & (source < count) & (target >= 0) & (target < count)
             )
@@ -128,6 +134,7 @@ class State:
             }
         if not count:
             return
+
         # Take every field's snapshot before writing any target, including
         # when distinct named fields borrow overlapping physical storage.
         snapshots = tuple(

@@ -56,18 +56,22 @@ class _TRTLLM(_Operator):
         if not q.is_cuda or torch.cuda.get_device_capability(q.device)[0] != 10:
             raise ValueError("TensorRT-LLM MHA requires an SM100 family GPU")
         self._validate(q, k, v, batch, out)
+
         if q.shape[0] == 0:
             if batch.write_indices is not None:
                 self.update_cache(k, v, indices=batch.write_indices)
             return out
+
         if q.ndim != 3 or (
             batch.queries.num_tokens is not None and q.shape[0] != batch.queries.num_tokens
         ):
             raise ValueError("packed attention rows must match their declared query lengths")
+
         key, value = (k, v) if self.cache is None else (self.cache.key, self.cache.value)
         if key.ndim != 4:
             raise ValueError("TensorRT-LLM MHA requires physical paged K/V backing")
         cache = (_head_major(key), _head_major(value))
+
         # Native stores require contiguous, aligned backing. An aliased
         # destination must not overwrite queries or shared prefix values until
         # every causal run has read them.
@@ -77,17 +81,21 @@ class _TRTLLM(_Operator):
             and not any(torch._C._overlaps(out, tensor) for tensor in (q, k, v, key, value))
         )
         destination = out if direct else torch.empty(out.shape, dtype=out.dtype, device=out.device)
+
         if len(set(batch.causal)) > 1 and batch.write_indices is not None:
             # Causal runs slice query domains. Commit the complete write once
             # before those runs, whose inputs then carry no write indices.
             self.update_cache(k, v, indices=batch.write_indices)
+
         for query_slice, _, run in causal_runs(batch):
             query = q[query_slice]
             if not query.shape[0]:
                 continue
+
             lengths = self.workspace["lengths"][: run.queries.batch_size]
             offsets = self.workspace["offsets"][: run.queries.batch_size + 1]
             prepare(self.cache, k, v, run, lengths=lengths, offsets=offsets)
+
             # The table's capacity is invariant across replay; actual key
             # lengths remain device inputs, including a growing decode prefix.
             maximum = run.block_table.indices.shape[1] * run.block_table.block_size
@@ -116,6 +124,7 @@ class _TRTLLM(_Operator):
                     causal=run.causal[0],
                     **options,
                 )
+
         if destination is not out:
             out.copy_(destination)
         return out

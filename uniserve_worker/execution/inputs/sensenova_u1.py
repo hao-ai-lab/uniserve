@@ -10,11 +10,14 @@ from .image import ImageBuilder
 
 
 class U1Builder(ImageBuilder):
+    """Construct SenseNova U1's denoising inputs and per-step image conditioning."""
+
     @property
     def max_tokens(self):
         return self.denoiser.config.max_image_seq_len
 
     def bind(self, *, samples, sizes, timesteps, positions, attention, step_index):
+        """Assemble one denoising step's typed input from resident tensors."""
         images = []
         for sample, size in zip(samples, sizes, strict=True):
             # This tower consumes the current image, which must be rebuilt
@@ -26,6 +29,7 @@ class U1Builder(ImageBuilder):
                 patch_size=self.denoiser.patch_size,
                 channels=self.denoiser.latent_channels,
             )
+
             patch = self.denoiser.config.vision.patch_size
             grid = torch.tensor(
                 [[size.height // patch, size.width // patch]],
@@ -34,6 +38,7 @@ class U1Builder(ImageBuilder):
             )
             scale = sample.new_tensor([self.denoiser.noise_scale.scale(sample.shape[0])])
             images.append(ImageConditioning(pixels, grid, scale))
+
         return DenoiserInput(
             latents={
                 "image": tuple(

@@ -46,9 +46,13 @@ class BatchState:
 
     batch: ScheduleBatch
     propagate_errors: bool = False
+
+    # Physical input reservations held until execution observes readiness.
     tensor_reads: dict[BufferId, TensorRead] = field(default_factory=dict)
     latent_imports: dict[BufferId, LatentImport] = field(default_factory=dict)
     cache_imports: dict[BufferId, CacheImport] = field(default_factory=dict)
+
+    # Completion predicates staged in a sealed buffer and read as booleans.
     predicate_buffer: OutputBuffer | None = None
     predicate_entries: list[tuple[OperationIdentity, tuple[int, int], int]] = field(
         default_factory=list
@@ -56,18 +60,26 @@ class BatchState:
     predicate_transfers: tuple[tuple[OperationIdentity, BufferId, int], ...] = ()
     predicates_sealed: bool = False
     _predicate_values: dict[OperationIdentity, bool] | None = None
+
+    # Declared physical inputs and their outstanding transfer dependencies.
     storage_dependencies: tuple[Future[None], ...] = ()
     input_products: tuple[TensorPublication, ...] = ()
     kv_inputs: tuple[KvTransfer, ...] = ()
+
+    # Lifecycle flags from input submission through terminal delivery.
     inputs_submitted: bool = False
     inputs_closed: bool = False
     launched: bool = False
     complete: bool = False
     error: WorkerError | None = None
+
+    # Final values addressed by original operation index and completion group.
     outputs: list[PendingOutput | RequestOutput | None] = field(default_factory=list)
     output_groups: dict[int, tuple[int, ...]] = field(default_factory=dict)
     completed_groups: set[int] = field(default_factory=set)
     accepted_groups: set[int] = field(default_factory=set)
+
+    # Per-group execution and publication bookkeeping.
     group_buffers: dict[int, OutputBuffer] = field(default_factory=dict)
     group_streams: dict[int, torch.cuda.Stream] = field(default_factory=dict)
     group_started_ns: dict[int, int] = field(default_factory=dict)
@@ -83,6 +95,8 @@ class BatchState:
     group_stats: dict[int, ForwardStats] = field(default_factory=dict)
     group_execution_us: dict[int, int] = field(default_factory=dict)
     visible_groups: set[int] = field(default_factory=set)
+
+    # Resource retirement decided during execution, applied by the owner.
     retirement_requests: frozenset[RequestKey] = frozenset()
     retirement_local_requests: frozenset[RequestKey] = frozenset()
     retirement_buffers: frozenset[BufferId] = frozenset()
@@ -91,15 +105,19 @@ class BatchState:
     retirement_releases: tuple[Future[None], ...] = ()
     retirement_events: tuple[torch.cuda.Event, ...] = ()
     retirement_cleaned: bool = False
+
+    # Delivery position over completed groups.
     sent_groups: set[int] = field(default_factory=set)
     terminal_sent: bool = False
     awaiting_poll: bool = False
 
     def __post_init__(self) -> None:
         self.outputs = [None] * len(self.batch.operations)
+
         groups: dict[tuple[object, str], list[int]] = {}
         for index, operation in enumerate(self.batch.operations):
             groups.setdefault((operation.kind, operation.entry), []).append(index)
+
         self.output_groups = {
             group: tuple(indexes) for group, indexes in enumerate(groups.values(), start=1)
         }
@@ -134,6 +152,7 @@ class BatchState:
             if (output.request_key, output.op_id) != (operation.request_key, operation.op_id):
                 raise invalid_descriptor("reserved output does not match its operation")
             self.outputs[index] = output
+
         self.group_buffers[group] = buffer
         self.group_started_ns[group] = started_ns
         self.group_forward_stats[group] = []
@@ -151,6 +170,8 @@ class BatchState:
         return cast(tuple[PendingOutput, ...], values)
 
     def pending_output(self, group: int, request_id: int) -> PendingOutput:
+        """Borrow the reserved pending output of one request in a completion group."""
+
         location = self.request_locations.get(int(request_id))
         if location is None or location[0] != group:
             raise invalid_descriptor(f"completion group has no request {request_id}")
@@ -203,6 +224,7 @@ class BatchState:
             return self._predicate_values
         if not buffer.ready():
             raise RuntimeError("prepared predicates were observed before readiness")
+
         values: dict[OperationIdentity, bool] = {}
         generation = buffer.generation
         try:
@@ -217,6 +239,7 @@ class BatchState:
         except BaseException:
             buffer.abandon()
             raise
+
         self._predicate_values = values
         return values
 
@@ -232,6 +255,7 @@ class BatchState:
         if not tickets and not dependencies:
             callback()
             return
+
         lock = Lock()
         fired = False
 
@@ -251,8 +275,10 @@ class BatchState:
 
         for ticket in tickets:
             ticket.add_done_callback(notify_if_ready)
+
         for dependency in dependencies:
             dependency.add_done_callback(lambda _future: notify_if_ready())
+
         notify_if_ready()
 
     def input_tickets(self) -> Iterator[TransferTicket]:
@@ -291,8 +317,10 @@ class BatchState:
 
         if self.inputs_closed:
             return
+
         self.inputs_closed = True
         actions: list[Callable[[], object]] = []
+
         if self.latent_imports:
             assert latent_pool is not None
             actions.extend(
@@ -300,6 +328,7 @@ class BatchState:
                 for write in self.latent_imports.values()
                 if not write.adopted
             )
+
         if self.cache_imports:
             assert kv_cache is not None
             actions.extend(
@@ -307,10 +336,13 @@ class BatchState:
                 for write in self.cache_imports.values()
                 if not write.released
             )
+
         if self.predicate_buffer is not None and self._predicate_values is None:
             actions.append(self.predicate_buffer.abandon)
+
         if self.tensor_reads:
             actions.append(partial(tensor_store.complete_reads, tuple(self.tensor_reads.values())))
+
         actions.extend(
             ticket.close for write in self.latent_imports.values() for ticket in write.transfers
         )
@@ -330,6 +362,7 @@ class BatchState:
 
         if group in self.group_stats:
             raise RuntimeError("completion group was published more than once")
+
         indexes = self.output_groups[group]
         for index, output in zip(indexes, outputs, strict=True):
             operation = self.batch.operations[index]
@@ -343,12 +376,14 @@ class BatchState:
             if (output.request_key, output.op_id) != (operation.request_key, operation.op_id):
                 raise invalid_descriptor("result does not match its submitted operation")
             self.outputs[index] = output
+
         identities = {(output.request_key, output.op_id) for output in outputs}
         if any(
             (value.product.request_key, value.product.producer_op_id) not in identities
             for value in products
         ):
             raise invalid_descriptor("product does not belong to its completion group")
+
         self.group_products[group] = products
         self.group_stats[group] = stats
         self.group_execution_us[group] = execution_us
@@ -356,6 +391,7 @@ class BatchState:
         self.group_forward_indices.pop(group, None)
         self.group_forward_stats.pop(group, None)
         self.group_component_us.pop(group, None)
+
         if visible:
             self.visible_groups.add(group)
 
@@ -401,15 +437,20 @@ class BatchState:
                 group: self.batch.operations[indexes[0]].entry
                 for group, indexes in self.output_groups.items()
             }
+
+            # Deliver one wire entry per fragment; groups sharing the first
+            # ready entry travel together.
             entry = entries[groups[0]]
             groups = tuple(group for group in groups if entries[group] == entry)
             self.sent_groups.update(groups)
+
             done = (
                 self.complete
                 and len(self.sent_groups) == len(self.output_groups)
                 and not any(isinstance(command, (Free, Finish)) for command in self.batch.commands)
             )
             self.terminal_sent = done
+
             values: list[RequestOutput] = []
             for group in groups:
                 for index in self.output_groups[group]:
@@ -417,9 +458,11 @@ class BatchState:
                     if not isinstance(value, RequestOutput):
                         raise RuntimeError("batch delivery encountered an unmaterialized output")
                     values.append(value)
+
             successful = {
                 (value.request_key, value.op_id) for value in values if value.status is OpStatus.OK
             }
+
             return BatchOutput(
                 batch_id=self.batch_id,
                 run_id=self.run_id,
@@ -445,6 +488,8 @@ class BatchState:
         raise RuntimeError("batch has no ready output")
 
     def take_error(self) -> WorkerError:
+        """Consume the terminal error exactly once."""
+
         error = self.error
         if error is None or self.terminal_sent:
             raise RuntimeError("batch has no unread terminal error")
@@ -452,6 +497,8 @@ class BatchState:
         return error
 
     def pending(self) -> bool:
+        """Report whether the batch still owes a delivery fragment."""
+
         return not self.terminal_sent
 
     def close(

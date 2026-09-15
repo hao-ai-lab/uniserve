@@ -31,6 +31,7 @@ class Encoder(nn.Module, Generic[InputT]):
         groups = defaultdict(list)
         for index, value in enumerate(inputs):
             groups[(value.shape, value.dtype, value.device)].append(index)
+
         result = [None] * len(inputs)
         for indices in groups.values():
             values = self.network(torch.stack(tuple(inputs[index] for index in indices)))
@@ -77,6 +78,7 @@ class PatchEncoder(Encoder[VisionInput]):
                 value.device,
             )
             groups[key].append(index)
+
         result = [None] * inputs.batch_size
         for indices in groups.values():
             pixels, grids, shapes = [], [], []
@@ -106,9 +108,11 @@ class PatchEncoder(Encoder[VisionInput]):
                 pixels.append(value)
                 grids.append(grid)
                 shapes.append(shape)
+
             values = torch.stack(pixels) if pixels[0].ndim == 3 else torch.cat(pixels)
             features = self.network(values, torch.cat(grids), tuple(shapes))
             features = self.connector(features).to(self._output_dtype)
+
             counts = tuple(height * width // self.downsample**2 for height, width in shapes)
             if features.shape != (sum(counts), self._output_size):
                 raise ValueError("vision features must cover the declared spatial output grids")
@@ -165,6 +169,7 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
         offsets = torch.cat((values.new_zeros(1), values.cumsum(0, dtype=torch.int32)))
         lengths = SequenceLengths(host=counts, values=values, offsets=offsets)
         attention = VarlenInput(lengths, lengths, (True,) * len(counts))
+
         embeddings = (
             self.network.embed_input_ids(packed) if self.network._pipeline.rank == 0 else None
         )

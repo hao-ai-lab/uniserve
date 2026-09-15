@@ -16,6 +16,8 @@ from ..protocol.output import BatchOutput
 def response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
     """Build a protocol response with the canonical kind tag and payload fields."""
 
+    # The envelope carries every field the wire protocol allows; payloads may
+    # only override declared fields, leaving the rest at their null defaults.
     response: dict[str, Any] = {
         "kind": kind.value,
         "call_id": None,
@@ -29,6 +31,7 @@ def response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
         "route": None,
         "operations": [],
     }
+
     unknown = set(payload) - set(response)
     if unknown:
         raise invalid_descriptor(f"worker response contains unknown fields {sorted(unknown)!r}")
@@ -92,23 +95,32 @@ def raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
         return run_requests(run) | requests
     if not isinstance(run, Mapping):
         return frozenset(requests)
+
+    # Walk the raw wire form: operation and command items may wrap their
+    # payload in a "value" key, and a request key may nest under a "request"
+    # payload (as in admission commands).
     groups: list[object] = [run.get("operations", ()), run.get("commands", ())]
     for group in groups:
         if not isinstance(group, Sequence):
             continue
+
         for item in group:
             if not isinstance(item, Mapping):
                 continue
+
             value = item.get("value", item)
             if not isinstance(value, Mapping):
                 continue
+
             key = value.get("request_key")
             request_value = value.get("request")
             if key is None and isinstance(request_value, Mapping):
                 key = request_value.get("request_key")
+
             request_id = key.get("request_id") if isinstance(key, Mapping) else None
             if isinstance(request_id, int) and not isinstance(request_id, bool):
                 requests.add(int(request_id))
+
     return frozenset(requests)
 
 

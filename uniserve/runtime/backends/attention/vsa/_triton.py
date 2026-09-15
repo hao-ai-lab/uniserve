@@ -73,6 +73,8 @@ if triton is not None:
             other=0.0,
         )
 
+        # Online softmax state for this [block_m, head_dim] query tile:
+        # running row max, running normalizer sum, FP32 output accumulator.
         normalizer_max = tl.full((block_m,), -float("inf"), tl.float32)
         normalizer_sum = tl.zeros((block_m,), tl.float32)
         accumulator = tl.zeros((block_m, head_dim), tl.float32)
@@ -203,6 +205,8 @@ def _launch_config(device: torch.device) -> tuple[int, int, int]:
     """Choose the resident query tile and software pipeline for one architecture."""
 
     major, _minor = torch.cuda.get_device_capability(device)
+    # Returns (block_m, num_warps, pipeline_stages); Hopper sustains the
+    # deeper pipeline, other architectures use the conservative pairing.
     if major == 9:
         return 64, 8, 3
     return 32, 4, 2
@@ -235,6 +239,7 @@ def block_sparse_attention(
     assert triton is not None
     block_m, num_warps, pipeline_stages = _launch_config(query.device)
     query_rows, heads, _width = (int(size) for size in query.shape)
+
     _block_sparse_attention_kernel[(triton.cdiv(query_rows, block_m), heads)](
         query,
         key,
@@ -266,4 +271,7 @@ def block_sparse_attention(
         num_warps=num_warps,
         num_stages=pipeline_stages,
     )
+
+    # Present the result as [batch=1, heads, rows, dim], matching the other
+    # providers without moving data.
     return output.unsqueeze(0).transpose(1, 2)

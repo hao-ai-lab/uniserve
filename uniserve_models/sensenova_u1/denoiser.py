@@ -19,6 +19,8 @@ from .transformer import Transformer
 
 
 class Denoiser(ImageDenoiser[DenoiserInput]):
+    """Predict image velocity from pixels through the shared text/flow backbone."""
+
     def __init__(self, config: Config, backbone: Transformer):
         stride = config.vision.patch_size * round(1 / config.vision.downsample_ratio)
         super().__init__(
@@ -37,6 +39,10 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
             if config.flow.add_noise_scale_embedding
             else None
         )
+
+        # Three checkpoint head variants: a convolutional pixel decoder, a deep
+        # adaptive time head, or a shallow two-layer MLP, exactly one of which
+        # is active per checkpoint.
         if config.flow.use_pixel_head:
             head = nn.Identity()
             decoder = flow.Decoder(config.text.hidden_size, final_upscale=stride // 4)
@@ -81,6 +87,7 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
             raise ValueError("SenseNova predicts the image latent modality")
         if not inputs.batch_size:
             return {"image": ()}
+
         for latent, size, conditioning, count in zip(
             inputs.latents["image"],
             inputs.sizes,
@@ -97,11 +104,13 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
                 raise ValueError(
                     "SenseNova samples and conditioning must cover their declared image dimensions"
                 )
+
         pipeline = self.mesh.get_group("pp" if "pp" in self.mesh.axes else ())
         hidden = None
         if pipeline.rank == 0:
             patch = self.config.vision.patch_size
             shapes = tuple((size.height // patch, size.width // patch) for size in inputs.sizes)
+            # [1, 3, H, W] pixels -> [patches, 3*patch*patch] rows per image.
             pixels = torch.cat(
                 tuple(
                     value.pixels.reshape(1, 3, height, patch, width, patch)
@@ -130,6 +139,7 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
                     )
                 )
                 hidden = hidden + self.noise_embedding(scales / self.noise_scale.maximum)
+
         hidden = self.backbone(
             hidden,
             torch.cat(inputs.positions, dim=1),
@@ -138,6 +148,7 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         )
         if pipeline.rank != pipeline.size - 1:
             return {"image": (None,) * inputs.batch_size}
+
         outputs = []
         for features, latent, size, conditioning in zip(
             hidden.split(inputs.sequence_lengths),

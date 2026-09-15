@@ -8,6 +8,8 @@ from .image import ImageBuilder
 
 
 class BagelBuilder(ImageBuilder):
+    """Construct BAGEL's denoising inputs with its two framing tokens."""
+
     framing = 2
     image_unconditional = BranchSource.CONDITIONING
 
@@ -16,6 +18,7 @@ class BagelBuilder(ImageBuilder):
         return self.denoiser.config.max_latent_size**2
 
     def bind(self, *, samples, sizes, timesteps, positions, attention, step_index):
+        """Assemble one denoising step's typed input from resident tensors."""
         return DenoiserInput(
             latents={
                 "image": tuple(

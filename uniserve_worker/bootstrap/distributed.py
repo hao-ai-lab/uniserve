@@ -38,6 +38,7 @@ def initialize_entries(
 
     if not entries or not any(groups.rank in entry.ranks for entry in entries.values()):
         raise ValueError("rank has no configured computation entry")
+
     return {
         name: ModelEntry(name, config, groups.process_group, meshes.get(name), groups.device)
         for name, config in entries.items()

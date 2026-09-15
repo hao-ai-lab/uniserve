@@ -11,6 +11,8 @@ _ACTIVE = ContextVar("uniserve_transfers", default=None)
 
 
 def _map(value, function):
+    """Apply ``function`` to every tensor inside a nested argument structure."""
+
     if isinstance(value, torch.Tensor):
         return function(value)
     if is_dataclass(value) and not isinstance(value, type):
@@ -59,6 +61,8 @@ class _Binding:
         self.calls = ContextVar("uniserve_transfer_calls", default=())
 
     def prepare(self, args, kwargs):
+        """Record the caller's devices, select the delivery stream, and move inputs."""
+
         devices = []
 
         def locate(value):
@@ -67,6 +71,7 @@ class _Binding:
 
         _map((args, kwargs), locate)
         target = devices[0] if devices else None
+
         origin = torch.cuda.current_stream() if self.device.type == "cuda" else None
         stream = origin
         if origin is not None and origin.device != self.device:
@@ -84,6 +89,7 @@ class _Binding:
                 stream = torch.cuda.Stream(device=self.device)
             self.streams[key] = stream
             self.streams[(stream.device, stream.cuda_stream, origin.device)] = origin
+
         scope = ExitStack()
         self.calls.set((*self.calls.get(), _Call(target, scope, origin, stream, kwargs.get("out"))))
         if stream is not None:
@@ -91,17 +97,21 @@ class _Binding:
                 stream.wait_stream(origin)
             scope.enter_context(torch.cuda.device(self.device))
             scope.enter_context(torch.cuda.stream(stream))
+
         return _map(
             (args, kwargs),
             lambda value: value.to(self.device, non_blocking=self.device.type != "cpu"),
         )
 
     def finish(self, result):
+        """Return outputs to the caller's device and rejoin its origin stream."""
+
         calls = self.calls.get()
         if not calls:
             return result
         call = calls[-1]
         self.calls.set(calls[:-1])
+
         try:
             if call.target is None or result is None:
                 return result
@@ -128,6 +138,9 @@ class _Transfers:
 
     def __init__(self, module, device):
         self.modules, self.bindings, self.streams = {}, {}, {}
+
+        # A submodule inherits its parent's placement unless every parameter
+        # (or, failing that, every buffer) agrees on one different device.
         inherited = {"": device}
         for path, child in module.named_modules(remove_duplicate=False):
             parent = inherited[path.rpartition(".")[0]]

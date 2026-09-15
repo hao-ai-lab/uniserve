@@ -183,6 +183,7 @@ class AvMuxSession:
                 raise RuntimeError("audio was muxed more than once")
             if pcm.ndim != 2 or pcm.shape[1] != 2:
                 raise RuntimeError("audio capture has invalid stereo dimensions")
+
             self._open()
             container, stream = self._container, self._audio
             if container is None or stream is None:
@@ -225,6 +226,7 @@ class AvMuxSession:
                 return value
             if self._video_frames != config.frame_count or not self._audio_written:
                 raise RuntimeError("media materialization is incomplete")
+
             container, video, audio = self._container, self._video, self._audio
             if container is None or video is None or audio is None:
                 raise RuntimeError("media mux session was never initialized")
@@ -374,6 +376,7 @@ class MediaMux:
 
         self.validate_track(request_key, MediaTrack.VIDEO, start_unit, unit_count)
         dependency = self._sessions[request_key].video_tail
+
         task = self._task(
             request_key,
             reservation,
@@ -405,6 +408,9 @@ class MediaMux:
 
         self.validate_track(request_key, MediaTrack.AUDIO, 0, 1)
         dependency = self._sessions[request_key].audio_tail
+
+        # The ring slot holds raw PCM bytes; reinterpret them as [samples, 2]
+        # int16 stereo samples for the encoder.
         task = self._task(
             request_key,
             reservation,
@@ -439,6 +445,7 @@ class MediaMux:
             or state.finalized
         ):
             raise invalid_descriptor("media finalization requires both completed output tracks")
+
         dependencies = tuple(
             tail
             for tail in (

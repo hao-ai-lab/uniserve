@@ -37,6 +37,7 @@ if triton is not None:
 
         offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         mask = offsets < elements
+
         output_width: tl.constexpr = width * PATCH_WIDTH
         output_height: tl.constexpr = height * PATCH_HEIGHT
         output_frames: tl.constexpr = frames * PATCH_FRAMES
@@ -44,7 +45,8 @@ if triton is not None:
         output_volume: tl.constexpr = output_frames * output_spatial
         output_channels: tl.constexpr = CHANNELS * output_volume
 
-        # Decompose a planar output offset, then invert the decoder's patch packing.
+        # Decompose a planar output offset into [batch, channel, frame, row, col]
+        # coordinates of the unpacked video.
         batch = offsets // output_channels
         remainder = offsets - batch * output_channels
         channel = remainder // output_volume
@@ -53,6 +55,9 @@ if triton is not None:
         remainder -= output_frame * output_spatial
         output_row = remainder // output_width
         output_column = remainder - output_row * output_width
+
+        # Invert the decoder's patch packing: locate the source patch and the
+        # element's position within that patch.
         frame = output_frame // PATCH_FRAMES
         temporal_patch = output_frame - frame * PATCH_FRAMES
         patch_row = output_row // PATCH_HEIGHT
@@ -63,6 +68,8 @@ if triton is not None:
         patch_channel = (
             ((channel * PATCH_FRAMES + temporal_patch) * PATCH_HEIGHT + inner_row) * PATCH_WIDTH
         ) + inner_column
+
+        # Source tokens are [batch, patch, channel-major patch volume].
         source_offsets = (batch * sequence + patch) * (
             CHANNELS * PATCH_FRAMES * PATCH_HEIGHT * PATCH_WIDTH
         ) + patch_channel
@@ -88,10 +95,12 @@ def unpatchify_video_tokens(
 
     if source.ndim != 3 or min(*grid_shape, *patch_shape) < 1:
         raise ValueError("video unpacking requires positive grid/patch dimensions and token rows")
+
     batch, sequence, token_width = source.shape
     frames, height, width = grid_shape
     patch_frames, patch_height, patch_width = patch_shape
     patch_volume = patch_frames * patch_height * patch_width
+
     if token_width % patch_volume or batch < 1:
         raise ValueError("token width must contain a positive integral channel count")
     channels = token_width // patch_volume
@@ -99,6 +108,7 @@ def unpatchify_video_tokens(
         raise ValueError("video unpacking has fewer tokens or channels than required")
     if bias is not None and (bias.shape != (token_width,) or bias.device != source.device):
         raise ValueError("patch bias must match the token width and device")
+
     if not (
         source.is_cuda
         and triton_available(source.device)
@@ -106,6 +116,7 @@ def unpatchify_video_tokens(
         and source.is_contiguous()
         and (bias is None or (bias.is_contiguous() and bias.dtype == source.dtype))
     ):
+        # Eager fallback: rearrange tokens with a permute instead of the kernel.
         if bias is not None:
             source = (source + bias).to(source.dtype)
         value = source[:, : frames * height * width].reshape(
@@ -118,11 +129,13 @@ def unpatchify_video_tokens(
                 batch, channels, frames * patch_frames, height * patch_height, width * patch_width
             )
         )
+
     output = torch.empty(
         (batch, channels, frames * patch_frames, height * patch_height, width * patch_width),
         dtype=source.dtype,
         device=source.device,
     )
+
     _unpatchify_video_tokens_kernel[(triton.cdiv(output.numel(), 1024),)](
         source,
         bias,

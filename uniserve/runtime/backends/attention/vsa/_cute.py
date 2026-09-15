@@ -109,6 +109,9 @@ def _compile_key(
     device_index = query.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
+
+    # The leading entries mirror the static kernel configuration in _compile;
+    # the trailing entries capture each tensor's ABI so layouts respecialize.
     return (
         device_index,
         torch.cuda.get_device_capability(query.device),
@@ -158,6 +161,7 @@ def _compile(
 
     if _cute is None or _kernel_type is None:
         raise RuntimeError("CuTe sparse video attention is unavailable") from _IMPORT_ERROR
+
     kernel = _kernel_type(
         head_dim=128,
         head_dim_v=128,
@@ -223,6 +227,7 @@ def _validate(
         raise ValueError("CuTe sparse attention strides must preserve 16-byte alignment")
     if any(tensor.data_ptr() % 16 for tensor in (query, key, value, output)):
         raise ValueError("CuTe sparse attention pointers must be 16-byte aligned")
+
     rows = int(query.shape[0])
     if rows % 64 or key.shape[0] % 64:
         raise ValueError("CuTe sparse attention rows must be a multiple of 64")
@@ -286,6 +291,8 @@ def block_sparse_attention(
         lse,
     )
     with torch.cuda.device(query.device):
+        # The kernel consumes [batch=1, heads, rows, dim] views of the
+        # caller's [rows, heads, dim] tensors; no data is moved.
         q_bhsd = query.unsqueeze(0).transpose(1, 2)
         k_bhsd = key.unsqueeze(0).transpose(1, 2)
         v_bhsd = value.unsqueeze(0).transpose(1, 2)
@@ -293,9 +300,11 @@ def block_sparse_attention(
         indices = block_indices.unsqueeze(0)
         counts = block_counts.unsqueeze(0)
         lse_bhq = None if lse is None else lse.unsqueeze(0)
+
         if _requires_int64_kv_strides is None:
             raise RuntimeError("CuTe sparse video attention stride validation is unavailable")
         use_int64_kv_strides = bool(_requires_int64_kv_strides(k_bhsd, v_bhsd))
+
         cache_key = _compile_key(
             q_bhsd,
             k_bhsd,
@@ -327,6 +336,7 @@ def block_sparse_attention(
                 allow_empty_blocks,
             )
             _EXECUTORS[cache_key] = executor
+
         if _cuda_driver is None:
             raise RuntimeError("CUDA driver bindings are unavailable") from _IMPORT_ERROR
         executor(

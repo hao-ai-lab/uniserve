@@ -51,6 +51,7 @@ def input_buffer_config(
     text = capability(model, CausalLM)
     if text is None:
         raise ValueError("text input staging requires a causal language model")
+
     max_rows = min(
         config.max_request_pool_size,
         config.max_batch_operations,
@@ -64,6 +65,7 @@ def input_buffer_config(
         if config.lanes
         else config.max_batch_tokens
     )
+
     flow = image_builder(model)
     branches = 1 if flow is None else len(Branch)
     injection = None if processor is None else processor.feature_injection
@@ -77,6 +79,7 @@ def input_buffer_config(
         + (2 if injection.layout is FeatureLayout.FRAMED else 0)
     )
     text_tokens = max_tokens + image_span
+
     if flow is None:
         flow_tokens = 0
     else:
@@ -91,6 +94,7 @@ def input_buffer_config(
                 ),
             )
         )
+
     return InputBufferConfig(
         max_rows=max_rows * branches,
         # Text and diffusion use separate homogeneous calls on this lane.
@@ -136,6 +140,7 @@ def tensor_slot_capacity(
     bytes_per_slot = sum(field.nbytes for field in schema.values() if not field.host)
     if minimum < 1 or maximum < minimum:
         raise ValueError("request tensor capacity requires valid slot bounds")
+
     candidates = range(minimum, maximum + 1)
     requirements = [count * bytes_per_slot + auxiliary_bytes(count) for count in candidates]
     agreed = torch.tensor(
@@ -144,9 +149,11 @@ def tensor_slot_capacity(
         device=group.device,
     )
     group.all_reduce(agreed, op="min")
+
     feasible = [count for count, fits in zip(candidates, agreed.cpu().tolist()) if fits]
     if feasible:
         return feasible[-1]
+
     raise RuntimeError(
         "insufficient device memory for a common request tensor slot count: "
         f"candidate range {minimum}..{maximum}, local requirements {requirements}, "
@@ -203,6 +210,7 @@ def local_product_storage_bytes(
 
     if max_unresolved_ops < 1:
         raise ValueError("product storage requires a positive output horizon")
+
     consumers: dict[str, set[str]] = {}
     # These are the concrete persistent Tensor consumers of the video path.
     # Denoising state is resident; write stages consume decoded output buffers.
@@ -235,10 +243,12 @@ def local_product_storage_bytes(
             )
             if not produces and not consumes:
                 continue
+
         units_per_operation = 1
         if producer is not None and entry in streamed:
             config = producer.config
             units_per_operation = len(config.ranks) * config.units_per_rank
+
         for output in outputs:
             size = output.max_bytes
             if entry in streamed:
@@ -257,6 +267,7 @@ def local_product_storage_bytes(
                     live_groups = min(ceil_div(max_units, units_per_operation), max_unresolved_ops)
                 size = live_groups * ceil_div(group_bytes, 256) * 256
             total += ceil_div(size, 256) * 256
+
     return total
 
 
@@ -302,6 +313,8 @@ def latent_pool_capacity_bytes(
     element_bytes = int(dtype_bytes)
     if min(slots, units, width, element_bytes) < 1 or pages < 2:
         raise ValueError("latent pool dimensions are invalid")
+
+    # One page stays reserved as the sentinel; only usable pages hold trajectories.
     usable_pages = pages - 1
     storage = 2 * pages * units * width * element_bytes
     step_buffer = usable_pages * units * width * element_bytes
@@ -393,6 +406,7 @@ def model_arena_capacity(
     slots = depth * max_operations
     if state_buffers is None:
         state_buffers = media_state_buffers(model, bindings or {}, worker_config)
+
     if capability(model, VideoPostprocessor) is not None or state_buffers:
         return request_tensor_arena_capacity(
             worker_config,
@@ -404,9 +418,11 @@ def model_arena_capacity(
                 max_unresolved_ops=request_tensor_window(depth, request_pool_size),
             ),
         )
+
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
     block_size = int(worker_config.block_size)
     flow = image_builder(model)
+
     latent_pool_bytes = 0
     latent_transfer_bytes = 0
     if flow is not None:
@@ -436,6 +452,7 @@ def model_arena_capacity(
         int(max_vision_feature_bytes),
         1,
     )
+
     device_product_slots = slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
     tensor_store = _DEVICE_PRODUCTS_PER_OPERATION * device_product_slots
     device_count = len(
@@ -528,6 +545,7 @@ def derive_runtime_kv_capacity(
         raise ValueError("KV capacity dimensions must be positive")
     if available_bytes is not None and available_bytes < 0:
         raise ValueError("KV memory grant must not be negative")
+
     if kv_token_capacity is not None:
         if kv_token_capacity <= 0:
             raise ValueError("configured KV token capacity must be positive")
@@ -540,11 +558,13 @@ def derive_runtime_kv_capacity(
         raise ValueError("automatic CUDA KV sizing requires a host memory grant")
     else:
         blocks = derive_num_blocks(block, None, default_blocks=default_blocks, floor=floor)
+
     if (
         available_bytes is not None
         and (resident_copies * blocks + co_resident_blocks) * block * token_bytes > available_bytes
     ):
         raise ValueError("configured KV storage exceeds the device memory grant")
+
     return RuntimeKVCapacity(
         block_size=block,
         bytes_per_token=token_bytes,
@@ -590,6 +610,7 @@ def resolve_request_capacity(
             if state_buffers is None
             else state_buffers
         )
+
         if capability(model, VideoPostprocessor) is not None or schema:
             if capacity_group is None:
                 raise unsupported_setup("request tensor sizing requires its rank group")

@@ -16,17 +16,26 @@ checkpoint_sources = (checkpoint.Config("primary"),)
 
 
 def _backbone_names(backbone: Transformer):
+    """Translate backbone parameter paths to checkpoint language_model names.
+
+    Text experts keep the plain checkpoint names; flow experts carry the
+    ``_mot_gen`` suffix. QK norms split into temporal and spatial (``_hw``)
+    checkpoint tensors. Only layers resident on this pipeline rank appear.
+    """
+
     names = {
         "embedding.weight": "embed_tokens.weight",
         "norm.text.weight": "norm.weight",
         "norm.flow.weight": "norm_mot_gen.weight",
     }
+
     for path, _ in backbone.named_parameters():
         if not path.startswith("layers."):
             continue
         _, index, kind, route, *parts = path.split(".")
         suffix = "" if route == "text" else "_mot_gen"
         tail = ".".join(parts)
+
         if kind in ("input_norms", "post_attention_norms"):
             target = (
                 ("input_layernorm" if kind == "input_norms" else "post_attention_layernorm")
@@ -51,11 +60,15 @@ def _backbone_names(backbone: Transformer):
             target = f"mlp{suffix}.{tail}"
         else:
             raise ValueError(f"unmapped SenseNova backbone parameter {path}")
+
         names[path] = f"layers.{index}.{target}"
+
     return {target: "language_model.model." + source for target, source in names.items()}
 
 
 def _mapped(module, names, *, nonresident=frozenset()):
+    """Build a primary-source mapping that skips tensors absent from the file."""
+
     def map_weights(reader):
         available = frozenset(reader.names())
         return tuple(
@@ -74,8 +87,12 @@ def _mapped(module, names, *, nonresident=frozenset()):
 
 
 def checkpoint_mappings(model: Model):
+    """Assign every resident module its checkpoint tensors per pipeline rank."""
+
     backbone = model.text.backbone
     names = _backbone_names(backbone)
+
+    # PP omits only the source layers and terminal modules assigned elsewhere.
     template = tuple(
         source.split(".", 4)[-1]
         for target, source in names.items()
@@ -93,6 +110,8 @@ def checkpoint_mappings(model: Model):
         nonresident.update(
             ("language_model.model.norm.weight", "language_model.model.norm_mot_gen.weight")
         )
+
+    # A tied head reads the embedding tensor instead of a separate lm_head.
     head_name = (
         "language_model.model.embed_tokens.weight"
         if model.config.text.tie_word_embeddings
@@ -100,9 +119,11 @@ def checkpoint_mappings(model: Model):
     )
     if model.text.lm_head is None or model.config.text.tie_word_embeddings:
         nonresident.add("language_model.lm_head.weight")
+
     components = [_mapped(backbone, names, nonresident=frozenset(nonresident))]
     if model.text.lm_head is not None:
         components.append(_mapped(model.text, {"lm_head.weight": head_name}))
+
     denoiser_names = {}
     for path, prefix in (
         ("input", "fm_modules.vision_model_mot_gen.embeddings."),
@@ -121,6 +142,9 @@ def checkpoint_mappings(model: Model):
                 for name, _ in model.denoiser.noise_embedding.projection.named_parameters()
             }
         )
+
+    # The three checkpoint head variants store the same parameters under
+    # different name schemes; translate each into fm_modules.fm_head names.
     for name, _ in model.denoiser.prediction.named_parameters():
         if model.config.flow.use_pixel_head:
             source = name.replace("decoder.blocks.1.", "conv1.").replace(
@@ -143,6 +167,7 @@ def checkpoint_mappings(model: Model):
             source = "net." + source
         denoiser_names["prediction." + name] = "fm_modules.fm_head." + source
     components.append(_mapped(model.denoiser, denoiser_names))
+
     components.append(
         _mapped(
             model.vision_encoder,

@@ -17,13 +17,21 @@ from . import Operator as _Operator
 
 
 def _paged(value, table, length):
+    """Gather one sequence's live prefix pages into compact [length, heads, dim] form.
+
+    The cache backing is [blocks, tokens, heads, dim]; per-block FP8 state is
+    dequantized during the gather.
+    """
+
     if value.ndim != 4 or length < 0:
         raise ValueError("paged attention requires [blocks, tokens, heads, dim] backing")
     if length == 0:
         return torch.empty((0, *value.shape[2:]), dtype=value.dtype, device=value.device)
+
     count = (length + value.shape[1] - 1) // value.shape[1]
     if table.numel() < count:
         raise ValueError("block table does not cover the requested key sequence")
+
     indices = table[:count].to(device=value.device, dtype=torch.int64)
     if isinstance(value, QuantizedTensor):
         if value.quantizer.format != "fp8" or value.quantizer.axis != 0:
@@ -43,11 +51,15 @@ def _dense(q, k, v, *, causal, scale, mask=None):
     packed = q.ndim == 3
     if packed:
         q, k, v = (value.transpose(0, 1).unsqueeze(0) for value in (q, k, v))
+
     if k.shape[-2] == 0:
         result = torch.zeros_like(q)
     else:
         causal_flag = causal and mask is None
+
         if causal and (mask is not None or q.shape[-2] != k.shape[-2]):
+            # SDPA's is_causal assumes square Q/K alignment and no custom mask;
+            # fold causality into an explicit visibility mask otherwise.
             query_positions = torch.arange(q.shape[-2], device=q.device) + k.shape[-2] - q.shape[-2]
             key_positions = torch.arange(k.shape[-2], device=q.device)
             visible = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
@@ -58,10 +70,12 @@ def _dense(q, k, v, *, causal, scale, mask=None):
             else:
                 mask = mask.to(device=q.device, dtype=torch.bool) & visible
             causal_flag = False
+
         if mask is not None:
             mask = mask.to(
                 device=q.device, dtype=q.dtype if mask.dtype.is_floating_point else torch.bool
             )
+
         result = F.scaled_dot_product_attention(
             q,
             k,
@@ -75,22 +89,34 @@ def _dense(q, k, v, *, causal, scale, mask=None):
 
 
 def _state(q, k, v, *, scale, allowed):
+    """Evaluate one attention segment in float32, returning (output, logsumexp).
+
+    q/k/v are [tokens, heads, dim]; `allowed` is an optional [queries, keys]
+    visibility mask shared across heads. A fully masked row yields NaN
+    probabilities, which nan_to_num resets to zero output with -inf LSE.
+    """
+
     if k.shape[0] == 0:
         return torch.zeros_like(q), torch.full(
             q.shape[:2], -torch.inf, dtype=torch.float32, device=q.device
         )
+
     copies = q.shape[1] // k.shape[1]
     if copies > 1:
         k, v = k.repeat_interleave(copies, dim=1), v.repeat_interleave(copies, dim=1)
+
     scores = torch.einsum("qhd,khd->qhk", q.float(), k.float()) * scale
     if allowed is not None:
         scores.masked_fill_(~allowed.unsqueeze(1), -torch.inf)
+
     lse = torch.logsumexp(scores, dim=-1)
     probabilities = torch.softmax(scores, dim=-1).nan_to_num(0).to(v.dtype)
     return torch.einsum("qhk,khd->qhd", probabilities, v).to(q.dtype), lse
 
 
 def _merge(first, second):
+    """Combine two (output, lse) partial attention states with online softmax."""
+
     a, alse = first
     b, blse = second
     maximum = torch.logaddexp(alse, blse)
@@ -125,6 +151,7 @@ def _captured(q, k, v, batch, cache, scale):
         query_count = batch.queries.values[row]
         local_query = query_indices - query_start
         queries = (local_query >= 0) & (local_query < query_count)
+
         if isinstance(batch, (PagedInput, SegmentedInput)) or (
             isinstance(batch, VisibleInput) and batch.block_table is not None
         ):
@@ -142,12 +169,14 @@ def _captured(q, k, v, batch, cache, scale):
             keys, values = k, v
             key_count = batch.keys.values[row]
             local_key = key_indices - batch.keys.offsets[row]
+
         valid_keys = (local_key >= 0) & (local_key < key_count)
         # Unused cache slots can contain arbitrary bytes, including NaNs.
         # Remove them before the matrix products rather than relying on a
         # later score mask to suppress invalid floating-point operands.
         keys = torch.where(valid_keys[:, None, None], keys, 0)
         values = torch.where(valid_keys[:, None, None], values, 0)
+
         allowed = queries[:, None] & valid_keys[None, :]
         if isinstance(batch, (PagedInput, VarlenInput)) and batch.causal[row]:
             allowed &= local_key[None, :] <= (local_query + key_count - query_count)[:, None]
@@ -155,6 +184,7 @@ def _captured(q, k, v, batch, cache, scale):
             ends = batch.visible_end[row]
             visible = ends[local_query.clamp(0, ends.numel() - 1)]
             allowed &= local_key[None, :] < visible[:, None]
+
         if isinstance(batch, SegmentedInput):
             current_key = key_indices - query_start
             current_keys = (current_key >= 0) & (current_key < query_count)
@@ -186,21 +216,28 @@ def _captured(q, k, v, batch, cache, scale):
 class _TorchOperator(_Operator):
     def __call__(self, q, k, v, batch, *, scale, out):
         self._validate(q, k, v, batch, out)
+
         if isinstance(batch, (PagedInput, SegmentedInput)) and batch.write_indices is not None:
             self.update_cache(k, v, indices=batch.write_indices)
+
         if isinstance(batch, DenseInput):
             return out.copy_(_dense(q, k, v, causal=batch.causal, scale=scale, mask=batch.mask))
+
         if q.ndim != 3 or (
             batch.queries.num_tokens is not None and q.shape[0] != batch.queries.num_tokens
         ):
             raise ValueError("packed attention rows must match their declared token lengths")
+
         if isinstance(batch, SegmentedInput) and self.cache is None:
             raise RuntimeError("segmented attention requires bound prefix state")
+
         if q.is_cuda and torch.cuda.is_current_stream_capturing():
             return out.copy_(_captured(q, k, v, batch, self.cache, scale))
+
         qstart = kstart = 0
         for row, count in enumerate(batch.queries.host):
             query = q[qstart : qstart + count]
+
             if isinstance(batch, VarlenInput):
                 key_count = batch.keys.host[row]
                 keys, values = k[kstart : kstart + key_count], v[kstart : kstart + key_count]
@@ -256,8 +293,10 @@ class _TorchOperator(_Operator):
                 )
             else:
                 raise TypeError("unsupported numerical attention input")
+
             out[qstart : qstart + count].copy_(result)
             qstart += count
+
         return out
 
 

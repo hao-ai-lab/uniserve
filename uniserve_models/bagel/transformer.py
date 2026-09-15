@@ -64,11 +64,15 @@ class TransformerLayer(nn.Module):
     ):
         hidden = hidden if residual is None else hidden.add(residual)
         normalized = hidden.apply(self.input_norms)
+
+        # All routes share one temporal rotary domain; only the expert
+        # projections, outputs, and MLPs differ per route.
         temporal = positions if positions.ndim == 1 else positions[0]
         cosine, sine = self.rotary(temporal, dtype=torch.float32, sequence_length=temporal.numel())
         route_names = frozenset(hidden.values)
         cos = RoutedTensor.from_packed(cosine, routes, routes=route_names)
         sin = RoutedTensor.from_packed(sine, routes, routes=route_names)
+
         projected = {
             route: self.projections[route](value, (cos.values[route],), (sin.values[route],))
             for route, value in normalized.values.items()
@@ -79,9 +83,11 @@ class TransformerLayer(nn.Module):
             )
             for index in range(3)
         )
+
         attended = self.attention(query, key, value, attention).flatten(1)
         update = RoutedTensor.from_packed(attended, routes, routes=route_names).apply(self.outputs)
         residual = hidden.add(update)
+
         normalized = residual.apply(self.post_attention_norms)
         # The checkpoint's expert FFNs consume BF16 normalization results,
         # including when their surrounding accumulation is higher precision.
@@ -92,6 +98,8 @@ class TransformerLayer(nn.Module):
 
 
 class Transformer(TransformerDecoder):
+    """Stack routed MoT layers over a shared embedding with per-route norms."""
+
     def __init__(self, config: TransformerConfig):
         super().__init__(
             VocabParallelEmbedding(config.vocab_size, config.hidden_size),

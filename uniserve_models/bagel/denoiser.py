@@ -19,6 +19,8 @@ from .transformer import Transformer
 
 
 class Denoiser(ImageDenoiser[DenoiserInput]):
+    """Predict image-latent velocity through the shared text/flow backbone."""
+
     def __init__(self, config: Config, backbone: Transformer):
         super().__init__(
             patch_size=config.latent_patch_size,
@@ -73,6 +75,7 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
     def forward(self, inputs: DenoiserInput, *, state, constants, workspace):
         if set(inputs.latents) != {"image"}:
             raise ValueError("BAGEL predicts the image latent modality")
+
         group = self.mesh.get_group("pp" if "pp" in self.mesh.axes else ())
         chunks, routes = [], []
         cursor = 0
@@ -86,16 +89,20 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
             shape = self.latent_shape("image", size)
             if latent.tensor.shape != shape or count != shape[0] + 2:
                 raise ValueError("BAGEL latents must cover their framed image sequence")
+
             if group.rank == 0:
+                # Frame latent features with embedded start/end-of-image markers;
+                # the marker rows route as text, the interior rows as flow.
                 marker = self.backbone.embed_input_ids(self.markers).to(torch.bfloat16)
                 coordinates = positions[1, 1:-1] * self.config.max_latent_size + positions[2, 1:-1]
-                features = self.input(latent.tensor.to(torch.bfloat16))
+                features = self.input(latent.tensor.to(torch.bfloat16))  # [latents, hidden]
                 features = (
                     features
                     + self.time_embedding(latent.timestep.reshape(1).expand(shape[0]))
                     + self.position(coordinates)
                 ).to(torch.bfloat16)
                 chunks.append(torch.cat((marker[:1], features, marker[1:])))
+
             routes.extend(
                 (
                     RouteSpan("text", cursor, 1),
@@ -104,8 +111,10 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
                 )
             )
             cursor += count
+
         if not inputs.batch_size:
             return {"image": ()}
+
         hidden = self.backbone(
             torch.cat(chunks) if group.rank == 0 else None,
             torch.cat(inputs.positions, dim=1),
@@ -114,10 +123,12 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         )
         if group.rank != group.size - 1:
             return {"image": (None,) * inputs.batch_size}
+
         outputs = []
         for hidden_row, size in zip(
             hidden.split(inputs.sequence_lengths), inputs.sizes, strict=True
         ):
+            # Strip the framing markers before predicting per-latent patches.
             prediction = self.prediction(hidden_row[1:-1].to(torch.bfloat16))
             shape = self.latent_shape("image", size)
             outputs.append(

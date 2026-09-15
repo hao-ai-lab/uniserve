@@ -54,6 +54,7 @@ def silu_and_mul(x: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.T
 
     if x.ndim < 1 or x.shape[-1] % 2:
         raise ValueError("gating requires equal channel halves")
+
     if isinstance(out, QuantizedTensor):
         from uniserve.quantization import Quantizer
 
@@ -66,6 +67,7 @@ def silu_and_mul(x: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.T
             # must not silently become one separate scale per flattened row.
             encoded = out.quantizer.quantize(activated)
             return _result(encoded.to(dtype=x.dtype), out)
+
         values, scales = ops.silu_and_mul_fp8(x)
         encoded = out.quantizer.from_tensors(
             {"values": values, "scale": scales.reshape(*x.shape[:-1], 1)},
@@ -73,6 +75,7 @@ def silu_and_mul(x: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.T
             dtype=x.dtype,
         )
         return _result(encoded, out)
+
     return _result(ops.silu_and_mul(x), out)
 
 
@@ -102,9 +105,11 @@ def attention(q, k, v, batch, *, scale: float, out=None):
 
     if q.ndim not in {3, 4}:
         raise ValueError("attention requires packed THD or dense BHTD tensors")
+
     size = (
         TextSize(
-            q.shape[0] if q.ndim == 3 else q.shape[0] * q.shape[2], 1 if q.ndim == 3 else q.shape[0]
+            q.shape[0] if q.ndim == 3 else q.shape[0] * q.shape[2],
+            1 if q.ndim == 3 else q.shape[0],
         )
         if isinstance(batch, DenseInput)
         else TextSize(q.shape[0], batch.queries.batch_size)
@@ -118,6 +123,7 @@ def attention(q, k, v, batch, *, scale: float, out=None):
         size=size,
         cache=None,
     )
+
     provider = resolve("auto", device=q.device)
     requirements = provider.workspace_buffers(**options)
     with TensorBuffers.allocate(requirements, device=q.device) as buffers:
@@ -156,8 +162,11 @@ def apply_rotary(x, cos, sin, *, rotation: Literal["interleaved", "split"], out=
         from uniserve import ops
 
         return _result(ops.apply_rotary_emb(x, cos, sin), out)
+
+    # Factors broadcast over the omitted head axis: [..., 1, width / 2].
     cosine, sine = cos.float().unsqueeze(-2), sin.float().unsqueeze(-2)
     prefix = x[..., :width].float()
+    # Split pairs the two half-widths; interleaved pairs adjacent coordinates.
     first, second = (
         prefix.chunk(2, dim=-1) if rotation == "split" else (prefix[..., ::2], prefix[..., 1::2])
     )
@@ -167,6 +176,7 @@ def apply_rotary(x, cos, sin, *, rotation: Literal["interleaved", "split"], out=
         if rotation == "split"
         else torch.stack((left, right), dim=-1).flatten(-2)
     ).to(x.dtype)
+
     if width < x.shape[-1]:
         rotated = torch.cat((rotated, x[..., width:]), dim=-1)
     return _result(rotated, out)
@@ -193,6 +203,7 @@ def qk_norm_rope(q, k, q_weight, k_weight, cos, sin, *, eps: float, axis_dims, o
         or k_weight.shape != q_weight.shape
     ):
         raise ValueError("Q/K rotary axes must partition the normalized head width")
+
     if len(axis_dims) == 1 and cos[0].shape[-1] * 2 < axis_dims[0]:
         # Normalize the complete head before rotating its leading coordinates.
         # Compact factors are consumed directly by the native kernel, including
@@ -218,6 +229,7 @@ def qk_norm_rope(q, k, q_weight, k_weight, cos, sin, *, eps: float, axis_dims, o
                 value = value * weight.float()
                 target.copy_(apply_rotary(value, cos[0], sin[0], rotation="split").to(source.dtype))
         return query, key
+
     if len(axis_dims) == 1:
         query, key = ops.qk_norm_rope(q, k, q_weight, k_weight, cos[0], sin[0], eps)
     else:
@@ -237,12 +249,16 @@ def qk_norm_rope(q, k, q_weight, k_weight, cos, sin, *, eps: float, axis_dims, o
 
 
 def _matrix(x: torch.Tensor) -> torch.Tensor:
+    """Flatten leading axes into logical GEMM rows, preserving encoded layouts."""
+
     if x.ndim == 2:
         return x
     shape = (prod(x.shape[:-1]), x.shape[-1])
     if not isinstance(x, QuantizedTensor):
         return x.reshape(shape)
+
     fields = dict(x.buffers())
+    # nvfp4 packs two values per byte, so its physical row width halves.
     fields["values"] = fields["values"].reshape(
         shape if x.quantizer.format != "nvfp4" else (shape[0], shape[1] // 2)
     )
@@ -303,6 +319,7 @@ def _linear(
         bias is not None and (bias.shape != (weight.shape[0],) or bias.device != x.device)
     ):
         raise ValueError("linear weights and bias must match output channels and device")
+
     result = torch.empty(shape, dtype=dtype, device=x.device) if out is None else out
     matrix = _matrix(x)
     if operator is None:
@@ -311,6 +328,7 @@ def _linear(
         operator = _binding.matmul.get().get(id(weight))
     if operator is None:
         operator = _operator(weight, matrix, dtype)
+
     destination = (
         result
         if result.is_contiguous()
@@ -354,6 +372,7 @@ def _merged_linear(
         for name, value in out.items()
     ):
         raise ValueError("merged outputs must match branch shape, dtype and device")
+
     if out is None:
         # Logical branches share caller-owned output storage. A fused GEMM can
         # write this matrix directly, and its consumers can borrow adjacent
@@ -363,6 +382,7 @@ def _merged_linear(
         outputs = dict(zip(weights, packed.split(widths, dim=-1), strict=True))
     else:
         outputs = out
+
     matrix = _matrix(x)
     if operator is None:
         from . import _binding
@@ -393,6 +413,7 @@ def _merged_linear(
             output_dtype=dtype,
             workspace=workspace,
         )
+
     destinations = {}
     for name, value in outputs.items():
         try:
@@ -403,6 +424,7 @@ def _merged_linear(
             destinations[name] = torch.empty(
                 (matrix.shape[0], weights[name].shape[0]), dtype=dtype, device=x.device
             )
+
     operator(matrix, biases, out=destinations)
     for name, value in destinations.items():
         if value.untyped_storage().data_ptr() != outputs[name].untyped_storage().data_ptr():
@@ -426,13 +448,16 @@ def merged_linear(x, weights, biases, *, branch_width=None, output_dtype=None, o
 
 def patchify(images: torch.Tensor, *, patch_size: int) -> torch.Tensor:
     """Pack CHW or NCHW images in spatial-patch, pixel, then channel order."""
+
     if type(patch_size) is not int or patch_size < 1 or images.ndim not in {3, 4}:
         raise ValueError("patching requires CHW/NCHW images and a positive patch size")
     channels, height, width = images.shape[-3:]
     if height % patch_size or width % patch_size:
         raise ValueError("image dimensions must be divisible by the patch size")
+
     batch = images.shape[0] if images.ndim == 4 else 1
     rows, columns = height // patch_size, width // patch_size
+    # [batch, rows * columns, patch_size**2 * channels]
     result = (
         images.reshape(batch, channels, rows, patch_size, columns, patch_size)
         .permute(0, 2, 4, 3, 5, 1)
@@ -443,6 +468,7 @@ def patchify(images: torch.Tensor, *, patch_size: int) -> torch.Tensor:
 
 def unpatchify(patches: torch.Tensor, size, *, patch_size: int, channels: int) -> torch.Tensor:
     """Restore canonical patch rows into a CHW or NCHW image of the explicit size."""
+
     if (
         type(patch_size) is not int
         or patch_size < 1
@@ -456,7 +482,9 @@ def unpatchify(patches: torch.Tensor, size, *, patch_size: int, channels: int) -
     rows, columns = size.height // patch_size, size.width // patch_size
     if patches.shape[-2:] != (rows * columns, patch_size**2 * channels):
         raise ValueError("patch rows do not match the requested image dimensions")
+
     batch = patches.shape[0] if patches.ndim == 3 else 1
+    # Inverse of patchify: [batch, channels, height, width]
     result = (
         patches.reshape(batch, rows, columns, patch_size, patch_size, channels)
         .permute(0, 5, 1, 3, 2, 4)

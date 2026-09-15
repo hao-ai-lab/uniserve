@@ -46,13 +46,18 @@ def prepare_worker_model(config: WorkerProcessArgs) -> models.Config | None:
 
     if config.use_stub_model:
         return None
+
     launch = config.model
     if launch is None:
         raise RuntimeError("validated model worker is missing model configuration")
+
+    # A meta-device skeleton is enough to validate placement and select the
+    # modules this rank must read from the checkpoint.
     metadata = models.read_config(launch.path, io=config.load, modules=frozenset())
     with torch.device("meta"):
         model = metadata.model_class(metadata.model)
     declared = validate_components(model, dict(config.components), entries=metadata.entry_points)
+
     resident = frozenset(
         call.path
         for name, component in config.components
@@ -60,6 +65,7 @@ def prepare_worker_model(config: WorkerProcessArgs) -> models.Config | None:
         for call in declared[name]
     )
     source = models.read_config(launch.path, io=config.load, modules=resident)
+
     return replace(
         source, weights=_weight_config(source, launch.quantization_config, config.execution)
     )
@@ -79,10 +85,12 @@ def _weight_config(source, options, execution) -> weights.Config:
         raise ValueError(f"quantization_config has unknown fields {sorted(unknown)}")
     if "mode" in options and "quant_method" in options:
         raise ValueError("precision mode and quant_method are mutually exclusive")
+
     selected = options.get("mode", options.get("quant_method"))
     components = options.get("components", {})
     if not isinstance(components, Mapping):
         raise TypeError("precision components must be an object")
+
     package = import_module(source.model_class.__module__.rsplit(".", 1)[0])
     if components:
         factory = getattr(package, "weight_config", None)
@@ -109,9 +117,11 @@ def _weight_config(source, options, execution) -> weights.Config:
         )
     else:
         raise ValueError(f"unknown precision {selected!r}; choose from {tuple(source.precisions)}")
+
     ignored = options.get("ignored_layers", ())
     if not isinstance(ignored, (tuple, list)) or any(not isinstance(path, str) for path in ignored):
         raise TypeError("ignored_layers must contain numerical module paths")
+
     return replace(
         result,
         dtype=getattr(torch, execution.model_dtype),
@@ -156,9 +166,11 @@ def load_worker_model(
         )
     if config.model is None or source is None:
         raise RuntimeError("validated model worker is missing model configuration")
+
     with torch.device("meta"):
         description = source.model_class(source.model)
     declarations = describe_components(description, entries=source.entry_points)
+
     meshes, attention = {}, {}
     for name, binding in bindings.items():
         if binding.mesh is None:
@@ -176,6 +188,7 @@ def load_worker_model(
         for path in sorted(roots):
             meshes[path] = binding.mesh
             attention[path] = attention_parallel(binding.config)
+
     loaded = models.load_model(
         source,
         device=config.execution.device,
@@ -185,13 +198,16 @@ def load_worker_model(
     )
     model = loaded.model
     bind_components(model, bindings, entries=source.entry_points)
+
     worker_config = loaded_worker_config(model, config.execution, config.ipc.pipeline_depth)
     override = config.model.quantization_config.get("kv_cache_dtype")
     if override is not None:
         worker_config = replace(worker_config, kv_cache_dtype=override)
+
     outputs = resolve_outputs(model, worker_config)
     for name, binding in bindings.items():
         binding.outputs = outputs.get(name, ())
+
     logger.info("loaded numerical model %s", type(model).__qualname__)
     return WorkerModel(
         model,
@@ -213,6 +229,7 @@ def _devices(model: nn.Module, generation_device: str | None) -> Mapping[str, st
         if isinstance(module, CausalLM)
         for child in module.modules()
     }
+
     placed = set()
     for module in model.modules():
         if isinstance(module, Denoiser):
@@ -223,6 +240,7 @@ def _devices(model: nn.Module, generation_device: str | None) -> Mapping[str, st
             placed.add(id(module["flow"]))
         if isinstance(module, (ImageDecoder, PatchAutoencoder)):
             placed.add(id(module))
+
     # Shared backbones and codecs have multiple ordinary module paths. Every
     # alias must express the same placement before the loader materializes it.
     paths = {

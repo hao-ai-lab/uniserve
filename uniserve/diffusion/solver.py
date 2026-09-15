@@ -27,6 +27,8 @@ def clean_sample_to_velocity(prediction, sample, timestep, *, out=None):
 
 
 class EulerSolver:
+    """First-order Euler update from velocity or clean-sample predictions."""
+
     def __init__(self, prediction_type: Literal["velocity", "sample"] = "velocity"):
         if prediction_type not in {"velocity", "sample"}:
             raise ValueError("Euler prediction must be velocity or sample")

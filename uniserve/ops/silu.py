@@ -90,10 +90,13 @@ if triton is not None:
         cols = tl.arange(0, block)
         mask = cols < n_cols
         base = row * (n_cols * 2)
+
         gate = tl.load(x_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
         value = tl.load(x_ptr + base + n_cols + cols, mask=mask, other=0.0).to(tl.float32)
         activated = gate / (1.0 + tl.exp(-gate))
         output = activated * value
+
+        # One E4M3 dequantization scale per row from the row's absolute max.
         output_fp32 = tl.where(mask, output.to(tl.float32), 0.0)
         scale = tl.maximum(tl.max(tl.abs(output_fp32), axis=0), _FP8_SCALE_EPS_TL)
         scale = scale / _FP8_MAX_TL
@@ -130,6 +133,7 @@ def silu_and_mul_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     output = torch.empty((*x.shape[:-1], n_cols), dtype=torch.float8_e4m3fn, device=x.device)
     scale = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
     block = triton.next_power_of_2(n_cols)
+
     _silu_and_mul_fp8_kernel[(rows,)](
         x,
         output,
@@ -256,11 +260,13 @@ if triton is not None:
     ):
         """Evaluate value-first SwiGLU over a packed ``[value, gate]`` projection."""
 
+        # Flattened projections can exceed int32 offsets, so index in int64.
         offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         offsets = offsets.to(tl.int64)
         mask = offsets < elements
         row = offsets // width
         column = offsets - row * width
+
         value = tl.load(value_gate_ptr + row * (2 * width) + column, mask=mask, other=0.0).to(
             tl.float32
         )
@@ -272,8 +278,10 @@ if triton is not None:
         if HAS_BIAS:
             value += tl.load(bias_ptr + column, mask=mask, other=0.0).to(tl.float32)
             gate += tl.load(bias_ptr + width + column, mask=mask, other=0.0).to(tl.float32)
+
         output = (value * gate / (1.0 + tl.exp(-gate))).to(output_ptr.dtype.element_ty)
         tl.store(output_ptr + offsets, output, mask=mask)
+
         if RETURN_ABSMAX:
             partial = tl.max(tl.where(mask, tl.abs(output.to(tl.float32)), 0.0), axis=0)
             tl.store(partials_ptr + tl.program_id(0), partial)
@@ -303,6 +311,7 @@ if triton is not None:
         ).to(tl.float32)
         activated_gate = gate / (1.0 + tl.exp(-gate))
         output = value * activated_gate
+
         output_fp32 = tl.where(mask, output.to(tl.float32), 0.0)
         output_scale = tl.maximum(tl.max(tl.abs(output_fp32), axis=0), _FP8_SCALE_EPS_TL)
         output_scale /= _FP8_MAX_TL
@@ -392,6 +401,7 @@ def value_first_swiglu(
     width = _validate_value_first(value_gate, bias)
     if not _value_first_inputs_eligible(value_gate):
         return _value_first_tensor(value_gate, bias).to(value_gate.dtype)
+
     output = torch.empty(
         (*value_gate.shape[:-1], width), dtype=value_gate.dtype, device=value_gate.device
     )
@@ -421,6 +431,9 @@ def value_first_swiglu_absmax(
     if not _value_first_inputs_eligible(value_gate):
         output = _value_first_tensor(value_gate, bias).to(value_gate.dtype)
         return output, output.abs().amax()
+
+    # The main kernel writes one magnitude partial per program; a second
+    # single-program kernel reduces them to the scalar absmax.
     elements = value_gate.numel() // 2
     block = 32768
     partial_count = triton.cdiv(elements, block)
@@ -428,6 +441,7 @@ def value_first_swiglu_absmax(
         (*value_gate.shape[:-1], width), dtype=value_gate.dtype, device=value_gate.device
     )
     partials = torch.empty((partial_count,), dtype=torch.float32, device=value_gate.device)
+
     _value_first_swiglu_kernel[(partial_count,)](
         value_gate,
         bias,
@@ -453,12 +467,14 @@ def value_first_swiglu_fp8(value_gate: torch.Tensor) -> tuple[torch.Tensor, torc
         output = _value_first_tensor(value_gate, None)
         encoded = Quantizer("fp8", axis=0).quantize(output.reshape(-1, width))
         return encoded.buffers()["values"].reshape(output.shape), encoded.buffers()["scale"]
+
     rows = value_gate.numel() // (2 * width)
     output = torch.empty(
         (*value_gate.shape[:-1], width), dtype=torch.float8_e4m3fn, device=value_gate.device
     )
     scales = torch.empty((rows, 1), dtype=torch.float32, device=value_gate.device)
     block = triton.next_power_of_2(width)
+
     _value_first_swiglu_fp8_kernel[(rows,)](
         value_gate,
         output,

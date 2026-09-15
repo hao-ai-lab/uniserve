@@ -11,7 +11,11 @@ import torch
 
 from uniserve.sampling import SamplingParams
 
+# Completion storage packs four columns per row: valid, active, token, accepted.
 SAMPLING_COMPLETION_FIELDS = 4
+
+# Tagged token relays set bit 31 to flag continuation; the low 31 bits carry
+# the token id, which bounds the vocabulary usable by device-side decisions.
 TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 

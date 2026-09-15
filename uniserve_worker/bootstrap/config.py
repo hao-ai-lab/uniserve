@@ -314,10 +314,14 @@ class WorkerProcessArgs:
             raise ValueError("--no-model loads synthetic outputs and requires --allow-stub")
         if not use_stub_model and not model_path:
             raise ValueError("--model is required for a model worker")
+
         if not set(publication_backends).issubset(backends):
             raise ValueError("publication backends must be bound transports")
         if "cuda_ipc" in backends and not device.startswith("cuda:"):
             raise ValueError("CUDA IPC requires a CUDA worker device")
+
+        # CUDA IPC shares pointers into the caching allocator's segments, which
+        # only works for natively reserved, non-expandable allocations.
         allocator = (
             (os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""))
             .replace(" ", "")
@@ -379,12 +383,14 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
             raise ValueError(f"{option} must be positive")
     if namespace.kv_token_capacity is not None and int(namespace.kv_token_capacity) <= 0:
         raise ValueError("--kv-token-capacity must be positive when provided")
+
     max_video_seconds = float(namespace.max_video_seconds)
     if not math.isfinite(max_video_seconds) or max_video_seconds <= 0:
         raise ValueError("--max-video-seconds must resolve to a supported frame count")
     max_video_frames = math.floor(max_video_seconds * 24.0 + 0.5)
     if max_video_frames < 6 or max_video_frames > 2**32 - 17:
         raise ValueError("--max-video-seconds must resolve to a supported frame count")
+
     if int(namespace.rank) < 0 or int(namespace.rank) >= int(namespace.world_size):
         raise ValueError("--rank must satisfy 0 <= rank < world-size")
 
@@ -435,15 +441,18 @@ def _parse_mesh(
         entry = raw_entry.strip()
         if not entry or "=" not in entry:
             raise ValueError(f"invalid --mesh entry {raw_entry!r}; expected key=value")
+
         key, value = (part.strip() for part in entry.split("=", 1))
         normalized_key = key.replace("_", "-").lower()
         if normalized_key in seen:
             raise ValueError(f"duplicate --mesh key {key!r}")
         seen.add(normalized_key)
+
         if normalized_key == "tower":
             generation_device = _parse_expert_device(value, device=device)
         else:
             raise ValueError(f"unknown --mesh key {key!r}")
+
     return generation_device
 
 
@@ -466,9 +475,11 @@ def _parse_expert_device(value: str, *, device: str) -> str:
     understanding_device = _normalize_device(parameters.get("text") or device)
     if understanding_device != device:
         raise ValueError("text expert device must match the Worker rank device")
+
     generation_device = _normalize_device(parameters["gen"])
     if understanding_device == generation_device:
         raise ValueError("tower text and gen devices must be different")
+
     return generation_device
 
 

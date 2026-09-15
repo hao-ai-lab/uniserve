@@ -46,12 +46,14 @@ class VideoDecoder(nn.Module):
     ) -> tuple[TensorOutput | None, ...]:
         if not latents or len(latents) != len(frames) or len(latents) != len(num_frames):
             raise ValueError("video latents, frame slices and durations must align")
+
         units = []
         for interval, count in zip(frames, num_frames, strict=True):
             legal = self.frame_slices(count)
             if interval not in legal:
                 raise ValueError("video frame slice must select one complete reconstruction window")
             units.append(legal.index(interval))
+
         outputs = []
         for latent, interval, count, unit in zip(latents, frames, num_frames, units, strict=True):
             inputs = self.unpack_latents(
@@ -110,6 +112,7 @@ class AudioDecoder(nn.Module):
             raise ValueError("audio latents and sample counts must align")
         if any(type(count) is not int or count < 1 for count in num_samples):
             raise ValueError("audio durations must contain a positive sample count")
+
         outputs = []
         for latent, count in zip(latents, num_samples, strict=True):
             inputs = self.unpack_latents(latent, count, workspace=workspace)
@@ -214,6 +217,7 @@ class VideoPostprocessor(nn.Module):
             values.append(value)
             slices.append((body_slice, next_slice))
             total_frames += expected
+
         if overlap.shape != (1, 3, extent, height, width):
             raise ValueError("video overlap state must contain the complete temporal overlap")
         if (
@@ -232,6 +236,7 @@ class VideoPostprocessor(nn.Module):
         ):
             raise ValueError("video views must share the decoded input device")
 
+        # Weights broadcast over the temporal axis of each NCTHW window.
         weights = self.overlap_weights.to(overlap.dtype).view(1, 1, extent, 1, 1)
         cursor = 0
         outputs = []

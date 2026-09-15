@@ -47,6 +47,8 @@ class CpuPool:
             return len(self._tasks)
 
     def reserve(self) -> CpuTask:
+        """Admit a task under the pool's capacity lease before its inputs exist."""
+
         with self._lock:
             if self._closed:
                 raise resource_error("worker CPU pool is closed")
@@ -181,10 +183,12 @@ class CpuTask:
             self._action = None
             self._dependencies = ()
             self._pool._remove(self)
+
         if error is None:
             self.promise.set_result(value)
         else:
             self.promise.set_exception(error)
+
         wake = self._pool._completion_wake
         if wake is not None:
             wake()

@@ -47,6 +47,7 @@ class LatentDecoder(nn.Module):
             raise ValueError(f"decoder latent shape must match {self.latent_shape}")
         if latents.device != self.mean.device or self.std.device != latents.device:
             raise ValueError("latent values and normalization statistics must share their device")
+
         from .spatial import SpatialDecoder
 
         values = latents.float() * self.std + self.mean

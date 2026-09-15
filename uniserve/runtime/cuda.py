@@ -27,11 +27,12 @@ def driver() -> Any:
 
 
 def cuda_status(result: tuple[Any, ...], operation: str) -> None:
-    """Validate a CUDA driver result and return its remaining values."""
+    """Validate a CUDA driver result, raising CUDAError with the decoded failure."""
 
     cu = driver()
     if result[0] == cu.CUresult.CUDA_SUCCESS:
         return
+
     name_result = cu.cuGetErrorName(result[0])
     name = str(name_result[1]) if name_result[0] == cu.CUresult.CUDA_SUCCESS else str(result[0])
     message_result = cu.cuGetErrorString(result[0])
@@ -47,21 +48,28 @@ def cuda_value(result: tuple[Any, ...], operation: str) -> Any:
 
 
 def verify_graph_context(graph: torch.cuda.CUDAGraph, contexts: frozenset[int]) -> int:
-    """Verify kernels belong to the execution context's actual device bindings."""
+    """Verify kernels belong to the execution context's actual device bindings.
+
+    Returns the number of captured kernel nodes; raises CUDAError when any
+    kernel was captured against a CUDA context outside ``contexts``.
+    """
 
     if not contexts:
         raise ValueError("CUDA graph verification requires its bound contexts")
+
     cu = driver()
     raw_graph = graph.raw_cuda_graph()
     nodes_result = cu.cuGraphGetNodes(cu.CUgraph(raw_graph), 1 << 20)
     cuda_status(nodes_result, "enumerate CUDA graph nodes")
     nodes = nodes_result[1]
     count = int(nodes_result[2])
+
     kernels = 0
     for node in nodes[:count]:
         node_type = cuda_value(cu.cuGraphNodeGetType(node), "query CUDA graph node type")
         if node_type != cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
             continue
+
         params = cuda_value(cu.cuGraphKernelNodeGetParams(node), "query kernel node context")
         if int(params.ctx) not in contexts:
             name_result = (
@@ -75,6 +83,7 @@ def verify_graph_context(graph: torch.cuda.CUDAGraph, contexts: frozenset[int]) 
                 f"actual={int(params.ctx):#x}, expected={sorted(hex(value) for value in contexts)}"
             )
         kernels += 1
+
     # Empty token partitions and copy-only computations are valid graphs.
     # Their lack of kernels does not violate device-context containment.
     return kernels

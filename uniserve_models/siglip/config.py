@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class TransformerConfig:
+    """Widths, depth, and normalization epsilon of the SigLIP encoder stack."""
+
     hidden_size: int
     num_attention_heads: int
     intermediate_size: int
@@ -34,6 +36,8 @@ class TransformerConfig:
 
 @dataclass(frozen=True)
 class Config:
+    """Patch geometry plus the encoder stack configuration for one SigLIP tower."""
+
     patch_size: int
     image_size: int
     num_channels: int

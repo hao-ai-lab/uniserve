@@ -75,6 +75,7 @@ class Modulation(nn.Module):
         for index, (weight, bias) in enumerate(layer_projections):
             if index >= layer_count:
                 raise ValueError("modulation checkpoint contains too many layer projections")
+
             projected = project(weight, bias)
             if blocks is None:
                 blocks = projected.new_empty((steps, layer_count, rows, projected.shape[-1]))
@@ -84,15 +85,19 @@ class Modulation(nn.Module):
                 or projected.device != blocks.device
             ):
                 raise ValueError("modulation layer projections must share output shape and format")
+
             blocks[:, index].copy_(projected)
             count += 1
+            # Release the streamed weight before the iterator yields the next.
             del weight, bias, projected
+
         if blocks is None or count != layer_count:
             raise ValueError("modulation checkpoint is missing layer projections")
         return cls(blocks, None if final_projection is None else project(*final_projection))
 
     def forward(self, step_index: int, layer_index: int) -> torch.Tensor:
         """Borrow one layer's modulation products at a prepared solver step."""
+
         if (
             not 0 <= step_index < self.products.shape[0]
             or not 0 <= layer_index < self.products.shape[1]
@@ -102,6 +107,7 @@ class Modulation(nn.Module):
 
     def output(self, step_index: int) -> torch.Tensor:
         """Borrow final-normalization products for one prepared solver step."""
+
         if self.output_products is None:
             raise ValueError("this modulation has no output projection")
         if not 0 <= step_index < self.output_products.shape[0]:

@@ -40,6 +40,7 @@ def host_lengths(batch, *, prepared=None):
 
 
 def _lengths(lengths, start, stop):
+    # Rebase cumulative offsets to zero at the run's first sequence.
     return SequenceLengths(
         host=lengths.host[start:stop],
         values=lengths.values[start:stop],
@@ -57,6 +58,7 @@ def causal_runs(batch):
     if len(set(batch.causal)) <= 1:
         yield slice(0, batch.queries.num_tokens), slice(None), batch
         return
+
     query_start = key_start = 0
     for _, rows in groupby(range(len(batch.causal)), key=batch.causal.__getitem__):
         members = tuple(rows)
@@ -64,7 +66,9 @@ def causal_runs(batch):
         queries = _lengths(batch.queries, start, stop)
         query_slice = slice(query_start, query_start + queries.num_tokens)
         changes = {"queries": queries, "causal": batch.causal[start:stop]}
+
         if isinstance(batch, PagedInput):
+            # Paged keys stay in the cache; only the query domain is sliced.
             changes.update(
                 prefixes=_lengths(batch.prefixes, start, stop),
                 block_table=BlockTable(
@@ -78,5 +82,6 @@ def causal_runs(batch):
             changes["keys"] = keys
             key_slice = slice(key_start, key_start + keys.num_tokens)
             key_start += keys.num_tokens
+
         yield query_slice, key_slice, replace(batch, **changes)
         query_start += queries.num_tokens

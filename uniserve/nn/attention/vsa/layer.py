@@ -29,10 +29,13 @@ class BlockAttention(nn.Module):
 
     @contextmanager
     def _operator(self, q, batch):
+        """Yield the bound operator, or build a transient one outside serving."""
+
         binding = _binding.vsa.get().get(id(self))
         if binding is not None:
             yield binding.prepare(batch.pattern, q)
             return
+
         from uniserve.runtime.backends.attention import vsa
         from uniserve.runtime.tensor_buffers import TensorBuffers
 
@@ -83,6 +86,9 @@ class _PreparedInput:
             or q.shape != v.shape
         ):
             raise ValueError("VSA projection chunks must cover complete in-range tiles")
+
+        # Pool one mean per 64-token tile, then pack the full-resolution rows
+        # into the shared exchange layout at the same logical positions.
         tiles = slice(start // 64, stop // 64)
         ops.pool_qkv_means(
             q,
@@ -128,11 +134,13 @@ class Attention(nn.Module):
         )
 
     def _select_pooled(self, inputs, selected_tiles, workspace, query_tile_offset=0):
+        # Similarity between pooled queries and pooled keys: [heads, query, key].
         scores = workspace.tile_scores
         query = workspace.pooled_query.permute(1, 0, 2)
         key = workspace.pooled_key.permute(1, 0, 2)
         torch.matmul(query, key.transpose(-1, -2), out=scores)
         scores.mul_(self.attention.scale)
+
         heads, tiles, _ = scores.shape
         pattern = inputs.pattern(
             tiles, selected_tiles=selected_tiles, query_tile_offset=query_tile_offset
@@ -140,11 +148,16 @@ class Attention(nn.Module):
         prefix, valid = inputs.prefix_tiles, inputs.valid_tiles
         local_prefix = max(0, min(tiles, prefix - query_tile_offset))
         local_video = max(0, min(tiles, valid - query_tile_offset))
+
+        # Prefix query tiles attend densely to every valid key tile.
         indices, counts = workspace.block_indices, workspace.block_counts
         indices.zero_()
         counts.fill_(1)
         indices[:, :local_prefix, :valid] = inputs.dense_key_indices
         counts[:, :local_prefix] = inputs.prefix_count + inputs.video_tiles
+
+        # Video query tiles attend to the dense prefix plus their top-scoring
+        # video tiles, written after the prefix entries in the block map.
         if local_video > local_prefix:
             selected = workspace.topk_indices
             if selected.shape != (heads, local_video - local_prefix, selected_tiles):
@@ -160,11 +173,14 @@ class Attention(nn.Module):
                 2, positions.expand(heads, local_video - local_prefix, -1), selected
             )
             counts[:, local_prefix:local_video] = inputs.prefix_count + selected_tiles
+
         return BlockInput(pattern, indices, counts, inputs.valid_sizes, query_tile_offset)
 
     def select(
         self, q, k, inputs: Input, *, selected_tiles: int, workspace: Workspace
     ) -> BlockInput:
+        """Pool complete Q/K and return the selected key-block domain."""
+
         offset = self._query_offset(q.shape[0], inputs.padded_tokens)
         ops.pool_qkv_means(
             q,
@@ -209,6 +225,8 @@ class Attention(nn.Module):
         workspace.compressed_tiles.masked_fill_(query_valid.view(1, -1, 1) == 0, 0)
 
     def forward(self, q, k, v, gate, batch: BlockInput, *, workspace: Workspace, out=None):
+        """Fuse selected fine attention with the gated dense tile compression."""
+
         ops.pool_qkv_means(
             q,
             k,
@@ -220,6 +238,7 @@ class Attention(nn.Module):
             query_tile_offset=batch.query_tile_offset,
         )
         self._compress(batch, workspace)
+
         if out is None:
             out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
         self.attention(q, k, v, batch, out=workspace.attention_output)
@@ -252,6 +271,7 @@ class Attention(nn.Module):
         if inputs.padded_tokens % context_size or query_tokens % (64 * owners):
             raise ValueError("VSA context and head partitions require complete tile intervals")
         query_tiles = slice(query_start // 64, (query_start + query_tokens) // 64)
+
         # Keys must be complete before fine attention. Pool and pack each
         # projection while its producer can overlap subsequent communication.
         intervals = []
@@ -301,6 +321,7 @@ class Attention(nn.Module):
             prepared.append(local, q, k, v)
             gate[local].copy_(g)
             intervals.append((interval.start, interval.stop))
+
         # A gather may publish its local interval before remote intervals.
         # Pooling and packing address logical positions, so publication order
         # is independent of coverage and every tile still has exactly one writer.
@@ -311,8 +332,10 @@ class Attention(nn.Module):
             cursor = stop
         if prepared is None or cursor != query_start + query_tokens:
             raise ValueError("VSA chunks must publish the complete context query interval")
+
         q, k, v = prepared.packed.unbind(0)
         if context_size > 1:
+            # Complete pooled keys and values across the context partition.
             group = parallel.context_group
             group._all_gather_into_tensor(
                 workspace.pooled_key, workspace.pooled_key[query_tiles].clone()
@@ -320,6 +343,7 @@ class Attention(nn.Module):
             group._all_gather_into_tensor(
                 workspace.pooled_value, workspace.pooled_value[query_tiles].clone()
             )
+
         batch = self._select_pooled(inputs, selected_tiles, workspace, query_start // 64)
         self._compress_scores(batch, workspace)
         if context_size > 1:
@@ -372,6 +396,7 @@ class Attention(nn.Module):
             parallel.col_group.size if parallel.col_group is not None else 1
         )
         context_k, context_v = parallel.distribute_key_value(k, v)
+
         physical = batch
         if parallel.mapped:
             transport = parallel.context_buffers
@@ -381,12 +406,16 @@ class Attention(nn.Module):
             transport.valid_sizes.view(parallel.key_group.size, capacity_tiles)[
                 :, :owner_tiles
             ].copy_(batch.valid_sizes.view(parallel.key_group.size, owner_tiles))
+            # Logical tile IDs index compact owner domains; mapped storage
+            # addresses them within each owner's page-aligned capacity instead.
             indices = batch.block_indices
             addresses = torch.div(
                 indices, owner_tiles, rounding_mode="floor"
             ) * capacity_tiles + indices.remainder(owner_tiles)
             physical = replace(batch, block_indices=addresses, valid_sizes=transport.valid_sizes)
+
         self.attention(q, context_k, context_v, physical, out=workspace.attention_output)
+
         outputs = parallel.output_views(q)
         attended = workspace.attention_output.transpose(0, 1).unsqueeze(0)
         if len(outputs) == 1:
@@ -395,6 +424,7 @@ class Attention(nn.Module):
             ops.compose_to_head_shards(
                 attended, gate, workspace.compressed_tiles, outputs, parallel.ulysses_group.rank
             )
+
         parallel.finish_context()
         result = parallel.finish_output(outputs)
         start = batch.query_tile_offset * 64 + parallel.ulysses_group.rank * result.shape[0]

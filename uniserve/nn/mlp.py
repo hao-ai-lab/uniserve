@@ -50,6 +50,7 @@ class GatedMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         branches = self.gate_up(x)
         packed = _join_channels((branches["gate"], branches["up"]))
+
         if (
             isinstance(self.activation, SiLUAndMul)
             and self.down.input_quantizer == Quantizer("fp8", axis=0)
@@ -66,4 +67,5 @@ class GatedMLP(nn.Module):
             )
             hidden = self.activation(matrix, out=encoded)
             return self.down(hidden).reshape(*shape[:-1], self.down.out_features)
+
         return self.down(self.activation(packed))

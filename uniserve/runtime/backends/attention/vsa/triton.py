@@ -23,6 +23,9 @@ class _Operator(BaseOperator):
         from ._rows import _Rows
 
         self.bind(batch)
+
+        # Reuse one row operator per softmax scale; its query-map plans are
+        # cached inside _Rows.
         key = ("rows", scale)
         if not hasattr(self, "_row_operators"):
             self._row_operators = {}

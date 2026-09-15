@@ -31,12 +31,16 @@ class MediaBuffers:
         self.audio_capacity = int(state_slots)
         if min(self.video_capacity, self.audio_capacity) < 1:
             raise ValueError("video output-ring capacities must be positive")
+
+        # One slot holds one decode round: packed RGB24 pixels for video, or
+        # the clip's stereo int16 samples (2 channels x 2 bytes) for audio.
         video_bytes = (
             int(max_video_frames_per_round) * int(video.frame.height) * int(video.frame.width) * 3
         )
         audio_bytes = round(int(video.num_frames) * int(audio_rate) / int(frame_rate)) * 2 * 2
         if min(video_bytes, audio_bytes) < 1:
             raise ValueError("video output-ring media capacities must be positive")
+
         self._video_storage = tuple(
             torch.empty(video_bytes, dtype=torch.uint8, pin_memory=True)
             for _ in range(self.video_capacity)
@@ -45,6 +49,8 @@ class MediaBuffers:
             torch.empty(audio_bytes, dtype=torch.uint8, pin_memory=True)
             for _ in range(self.audio_capacity)
         )
+
+        # Free lists are reversed so pop() leases the lowest slot index first.
         self._video_free = list(range(self.video_capacity - 1, -1, -1))
         self._audio_free = list(range(self.audio_capacity - 1, -1, -1))
         self._lock = RLock()
@@ -125,6 +131,9 @@ class MediaLease:
         if completion.done():
             self.release()
             return
+
+        # Capture the slot identity locally: the callback fires after this
+        # lease object is gone, so it must not close over ``self``.
         self._released = True
         ring, kind, index = self._ring, self.kind, self.index
         completion.add_done_callback(lambda _future: ring._release(kind, index))

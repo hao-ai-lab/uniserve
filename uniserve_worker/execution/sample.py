@@ -61,6 +61,7 @@ def sample(
             or len(task.penalty_counts) != len(task.allowed)
         ):
             raise invalid_descriptor("sampling task logits must be shaped [rows, vocab]")
+
         device_greedy = (
             not task.draft_token_ids
             and device_greedy_parameters(task.parameters)
@@ -88,21 +89,27 @@ def sample(
                 or not draws.is_floating_point()
             ):
                 raise invalid_descriptor("sampling task draws must align with its rows")
+
             if parameter_values.device != task.logits.device or parameter_values.shape != (
                 len(task.allowed),
                 3,
             ):
                 raise invalid_descriptor("sampling task parameter vectors do not align")
+
         if task.draft_token_ids:
             if len(task.allowed) != len(task.draft_token_ids) + 1:
                 raise invalid_descriptor("speculative sampling rows do not cover the draft chain")
         elif len(task.allowed) != 1:
             raise invalid_descriptor("ordinary sampling tasks must contain exactly one row")
+
         vocab = int(task.logits.shape[1])
         if vocab > TOKEN_VALUE_MASK:
             raise unsupported_setup("vocabulary exceeds the device token decision range")
         if any(value < 0 or value >= vocab for value in task.draft_token_ids):
             raise invalid_descriptor("speculative draft token is outside the model vocabulary")
+
+        # Path key: -2 suppressed greedy, -1 plain greedy, 0 generic row-wise
+        # sampling, or a positive fused top-k width for the compiled kernel.
         sampling_path = (
             (-2 if task.suppress else -1) if device_greedy else _fused_top_k(task, vocab)
         )
@@ -111,6 +118,7 @@ def sample(
     result: list[SamplerRow | None] = [None] * len(tasks)
     for (_device, _vocab, sampling_path), compatible in grouped.items():
         indexes, group = zip(*compatible, strict=True)
+
         if sampling_path < 0:
             sampled_group = sample_device_greedy_group(
                 tuple(group),
@@ -128,6 +136,7 @@ def sample(
                 tuple(group),
                 selection_broadcast=selection_broadcast,
             )
+
         for index, sampled in zip(indexes, sampled_group, strict=True):
             result[index] = sampled
     return tuple(cast(SamplerRow, value) for value in result)
@@ -154,14 +163,17 @@ def sample_device_greedy_group(
             for token_id in dict.fromkeys(int(value) for value in task.suppress):
                 if 0 <= token_id < vocab:
                     selection_logits[row_index, token_id].fill_(float("-inf"))
+
     device_tokens = torch.argmax(selection_logits, dim=-1)
     valid = (
         ~torch.isnan(selection_logits).any(dim=-1)
         & ~torch.isposinf(selection_logits).any(dim=-1)
         & torch.isfinite(selection_logits).any(dim=-1)
     )
+
     if selection_broadcast is not None:
         selection_broadcast(device_tokens)
+
     active = _sample_predicates(tasks, device_tokens.device)
     device_finish, continuation_values = _resolve_sampled_finish_values(
         tasks, device_tokens, valid, active, torch.zeros_like(active, dtype=torch.bool)
@@ -237,6 +249,7 @@ def _sample_fused_top_k_group(
     parameters = torch.cat(
         tuple(cast(torch.Tensor, task.parameter_values) for task in tasks), dim=0
     )
+
     tokens, valid = _run_fused_top_k_sampling(
         logits,
         draws,
@@ -312,6 +325,7 @@ def _sample_task_group(
     for task in tasks:
         offsets.append(offset)
         offset += len(task.allowed)
+
     parameters = tuple(task.parameters for task in tasks for _ in task.allowed)
     logits = torch.cat(tuple(task.logits.float() for task in tasks), dim=0)
     draws = torch.cat(tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0)
@@ -372,6 +386,7 @@ def _sample_task_group(
         terminal_finishes.append(terminal)
         output_rows.append(accepted + row_offset)
         terminal_tokens.append(terminal_token)
+
     output_indexes = torch.stack(output_rows)
     task_tokens = row_tokens.index_select(0, output_indexes)
     counts = torch.stack(accepted_counts)
@@ -406,6 +421,7 @@ def _sample_task_group(
             for index, task in enumerate(tasks)
         )
     )
+
     active = _sample_predicates(tasks, task_tokens.device)
     device_finish, continuation_values = _resolve_sampled_finish_values(
         tasks,
@@ -417,6 +433,7 @@ def _sample_task_group(
     transitions = _sampled_transition_values(tasks, task_tokens, task_valid, active)
     tagged_tokens = tagged_token_values(task_tokens, continuation_values)
     span = sampling_columns(task_valid, active, task_tokens, counts)
+
     details = logprob_details(
         work,
         output_indexes - terminal_finish.to(dtype=torch.long),
@@ -486,9 +503,12 @@ def sampled_finish_values(
     validity = valid.reshape(-1)
     if len(force_finish) != count or int(tokens.numel()) != count or int(validity.numel()) != count:
         raise RuntimeError("sampling finish vectors do not align")
+
     if count == 0:
         return validity.to(dtype=torch.bool)
 
+    # Fast path: every row shares one terminal policy, so the token match is a
+    # single vectorized comparison instead of per-row scalar work.
     first_ids = finish_token_ids[0]
     first_force = force_finish[0]
     if all(
@@ -685,6 +705,7 @@ def _shape_sampling_logits_batch(
     ):
         raise invalid_descriptor("sampling parameters do not align with logits rows")
 
+    # Allowed-token restriction masks every other vocabulary entry to -inf.
     allowed_rows: list[int] = []
     allowed_flat: list[int] = []
     for row_index, allowed_values in enumerate(allowed_tokens):
@@ -705,6 +726,7 @@ def _shape_sampling_logits_batch(
         mask.reshape(-1)[torch.tensor(allowed_flat, dtype=torch.long, device=work.device)] = True
         work.masked_fill_(~mask, float("-inf"))
 
+    # Suppressed tokens are masked to -inf regardless of any other shaping.
     suppressed_flat = tuple(
         row_index * vocab + value
         for row_index, suppressed in enumerate(suppressed_tokens)
@@ -752,6 +774,7 @@ def _shape_sampling_logits_batch(
         apply = seen & ~torch.isneginf(values)
         work.index_copy_(0, row_index_tensor, torch.where(apply, adjusted, values))
 
+    # Logit bias adds per-token offsets on top of the penalized logits.
     bias_indexes: list[int] = []
     bias_values: list[float] = []
     for row_index, row in enumerate(parameters):
@@ -773,6 +796,7 @@ def _shape_sampling_logits_batch(
             accumulate=True,
         )
 
+    # Per-row (temperature, min_p, top_p) values drive the remaining shaping.
     parameter_values = torch.tensor(
         [
             (
@@ -785,6 +809,8 @@ def _shape_sampling_logits_batch(
         dtype=work.dtype,
         device=work.device,
     )
+
+    # A zero temperature divides by one; the caller selects those rows by argmax.
     temperatures = parameter_values[:, 0]
     divisors = torch.where(
         temperatures > 0.0,
@@ -793,6 +819,8 @@ def _shape_sampling_logits_batch(
     )
     work.div_(divisors.unsqueeze(1))
 
+    # Top-k truncation; top-p is applied within each retained top-k candidate
+    # set, so rows sharing a width are truncated in one gather/sort pass.
     top_k_groups: dict[int, list[int]] = defaultdict(list)
     for index, row in enumerate(parameters):
         top_k = int(row.top_k)
@@ -828,6 +856,7 @@ def _shape_sampling_logits_batch(
         truncated.scatter_(1, token_indexes, ordered)
         work.index_copy_(0, indexes, truncated)
 
+    # Full-vocabulary top-p truncation for rows without a top-k restriction.
     top_p_rows = tuple(
         index
         for index, row in enumerate(parameters)
@@ -856,6 +885,8 @@ def _shape_sampling_logits_batch(
         truncated.scatter_(1, token_indexes, ordered)
         work.index_copy_(0, indexes, truncated)
 
+    # Min-p drops tokens below a fraction of the row maximum, compared in log
+    # space so the shaped logits can be used directly.
     min_p_rows = tuple(index for index, row in enumerate(parameters) if float(row.min_p) > 0.0)
     if min_p_rows:
         indexes = torch.tensor(min_p_rows, dtype=torch.long, device=work.device)
@@ -865,6 +896,8 @@ def _shape_sampling_logits_batch(
         subset.masked_fill_(subset < min_threshold.unsqueeze(1), float("-inf"))
         work.index_copy_(0, indexes, subset)
 
+    # Typical-p keeps the tokens whose surprise is closest to the row entropy,
+    # covering the requested probability mass.
     typical_rows = tuple(
         index for index, row in enumerate(parameters) if float(row.typical_p) < 1.0
     )
@@ -893,6 +926,8 @@ def _shape_sampling_logits_batch(
         subset.scatter_(1, order, subset.gather(1, order).masked_fill(drop, float("-inf")))
         work.index_copy_(0, indexes, subset)
 
+    # A row is usable only with no NaN or +inf entries and at least one finite
+    # candidate left after all truncation stages.
     valid = (
         ~torch.isnan(work).any(dim=-1)
         & ~torch.isposinf(work).any(dim=-1)
@@ -940,6 +975,8 @@ def logprob_details(
             dtype=torch.long,
             device=work.device,
         ).unsqueeze(0)
+        # Competition ranking: equal values share a rank, and the next
+        # strictly lower value resumes at its own position.
         starts = torch.cat(
             (
                 torch.ones(
@@ -977,6 +1014,8 @@ def logprob_details(
     )
     max_requested = max((len(value) for value in requested_ids), default=0)
     if max_requested:
+        # Rows with fewer requested ids keep zero-padding columns; the
+        # requested_ids tuples record how many leading columns are real.
         candidate_indexes = torch.zeros(
             (len(requested_rows), max_requested),
             dtype=torch.long,

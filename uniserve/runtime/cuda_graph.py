@@ -38,6 +38,7 @@ class CUDAGraph(Generic[ResultT]):
         context._open()
         if context._device.type != "cuda":
             raise ValueError("CUDA graph execution requires a CUDA module")
+
         self.context = context
         self.pools = dict(pools or {})
         self._stream = context.stream or torch.cuda.Stream(device=context._device)
@@ -50,12 +51,21 @@ class CUDAGraph(Generic[ResultT]):
     def capture(
         self, call: Callable[[], ResultT], *, restore: Callable[[], None] | None = None
     ) -> None:
+        """Invoke ``call`` once under capture on this graph's private stream.
+
+        Every kernel specialization the call exercises must already be warmed.
+        When given, ``restore`` runs after the capture attempt, successful or
+        not, to return mutated inputs to their pre-capture state.
+        """
+
         if self._closed or self._graph is not None:
             raise CUDAGraphError("capture requires an open uncaptured graph")
         self.context._open()
+
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         device = self.context._device
         current = torch.cuda.current_stream(device)
+        # Capture observes all work the caller has already submitted.
         self._stream.wait_stream(current)
         try:
             with (
@@ -67,6 +77,7 @@ class CUDAGraph(Generic[ResultT]):
                 for target, pool in self.pools.items():
                     if target != device:
                         scope.enter_context(torch.cuda.use_mem_pool(pool, target))
+
                 pool = self.pools.get(device)
                 try:
                     with torch.cuda.graph(
@@ -74,6 +85,7 @@ class CUDAGraph(Generic[ResultT]):
                     ):
                         output = call()
                     graph.instantiate()
+
                     if self.context.stream is not None:
                         cu = driver()
                         streams = (self._stream, *self.context._transfers.streams.values())
@@ -97,10 +109,14 @@ class CUDAGraph(Generic[ResultT]):
                 error.add_note(f"CUDA graph cleanup failed: {cleanup!r}")
             raise CUDAGraphError(f"CUDA graph capture failed on {device}: {error}") from error
         finally:
+            # Keep the caller's stream ordered after capture-side work.
             current.wait_stream(self._stream)
+
         self._graph, self._output, self._call = graph, output, call
 
     def replay(self) -> ResultT:
+        """Replay the captured call and return its retained output views."""
+
         if self._closed or self._graph is None:
             raise CUDAGraphError("replay requires an open captured graph")
         self.context._open()
@@ -112,6 +128,8 @@ class CUDAGraph(Generic[ResultT]):
         return self._output
 
     def close(self) -> None:
+        """Release the graph and its pool references; output views become invalid."""
+
         if self._closed:
             return
         self._closed = True

@@ -14,6 +14,7 @@ def rescale_blocks(
     tile: tl.constexpr,
     compute_dtype: tl.constexpr,
 ):
+    # values: [blocks, width] flattened FP8 codes; scales and flags: [blocks].
     block = tl.program_id(0)
     old = tl.load(old_scales + block)
     new = tl.load(new_scales + block)

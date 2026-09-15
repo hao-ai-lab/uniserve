@@ -32,14 +32,20 @@ def _gather_chunks(
     if group.size == 1:
         yield slice(0, rows), input
         return
+
     byte_count = input.numel() * input.element_size() * group.size
     if not workspace.is_contiguous() or workspace.device != input.device:
         raise ValueError("row gathering requires contiguous scratch on the input device")
     if workspace.numel() * workspace.element_size() < byte_count:
         raise ValueError("row gathering scratch cannot hold all input rows")
+
+    # Scratch layout per segment: [group.size, count, width] with one member
+    # slot per rank in backend order. Segments stay near 64 MiB of staged
+    # source rows, rounded down to whole 128-row units.
     storage = workspace.view(torch.uint8).view(-1)[:byte_count].view(input.dtype)
     segment_rows = max(1, ((64 * 1024 * 1024) // (width * input.element_size()) // 128) * 128)
     local_rank = group._backend_order.index(group.rank)
+
     segments = []
     for start in range(0, rows, segment_rows):
         count = min(segment_rows, rows - start)
@@ -47,6 +53,7 @@ def _gather_chunks(
         sources = sources.view(group.size, count, width)
         sources[local_rank].copy_(input[start : start + count])
         segments.append((start, count, sources))
+
     pending = []
     consumed = 0
     try:
@@ -54,6 +61,7 @@ def _gather_chunks(
             pending.append(
                 _start_all_gather(sources.flatten(0, 1), sources[local_rank], group._require())
             )
+
         begin = group.rank * rows
         yield slice(begin, begin + rows), input
         for (start, count, sources), work in zip(segments, pending, strict=True):
@@ -95,6 +103,7 @@ def _produce_exchange(
         or source.data_ptr() == destination.data_ptr()
     ):
         raise ValueError("produced exchange requires distinct matching peer buffers")
+
     order = group._backend_order
     producer(tuple(source[order.index(rank)] for rank in range(group.size)))
     if group.size == 1:
@@ -147,6 +156,7 @@ def _produce_chunks(
         or workspace.data_ptr() == output.data_ptr()
     ):
         raise ValueError("row production requires distinct matching contiguous buffers")
+
     rows = shape[1]
     row_elements = prod(shape[2:])
     source_flat, target_flat = workspace.view(-1), output.view(-1)

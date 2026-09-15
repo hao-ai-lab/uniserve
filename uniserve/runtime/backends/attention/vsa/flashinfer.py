@@ -22,6 +22,7 @@ class _Operator(BaseOperator):
 
     def __call__(self, q, k, v, batch, *, scale, out):
         self._validate(q, k, v, batch, out)
+
         plan = _flashinfer._plan_for(
             self._state,
             q,
@@ -31,6 +32,9 @@ class _Operator(BaseOperator):
             scale=scale,
         )
         _flashinfer._fill_flattened_bsr(plan, batch.block_indices, batch.valid_sizes)
+
+        # Equal Q/K extents share one packed row domain; unequal extents need
+        # explicit head-first layouts with invalid keys zeroed by hand.
         if q.shape == k.shape:
             query, key, value = pack_sparse_input_rows(q, k, v, batch.valid_sizes).unbind(0)
         else:
@@ -41,6 +45,7 @@ class _Operator(BaseOperator):
             query = q.transpose(0, 1).contiguous()
             key = k.masked_fill(invalid, 0).transpose(0, 1).contiguous()
             value = v.masked_fill(invalid, 0).transpose(0, 1).contiguous()
+
         result = plan.wrapper.run(
             query.reshape(-1, 1, self.head_dim),
             key.reshape(-1, 1, self.head_dim),
@@ -51,6 +56,7 @@ class _Operator(BaseOperator):
 
     def rows(self, q, k, v, batch, *, gate, compressed, out, owners, chunk_tokens, packed, scale):
         self.bind(batch)
+
         if not _flashinfer.uses_row_major_inputs(q.device):
             packed = packed.transpose(1, 2).contiguous()
         return _flashinfer.prepare_rows(

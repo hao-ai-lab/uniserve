@@ -28,6 +28,7 @@ def frame_slices(num_frames: int) -> tuple[slice, ...]:
     if type(num_frames) is not int or num_frames < 22 or num_frames % 17 != 5:
         raise ValueError("H3 frame count must have the form 17 * n + 5 with n positive")
     count = (num_frames - 5) // 17
+    # Every unit covers a 17-frame body; the last unit adds the 5-frame tail.
     return tuple(
         slice(index * 17, (index + 1) * 17 + (5 if index + 1 == count else 0))
         for index in range(count)
@@ -44,6 +45,8 @@ class VideoPostprocessor(BaseVideoPostprocessor):
     def reconstruction_slices(self, frames: slice, num_frames: int) -> tuple[slice, slice]:
         if frames not in frame_slices(num_frames):
             raise ValueError("H3 RGB reconstruction requires a complete legal frame slice")
+        # Each decoded unit is 25 frames: a 17-frame body to keep, three VAE
+        # padding frames to drop, and a five-frame tail overlapping the next unit.
         return slice(0, 17), slice(20, 25)
 
     def output_layout(self, num_frames: int) -> Mapping[str, OutputLayout]:
@@ -82,6 +85,7 @@ class VideoPostprocessor(BaseVideoPostprocessor):
         buffers = self.constant_buffers(num_frames)
         if out.keys() != buffers.keys():
             raise ValueError("RGB constants must contain mean and standard deviation")
+        # Per-channel statistics that normalize the RGB raster.
         for name, values in (
             ("pixel_mean", (0.485, 0.456, 0.406)),
             ("pixel_std", (0.229, 0.224, 0.225)),

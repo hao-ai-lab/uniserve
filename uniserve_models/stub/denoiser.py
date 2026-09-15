@@ -17,6 +17,8 @@ from .inputs import DenoiserInput
 
 
 class Denoiser(ImageDenoiser):
+    """Zero-valued image prediction over the real diffusion solver machinery."""
+
     def __init__(self, config: Config, backbone: TransformerDecoder):
         super().__init__(
             patch_size=config.patch_size,
@@ -45,6 +47,7 @@ class Denoiser(ImageDenoiser):
     def forward(self, inputs: DenoiserInput, *, state, constants, workspace):
         if set(inputs.latents) != {"image"}:
             raise ValueError("simulation predicts the image latent modality")
+
         # Latent-feature prefill and image prediction share the scalar cache
         # layer. Read-only attention inputs leave the prefix untouched.
         count = inputs.attention.queries.num_tokens
@@ -57,6 +60,9 @@ class Denoiser(ImageDenoiser):
             self.backbone.layers["0"].attention.update_cache(
                 values, values, indices=inputs.attention.write_indices
             )
+
+        # The prediction is exactly zero; only the shape must match each
+        # latent's canonical patch grid.
         outputs = []
         for latent, size in zip(inputs.latents["image"], inputs.sizes, strict=True):
             shape = self.latent_shape("image", size)

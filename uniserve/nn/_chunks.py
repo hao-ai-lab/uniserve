@@ -15,12 +15,24 @@ from . import _binding, functional
 
 
 def tensor_statistics(quantizer: Quantizer | None) -> bool:
+    """Return whether encoding derives scales from whole-tensor statistics.
+
+    nvfp4 and per-tensor FP8 scales span every source value, so encoded
+    transport must wait for the complete input before quantization.
+    """
+
     return quantizer is not None and (
         quantizer.format == "nvfp4" or (quantizer.format == "fp8" and quantizer.axis is None)
     )
 
 
 def _partition(module, x, token_slice, num_tokens):
+    """Locate this rank's token interval within the logical projection input.
+
+    Returns the gather group, the per-owner padded row capacity, and the
+    logical token slice this context coordinate is responsible for.
+    """
+
     axes = module.input_distribution.shard_axes(0)
     mesh = module.input_distribution.mesh
     owners = mesh.get_group(axes)
@@ -35,6 +47,7 @@ def _partition(module, x, token_slice, num_tokens):
         or (x is not None and (x.ndim != 2 or x.shape[0] != stop - start))
     ):
         raise ValueError("token input must match its complete logical shard")
+
     gathered = getattr(module, "_gather_axes", axes)
     if not set(gathered).issubset(axes):
         raise ValueError("projection gather axes must partition input tokens")
@@ -43,6 +56,7 @@ def _partition(module, x, token_slice, num_tokens):
     # axes inside it then publish consecutive subintervals in logical order.
     if tuple((*retained, *gathered)) != axes:
         raise ValueError("context token axes must precede gathered head axes")
+
     group = mesh.get_group(gathered)
     domain_rank = mesh.get_group(retained).rank
     begin = min(num_tokens, domain_rank * capacity * group.size)
@@ -72,6 +86,12 @@ def _storage(module, size, device):
 
 @contextmanager
 def _encoded_gather(module, x, group, capacity, num_tokens):
+    """All-gather every row-dependent encoded field into one quantized input.
+
+    Row fields are packed contiguously into a single byte payload, one padded
+    shard interval per group member, then narrowed back to the valid rows.
+    """
+
     x = x.repack(scale_layout=ScaleLayout.LINEAR)
     row_fields = {
         name: value for name, value in x.buffers().items() if _row_field(name, x.quantizer)
@@ -99,6 +119,7 @@ def _encoded_gather(module, x, group, capacity, num_tokens):
             group.all_gather(source.view(torch.uint8), out=target.view(torch.uint8))
             fields[name] = target[:num_tokens]
             cursor += byte_count
+
         yield x.quantizer.from_tensors(
             fields, shape=(num_tokens, x.shape[1]), dtype=x.dtype, scale_layout=ScaleLayout.LINEAR
         )
@@ -106,9 +127,12 @@ def _encoded_gather(module, x, group, capacity, num_tokens):
 
 @contextmanager
 def materialize_input(module, x, token_slice, num_tokens):
+    """Yield the complete gathered input rows for this context coordinate."""
+
     x = functional._matrix(x)
     group, capacity, domain = _partition(module, x, token_slice, num_tokens)
     num_tokens = domain.stop - domain.start
+
     if group.size == 1 or num_tokens == 0:
         yield x
     elif isinstance(x, QuantizedTensor):
@@ -124,15 +148,23 @@ def materialize_input(module, x, token_slice, num_tokens):
 
 
 def projection_inputs(module, x, token_slice, num_tokens) -> Iterator[tuple[slice, torch.Tensor]]:
+    """Yield ``(logical token slice, gathered rows)`` pairs for one projection.
+
+    A plain tensor is exchanged in transport-sized chunks; a chunk iterator is
+    streamed through ``_stream_inputs`` so projection can overlap production.
+    """
+
     if not isinstance(x, torch.Tensor):
         yield from _stream_inputs(module, x, token_slice, num_tokens)
         return
+
     x = functional._matrix(x)
     group, capacity, domain = _partition(module, x, token_slice, num_tokens)
     num_tokens = domain.stop - domain.start
     if group.size == 1 or num_tokens == 0:
         yield token_slice, x
         return
+
     if isinstance(x, QuantizedTensor) or tensor_statistics(module.input_quantizer):
         # Resolve full-source tensor statistics before transmitting encoded
         # fields. A scalar scale is replicated; row/block scales follow values.
@@ -143,6 +175,7 @@ def projection_inputs(module, x, token_slice, num_tokens) -> Iterator[tuple[slic
         with _encoded_gather(module, x, group, capacity, num_tokens) as values:
             yield domain, values
         return
+
     local = _pad(x, capacity)
     with _storage(module, local.numel() * local.element_size() * group.size, x.device) as storage:
         for interval, values in _gather_chunks(group, local, storage):
@@ -166,10 +199,12 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
     width = module.weight.shape[1]
     rows = token_slice.stop - token_slice.start
     chunks = iter(chunks)
+
     if tensor_statistics(module.input_quantizer):
         values = _assemble(chunks, token_slice, width, module.weight)
         yield from projection_inputs(module, values, token_slice, num_tokens)
         return
+
     if group.size == 1:
         cursor = token_slice.start
         for interval, value in chunks:
@@ -194,6 +229,7 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
         values = _assemble(chain((first,), chunks), token_slice, width, module.weight)
         yield from projection_inputs(module, values, token_slice, num_tokens)
         return
+
     byte_count = capacity * width * dtype.itemsize * group.size
     with _storage(module, byte_count, device) as backing:
         storage = backing[:byte_count].view(dtype)
@@ -206,6 +242,8 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
         from itertools import chain
 
         def publish(start, count):
+            # Storage lays each payload out as [group.size, count, width] so
+            # every member contributes its staged rows at its own backend rank.
             target = storage[start * group.size * width : (start + count) * group.size * width]
             target = target.view(group.size, count, width)
             work = _start_all_gather(target.flatten(0, 1), target[backend_rank], group._require())
@@ -219,6 +257,8 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
 
         consumed = 0
         try:
+            # Stage produced rows into this member's payload slot and publish
+            # each full payload as soon as its rows are complete.
             for interval, value in chain(() if first is None else (first,), chunks):
                 _check_chunk(interval, value, token_slice.start + cursor, token_slice.stop, width)
                 offset = 0
@@ -240,6 +280,9 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
                             yield ready
             if cursor != rows:
                 raise ValueError("projection chunks must cover their complete token shard")
+
+            # Pad and publish any remaining payload slots up to the shard
+            # capacity so every peer's collective sees the same payload sizes.
             while staged < capacity:
                 count = min(chunk_rows, capacity - staged)
                 target = storage[
@@ -250,6 +293,8 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
                 staged += count
                 if ready is not None:
                     yield ready
+
+            # Remote rows become readable once their owners' gathers complete.
             for start, count, target, work in pending:
                 _finish(work, target)
                 consumed += 1
@@ -277,6 +322,8 @@ def _check_chunk(interval, value, cursor, stop, width):
 
 
 def _assemble(chunks, token_slice, width, reference):
+    """Join an ordered chunk stream into one dense or encoded [rows, width] tensor."""
+
     cursor = token_slice.start
     parts = []
     for interval, value in chunks:
@@ -285,12 +332,14 @@ def _assemble(chunks, token_slice, width, reference):
         parts.append(value)
     if cursor != token_slice.stop:
         raise ValueError("projection chunks must cover their complete token shard")
+
     if not parts:
         return torch.empty((0, width), dtype=reference.dtype, device=reference.device)
     if len(parts) == 1:
         return parts[0]
     if not any(isinstance(value, QuantizedTensor) for value in parts):
         return torch.cat(parts)
+
     first = parts[0]
     if not all(
         isinstance(value, QuantizedTensor)
@@ -300,6 +349,7 @@ def _assemble(chunks, token_slice, width, reference):
         for value in parts
     ):
         raise ValueError("encoded projection chunks must share one representation")
+
     encoded = [value.repack(scale_layout=ScaleLayout.LINEAR) for value in parts]
     fields = {}
     for name in first.buffers():
@@ -322,6 +372,7 @@ def _assemble(chunks, token_slice, width, reference):
                 elif not bool(equal):
                     raise ValueError("projection chunk scale domains disagree")
             fields[name] = values[0]
+
     return first.quantizer.from_tensors(
         fields,
         shape=(token_slice.stop - token_slice.start, width),
@@ -331,6 +382,8 @@ def _assemble(chunks, token_slice, width, reference):
 
 
 def _row_field(name, quantizer):
+    """Return whether an encoded buffer carries one value per tensor row."""
+
     return name in {"values", "block_scale"} or (
         name == "scale" and (quantizer.axis == 0 or quantizer.format == "mxfp8")
     )

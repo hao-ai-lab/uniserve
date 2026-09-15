@@ -63,6 +63,7 @@ class TransferMode(StrEnum):
 
 Computation: TypeAlias = ForwardMode | PipelineStage | TransferMode
 
+# The stage sequence of a video generation pipeline, in execution order.
 VIDEO_STAGES = (
     PipelineStage.TEXT_ENCODING,
     PipelineStage.LATENT_PREPARATION,
@@ -114,13 +115,19 @@ class ErrorCode(StrEnum):
 
 
 class DrawLayout(StrEnum):
-    """Assigns deterministic RNG coordinates to sampling, speculation, and flow noise."""
+    """Assigns deterministic RNG coordinates to sampling, speculation, and flow noise.
+
+    Each draw consumes one semantic position index within its layout so that
+    replays and recomputation reproduce identical random values.
+    """
 
     TARGET_SAMPLING = "target_sampling"
     SPECULATIVE_PROPOSAL = "speculative_proposal"
     FLOW_NOISE = "flow_noise"
 
 
+# Computations that advance a request's accepted progress; they require a
+# predecessor and mark visible completion when they finish.
 _STATE_ADVANCING_WORK = frozenset(
     {
         ForwardMode.PREFILL,
@@ -137,6 +144,8 @@ _COMPUTATION_BY_VALUE = {member.value: member for member in COMPUTATIONS}
 def _sampling_params_from_mapping(
     value: object, where: str = "sampling"
 ) -> sampling.SamplingParams:
+    """Decode wire sampling parameters, mapping validation errors to descriptors."""
+
     data = _map(value, where)
     values = {
         "temperature": _float(data.get("temperature", 0.0), f"{where}.temperature"),
@@ -191,6 +200,8 @@ def _sampling_params_from_mapping(
 
 
 def _sampling_params_to_mapping(params: sampling.SamplingParams) -> dict[str, object]:
+    """Serialize sampling parameters into their wire mapping."""
+
     return {
         "temperature": params.temperature,
         "top_k": params.top_k,
@@ -219,7 +230,11 @@ def _sampling_params_to_mapping(params: sampling.SamplingParams) -> dict[str, ob
 
 @dataclass(frozen=True, slots=True)
 class ImageParams:
-    """Defines source image bytes, format, dimensions, and preprocessing bounds for an encode request."""
+    """Image-generation controls for an encode request.
+
+    Covers the diffusion schedule (steps, timestep shift), classifier-free
+    guidance scales and renormalization, output dimensions, and prompt inputs.
+    """
 
     steps: int = 50
     cfg_text_scale: float = 4.0
@@ -237,18 +252,21 @@ class ImageParams:
     retain_images: bool = True
 
     def __post_init__(self) -> None:
-        """Validate encoded image payload, dimensions, format, and preprocessing bounds."""
+        """Validate generation step count, dimensions, and guidance scale ranges."""
 
         if not 1 <= self.steps <= 1000:
             raise invalid_descriptor("image.steps must be in 1..=1000")
+
         for name in ("height", "width"):
             dimension = int(getattr(self, name))
             if not 16 <= dimension <= 4096 or dimension % 16:
                 raise invalid_descriptor(f"image.{name} must be a multiple of 16 in 16..=4096")
+
         for name in ("cfg_text_scale", "cfg_img_scale"):
             scale = float(getattr(self, name))
             if not math.isfinite(scale) or not 0 <= scale <= 100:
                 raise invalid_descriptor(f"image.{name} must be finite and in [0, 100]")
+
         for name, value in (
             ("cfg_renorm_min", self.cfg_renorm_min),
             ("cfg_interval[0]", self.cfg_interval[0]),
@@ -257,6 +275,7 @@ class ImageParams:
         ):
             if not math.isfinite(float(value)):
                 raise invalid_descriptor(f"image.{name} must be finite")
+
         if self.cfg_interval[0] > self.cfg_interval[1]:
             raise invalid_descriptor("image.cfg_interval must be ordered")
         if not self.cfg_renorm_type.strip():
@@ -268,7 +287,7 @@ class ImageParams:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "image") -> ImageParams:
-        """Parse encoded image input and validate format, dimensions, and processing bounds."""
+        """Parse image-generation controls, applying defaults for omitted fields."""
 
         data = _map(value, where)
         interval = _pair(data.get("cfg_interval", (0.0, 1.0)), f"{where}.cfg_interval")
@@ -320,7 +339,10 @@ class ImageParams:
 
 @dataclass(frozen=True, slots=True)
 class Bounds:
-    """Caps tokens, pages, latent bytes, completion bytes, and transfer bytes for one operation."""
+    """Scheduler-enforced resource ceilings for one operation.
+
+    Zero means the corresponding resource is not used by the operation.
+    """
 
     max_tokens: int = 0
     max_kv_pages: int = 0
@@ -363,6 +385,7 @@ class Rng:
     """Defines the seed, semantic offset, and draw layout for deterministic random values."""
 
     seed: int
+    # First semantic position index covered by this operation's draws.
     semantic_index_base: int
     draw_layout: DrawLayout
 
@@ -398,10 +421,15 @@ class ScheduledRequest:
 
     request_key: identity.RequestKey
     op_id: identity.ComputationId
+    # Immediate dependency within the request; must precede op_id and is
+    # required for state-advancing work and KV installation.
     predecessor: identity.ComputationId | None
     kind: Computation
     bounds: Bounds
+    # Name of the worker model component that executes this computation.
     entry: str = "model"
+
+    # Tensor dataflow: generic inputs/outputs plus role-specific endpoints.
     inputs: tuple[tensor.TensorRef, ...] = ()
     outputs: tuple[tensor.TensorRef, ...] = ()
     token_input: tensor.TensorRef | None = None
@@ -415,11 +443,17 @@ class ScheduledRequest:
     image_output: tensor.TensorRef | None = None
     completion_output: tensor.TensorRef | None = None
     transition_output: tensor.TensorRef | None = None
+    # Device-resident scalar that gates execution (u8 flag or packed i64 continuation).
     predicate: tensor.TensorRef | None = None
+
+    # Scalar side-channel inputs carried on the wire rather than as tensors.
     rng: Rng | None = None
     sampling_state: SamplingState | None = None
     input_token_ids: tuple[int, ...] = ()
+    # Encoded source image payload for a vision or latent encoding operation.
     input_image: str | None = None
+
+    # KV cache transfer endpoints, as persistent buffer identities.
     kv_input: identity.BufferId | None = None
     kv_output: identity.BufferId | None = None
 
@@ -496,6 +530,7 @@ class ScheduledRequest:
     def validate(self) -> None:
         """Enforce operation-family, predecessor, bound, dataflow, predicate, and RNG invariants."""
 
+        # Identity and dependency ordering.
         if self.op_id.batch_id < 1:
             raise invalid_descriptor("operation id must be positive")
         if not isinstance(self.entry, str) or not self.entry:
@@ -511,6 +546,8 @@ class ScheduledRequest:
                 raise invalid_descriptor("state-changing operation requires a predecessor")
         if self.predecessor is not None and not self.predecessor < self.op_id:
             raise invalid_descriptor("predecessor must precede operation")
+
+        # Token and sampling inputs.
         if len(self.input_token_ids) > self.bounds.max_tokens:
             raise invalid_descriptor("input token count exceeds the computation token bound")
         if any(token < 0 or token > 0xFFFFFFFF for token in self.input_token_ids):
@@ -526,6 +563,8 @@ class ScheduledRequest:
             raise invalid_descriptor(
                 "encoded image requires an image encoder without another image source"
             )
+
+        # KV cache transfer endpoints.
         output_indices: set[int] = set()
         publishes_kv = self.kind in {TransferMode.KV_PUBLISH, TransferMode.KV_INSTALL}
         if (self.kv_output is not None) != publishes_kv:
@@ -552,6 +591,7 @@ class ScheduledRequest:
         if self.kind is TransferMode.KV_INSTALL and self.kv_input is None:
             raise invalid_descriptor("KV installation requires a source publication")
 
+        # Output ownership, generation, and capacity.
         for product in self.tensor_outputs():
             if product.request_key != self.request_key or product.producer_op_id != self.op_id:
                 raise invalid_descriptor(
@@ -567,6 +607,8 @@ class ScheduledRequest:
                 raise invalid_descriptor(
                     "image or trajectory output exceeds its declared byte capacity"
                 )
+
+        # Scalar relay endpoints: one int64 token, one uint8 completion flag.
         if self.token_input is not None and (
             self.kind is not TransferMode.TENSOR
             or self.token_input.dtype is not tensor.DType.I64
@@ -585,6 +627,9 @@ class ScheduledRequest:
                 output.dtype is not tensor.DType.U8 or output.shape_bound.max_elements != 1
             ):
                 raise invalid_descriptor("device completion requires one uint8 element")
+
+        # Inputs and predicate must belong to this request's lineage, except
+        # admitted cross-request encoder products (vision, latent features).
         for product in self.tensor_inputs():
             if product.request_key != self.request_key and product not in (
                 self.vision_input,
@@ -615,6 +660,7 @@ class ScheduledRequest:
         # diagnostics identify the first invalid declaration.
         data = _map(value, where)
         get = data.get
+
         request_key = identity._fast_request_key(get("request_key"))
         if request_key is None:
             request_key = identity.RequestKey.from_mapping(
@@ -632,6 +678,7 @@ class ScheduledRequest:
         bounds = _fast_bounds(get("bounds"))
         if bounds is None:
             bounds = Bounds.from_mapping(get("bounds"), f"{where}.bounds")
+
         inputs = tensor.tensor._fast_tensor_refs(get("inputs", ()))
         if inputs is None:
             inputs = tuple(
@@ -644,6 +691,7 @@ class ScheduledRequest:
                 tensor.TensorRef.from_mapping(item, f"{where}.outputs[{index}]")
                 for index, item in enumerate(_seq(get("outputs", ()), f"{where}.outputs"))
             )
+
         predicate_raw = get("predicate")
         if predicate_raw is None:
             predicate = None
@@ -658,6 +706,7 @@ class ScheduledRequest:
             rng = _fast_rng(rng_raw)
             if rng is None:
                 rng = Rng.from_mapping(rng_raw, f"{where}.rng")
+
         operation = cls(
             request_key=request_key,
             op_id=op_id,
@@ -781,6 +830,7 @@ class SamplingState:
     so no host token history participates in a successor's sampling input.
     """
 
+    # Sampling whitelist; None means unrestricted, an empty tuple means none allowed.
     allowed_token_ids: tuple[int, ...] | None = None
     suppressed_token_ids: tuple[int, ...] = ()
     finish_token_ids: tuple[int, ...] = ()

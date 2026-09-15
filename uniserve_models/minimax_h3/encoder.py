@@ -15,8 +15,8 @@ from uniserve_models import qwen3
 class TextEncoderConfig:
     """Define the H3 text encoder's vocabulary and tensor dimensions.
 
-    The configuration fixes hidden width, attention num_attention_heads, layer count, and rotary
-    settings.
+    The configuration fixes hidden width, attention head counts, layer count,
+    and rotary settings.
     """
 
     vocab_size: int = 151_936
@@ -80,6 +80,8 @@ class TextEncoder(BaseTextEncoder):
                 moe_intermediate_size=config.intermediate_size,
             )
         )
+        # H3 conditions on the retained layer's raw hidden state; the Qwen
+        # final norm is not part of the checkpoint's conditioning path.
         network.norm = nn.Identity()
         super().__init__(network, tuple(range(config.num_retained_layers)))
         self.config = config

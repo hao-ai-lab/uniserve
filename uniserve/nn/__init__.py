@@ -13,7 +13,7 @@ _EXPORTS: dict[str, str] = {
     "get_act_fn": "activation",
     # attention
     "Attention": "attention",
-    # decoder
+    # mlp and token routing
     "GatedMLP": "mlp",
     "RouteSpan": "routing",
     "RoutedTensor": "routing",
@@ -23,13 +23,12 @@ _EXPORTS: dict[str, str] = {
     "MergedColumnParallelLinear": "linear",
     "QKVParallelLinear": "linear",
     "RowParallelLinear": "linear",
-    # mesh (parallelism topology + transports)
     # moe
     "FusedMoE": "moe",
     "TopK": "moe",
     # norm
     "RMSNorm": "norm",
-    # rope
+    # position and timestep embeddings
     "RotaryEmbedding": "rope",
     "TimestepEmbedding": "timestep",
     "Modulation": "modulation",
@@ -45,7 +44,7 @@ _EXPORTS: dict[str, str] = {
     # vision
     "MLPConnector": "vision",
     "PatchEmbed": "vision",
-    # vocab_parallel_embedding
+    # vocab-parallel embedding and logits head
     "VocabParallelHead": "linear",
     "VocabParallelEmbedding": "linear",
 }
@@ -120,10 +119,5 @@ if TYPE_CHECKING:  # Expose concrete definitions to type checkers without import
     )
     from uniserve.nn.moe import FusedMoE, TopK
     from uniserve.nn.norm import RMSNorm
-    from uniserve.nn.rope import (
-        RotaryEmbedding,
-    )
-    from uniserve.nn.vision import (
-        MLPConnector,
-        PatchEmbed,
-    )
+    from uniserve.nn.rope import RotaryEmbedding
+    from uniserve.nn.vision import MLPConnector, PatchEmbed

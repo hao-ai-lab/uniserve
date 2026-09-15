@@ -54,6 +54,7 @@ class _WarmupRequests:
         self._prefix_slots: dict[RequestKey, int] = {}
         self._latent_pages: dict[RequestKey, list[int]] = {}
         self._buffers: dict[BufferId, BufferAllocation] = {}
+        # Free extents of the synthetic persistent buffer pool, as (offset, bytes).
         self._free_buffer_ranges: list[tuple[int, int]] = [
             (0, int(self.worker.info.buffer_pool_bytes))
         ]
@@ -65,10 +66,12 @@ class _WarmupRequests:
         request = self.worker.requests.peek(int(request_id))
         if request is None:
             return
+
         self._execute_controls((Finish(request.request_key),))
         # Serving keeps a terminal row until its slot is reassigned. Synthetic
         # requests have no further scheduler messages and can leave the table.
         self.worker.requests.drop(request_id)
+
         for group_id in range(
             0 if self.worker.kv_cache is None else self.worker.kv_cache.group_count
         ):
@@ -76,6 +79,7 @@ class _WarmupRequests:
         self._prefix_pages.pop(request.request_key, None)
         self._prefix_slots.pop(request.request_key, None)
         self._latent_pages.pop(request.request_key, None)
+
         released = tuple(
             buffer
             for buffer, allocation in self._buffers.items()
@@ -114,6 +118,8 @@ class _WarmupRequests:
                 self._free_buffer_ranges.append((allocation.offset, allocation.bytes))
         if not self._free_buffer_ranges:
             return
+
+        # Coalesce adjacent free extents so later large products still fit.
         merged: list[tuple[int, int]] = []
         for offset, extent in sorted(self._free_buffer_ranges):
             if merged and merged[-1][0] + merged[-1][1] == offset:
@@ -129,6 +135,8 @@ class _WarmupRequests:
         existing = self._buffers.get(product.buffer_id)
         if existing is not None:
             return existing
+
+        # First-fit over the free extents, honoring the pool's 256-byte alignment.
         alignment = 256
         required = int(product.max_bytes)
         for index, (offset, extent) in enumerate(self._free_buffer_ranges):
@@ -136,15 +144,18 @@ class _WarmupRequests:
             end = aligned + required
             if end > offset + extent:
                 continue
+
             replacement: list[tuple[int, int]] = []
             if aligned > offset:
                 replacement.append((offset, aligned - offset))
             if end < offset + extent:
                 replacement.append((end, offset + extent - end))
+
             self._free_buffer_ranges[index : index + 1] = replacement
             allocation = BufferAllocation(product.buffer_id, aligned, required)
             self._buffers[product.buffer_id] = allocation
             return allocation
+
         raise invalid_descriptor("warmup persistent buffer allocation exceeds resident capacity")
 
 
@@ -163,7 +174,12 @@ def _warmup_batch(
     buffer_allocations: tuple[BufferAllocation, ...],
     input_products: tuple[TensorPublication, ...] = (),
 ) -> ScheduleBatch:
-    """Assemble warmup operations and their physical input columns."""
+    """Assemble warmup operations and their physical input columns.
+
+    forward_inputs maps each operation to its forward-row columns:
+    (request_pool_indices, seq_lens, query_lens, write_kv). The batch
+    flattens them into the ScheduleBatch's parallel row arrays.
+    """
 
     return ScheduleBatch(
         batch_id=run_id,
@@ -276,6 +292,8 @@ def _execute_warmup(
 
     worker = requests.worker
     state = worker.submit(batch, propagate_errors=True)
+
+    # Drive the worker loop until the run's final fragment arrives.
     fragments: list[BatchOutput] = []
     while True:
         worker.advance()
@@ -283,9 +301,11 @@ def _execute_warmup(
         if output is None:
             time.sleep(0.00005)
             continue
+
         fragments.append(output)
         if output.done:
             break
+
     finalized = BatchOutput.combine(fragments)
     device_buffers = tuple(
         output.buffer_id
@@ -310,6 +330,7 @@ def _execute_warmup(
             raise RuntimeError("finalized warmup result retains unresolved device output")
         if completion.status is OpStatus.ERROR:
             failures.append(completion)
+
     if failures:
         details = ", ".join(
             f"request={completion.request_key.request_id} op={completion.op_id} "
@@ -317,8 +338,10 @@ def _execute_warmup(
             for completion in failures
         )
         raise RuntimeError(f"startup warmup execution failed: {details}")
+
     if not retain_device_outputs:
         requests.free_products(device_buffers)
+
     return finalized
 
 
@@ -360,6 +383,7 @@ def _build_warmup_batch(
             request_pool_indices[operation.request_key] = admission.request_pool_idx
         else:
             request_pool_indices[operation.request_key] = request.request_pool_idx
+
         if operation.kind not in {
             ForwardMode.PREFILL,
             ForwardMode.DECODE,
@@ -370,6 +394,7 @@ def _build_warmup_batch(
             PipelineStage.DENOISING,
         }:
             continue
+
         if (
             request is None
             and admission is not None
@@ -381,6 +406,7 @@ def _build_warmup_batch(
         if request is not None:
             runtime = request.accepted_progress
             visible = int(runtime.kv_visible_len)
+
         input_length = (
             int(operation.bounds.max_tokens)
             if operation.kind
@@ -391,10 +417,12 @@ def _build_warmup_batch(
             }
             else 0
         )
+
         tables: list[BlockTable] = []
         allocations: list[CachePageAllocation] = []
         if requests.worker.kv_cache is None:
             raise invalid_descriptor("warmup KV operation requires cache storage")
+
         for group_id in range(requests.worker.kv_cache.group_count):
             lease_key = (operation.request_key, group_id)
             block_table = requests._kv_pages.setdefault(lease_key, [])
@@ -402,9 +430,12 @@ def _build_warmup_batch(
                 visible + input_length,
                 int(requests.worker.kv_cache.info.block_size),
             )
+
+            # Leases only grow: earlier captured graphs still reference these pages.
             missing = target_pages - len(block_table)
             if missing < 0:
                 raise invalid_descriptor("warmup operation regresses its KV capacity")
+
             allocated = tuple(
                 candidate
                 for candidate in requests.worker.kv_cache.page_ids(group_id)
@@ -418,6 +449,7 @@ def _build_warmup_batch(
                     f"resident_pages={len(requests.worker.kv_cache.page_ids(group_id))}, "
                     f"leased_pages={len(occupied_blocks)}"
                 )
+
             block_table.extend(allocated)
             occupied_blocks.update(allocated)
             tables.append(
@@ -447,6 +479,7 @@ def _build_warmup_batch(
                 (True,),
             )
     height, width = image_size or _warmup_image_size(requests)
+    # Latents occupy a grid of (height/downsample) x (width/downsample) units.
     latent_units = max(
         1,
         (height // max(1, int(requests.worker._layout.latent_downsample)))
@@ -455,6 +488,7 @@ def _build_warmup_batch(
     page_units = int(requests.worker.info.latent_page_units)
     latent_page_count = (latent_units + page_units - 1) // page_units if page_units > 0 else 0
     occupied_latent_pages = {page for pages in requests._latent_pages.values() for page in pages}
+
     for operation in operations:
         if (
             operation.kind
@@ -469,6 +503,7 @@ def _build_warmup_batch(
         missing = latent_page_count - len(page_table)
         if missing < 0:
             raise invalid_descriptor("warmup latent allocation regresses its physical extent")
+
         allocated = tuple(
             page
             for page in range(1, int(requests.worker.info.latent_pages))
@@ -476,8 +511,10 @@ def _build_warmup_batch(
         )[:missing]
         if len(allocated) != missing:
             raise invalid_descriptor("warmup latent allocation exceeds resident capacity")
+
         page_table.extend(allocated)
         occupied_latent_pages.update(allocated)
+
         request = requests.worker.requests.peek(int(operation.request_key.request_id))
         start_step = 0 if request is None else int(request.accepted_progress.flow_step)
         latent_params[(operation.request_key, operation.op_id)] = LatentParams(
@@ -507,6 +544,7 @@ def _build_warmup_batch(
                 *extra_allocations,
             )
             forward_inputs[identity] = flow_rows
+
     return _warmup_batch(
         run_id=requests._run_id,
         admissions=admissions,
@@ -542,6 +580,7 @@ def _warmup_flow_tables(
     branches = trajectory.guidance.branches(
         trajectory.schedule, request.accepted_progress.flow_step
     )
+
     runtime = request.accepted_progress
     query = generation.sequence_length(ImageConfig(height, width))
     image_prompt = image.image_prompts[0] if image.image_prompts else ""
@@ -557,14 +596,17 @@ def _warmup_flow_tables(
             tokenizer=requests.worker.tokenizer,
         )
         branch_prefixes.append((prefix, copy_conditioning))
+
     alternatives = {
         prefix for prefix, copy_conditioning in branch_prefixes if not copy_conditioning
     }
     if len(alternatives) > 1:
         raise invalid_descriptor("warmup flow has multiple distinct alternative prefixes")
     alternative = next(iter(alternatives), ())
+
     if requests.worker.kv_cache is None:
         raise invalid_descriptor("warmup flow requires KV cache storage")
+
     required = ceil_div(len(alternative), requests.worker.kv_cache.info.block_size)
     lease = requests._prefix_pages.setdefault(operation.request_key, [])
     missing = required - len(lease)
@@ -582,6 +624,7 @@ def _warmup_flow_tables(
     if len(allocated) != missing:
         raise invalid_descriptor("warmup alternative prefix exceeds KV capacity")
     lease.extend(allocated)
+
     tables: tuple[BlockTable, ...] = ()
     allocations: tuple[CachePageAllocation, ...] = ()
     alternative_slot = main_slot
@@ -589,6 +632,7 @@ def _warmup_flow_tables(
     seq_lens: list[int] = []
     query_lens: list[int] = []
     write_kv: list[bool] = []
+
     if alternative:
         alternative_slot = requests._prefix_slots.setdefault(
             operation.request_key,
@@ -616,6 +660,7 @@ def _warmup_flow_tables(
         seq_lens.append(len(alternative))
         query_lens.append(len(alternative))
         write_kv.append(True)
+
     # Append every column in the exact guidance-branch evaluation order.
     for prefix, copy_conditioning in branch_prefixes:
         request_pool_indices.append(main_slot if copy_conditioning else alternative_slot)
@@ -638,10 +683,12 @@ def warmup_requests(worker: Worker) -> None:
     """
 
     requests = _WarmupRequests(worker)
+
     if torch.device(worker.worker_config.device).type == "cuda":
         if ForwardMode.PREFILL in worker.info.supported_ops:
             _warmup_tokens(requests)
             logger.info("completed token runtime warmup")
+
         if worker.runner.image_builder is not None:
             _warmup_flow(requests)
             logger.info("completed flow runtime warmup")
@@ -654,6 +701,7 @@ def _warmup_image_size(requests: _WarmupRequests) -> tuple[int, int]:
     capacity = int(requests.worker.info.latent_capacity_units)
     if int(requests.worker._layout.max_vae_grid_tokens) > 0:
         capacity = min(capacity, int(requests.worker._layout.max_vae_grid_tokens))
+
     side = max(1, math.isqrt(max(1, capacity)))
     return side * downsample, side * downsample
 
@@ -669,11 +717,15 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
     variants = requests.worker.info.supported_ops
     if ForwardMode.PREFILL not in variants:
         return
+
     pool = requests.worker.kv_cache
     if pool is None:
         raise invalid_descriptor("autoregressive warmup requires KV cache storage")
+
+    # Synthetic scenarios require an empty request pool.
     if requests.worker.requests.request_ids():
         return
+
     batch_sizes = (1,)
     request_ids = tuple(range(1, max(batch_sizes) + 1))
     keys = {sid: RequestKey(0, sid, 1) for sid in request_ids}
@@ -740,6 +792,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
         op_id = ComputationId(requests._run_id + 1, len(operations))
         operation = prompt_op(sid, op_id, root, (0,))
         operations.append(operation)
+
     _execute_warmup(
         requests,
         _build_warmup_batch(
@@ -750,6 +803,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
         retain_device_outputs=ForwardMode.DECODE in variants,
     )
     predecessors.update(zip(request_ids, operations, strict=True))
+
     if ForwardMode.DECODE in variants:
         for batch_size in batch_sizes:
             selected = request_ids[:batch_size]
@@ -757,6 +811,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
             for sid in selected:
                 op_id = ComputationId(requests._run_id + 1, len(operations))
                 operations.append(decode_op(sid, op_id, predecessors[sid]))
+
             _execute_warmup(
                 requests,
                 _build_warmup_batch(
@@ -778,12 +833,13 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
     device = torch.device(requests.worker.worker_config.device)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
     for sid in request_ids:
         requests.drop_request(sid)
 
 
 def _warmup_flow(requests: _WarmupRequests) -> None:
-    """Drive one denoise quantum through the real flow forward path."""
+    """Drive chained denoise quanta through the real flow forward path."""
 
     from ..protocol.batch import NewRequest
     from ..protocol.operation import (
@@ -809,8 +865,10 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         or generation is None
     ):
         return
+
     if requests.worker.requests.request_ids():
         return
+
     # One scenario per CFG execution branch; numerical shape catalogs belong
     # to the execution owners and are already resident before these requests.
     configured = tuple(
@@ -834,6 +892,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         cfg_branches = bucket.cfg_branches
         if batch_size > int(requests.worker.info.request_slots):
             continue
+
         request_ids = tuple(range(next_request_id, next_request_id + batch_size))
         next_request_id += batch_size
         keys = tuple(RequestKey(0, request_id, 1) for request_id in request_ids)
@@ -851,6 +910,8 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
             for index, key in enumerate(keys, start=1)
         )
         roots = tuple(ComputationId(0, 0) for key in keys)
+
+        # Publish one conditioning KV product per request.
         conditionings: list[BufferId] = []
         publications: list[ScheduledRequest] = []
         for key, root in zip(keys, roots, strict=True):
@@ -882,10 +943,14 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                 image_size=(height, width),
             ),
         )
+
         max_latent_elements = max(
             1,
             math.prod(generation.denoiser.latent_shape("image", ImageConfig(height, width))),
         )
+        # Byte budgets below assume BF16 latents: 2 bytes per element.
+
+        # Prepare each request's initial latent and its readiness product.
         initial_latents: list[TensorRef] = []
         transitions: list[ScheduledRequest] = []
         for key, root, conditioning in zip(keys, roots, conditionings, strict=True):
@@ -929,6 +994,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                     ),
                 )
             )
+
         _execute_warmup(
             requests,
             _build_warmup_batch(
@@ -938,8 +1004,11 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                 image_size=(height, width),
             ),
         )
+
         current_latents = tuple(initial_latents)
         flow_predecessors = dict(zip(request_ids, transitions, strict=True))
+
+        # Chain two denoise quanta so back-to-back execution shapes run.
         for _ in range(2):
             outputs: list[TensorRef] = []
             flows: list[ScheduledRequest] = []
@@ -972,6 +1041,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                         latent_output=output,
                     )
                 )
+
             _execute_warmup(
                 requests,
                 _build_warmup_batch(
@@ -984,5 +1054,6 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
             requests.free_products(tuple(product.buffer_id for product in current_latents))
             current_latents = tuple(outputs)
             flow_predecessors.update(zip(request_ids, flows, strict=True))
+
         for request_id in request_ids:
             requests.drop_request(request_id)

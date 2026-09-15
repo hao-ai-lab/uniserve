@@ -16,6 +16,8 @@ from . import _binding, functional
 
 
 def _distribution(group: Communicator | None = None, dim: int | None = None) -> Distribution:
+    """View a communicator as a single-axis tensor-parallel distribution."""
+
     group = Communicator() if group is None else group
     mesh = DeviceMesh(ranks=group.ranks, shape=(group.size,), axes=("tp",), rank=group.global_rank)
     object.__setattr__(mesh, "_groups", {("tp",): group})
@@ -49,6 +51,7 @@ def _coalesce(projections, *, assigned=None):
             continue
         if len({id(value) for value in parameters}) != len(parameters):
             continue
+
         encoded = tuple(isinstance(value, QuantizedTensor) for value in parameters)
         if any(encoded) and not all(encoded):
             continue
@@ -58,6 +61,7 @@ def _coalesce(projections, *, assigned=None):
             tensors = tuple(value.buffers()["values"] for value in parameters)
         else:
             tensors = parameters
+
         first = tensors[0]
         if any(
             value.dtype != first.dtype
@@ -66,6 +70,7 @@ def _coalesce(projections, *, assigned=None):
             for value in tensors
         ):
             continue
+
         backing = torch.cat(tensors, dim=0)
         for parameter, tensor, view in zip(
             parameters, tensors, backing.split([value.shape[0] for value in tensors]), strict=True
@@ -126,6 +131,7 @@ class Linear(nn.Module):
         dtype = x.dtype if output_dtype is None else output_dtype
         _check_output(out, shape, dtype, x.device)
         encoded = _input(self, x)
+
         if encoded is x:
             return functional._linear(
                 x,
@@ -135,6 +141,9 @@ class Linear(nn.Module):
                 out=out,
                 operator=_binding.matmul.get().get(id(self)),
             )
+
+        # Quantization flattens leading axes into GEMM rows; a contiguous
+        # caller output can absorb the result directly at that row shape.
         target = out.reshape(-1, shape[-1]) if out is not None and out.is_contiguous() else None
         result = functional._linear(
             encoded,
@@ -169,6 +178,7 @@ class ColumnParallelLinear(Linear):
         self.group = Communicator() if group is None else group
         if out_features % self.group.size:
             raise ValueError("column output channels must divide the tensor-parallel group")
+
         width = out_features // self.group.size
         super().__init__(in_features, width, bias=bias, device=device, dtype=dtype)
         self.out_features = out_features
@@ -186,6 +196,8 @@ class ColumnParallelLinear(Linear):
         num_tokens: int,
         output_dtype: torch.dtype | None = None,
     ) -> Iterator[tuple[slice, torch.Tensor]]:
+        """Project gathered token intervals as the input exchange yields them."""
+
         from ._chunks import projection_inputs
 
         for interval, values in projection_inputs(self, x, token_slice, num_tokens):
@@ -209,6 +221,7 @@ class RowParallelLinear(Linear):
         self.group = Communicator() if group is None else group
         if in_features % self.group.size:
             raise ValueError("row input channels must divide the tensor-parallel group")
+
         width = in_features // self.group.size
         super().__init__(width, out_features, bias=bias, device=device, dtype=dtype)
         self.in_features = in_features
@@ -235,6 +248,7 @@ class RowParallelLinear(Linear):
         dtype = x.dtype if output_dtype is None else output_dtype
         _check_output(out, shape, dtype, x.device)
         encoded = _input(self, x)
+
         target = (
             out
             if encoded is x
@@ -247,6 +261,7 @@ class RowParallelLinear(Linear):
             out=target,
             operator=_binding.matmul.get().get(id(self)),
         ).reshape(shape)
+
         self.group.all_reduce(result)
         if self.bias is not None:
             result.add_(self.bias.to(dtype))
@@ -258,12 +273,15 @@ class RowParallelLinear(Linear):
         *,
         output_dtype: torch.dtype | None = None,
     ) -> Iterator[tuple[slice, torch.Tensor]]:
+        """Reduce each gathered interval, quantizing whole-tensor scales jointly."""
+
         from ._chunks import tensor_statistics
 
         if not tensor_statistics(self.input_quantizer):
             for interval, values in chunks:
                 yield interval, self(values, output_dtype=output_dtype)
             return
+
         # Tensor scales span every supplied row, even when publication order
         # differs from logical token order. Wait for that numerical dependency.
         rows = list(chunks)
@@ -271,6 +289,7 @@ class RowParallelLinear(Linear):
             for interval, values in rows:
                 yield interval, self(values, output_dtype=output_dtype)
             return
+
         maximum = torch.zeros((), dtype=torch.float32, device=self.weight.device)
         for _, values in rows:
             if values.numel():
@@ -280,6 +299,7 @@ class RowParallelLinear(Linear):
             *self.input_distribution.shard_axes(1),
         ):
             self.input_distribution.mesh.get_group(axis).all_reduce(maximum, op="max")
+
         for interval, values in rows:
             encoded = self.input_quantizer.quantize(functional._matrix(values), amax=maximum)
             yield interval, self(encoded, output_dtype=output_dtype)
@@ -327,6 +347,7 @@ class MergedColumnParallelLinear(nn.Module):
     ) -> Mapping[str, torch.Tensor]:
         if out is not None and set(out) != set(self.projections):
             raise ValueError("merged output names must match the projection branches")
+
         branches = tuple(self.projections.values())
         dtype = x.dtype if output_dtype is None else output_dtype
         for name, branch in self.projections.items():
@@ -336,11 +357,15 @@ class MergedColumnParallelLinear(nn.Module):
                 dtype,
                 x.device,
             )
+
+        # Branches with divergent input quantization encode separately and
+        # cannot share one fused GEMM over a common encoded input.
         if any(branch.input_quantizer != branches[0].input_quantizer for branch in branches[1:]):
             return {
                 name: branch(x, output_dtype=dtype, out=None if out is None else out[name])
                 for name, branch in self.projections.items()
             }
+
         encoded = _input(branches[0], x)
         targets = None if encoded is not x or out is None else out
         values = functional._merged_linear(
@@ -352,6 +377,7 @@ class MergedColumnParallelLinear(nn.Module):
             out=targets,
             operator=_binding.merged_matmul.get().get(id(self)),
         )
+
         result = {
             name: value.reshape(*x.shape[:-1], value.shape[-1]) for name, value in values.items()
         }
@@ -369,6 +395,8 @@ class MergedColumnParallelLinear(nn.Module):
         num_tokens: int,
         output_dtype: torch.dtype | None = None,
     ) -> Iterator[tuple[slice, Mapping[str, torch.Tensor]]]:
+        """Project gathered token intervals, fusing branches that share quantization."""
+
         from ._chunks import _assemble, _partition, materialize_input, projection_inputs
 
         branches = tuple(self.projections.values())
@@ -379,6 +407,7 @@ class MergedColumnParallelLinear(nn.Module):
             with materialize_input(branches[0], x, token_slice, num_tokens) as values:
                 yield domain, self(values, output_dtype=output_dtype)
             return
+
         for interval, values in projection_inputs(branches[0], x, token_slice, num_tokens):
             yield interval, self(values, output_dtype=output_dtype)
 
@@ -461,6 +490,8 @@ class VocabParallelEmbedding(nn.Module):
         self.weight_distribution = _distribution(self.group, 0)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # IDs owned by other shards embed as zeros here; the all-reduce sums
+        # every shard's partial rows into the complete embedding.
         region = self.vocab.local_slice
         outside = (input_ids < region.start) | (input_ids >= min(region.stop, self.vocab.size))
         local_ids = (input_ids - region.start).masked_fill(outside, 0)

@@ -225,6 +225,8 @@ class Communicator:
 
     @property
     def _backend_order(self) -> tuple[int, ...]:
+        """Map each ascending backend position to its logical member index."""
+
         return tuple(self.ranks.index(rank) for rank in sorted(self.ranks))
 
     def all_reduce(
@@ -239,6 +241,7 @@ class Communicator:
         operations = {"sum": dist.ReduceOp.SUM, "min": dist.ReduceOp.MIN, "max": dist.ReduceOp.MAX}
         if op not in operations:
             raise ValueError(f"unsupported reduction {op!r}")
+
         result = value if out is None else _destination(value, tuple(value.shape), out)
         if result is not value:
             result.copy_(value)
@@ -266,11 +269,15 @@ class Communicator:
         shape = list(value.shape)
         shape[dim] *= self.size
         result = _destination(value, tuple(shape), out)
+
         if self.size == 1:
             return result.copy_(value)
         if dim == 0 and result.is_contiguous():
             self._all_gather_into_tensor(result, value.contiguous())
             return result
+
+        # General path: gather into a leading member axis, then move each
+        # backend-ordered chunk to its logical position along dim.
         group = self._require()
         bound = stream_collectives(group.group_name)
         storage = torch.empty((self.size, *value.shape), dtype=value.dtype, device=value.device)
@@ -299,9 +306,13 @@ class Communicator:
         dim = _dimension(value, dim)
         if self.rank != dst and out is not None:
             raise ValueError("only the gather destination may provide output storage")
+
         shape = list(value.shape)
         shape[dim] *= self.size
         result = _destination(value, tuple(shape), out) if self.rank == dst else None
+
+        # A contiguous dim-0 destination can receive the leading member axis
+        # directly; other layouts stage through a scratch buffer and copy out.
         if dim == 0 and (result is None or result.is_contiguous()):
             storage = None if result is None else result.view(self.size, *value.shape)
         else:
@@ -335,6 +346,7 @@ class Communicator:
                 raise ValueError("all-to-all requires one nonnegative count per member")
         if value.ndim == 0 or sum(input_splits) != value.shape[0]:
             raise ValueError("all-to-all counts must cover the input leading axis")
+
         result = _destination(value, (sum(output_splits), *value.shape[1:]), out)
         target = result if result.is_contiguous() else torch.empty_like(result).contiguous()
         self._all_to_all_single_into(target, value.contiguous(), output_splits, input_splits)
@@ -346,10 +358,13 @@ class Communicator:
         if self.size == 1:
             output.reshape(-1).copy_(input.reshape(-1))
             return
+
         name = self._require().group_name
         if tuple(sorted(self.ranks)) == self.ranks:
             _all_gather_into_tensor(output, input, name)
         else:
+            # The backend delivers chunks in ascending-rank order; copy each
+            # into its logical member slot when the orders disagree.
             scratch = torch.empty_like(output)
             _all_gather_into_tensor(scratch, input, name)
             sources = scratch.reshape(self.size, *input.shape)
@@ -372,11 +387,15 @@ class Communicator:
         if self.size == 1:
             output.copy_(input)
             return
+
         name = self._require().group_name
         order = self._backend_order
         if tuple(sorted(self.ranks)) == self.ranks:
             _all_to_all_single_into(output, input, list(output_splits), list(input_splits), name)
             return
+
+        # Repack splits from logical member order into backend rank order,
+        # exchange, then scatter the received chunks back to logical order.
         send = input.split(tuple(input_splits), dim=0)
         packed = torch.cat([send[index] for index in order], dim=0)
         received = torch.empty_like(output)
@@ -408,6 +427,7 @@ class Communicator:
             if output is not None:
                 raise ValueError("only the gather destination may provide output storage")
             gather_list = None
+
         if self.size == 1:
             assert output is not None
             output[0].copy_(input)
@@ -449,13 +469,18 @@ class Communicator:
         shape = list(value.shape)
         shape[dim] = divide(shape[dim], self.size)
         result = _destination(value, tuple(shape), out)
+
         if self.size == 1:
             return result.copy_(value)
+
+        # reduce_scatter_tensor consumes a flat concatenation of partitions in
+        # ascending backend rank order, one movedim-packed chunk per member.
         chunks = value.chunk(self.size, dim=dim)
         packed = torch.cat([chunks[index].movedim(dim, 0) for index in self._backend_order], dim=0)
         output = result.movedim(dim, 0)
         if not output.is_contiguous():
             output = torch.empty_like(output, memory_format=torch.contiguous_format)
+
         group = self._require()
         bound = stream_collectives(group.group_name)
         if bound is not None:
@@ -508,6 +533,7 @@ class Communicator:
         global_dst, global_src = self._peer(dst), self._peer(src)
         if not output.is_contiguous():
             raise ValueError("point-to-point exchange requires contiguous output storage")
+
         if self.size == 1:
             return output.copy_(value)
         _send_recv(value.contiguous(), output, global_dst, global_src, self._require().group_name)
@@ -602,7 +628,10 @@ class DeviceMesh:
             raise ValueError("nonparticipating rank cannot borrow a mesh communicator")
         if selected in self._groups:
             return self._groups[selected]
+
         members = next(fiber for fiber in self.members(selected) if self.rank in fiber)
+        # The same axis set selected in a different order shares one backend
+        # group; only the logical member ordering of the descriptor changes.
         for axes, group in self._groups.items():
             if set(axes) == set(selected):
                 return Communicator(
@@ -612,6 +641,7 @@ class DeviceMesh:
                     self._device,
                     group._group,
                 )
+
         # An unbound descriptor remains useful for mathematical queries. Any
         # multi-rank numerical communication still requires runtime binding.
         return Communicator(

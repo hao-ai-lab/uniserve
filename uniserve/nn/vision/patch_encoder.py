@@ -43,6 +43,7 @@ class PatchEncoder(nn.Module):
 
         if pixels.ndim != 4:
             raise ValueError("patch encoding requires NCHW pixels")
+
         batch, channels, height, width = pixels.shape
         patch = self.patch_size
         positions = get_flattened_position_ids_extrapolate(
@@ -50,10 +51,11 @@ class PatchEncoder(nn.Module):
         ).repeat(batch)
         patches = patchify_batch(pixels, patch).reshape(-1, patch * patch * channels)
         tokens = (height // patch) * (width // patch)
+
+        # Cumulative bounds isolate attention while all images share one grid.
         boundaries = torch.arange(
             0, (batch + 1) * tokens, tokens, dtype=torch.int32, device=pixels.device
         )
-        # Cumulative bounds isolate attention while all images share one grid.
         features = self.encoder(
             patches.to(self.dtype),
             {
@@ -63,5 +65,6 @@ class PatchEncoder(nn.Module):
             },
             None,
         )
+
         projected = self.projection(features) + self.position_embed(positions)
         return projected.reshape(batch, tokens, -1).to(self.dtype)

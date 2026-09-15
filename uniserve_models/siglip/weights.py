@@ -22,6 +22,8 @@ def assignments(
         elif name.startswith("encoder.norm."):
             source = "post_layernorm." + name.removeprefix("encoder.norm.")
         else:
+            # Transformer layers translate through several renames; each
+            # replace is a no-op for names that do not contain its pattern.
             source = name.replace(".input_norm.", ".layer_norm1.")
             source = source.replace(".output_norm.", ".layer_norm2.")
             source = source.replace(".attention.output.", ".self_attn.out_proj.")
@@ -30,6 +32,8 @@ def assignments(
                     f".attention.qkv.projections.{branch}.", f".self_attn.{branch}_proj."
                 )
             source = source.replace(".mlp.0.", ".mlp.fc1.").replace(".mlp.2.", ".mlp.fc2.")
+
+        # Parameters absent from this checkpoint reader keep their init values.
         if prefix + source in available:
             result.append(weights.Assignment(parameter, reader.get(prefix + source)))
     return tuple(result)

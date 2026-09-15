@@ -43,14 +43,16 @@ class RefinerBlock(nn.Module):
         self.mlp = GatedMLP(config.hidden_size, config.intermediate_size)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        # hidden is [batch, tokens, hidden_size]; one document per batch row.
         batch, tokens, _ = hidden.shape
         projections = self.qkv(self.norms[0](hidden))
         q, k, v = (
             projections[name].reshape(batch, tokens, -1, self.head_dim) for name in ("q", "k", "v")
         )
         q, k = self.norms[2](q), self.norms[3](k)
+
         attended = self.attention(
-            q.transpose(1, 2),
+            q.transpose(1, 2),  # [batch, heads, tokens, head_dim]
             k.transpose(1, 2),
             v.transpose(1, 2),
             DenseInput(causal=False, mask=None),
@@ -102,6 +104,7 @@ def assignments(model: Conditioner, reader):
     for name, parameter in refiner.input.named_parameters():
         yield weights.Assignment(parameter, reader.get(f"context_embedder.{name}"))
     yield weights.Assignment(refiner.norm.weight, reader.get("token_refiner.final_norm.weight"))
+
     for index, block in enumerate(refiner.blocks):
         prefix = f"token_refiner.refiner_blocks.{index}"
         for name, norm in zip(
@@ -113,6 +116,8 @@ def assignments(model: Conditioner, reader):
                 projection.weight, reader.get(f"{prefix}.attn.to_{name}.weight")
             )
         yield weights.Assignment(block.output.weight, reader.get(f"{prefix}.attn.to_out.0.weight"))
+
+        # The fused checkpoint rows store the value branch first, gate second.
         source = reader.get(f"{prefix}.ff.net.0.proj.weight")
         width = source.shape[0] // 2
         for name, begin in (("up", 0), ("gate", width)):

@@ -84,6 +84,7 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
 
     def latent_shape(self, modality: str, size: DenoiserSize) -> tuple[int, ...]:
         if modality == "video":
+            # The 48x84 latent raster yields 24x42 tokens per frame at patch 2x2.
             return video_latent_frames(size.num_frames) * 24 * 42, self.config.video_channels * 4
         if modality == "audio":
             return 2 * audio_latent_frames(size.num_frames), self.config.audio_channels
@@ -91,6 +92,7 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
 
     def noise_shape(self, modality: str, size: DenoiserSize) -> tuple[int, ...]:
         if modality == "video":
+            # Native draws keep the [C, T, 48, 84] latent layout before patching.
             return 1, self.config.video_channels, video_latent_frames(size.num_frames), 48, 84
         return self.latent_shape(modality, size)
 
@@ -145,8 +147,12 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
                     else torch.arange(indices.numel(), device="cpu")
                 )
                 values[f"{name}_indices"] = raster[selected]
+
+        # Modulation rows are addressed by token tag, with audio offset past
+        # the video/text rows of the packed per-layer table.
         tags = packing.token_tags[interval]
         values["modulation_indices"] = (tags == AUDIO_TAG).long() * 3 + tags
+
         values.update(
             tile_valid_sizes=packing.tile_valid_sizes,
             prefix_key_indices=torch.arange(packing.prefix_tiles, dtype=torch.int32, device="cpu"),
@@ -155,6 +161,7 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
             ),
             prefix_count=torch.tensor(packing.prefix_tiles, dtype=torch.int32, device="cpu"),
         )
+
         cosine, sine = self.rotary(
             packing.position_ids, dtype=torch.float32, sequence_length=packing.padded_tokens
         )
@@ -180,6 +187,7 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
                 raise ValueError(f"H3 constant {name!r} has incompatible shape or dtype")
             if name in {"video_indices", "audio_indices"} and target.device.type != "cpu":
                 raise ValueError("H3 native draw indices require CPU representation")
+
         for name, value in values.items():
             out[name].copy_(value)
 
@@ -262,11 +270,15 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
             or hidden.dtype != torch.bfloat16
         ):
             raise ValueError("H3 hidden workspace must match the local BF16 token shard")
+
         pipeline = self.mesh.get_group("pp" if "pp" in self.mesh.axes else ())
         if pipeline.rank == 0:
             text = inputs.text_features[0]
             if text.shape != (size.num_text_tokens, self.config.hidden_size):
                 raise ValueError("H3 text features must be refined tokens with the declared width")
+
+            # Scatter text and projected latents into the packed token rows;
+            # padding rows stay zero.
             hidden.zero_()
             hidden.index_copy_(
                 0,
@@ -286,6 +298,7 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
                 hidden.index_copy_(
                     0, indices, projection(sample, output_dtype=torch.float32).to(hidden.dtype)
                 )
+
         predictions = self.transformer(
             hidden,
             attention,
@@ -295,6 +308,7 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
         )
         if not predictions:
             return {name: (None,) for name in self.modalities}
+
         layouts = self.output_layout(size)
         return {
             name: (TensorOutput(value, layouts[name]),)

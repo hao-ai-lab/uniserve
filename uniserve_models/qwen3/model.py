@@ -20,6 +20,9 @@ class Model(CausalLM):
             Transformer(config), VocabParallelHead(config.hidden_size, config.vocab_size)
         )
         self.config = config
+
+        # Tied checkpoints store one embedding matrix; the head shares that
+        # same Parameter instead of holding a second copy.
         if config.tie_word_embeddings:
             self.lm_head.weight = self.backbone.embedding.weight
 
@@ -28,6 +31,7 @@ entry_paths = MappingProxyType({"model": "forward"})
 
 
 def entry_points(config: Config) -> Mapping[str, tuple[EntryPoint, ...]]:
+    """Declare the numerical methods serving ranks may invoke on this model."""
     return MappingProxyType(
         {
             "": (

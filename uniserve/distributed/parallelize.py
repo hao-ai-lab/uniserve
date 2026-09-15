@@ -37,6 +37,7 @@ def _replicated_heads(mesh: DeviceMesh, heads: int) -> Distribution:
     replica_axis = "kv_replica"
     if replica_axis in mesh.axes:
         raise ValueError("KV replication requires an unambiguous replica axis")
+
     axes = (*mesh.axes[:index], "tp", replica_axis, *mesh.axes[index + 1 :])
     shape = (*mesh.shape[:index], heads, mesh.size("tp") // heads, *mesh.shape[index + 1 :])
     result = DeviceMesh(ranks=mesh.ranks, shape=shape, axes=axes, rank=mesh.rank)
@@ -72,6 +73,9 @@ def parallelize_(
 
     if mesh.rank not in mesh.ranks:
         raise ValueError("a nonparticipating rank cannot bind resident layers")
+
+    # Token axes named by the attention config must be declared by the mesh
+    # and stay distinct from the channel (tp) and stage (pp) partitions.
     selected = set()
     if attention.heads is not None:
         selected.add(attention.heads.axis)
@@ -83,6 +87,8 @@ def parallelize_(
         )
     if not selected.issubset(mesh.axes) or selected.intersection({"tp", "pp"}):
         raise ValueError("attention requires distinct token axes declared by the mesh")
+
+    # Deferred import: uniserve.model depends on the modules bound here.
     from uniserve.model import CausalLM, Encoder, TransformerDecoder
 
     # An encoder consumes complete samples through its own numerical call.
@@ -103,6 +109,7 @@ def parallelize_(
             visit(nested)
 
     visit(module)
+
     pipeline = mesh.get_group("pp" if "pp" in mesh.axes else ())
     token_axes = tuple(axis for axis in mesh.axes if axis in selected)
     for child in modules:
@@ -110,11 +117,15 @@ def parallelize_(
             child.mesh = mesh
         if not isinstance(child, TransformerDecoder):
             continue
+
         bound = getattr(child, "_parallel_mesh", None)
         if bound is not None:
             if bound != mesh or child._attention_parallel != attention:
                 raise ValueError("a decoder cannot change its mathematical partition")
             continue
+
+        # Keep only this pipeline stage's contiguous share of the layers.
+        # Stage-boundary modules live on the stages that consume them.
         layers = tuple(child.layers)
         if len(layers) < pipeline.size:
             raise ValueError("every pipeline stage requires at least one decoder layer")
@@ -125,16 +136,21 @@ def parallelize_(
             child.embedding = None
         if pipeline.rank != pipeline.size - 1:
             child.norm = None
+
         child.mesh = mesh
         child._pipeline = pipeline
         child._tokens = mesh.get_group(token_axes)
         child._parallel_mesh = mesh
         child._attention_parallel = attention
+
+    # Pipeline trimming detached layers held by other stages; only rebind
+    # modules that remain reachable from the root.
     retained = {id(child) for child in module.modules()}
     modules = [child for child in modules if id(child) in retained]
     for child in modules:
         if isinstance(child, CausalLM) and child.backbone._pipeline.rank != pipeline.size - 1:
             child.lm_head = None
+
     group = mesh.get_group("tp" if "tp" in mesh.axes else ())
     parameters = {}
     expanded = {}
@@ -171,6 +187,8 @@ def parallelize_(
             )
         return parameters[key]
 
+    # Record per-module channel facts before partitioning any weights:
+    # interleaved-branch projections and each QKV layer's KV head geometry.
     kv = {}
     projected = {}
     for child in modules:
@@ -185,6 +203,7 @@ def parallelize_(
                 if branch.out_features % (projection_group.size * child.branch_width):
                     raise ValueError("projected heads must divide whole interleaved channel groups")
                 projected[id(branch)] = projection_group, axes, head_axis
+
         if isinstance(child, QKVParallelLinear):
             if child.num_heads % group.size:
                 raise ValueError("query heads must divide the tensor-parallel group")
@@ -212,6 +231,7 @@ def parallelize_(
                 if bound != mesh or child._attention_parallel != attention:
                     raise ValueError("attention cannot change its mathematical partition")
                 continue
+
             if child.num_heads % group.size:
                 raise ValueError("attention query heads must divide tensor parallelism")
             if child.num_kv_heads >= group.size:
@@ -220,16 +240,20 @@ def parallelize_(
                 heads = child.num_kv_heads // group.size
                 start = group.rank * heads
             else:
+                # Fewer KV heads than TP ranks: several ranks host adjacent
+                # copies of the same head, indexed by this rank's copy slot.
                 if group.size % child.num_kv_heads:
                     raise ValueError("attention KV replicas must divide tensor parallelism")
                 heads = 1
                 start = group.rank // (group.size // child.num_kv_heads)
+
             exchange = _HeadExchange(
                 mesh.get_group(() if attention.heads is None else attention.heads.axis)
             )
             query_heads = child.num_heads // group.size
             if query_heads % exchange.group.size:
                 raise ValueError("local query heads must divide Ulysses membership")
+
             head_slice = exchange.head_slice(heads)
             child._local_heads = query_heads // exchange.group.size
             child._local_kv_heads = head_slice.stop - head_slice.start
@@ -247,6 +271,7 @@ def parallelize_(
             if bound != mesh or child._attention_parallel != attention:
                 raise ValueError("a resident layer cannot change its mathematical partition")
             continue
+
         if isinstance(child, (VocabParallelEmbedding, VocabParallelHead)):
             if child.weight.shape[0] != child.vocab.padded_size:
                 raise ValueError("parallelize_ requires an unpartitioned vocabulary source")
@@ -269,6 +294,9 @@ def parallelize_(
             child.out_features = padded
         if tuple(child.weight.shape) != (child.out_features, child.in_features):
             raise ValueError("parallelize_ requires complete unpartitioned source parameters")
+
+        # Default partition: tokens shard along the selected token axes, and
+        # the weight stays whole unless a column/row branch narrows it below.
         weight_dim = None
         input_places = [Shard(0) if axis in selected else Replicate() for axis in mesh.axes]
         output_places = list(input_places)
@@ -276,6 +304,7 @@ def parallelize_(
         column = slice(0, child.in_features)
         projection = projected.get(id(child))
         column_group = group if projection is None else projection[0]
+
         if isinstance(child, ColumnParallelLinear):
             weight_dim = 0
             heads = kv.get(id(child))
@@ -302,6 +331,7 @@ def parallelize_(
             column = slice(group.rank * width, (group.rank + 1) * width)
             if "tp" in mesh.axes:
                 input_places[mesh.axes.index("tp")] = Shard(1)
+
         child.weight = shard(child.weight, (row, column))
         child.bias = shard(child.bias, (row,))
         child._weight_slice = (row, column)
@@ -317,6 +347,7 @@ def parallelize_(
                 for axis in mesh.axes
             ),
         )
+
         if id(child) in kv and kv[id(child)][0] < group.size:
             child.weight_distribution = _replicated_heads(mesh, kv[id(child)][0])
             output_mesh = child.weight_distribution.mesh

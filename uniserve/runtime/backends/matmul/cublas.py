@@ -16,12 +16,14 @@ class _CUBLASOperator(_Operator):
             raise ValueError("cuBLAS requires CUDA operands")
         if x.shape[0] == 0:
             return out
+
         if isinstance(x, QuantizedTensor) or isinstance(weight, QuantizedTensor):
             if any(
                 isinstance(value, QuantizedTensor) and value.quantizer.format != "fp8"
                 for value in (x, weight)
             ):
                 raise ValueError("cuBLAS encoded operands require the FP8 format")
+
             if not all(isinstance(value, QuantizedTensor) for value in (x, weight)):
                 # One encoded operand does not authorize quantizing the other.
                 # Its existing FP8 values and scales define an FP32 product.
@@ -39,6 +41,7 @@ class _CUBLASOperator(_Operator):
                 if bias is not None:
                     out.add_(bias.to(out.dtype))
                 return out
+
             left, right = x.buffers(), weight.buffers()
             scale_a = left["scale"].reshape(-1, 1)
             scale_b = right["scale"].reshape(-1, 1).T
@@ -49,6 +52,7 @@ class _CUBLASOperator(_Operator):
                 scale_a = scale_a.expand(x.shape[0], 1)
                 scale_b = scale_b.expand(1, weight.shape[0])
             scale_a, scale_b = scale_a.contiguous(), scale_b.contiguous()
+
             # The scaled cuBLAS entry point requires unit channel stride.
             # Dense GEMM supports more layouts, including transposed outputs.
             target = (

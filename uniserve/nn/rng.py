@@ -61,6 +61,8 @@ def philox4x32_10(
         if rounds > 0:
             k0 = (k0 + _PHILOX_KEY_BUMP_0) & _U32
             k1 = (k1 + _PHILOX_KEY_BUMP_1) & _U32
+
+        # One round: 32x32 -> 64 multiply-high/low mixing with key injection.
         p0 = _PHILOX_M0 * c0
         p1 = _PHILOX_M1 * c2
         hi0, lo0 = (p0 >> 32) & _U32, p0 & _U32
@@ -85,6 +87,7 @@ def sampling_uniform(
         int(draw_index) & _U32,
     )
     words = philox4x32_10(counter, (int(key) & _U32, (int(key) >> 32) & _U32))
+    # Top 24 bits of the first word, scaled into [0, 1).
     return (words[0] >> 8) * (1.0 / 16_777_216.0)
 
 

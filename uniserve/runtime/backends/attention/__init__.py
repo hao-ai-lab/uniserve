@@ -27,6 +27,7 @@ class Operator:
         self.cache = cache
         self.workspace = workspace
         self._closed = False
+
         if cache is not None and cache.key.shape[2:] != (num_kv_heads, head_dim):
             raise ValueError("prefix state does not match the prepared KV head dimensions")
 
@@ -34,6 +35,7 @@ class Operator:
         """Prepare changed numerical metadata without relying on object identity."""
 
         self._check_batch(batch)
+
         if self.requires_host_lengths(batch) and any(
             lengths is not None and lengths.host is None
             for lengths in (getattr(batch, name, None) for name in ("queries", "keys", "prefixes"))
@@ -52,6 +54,7 @@ class Operator:
     def _check_batch(self, batch):
         if self._closed:
             raise RuntimeError("attention operator is closed")
+
         if not isinstance(batch, DenseInput) and (
             (
                 batch.queries.num_tokens is not None
@@ -60,6 +63,7 @@ class Operator:
             or batch.queries.batch_size > self.size.batch_size
         ):
             raise ValueError("attention input exceeds prepared token or sequence capacity")
+
         if isinstance(batch, (PagedInput, SegmentedInput)) and self.cache is not None:
             if batch.block_table.block_size != self.cache.block_size:
                 raise ValueError("attention block table and cache block sizes differ")
@@ -67,10 +71,13 @@ class Operator:
     def update_cache(
         self, k: torch_lib.Tensor, v: torch_lib.Tensor, *, indices: torch_lib.Tensor
     ) -> None:
+        """Write current K/V rows into the bound prefix cache."""
+
         if self._closed:
             raise RuntimeError("attention operator is closed")
         if self.cache is None:
             raise RuntimeError("attention cache update requires bound prefix state")
+
         self.cache.update(k, v, indices=indices)
 
     def _validate(self, q, k, v, batch, out):
@@ -78,12 +85,14 @@ class Operator:
         # The numerical call only validates capacity and borrowed tensor views.
         self._check_batch(batch)
         head_axis = 1
+
         if (
             q.ndim not in {3, 4}
             or q.shape[head_axis] != self.num_heads
             or q.shape[-1] != self.head_dim
         ):
             raise ValueError("query tensor does not match prepared attention dimensions")
+
         if (
             q.dtype != self.dtype
             or out.shape != q.shape
@@ -91,15 +100,21 @@ class Operator:
             or out.device != q.device
         ):
             raise ValueError("attention output and query representation must match")
+
         if q.ndim == 3 and q.shape[0] > self.size.num_tokens:
             raise ValueError("attention queries exceed prepared token capacity")
+
         if isinstance(batch, DenseInput):
             tokens = q.shape[0] if q.ndim == 3 else q.shape[0] * q.shape[2]
             batches = 1 if q.ndim == 3 else q.shape[0]
             if tokens > self.size.num_tokens or batches > self.size.batch_size:
                 raise ValueError("dense attention exceeds the prepared token or batch capacity")
+
         if k.shape != v.shape or k.device != q.device or v.device != q.device:
             raise ValueError("key and value tensors must have matching dimensions and devices")
+
+        # Packed K/V are [tokens, heads, dim]; paged cache rows are
+        # [blocks, tokens, heads, dim] with the head axis shifted.
         kv_axis = 1 if k.ndim == 3 or isinstance(batch, DenseInput) else 2
         if (
             k.ndim not in {3, 4}
@@ -123,6 +138,8 @@ class Operator:
         raise NotImplementedError
 
     def close(self) -> None:
+        """Release borrowed state; the operator must not be invoked afterward."""
+
         self._closed = True
         self.cache = None
         self.workspace = {}
@@ -176,14 +193,18 @@ def resolve(backend: str | Backend, *, device: torch_lib.device, flashinfer=None
 
     if isinstance(backend, Backend):
         return backend
+
     if backend == "auto":
         from ._auto import Backend as _Auto
 
         return _Auto(device, flashinfer=flashinfer)
+
     if backend not in {"torch", "flash_attn", "flash_attn_4", "flashinfer", "trtllm", "sgl_kernel"}:
         raise ValueError(f"unknown attention backend {backend!r}")
+
     if backend == "flashinfer" and flashinfer is not None:
         return flashinfer
+
     factory = import_module(f"{__name__}.{backend}").Backend
     if backend == "trtllm" and flashinfer is not None:
         return factory(workspace_size=flashinfer.config.workspace_size)

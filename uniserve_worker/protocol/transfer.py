@@ -31,6 +31,8 @@ class WorkerEndpoint:
     incarnation: str
 
     def __post_init__(self) -> None:
+        """Validate that every component of the endpoint identity is present."""
+
         if (
             not self.worker_id
             or self.rank < 0
@@ -50,6 +52,8 @@ class WorkerEndpoint:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "endpoint") -> WorkerEndpoint:
+        """Parse a complete worker endpoint identity from the wire schema."""
+
         data = _map(value, where)
         return cls(
             worker_id=_str(data.get("worker_id"), f"{where}.worker_id"),
@@ -60,6 +64,8 @@ class WorkerEndpoint:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize the endpoint identity for IPC."""
+
         return {
             "worker_id": self.worker_id,
             "rank": self.rank,
@@ -207,6 +213,7 @@ class Locator:
 
         data = _map(value, where)
         kind = _str(data.get("transport"), f"{where}.transport")
+
         if kind == "local":
             transport: TransferTransport = LocalTransfer(
                 endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
@@ -236,6 +243,7 @@ class Locator:
             )
         else:
             raise invalid_descriptor(f"{where}.transport is invalid")
+
         return cls(
             source=WorkerEndpoint.from_mapping(data.get("source"), f"{where}.source"),
             transport=transport,
@@ -257,6 +265,7 @@ class Locator:
             "offset": list(self.offset),
             "device": self.device,
         }
+
         transport = self.transport
         if isinstance(transport, LocalTransfer):
             output.update(transport="local", endpoint=transport.endpoint, key=transport.key)
@@ -294,12 +303,19 @@ class TensorTransfer:
     locations: tuple[Locator, ...]
 
     def __post_init__(self) -> None:
+        """Validate that every location is a consistent region of the logical tensor."""
+
         if not self.shape or any(extent < 1 for extent in self.shape) or not self.locations:
             raise invalid_descriptor("tensor transfer has no shape or locations")
+
+        # The first location fixes the element byte width; every location must
+        # share its dtype, stay inside the logical shape, and occupy exactly
+        # shape * element_bytes bytes.
         first = self.locations[0]
         elements = math.prod(first.shape)
         if first.nbytes % elements or first.nbytes < elements:
             raise invalid_descriptor("tensor transfer has an invalid element size")
+
         element_bytes = first.nbytes // elements
         for location in self.locations:
             if (
@@ -391,13 +407,17 @@ class KvTransfer:
             or self.compute_dtype not in {"float16", "bfloat16", "float32", "float64"}
         ):
             raise invalid_descriptor("KV publication storage identity is invalid")
+
         suffix = self.published_extent - self.base_extent
         if not suffix:
             if self.tensors:
                 raise invalid_descriptor("empty KV suffix carries physical tensors")
             return
+
         if len(self.tensors) not in {2, 3}:
             raise invalid_descriptor("KV publication requires raw keys, values and optional scales")
+
+        # Key and value tensors are [suffix tokens, layers, heads, head dim].
         key, value = self.tensors[:2]
         if (
             len(key.shape) != 4
@@ -407,11 +427,15 @@ class KvTransfer:
             or key.dtype not in {"float16", "bfloat16", "float32", "float64", "float8_e4m3fn"}
         ):
             raise invalid_descriptor("KV publication has invalid token, layer, or head bounds")
+
         quantized = key.dtype == "float8_e4m3fn"
         if (len(self.tensors) == 3) != quantized:
             raise invalid_descriptor("KV publication scale presence disagrees with its storage")
+
         if quantized:
             scales = self.tensors[2]
+            # Pages cover the unaligned base tail plus the suffix, and scales
+            # are [pages, K/V, layers, head groups] per source page.
             pages = (
                 self.base_extent % self.page_size + suffix + self.page_size - 1
             ) // self.page_size
@@ -505,8 +529,16 @@ TransferValue: TypeAlias = EncoderTransferValue | DeviceProductTransferValue | L
 
 
 def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
+    """Estimate the encoded byte size of tensor locators for handle bounding.
+
+    The integer constants are conservative per-record overheads (field names,
+    tags, lengths), not exact wire sizes; only string and list lengths are
+    measured from the values themselves.
+    """
+
     locators = tuple(location for tensor in tensors for location in tensor.locations)
     size = 512 + sum(64 + 8 * len(tensor.shape) for tensor in tensors)
+
     for locator in locators:
         size += (
             256
@@ -518,6 +550,7 @@ def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
             + len(locator.source.address_space.encode())
             + len(locator.source.incarnation.encode())
         )
+
         transport = locator.transport
         if isinstance(transport, LocalTransfer):
             size += len(transport.endpoint.encode()) + 16

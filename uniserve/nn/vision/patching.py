@@ -93,6 +93,7 @@ def build_abs_positions_from_grid_hw(
     widths = grid_hw[:, 1]
     counts = heights * widths
     total = int(total)
+
     patch_to_sample = torch.repeat_interleave(
         torch.arange(batch, device=device), counts, output_size=total
     )
@@ -102,6 +103,7 @@ def build_abs_positions_from_grid_hw(
     # it, which is rejected mid CUDA-graph capture.
     offsets = torch.cumsum(torch.cat([counts.new_zeros(1), counts[:-1]]), dim=0)
     patch_id = patch_id - offsets[patch_to_sample]
+
     width_per_patch = widths[patch_to_sample]
     abs_x = patch_id % width_per_patch
     abs_y = patch_id // width_per_patch

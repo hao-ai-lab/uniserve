@@ -147,6 +147,8 @@ class OutputInfo:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "output_info") -> OutputInfo:
+        """Parse a named result description with its dtype and shape bound."""
+
         data = _map(value, where)
         return cls(
             name=_str(data.get("name"), f"{where}.name"),
@@ -155,6 +157,8 @@ class OutputInfo:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize the result description for IPC."""
+
         return {
             "name": self.name,
             "dtype": self.dtype.value,
@@ -245,6 +249,8 @@ def _interned_shape_bound(
 ) -> ShapeBound:
     """Reuse an immutable shape bound for an already encoded dimension tuple."""
 
+    # Dimensions arrive pre-validated by _fast_shape_bound, so construction
+    # bypasses __post_init__ to keep interning a pure allocation.
     shape = object.__new__(ShapeBound)
     object.__setattr__(
         shape,
@@ -266,6 +272,8 @@ def _fast_shape_bound(value: object) -> ShapeBound | None:
     kind = type(raw_dims)
     if kind is not list and kind is not tuple:
         return None
+
+    # Each dim is encoded as (is_device_dim, extent) for the interning cache key.
     dims: list[tuple[bool, int]] = []
     device_dims = 0
     for item in raw_dims:
@@ -287,6 +295,7 @@ def _fast_shape_bound(value: object) -> ShapeBound | None:
             device_dims += 1
         else:
             return None
+
     if device_dims > 1:
         # Delegate the invalid shape to the validating decoder.
         return None
@@ -298,9 +307,11 @@ def _fast_tensor_ref(value: object) -> TensorRef | None:
 
     if type(value) is not dict:
         return None
+
     request_key = identity._fast_request_key(value.get("request_key"))
     if request_key is None:
         return None
+
     producer_op_id = value.get("producer_op_id")
     output_index = value.get("output_index")
     generation = value.get("generation")
@@ -312,15 +323,19 @@ def _fast_tensor_ref(value: object) -> TensorRef | None:
         and generation > 0
     ):
         return None
+
     raw_dtype = value.get("dtype")
     if type(raw_dtype) is not str:
         return None
     dtype = _DTYPE_BY_VALUE.get(raw_dtype)
     if dtype is None:
         return None
+
     shape_bound = _fast_shape_bound(value.get("shape_bound"))
     if shape_bound is None:
         return None
+
+    # Every field validated above, so construction skips __post_init__.
     reference = object.__new__(TensorRef)
     set_field = object.__setattr__
     set_field(reference, "request_key", request_key)

@@ -8,10 +8,7 @@ import torch
 
 from uniserve.media import image
 from uniserve.model import DenoiserInput as NumericalDenoiserInput
-from uniserve.nn.attention import (
-    AttentionInput,
-    DenseInput,
-)
+from uniserve.nn.attention import AttentionInput, DenseInput
 
 
 @dataclass(frozen=True)
@@ -36,6 +33,12 @@ class ImageConditioning:
 
 @dataclass(frozen=True)
 class DenoiserInput(NumericalDenoiserInput[image.Config]):
+    """Image tokens with temporal/height/width positions [3, tokens] per sample.
+
+    Temporal coordinates apply to every token through axial RoPE; height and
+    width index each token's patch within its image grid.
+    """
+
     images: tuple[ImageConditioning, ...]
     positions: tuple[torch.Tensor, ...]
     sequence_lengths: tuple[int, ...]

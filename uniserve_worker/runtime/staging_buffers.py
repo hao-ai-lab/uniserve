@@ -23,6 +23,7 @@ class StagingBuffers:
         count = int(depth)
         if count < 1:
             raise ValueError("host staging depth must be positive")
+
         self.device = canonical_device(device)
         pin = self.device.type == "cuda"
         self._buffers = tuple(
@@ -38,6 +39,7 @@ class StagingBuffers:
             raise RuntimeError("host staging storage is closed")
         slot = self._cursor % len(self._buffers)
         self._cursor += 1
+        # A slot is reusable only after the fence of its previous H2D copy.
         event = self._events[slot]
         if event is not None and not event.query():
             event.synchronize()

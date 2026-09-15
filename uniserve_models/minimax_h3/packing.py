@@ -128,6 +128,7 @@ def build_packing(
         raise ValueError("fixed latent dimensions are not divisible by the transformer patch")
 
     # Text and audio occupy dense 64-row tiles before the sparse video region.
+    # Latents are 16x spatially compressed relative to the output raster.
     rows_per_frame = latent_height // patch_h * (latent_width // patch_w)
     audio_rows = AUDIO_CHANNELS * audio_frames
     video_rows = video_frames // patch_t * rows_per_frame
@@ -247,6 +248,7 @@ def patchify_video(
 
     patch_t, patch_h, patch_w = patch_size
     batch, channels, frames, height, width = latents.shape
+    # Split each axis into (cell, patch) pairs, then walk cells in raster order.
     rows = latents.reshape(
         batch,
         channels,

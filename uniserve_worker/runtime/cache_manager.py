@@ -70,6 +70,7 @@ class CacheManager:
             raise ValueError("cache backing must cover the advertised resident layers")
         for name in self.layers:
             state = cache.state(name)
+            # Physical K/V pages are [page, token within page, KV head, head dim].
             if state.key.shape != (
                 info.num_blocks,
                 info.block_size,
@@ -77,6 +78,7 @@ class CacheManager:
                 info.head_dim,
             ):
                 raise ValueError("cache backing must match the advertised page and head extents")
+
         self.compute_dtype = cache.config.layers[self.layers[0]].compute_dtype
         self.group_ranges = self._group_ranges(group_ranges)
         self.group_count = len(self.group_ranges)
@@ -85,12 +87,15 @@ class CacheManager:
         self._validated_page_tuples: dict[
             tuple[tuple[int, ...], bool, int | None], tuple[int, ...]
         ] = {}
+
         self.exports: dict[BufferId, ExportLocations] = {}
         self.export_releases: dict[BufferId, tuple[Future[None], ...]] = {}
         self._sources: dict[BufferId, CacheExport] = {}
+
         self._executions: dict[Future[None], CacheAccess] = {}
         self._execution_pages: dict[int, set[CacheAccess]] = {}
         self._execution_lock = RLock()
+
         self.block_tables = BlockTables(
             group_count=self.group_count,
             request_pool_size=request_pool_size,
@@ -101,9 +106,11 @@ class CacheManager:
             device=cache.device,
             staging_depth=staging_depth,
         )
+
         self._publications: dict[BufferId, KvTransfer] = {}
         self._destination_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]] = {}
         self._installed_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]] = {}
+
         self.imports = CacheImports(self, capacity=import_capacity)
 
     @contextmanager
@@ -155,16 +162,20 @@ class CacheManager:
             return
         pages = self.validate_pages(page_ids, group=group)
         ranges = tuple(page_spans(pages, 0, length, page_size=self.info.block_size))
+
         with self._execution_lock:
             if completion.done():
                 completion.result()
                 return
+
             execution = self._executions.get(completion)
             register = execution is None
             if execution is None:
                 execution = CacheAccess(completion, set(), {})
                 self._executions[completion] = execution
             execution.requests.add(request)
+
+            # Merge overlapping spans so each page retains a single interval.
             for page, offset, count in ranges:
                 previous = execution.ranges.get(page)
                 if previous is not None:
@@ -173,6 +184,7 @@ class CacheManager:
                     count = end - offset
                 execution.ranges[page] = (offset, count)
                 self._execution_pages.setdefault(page, set()).add(execution)
+
         if register:
             completion.add_done_callback(self._execution_completed)
 
@@ -183,6 +195,7 @@ class CacheManager:
             execution = self._executions.pop(completion, None)
             if execution is None:
                 return
+
             for page in execution.ranges:
                 uses = self._execution_pages[page]
                 uses.remove(execution)
@@ -255,6 +268,7 @@ class CacheManager:
         selected = tuple(buffers)
         release_exports(self.exports, self.export_releases, selected)
         self.imports.release(selected)
+
         for buffer in selected:
             source = self._sources.get(buffer)
             if source is not None:
@@ -282,6 +296,7 @@ class CacheManager:
                 if future.done():
                     future.result()
         self._reap_sources()
+
         # Free retires a publication, not the request's resident KV pages.
         # Unrelated products can share that request while later computation
         # still reads its prefix. Only request retirement waits for all such
@@ -292,9 +307,11 @@ class CacheManager:
                 for execution in self._executions.values()
                 if execution.requests.intersection(owners)
             )
+
         for execution in executions:
             if execution.completion.done():
                 execution.completion.result()
+
         return (
             not executions
             and all(source.buffer not in self._sources for source in sources)
@@ -369,10 +386,12 @@ class CacheManager:
         self.imports.stop()
         self.release_buffers(tuple(self._sources))
         self.imports.require_retired()
+
         if self._executions:
             raise resource_error("KV cache still has executing producers or consumers")
         if self._sources:
             raise resource_error("KV cache still has unretired physical publications")
+
         self.exports.clear()
         self.export_releases.clear()
         self.block_tables.close()
@@ -394,6 +413,8 @@ class CacheManager:
         )
         if not ranges:
             raise invalid_descriptor("KVCache declares no KV groups")
+
+        # Groups must tile the physical pool exactly: no gaps, no overlap.
         covered = [False] * self.info.num_blocks
         for group, (offset, count) in enumerate(ranges):
             end = offset + count
@@ -403,6 +424,7 @@ class CacheManager:
                 if covered[page]:
                     raise invalid_descriptor("KV group physical page ranges overlap")
                 covered[page] = True
+
         if not all(covered):
             raise invalid_descriptor("KV group physical page ranges do not cover the request pool")
         return ranges
@@ -442,19 +464,25 @@ class CacheManager:
             return cached
         pages = tuple(int(page) for page in pages)
         key = (pages, bool(allow_sentinel), group)
+
+        # Page 0 is the padding sentinel; uniqueness and group bounds apply
+        # only to real pages.
         real_pages = tuple(page for page in pages if page != 0)
         if len(set(real_pages)) != len(real_pages):
             raise invalid_descriptor("KV allocation repeats a physical page")
+
         lower = 0 if allow_sentinel else 1
         upper = self.info.num_blocks
         if pages and (min(pages) < lower or max(pages) >= upper):
             raise invalid_descriptor("KV allocation exceeds the fixed physical pool")
+
         if group is not None:
             group_id = self.validate_group(group)
             offset, count = self.group_ranges[group_id]
             end = offset + count
             if any(page < offset or page >= end for page in real_pages):
                 raise invalid_descriptor("KV allocation addresses another cache group")
+
         if len(self._validated_page_tuples) >= 16_384:
             self._validated_page_tuples.clear()
         self._validated_page_tuples[key] = pages
@@ -525,12 +553,14 @@ class CacheManager:
             installed_buffer, base_extent = installed
             if installed_buffer != expected_base:
                 raise invalid_descriptor("KV publication expected base does not match destination")
+
         pages = self.block_tables.pages(request_pool_idx, group_id)
         visible = int(visible_length)
         if visible > self.block_tables.allocated_length(request_pool_idx):
             raise invalid_descriptor("KV publication exceeds its scheduler block table")
         if visible < base_extent:
             raise invalid_descriptor("KV publication destination is ahead of its source")
+
         suffix = visible - base_extent
         source = (
             self.reserve_publication(
@@ -539,6 +569,7 @@ class CacheManager:
             if suffix
             else None
         )
+
         locators: list[Locator] = []
         tensors: list[TensorTransfer] = []
         try:
@@ -555,6 +586,8 @@ class CacheManager:
                             if isinstance(tensor, QuantizedTensor)
                             else tensor
                         )
+                        # Each span view is [tokens, 1, kv heads, head dim]:
+                        # the unsqueezed axis is this layer's slice.
                         views = tuple(
                             values[page, start : start + count].unsqueeze(1)
                             for page, start, count in spans
@@ -583,6 +616,8 @@ class CacheManager:
                             locations=tuple(locations),
                         )
                     )
+
+                # FP8 exports additionally carry one scale row per published page.
                 if self.info.dtype == "float8_e4m3fn":
                     locations = []
                     for layer, name in enumerate(self.layers, self.info.layer_offset):
@@ -622,6 +657,7 @@ class CacheManager:
                 transports[locator.backend].release(locator)
             self.release_buffers((buffer,))
             raise
+
         publication = KvTransfer(
             tensors=tuple(tensors),
             source=buffer,
@@ -721,15 +757,19 @@ class CacheManager:
             or not set(initialized).issubset(pages)
         ):
             raise invalid_descriptor("KV import exceeds its scheduler block table")
+
         if publication.base_extent:
             base_pages = (
                 publication.base_extent + self.info.block_size - 1
             ) // self.info.block_size
+            # The installed base pages must stay identical and must not be
+            # re-initialized by this import.
             installed_pages = self.block_tables.pages(request_pool_idx, group_id)[:base_pages]
             if pages[:base_pages] != installed_pages or set(initialized).intersection(
                 installed_pages
             ):
                 raise invalid_descriptor("KV import would replace its installed base pages")
+
         return self.imports.reserve(
             source,
             publication,
@@ -761,12 +801,14 @@ class CacheManager:
             or write.group_id != group_id
         ):
             raise invalid_descriptor("installed KV buffer identity is invalid")
+
         self._validate_install(source, publication, group_id=group_id)
         if (
             self.block_tables.pages(request_pool_idx, group_id) != write.pages
             or self.block_tables.allocated_length(request_pool_idx) < publication.published_extent
         ):
             raise invalid_descriptor("KV installation scheduler block table changed")
+
         self.imports.adopt(write)
         self.block_tables.set_verified(
             torch.tensor((request_pool_idx,), device=self.block_tables.page_tables.device),
@@ -783,9 +825,12 @@ class CacheManager:
     ) -> None:
         """Validate touched KV versions before any group resource becomes visible."""
 
+        # Transaction-local views start from resident state, so the batch is
+        # validated as one consistent step.
         publications_by_buffer: dict[BufferId, KvTransfer] = {}
         destination_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]] = {}
         installed_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]] = {}
+
         for buffer, publication in publications:
             if buffer != publication.source:
                 raise invalid_descriptor("KV publication buffer identity is invalid")
@@ -806,6 +851,7 @@ class CacheManager:
                 publication.source,
                 publication.published_extent,
             )
+
         for source, installed_buffer, publication in installations:
             if source != publication.source or installed_buffer.owner != source.owner:
                 raise invalid_descriptor("installed KV buffer identity is invalid")
@@ -833,12 +879,14 @@ class CacheManager:
         """Publish validated KV versions by updating only affected directory entries."""
 
         self.validate_publications(publications, installations)
+
         for buffer, publication in publications:
             self._publications[buffer] = publication
             self._destination_bases[(buffer.owner, publication.destination)] = (
                 publication.source,
                 publication.published_extent,
             )
+
         for source, installed_buffer, publication in installations:
             self._publications[source] = publication
             self._publications[installed_buffer] = publication

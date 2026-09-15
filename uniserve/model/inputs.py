@@ -17,6 +17,12 @@ SizeT = TypeVar("SizeT")
 
 @dataclass(frozen=True, slots=True)
 class EntryPoint:
+    """A callable numerical method with its pipeline-stage participation.
+
+    ``stage`` restricts which pipeline ranks execute the method; ``groups``
+    names the communication axes it joins.
+    """
+
     method: str
     stage: Literal["all", "first", "last"] = "all"
     groups: tuple[str, ...] = ()
@@ -32,12 +38,16 @@ class EntryPoint:
 
 @dataclass(frozen=True, slots=True)
 class EmbeddingReplacement:
+    """Precomputed embeddings spliced in place of token embeddings where ``mask`` is set."""
+
     values: torch.Tensor
     mask: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
 class TextInput:
+    """Borrowed tensors for one transformer forward over packed tokens."""
+
     input_ids: torch.Tensor
     positions: torch.Tensor
     attention: AttentionInput
@@ -53,6 +63,8 @@ class TextInput:
 
 @dataclass(frozen=True, slots=True)
 class VisionInput:
+    """Per-sample images, either CHW rasters or packed patch rows with grids."""
+
     images: tuple[torch.Tensor, ...]
     grids: tuple[torch.Tensor | None, ...]
     grid_shapes: tuple[tuple[int, int] | None, ...]
@@ -68,12 +80,16 @@ class VisionInput:
 
 @dataclass(frozen=True, slots=True)
 class LatentInput:
+    """One sample's latent tensor and its diffusion timestep."""
+
     tensor: torch.Tensor
     timestep: torch.Tensor
 
 
 @dataclass(frozen=True)
 class DenoiserInput(Generic[SizeT]):
+    """Per-modality latents aligned with sample sizes at one solver step."""
+
     latents: Mapping[str, tuple[LatentInput, ...]]
     sizes: tuple[SizeT, ...]
     step_index: int
@@ -92,6 +108,8 @@ class DenoiserInput(Generic[SizeT]):
 
 @dataclass(frozen=True, slots=True)
 class TextSize:
+    """Token and sequence counts describing a text workload."""
+
     num_tokens: int
     batch_size: int
 

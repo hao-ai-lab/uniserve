@@ -222,6 +222,7 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
     denoiser = TransformerConfig(
         **{target: transformer[source] for source, target in TRANSFORMER_FIELDS.items()}
     )
+
     text = metadata["text_encoder"].get("text_config")
     if not isinstance(text, dict):
         raise ValueError("FastH3 text encoder requires text_config")
@@ -250,6 +251,7 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
             f"FastH3 text_encoder.text_config is missing fields: {', '.join(sorted(missing))}"
         )
     encoder = TextEncoderConfig(**{target: text[source] for source, target in TEXT_FIELDS.items()})
+
     video_values = {}
     for field in fields(video_vae.Config):
         if field.name not in metadata["video_vae"]:
@@ -260,6 +262,7 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
                 raise ValueError(f"FastH3 video_vae.{field.name} must be a sequence")
             value = tuple(value)
         video_values[field.name] = value
+
     audio_values = {}
     for field in fields(audio_vae.Config):
         if field.name not in metadata["audio_vae"]:
@@ -274,9 +277,11 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
         elif isinstance(field.default, tuple):
             value = tuple(value)
         audio_values[field.name] = value
+
     for name in ("scheduler", "audio_scheduler"):
         if "shift" not in metadata[name]:
             raise ValueError(f"FastH3 {name} is missing field shift")
+
     return Config(
         text_encoder=encoder,
         denoiser=denoiser,

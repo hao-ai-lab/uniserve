@@ -126,6 +126,8 @@ if triton is not None:
     ):
         """Normalize flattened query and key head rows in one launch domain."""
 
+        # Sources are [tokens, heads, dim] with arbitrary strides; outputs are
+        # contiguous [tokens * heads, dim] in head-minor row order.
         pid = tl.program_id(0)
         offs = tl.arange(0, block)
         col_mask = offs < n_cols
@@ -283,6 +285,7 @@ def run_qk_rms_norm(
     block, num_warps = _norm_launch_config(head_dim)
     q_rows = q_tokens * q_heads
     k_rows = k_tokens * k_heads
+
     _qk_rms_norm_kernel[(q_rows + k_rows,)](
         q,
         k,
@@ -344,9 +347,11 @@ class SglRmsNorm(Operator):
         # logical leading dimensions recorded in ``original_shape``.
         rows = _reshape_norm_rows(coerced, hidden_size)
         out = torch.empty_like(rows)
+
         kernel = _sgl_rmsnorm_kernel()
         if kernel is None:
             raise RuntimeError("sgl rmsnorm kernel unavailable")
+
         kernel(rows, req.weight, float(req.eps), out=out)
         return out.reshape(original_shape)
 
@@ -374,6 +379,7 @@ class TritonRmsNorm(Operator):
         out = torch.empty_like(req.hidden_states)
 
         block, num_warps = _norm_launch_config(hidden_size)
+
         _rms_norm_kernel[(rows,)](
             req.hidden_states,
             req.weight,
@@ -433,6 +439,7 @@ class SglAddRmsNorm(Operator):
         kernel = _sgl_fused_add_rmsnorm_kernel()
         if kernel is None:
             raise RuntimeError("sgl fused_add_rmsnorm kernel unavailable")
+
         kernel(
             _reshape_norm_rows(req.hidden_states, hidden_size),
             _reshape_norm_rows(req.residual, hidden_size),
@@ -471,7 +478,9 @@ class TritonAddRmsNorm(Operator):
         # when the request does not select SGL's in-place form.
         normed = torch.empty_like(req.hidden_states)
         combined = torch.empty_like(req.hidden_states)
+
         block, num_warps = _norm_launch_config(hidden_size)
+
         _add_rms_norm_kernel[(rows,)](
             req.hidden_states,
             req.residual,

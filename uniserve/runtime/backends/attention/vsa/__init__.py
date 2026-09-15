@@ -15,6 +15,7 @@ class Operator:
     def __init__(self, pattern, *, num_heads, head_dim, dtype, workspace):
         if min(num_heads, head_dim) < 1 or len(pattern.row_counts) not in (1, num_heads):
             raise ValueError("VSA operator requires compatible positive head dimensions")
+
         self.pattern, self.num_heads, self.head_dim, self.dtype = (
             pattern,
             num_heads,
@@ -24,12 +25,16 @@ class Operator:
         self.workspace, self._closed = workspace, False
 
     def bind(self, batch: BlockInput) -> None:
+        """Check a live batch against the prepared pattern before use."""
+
         if self._closed:
             raise RuntimeError("VSA operator is closed")
         if batch.pattern != self.pattern:
             raise ValueError("VSA block cardinalities differ from the prepared pattern")
 
     def _validate(self, q, k, v, batch, out):
+        """Bind the batch and check every tensor against the prepared dimensions."""
+
         self.bind(batch)
         if (
             q.shape != (len(self.pattern.row_counts[0]) * 64, self.num_heads, self.head_dim)
@@ -49,30 +54,41 @@ class Operator:
             raise ValueError("VSA tensors disagree with the prepared numerical dimensions")
 
     def __call__(self, q, k, v, batch, *, scale, out):
+        """Evaluate one attention call; implemented by each concrete backend."""
+
         raise NotImplementedError
 
     def close(self):
+        """Release the borrowed workspace; the operator cannot be reused."""
+
         self._closed = True
         self.workspace = {}
 
 
 class Backend:
+    """Construct operators and their workspace for one concrete VSA provider."""
+
     operator_class: type[Operator]
 
     def workspace_buffers(
         self, pattern: Pattern, *, num_heads: int, head_dim: int, dtype: torch.dtype
     ):
+        """Describe extra device buffers the backend needs beyond caller tensors."""
+
         return {}
 
     def prepare(
         self, pattern: Pattern, *, num_heads: int, head_dim: int, dtype: torch.dtype, workspace
     ):
+        """Build an operator bound to one pattern, dtype, and borrowed workspace."""
+
         return self.operator_class(
             pattern, num_heads=num_heads, head_dim=head_dim, dtype=dtype, workspace=workspace
         )
 
 
 def resolve(backend, *, device):
+    """Return the Backend for a name, an existing instance, or 'auto' device probing."""
     if isinstance(backend, Backend):
         return backend
     if backend == "auto":
@@ -81,6 +97,7 @@ def resolve(backend, *, device):
             if candidate.available(device):
                 return candidate.Backend()
         raise RuntimeError(f"no installed VSA backend supports {device}")
+
     if backend not in {"sm100", "cute", "flashinfer", "triton"}:
         raise ValueError(f"unknown VSA backend {backend!r}")
     module = import_module(f"{__name__}.{backend}")

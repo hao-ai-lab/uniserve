@@ -57,6 +57,7 @@ class InputBufferConfig:
             "write_indices": BufferConfig((tokens,), torch.int64),
             "timesteps": BufferConfig((rows,), torch.float32),
         }
+
         if self.hidden_size:
             fields["input_embeddings"] = BufferConfig(
                 (text, self.hidden_size), self.embedding_dtype
@@ -84,13 +85,18 @@ class InputBuffers:
             config.max_blocks_per_row,
         )
         self.hidden_size = config.hidden_size
+
         self._backing = TensorBuffers.allocate(config.buffers(), device=self.device)
         for name, tensor in self._backing.view(config.buffers()).items():
             tensor.zero_()
             setattr(self, name, tensor)
+
+        # Unused slots keep sentinel values; staged calls overwrite the prefix
+        # they use.
         self.input_ids.fill_(1)
         self.write_indices.fill_(-1)
         self.input_embeddings = getattr(self, "input_embeddings", None)
+
         self._request_host = StagingBuffers(
             self.max_rows, dtype=torch.int64, depth=max_inflight, device=device
         )
@@ -104,12 +110,15 @@ class InputBuffers:
         self._backing.close()
 
     def _requests(self, rows):
+        """Copy request pool indices and any force-finish flags into device staging."""
+
         count = len(rows)
         slot, host = self._request_host.acquire()
         fill_cpu_ints(host, tuple(row.request_pool_idx for row in rows))
         requests = self.request_pool_indices[:count]
         requests.copy_(host[:count], non_blocking=True)
         self._request_host.record_copy(slot)
+
         finish = None
         if all(row.decode_predicate is not None and row.decode_predicate_tagged for row in rows):
             finish = self.decode_force_finish[:count]
@@ -117,6 +126,7 @@ class InputBuffers:
             fill_cpu_bools(host, tuple(row.decode_force_finish for row in rows))
             finish.copy_(host[:count], non_blocking=True)
             self._finish_host.record_copy(slot)
+
         return requests, finish
 
     def stage(
@@ -129,6 +139,8 @@ class InputBuffers:
         tables=None,
         states=None,
     ):
+        """Stage one homogeneous call into the lane's fixed buffers and bind its typed inputs."""
+
         if not 0 < len(rows) <= self.max_rows:
             raise ValueError("forward row count exceeds input-buffer capacity")
         if any(
@@ -139,7 +151,9 @@ class InputBuffers:
             for row in rows
         ):
             raise ValueError("one input call requires homogeneous computations")
+
         requests, finish = self._requests(rows)
+
         indexed = any(row.request_indexed_decode for row in rows)
         if indexed:
             if states is None or any(
@@ -154,6 +168,7 @@ class InputBuffers:
                 if row.request_indexed_decode
             ):
                 raise ValueError("indexed decode requires valid resident request slots")
+
             if (
                 attention is None
                 and cache is not None
@@ -167,6 +182,9 @@ class InputBuffers:
                 return InputBatch(
                     forward_mode, inputs, requests, tuple(row.selection for row in rows), finish
                 )
+
+            # Without a compatible resident CUDA cache, materialize one token
+            # and position per row and continue through the ordinary path.
             rows = tuple(
                 replace(
                     row,
@@ -187,6 +205,7 @@ class InputBuffers:
                 columns(rows, cache=cache, tables=tables) if attention is None else attention
             )
             staged = self.stage_attention(attention)
+
             if isinstance(forward_mode, ForwardMode):
                 inputs = self._text(rows, staged)
                 selections = tuple(row.selection for row in rows)
@@ -208,19 +227,25 @@ class InputBuffers:
             )
         else:
             raise ValueError(f"unsupported staged computation {forward_mode}")
+
         return InputBatch(forward_mode, inputs, requests, selections, finish)
 
     def _text(self, rows, attention):
+        """Stage token IDs, positions and optional embeddings into the text columns."""
+
         if any(
             row.token_ids is None or row.positions is None or row.selection is None for row in rows
         ):
             raise ValueError("text inputs require IDs, positions and output selection")
+
         lengths = tuple(row.token_ids.numel() for row in rows)
         total = sum(lengths)
         if min(lengths) < 1 or total > self.max_text_tokens:
             raise ValueError("text token count exceeds input-buffer capacity")
+
         self.positions[:, :total].zero_()
         self.embedding_mask[:total].zero_()
+
         has_embeddings = any(row.token_embeddings is not None for row in rows)
         # Multimodal prefills share one capture representation whether the
         # current prompt inserts features or consists entirely of token IDs.
@@ -249,19 +274,24 @@ class InputBuffers:
                 self.input_ids[offset : offset + length].copy_(
                     row.token_ids.reshape(-1), non_blocking=True
                 )
+
             self._positions(row.positions, offset, length)
             axes = max(axes, 1 if row.positions.ndim == 1 else row.positions.shape[0])
+
             if row.token_embeddings is not None:
                 values = row.token_embeddings.reshape(length, -1)
                 if values.shape[1] != self.hidden_size:
                     raise ValueError("input embeddings must match the hidden width")
+
                 self.input_embeddings[offset : offset + length].copy_(values, non_blocking=True)
                 mask = self.embedding_mask[offset : offset + length]
                 if row.token_embedding_mask is None:
                     mask.fill_(True)
                 else:
                     mask.copy_(row.token_embedding_mask.reshape(-1), non_blocking=True)
+
             offset += length
+
         return TextInput(
             self.input_ids[:total],
             self.positions[0, :total] if axes == 1 else self.positions[:axes, :total],
@@ -272,20 +302,26 @@ class InputBuffers:
         )
 
     def _images(self, rows, attention):
+        """Stage denoising positions and timesteps, then bind the image inputs."""
+
         if self.image_builder is None:
             raise ValueError("image denoising requires its bound input builder")
+
         sizes = tuple(image.Config(row.image_height, row.image_width) for row in rows)
         lengths = tuple(self.image_builder.sequence_length(size) for size in sizes)
         if sum(lengths) > self.max_tokens:
             raise ValueError("image sequences exceed input-buffer capacity")
+
         positions, offset = [], 0
         for index, (row, size, length) in enumerate(zip(rows, sizes, lengths, strict=True)):
             if row.timestep is None or row.positions is None:
                 raise ValueError("image denoising requires positions and a timestep")
+
             self._positions(row.positions, offset, length)
             positions.append(self.positions[:, offset : offset + length])
             self.timesteps[index].copy_(row.timestep.reshape(()))
             offset += length
+
         return self.image_builder.bind(
             samples=tuple(self._device_view(row.latent) for row in rows),
             sizes=sizes,
@@ -296,8 +332,11 @@ class InputBuffers:
         )
 
     def stage_attention(self, attention):
+        """Copy paged or segmented attention columns into the lane's fixed buffers."""
+
         if not isinstance(attention, (PagedInput, SegmentedInput)):
             raise TypeError("worker token staging requires paged or prefix/current attention")
+
         count = attention.queries.batch_size
         queries = SequenceLengths(
             host=attention.queries.host,
@@ -309,21 +348,27 @@ class InputBuffers:
             values=self._vector(self.cache_lengths, attention.prefixes.values),
             offsets=self._vector(self.cumulative_prefix_lengths, attention.prefixes.offsets),
         )
+
         source = attention.block_table.indices
         if source.shape[1] > self.max_blocks_per_row:
             raise ValueError("block tables exceed input-buffer capacity")
+
         table = self.block_tables[:count, : source.shape[1]]
         table.copy_(source, non_blocking=True)
         blocks = BlockTable(table, attention.block_table.block_size)
+
         writes = (
             None
             if attention.write_indices is None
             else self._vector(self.write_indices, attention.write_indices)
         )
+
         if isinstance(attention, PagedInput):
             return PagedInput(queries, prefixes, blocks, writes, attention.causal)
+
         if not attention.fully_visible_current:
             raise ValueError("image staging requires fully visible current sequences")
+
         return SegmentedInput(
             queries,
             prefixes,
@@ -334,6 +379,8 @@ class InputBuffers:
         )
 
     def _indexed(self, rows, width, cache, tables, states):
+        """Gather resident decode rows on device directly into paged staging."""
+
         count = len(rows)
         gather_request_decode_inputs(
             request_pool_indices=self.request_pool_indices,
@@ -353,6 +400,7 @@ class InputBuffers:
             group_id=rows[0].group_id,
             page_size=cache.info.block_size,
         )
+
         writes = self.write_indices[:count]
         queries = SequenceLengths(
             host=(1,) * count,
@@ -364,6 +412,7 @@ class InputBuffers:
             values=self.cache_lengths[:count],
             offsets=self.cumulative_prefix_lengths[: count + 1],
         )
+
         attention = PagedInput(
             queries,
             prefixes,
@@ -371,10 +420,12 @@ class InputBuffers:
             writes,
             tuple(row.causal for row in rows),
         )
+
         if self.image_builder is not None:
             positions = self.positions[:, :count]
         else:
             positions = self.positions[0, :count]
+
         return TextInput(self.input_ids[:count], positions, attention)
 
     def _positions(self, source, offset, count):

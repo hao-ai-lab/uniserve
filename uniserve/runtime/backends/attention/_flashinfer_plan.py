@@ -195,7 +195,7 @@ def _apply_fast_plan_overrides(
     global_override_indptr_cpu: torch.Tensor | None,
     global_override_last_page_len_cpu: torch.Tensor,
 ) -> None:
-    """Install temporary planner metadata overrides and restore wrapper state afterward."""
+    """Bind reusable metadata buffers, invoke the cached planner, and stamp scalar settings."""
 
     is_graph = bool(getattr(wrapper, "is_cuda_graph_enabled", False))
     _prepare_fast_decode_plan_buffers(
@@ -394,7 +394,11 @@ def _fast_decode_plan_args(
     disable_split_kv: bool,
     is_graph: bool,
 ) -> list[Any]:
-    """Assemble the ordered low-level argument tuple for the installed decode planner."""
+    """Assemble the ordered low-level argument tuple for the installed decode planner.
+
+    The positional order mirrors the cached FlashInfer decode module's plan()
+    signature and is fixed by the installed FlashInfer build.
+    """
 
     args = [
         wrapper._float_workspace_buffer,

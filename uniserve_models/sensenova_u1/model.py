@@ -23,9 +23,17 @@ from .transformer import Transformer
 
 
 class Model(nn.Module):
+    """Compose text, denoising, and vision over one shared MoT backbone.
+
+    The text LM and the image denoiser share the same transformer; the vision
+    encoder feeds NEO patch features into it, and the image decoder unfolds
+    predicted patches back into RGB pixels.
+    """
+
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
+
         backbone = Transformer(config.text)
         self.text = CausalLM(
             backbone, VocabParallelHead(config.text.hidden_size, config.text.vocab_size)
@@ -33,6 +41,7 @@ class Model(nn.Module):
         if config.text.tie_word_embeddings:
             self.text.lm_head.weight = backbone.embedding.weight
         self.denoiser = Denoiser(config, backbone)
+
         self.vision_encoder = PatchEncoder(
             vision.Encoder(config.vision),
             nn.Identity(),

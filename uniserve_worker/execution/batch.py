@@ -68,12 +68,14 @@ class ExecutionOutput:
             object.__setattr__(self, "vocabularies", (None,) * len(self.values))
         if len(self.vocabularies) != len(self.values):
             raise ValueError("vocabulary metadata must align with output rows")
+
         for value, vocab in zip(self.values, self.vocabularies, strict=True):
             if vocab is not None and (
                 value.ndim != 2
                 or value.shape[-1] != vocab.local_slice.stop - vocab.local_slice.start
             ):
                 raise ValueError("vocabulary output rows disagree with their shard")
+
         if not self.layouts:
             object.__setattr__(self, "layouts", (None,) * len(self.values))
         if len(self.layouts) != len(self.values):
@@ -86,8 +88,11 @@ class ExecutionOutput:
             if not self.values:
                 raise RuntimeError("forward output has a fence without a producer tensor")
             torch.cuda.current_stream(self.values[0].device).wait_event(self.output_event)
+
         if not any(self.vocabularies):
             return self
+
+        # Bucket rows that share one vocabulary shard so they gather together.
         groups = {}
         for index, vocab in enumerate(self.vocabularies):
             if vocab is not None:
@@ -101,6 +106,7 @@ class ExecutionOutput:
                     self.values[index].dtype,
                 )
                 groups.setdefault(key, []).append(index)
+
         values = list(self.values)
         for indexes in groups.values():
             vocab = self.vocabularies[indexes[0]]
@@ -132,9 +138,12 @@ class ExecutionOutput:
             if not self.values:
                 raise RuntimeError("forward output has a fence without a producer tensor")
             torch.cuda.current_stream(self.values[0].device).wait_event(self.output_event)
+
+        # Tensors sharing a device and dtype copy through one flat allocation.
         groups: dict[tuple[torch.device, torch.dtype], list[int]] = defaultdict(list)
         for index, value in enumerate(self.values):
             groups[(value.device, value.dtype)].append(index)
+
         copied = list(self.values)
         for indexes in groups.values():
             if len(indexes) == 1:
@@ -146,6 +155,7 @@ class ExecutionOutput:
             views = storage.split(tuple(value.numel() for value in sources))
             for index, view in zip(indexes, views, strict=True):
                 copied[index] = view.reshape(self.values[index].shape)
+
         greedy = self.greedy
         if greedy is not None:
             greedy = greedy.clone()

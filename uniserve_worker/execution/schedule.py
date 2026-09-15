@@ -78,12 +78,14 @@ def execute_groups(
                 for device in model_runner.operation_devices(operation)
             ):
                 state.group_buffers[completion_group].begin_device(device)
+
     grouped: list[list[PendingOutput | None]] = [
         [None] * len(state.group_operations(completion_group))
         for completion_group in completion_groups
     ]
     scheduled: list[tuple[ScheduledRequest, int]] = []
     locations: list[tuple[int, int]] = []
+
     for group_index, completion_group in enumerate(completion_groups):
         for operation_index, operation in enumerate(state.group_operations(completion_group)):
             if (
@@ -96,6 +98,7 @@ def execute_groups(
                 continue
             locations.append((group_index, operation_index))
             scheduled.append((operation, completion_group))
+
     completed, errors = _execute_operations(
         tuple(scheduled),
         kv_cache=kv_cache,
@@ -113,9 +116,11 @@ def execute_groups(
         config=config,
         state=state,
     )
+
     for index, outcome in completed.items():
         group_index, operation_index = locations[index]
         grouped[group_index][operation_index] = outcome
+
     outcomes: dict[int, tuple[PendingOutput, ...]] = {}
     for completion_group, group_outcomes in zip(completion_groups, grouped, strict=True):
         group_id = completion_group
@@ -241,6 +246,7 @@ def _execute_operations(
             *((operation.kv_output,) if operation.kv_output is not None else ()),
         )
     }
+
     outcomes: dict[int, PendingOutput] = {}
     errors: dict[int, BaseException] = {}
 
@@ -267,6 +273,7 @@ def _execute_operations(
                 if live(index)
             )
             raise RuntimeError(f"operation products contain an unresolved dependency: {blocked!r}")
+
         numerical = tuple(
             index
             for index in frontier
@@ -282,6 +289,7 @@ def _execute_operations(
                 }
             )
         )
+
         if not numerical:
             _execute_ready_actions(
                 frontier,
@@ -355,6 +363,7 @@ def _execute_operations(
                 model_runner=model_runner,
                 decode_state=decode_state,
             )
+
             values = (
                 forward_values(
                     model_runner,
@@ -372,6 +381,7 @@ def _execute_operations(
                 if forward
                 else ()
             )
+
             predictions = publish_forward_values(
                 forward,
                 values,
@@ -390,6 +400,7 @@ def _execute_operations(
                 sampling_group=sampling_group,
                 config=config,
             )
+
             if predictions:
                 assert latent_pool is not None
                 integrate_predictions(

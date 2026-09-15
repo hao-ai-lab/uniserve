@@ -14,6 +14,8 @@ from uniserve._slices import within
 
 @dataclass(frozen=True, slots=True)
 class RouteSpan:
+    """One route's contiguous token interval within a packed row layout."""
+
     route: str
     start: int
     length: int
@@ -59,9 +61,12 @@ class RoutedTensor:
     def from_packed(
         cls, value: torch.Tensor, spans: tuple[RouteSpan, ...], *, routes: frozenset[str]
     ) -> RoutedTensor:
+        """Split packed token rows into per-route tensors in span order."""
+
         _, count = _counts(spans, routes)
         if value.ndim < 1 or value.shape[0] != count:
             raise ValueError("packed tensor and route spans must cover the same tokens")
+
         values = {}
         for route in sorted(routes):
             pieces = [
@@ -81,6 +86,8 @@ class RoutedTensor:
         return size
 
     def packed(self, spans: tuple[RouteSpan, ...]) -> torch.Tensor:
+        """Join the per-route tensors back into packed span order."""
+
         self._validate(spans)
         offsets = dict.fromkeys(self.values, 0)
         pieces = []
@@ -89,14 +96,18 @@ class RoutedTensor:
             if span.length:
                 pieces.append(self.values[span.route][start : start + span.length])
             offsets[span.route] += span.length
+
         if not pieces:
             return next(iter(self.values.values()))[:0]
         return torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0]
 
     def narrow(self, interval: slice, spans: tuple[RouteSpan, ...]) -> RoutedTensor:
+        """Borrow the routes' rows covered by one packed token interval."""
+
         size = self._validate(spans)
         if not within((interval,), (size,)):
             raise ValueError("routed interval exceeds its packed token extent")
+
         offsets = dict.fromkeys(self.values, 0)
         pieces = {route: [] for route in self.values}
         for span in spans:
@@ -105,6 +116,7 @@ class RoutedTensor:
                 local = offsets[span.route] + start - span.start
                 pieces[span.route].append(self.values[span.route][local : local + stop - start])
             offsets[span.route] += span.length
+
         return RoutedTensor(
             {
                 route: torch.cat(parts, dim=0)
@@ -117,6 +129,8 @@ class RoutedTensor:
         )
 
     def apply(self, modules: Mapping[str, nn.Module]) -> RoutedTensor:
+        """Run each route's tensor through its corresponding module."""
+
         if set(self.values).difference(modules):
             raise ValueError("every numerical route requires a corresponding module")
         # Empty routes still execute: their layers may participate in shared
@@ -124,6 +138,8 @@ class RoutedTensor:
         return RoutedTensor({route: modules[route](value) for route, value in self.values.items()})
 
     def add(self, other: RoutedTensor) -> RoutedTensor:
+        """Add another routed tensor route by route."""
+
         if set(other.values) != set(self.values) or any(
             value.shape != other.values[route].shape for route, value in self.values.items()
         ):

@@ -64,6 +64,7 @@ class TensorBuffers:
         for name, group in symmetric.items():
             if configs[name].host or group.device != device:
                 raise ValueError("symmetric storage requires the group's assigned device")
+
         result = cls()
         for name, config in configs.items():
             shape = config.capacity_shape if config.capacity_shape is not None else config.shape
@@ -91,10 +92,12 @@ class TensorBuffers:
 
         if self._closed:
             raise RuntimeError("tensor buffers are closed")
+
         key = tuple(configs.items())
         cached = self._views.get(key)
         if cached is not None:
             return cached
+
         views = {}
         for name, config in configs.items():
             value = self._tensors.get(name)

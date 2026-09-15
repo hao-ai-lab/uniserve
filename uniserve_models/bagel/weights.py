@@ -33,11 +33,18 @@ precisions = MappingProxyType(
 
 
 def _backbone_names(backbone: Transformer) -> dict[str, str]:
+    """Translate backbone parameter paths to checkpoint language_model names.
+
+    Text experts keep the plain checkpoint names; flow experts carry the
+    ``_moe_gen`` suffix. Only layers resident on this pipeline rank appear.
+    """
+
     names = {
         "embedding.weight": "embed_tokens.weight",
         "norm.text.weight": "norm.weight",
         "norm.flow.weight": "norm_moe_gen.weight",
     }
+
     for path, _ in backbone.named_parameters():
         if not path.startswith("layers."):
             continue
@@ -69,11 +76,15 @@ def _backbone_names(backbone: Transformer) -> dict[str, str]:
             target = f"mlp{suffix}.{tail}"
         else:
             raise ValueError(f"unmapped BAGEL backbone parameter {path}")
+
         names[path] = f"layers.{index}.{target}"
+
     return {target: "language_model.model." + source for target, source in names.items()}
 
 
 def _mapped(module, source_names, *, nonresident=frozenset()):
+    """Build a primary-source mapping that skips tensors absent from the file."""
+
     def map_weights(reader):
         available = frozenset(reader.names())
         return tuple(
@@ -92,8 +103,11 @@ def _mapped(module, source_names, *, nonresident=frozenset()):
 
 
 def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
+    """Assign every resident module its checkpoint tensors per pipeline rank."""
+
     backbone = model.text.backbone
     source_names = _backbone_names(backbone)
+
     # PP omits only the source layers and terminal modules assigned elsewhere.
     template = tuple(
         source.split(".", 4)[-1]
@@ -112,10 +126,12 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
         nonresident.update(
             ("language_model.model.norm.weight", "language_model.model.norm_moe_gen.weight")
         )
+
     components = [_mapped(backbone, source_names, nonresident=frozenset(nonresident))]
     if model.text.lm_head is not None:
         components.append(_mapped(model.text, {"lm_head.weight": "language_model.lm_head.weight"}))
     else:
+        # Without a resident head, declare its tensor nonresident on the backbone.
         first = components[0]
         components[0] = weights.ModuleMapping(
             first.module,
@@ -124,6 +140,7 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
             first.required,
             nonresident=first.nonresident | {"language_model.lm_head.weight"},
         )
+
     denoiser_names = {}
     for path, prefix in (
         ("input", "vae2llm."),
@@ -138,6 +155,7 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
         )
     denoiser_names["position.weight"] = "latent_pos_embed.pos_embed"
     components.append(_mapped(model.denoiser, denoiser_names))
+
     vision = model.vision_encoder.network
     vision_names = {
         "network.connector." + name: "connector."
@@ -157,6 +175,7 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
             frozenset(dict(model.vision_encoder.named_parameters())),
         )
     )
+
     components.append(
         weights.ModuleMapping(
             model.latent_encoder,

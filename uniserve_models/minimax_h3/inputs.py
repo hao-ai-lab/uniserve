@@ -15,6 +15,8 @@ from .packing import Packing, video_latent_frames
 
 @dataclass(frozen=True, slots=True)
 class DenoiserSize:
+    """Describe one sample's output timeline and conditioning length."""
+
     num_frames: int
     num_text_tokens: int
 
@@ -26,6 +28,8 @@ class DenoiserSize:
 
 @dataclass(frozen=True)
 class DenoiserInput(BaseDenoiserInput[DenoiserSize]):
+    """Carry ordered video/audio latents with one refined text tensor per sample."""
+
     text_features: tuple[torch.Tensor, ...]
 
     def __post_init__(self):
@@ -55,6 +59,7 @@ class AttentionInput:
             raise ValueError("H3 token slice must match the logical sequence rank")
         if self.vsa.padded_tokens != tokens:
             raise ValueError("H3 attention and packing must describe the same token domain")
+
         for indices in (
             self.local_text_indices,
             self.local_video_indices,

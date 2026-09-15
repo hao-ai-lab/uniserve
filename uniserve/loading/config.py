@@ -7,6 +7,12 @@ from typing import Literal
 
 @dataclass(frozen=True, slots=True)
 class Config:
+    """Checkpoint IO policy: encoding, read mode, concurrency, caching and integrity.
+
+    mode selects eager full reads, per-shard layered reads, or deterministic
+    dummy values; prefetch defaults to mmap when unset.
+    """
+
     format: Literal["auto", "safetensors", "pt"] = "auto"
     mode: Literal["eager", "layered", "dummy"] = "eager"
     revision: str | None = None

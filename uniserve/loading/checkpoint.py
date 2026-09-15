@@ -43,6 +43,13 @@ class Config:
                 raise ValueError("checkpoint sources must stay inside their root")
 
     def resolve(self, root: Path, *, io: IOConfig) -> Source:
+        """Locate this source's files under root and return a resolved Source.
+
+        Explicit filenames win in declaration order; otherwise an index file
+        selects shards, then any matching weight files. ignore_patterns are
+        matched against root-relative paths.
+        """
+
         root = Path(root)
         directory = root / self.directory
         available = frozenset(
@@ -58,6 +65,7 @@ class Config:
         files = tuple(sorted(path for path in available if path.parent == directory))
         formats = ("safetensors", "pt") if io.format == "auto" else (io.format,)
         suffixes = {"safetensors": {".safetensors"}, "pt": {".pt", ".bin"}}
+
         if self.filenames:
             chosen = next(
                 (
@@ -73,6 +81,8 @@ class Config:
                     return Source(self.name, root, (), self.prefix)
                 raise FileNotFoundError(f"source {self.name!r} requires one of {self.filenames!r}")
             return Source(self.name, root, (chosen,), self.prefix)
+
+        # Training-state files shipped in published checkpoints are not weights.
         excluded = {
             "optimizer.pt",
             "optimizer.bin",
@@ -133,6 +143,8 @@ class Source:
                 raise FileNotFoundError(path)
 
     def open(self, *, io: IOConfig) -> Reader:
+        """Verify integrity and encoding, then open a reader for the IO mode."""
+
         _checksums(self, io.checksum_manifest)
         suffixes = {path.suffix for path in self.files}
         supported = (
@@ -142,6 +154,7 @@ class Source:
         )
         if not suffixes.issubset(supported):
             raise ValueError("checkpoint files disagree with the selected file encoding")
+
         if io.mode == "dummy":
             return _DummyReader(self, io)
         if io.mode == "layered":
@@ -316,6 +329,10 @@ class Reader:
                     self._weights[logical] = _FileWeight(logical, shape, dtype, self, logical)
                     self._locations[logical] = (path, name)
         self._weights = dict(sorted(self._weights.items()))
+
+        # Pair serialized E4M3 weights with their weight_scale tensors into
+        # FP8Weight views. The scale's element count selects its statistical
+        # domain: one element is per-tensor, one per leading row is per-row.
         for name, value in tuple(self._weights.items()):
             if value.dtype != torch.float8_e4m3fn or not name.endswith(".weight"):
                 continue
@@ -381,6 +398,7 @@ class _SafetensorsReader(Reader):
                 )
             value = self._files[path].get_slice(name)
             return value[region] if region else self._files[path].get_tensor(name)
+
         if path not in self._states:
             self._states[path] = load_safetensors(path.read_bytes())
         return self._states[path][name][region]
@@ -413,6 +431,9 @@ class _LayeredReader(Reader):
     def _read(self, logical, region):
         self._require_open()
         path, _ = self._locations[logical]
+
+        # Switching shards retires every previously opened file so at most
+        # one shard's decoded state is resident at a time.
         if path not in self._files and path not in self._states:
             self._files.clear()
             self._states.clear()
@@ -450,6 +471,7 @@ class _DummyReader(Reader):
         self._require_open()
         weight = self._weights[logical]
         raw = weight.values if isinstance(weight, FP8Weight) else weight
+
         seed = int.from_bytes(hashlib.sha256(logical.encode()).digest()[:8], "little")
         generator = torch.Generator(device="cpu").manual_seed(seed)
         value = torch.empty(raw.shape, dtype=torch.float32)
@@ -457,6 +479,9 @@ class _DummyReader(Reader):
             value.normal_(0, 0.02, generator=generator)
         else:
             value.zero_()
+
+        # A tensor serving as an FP8 scale domain must dequantize to the
+        # values' original magnitudes, not random noise.
         if any(
             isinstance(item, FP8Weight) and item.scale.name == logical
             for item in self._weights.values()
@@ -516,6 +541,8 @@ def _advise(path, kind):
 
 
 def _checksums(source, manifest):
+    """Verify every source file against a sha256 manifest, when one is given."""
+
     if manifest is None:
         return
     value = json.loads(manifest.read_text())
@@ -523,6 +550,7 @@ def _checksums(source, manifest):
         value = value["files"]
     if not isinstance(value, dict):
         raise ValueError("checksum manifest requires a relative-path mapping")
+
     for path in source.files:
         name = path.relative_to(source.root).as_posix()
         expected = value.get(name)

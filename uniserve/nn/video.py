@@ -18,11 +18,15 @@ def blend_decoded_overlap(
     extent = min(previous.shape[dim], current.shape[dim], extent)
     if extent == 0:
         return current
+
+    # Linear ramp along the blend axis: the previous tile's weight falls from
+    # 1 to 0 while the current tile's weight rises from 0 to (extent-1)/extent.
     positions = torch.arange(extent, device=current.device, dtype=current.dtype)
     shape = [1] * current.ndim
     shape[dim] = extent
     previous_weight = (1 - positions / extent).view(shape)
     current_weight = (positions / extent).view(shape)
+
     previous_slice = [slice(None)] * current.ndim
     current_slice = [slice(None)] * current.ndim
     previous_slice[dim] = slice(-extent, None)
@@ -31,6 +35,7 @@ def blend_decoded_overlap(
         previous[tuple(previous_slice)] * previous_weight
         + current[tuple(current_slice)] * current_weight
     )
+
     if extent == current.shape[dim]:
         return blended
     remainder = [slice(None)] * current.ndim
@@ -70,9 +75,12 @@ def video_segment_rgb(
     body = segment[:, :, :body_frames]
     if previous_overlap is not None:
         body = blend_decoded_overlap(previous_overlap, body, overlap_frames, dim=-3)
+
     next_overlap = segment[:, :, body_frames + padding_frames :].contiguous()
     if final_unit:
         body = torch.cat((body, next_overlap[:, :, :overlap_frames]), dim=2)
+
+    # Denormalize to [0, 1], then emit [frames, height, width, 3] uint8 rows.
     pixels = (body.float() * pixel_std + pixel_mean).clamp_(0.0, 1.0)
     rgb24 = pixels[0].permute(1, 2, 3, 0).mul_(255.0).round_().to(torch.uint8).contiguous()
     return rgb24, next_overlap[:, :, :overlap_frames].contiguous()

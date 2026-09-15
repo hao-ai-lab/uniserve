@@ -18,10 +18,14 @@ class PatchEmbed(nn.Module):
         )
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Return ``[batch, H*W tokens, embed_dim]`` patch rows."""
+
         return self.projection(pixels).flatten(2).transpose(1, 2)
 
 
 class MLPConnector(nn.Module):
+    """Map vision features to language width through a two-layer MLP."""
+
     def __init__(self, input_dim: int, output_dim: int, activation: str = "gelu_pytorch_tanh"):
         super().__init__()
         self.projection = nn.Sequential(

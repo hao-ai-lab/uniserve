@@ -25,6 +25,7 @@ class TextCall:
         self.pipeline = mesh.get_group("pp" if "pp" in mesh.axes else ())
         tensor_group = mesh.get_group("tp" if "tp" in mesh.axes else ())
         last = self.pipeline.rank == self.pipeline.size - 1
+
         # The vocabulary head may be nonresident on this pipeline stage. Its
         # actual descriptor is communicated rather than reproducing the head's
         # numerical padding/partition rule in execution.
@@ -44,6 +45,7 @@ class TextCall:
                 )
             )
         self.pipeline.broadcast(descriptor, src=self.pipeline.size - 1)
+
         size, padded, start, stop = descriptor.cpu().tolist()
         self.vocab = VocabShard(size, slice(start, stop), padded, tensor_group)
 
@@ -57,6 +59,7 @@ class TextCall:
 
         hidden = self.model(inputs)
         indices = (inputs.attention.queries.offsets[1:].to(torch.int64) - 1).clamp_min(0)
+
         if self.pipeline.rank == self.pipeline.size - 1:
             values = self.model.compute_logits(hidden, token_indices=indices).values
         else:
@@ -69,6 +72,13 @@ class TextCall:
     def __call__(
         self, inputs: TextInput, selections: tuple[TokenSelection, ...]
     ) -> ExecutionOutput:
+        """Run one backbone pass and return the per-row selection it requests.
+
+        Each row independently selects final-token logits, all-token logits, or
+        raw hidden states. Logit and hidden columns are computed once on the
+        last pipeline stage and broadcast so every stage returns the same rows.
+        """
+
         if isinstance(inputs.attention, DenseInput):
             count = inputs.input_ids.numel() // inputs.batch_size
             lengths = (count,) * inputs.batch_size
@@ -76,6 +86,7 @@ class TextCall:
         else:
             lengths = inputs.attention.queries.host
             offsets = inputs.attention.queries.offsets
+
         if len(selections) != len(lengths) or any(
             not isinstance(item, TokenSelection) for item in selections
         ):
@@ -99,6 +110,7 @@ class TextCall:
                         if selection is TokenSelection.LAST_LOGITS
                         else torch.arange(length, device=hidden.device) + offsets[index]
                     )
+
         num_logits = sum(logit_lengths)
         logits = None
         if num_logits:

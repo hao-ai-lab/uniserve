@@ -74,6 +74,7 @@ def _commit_group(
         else:
             latent_pool.validate_updates(outcomes)
         state.group_buffers[completion_group].seal()
+
         # Prepare the execution result without mutating resident state.
         records: list[PendingOutput] = []
         report_products: list[TensorPublication] = []
@@ -86,6 +87,7 @@ def _commit_group(
             )
         ):
             _validate_completion_products(operation, outcome.products)
+
             if outcome.kv_output is not None:
                 if outcome.kv_output.source != operation.kv_output:
                     raise invalid_descriptor("KV publication differs from its declared output")
@@ -95,6 +97,7 @@ def _commit_group(
                 ):
                     raise invalid_descriptor("KV publication exceeds its transfer-byte bound")
                 outcome.kv_output.encoded_size_bound()
+
             # The bound covers score values and prompt-position counts; framing is
             # owned by the single IPC result message, not by stored products.
             logprob_bytes = (
@@ -108,15 +111,18 @@ def _commit_group(
                 raise invalid_descriptor(
                     "logprob result exceeds its registered completion capacity"
                 )
+
             reports_output = config.rank == worker_info.output_rank(operation.entry)
             report_products.extend(outcome.products)
             pending = request
             if outcome is not pending:
                 raise RuntimeError("operation completion lost its prepared output")
             pending._reports_output = reports_output
+
             # All ranks retain their score ranges until the output buffer retires;
             # materialization emits scores only on the designated output rank.
             records.append(pending)
+
         record_component(state.group_component_us[completion_group], "commit_lane", commit_started)
 
         # Prepare cross-resource commit records first so no publication is visible
@@ -125,6 +131,7 @@ def _commit_group(
         stats = _forward_stats(
             state.group_forward_stats[completion_group], state.group_component_us[completion_group]
         )
+
         cache_publications = kv_cache
         publications = tuple(
             request.cache_publication
@@ -141,6 +148,7 @@ def _commit_group(
                 raise RuntimeError("cache publication has no backing KV resources")
         else:
             cache_publications.validate_publications(publications, installations)
+
         tensor_exports = {
             buffer: locations
             for request in state.pending_outputs(completion_group)
@@ -156,6 +164,7 @@ def _commit_group(
             for request in state.pending_outputs(completion_group)
             for buffer, locations in request.latent_exports.items()
         }
+
         request_pool.validate_pending(records)
         for owner, exports in (
             (tensor_store, tensor_exports),
@@ -167,22 +176,28 @@ def _commit_group(
                     raise RuntimeError("transport export has no backing storage")
             else:
                 validate_exports(owner.exports, exports)
+
         # From this point the completion group cannot be discarded: apply resource commits, then
         # reserve the request publication that gates successor readiness.
         state.group_published[completion_group] = True
         tensor_store.commit_writes(writes)
+
         if latent_pool is not None:
             latent_pool.apply_updates(outcomes)
         if cache_publications is not None:
             cache_publications.commit_publications(publications, installations)
+
         tensor_store.exports.update(tensor_exports)
         if kv_cache is not None:
             kv_cache.exports.update(cache_exports)
         if latent_pool is not None:
             latent_pool.exports.update(latent_exports)
+
         _commit_runtime_states(completion_group, decode_state=decode_state, state=state)
+
         for request in state.pending_outputs(completion_group):
             request.release_execution_references()
+
         request_pool.add_pending(records)
         state.record_outputs(
             completion_group,
@@ -218,6 +233,7 @@ def _commit_runtime_states(
             states.set_cache_length(
                 int(request.request.request_pool_idx), request.runtime_cache_length
             )
+
     decode = tuple(
         request
         for request in requests
@@ -241,6 +257,7 @@ def _commit_runtime_states(
             valid=valid,
             active=active,
         )
+
     for request in requests:
         sampled = request.sampled
         if sampled is not None and not request.runtime_decode_increment:
@@ -254,6 +271,7 @@ def _commit_runtime_states(
                 valid=sampled.valid,
                 active=sampled.active,
             )
+
     for request in requests:
         if request.runtime_prompt_logits is not None:
             states.set_prompt_logits(
@@ -278,15 +296,20 @@ def _discard_group(
         if state.group_published[completion_group]:
             raise RuntimeError("published completion group state cannot be discarded")
         _finish_device_reads(completion_group, tensor_store=tensor_store, state=state)
+
         # Cancellation uses the same producer fence as successful CPU work.
         state.group_buffers[completion_group].seal()
+
         for pending in state.pending_outputs(completion_group):
             pending.abandon()
+
         if media_mux is not None:
             for operation in state.group_operations(completion_group):
                 if operation.kind is PipelineStage.LATENT_PREPARATION:
                     media_mux.drop(int(operation.request_key.request_id))
+
         state.group_buffers[completion_group].abandon()
+
         tensor_store.abandon_writes(
             tuple(
                 write
@@ -294,12 +317,14 @@ def _discard_group(
                 for write in request.writes
             )
         )
+
         if kv_cache is not None:
             kv_cache.release_buffers(
                 operation.kv_output
                 for operation in state.group_operations(completion_group)
                 if operation.kv_output is not None
             )
+
         imported_slots = tuple(
             int(request.request.request_pool_idx)
             for request in state.pending_outputs(completion_group)
@@ -307,6 +332,7 @@ def _discard_group(
         )
         if latent_pool is not None and imported_slots:
             latent_pool.release_slots(imported_slots)
+
         if latent_pool is not None:
             latent_pool.release_buffers(
                 tuple(
@@ -315,6 +341,7 @@ def _discard_group(
                     for product in operation.tensor_outputs()
                 )
             )
+
         _release_locators(
             tuple(
                 locator
@@ -323,6 +350,7 @@ def _discard_group(
             ),
             transfer_backends=transfer_backends,
         )
+
         for request in state.pending_outputs(completion_group):
             request.release_execution_references()
 
@@ -355,8 +383,11 @@ def _publish_predicates(
     )
     if not writes:
         return
+
     views = tensor_store.producer_write_views(writes)
     first = views[0]
+
+    # Resolved predicates publish as 1, one scalar per producer view.
     tensor_store.publish_writes(
         writes,
         torch.ones(
@@ -388,6 +419,7 @@ def _finish_device_reads(
             reads,
             after_writes=after_writes if len(after_writes) == len(reads) else (),
         )
+
     feature_reads = tuple(
         read
         for request in state.pending_outputs(completion_group)
@@ -395,6 +427,7 @@ def _finish_device_reads(
     )
     if feature_reads:
         tensor_store.complete_reads(feature_reads)
+
     for request in state.pending_outputs(completion_group):
         request.device_reads.clear()
         request.feature_reads.clear()

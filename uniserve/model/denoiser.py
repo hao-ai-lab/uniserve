@@ -112,6 +112,7 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
 
     def noise_shape(self, modality: str, size: image.Config) -> tuple[int, ...]:
         self.latent_shape(modality, size)
+        # [1, channels, height, width] in output pixels, before patchify
         return (
             1,
             self.latent_channels,
@@ -125,6 +126,7 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
             raise ValueError("noise and sample storage must align with image sizes")
         if source.device != destination.device or source.dtype != destination.dtype:
             raise ValueError("image noise must use the sample device and dtype")
+
         for index, size in enumerate(sizes):
             native = self.noise_shape("image", size)
             canonical = self.latent_shape("image", size)
@@ -132,6 +134,7 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
                 raise ValueError(
                     "image storage must match the native draw and canonical patch shapes"
                 )
+
             # Scaling precedes the layout permutation and rounds in the sample
             # dtype. A separate value protects permitted source/state aliases.
             scaled = source[index] * self.noise_scale.scale(canonical[0])

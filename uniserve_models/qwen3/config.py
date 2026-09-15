@@ -48,10 +48,12 @@ class Config:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"Qwen3 {name} must be a positive integer")
+
         if self.head_dim % 2:
             raise ValueError("Qwen3 head_dim must be even for rotary positions")
         if self.num_attention_heads % self.num_key_value_heads:
             raise ValueError("Qwen3 attention heads must be divisible by KV heads")
+
         if (
             not isinstance(self.num_experts, int)
             or isinstance(self.num_experts, bool)
@@ -60,6 +62,7 @@ class Config:
             raise ValueError("Qwen3 num_experts must be a non-negative integer")
         if self.num_experts and self.num_experts_per_tok > self.num_experts:
             raise ValueError("Qwen3 num_experts_per_tok must not exceed num_experts")
+
         for name in ("rms_norm_eps", "rope_theta"):
             value = getattr(self, name)
             if (
@@ -69,9 +72,11 @@ class Config:
                 or value <= 0
             ):
                 raise ValueError(f"Qwen3 {name} must be finite and positive")
+
         for name in ("attention_bias", "tie_word_embeddings"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"Qwen3 {name} must be boolean")
+
         if self.hidden_act not in {
             "silu",
             "swish",
@@ -146,6 +151,7 @@ def read_config(root: Path, io: loading.Config) -> Config:
     """Normalize checkpoint metadata into immutable decoder configuration."""
 
     config = json.loads((root / "config.json").read_text())
+
     rotary = config.get("rope_parameters") or {}
     if not isinstance(rotary, Mapping):
         raise ValueError("Qwen3 rope_parameters must be an object")
@@ -157,6 +163,7 @@ def read_config(root: Path, io: loading.Config) -> Config:
         # Current Transformers serializes this numerical field under
         # rope_parameters. Constructors consume its single normalized value.
         config["rope_theta"] = rotary["rope_theta"]
+
     hidden_size = _required_int(config, "hidden_size")
     num_attention_heads = _required_int(config, "num_attention_heads")
     if "head_dim" not in config and hidden_size % num_attention_heads:
@@ -170,6 +177,7 @@ def read_config(root: Path, io: loading.Config) -> Config:
     num_experts = _optional_int(config, "num_experts", 0, minimum=0)
     num_experts_per_tok = _optional_int(config, "num_experts_per_tok", 1, minimum=1)
     intermediate_size = _required_int(config, "intermediate_size")
+
     cfg = Config(
         vocab_size=_required_int(config, "vocab_size"),
         hidden_size=hidden_size,

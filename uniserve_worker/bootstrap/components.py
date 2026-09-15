@@ -85,6 +85,7 @@ def describe_components(
         package = import_module(type(model).__module__)
         entries = package.entry_points(model.config) if entries is None else entries
         paths = package.entry_paths if paths is None else paths
+
     owners: dict[tuple[str, str], str] = {}
     calls: dict[str, list[Call]] = {path: [] for path in entries}
     for component, points in entries.items():
@@ -136,13 +137,17 @@ def describe_components(
         if component in anchors:
             raise unsupported_setup(f"component {component!r} belongs to multiple IPC entries")
         anchors[component] = name
+
     missing = entries.keys() - anchors.keys()
     if missing:
         raise unsupported_setup(f"components {sorted(missing)} require an explicit IPC entry")
+
     return {name: tuple(calls[component]) for component, name in anchors.items()}
 
 
 def supported_operations(model: nn.Module) -> frozenset[Computation]:
+    """Collect every computation and transfer mode the loaded model can serve."""
+
     calls = tuple(call for calls in describe_components(model).values() for call in calls)
     operations = {TransferMode.TENSOR, *call_operations(calls)}
     if any(isinstance(call.module, CausalLM) for call in calls):
@@ -160,6 +165,7 @@ def media_components(model: nn.Module) -> dict[PipelineStage, str]:
         for call in calls
     ):
         return {}
+
     stages = {
         PipelineStage.TEXT_ENCODING,
         PipelineStage.LATENT_PREPARATION,
@@ -170,12 +176,14 @@ def media_components(model: nn.Module) -> dict[PipelineStage, str]:
         PipelineStage.AUDIO_ENCODING,
         PipelineStage.MUXING,
     }
+
     routes = {}
     for name, calls in components.items():
         for stage in call_operations(calls) & stages:
             if stage in routes:
                 raise unsupported_setup(f"media pipeline repeats {stage.value} computation")
             routes[stage] = name
+
     if stages - routes.keys():
         raise unsupported_setup("media pipeline lacks required numerical capabilities")
     if routes[PipelineStage.LATENT_PREPARATION] != routes[PipelineStage.DENOISING]:
@@ -229,6 +237,7 @@ def bind_components(
         binding.calls = ()
         if not binding.owns or binding.mesh is None:
             continue
+
         mesh = binding.mesh
         pipeline = mesh.get_group("pp")
         calls = []
@@ -238,6 +247,7 @@ def bind_components(
                 continue
             if stage == "last" and pipeline.rank != pipeline.size - 1:
                 continue
+
             groups = {}
             for role in call.entry.groups:
                 axes = (
@@ -250,8 +260,10 @@ def bind_components(
                     else (role,)
                 )
                 group = mesh.get_group(axes)
+                # Roles resolving to the same rank set share one group.
                 if group.size > 1:
                     groups[group.ranks] = group
             calls.append(replace(call, groups=tuple(groups.values())))
+
         binding.calls = tuple(calls)
         binding.computations = tuple(call_operations(calls))

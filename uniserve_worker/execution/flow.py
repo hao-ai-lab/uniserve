@@ -119,6 +119,7 @@ def prepare_latent(
         visible_length=cache[2],
         publication=publication if isinstance(publication, KvTransfer) else None,
     )
+
     image = request.request.image
     if image is None:
         raise invalid_descriptor("media preparation has no admitted image parameters")
@@ -127,6 +128,7 @@ def prepare_latent(
         or operations.require_progress(request).flow_step != 0
     ):
         raise invalid_descriptor("media preparation repeats an active latent trajectory")
+
     rng = operation.rng
     if rng is None or rng.draw_layout is not DrawLayout.FLOW_NOISE:
         raise invalid_descriptor("media preparation requires semantic flow-noise RNG coordinates")
@@ -144,6 +146,7 @@ def prepare_latent(
     staging = row.latent_staging
     if params is None or staging is None:
         raise invalid_descriptor("trajectory operation has no staged latent inputs")
+
     pool = latent_pool
     staging.value.zero_()
     initial = staging.value[: int(params.latent_units)]
@@ -153,6 +156,7 @@ def prepare_latent(
         image,
     )
     row.request.diffusion = trajectory
+
     initial_latent(
         operation,
         int(params.height),
@@ -177,6 +181,7 @@ def prepare_latent(
     request.projected_progress = replace(
         operations.require_progress(request), latent_product=output
     )
+
     products = publish_latent_transfer(
         operation,
         output,
@@ -189,6 +194,7 @@ def prepare_latent(
         config=config,
         state=state,
     )
+
     request.status = OpStatus.OK
     request.projected_progress = operations.execution_runtime(request, cache, flow_step=0)
     request.finish_flags = FinishFlags()
@@ -232,6 +238,7 @@ def initialize(
         visible_length=cache[2],
         publication=publication if isinstance(publication, KvTransfer) else None,
     )
+
     image = request.request.image
     if image is None:
         raise invalid_descriptor("flow operation has no admitted image parameters")
@@ -245,11 +252,13 @@ def initialize(
         raise invalid_descriptor("flow latent generations are invalid")
     if operations.require_progress(request).latent_product != latent_input:
         raise invalid_descriptor("flow operation does not name the current latent generation")
+
     row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
         raise invalid_descriptor("trajectory operation has no staged latent inputs")
+
     pool = latent_pool
     start_step = int(params.start_step)
     pool.gather_current(
@@ -261,11 +270,13 @@ def initialize(
         height=int(params.height),
         width=int(params.width),
     )
+
     size = media_image.Config(int(params.height), int(params.width))
     trajectory = row.request.diffusion
     if not isinstance(trajectory, ImageState) or trajectory.size != size:
         trajectory = image_state(require_inputs(model_runner), size, image)
         row.request.diffusion = trajectory
+
     # Prefix initialization follows this submission's descriptors, including
     # retries after a failed operation; retained metadata is not accepted state.
     trajectory.cache = cache
@@ -291,12 +302,14 @@ def prepare_step(
     image = request.request.image
     if image is None:
         raise invalid_descriptor("flow step requires admitted image parameters")
+
     builder = require_inputs(model_runner)
     row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
         raise invalid_descriptor("trajectory operation has no staged latent inputs")
+
     schedule = trajectory.schedule
     if not 0 <= step_index < schedule.num_steps:
         raise IndexError(step_index)
@@ -304,6 +317,7 @@ def prepare_step(
     t, t_next = latent_pool.stage_timestep(
         row.request.request_pool_idx, float(times[step_index]), float(times[step_index + 1])
     )
+
     branches = trajectory.guidance.branches(schedule, step_index)
     prefix_rows = []
     prefix_branches = []
@@ -313,10 +327,14 @@ def prepare_step(
     )
     if len(descriptors) < len(branches):
         raise invalid_descriptor("media denoise has incomplete forward-row metadata")
+
+    # The last descriptors of this operation belong to the denoise branches;
+    # any earlier ones cover prefix forwards emitted on a first visit.
     denoise_descriptors = descriptors[-len(branches) :]
     for branch_index, branch in enumerate(branches):
         if branch in entries:
             continue
+
         source = builder.branch_source(branch)
         if source not in trajectory.prefixes:
             trajectory.prefixes[source] = resolve_prefix(
@@ -329,6 +347,7 @@ def prepare_step(
             )
         prefix, copy_conditioning = trajectory.prefixes[source]
         descriptor = denoise_descriptors[branch_index]
+
         if copy_conditioning:
             entry = trajectory.cache
         else:
@@ -338,12 +357,17 @@ def prepare_step(
                 raise invalid_descriptor("flow prefixes require request page tables")
             capacity = page_tables.allocated_length(slot)
             page_tables.pages(slot, 0)
+
+            # A sibling forward in this same submission may already write the
+            # prefix; otherwise the branch row carries its own prefix extent.
             has_prefix_forward = any(
                 state.batch.request_pool_indices[candidate] == slot
                 and (state.batch.seq_lens[candidate] - state.batch.query_lens[candidate]) == 0
                 and state.batch.query_lens[candidate] == len(prefix)
                 for candidate in descriptors[: -len(branches)]
             )
+
+            # entry = (pool slot, KV group, materialized prefix length, token capacity).
             entry = (
                 slot,
                 0,
@@ -352,6 +376,7 @@ def prepare_step(
                 else (state.batch.seq_lens[descriptor] - state.batch.query_lens[descriptor]),
                 capacity,
             )
+
         prefix_length = trajectory.cache[2] if copy_conditioning else len(prefix)
         if prefix_length > entry[3]:
             raise invalid_descriptor("flow prefix exceeds scheduler params")
@@ -359,11 +384,13 @@ def prepare_step(
             raise invalid_descriptor(
                 "flow branch prefix disagrees with its initialized physical state"
             )
+
         initialize_prefix = entry[2] == 0 and prefix_length > 0
         entries[branch] = entry
         if initialize_prefix and prefix:
             prefix_rows.append(prefix_row(prefix, entry))
             prefix_branches.append(branch)
+
     return branches, t, t_next, tuple(zip(prefix_branches, prefix_rows, strict=True))
 
 
@@ -387,9 +414,11 @@ def finish(
     staging = row.latent_staging
     if params is None or staging is None:
         raise invalid_descriptor("trajectory operation has no staged latent inputs")
+
     latent_input, latent_output = operation.latent_input, operation.latent_output
     if latent_input is None or latent_output is None or request.request.image is None:
         raise invalid_descriptor("flow completion lost its trajectory state")
+
     start_step = int(params.start_step)
     final_step = start_step + int(params.step_count)
     latent_pool.write_inactive(
@@ -409,6 +438,7 @@ def finish(
     request.projected_progress = replace(
         operations.require_progress(request), latent_product=latent_output
     )
+
     products = publish_latent_transfer(
         operation,
         latent_output,
@@ -421,6 +451,7 @@ def finish(
         config=config,
         state=state,
     )
+
     request.status = OpStatus.OK
     request.projected_progress = operations.execution_runtime(
         request,
@@ -430,6 +461,9 @@ def finish(
     request.finish_flags = FinishFlags()
     request.product_generations = operations.output_generations(operation)
     request.products = products
+
+    # Branch prefixes live in pool slots separate from the request's own KV;
+    # they are retired once the trajectory has written its final step.
     main_slot = int(request.request.request_pool_idx)
     alternative_slots = {
         int(entry[0]) for entry in trajectory.entries.values() if int(entry[0]) != main_slot
@@ -460,11 +494,13 @@ def publish_latent_transfer(
     params = row.input_latent_params
     if params is None:
         raise invalid_descriptor("latent publication has no staged parameters")
+
     transports = publication_transports
     if not any(name != "local" for name in transports) or (
         config.rank != worker_info.output_rank(operation.entry)
     ):
         return ()
+
     pool = latent_pool
     source = pool.reserve_publication(
         product,
@@ -543,6 +579,7 @@ def flow_rows(builder, trajectory, current, branches, timestep, *, conditioning_
 
     current = _to_device(current, device)
     timestep = _to_device(timestep, device)
+
     size, rows = trajectory.size, []
     for branch in branches:
         entry = trajectory.entries[branch]
@@ -610,6 +647,10 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
     capture = runner.worker_config.graph_policy != "off" and runner.worker_config.prefill_cuda_graph
     capacity = min(builder.max_tokens, latent_pool.capacity_units)
     side = max(1, math.isqrt(capacity)) * builder.denoiser.downsample
+
+    # Without capture, warm one shape per guidance-branch count: the largest
+    # configured capture with that branch count, or a square fallback sized to
+    # the available latent capacity.
     shapes = (
         runner.flow_captures
         if capture and runner.flow_captures
@@ -625,11 +666,13 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
             for branches in runner.flow_cfg_branches
         )
     )
+
     forward = partial(runner.batch_forward, entry)
     prefix_entry = runner._forward_entries[(entry.name, ForwardMode.PREFILL)]
     stream = entry.context.stream
     if stream is not None:
         stream.wait_stream(torch.cuda.current_stream(entry.device))
+
     with entry.context.activate():
         for shape in sorted(
             shapes,
@@ -644,6 +687,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
             branches = trajectory.guidance.branches(trajectory.schedule, 0)
             if len(branches) != shape.cfg_branches:
                 raise ValueError("capture guidance does not realize its configured branch count")
+
             prefixes = (
                 tuple(
                     resolve_prefix(
@@ -659,6 +703,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                 * shape.rows
             )
             page_counts = tuple(ceil_div(len(prefix), cache.info.block_size) for prefix in prefixes)
+
             with (
                 cache.startup_pages(sum(page_counts)) as scratch,
                 latent_pool.startup_values(
@@ -667,10 +712,12 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
             ):
                 for value in latents:
                     value.zero_()
+
                 pages, cursor = [], 0
                 for count in page_counts:
                     pages.append(tuple(scratch[cursor : cursor + count]))
                     cursor += count
+
                 selected = tuple(index for index, prefix in enumerate(prefixes) if prefix)
                 if selected:
                     batch = stage_text(
@@ -694,6 +741,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                     )
                     if prefix_stream is not None:
                         current_stream.wait_stream(prefix_stream)
+
                 attention = from_blocks(
                     pages=tuple(pages),
                     query_lengths=(builder.sequence_length(size),) * len(prefixes),
@@ -717,6 +765,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                     )
                     for index, prefix in enumerate(prefixes)
                 )
+
                 batch = entry.input_buffers.stage(
                     rows, forward_mode=PipelineStage.DENOISING, attention=attention
                 )
@@ -724,5 +773,6 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                     runner.capture_batch(entry, batch, forward)
                 else:
                     runner.eager_batch(entry, batch, forward)
+
     if stream is not None:
         torch.cuda.current_stream(entry.device).wait_stream(stream)

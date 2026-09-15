@@ -56,10 +56,12 @@ def resolve_prefix(
         return (), True
     if source is BranchSource.NEGATIVE_OR_START and negative_token_ids:
         return negative_token_ids, False
+
     if prompt is None:
         if source is BranchSource.CONDITIONING:
             raise invalid_descriptor("this model does not accept a generation prompt override")
         return (), False
+
     if source is BranchSource.CONDITIONING:
         text = image_prompt.strip()
         conditioned = True

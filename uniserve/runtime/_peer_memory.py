@@ -83,11 +83,13 @@ def allocate_peer_tensor(
     try:
         if group.size == 1:
             return allocation.map_peers(descriptors)
+
         with tempfile.TemporaryDirectory(prefix="uniserve-peer-") as directory:
             address = os.path.join(directory, "memory.sock")
             with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as channel:
                 channel.bind(address)
                 channel.settimeout(dist.constants.default_pg_timeout.total_seconds())
+
                 identity = (socket.gethostname(), address, shape, str(dtype))
                 identities: list[tuple[str, str, tuple[int, ...], str] | None] = [None] * group.size
                 dist.all_gather_object(identities, identity, group=group._require())
@@ -96,10 +98,16 @@ def allocate_peer_tensor(
                     for peer in identities
                 ):
                     raise ValueError("peer tensors require matching shapes on one host")
+
                 backend_ranks = sorted(group.ranks)
                 ordered = [identities[backend_ranks.index(rank)] for rank in group.ranks]
                 destination = ordered[(group.rank + 1) % group.size]
                 assert destination is not None
+
+                # Descriptors rotate around the logical rank ring: each hop a
+                # rank forwards the descriptor it just received to its successor
+                # and accepts its predecessor's, so after size - 1 hops every
+                # rank holds one descriptor per owner.
                 owner_descriptors = {group.rank: descriptors[0]}
                 current = descriptors[0]
                 for hop in range(1, group.size):
@@ -115,6 +123,7 @@ def allocate_peer_tensor(
                         raise RuntimeError("peer allocation exchange requires one descriptor")
                     current = received[0]
                     owner_descriptors[(group.rank - hop) % group.size] = current
+
                 return allocation.map_peers(
                     [owner_descriptors[owner] for owner in range(group.size)]
                 )
@@ -180,11 +189,17 @@ def allocate_peer_workspace(
 
     if not shape or any(size < 1 for size in shape) or row_multiple < 1:
         raise ValueError("peer tensor extents and row alignment must be positive")
+
+    # Each rank's leading-axis shard must hold a whole number of rows while its
+    # byte size stays a multiple of the VMM allocation granularity, so rows per
+    # shard is the least common multiple of the caller's row multiple and the
+    # rows needed to cover one granularity unit.
     element_bytes = torch.empty((), dtype=dtype).element_size()
     row_bytes = math.prod(shape[1:]) * element_bytes
     granularity = allocation_granularity(group.device)
     aligned_rows = math.lcm(row_multiple, granularity // math.gcd(row_bytes, granularity))
     capacity = ((shape[0] + aligned_rows - 1) // aligned_rows) * aligned_rows
+
     global_tensor = allocate_peer_tensor(
         group,
         (capacity, *shape[1:]),

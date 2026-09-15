@@ -76,6 +76,7 @@ class ModelEntry:
     def __post_init__(self) -> None:
         if any(rank not in self.process_group.ranks for rank in self.config.ranks):
             raise ValueError(f"entry {self.name} members lie outside its Worker")
+
         if self.config.distribution is None:
             if (self.mesh is not None) != self.owns:
                 raise ValueError(f"entry {self.name} requires its local mesh")
@@ -85,8 +86,10 @@ class ModelEntry:
                 != self.config.parallel_config.dimensions
             ):
                 raise ValueError(f"entry {self.name} mesh disagrees with configuration")
+
         if self.mesh is not None:
             if not self.groups:
+                # Deduplicate the mesh's per-axis groups by their member ranks.
                 self.groups = tuple(
                     {
                         group.ranks: group
@@ -106,6 +109,7 @@ class ModelEntry:
         config = self.config
         if config.distribution is not None:
             return config.ranks
+
         width = config.parallel_config.world_size // config.parallel_config.pipeline_parallel_size
         return config.ranks[:width]
 
@@ -115,6 +119,8 @@ class ModelEntry:
         config = self.config
         if config.distribution is not None:
             return config.ranks
+
+        # Only tp coordinate 0 on the last pipeline stage owns each replica.
         mesh = DeviceMesh(
             ranks=config.ranks,
             rank=config.ranks[0],

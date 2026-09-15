@@ -138,6 +138,8 @@ def transformer_assignments(model, reader):
         if source not in available:
             continue
         value = reader.get(source)
+
+        # SwiGLU branches share one fused checkpoint tensor with value rows first.
         region = None
         if branch is not None:
             width = value.shape[0] // 2

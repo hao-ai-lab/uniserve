@@ -93,6 +93,7 @@ class TransformerDecoder(nn.Module):
             for value in (hidden, residual):
                 self._pipeline.recv(src=self._pipeline.rank - 1, out=value)
 
+        # Clip route spans to this rank's token shard, in shard-local offsets.
         local_routes = ()
         if routes:
             local_routes = tuple(
@@ -125,6 +126,8 @@ class TransformerDecoder(nn.Module):
                 packed = value.packed(local_routes) if isinstance(value, RoutedTensor) else value
                 self._pipeline.send(packed, dst=self._pipeline.rank + 1)
             return hidden.packed(local_routes) if isinstance(hidden, RoutedTensor) else hidden
+
+        # Fold the residual into the output norm only on the final stage.
         if isinstance(hidden, RoutedTensor):
             result = hidden.add(residual).apply(self.norm).packed(local_routes)
         elif isinstance(self.norm, RMSNorm):

@@ -46,7 +46,10 @@ class _Rows:
         transport destinations; downstream consumers may then reuse that scratch.
         """
 
+        # The row path reads the live device block maps on every call, so the
+        # static pattern carries no information here.
         del pattern
+
         if (
             query.ndim != 3
             or query.shape != key.shape
@@ -57,6 +60,7 @@ class _Rows:
             or chunk_rows % _TILE
         ):
             raise ValueError("sparse row production requires tile-aligned equal QKV intervals")
+
         rows, heads, width = query.shape
         owner_rows = rows // owners
         if packed is None:
@@ -88,6 +92,7 @@ class _Rows:
                 )
             ):
                 raise ValueError("sparse row destinations must match the prepared owner interval")
+
             signature = (
                 query.device,
                 heads,
@@ -101,10 +106,14 @@ class _Rows:
             if plan is None:
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("prepare VSA query intervals before graph capture")
+
+                # Map each owner's packed local tiles onto its own query tiles
+                # in the full row domain: owner stride owner_rows, offset start.
                 tiles = owners * count // _TILE
                 local = torch.arange(tiles)
                 selected = local // (count // _TILE) * (owner_rows // _TILE)
                 selected += start // _TILE + local % (count // _TILE)
+
                 plan = (
                     selected.to(device=query.device),
                     torch.empty(
@@ -115,9 +124,11 @@ class _Rows:
                     torch.empty((heads, tiles), device=query.device, dtype=torch.int32),
                 )
                 self.plans[signature] = plan
+
             selected, indices, counts = plan
             torch.index_select(mask_block_indices, 1, selected, out=indices)
             torch.index_select(mask_block_count, 1, selected, out=counts)
+
             elements = owners * count * heads * width
             packed_query = packed[0].view(-1).narrow(0, start * owners * heads * width, elements)
             packed_query = packed_query.view(owners * count, heads, width)

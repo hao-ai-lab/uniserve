@@ -17,6 +17,10 @@ def available(device):
 class _Operator(BaseOperator):
     def __call__(self, q, k, v, batch, *, scale, out):
         self._validate(q, k, v, batch, out)
+
+        # Non-default scales and shapes near the provider boundary take the
+        # CuTe path; the custom kernel serves only the default-scale shapes it
+        # was measured for.
         if scale != q.shape[-1] ** -0.5 or _cute.should_use(
             rows=k.shape[0], prefix_tiles=self.pattern.dense_prefix_tiles
         ):
@@ -41,6 +45,7 @@ class _Operator(BaseOperator):
                     k.transpose(0, 1),
                     v.transpose(0, 1),
                 )
+
             attended = _kernel.block_sparse_attention(
                 query.unsqueeze(0),
                 key.unsqueeze(0),
@@ -58,6 +63,9 @@ class _Operator(BaseOperator):
         from ._rows import _Rows
 
         self.bind(batch)
+
+        # Reuse one row operator per softmax scale; its query-map plans are
+        # cached inside _Rows.
         key = ("rows", scale)
         if not hasattr(self, "_row_operators"):
             self._row_operators = {}

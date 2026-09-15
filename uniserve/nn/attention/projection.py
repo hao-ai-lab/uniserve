@@ -16,6 +16,8 @@ class QKVProjection(nn.Module):
         self.projection = projection
 
     def forward(self, hidden, cos, sin):
+        """Project to ``[tokens, heads, head_dim]`` and normalize/rotate Q and K."""
+
         values = self.projection(hidden)
         query, key, value = (
             values[name].reshape(
@@ -42,6 +44,9 @@ class RotaryQKVProjection(QKVProjection):
     def normalize(self, q, k, cos, sin):
         if len(cos) != 1 or len(sin) != 1:
             raise ValueError("rotary QKV projection requires one factor pair")
+
+        # Fused path: full-head RMS norms with matching eps and split rotation
+        # over the whole head reduce in one kernel.
         if (
             isinstance(self.query_norm, RMSNorm)
             and isinstance(self.key_norm, RMSNorm)
@@ -58,6 +63,7 @@ class RotaryQKVProjection(QKVProjection):
                 eps=self.query_norm.eps,
                 axis_dims=(q.shape[-1],),
             )
+
         return (
             functional.apply_rotary(
                 self.query_norm(q.float()), cos[0], sin[0], rotation="split"
@@ -99,10 +105,13 @@ class AxialQKVProjection(QKVProjection):
                 raise ValueError("query and key normalization domains must align")
 
     def _axis_norms(self, norms):
+        """Map each rotary axis to the RMSNorm domain that covers it."""
+
         if not isinstance(norms, nn.ModuleList) or not all(
             isinstance(norm, RMSNorm) for norm in norms
         ):
             raise ValueError("partitioned Q/K normalization requires ordered RMSNorm modules")
+
         result = []
         axis = 0
         for norm in norms:
@@ -120,6 +129,7 @@ class AxialQKVProjection(QKVProjection):
     def normalize(self, q, k, cos, sin):
         if len(cos) != len(self.axis_dims) or len(sin) != len(self.axis_dims):
             raise ValueError("each rotary axis requires one factor pair")
+
         partitioned = isinstance(self.query_norm, nn.ModuleList)
         if partitioned and all(rotation == "split" for rotation in self.rotations):
             from uniserve import ops
@@ -154,6 +164,8 @@ class AxialQKVProjection(QKVProjection):
                 eps=self.query_norm.eps,
                 axis_dims=self.axis_dims,
             )
+
+        # General path: normalize each norm domain, then rotate each axis.
         outputs = []
         for tensor, norm in ((q, self.query_norm), (k, self.key_norm)):
             if partitioned:

@@ -55,6 +55,9 @@ class SparseAttentionSm100(BlockSparseAttnForwardSm100Blk64):
         oStats[(partner_warp * 64) + lane_idx * 2 + 1] = my_max
         bsa_fwd_helpers.mbar_arrive_and_wait(reduce_mbar_addr, Int32(0))
 
+        # Softmax correction across the warp pair: rescale each half's partial
+        # output by its share of the combined normalizer. A side with zero
+        # mass (empty key partition or full underflow) contributes nothing.
         partner_sum = oStats[(corr_warp * 64) + lane_idx * 2 + 0]
         partner_max = oStats[(corr_warp * 64) + lane_idx * 2 + 1]
         max_total = cutlass.max(my_max, partner_max)
@@ -104,6 +107,8 @@ class SparseAttentionSm100(BlockSparseAttnForwardSm100Blk64):
 
         bsa_fwd_helpers.mbar_arrive_and_wait(reduce_mbar_addr, Int32(1))
 
+        # Reduce each warp pair's exchange buffers into the shared output tile:
+        # warps 0-1 read their own and their partner's scaled partials.
         out_row = (corr_warp & 1) * cute.arch.WARP_SIZE + lane_idx
         if corr_warp < 2 and out_row < self.m_block_size:
             own_warp_base = corr_warp * 4 * 32 * 32
@@ -116,6 +121,7 @@ class SparseAttentionSm100(BlockSparseAttnForwardSm100Blk64):
                 col2 = (((c * 4) + 2) ^ lane_col_swizzle) * 8
                 col3 = (((c * 4) + 3) ^ lane_col_swizzle) * 8
                 if const_expr(self.o_dtype == Float32):
+                    # FP32 output covers eight columns per lane pass, not four.
                     col0 = (((c * 8) + 0) ^ lane_col_swizzle) * 4
                     col1 = (((c * 8) + 1) ^ lane_col_swizzle) * 4
                     col2 = (((c * 8) + 2) ^ lane_col_swizzle) * 4

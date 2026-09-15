@@ -12,6 +12,7 @@ from .video_vae import Config as VideoConfig
 
 # This table is the single definition of each named numerical choice. Both
 # complete presets and component overrides expand through weight_config.
+# Each row names (attention, mlp, text_encoder, video_vae) representations.
 _formats = {
     "default": ("bf16", "bf16", "bf16", "nvfp4"),
     "quality": ("bf16", "bf16", "bf16", "fp16"),
@@ -37,6 +38,7 @@ def weight_config(
 
     if preset not in _formats:
         raise ValueError(f"unknown H3 precision {preset!r}; choose from {tuple(_formats)}")
+
     attention, mlp, text_encoder, video_vae = (
         base if override is None else override
         for base, override in zip(
@@ -54,11 +56,13 @@ def weight_config(
             raise ValueError(f"H3 {name} requires one of {supported}")
 
     def encoded(value, *, tensorwise=False):
+        # Unquantized precisions are expressed as a plain dtype, not a Quantizer.
         if value in {"bf16", "fp16"}:
             return None
         quantizer = Quantizer(value, axis=0 if value == "fp8" and not tensorwise else None)
         return QuantizationConfig(quantizer, quantizer)
 
+    # The decoders and the transformer's FP32 latent heads never quantize.
     dtypes = {
         "audio_decoder": torch.float32,
         "video_decoder": torch.float32,
@@ -74,6 +78,7 @@ def weight_config(
         quantization[f"{path}.attention.output"] = encoded(attention)
         quantization[f"{path}.mlp"] = encoded(mlp)
     quantization["text_encoder"] = encoded(text_encoder)
+
     path = "video_decoder.decoder.decoder"
     if video_vae in {"fp16", "bf16"}:
         dtype = torch.float16 if video_vae == "fp16" else torch.bfloat16
@@ -84,6 +89,7 @@ def weight_config(
         dtype = torch.bfloat16
         quantization[f"{path}.decoder.output"] = encoded(video_vae)
         dtypes[f"{path}.decoder.output"] = dtype
+
     for index in range(VideoConfig().decoder_num_layers):
         for layer in ("qkv", "output", "mlp"):
             child = f"{path}.decoder.layers.{index}.{layer}"

@@ -65,6 +65,7 @@ class BlockTables:
         tensors = TensorBuffers.allocate(buffer_configs, device=device).view(buffer_configs)
         for name, value in {"page_tables": 0, "verified_lengths": 0, "alloced_lens": 0}.items():
             tensors[name].fill_(value)
+
         self.page_tables = tensors["page_tables"]
         self.verified_lengths = tensors["verified_lengths"]
         self.alloced_lens = tensors["alloced_lens"]
@@ -72,6 +73,8 @@ class BlockTables:
         self._slot_staging = tensors["_slot_staging"]
         self._group_staging = tensors["_group_staging"]
         self._allocated_staging = tensors["_allocated_staging"]
+
+        # Host mirrors of the device tables drive change detection in install.
         self._host_tables: dict[tuple[int, int], tuple[int, ...]] = {}
         self._host_alloced_lens: dict[int, int] = {}
 
@@ -112,9 +115,12 @@ class BlockTables:
             raise invalid_descriptor("request-to-token pool dimensions are invalid")
         rows, tables = request_pool_size + 1, request_pool_size * group_count
         return {
+            # [group, slot, block]: page ids per request slot and cache group.
             "page_tables": BufferConfig((group_count, rows, max_blocks_per_request), torch.int32),
+            # [slot]: verified and allocated token lengths per request slot.
             "verified_lengths": BufferConfig((rows,), torch.int32),
             "alloced_lens": BufferConfig((rows,), torch.int32),
+            # Device staging targets for one full installation batch.
             "_page_staging": BufferConfig((tables, max_blocks_per_request), torch.int32),
             "_slot_staging": BufferConfig((2, tables), torch.int64),
             "_group_staging": BufferConfig((tables,), torch.int64),
@@ -138,6 +144,7 @@ class BlockTables:
         allocated_by_slot: dict[int, int] = {}
         slot_allocations: dict[int, int] = {}
         identities: set[tuple[int, int]] = set()
+
         for raw_slot, raw_group, raw_pages, raw_allocated in tables:
             slot = int(raw_slot)
             group = int(raw_group)
@@ -215,6 +222,7 @@ class BlockTables:
                 self._allocated_staging[:allocated_count],
             )
 
+        # Mirror the accepted installation on the host for change detection.
         for slot, group, pages, allocated_tokens in (
             (
                 int(raw_slot),
@@ -291,15 +299,18 @@ class BlockTables:
             return
         if any(slot < 1 or slot > self.request_pool_size for slot in values):
             raise invalid_descriptor("released request slot is outside capacity")
+
         count = len(values)
         slot, host = self._slot_host.acquire()
         fill_cpu_ints(host[0, :count], values)
         indices = self._slot_staging[0, :count]
         indices.copy_(host[0, :count], non_blocking=self.page_tables.device.type == "cuda")
         self._slot_host.record_copy(slot)
+
         self.page_tables.index_fill_(1, indices, 0)
         self.verified_lengths.index_fill_(0, indices, 0)
         self.alloced_lens.index_fill_(0, indices, 0)
+
         selected = set(values)
         for identity in tuple(self._host_tables):
             if identity[0] in selected:
@@ -309,7 +320,10 @@ class BlockTables:
 
 
 def page_spans(page_ids, start: int, length: int, page_size: int):
-    """Map a logical token interval to scheduler-owned page/offset/count spans."""
+    """Map a logical token interval to scheduler-owned page/offset/count spans.
+
+    Each returned span is (page id, token offset within the page, token count).
+    """
 
     if page_size < 1 or start < 0 or length < 0 or start + length > len(page_ids) * page_size:
         raise ValueError("KV token interval exceeds its block table")

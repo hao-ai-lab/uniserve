@@ -205,6 +205,9 @@ def build_worker_layout(
 
     if state_buffers is None:
         state_buffers = media_state_buffers(model, bindings or {}, worker_config)
+
+    # Media workers hold fixed request tensors; token workers size paged KV,
+    # latent pools, and text staging instead.
     if capability(model, VideoPostprocessor) is not None or state_buffers:
         layout = _request_tensor_worker_layout(
             model,
@@ -281,6 +284,7 @@ def _token_worker_layout(
     owns_kv = text is not None
     cache = None if text is None else cache_info(text, worker_config, num_blocks=1)
     bytes_per_token = 0 if cache is None else cache.bytes_per_token
+
     flow = image_builder(model)
     requested_latent_units = (
         active_latent_capacity_tokens(
@@ -309,6 +313,7 @@ def _token_worker_layout(
         if flow is not None
         else 0
     )
+
     max_vit_grid_tokens = vision_tokens(model, image_processor)
     vision = capability(model, PatchEncoder)
     # Encoder representation remains meaningful on a worker without a text
@@ -322,6 +327,7 @@ def _token_worker_layout(
     max_latent_feature_bytes = (
         0 if flow is None else flow.max_tokens * latent_width * model_dtype_bytes
     )
+
     capacity = None
     unresolved_window = operation_window(int(queue_depth), int(worker_config.max_batch_operations))
     buffer_pool_bytes = (encoder_cache_entries + 1) * max(
@@ -332,6 +338,7 @@ def _token_worker_layout(
     buffer_pool_bytes += worker_config.max_request_pool_size * product_storage_bytes(
         resolve_outputs(model, worker_config)
     )
+
     arena_args = dict(
         pipeline_depth=int(queue_depth),
         completion_payload_bytes=int(completion_payload_bytes),
@@ -349,6 +356,7 @@ def _token_worker_layout(
     input_config = (
         input_buffer_config(model, worker_config, processor=image_processor) if owns_kv else None
     )
+
     devices = tuple(
         dict.fromkeys(
             (worker_config.device, worker_config.generation_device or worker_config.device)
@@ -360,11 +368,13 @@ def _token_worker_layout(
         devices, buffer_pool_bytes + arena.device_product_bytes // len(devices)
     )
     fixed_bytes[worker_config.generation_device or worker_config.device] += latent_pool_bytes
+
     if text is not None:
         assert cache is not None and input_config is not None
         input_bytes = sum(field.nbytes for field in input_config.buffers().values())
         for device in devices:
             fixed_bytes[device] += input_bytes * max(1, len(worker_config.lanes))
+
         schemas = (
             BlockTables.buffers(
                 group_count=1,
@@ -387,6 +397,7 @@ def _token_worker_layout(
             head_dim=int(cache.head_dim),
             capacity=unresolved_window,
         )
+
         resident_copies, co_resident_blocks = _kv_residency_shape(
             worker_config,
             bytes_per_token=bytes_per_token,
@@ -401,6 +412,9 @@ def _token_worker_layout(
             resident_copies=resident_copies,
             co_resident_blocks=co_resident_blocks,
         )
+
+        # Ranks sharing one logical pool must agree on its page count; the
+        # minimum keeps every member within its own memory grant.
         if capacity_group is not None and capacity_group.size > 1:
             pages = torch.tensor(
                 capacity.num_blocks, dtype=torch.int64, device=capacity_group.device
@@ -410,6 +424,7 @@ def _token_worker_layout(
             capacity = replace(
                 capacity, num_blocks=blocks, token_capacity=blocks * capacity.block_size
             )
+
     supported_ops = tuple(code for code in COMPUTATIONS if code in supported_operations(model))
     info = WorkerInfo(
         model_name=model_name,
@@ -480,6 +495,7 @@ def _request_tensor_worker_layout(
     depth = int(queue_depth)
     unresolved_window = request_tensor_window(depth, slots)
     max_operations = min(slots, int(worker_config.max_batch_operations))
+
     info = WorkerInfo(
         model_name=model_name,
         endpoint=endpoint,
@@ -498,6 +514,7 @@ def _request_tensor_worker_layout(
         pipeline_components=dict(media_components(model)),
         num_inference_steps=media_builder(model, worker_config).num_steps,
     )
+
     return WorkerLayout(
         info=info,
         arena=model_arena_capacity(
@@ -571,8 +588,10 @@ def _kv_residency_shape(
         graph_memory_budget_bytes(device_total_bytes(worker_config.device)),
         block_size * max(1, int(bytes_per_token)),
     )
+
     fixed_owner_blocks = ceil_div(
         max(0, int(co_resident_bytes)),
         block_size * max(1, int(bytes_per_token)),
     )
+
     return 1, padding_blocks + graph_blocks + fixed_owner_blocks

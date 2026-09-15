@@ -78,10 +78,17 @@ def prepare_batch(
     request_tables: BlockTables | None,
     request_pool: RequestPool,
 ) -> None:
-    """Reserve input dependencies after admission and release controls have been applied."""
+    """Materialize KV publications and record storage write dependencies for the batch.
+
+    Runs after admission and release controls have been applied. KV install
+    operations receive a cache publication for their source, and every latent,
+    cache-page, and KV write records the future that must complete before its
+    target storage is written.
+    """
 
     batch = prepared.batch
     storage_dependencies: list[Future[None]] = []
+
     pool = latent_pool
     if pool is not None:
         admissions = {
@@ -94,6 +101,7 @@ def prepare_batch(
             operation = scheduled[(latent_params.request_key, latent_params.op_id)]
             if operation.kind not in {PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING}:
                 continue
+
             request = request_pool.peek(latent_params.request_key.request_id)
             request_slot = (
                 admissions.get(latent_params.request_key)
@@ -106,6 +114,8 @@ def prepare_batch(
                 pool.write_dependencies(request_slot, latent_params.page_table)
             )
 
+    # Install operations may reference sources without a scheduler-supplied
+    # publication; the cache materializes one for each missing source.
     entries = list(batch.input_products)
     kv_entries = list(batch.kv_inputs)
     supplied = {publication.source for publication in kv_entries}
@@ -120,6 +130,7 @@ def prepare_batch(
                 raise invalid_descriptor("KV installation requires cache publication storage")
             kv_entries.append(kv_cache.publication(source))
             supplied.add(source)
+
     cache = kv_cache
     tables = request_tables
     if cache is not None and tables is not None and cache.has_pending_accesses:
@@ -135,6 +146,8 @@ def prepare_batch(
             pages = assigned.get((slot, group))
             return tables.pages(slot, group) if pages is None else pages
 
+        # New pages are written from the start; ongoing rows append after the
+        # tokens already visible in their sequence.
         for allocation in batch.new_cache_pages:
             storage_dependencies.extend(
                 cache.write_dependencies(
@@ -144,6 +157,7 @@ def prepare_batch(
                     length=len(allocation.page_ids) * cache.info.block_size,
                 )
             )
+
         for row, write_kv in enumerate(batch.write_kv):
             if not write_kv:
                 continue
@@ -155,6 +169,9 @@ def prepare_batch(
                     length=batch.query_lens[row],
                 )
             )
+
+        # An installation overwrites the published extent of its source into
+        # the destination request's page table.
         for operation in batch.operations:
             if operation.kind is not TransferMode.KV_INSTALL:
                 continue
@@ -179,6 +196,7 @@ def prepare_batch(
                         length=kv_publication.published_extent - kv_publication.base_extent,
                     )
                 )
+
     prepared.storage_dependencies = tuple(storage_dependencies)
     prepared.input_products = tuple(entries)
     prepared.kv_inputs = tuple(kv_entries)
@@ -197,7 +215,12 @@ def prepare_inputs(
     transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> None:
-    """Reserve transfer destinations and submit reads after their storage is available."""
+    """Reserve transfer destinations and submit reads after their storage is available.
+
+    Each cross-stage input descriptor is validated against its declared product
+    before a destination is reserved; on failure, every input reserved so far
+    is released before the error propagates.
+    """
 
     from . import transfer
 
@@ -206,9 +229,12 @@ def prepare_inputs(
     transports = transfer_backends
     if (entries or kv_entries) and not transports:
         raise unsupported_setup("cross-stage input requires a configured transport")
+
     try:
         for entry in entries:
             assert transports
+
+            # One transferred product must land on exactly one consumer device.
             devices = {
                 model_runner.operation_devices(operation)[0]
                 for operation in batch.operations
@@ -218,6 +244,7 @@ def prepare_inputs(
             if len(devices) != 1:
                 raise invalid_descriptor("transferred product requires one consumer device per run")
             device = next(iter(devices))
+
             value = entry.value
             if isinstance(value, EncoderTransferValue):
                 main = value.tensor
@@ -240,6 +267,7 @@ def prepare_inputs(
                     raise invalid_descriptor(
                         "encoder transfer entry disagrees with its product identity"
                     )
+
             elif isinstance(value, DeviceProductTransferValue):
                 main = value.tensor
                 if min(value.height, value.width) < 0:
@@ -263,9 +291,13 @@ def prepare_inputs(
                     raise invalid_descriptor(
                         "device-product transfer metadata exceeds its product bounds"
                     )
+
             elif isinstance(value, LatentTransferValue):
                 main = value.tensor
                 pool = latent_pool
+
+                # A latent payload must exactly match the pool's element
+                # layout: [latent_units, latent_width] at the pool dtype.
                 expected_dtype = "" if pool is None else str(pool.dtype).removeprefix("torch.")
                 expected_nbytes = (
                     0
@@ -287,8 +319,10 @@ def prepare_inputs(
                     or math.prod(main.shape) > entry.product.shape_bound.max_elements
                 ):
                     raise invalid_descriptor("latent transfer metadata exceeds its product bounds")
+
             else:
                 raise invalid_descriptor("cross-stage transfer entry has an unknown kind")
+
             parameters = {params.buffer: params for params in batch.buffer_allocations}
             if isinstance(value, (EncoderTransferValue, DeviceProductTransferValue)):
                 request_slots = {
@@ -328,6 +362,7 @@ def prepare_inputs(
                 assert imported.imported is not None
                 state.tensor_reads[entry.product.buffer_id] = imported
                 continue
+
             elif isinstance(value, LatentTransferValue):
                 consumers = tuple(
                     operation
@@ -337,6 +372,7 @@ def prepare_inputs(
                 if len(consumers) != 1:
                     raise invalid_descriptor("latent transfer must have one consumer")
                 consumer = consumers[0]
+
                 params = next(
                     (
                         params
@@ -358,6 +394,7 @@ def prepare_inputs(
                     params.start_step,
                 ):
                     raise invalid_descriptor("latent transfer disagrees with its scheduler params")
+
                 resident = request_pool.peek(entry.product.request_key.request_id)
                 admission = next(
                     (
@@ -373,6 +410,7 @@ def prepare_inputs(
                     slot = int(admission.request_pool_idx)
                 else:
                     raise invalid_descriptor("latent transfer has no request slot")
+
                 # Transfer metadata validation above established the physical pool.
                 assert latent_pool is not None
                 pool = latent_pool
@@ -382,6 +420,7 @@ def prepare_inputs(
                     page_table=params.page_table,
                     latent_units=value.latent_units,
                 )
+
                 # The actual reservation retains tickets before fetch can fail.
                 state.latent_imports[entry.product.buffer_id] = binding
                 from ..transfer.layout import fetch_tensor
@@ -396,6 +435,7 @@ def prepare_inputs(
                     },
                     retain=partial(pool.retain_transfer, binding),
                 )
+
         for kv_transfer in kv_entries:
             consumers = tuple(
                 operation
@@ -404,11 +444,13 @@ def prepare_inputs(
             )
             if len(consumers) != 1 or consumers[0].kind is not TransferMode.KV_INSTALL:
                 raise invalid_descriptor("KV input requires one installation consumer")
+
             publications = kv_cache
             cache = kv_cache
             tables = request_tables
             if publications is None or cache is None or tables is None:
                 raise invalid_descriptor("KV input requires physical cache storage")
+
             resident = request_pool.peek(kv_transfer.source.owner.request_id)
             admission = next(
                 (row for row in batch.admissions if row.request_key == kv_transfer.source.owner),
@@ -420,6 +462,9 @@ def prepare_inputs(
                 slot = int(admission.request_pool_idx)
             else:
                 raise invalid_descriptor("KV transfer has no admitted request slot")
+
+            # Prefer scheduler-supplied block tables; otherwise fall back to
+            # the request's currently installed pages and allocated length.
             table = next(
                 (
                     table
@@ -448,6 +493,7 @@ def prepare_inputs(
                 transports=transports,
             )
             state.cache_imports[kv_transfer.source] = write
+
         _prepare_predicates(
             state,
             tensor_store=tensor_store,
@@ -455,6 +501,8 @@ def prepare_inputs(
             model_runner=model_runner,
         )
     except BaseException as error:
+        # Release every input reserved above; a cleanup failure annotates the
+        # original error rather than masking it.
         try:
             state.close_inputs(tensor_store, latent_pool, kv_cache)
         except BaseException as cleanup_error:
@@ -480,6 +528,7 @@ def _prepare_predicates(
     )
     if not scheduled:
         return
+
     buffer = output_pool.acquire(
         len(scheduled),
         token_capacity=len(scheduled),
@@ -507,6 +556,7 @@ def _prepare_predicates(
                         rows[operations.operation_identity(operation)],
                     )
                 )
+
         for device, device_operations in grouped.items():
             reads = tensor_store.consume_batch(
                 tuple(
@@ -551,6 +601,7 @@ def capture_predicates(state: BatchState, tensor_store: TensorStore) -> None:
         return
     if not all(state.input_ready(source) for _, source, _ in state.predicate_transfers):
         return
+
     try:
         for identity, source, row in state.predicate_transfers:
             read = state.tensor_reads[source]
@@ -560,6 +611,7 @@ def capture_predicates(state: BatchState, tensor_store: TensorStore) -> None:
     except BaseException:
         buffer.abandon()
         raise
+
     state.predicates_sealed = True
 
 
@@ -604,6 +656,7 @@ def _open_group(
             if operations.operation_identity(operation) not in predicated
         )
     )
+
     if active_operations:
         stream = model_runner.operation_stream(active_operations[0])
         if stream is not None:
@@ -633,6 +686,7 @@ def _open_group(
             for payload in batch.input_products
             if payload.product.buffer_id in declared_inputs
         )
+
         completion: OutputBuffer | None = None
         try:
             # Candidate drafts and completion slots form a speculative ownership unit:
@@ -657,11 +711,13 @@ def _open_group(
             if completion is not None:
                 completion.abandon()
             raise
+
         assert completion is not None
         for request in candidates:
             if operations.operation_identity(request.operation) in predicated:
                 request.status = OpStatus.PREDICATED
         state.bind_outputs(completion_group, candidates, completion, started)
+
         try:
             # Bind physical state in dependency order before decoding transferred inputs.
             _reserve_cpu_tasks(
@@ -680,6 +736,7 @@ def _open_group(
                     operations.operation_identity(batch.operations[index]) in identities
                     for index in batch.forward_operation_indices
                 )
+
                 if kv_cache is None or request_tables is None:
                     if has_forward:
                         raise unsupported_setup("KV-free execution received cache forward rows")
@@ -756,6 +813,8 @@ def _open_group(
 def _completion_words(scheduled: tuple[ScheduledRequest, ...]) -> int:
     """Compute fixed completion-word capacity for all operations in a completion group."""
 
+    # Completion storage is addressed in 4-byte words; payload byte budgets
+    # round up to whole words.
     return max(
         1,
         SAMPLING_COMPLETION_FIELDS * len(scheduled)
@@ -784,11 +843,15 @@ def _reserve_cpu_tasks(
             PipelineStage.MUXING,
         }:
             continue
+
+        # With a video postprocessor, only the output rank materializes media.
         if postprocessor is not None and config.rank != worker_info.output_rank(operation.entry):
             continue
+
         pending = state.pending_output(completion_group, operation.request_key.request_id)
         if pending.completion_tasks:
             raise invalid_descriptor("materialization repeats its CPU task identity")
+
         reservation = cpu_tasks.reserve()
         try:
             if operation.kind in {PipelineStage.VIDEO_ENCODING, PipelineStage.AUDIO_ENCODING}:
@@ -798,6 +861,7 @@ def _reserve_cpu_tasks(
         except BaseException:
             reservation.abandon()
             raise
+
         pending.completion_tasks = (reservation,)
 
 
@@ -815,6 +879,7 @@ def validate_batch(
         for params in batch.buffer_allocations
     ):
         raise invalid_descriptor("run buffer params exceeds the worker buffer pool")
+
     if worker_info.components:
         for operation in batch.operations:
             entry = next(
@@ -824,12 +889,15 @@ def validate_batch(
                 raise invalid_descriptor(
                     f"operation targets entry {operation.entry!r} outside this rank"
                 )
+
     if len(batch.operations) > config.max_batch_operations:
         raise invalid_descriptor("execution batch exceeds the worker_config operation limit")
+
     for operation in batch.operations:
         variant = operation.kind
         if variant not in worker_info.supported_ops:
             raise unsupported_operation(variant.value, operation.request_key.request_id)
+
     if any(
         index > config.max_request_pool_size
         for index in (
@@ -838,6 +906,7 @@ def validate_batch(
         )
     ):
         raise invalid_descriptor("execution batch exceeds request-slot capacity")
+
     validate_video_batch(batch, postprocessor=model_runner.video_postprocessor)
 
 
@@ -853,16 +922,20 @@ def _reserve_outputs(
 
     regions = {}
     shapes = {}
+    # Scalar outputs sharing device, dtype, and shape bound are co-allocated
+    # so one bounded allocation serves every compatible write.
     scalar_groups: dict[
         tuple[torch.device, DType, ShapeBound], list[tuple[TensorRef, torch.device | str]]
     ] = {}
     persistent_bindings: list[tuple[TensorRef, torch.device | str]] = []
     encoder_bindings: list[tuple[TensorRef, torch.device | str]] = []
     by_identity = {operations.operation_identity(operation): operation for operation in scheduled}
+
     for operation in scheduled:
         device = model_runner.operation_devices(operation)[2]
         request = state.pending_output(completion_group, operation.request_key.request_id)
         predicated = request.status is OpStatus.PREDICATED
+
         if not predicated:
             decode = next(
                 (
@@ -873,6 +946,7 @@ def _reserve_outputs(
                 ),
                 None,
             )
+
             for output in operation.outputs:
                 if operation.kind is TransferMode.TENSOR:
                     # Transfers publish the delivered input's representation;
@@ -892,10 +966,12 @@ def _reserve_outputs(
                 if layout.local_slice != tuple(slice(0, extent) for extent in layout.shape):
                     regions[output] = layout.local_slice
                 persistent_bindings.append((output, device))
+
             if operation.image_output is not None:
                 persistent_bindings.append((operation.image_output, device))
             if operation.encoder_output is not None:
                 encoder_bindings.append((operation.encoder_output, device))
+
         # A skipped computation propagates false predicates but publishes no
         # sampled token, feature, image, or latent state.
         for scalar in (
@@ -908,9 +984,11 @@ def _reserve_outputs(
             scalar_groups.setdefault((device, scalar.dtype, scalar.shape_bound), []).append(
                 (scalar, device)
             )
+
     groups = tuple(tuple(group) for group in scalar_groups.values())
     if persistent_bindings:
         groups = (*groups, tuple(persistent_bindings))
+
     request_slots = {
         request.request.request_key: int(request.request.request_pool_idx)
         for request in state.pending_outputs(completion_group)
@@ -923,17 +1001,21 @@ def _reserve_outputs(
         request_slots=request_slots,
         buffer_allocations=allocations,
     )
+
     # Retain each successful reservation before the next store call can fail.
     for binding in bound_groups:
         for write in binding:
             request = state.pending_output(completion_group, write.reference.request_key.request_id)
             request.writes.append(write)
+
     features = tensor_store.reserve_features(
         tuple(encoder_bindings), buffer_allocations=allocations
     )
     for write in features:
         request = state.pending_output(completion_group, write.reference.request_key.request_id)
         request.writes.append(write)
+
+    # Classify each bound write against its producer's declared output roles.
     for write in (write for binding in bound_groups for write in binding):
         identity = (write.reference.request_key, write.reference.producer_op_id)
         producer = by_identity.get(identity)
@@ -984,6 +1066,7 @@ def _consume_predicates(
                 ),
             )
         )
+
     for device, entries in grouped.items():
         reads = tensor_store.consume_batch(
             tuple(request for _operation, request in entries),
@@ -991,6 +1074,8 @@ def _consume_predicates(
         )
         for (operation, _request), read in zip(entries, reads, strict=True):
             predicate = cast(TensorRef, operation.predicate)
+            # I64 predicates are relay tags carrying a predecessor's decision;
+            # U8 predicates are plain completion booleans.
             tagged = predicate.dtype is DType.I64
             request = state.pending_output(completion_group, operation.request_key.request_id)
             request.device_reads.append(read)
@@ -1032,6 +1117,7 @@ def _bind_latent_inputs(
     )
     if not parameters:
         return
+
     pool = latent_pool
     requests = {
         operations.operation_identity(operation): (
@@ -1040,6 +1126,7 @@ def _bind_latent_inputs(
         )
         for operation in scheduled
     }
+
     if pool is None:
         # Fixed request tensors own the trajectory directly. Solver progress
         # remains explicit, without a second paged-storage reservation.
@@ -1053,6 +1140,9 @@ def _bind_latent_inputs(
             operation, request = selected
             if params.page_table or params.latent_units:
                 raise invalid_descriptor("paged latent params require a resident latent pool")
+
+            # Preparation runs once at step zero; each denoise call advances
+            # exactly one step from the committed solver state.
             if operation.kind is PipelineStage.LATENT_PREPARATION:
                 valid = int(params.start_step) == 0 and int(params.step_count) == 0
             elif operation.kind is PipelineStage.DENOISING:
@@ -1070,6 +1160,7 @@ def _bind_latent_inputs(
                     "pool-free latent params disagrees with resident generation state"
                 )
         return
+
     # Pooled models bind each operation to validated image dimensions and page ownership.
     rows: list[tuple[OperationIdentity, LatentParams, int]] = []
     for params in parameters:
@@ -1081,6 +1172,7 @@ def _bind_latent_inputs(
             )
         operation, request = selected
         slot = int(request.request.request_pool_idx)
+
         image = request.request.image
         if image is None:
             raise invalid_descriptor("latent params has no admitted image dimensions")
@@ -1098,6 +1190,9 @@ def _bind_latent_inputs(
             or int(params.latent_units) != expected_units
         ):
             raise invalid_descriptor("latent params disagrees with admitted model dimensions")
+
+        # A transferred trajectory commits at the step it was published at;
+        # a resident trajectory commits at its recorded solver step.
         transferred = next(
             (
                 publication.value
@@ -1112,6 +1207,7 @@ def _bind_latent_inputs(
             if transferred is None
             else transferred.step
         )
+
         if operation.kind is PipelineStage.LATENT_PREPARATION:
             if int(params.start_step) != 0 or int(params.step_count) != 0:
                 raise invalid_descriptor("media preparation params carries denoise steps")
@@ -1128,6 +1224,7 @@ def _bind_latent_inputs(
                 raise invalid_descriptor("media denoise params exceeds its committed schedule")
         elif int(params.start_step) != committed_step or int(params.step_count) != 0:
             raise invalid_descriptor("latent reader params disagrees with committed step state")
+
         rows.append((identity, params, slot))
     # Stage every page table together so overlapping physical ownership is
     # rejected before any operation receives a writable tensor view.
@@ -1140,6 +1237,7 @@ def _bind_latent_inputs(
             if isinstance(output, PendingOutput) and output.latent_staging is not None
         ),
     )
+
     for (identity, params, slot), value in zip(rows, staged, strict=True):
         request = state.pending_output(completion_group, identity[0].request_id)
         request.input_latent_params = params
@@ -1160,9 +1258,13 @@ def _bind_cache_tables(
     page_tables = request_tables
     if cache is None or page_tables is None:
         raise invalid_descriptor("cache tables require physical KV storage")
+
     started = time.perf_counter_ns()
     inputs = state.batch
     identities = {operations.operation_identity(op) for op in scheduled}
+
+    # Tables are needed for every slot this group reads or writes: its own
+    # requests plus any alternative-prefix rows of its forward operations.
     slots = {
         state.pending_output(
             completion_group, operation.request_key.request_id
@@ -1176,6 +1278,7 @@ def _bind_cache_tables(
             if operations.operation_identity(inputs.operations[index]) in identities
         }
     )
+
     tables = []
     for table in inputs.block_tables:
         if table.request_pool_idx not in slots:
@@ -1192,6 +1295,7 @@ def _bind_cache_tables(
             )
         )
     page_tables.install(tuple(tables))
+
     for allocation in inputs.new_cache_pages:
         if allocation.request_pool_idx not in slots:
             continue
@@ -1202,6 +1306,9 @@ def _bind_cache_tables(
         installed = page_tables.pages(allocation.request_pool_idx, allocation.group_id)
         if not set(pages).issubset(installed):
             raise invalid_descriptor("new cache pages are outside the installed block table")
+
+        # Pages a KV installation will fill are initialized on arrival; every
+        # other new page starts zeroed so stale cache content is never read.
         initialized = {
             page
             for write in state.cache_imports.values()
@@ -1228,6 +1335,7 @@ def _bind_cache_tables(
         state.group_forward_indices[completion_group][operations.operation_identity(operation)] = (
             tuple(operation_rows)
         )
+
         main_descriptor = next(
             (row for row in operation_rows if inputs.request_pool_indices[row] == main_slot),
             None,
@@ -1243,6 +1351,7 @@ def _bind_cache_tables(
                 raise invalid_descriptor(
                     "forward row sequence length disagrees with execution state"
                 )
+
         for descriptor in operation_rows:
             slot = inputs.request_pool_indices[descriptor]
             pages = page_tables.pages(slot, 0)
@@ -1252,6 +1361,9 @@ def _bind_cache_tables(
                 raise invalid_descriptor("forward row exceeds alternative-prefix capacity")
             if slot != main_slot:
                 page_tables.retain_prefix(operation.request_key, slot)
+
+            # Rows that write KV this step own only their committed prefix;
+            # read-only rows also cover the tokens they query.
             cache.retain_execution(
                 operation.request_key,
                 pages,
@@ -1260,6 +1372,7 @@ def _bind_cache_tables(
                 - (0 if inputs.write_kv[descriptor] else inputs.query_lens[descriptor]),
                 completion=state.group_buffers[completion_group].completion_future(),
             )
+
     record_component(state.group_component_us[completion_group], "bc_tables", started)
 
 
@@ -1275,6 +1388,8 @@ def _stage_input_products(
 ) -> None:
     """Publish query-ready transferred values into their owning runtime stores."""
 
+    # KV imports consumed by this group must be complete and conflict-free
+    # before any transferred product is published.
     cache_inputs = {operation.kv_input for operation in state.group_operations(completion_group)}
     for buffer, write in state.cache_imports.items():
         if buffer not in cache_inputs:
@@ -1286,12 +1401,14 @@ def _stage_input_products(
         existing = kv_cache.resident(buffer)
         if existing is not None and existing != write.publication:
             raise invalid_descriptor("staged KV publication conflicts with its buffer identity")
+
     for entry in input_products:
         product = entry.product
         # Transfer metadata determines which runtime owns the imported value;
         # each branch validates identity and shape before publication.
         if not state.input_ready(product.buffer_id):
             raise invalid_descriptor("cross-stage input has no query-ready prepared transfer")
+
         value = entry.value
         if isinstance(value, LatentTransferValue):
             consumers = tuple(
@@ -1301,6 +1418,7 @@ def _stage_input_products(
             )
             if len(consumers) != 1:
                 raise invalid_descriptor("latent transfer must have one completion group consumer")
+
             row = state.pending_output(completion_group, consumers[0].request_key.request_id)
             params = row.input_latent_params
             staging = row.latent_staging
@@ -1313,12 +1431,14 @@ def _stage_input_products(
                 or value.step != int(params.start_step)
             ):
                 raise invalid_descriptor("latent transfer disagrees with its scheduler params")
+
             request = state.pending_output(completion_group, product.request_key.request_id)
             if (
                 operations.require_progress(request).latent_product is not None
                 or int(operations.require_progress(request).flow_step) != 0
             ):
                 raise invalid_descriptor("latent transfer destination already owns a trajectory")
+
             binding = state.latent_imports.get(product.buffer_id)
             if not isinstance(binding, LatentImport):
                 raise RuntimeError("latent transfer lost its reserved destination")
@@ -1327,6 +1447,9 @@ def _stage_input_products(
                 tuple(params.page_table),
             ):
                 raise invalid_descriptor("latent import reservation changed before execution")
+
+            # The reserved import becomes a live trajectory at the transferred
+            # solver step, replacing the destination's empty progress.
             assert latent_pool is not None
             latent_pool.adopt_import(
                 binding,
@@ -1343,6 +1466,7 @@ def _stage_input_products(
                 operations.require_progress(request), flow_step=value.step
             )
             continue
+
         consumers = tuple(
             operation
             for operation in state.group_operations(completion_group)
@@ -1350,11 +1474,13 @@ def _stage_input_products(
         )
         if not consumers:
             raise invalid_descriptor("transferred product has no completion group consumer")
+
         devices = {model_runner.operation_devices(operation)[0] for operation in consumers}
         if len(devices) != 1:
             raise invalid_descriptor("transferred product spans multiple consumer devices")
         if not isinstance(value, (DeviceProductTransferValue, EncoderTransferValue)):
             raise RuntimeError("prepared transfer has an unknown descriptor")
+
         imported = state.tensor_reads.get(product.buffer_id)
         if imported is None:
             raise RuntimeError("tensor transfer lost its reserved destination")

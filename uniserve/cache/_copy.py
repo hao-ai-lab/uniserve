@@ -44,6 +44,8 @@ def scatter_blocks(target, indices, snapshot):
     width = prod(target.shape[1:])
     if not indices.numel() or not width:
         return
+
+    # One program per (block slot, 1024-column tile) of the flattened block.
     with torch.cuda.device(target.device):
         _scatter_kernel[(indices.numel(), triton.cdiv(width, 1024))](
             snapshot,

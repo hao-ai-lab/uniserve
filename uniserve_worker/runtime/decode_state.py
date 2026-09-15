@@ -38,6 +38,7 @@ class DecodeState:
         self.vocab_size = int(vocab_size)
         self.continuation_width = int(continuation_width)
         self.device = torch.device(device)
+
         if not logits_dtype.is_floating_point:
             raise ValueError("runtime prompt-logit dtype must be floating point")
         self.logits_dtype = logits_dtype
@@ -55,6 +56,7 @@ class DecodeState:
             ):
                 raise ValueError("runtime cache-length storage is incompatible")
             self.valid_cache_lengths = valid_cache_lengths
+
         buffer_configs = self.buffers(
             request_pool_size=self.request_pool_size,
             vocab_size=self.vocab_size,
@@ -72,6 +74,7 @@ class DecodeState:
             "_ones_int64": 1,
         }.items():
             tensors[name].fill_(value)
+
         self.logical_lengths = tensors["logical_lengths"]
         self.sampling_positions = tensors["sampling_positions"]
         self.future_input_tokens = tensors["future_input_tokens"]
@@ -139,6 +142,8 @@ class DecodeState:
     ) -> None:
         """Initialize selected request rows with validated cache length and sampling state."""
 
+        # Host fast path: fully CPU-resident columns reset their rows directly,
+        # without building device index tensors.
         if not isinstance(request_pool_indices, torch.Tensor) and self.device.type == "cuda":
             host = tuple(int(value) for value in request_pool_indices)
             self._validate_host_indices(host)
@@ -154,6 +159,7 @@ class DecodeState:
                         sampling[position],
                     )
                 return
+
         indices = self._indices(request_pool_indices)
         self.future_input_tokens.index_fill_(0, indices, 1)
         self.penalty_counts.index_fill_(0, indices, 0)
@@ -198,6 +204,7 @@ class DecodeState:
         self._validate_host_indices(indices)
         if len(indices) != len(penalty_bases):
             raise ValueError("decode penalty rows do not align with request slots")
+
         if device_slots is not None:
             if logical_position is not None or sampling_position is not None:
                 raise ValueError("batched decode does not replace explicit coordinates")
@@ -216,6 +223,7 @@ class DecodeState:
             self._copy_scalar(self.logical_lengths[slot : slot + 1], logical_position)
             self._copy_scalar(self.sampling_positions[slot : slot + 1], sampling_position)
             penalty_tokens = future_token
+        # Occurrence counts grow only for tokens that are valid and active.
         for index, counts in enumerate(penalty_bases):
             if counts is None:
                 continue
@@ -282,6 +290,8 @@ class DecodeState:
                 block_size=block_size,
             )
             return
+
+        # Fallback without Triton: the same scatter updates via index ops.
         self.future_input_tokens[:, 0].index_copy_(
             0,
             indices,
@@ -381,6 +391,7 @@ class DecodeState:
                 block_size=block_size,
             )
             return
+
         self.future_input_tokens[row].fill_(1)
         self.penalty_counts[row].zero_()
         self.predicates[row].fill_(False)

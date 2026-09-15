@@ -17,5 +17,6 @@ def close_resources(*actions: Callable[[], object]) -> None:
                 failure = error
             else:
                 failure.add_note(f"Resource cleanup also failed: {error!r}")
+
     if failure is not None:
         raise failure

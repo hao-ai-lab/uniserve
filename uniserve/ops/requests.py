@@ -1,4 +1,8 @@
-"""Typed operator requests."""
+"""Typed operator requests.
+
+Each frozen dataclass bundles the exact tensors and scalars one operator
+family consumes, so providers can be dispatched without inspecting callers.
+"""
 
 from __future__ import annotations
 

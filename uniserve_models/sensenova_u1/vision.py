@@ -76,7 +76,9 @@ class Encoder(nn.Module):
         factor = round(1 / self.config.downsample_ratio)
         if any(min(shape) < 1 or any(axis % factor for axis in shape) for shape in grid_shapes):
             raise ValueError("NEO image grids must align with dense spatial downsampling")
+
         if pixels.ndim == 2:
+            # Packed patches arrive as [total_patches, channels*patch*patch].
             if pixels.shape != (sum(counts), self.config.num_channels * self.config.patch_size**2):
                 raise ValueError("NEO packed CHW pixels must cover the declared image grids")
             pixels = pixels.reshape(
@@ -84,12 +86,15 @@ class Encoder(nn.Module):
             )
         if pixels.ndim != 4:
             raise ValueError("NEO pixels must be NCHW images or flattened CHW patches")
+
         features = self.activation(
             self.patch_embedding(pixels.to(self.patch_embedding.weight.dtype))
         )
+        # [patches, hidden, h, w] -> [total_patches, hidden] across all images.
         features = features.permute(0, 2, 3, 1).reshape(-1, self.config.hidden_size)
         if features.shape[0] != sum(counts):
             raise ValueError("NEO image grids must cover all projected patches")
+
         columns, rows = build_abs_positions_from_grid_hw(grids, total=sum(counts))
         parts = []
         for hidden, coordinates, axis in zip(
@@ -104,8 +109,11 @@ class Encoder(nn.Module):
                 apply_rotary(hidden.unsqueeze(1), cosine, sine, rotation="interleaved").squeeze(1)
             )
         features = torch.cat(parts, dim=-1).to(features.dtype)
+
         if not grid_shapes:
             return features.new_empty((0, self.config.output_size))
+
+        # Equal grids reduce in one batched convolution; mixed grids loop.
         if all(shape == grid_shapes[0] for shape in grid_shapes):
             height, width = grid_shapes[0]
             spatial = features.reshape(len(grid_shapes), height, width, -1).permute(0, 3, 1, 2)

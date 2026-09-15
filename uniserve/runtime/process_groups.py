@@ -67,6 +67,7 @@ class ProcessGroups:
 
         if mesh.rank != self.rank or any(rank >= self.world_size for rank in mesh.ranks):
             raise ValueError("mesh ranks disagree with the process world")
+
         device = torch.device(device)
         handles = {}
         groups = {}
@@ -96,6 +97,7 @@ class ProcessGroups:
                             device,
                             handles.get(ordered),
                         )
+
         result = DeviceMesh(ranks=mesh.ranks, shape=mesh.shape, axes=mesh.axes, rank=mesh.rank)
         object.__setattr__(result, "_device", device)
         object.__setattr__(result, "_groups", MappingProxyType(groups))
@@ -136,6 +138,7 @@ def initialize_process_groups(
 
     if world_size < 1 or not 0 <= rank < world_size or local_rank < 0:
         raise ValueError("launch rank must satisfy 0 <= rank < positive world_size")
+
     local_device = torch.device(device)
     if local_device.type == "cuda":
         index = local_device.index if local_device.index is not None else local_rank
@@ -145,8 +148,10 @@ def initialize_process_groups(
                 f"cuda device {local_device} is outside the {torch.cuda.device_count()} visible CUDA device(s)"
             )
         torch.cuda.set_device(local_device)
+
     backend = backend or ("nccl" if local_device.type == "cuda" else "gloo")
     environment = ProcessGroups(rank, world_size, local_device, backend)
+
     if dist.is_initialized():
         if (dist.get_rank(), dist.get_world_size()) != (rank, world_size):
             raise ValueError("existing process world disagrees with supplied rank/world_size")
@@ -167,6 +172,7 @@ def initialize_process_groups(
             device_id=local_device if backend == "nccl" else None,
         )
         environment._groups.append(dist.group.WORLD)
+
     return environment
 
 

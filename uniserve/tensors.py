@@ -32,11 +32,15 @@ def adjacent_view(values: Sequence[torch.Tensor]) -> torch.Tensor | None:
 
     storage = first.untyped_storage().data_ptr()
     offset = int(first.storage_offset())
+
+    # Each flattened view must share one storage and begin exactly where the
+    # previous view ended; any gap or overlap forces the concatenation path.
     expected = offset
     for value in flat:
         if value.untyped_storage().data_ptr() != storage or int(value.storage_offset()) != expected:
             return None
         expected += int(value.numel())
+
     return first.as_strided((expected - offset,), (1,), storage_offset=offset)
 
 
@@ -51,11 +55,17 @@ def concatenate_views(values: Sequence[torch.Tensor]) -> torch.Tensor:
 
 
 def _join_channels(values, *, copy: bool = True):
-    """Borrow adjacent channel views, or concatenate unrelated output storage."""
+    """Borrow adjacent channel views, or concatenate unrelated output storage.
+
+    Channel views qualify when they share one storage, agree on every
+    non-channel extent and stride, and tile the last axis back to back.
+    """
 
     first = values[0]
     position = first.storage_offset()
     storage = first.untyped_storage().data_ptr()
+
+    # A single mismatch on any view abandons the borrowed-view path entirely.
     for value in values:
         if (
             value.shape[:-1] != first.shape[:-1]

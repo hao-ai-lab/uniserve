@@ -46,10 +46,14 @@ class _DeferredRelease:
 
 
 class EventPool:
-    """Own CUDA events until every store reference is query-ready and released."""
+    """Own CUDA events until every store reference is query-ready and released.
+
+    All public methods are thread-safe. Deferred completion callbacks run
+    outside the pool lock so their owners may release further events from them.
+    """
 
     def __init__(self) -> None:
-        """Initialize reusable CUDA-event pools and generation-tagged active ownership."""
+        """Initialize empty reusable event pools and active ownership state."""
 
         self._available: dict[tuple[str, bool, bool], deque[torch.cuda.Event]] = {}
         self._active: dict[int, _EventState] = {}
@@ -74,6 +78,7 @@ class EventPool:
         wake_on_stream = self._wake_on_stream
         if wake_on_stream is None:
             return
+
         target = canonical_device(device)
         device_name = str(target)
         with self._lock:
@@ -108,6 +113,7 @@ class EventPool:
         with self._lock:
             if self._closed:
                 raise _invariant("device event pool is closed")
+
             available = self._available.get(key)
             event = (
                 available.pop()
@@ -118,6 +124,7 @@ class EventPool:
             )
             if id(event) in self._active:
                 raise _invariant("device event was reused while still referenced")
+
             self._active[id(event)] = _EventState(
                 event=event,
                 device_name=device_name,
@@ -156,12 +163,14 @@ class EventPool:
             state = self._require_locked(event, target)
             if state.recorded:
                 raise _invariant("device event was recorded more than once")
+
             stream = state.stream
             if stream is None:
                 stream = torch.cuda.current_stream(target)
                 state.stream = stream
             stream_id = int(stream.cuda_stream)
             state.stream_id = stream_id
+
             event.record(stream)
             state.recorded = True
         return stream_id
@@ -192,11 +201,14 @@ class EventPool:
             state = self._active.get(id(event))
             if state is None or state.event is not event or state.references < references:
                 raise _invariant("device event reference accounting is invalid")
+
             state.references -= references
             if state.references != 0:
                 return
+
             if not state.recorded or not bool(event.query()):
                 raise _invariant("device event was released before it became query-ready")
+
             self._recycle_locked(state)
 
     def defer_release(
@@ -216,11 +228,14 @@ class EventPool:
             # by completed public tickets can outlive the pool's active scope.
             if self._closed:
                 return
+
             for event in retained:
                 state = self._active.get(id(event))
                 if state is None or state.event is not event or state.references < 1:
                     raise _invariant("deferred device event has invalid ownership")
+
             self._deferred.append(_DeferredRelease(retained, owner, completed))
+
         self.reap()
 
     def reap(self) -> None:
@@ -238,11 +253,14 @@ class EventPool:
 
         for stream in self._wake_streams.values():
             stream.synchronize()
+
         with self._lock:
             for state in self._active.values():
                 if state.recorded:
                     state.event.synchronize()
+
         self.reap()
+
         with self._lock:
             self._closed = True
             self._wake_streams.clear()
@@ -257,8 +275,10 @@ class EventPool:
         deferred_releases, self._deferred = self._deferred, []
         for deferred in deferred_releases:
             if not all(bool(event.query()) for event in deferred.events):
+                # Recorded work is still in flight; check again on the next reap.
                 self._deferred.append(deferred)
                 continue
+
             for event in deferred.events:
                 state = self._active.get(id(event))
                 if state is None or state.event is not event or state.references < 1:
@@ -266,8 +286,10 @@ class EventPool:
                 state.references -= 1
                 if state.references == 0:
                     self._recycle_locked(state)
+
             if deferred.completed is not None:
                 callbacks.append(deferred.completed)
+
         return tuple(callbacks)
 
     def _recycle_locked(self, state: _EventState) -> None:

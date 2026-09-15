@@ -747,6 +747,7 @@ class Worker:
         self._next_sequence += 1
         self._transport_occupancy += 1
         requests = messages.raw_request_ids(request)
+
         try:
             kind = messages.request_kind(request)
 
@@ -756,6 +757,7 @@ class Worker:
                 self._admission_closed = True
                 self._shutdown_response = messages.with_call_id(self._dispatch(request), request)
                 return sequence
+
             run: ScheduleBatch | None = None
             if kind is RequestKind.SUBMIT:
                 raw_run = messages.required(request, "run", kind)
@@ -774,6 +776,7 @@ class Worker:
                         if isinstance(raw_run, ScheduleBatch)
                         else ScheduleBatch.from_mapping(raw_run)
                     )
+
                 if run.run_id <= self._last_run_id:
                     raise invalid_descriptor(
                         f"run id {run.run_id} must exceed previously submitted id {self._last_run_id}"
@@ -790,6 +793,7 @@ class Worker:
                 )
                 if freed:
                     self.release_buffers(freed)
+
                 requests = messages.run_requests(run)
 
             # Each request identifier forms a FIFO dependency chain. Multi-key
@@ -801,6 +805,7 @@ class Worker:
                 kind=kind,
                 run=run,
             )
+
             predecessors = {
                 id(predecessor): predecessor
                 for request_id in requests
@@ -817,11 +822,14 @@ class Worker:
                         self._collective_submission_tail
                     )
                 self._collective_submission_tail = pending
+
             pending.dependencies = len(predecessors)
             for predecessor in predecessors.values():
                 predecessor.successors.append(pending)
+
             for request_id in requests:
                 self._request_tails[request_id] = pending
+
             self._pending_requests[sequence] = pending
             if pending.dependencies == 0:
                 self._enqueue(pending)
@@ -844,12 +852,15 @@ class Worker:
         if pending.released:
             return
         pending.released = True
+
         self._pending_requests.pop(pending.sequence, None)
         if self._collective_submission_tail is pending:
             self._collective_submission_tail = None
+
         for request in pending.requests:
             if self._request_tails.get(request) is pending:
                 del self._request_tails[request]
+
         for successor in pending.successors:
             successor.dependencies -= 1
             if successor.dependencies == 0:
@@ -870,6 +881,7 @@ class Worker:
         )
         if position is None:
             return False
+
         pending = self._ready_requests.pop(position)
 
         try:
@@ -912,6 +924,7 @@ class Worker:
         run = BatchState(pending.run)
         self._run_submissions[run.run_id] = pending
         self.inflight[run.run_id] = run
+
         self._start_execution(run)
         self._queue_result(pending, run)
 
@@ -929,7 +942,9 @@ class Worker:
                 raise invalid_descriptor(
                     f"execution run contains work variants unsupported by this worker: {names!r}"
                 )
+
             self._prepare_execution(run)
+
             if self._advance_execution(run):
                 if not run.complete:
                     self._executing_runs.append(run)
@@ -966,6 +981,7 @@ class Worker:
                     for task in parent.completion_tasks:
                         task.submit_if_ready()
                     parent = parent.predecessor
+
             for group, indexes in run.output_groups.items():
                 if group in run.completed_groups:
                     continue
@@ -986,6 +1002,7 @@ class Worker:
                 for index, value in zip(indexes, values, strict=True):
                     run.outputs[index] = value
                 run.completed_groups.add(group)
+
             if len(run.completed_groups) == len(run.output_groups):
                 run.complete = self._advance_retirement(run)
             self._notify_run(run)
@@ -1002,6 +1019,8 @@ class Worker:
         self._run_ready(run)
 
     def _fail_run(self, run: BatchState, error: BaseException, *, context: str = "execute") -> None:
+        """Record a classified failure, close the batch, and wake its waiting responses."""
+
         if run.complete:
             return
         run.error = error if isinstance(error, WorkerError) else classify(error, context=context)
@@ -1019,6 +1038,7 @@ class Worker:
         run = self.inflight.get(run_id)
         if run is None or not run.awaiting_poll:
             raise invalid_descriptor(f"poll names run {run_id} with no pending results")
+
         run.awaiting_poll = False
         self._queue_result(pending, run)
 
@@ -1068,6 +1088,7 @@ class Worker:
                     else:
                         run.on_dependencies_ready(partial(self._preparation_completed, run))
             advanced = True
+
         # Query every launched run: one pending host read or retirement must not
         # hide an independent completion behind it.
         for _ in range(len(self._executing_runs)):
@@ -1104,11 +1125,13 @@ class Worker:
         response = dict(pending.response)
         run = pending.run
         run_id = run.run_id if run is not None else None
+
         if run is not None:
             if run.error is not None:
                 response = messages.error_response(run.take_error(), pending.response)
             else:
                 response["result"] = run.take_output()
+
             if run.pending():
                 run.awaiting_poll = True
             else:
@@ -1121,10 +1144,12 @@ class Worker:
         ):
             finalized = messages.finalize_response(response)
         self._transport_respond(finalized)
+
         if pending.sequence > 0:
             self._transport_occupancy -= 1
             if self._transport_occupancy < 0:
                 raise RuntimeError("worker transport occupancy underflow")
+
         if fatal:
             self._admission_closed = True
 
@@ -1164,6 +1189,8 @@ class Worker:
         return self._layout.info
 
     def _require_open(self) -> None:
+        """Raise when this worker's resource scope has already been closed."""
+
         if self._closed:
             raise RuntimeError("worker is closed and cannot be reused")
 
@@ -1178,8 +1205,10 @@ class Worker:
         self._require_open()
         if batch.run_id in self.inflight:
             raise invalid_descriptor("run ID already has an in-flight batch")
+
         state = BatchState(batch, propagate_errors=propagate_errors)
         self.inflight[state.run_id] = state
+
         try:
             self._prepare_execution(state)
             self._advance_execution(state)
@@ -1188,6 +1217,7 @@ class Worker:
             self.inflight.pop(state.run_id, None)
             self._close_batch(state)
             raise
+
         if state.error is not None and propagate_errors:
             error = state.error
             self.inflight.pop(state.run_id, None)
@@ -1211,15 +1241,18 @@ class Worker:
             raise invalid_descriptor("poll names a batch no longer owned by this Worker")
         if not state.ready():
             return None
+
         if state.error is not None:
             error = state.take_error()
             del self.inflight[state.run_id]
             self._close_batch(state)
             raise error
+
         output = state.take_output()
         if not state.pending():
             del self.inflight[state.run_id]
             self._close_batch(state)
+
         return output
 
     def _execute_batch(self, state: BatchState) -> None:
@@ -1254,6 +1287,7 @@ class Worker:
             transfer_backends=self.transports,
             config=self.worker_config,
         )
+
         consumed = _input_producers(batch)
         self._release_predecessors(
             tuple(
@@ -1264,6 +1298,7 @@ class Worker:
                 and (operation.request_key, operation.predecessor) in consumed
             )
         )
+
         self.tensor_store.release_buffers(
             tuple(
                 predicate.buffer_id
@@ -1284,14 +1319,18 @@ class Worker:
         return kind in self.info.supported_ops
 
     def _prepare_execution(self, state: BatchState) -> None:
+        """Validate the batch, apply its commands, and prepare its physical inputs."""
+
         batch = state.batch
         validate_batch(
             batch, worker_info=self.info, model_runner=self.runner, config=self.worker_config
         )
+
         for command in batch.commands:
             slots = self.requests.apply_commands((command,))
             if slots and self.decode_state is not None:
                 self.decode_state.reset(slots)
+
         consumed = _input_producers(batch)
         self._release_predecessors(
             tuple(
@@ -1329,6 +1368,7 @@ class Worker:
         if state.input_products or state.kv_inputs:
             for dependency in state.storage_dependencies:
                 dependency.result()
+
         prepare_inputs(
             state,
             kv_cache=self.kv_cache,
@@ -1357,9 +1397,11 @@ class Worker:
             if (row := self.requests.peek(key.request_id)) is not None and row.request_key == key
         )
         freed = frozenset(command.buffer for command in batch.commands if isinstance(command, Free))
+
         if not closed and not freed:
             state.retirement_cleaned = True
             return
+
         retained = (
             frozenset(
                 buffer
@@ -1370,8 +1412,10 @@ class Worker:
             - freed
         )
         self.tensor_store.release_requests(closed, retained=retained)
+
         if self.latent_pool is not None:
             self.latent_pool.cancel_imports(tuple(closed))
+
         stores = tuple(
             store
             for store in (self.tensor_store, self.kv_cache, self.latent_pool)
@@ -1389,11 +1433,13 @@ class Worker:
             for store in stores
             for future in release_exports(store.exports, store.export_releases, selected)
         )
+
         if self.latent_pool is not None:
             self.latent_pool.release_buffers(selected)
         if self.kv_cache is not None:
             self.kv_cache.imports.cancel_requests(closed, retained=retained)
             self.kv_cache.release_buffers(selected)
+
         wake = self._completion_wake
         if wake is not None:
             for future in releases:
@@ -1409,6 +1455,8 @@ class Worker:
         state.retirement_events = self._record_retirement_events() if closed else ()
 
     def _record_retirement_events(self) -> tuple[torch.cuda.Event, ...]:
+        """Record one tracked completion event per CUDA device in the buffer pool."""
+
         events = []
         for device in self.buffer_pool.devices:
             if device.type != "cuda":
@@ -1426,14 +1474,18 @@ class Worker:
         self.device_events.reap()
         if not all(event.query() for event in state.retirement_events):
             return False
+
         for event in state.retirement_events:
             self.device_events.release(event)
         state.retirement_events = ()
+
         if state.retirement_cleaned:
             return True
+
         closed = state.retirement_requests
         freed = state.retirement_buffers
         retained = state.retained_buffers
+
         if any(not self.requests.retirement_ready(key) for key in state.retirement_local_requests):
             return False
         if not self.tensor_store.retirement_ready(
@@ -1450,11 +1502,13 @@ class Worker:
             if not future.done():
                 return False
             future.result()
+
         for store in (self.tensor_store, self.kv_cache, self.latent_pool):
             if store is not None:
                 forget_exports(store.exports, store.export_releases, state.retirement_exports)
         for key in state.retirement_local_requests:
             self.retire_request(key, retained=retained)
+
         # Slot reset itself submits writes; their completion permits address reuse.
         state.retirement_events = self._record_retirement_events() if closed else ()
         state.retirement_cleaned = True
@@ -1476,9 +1530,11 @@ class Worker:
         self._require_open()
         if state.inputs_closed:
             raise RuntimeError("batch inputs have already been consumed")
+
         self.advance_inputs(state)
         if not state.inputs_ready():
             raise RuntimeError("batch was observed before dependency readiness")
+
         try:
             for dependency in state.storage_dependencies:
                 dependency.result()
@@ -1544,6 +1600,7 @@ class Worker:
             for command in batch.commands
             if isinstance(command, Finish)
         }
+
         closing = tuple(
             buffer
             for request_key, retained in closed.items()
@@ -1554,6 +1611,7 @@ class Worker:
             )
         )
         self.release_buffers((*freed, *closing))
+
         if self.kv_cache is not None:
             for request_key, retained in closed.items():
                 self.kv_cache.imports.cancel_requests(frozenset((request_key,)), retained=retained)
@@ -1571,10 +1629,12 @@ class Worker:
                 self.decode_state.reset((request.request_pool_idx,))
             if self.block_tables is not None:
                 self.block_tables.release((request.request_pool_idx,))
+
         if self.kv_cache is not None:
             self.kv_cache.drop(request_id)
         if request is not None and self.block_tables is not None:
             self.block_tables.release_prefixes(request.request_key)
+
         for store in (self.tensor_store, self.kv_cache, self.latent_pool):
             if store is not None:
                 selected = tuple(
@@ -1583,6 +1643,7 @@ class Worker:
                     if int(buffer.owner.request_id) == request_id and buffer not in retained
                 )
                 store.release_buffers(selected)
+
         if request is not None:
             self.tensor_store.release_requests((request.request_key,), retained=retained)
         if self.media_mux is not None:

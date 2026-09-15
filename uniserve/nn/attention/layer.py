@@ -58,10 +58,18 @@ class Attention(nn.Module):
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Apply attention to ``[tokens, heads, head_dim]`` projections.
+
+        Returns a tensor shaped like ``q``, written into ``out`` when given.
+        Under Ulysses the token shard is exchanged for this rank's head shard
+        before compute and restored to token layout afterwards.
+        """
+
         if out is not None and (
             out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
         ):
             raise ValueError("attention output must match the local query representation")
+
         group = self._exchange.group
         operator = _binding.attention.get().get(id(self))
         if self._context is not None:
@@ -71,6 +79,7 @@ class Attention(nn.Module):
             return operator(q, k, v, batch, scale=self.scale, out=destination)
         if group.size == 1:
             return self._compute(operator, q, k, v, batch, out)
+
         if isinstance(batch, DenseInput) or q.ndim != 3:
             raise ValueError("Ulysses attention requires explicit packed sequence lengths")
         if batch.queries.num_tokens is None:
@@ -80,6 +89,8 @@ class Attention(nn.Module):
         partition = _TokenShard(batch.queries.num_tokens, group)
         if partition.num_tokens == 0:
             return torch.empty_like(q) if out is None else out
+
+        # Token shard -> this rank's head shard, over the padded common layout.
         storage = _binding.attention_storage.get().get(id(self))
         query, key, value = (
             self._exchange.heads(partition.pad(tensor), storage=storage, role=role)[
@@ -88,6 +99,9 @@ class Attention(nn.Module):
             for role, tensor in zip(("query", "key", "value"), (q, k, v), strict=True)
         )
         result = self._compute(operator, query, key, value, batch, None)
+
+        # Head shard -> token shard. The exchange spans the padded physical
+        # token count, so a short compute result is zero-filled first.
         physical_tokens = partition.capacity * group.size
         if result.shape[0] != physical_tokens:
             padded = result.new_zeros((physical_tokens, *result.shape[1:]))
@@ -99,6 +113,7 @@ class Attention(nn.Module):
     def _compute(self, operator, q, k, v, batch, out):
         if q.shape[1] != self._local_heads or k.shape[-1] != self.head_dim:
             raise ValueError("attention projections do not match the bound head partition")
+
         if operator is None:
             if isinstance(batch, SegmentedInput) or (
                 isinstance(batch, PagedInput) and batch.write_indices is not None
@@ -118,9 +133,11 @@ class Attention(nn.Module):
         operator = _binding.attention.get().get(id(self))
         if operator is None:
             raise RuntimeError("cache writes require an active ExecutionContext")
+
         if self._context is not None:
             operator.update_cache(k, v, indices=indices)
             return
+
         if self._exchange.group.size > 1:
             partition = _TokenShard(indices.numel(), self._exchange.group)
             if partition.num_tokens == 0:
@@ -132,4 +149,5 @@ class Attention(nn.Module):
                 ]
                 for role, tensor in (("key", k), ("value", v))
             )
+
         operator.update_cache(k, v, indices=indices)

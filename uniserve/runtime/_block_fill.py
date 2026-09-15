@@ -25,6 +25,9 @@ if triton is not None:
         start,
         block: tl.constexpr,
     ):
+        # Grid axis 0 walks the per-field 1024-element tiles of one block,
+        # concatenated across fields; axis 1 indexes blocks along the leading
+        # axis, offset by ``start``. Each tensor is [block, *widths[field]].
         tile = tl.program_id(0)
         page = start + tl.program_id(1)
         first: tl.constexpr = 0
@@ -52,6 +55,7 @@ class BlockFill:
         self.tensors, self.values = tensors, values
         self.widths = tuple(prod(tensor.shape[1:]) for tensor in tensors)
         self.tiles = tuple((width + 1023) // 1024 for width in self.widths)
+
         self._cuda = (
             triton is not None
             and bool(tensors)
@@ -77,6 +81,8 @@ class BlockFill:
         )
 
     def __call__(self, start: int, stop: int) -> None:
+        """Fill the leading-axis block interval ``[start, stop)`` on every field."""
+
         if self._cuda:
             # A public cache operation follows its backing device even when
             # the calling thread currently has another CUDA device selected.

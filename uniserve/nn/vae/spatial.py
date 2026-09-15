@@ -23,13 +23,18 @@ def split_tiles(
         raise ValueError("spatial tiles and overlap must align with the decoder scale")
     if tile_size >= length:
         return [0], [length], []
+
+    # Smallest tile count whose minimum-overlap coverage reaches the extent.
     tile_count = math.ceil(length / tile_size)
     while tile_size * tile_count - minimum_overlap * (tile_count - 1) < length:
         tile_count += 1
+
+    # Spread the slack beyond minimum overlap over the seams, in tile order.
     overlaps = [minimum_overlap] * (tile_count - 1)
     remaining = tile_size * tile_count - sum(overlaps) - length
     for index in range(remaining // alignment):
         overlaps[index % (tile_count - 1)] += alignment
+
     starts = [0]
     for overlap in overlaps:
         starts.append(starts[-1] + tile_size - overlap)
@@ -100,10 +105,13 @@ class SpatialDecoder(nn.Module):
 
     def decode(self, latents: torch.Tensor, *, tiled: bool) -> torch.Tensor:
         """Restore NCTHW latents, preserving sample independence within each tile."""
+
         if latents.ndim != 5 or latents.shape[0] < 1:
             raise ValueError("spatial decoding requires a nonempty NCTHW latent")
         if not tiled:
             return self(latents)
+
+        # Tile extents are output pixels; latent slices divide them by the ratio.
         ratio = self.spatial_compression
         y_indices, y_lengths, y_overlaps = split_tiles(
             int(latents.shape[-2]) * ratio, self.tile_height, self.overlap_height, ratio
@@ -111,6 +119,8 @@ class SpatialDecoder(nn.Module):
         x_indices, x_lengths, x_overlaps = split_tiles(
             int(latents.shape[-1]) * ratio, self.tile_width, self.overlap_width, ratio
         )
+
+        # Decode every tile as one batch: [batch * rows * columns, C, T, H, W].
         tiles = torch.cat(
             tuple(
                 latents[
@@ -124,6 +134,8 @@ class SpatialDecoder(nn.Module):
             dim=0,
         )
         decoded = self(tiles)
+
+        # Reshape back into a per-sample grid of tiles before blending seams.
         flat_tiles = decoded.split(latents.shape[0], dim=0)
         columns = len(x_indices)
         rows = [

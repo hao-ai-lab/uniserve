@@ -37,17 +37,20 @@ def parameter_sources(config: Config) -> Mapping[str, str]:
         target, source = f"backbone.layers.{index}", f"model.layers.{index}"
         names[f"{target}.input_norm.weight"] = f"{source}.input_layernorm.weight"
         names[f"{target}.post_attention_norm.weight"] = f"{source}.post_attention_layernorm.weight"
+
         for field in ("weight", "bias") if config.attention_bias else ("weight",):
             for branch in ("q", "k", "v"):
                 names[f"{target}.attention.qkv.projection.projections.{branch}.{field}"] = (
                     f"{source}.self_attn.{branch}_proj.{field}"
                 )
             names[f"{target}.attention.output.{field}"] = f"{source}.self_attn.o_proj.{field}"
+
         for branch in ("q", "k"):
             norm = "query_norm" if branch == "q" else "key_norm"
             names[f"{target}.attention.qkv.{norm}.weight"] = (
                 f"{source}.self_attn.{branch}_norm.weight"
             )
+
         if config.num_experts:
             names[f"{target}.mlp.router.weight"] = f"{source}.mlp.gate.weight"
             mlps = tuple(
@@ -62,6 +65,7 @@ def parameter_sources(config: Config) -> Mapping[str, str]:
                     f"{source_mlp}.{branch}_proj.weight"
                 )
             names[f"{target_mlp}.down.weight"] = f"{source_mlp}.down_proj.weight"
+
     return names
 
 
@@ -81,6 +85,8 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
         result = []
         for target, parameter in parameters.items():
             source = names[target]
+            # Some checkpoints serialize the same tensors without the
+            # "model." prefix used by the canonical naming.
             if source not in available and source.startswith("model.layers."):
                 source = source.removeprefix("model.")
             if source in available:

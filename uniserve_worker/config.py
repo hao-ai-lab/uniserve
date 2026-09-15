@@ -1,7 +1,7 @@
 """Typed model-execution configuration.
 
-Bootstrap resolves stable execution settings before model materialization.
-Bootstrap passes the immutable value into every configured subsystem.
+Bootstrap resolves these stable execution settings before model materialization
+and passes the immutable value into every configured subsystem.
 """
 
 from __future__ import annotations
@@ -34,128 +34,23 @@ __all__ = [
 ]
 
 
+# Dense small batches, then strides of 8 up to the largest captured batch.
 DEFAULT_DECODE_GRAPH_BATCH_SIZES = (
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8,
-    9,
-    10,
-    11,
-    12,
-    13,
-    14,
-    15,
-    16,
-    17,
-    18,
-    19,
-    20,
-    21,
-    22,
-    23,
-    24,
-    25,
-    26,
-    27,
-    28,
-    29,
-    30,
-    31,
-    32,
-    40,
-    48,
-    56,
-    64,
-    72,
-    80,
-    88,
-    96,
-    104,
-    112,
-    120,
-    128,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+    40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128
 )
 
+# Token buckets grow geometrically so the captured-graph count stays bounded
+# while padding waste stays proportional to the bucket size.
 DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
-    4,
-    8,
-    12,
-    16,
-    20,
-    24,
-    28,
-    32,
-    48,
-    64,
-    80,
-    96,
-    112,
-    128,
-    144,
-    160,
-    176,
-    192,
-    208,
-    224,
-    240,
-    256,
-    288,
-    320,
-    352,
-    384,
-    416,
-    448,
-    480,
-    512,
-    576,
-    640,
-    704,
-    768,
-    832,
-    896,
-    960,
-    1024,
-    1280,
-    1536,
-    1792,
-    2048,
-    2304,
-    2560,
-    2816,
-    3072,
-    3328,
-    3584,
-    3840,
-    4096,
-    4608,
-    5120,
-    5632,
-    6144,
-    6656,
-    7168,
-    7680,
-    8192,
-    8704,
-    9216,
-    9728,
-    10240,
-    10752,
-    11264,
-    11776,
-    12288,
-    12800,
-    13312,
-    13824,
-    14336,
-    14848,
-    15360,
-    15872,
-    16384,
+    4, 8, 12, 16, 20, 24, 28, 32,
+    48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256,
+    288, 320, 352, 384, 416, 448, 480, 512,
+    576, 640, 704, 768, 832, 896, 960, 1024,
+    1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096,
+    4608, 5120, 5632, 6144, 6656, 7168, 7680, 8192, 8704, 9216, 9728, 10240,
+    10752, 11264, 11776, 12288, 12800, 13312, 13824, 14336, 14848, 15360, 15872, 16384
 )
 
 DEFAULT_PREFILL_GRAPH_ROW_BUCKETS = (8, 16, 32)
@@ -166,6 +61,9 @@ def graph_padding_block_count(block_size: int) -> int:
 
     block_size = max(1, int(block_size))
     decode_tokens = max(DEFAULT_DECODE_GRAPH_BATCH_SIZES) - 1
+
+    # The largest gap between consecutive prefill buckets is the most padding a
+    # rounded-up prefill graph ever appends to a real token count.
     prefill_tokens = max(
         current - previous
         for previous, current in zip(
@@ -415,6 +313,7 @@ def _parse_positive_int_csv(raw: object | None, *, default: tuple[int, ...]) -> 
     parts = tuple(part.strip() for part in str(raw).split(","))
     if not parts or any(not part for part in parts):
         raise ValueError("integer bucket lists must contain only non-empty values")
+
     values = tuple(int(part) for part in parts)
     if any(value <= 0 for value in values):
         raise ValueError("integer bucket lists must contain only positive values")
@@ -428,6 +327,7 @@ def _parse_image_shapes(raw: object | None) -> tuple[tuple[int, int], ...]:
 
     if raw is None:
         return ((1152, 2048), (2048, 1152))
+
     values: list[tuple[int, int]] = []
     for item in str(raw).split(","):
         height_text, separator, width_text = item.strip().lower().partition("x")
@@ -437,6 +337,7 @@ def _parse_image_shapes(raw: object | None) -> tuple[tuple[int, int], ...]:
         if min(shape) < 1 or shape in values:
             raise ValueError("flow graph shapes must be positive and unique")
         values.append(shape)
+
     if not values:
         raise ValueError("flow graph shapes must not be empty")
     return tuple(values)
@@ -449,6 +350,7 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
     values = () if raw is None else raw
     if not isinstance(values, (list, tuple)):
         raise ValueError("lanes must be a sequence of JSON objects")
+
     for index, value in enumerate(values):
         try:
             data = json.loads(str(value))
@@ -456,6 +358,7 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
             raise ValueError(f"lane {index} is not valid JSON") from error
         if not isinstance(data, dict):
             raise ValueError(f"lane {index} must be a JSON object")
+
         known = {
             "lane_id",
             "sm_budget",
@@ -469,6 +372,7 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
         unknown = set(data).difference(known)
         if unknown:
             raise ValueError(f"lane {index} has unknown fields {sorted(unknown)!r}")
+
         domains = data.get("domains")
         if not isinstance(domains, list):
             raise ValueError(f"lane {index}.domains must be a JSON list")
@@ -476,6 +380,7 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
             not isinstance(name, str) or name not in LANE_COMPUTATION_GROUPS for name in domains
         ):
             raise ValueError(f"lane {index}.domains must name prefill, decode, or flow")
+
         result.append(
             LaneConfig(
                 lane_id=str(data.get("lane_id", "")),
@@ -490,6 +395,9 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
                 max_inflight=_json_optional_int(data, "max_inflight"),
             )
         )
+
+    # Every computation binds to exactly one lane, and every lane id is
+    # distinct, so scheduling classification stays unambiguous.
     if len({lane.lane_id for lane in result}) != len(result):
         raise ValueError("lane ids must be unique")
     computations = tuple(kind for lane in result for kind in lane.computations)

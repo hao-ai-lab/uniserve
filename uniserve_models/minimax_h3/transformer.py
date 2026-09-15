@@ -48,6 +48,7 @@ class TransformerLayer(nn.Module):
             )
             source = chain((first,), source)
         indices = workspace["modulation_indices"]
+        # Six per-token affine vectors: shift/scale/gate for attention and MLP.
         shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = (
             value.to(hidden.dtype)
             for value in modulation.reshape(-1, 6 * self.hidden_size).chunk(6, dim=-1)
@@ -162,6 +163,9 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleDict(
             {str(index): TransformerLayer(config) for index in range(config.num_hidden_layers)}
         )
+        # Precomputed affine products of the fixed four-evaluation ladder:
+        # [step, layer, modality, packed shift/scale/gate] per transformer layer,
+        # and [step, modality, shift + scale] for the final output norm.
         self.modulation = Modulation(
             torch.empty(
                 4, config.num_hidden_layers, 2, 18 * config.hidden_size, dtype=torch.bfloat16
@@ -187,6 +191,7 @@ class Transformer(nn.Module):
         pipeline = self.mesh.get_group("pp" if "pp" in self.mesh.axes else ())
         if pipeline.rank:
             pipeline.recv(src=pipeline.rank - 1, out=hidden)
+
         buffers = {
             **workspace,
             "modulation_indices": constants["modulation_indices"],
@@ -195,6 +200,8 @@ class Transformer(nn.Module):
         }
         chunks = ((inputs.token_slice, hidden),)
         for index, layer in enumerate(self.layers.values()):
+            # Adjacent layers alternate between the two attention scratch sets
+            # so a completed chunk can feed the next projection in place.
             prefix = f"attention.{index % 2}."
             layer_buffers = {
                 **buffers,
@@ -207,12 +214,14 @@ class Transformer(nn.Module):
             chunks = layer.forward_chunks(
                 chunks, self.modulation(step_index, index), inputs, workspace=layer_buffers
             )
+
         outputs = tuple(value for _, value in chunks)
         hidden = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
         if pipeline.rank + 1 < pipeline.size:
             pipeline.send(hidden, dst=pipeline.rank + 1)
             return ()
 
+        # The final pipeline stage projects each modality with its own head.
         modulation = self.modulation.output(step_index)
         results = []
         for index, (indices, projection) in enumerate(

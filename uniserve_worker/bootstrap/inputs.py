@@ -40,17 +40,23 @@ def builder_type(denoiser: Denoiser):
 
 
 def image_builder(model: nn.Module):
+    """Instantiate the image-denoising input builder, or ``None`` without one."""
+
     denoiser = capability(model, ImageDenoiser)
     return None if denoiser is None else builder_type(denoiser)(denoiser)
 
 
 def media_builder(model: nn.Module, config: WorkerConfig):
+    """Instantiate the video input builder bounded by the worker's frame budget."""
+
     denoiser = capability(model, Denoiser)
     if denoiser is None or isinstance(denoiser, ImageDenoiser):
         return None
+
     output = capability(model, VideoPostprocessor)
     if output is None:
         raise ValueError("media input construction requires its output sampling clock")
+
     return builder_type(denoiser)(
         denoiser,
         max_frames=int(config.max_video_seconds * output.frame_rate + 0.5),

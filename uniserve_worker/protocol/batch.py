@@ -40,7 +40,13 @@ def native_run(
     input_products: Sequence[object],
     kv_inputs: Sequence[object],
 ) -> ScheduleBatch:
-    """Assemble a physical run from transport-constructed members."""
+    """Assemble a validated run from transport-constructed members.
+
+    Called by the Rust IPC transport, which has already decoded and validated
+    every field. Construction therefore bypasses ``ScheduleBatch.__init__`` so
+    typed leaves are not reparsed and ``__post_init__`` validation is not
+    repeated.
+    """
 
     run = object.__new__(ScheduleBatch)
     set_field = object.__setattr__
@@ -55,6 +61,7 @@ def native_run(
     set_field(run, "seq_lens", forward_inputs[2])
     set_field(run, "query_lens", forward_inputs[3])
     set_field(run, "write_kv", forward_inputs[4])
+
     set_field(
         run,
         "latent_params",
@@ -80,6 +87,7 @@ def native_run(
         ),
     )
     set_field(run, "commands", commands)
+
     set_field(
         run,
         "input_products",
@@ -89,7 +97,9 @@ def native_run(
         ),
     )
     set_field(
-        run, "kv_inputs", tuple(transfer.KvTransfer.from_mapping(value) for value in kv_inputs)
+        run,
+        "kv_inputs",
+        tuple(transfer.KvTransfer.from_mapping(value) for value in kv_inputs),
     )
     return run
 
@@ -174,11 +184,15 @@ def command_from_mapping(
     data = _map(payload, f"{where}.value")
     if kind == "start":
         return Start.from_mapping(data, f"{where}.value")
+
+    # Free carries no request_key; finish falls back to the validating parser
+    # when the fast decode does not recognize the value.
     request_key = identity._fast_request_key(data.get("request_key"))
     if kind != "free" and request_key is None:
         request_key = identity.RequestKey.from_mapping(
             data.get("request_key"), f"{where}.value.request_key"
         )
+
     if kind == "finish":
         assert request_key is not None
         command: BatchCommand = Finish(
@@ -220,14 +234,14 @@ def command_to_mapping(command: BatchCommand) -> dict[str, object]:
 
 @dataclass(frozen=True, slots=True)
 class GenerationParams:
-    """Defines prompt tokens and sampling policy for autoregressive execution.
-
-    The parameters also bound generated tokens and carry speculative draft input.
-    """
+    """Sampling policy and token controls for autoregressive execution."""
 
     sampling: sampling.SamplingParams = field(default_factory=sampling.SamplingParams)
+    # Tokens suppressed from generation.
     negative_token_ids: tuple[int, ...] = ()
+    # Stop tokens; must be strictly ascending (canonical form, no duplicates).
     finish_token_ids: tuple[int, ...] = ()
+    # Accepted prefix length at admission (tokens already computed, e.g. cache reuse).
     initial_position: int = 0
 
     def __post_init__(self) -> None:
@@ -280,6 +294,7 @@ class DiffusionParams:
     num_frames: int
     num_decode_chunks: int
     num_inference_steps: int
+    # Deterministic noise seed; nonnegative.
     seed: int
 
     def __post_init__(self) -> None:
@@ -320,10 +335,13 @@ class NewRequest:
     """Binds one request key to its autoregressive, multimodal, or diffusion parameters."""
 
     request_key: identity.RequestKey
+    # 1-based request-pool slot; index 0 is reserved.
     request_pool_idx: int
+    # Exactly one of the three runtime-family parameter sets must be present.
     generation: GenerationParams | None = None
     image: operation.ImageParams | None = None
     diffusion: DiffusionParams | None = None
+    # Prompt tokens; required (non-empty) for diffusion requests.
     prompt_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
@@ -386,9 +404,12 @@ class NewRequest:
 class BlockTable:
     """Maps a request and KV group to its ordered physical pages and allocated token extent."""
 
+    # 1-based request-pool slot.
     request_pool_idx: int
     group_id: int
+    # Ordered 1-based physical page identifiers; unique within the table.
     page_ids: tuple[int, ...]
+    # Tokens covered by this table; zero only when no pages are installed.
     allocated_tokens: int
 
     def __post_init__(self) -> None:
@@ -446,8 +467,10 @@ class BlockTable:
 class CachePageAllocation:
     """Declares newly assigned physical pages for a request KV group."""
 
+    # 1-based request-pool slot.
     request_pool_idx: int
     group_id: int
+    # Newly assigned 1-based physical pages; non-empty and unique.
     page_ids: tuple[int, ...]
 
     def __post_init__(self) -> None:
@@ -529,15 +552,19 @@ class LatentParams:
 
     request_key: identity.RequestKey
     op_id: identity.ComputationId
+    # 1-based physical pages backing paged latent storage; empty iff latent_units is zero.
     page_table: tuple[int, ...]
+    # Number of latent units (trajectory rows); zero iff page_table is empty.
     latent_units: int
+    # Raster shape of each latent frame.
     height: int
     width: int
+    # Inclusive solver-step window [start_step, start_step + step_count).
     start_step: int
     step_count: int
 
     def __post_init__(self) -> None:
-        """Validate latent page ownership, bank, units, width, and raster shape."""
+        """Validate the operation identity, raster shape, and page-table/unit consistency."""
 
         if self.op_id.batch_id < 1:
             raise invalid_descriptor("latent params operation id must be positive")
@@ -598,11 +625,13 @@ class DecodeRange:
 
     request_key: identity.RequestKey
     op_id: identity.ComputationId
+    # Position (in media units) at which reconstruction resumes.
     cursor: int
+    # Maximum media units this operation may emit.
     max_units: int
 
     def __post_init__(self) -> None:
-        """Validate latent slice bounds and destination output-ring slot."""
+        """Validate the operation identity, cursor, and unit bound."""
 
         if self.op_id.batch_id < 1 or self.max_units < 1:
             raise invalid_descriptor("decode params identity and unit bound must be positive")
@@ -638,6 +667,7 @@ class BufferAllocation:
     """Assigns a product to a bounded slice of scheduler-managed persistent storage."""
 
     buffer: identity.BufferId
+    # Byte range [offset, offset + bytes) within the buffer; must not overflow u64.
     offset: int
     bytes: int
 
@@ -684,9 +714,11 @@ def _validate_buffer_allocations(
             raise invalid_descriptor(f"{where} repeats a buffer params identity")
         by_id[params.buffer] = params
         spans.append((params.offset, params.offset + params.bytes))
+
     spans.sort()
     if any(left[1] > right[0] for left, right in zip(spans, spans[1:])):
         raise invalid_descriptor(f"{where} buffer parameters overlap")
+
     for scheduled in operations:
         for output in scheduled.buffer_outputs():
             output_allocation = by_id.get(output.buffer_id)
@@ -702,15 +734,20 @@ class ScheduleBatch:
 
     batch_id: int
     run_id: int
+    # Monotonic sequence number ordering collective communication across workers.
     collective_seq: int = 1
     operations: tuple[operation.ScheduledRequest, ...] = ()
     block_tables: tuple[BlockTable, ...] = ()
     new_cache_pages: tuple[CachePageAllocation, ...] = ()
+
+    # Columnar model-forward inputs: one row per forward, all columns the same
+    # length. seq_lens counts total tokens per row, query_lens the new tokens.
     forward_operation_indices: tuple[int, ...] = ()
     request_pool_indices: tuple[int, ...] = ()
     seq_lens: tuple[int, ...] = ()
     query_lens: tuple[int, ...] = ()
     write_kv: tuple[bool, ...] = ()
+
     latent_params: tuple[LatentParams, ...] = ()
     decode_ranges: tuple[DecodeRange, ...] = ()
     buffer_allocations: tuple[BufferAllocation, ...] = ()
@@ -746,6 +783,8 @@ class ScheduleBatch:
             self.query_lens,
             self.write_kv,
         )
+        # Every computation belongs to this logical batch, with unique
+        # computation identities and at most one operation per request.
         computation_ids = [operation.op_id for operation in self.operations]
         if any(identity.batch_id != self.batch_id for identity in computation_ids):
             raise invalid_descriptor("computation identity belongs to another logical batch")
@@ -759,6 +798,8 @@ class ScheduleBatch:
         admitted = [admission.request_key for admission in self.admissions]
         if len(set(admitted)) != len(admitted):
             raise invalid_descriptor("a submission batch carries a duplicate admission")
+
+        # Lifecycle commands may repeat identically but not conflict.
         identities: dict[
             tuple[identity.RequestKey, int, identity.BufferId | None], BatchCommand
         ] = {}
@@ -775,6 +816,9 @@ class ScheduleBatch:
                     "a submission batch reuses a command identity with different content"
                 )
             identities[command_key] = command
+
+        # Every input product payload must feed a declared operation input or
+        # predicate, exactly once.
         declared_inputs = {
             product
             for operation in self.operations
@@ -791,6 +835,9 @@ class ScheduleBatch:
             if product in supplied_inputs:
                 raise invalid_descriptor("a submission batch repeats an input product payload")
             supplied_inputs.add(product)
+
+        # Each KV transfer installs into exactly one operation and must fit
+        # that operation's transfer-byte bound.
         sources: set[identity.BufferId] = set()
         for publication in self.kv_inputs:
             publication.encoded_size_bound()
@@ -818,6 +865,7 @@ class ScheduleBatch:
         data = _map(value, "execute run")
         batch_id = _uint(data.get("batch_id"), "execute run.batch_id")
         run_id = _uint(data.get("run_id"), "execute run.run_id")
+
         operations = tuple(
             operation.ScheduledRequest.from_mapping(item, f"execute run.operations[{index}]")
             for index, item in enumerate(_seq(data.get("operations", ()), "execute run.operations"))
@@ -835,6 +883,7 @@ class ScheduleBatch:
                 _seq(data.get("input_products", ()), "execute run.input_products")
             )
         )
+
         return cls(
             batch_id=batch_id,
             run_id=run_id,
@@ -958,6 +1007,9 @@ class TensorPublication:
         transfer_data = _map(data.get("value"), f"{where}.value")
         kind = _str(transfer_data.get("kind"), f"{where}.value.kind")
         payload = _map(transfer_data.get("value"), f"{where}.value.value")
+
+        # Height/width default to zero for device products and are required
+        # for every other transfer kind.
         height = _uint(
             payload.get("height", 0) if kind == "device_product" else payload.get("height"),
             f"{where}.value.height",

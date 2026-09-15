@@ -23,6 +23,7 @@ def pil_image_to_png_bytes(image: Image.Image) -> bytes:
     Low compression preserves lossless pixels while keeping CPU encoding latency
     practical for high-resolution generated images.
     """
+
     buffer = io.BytesIO()
     image.save(buffer, format="PNG", compress_level=1)
     return buffer.getvalue()
@@ -36,6 +37,7 @@ def png_bytes_to_b64(png: bytes) -> str:
 
 def pil_image_to_png_b64(image: Image.Image) -> str:
     """Encode a PIL image as a base64 PNG string."""
+
     return png_bytes_to_b64(pil_image_to_png_bytes(image))
 
 
@@ -50,6 +52,7 @@ def quantize_image_hwc(
     clamping and conversion to ``[0, 255]``. The default ``(-1, 1)`` matches
     diffusion decoder output; callers with normalized pixels pass ``(0, 1)``.
     """
+
     # Collapse the supported singleton batch form into the canonical CHW layout.
     image = tensor.detach()
     if image.ndim == 4:

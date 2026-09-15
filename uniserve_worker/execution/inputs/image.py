@@ -36,6 +36,9 @@ class ImageBuilder:
         stride = self.denoiser.downsample
         height, width = size.height // stride, size.width // stride
         count = self.sequence_length(size)
+
+        # [3, count]: one (temporal, height, width) coordinate per sequence
+        # position; framing tokens keep zero h/w coordinates at the edges.
         result = torch.zeros((3, count), dtype=torch.int64, device=device)
         result[0].fill_(temporal)
         interior = result[:, 1:-1] if self.framing else result
@@ -44,6 +47,7 @@ class ImageBuilder:
         return result
 
     def branch_source(self, branch: Branch) -> BranchSource:
+        """Map a guidance branch to the prefix it conditions on."""
         if branch is Branch.CONDITIONED:
             return BranchSource.CONDITIONING
         if branch is Branch.TEXT_UNCONDITIONAL:
@@ -58,6 +62,7 @@ class ImageBuilder:
 
         if out.shape != self.denoiser.latent_shape("image", size):
             raise ValueError("image trajectory storage must have its canonical patch shape")
+
         noise = torch.empty(
             (1, *self.denoiser.noise_shape("image", size)), dtype=out.dtype, device=out.device
         )

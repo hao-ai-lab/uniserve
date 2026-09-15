@@ -25,6 +25,8 @@ def rescale_(
         with torch.cuda.device(values.device):
             _rescale(values, old, new, initialized, dtype=dtype)
         return
+
+    # Host fallback: a per-block scalar loop mirroring the Triton kernel.
     for block in range(values.shape[0]):
         if initialized[block] and new[block] > old[block]:
             decoded = (values[block].float() * old[block]).to(dtype).float()

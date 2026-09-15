@@ -41,11 +41,13 @@ class DenoisingStep(Generic[InputT, SizeT]):
             raise ValueError("denoising inputs and schedules must cover the declared modalities")
         if any(not 0 <= index < schedule.num_steps for schedule in self.schedules.values()):
             raise ValueError("denoising requires an evaluation index within every schedule")
+
         predictions = self.denoiser(
             self.inputs, state=self.state, constants=self.constants, workspace=self.workspace
         )
         if set(predictions) != set(names):
             raise ValueError("denoising predictions must cover the declared modalities")
+
         samples = {}
         for name in names:
             schedule = self.schedules[name]
@@ -71,6 +73,8 @@ class DenoisingStep(Generic[InputT, SizeT]):
                     sigma=schedule.sigmas[index],
                     next_sigma=schedule.sigmas[index + 1],
                 )
+        # With pipeline parallelism the last stage holds the updated samples;
+        # it sends them back to rank 0 so every stage agrees on the result.
         mesh = self.denoiser.mesh
         pipeline = mesh.get_group("pp" if "pp" in mesh.axes else ())
         if pipeline.size > 1:

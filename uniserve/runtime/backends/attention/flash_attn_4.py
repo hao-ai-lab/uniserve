@@ -29,11 +29,13 @@ def _visible_options(batch, keys, *, query_capacity, key_capacity, segmented=Fal
     complete = batch.fully_visible_current if segmented else batch.fully_visible
     if complete:
         return {}
+
     visible = visible.to(dtype=torch.int32).contiguous()
     # The mask reads one sequence-local endpoint. Its inner stride and integer
     # alignment must survive CuTe's dynamic tensor conversion.
     visible.__leading_dim__ = 1
     visible.__assumed_align__ = 4
+
     result = {"aux_tensors": [visible], "mask_mod": hybrid_multimodal_mask}
     architecture = torch.cuda.get_device_capability(visible.device)[0]
     if (
@@ -102,10 +104,13 @@ class _FlashAttentionOperator(_Operator):
         if isinstance(batch, DenseInput) and batch.mask is not None:
             raise ValueError("FlashAttention-4 does not consume arbitrary dense masks")
         self._validate(q, k, v, batch, out)
+
         if isinstance(batch, (PagedInput, SegmentedInput)) and batch.write_indices is not None:
             self.update_cache(k, v, indices=batch.write_indices)
+
         if q.numel() == 0:
             return out
+
         if isinstance(batch, DenseInput):
             packed = q.ndim == 3
             query, key, value = (
@@ -116,10 +121,12 @@ class _FlashAttentionOperator(_Operator):
                 query, key, value, softmax_scale=scale, causal=batch.causal, out=destination
             )
             return out
+
         if q.ndim != 3 or (
             batch.queries.num_tokens is not None and q.shape[0] != batch.queries.num_tokens
         ):
             raise ValueError("packed attention rows must match the declared query lengths")
+
         if isinstance(batch, (PagedInput, VarlenInput)):
             for query_slice, key_slice, run in causal_runs(batch):
                 if query_slice.stop == query_slice.start:
@@ -129,6 +136,7 @@ class _FlashAttentionOperator(_Operator):
                 )
         elif isinstance(batch, VisibleInput):
             key, value = (k, v) if batch.block_table is None else self._cache_values(k, v)
+
             self._forward(
                 q,
                 key,
@@ -152,6 +160,9 @@ class _FlashAttentionOperator(_Operator):
         elif isinstance(batch, SegmentedInput):
             if self.cache is None:
                 raise RuntimeError("segmented attention requires bound prefix state")
+
+            # Evaluate the current window and the paged prefix independently,
+            # then merge both partial states with online softmax.
             common = dict(
                 cu_seqlens_q=batch.queries.offsets,
                 max_seqlen_q=q.shape[0],
@@ -179,6 +190,7 @@ class _FlashAttentionOperator(_Operator):
             )
             if batch.block_table.indices.shape[1] == 0:
                 return out.copy_(current[0])
+
             prefix = _lse(
                 self._forward(
                     q,
@@ -207,10 +219,12 @@ class _FlashAttentionOperator(_Operator):
             causal=batch.causal[0],
             out=out,
         )
+
         if isinstance(batch, PagedInput):
             key, value = self._cache_values(k, v)
             lengths = self.workspace["lengths"][: batch.queries.batch_size]
             torch.add(batch.prefixes.values, batch.queries.values, out=lengths)
+
             self._forward(
                 q,
                 key,

@@ -53,6 +53,7 @@ def execution_runtime(
         return None
     parent = input_progress(request)
     assert parent is not None
+
     if cache is None:
         visible = parent.kv_visible_len
         computed = parent.kv_computed_len
@@ -80,11 +81,13 @@ def cache_coordinates(
     # The request state owns the accepted extent used by numerical consumers.
     parent = input_progress(request)
     visible = 0 if parent is None else int(parent.kv_visible_len)
+
     pool = tables
     if pool is None:
         raise unsupported_setup("operation requires request-to-token storage")
     pool.pages(slot, group_id)
     capacity = pool.allocated_length(slot)
+
     if visible > capacity:
         raise invalid_descriptor("operation visibility exceeds scheduler block table")
     return slot, int(group_id), visible, capacity

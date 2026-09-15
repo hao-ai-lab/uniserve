@@ -23,6 +23,7 @@ def media_state_buffers(
     builder = media_builder(model, config)
     if builder is None:
         return {}
+
     result = {}
     for binding in bindings.values():
         for call in binding.calls:
@@ -32,6 +33,7 @@ def media_state_buffers(
                 fields = call.module.state_buffers(builder.maximum.num_frames)
             else:
                 continue
+
             for name, field in fields.items():
                 if name in result and result[name] != field:
                     raise ValueError(f"media request fields disagree about {name!r}")
@@ -56,15 +58,18 @@ def output_layouts(
         return component.output_layout(
             config.max_sequence_tokens if prompt_tokens is None else prompt_tokens
         )
+
     if not isinstance(component, (Denoiser, VideoDecoder, AudioDecoder)):
         return {}
     if isinstance(component, VideoDecoder) and frames is not None:
         return component.output_layout(frames)
+
     builder = media_builder(model, config)
     if builder is None:
         # Image execution returns its features and decoded raster through the
         # token/image protocol rather than persistent inter-component products.
         return {}
+
     size = builder.size(
         builder.maximum.num_frames if frames is None else frames,
         config.max_sequence_tokens if prompt_tokens is None else prompt_tokens,
@@ -73,6 +78,8 @@ def output_layouts(
         return component.output_layout(size)
     if isinstance(component, VideoDecoder):
         return component.output_layout(size.num_frames)
+
+    # Audio length follows from the video frame count at the declared rates.
     clock = capability(model, VideoPostprocessor)
     samples = round(size.num_frames * component.sample_rate / clock.frame_rate)
     return component.output_layout(samples)

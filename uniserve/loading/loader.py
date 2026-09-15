@@ -116,16 +116,21 @@ def load_model(
         model = model_class(config)
     if not isinstance(model, nn.Module):
         raise TypeError("model constructor must return torch.nn.Module")
+
     known_paths = frozenset(path for path, _ in model.named_modules(remove_duplicate=False))
     selected = {
         id(child)
         for path in (("",) if modules is None else modules)
         for child in model.get_submodule(path).modules()
     }
+
     meshes = {} if meshes is None else meshes
     attention = {} if attention is None else attention
     if set(attention).difference(meshes):
         raise ValueError("attention parallel settings require a mesh at the same module path")
+
+    # A mesh this rank does not participate in makes its whole subtree remote:
+    # those modules stay on meta and are never materialized here.
     remote = {
         id(child)
         for path, mesh in meshes.items()
@@ -145,6 +150,7 @@ def load_model(
         child = model.get_submodule(path)
         if mesh.rank in mesh.ranks:
             parallelize_(child, mesh, attention=attention.get(path, AttentionParallelConfig()))
+
     declared = mapping(model)
     parameters = {
         id(parameter)
@@ -152,6 +158,9 @@ def load_model(
         if id(child) in selected
         for parameter in child.parameters(recurse=False)
     }
+
+    # Narrow each declared mapping to the selected modules: unselected
+    # parameters keep their meta placeholders and their assignments drop out.
     mapped = []
     for component in declared:
         names = {
@@ -176,6 +185,7 @@ def load_model(
                 optional=component.optional & names,
             )
         )
+
     reports = _load(
         model,
         checkpoint,

@@ -43,14 +43,17 @@ if triton is not None:
         offsets = tl.program_id(0) * block + tl.arange(0, block)
         rows = offsets // width
         position_offsets = tl.full((block,), 0, tl.int64)
+
         # The leading extent only bounds the launch. Remaining dimensions
         # describe the strided row layout; a new token count needs no kernel.
         for axis in tl.static_range(len(shape) - 1, -1, -1):
             position_offsets += (rows % shape[axis]) * strides[axis + 1]
             rows //= shape[axis]
         position_offsets += rows * strides[0] if len(strides) else 0
+
         position = tl.load(positions + position_offsets, offsets < total, other=0).to(tl.float32)
         frequency = tl.load(frequencies + (offsets % width) * frequency_stride).to(tl.float32)
+
         # Match the public FP32 phase domain, including range reduction for
         # large or negative positions. Approximate sin/cos instructions do not
         # provide that domain; libdevice uses the CUDA numerical functions.
@@ -73,6 +76,7 @@ if triton is not None:
     ):
         """Rotate flattened packed token/head rows in GPT-NeoX half layout."""
 
+        # offs flattens the [tokens, heads, dim] layout of the input tensor.
         offs = tl.program_id(0) * block + tl.arange(0, block)
         mask = offs < total
         d = offs % dim
@@ -87,6 +91,7 @@ if triton is not None:
         x2 = tl.load(x_ptr + base + half + d_half, mask=mask, other=0.0).to(tl.float32)
         cos = tl.load(cos_ptr + token * half + d_half, mask=mask, other=0.0).to(tl.float32)
         sin = tl.load(sin_ptr + token * half + d_half, mask=mask, other=0.0).to(tl.float32)
+
         first_half = d < half
         out = tl.where(first_half, x1 * cos - x2 * sin, x2 * cos + x1 * sin)
         tl.store(out_ptr + offs, out, mask=mask)
@@ -118,6 +123,8 @@ if triton is not None:
         head = rows % heads
         bases = tokens * stride_token + head * stride_head
         mask = (rows[:, None] < row_count) & (columns[None, :] < dim)
+
+        # values: [rows_per_program, block] tile of head features.
         values = tl.load(
             source + bases[:, None] + columns[None, :] * stride_feature,
             mask=mask,
@@ -125,6 +132,7 @@ if triton is not None:
         ).to(tl.float32)
         variance = tl.sum(values * values, axis=1) / dim
         inverse = tl.rsqrt(variance + epsilon)
+
         offsets = columns % half
         left = tl.load(
             source + bases[:, None] + offsets[None, :] * stride_feature,
@@ -140,9 +148,11 @@ if triton is not None:
         right_weight = tl.load(weight + half + offsets, mask=columns < dim, other=0.0).to(
             tl.float32
         )
+
         factors = tokens[:, None] * half + offsets[None, :]
         cos = tl.load(cosine + factors, mask=mask, other=0.0).to(tl.float32)
         sin = tl.load(sine + factors, mask=mask, other=0.0).to(tl.float32)
+
         # Keep normalization, learned scale and rotation in FP32 until store.
         left = left * inverse[:, None] * left_weight[None, :]
         right = right * inverse[:, None] * right_weight[None, :]
@@ -250,12 +260,15 @@ if triton is not None:
         head = tl.program_id(1)
         columns = tl.arange(0, head_dim)
         valid = row_offsets[:, None] < rows
+
         query_offsets = (
             row_offsets[:, None] * query_stride_row + head * query_stride_head + columns[None, :]
         )
         key_offsets = (
             row_offsets[:, None] * key_stride_row + head * key_stride_head + columns[None, :]
         )
+
+        # query/key tiles: [block_rows, head_dim] for one head.
         query_values = tl.load(query + query_offsets, mask=valid, other=0.0).to(tl.float32)
         key_values = tl.load(key + key_offsets, mask=valid, other=0.0).to(tl.float32)
         query_weights = tl.load(query_weight + columns)[None, :].to(tl.float32)
@@ -277,6 +290,7 @@ if triton is not None:
             columns - half_rotary,
         )
         partner_columns = tl.where(columns < rotary_dim, partner_columns, columns)
+
         partner_query = tl.load(
             query
             + row_offsets[:, None] * query_stride_row
@@ -310,6 +324,7 @@ if triton is not None:
             mask=valid & rotary_mask,
             other=0.0,
         ).to(tl.float32)
+
         sign = tl.where(columns[None, :] < half_rotary, -1.0, 1.0)
         query_output = tl.where(
             rotary_mask,
@@ -352,6 +367,7 @@ if triton is not None:
         xa = tl.load(x_ptr + base + offs_a * stride_2, mask=mask_a, other=0.0).to(tl.float32)
         var_a = tl.sum(xa * xa, axis=0) / rope_dim
         inv_a = tl.rsqrt(var_a + eps)
+
         d_half = offs_a % rope_half
         second_offs = rope_half + d_half
         first_half = offs_a < rope_half
@@ -361,6 +377,7 @@ if triton is not None:
         w2 = tl.load(head_w_ptr + second_offs, mask=offs_a < rope_dim, other=0.0).to(tl.float32)
         cos = tl.load(cos_ptr + token * rope_half + d_half, mask=mask_a, other=0.0).to(tl.float32)
         sin = tl.load(sin_ptr + token * rope_half + d_half, mask=mask_a, other=0.0).to(tl.float32)
+
         x1n = x1 * inv_a * w1
         x2n = x2 * inv_a * w2
         rot = tl.where(first_half, x1n * cos - x2n * sin, x2n * cos + x1n * sin)
@@ -375,6 +392,7 @@ if triton is not None:
         )
         var_b = tl.sum(xb * xb, axis=0) / tail_dim
         wb = tl.load(tail_w_ptr + offs_b, mask=offs_b < tail_dim, other=0.0).to(tl.float32)
+
         out_b = xb * tl.rsqrt(var_b + eps) * wb
         tl.store(out_ptr + out_base + rope_dim + offs_b, out_b, mask=mask_b)
 
@@ -497,15 +515,18 @@ if triton is not None:
         d_half = offs_a % half0
         second = half0 + d_half
         first_half = offs_a < half0
+
         xa = tl.load(x_ptr + base + offs_a * stride_2, mask=col_a, other=0.0).to(tl.float32)
         var_a = tl.sum(xa * xa, axis=0) / dim0
         inv_a = tl.rsqrt(var_a + eps)
+
         x1 = tl.load(x_ptr + base + d_half * stride_2, mask=col_a, other=0.0).to(tl.float32)
         x2 = tl.load(x_ptr + base + second * stride_2, mask=col_a, other=0.0).to(tl.float32)
         w1 = tl.load(head_w_ptr + d_half, mask=col_a, other=0.0).to(tl.float32)
         w2 = tl.load(head_w_ptr + second, mask=col_a, other=0.0).to(tl.float32)
         cos = tl.load(cos0_ptr + token * half0 + d_half, mask=col_a, other=0.0).to(tl.float32)
         sin = tl.load(sin0_ptr + token * half0 + d_half, mask=col_a, other=0.0).to(tl.float32)
+
         x1n = x1 * inv_a * w1
         x2n = x2 * inv_a * w2
         rot = tl.where(first_half, x1n * cos - x2n * sin, x2n * cos + x1n * sin)
@@ -522,16 +543,19 @@ if triton is not None:
         ).to(tl.float32)
         var_b = tl.sum(xb * xb, axis=0) / tail_dim
         inv_b = tl.rsqrt(var_b + eps)
+
         is_second_axis = offs_b >= axis_dim
         dj = (offs_b % axis_dim) % axis_half
         src1 = tl.where(is_second_axis, axis_dim, 0) + dj
         src2 = src1 + axis_half
+
         y1 = tl.load(x_ptr + base + (dim0 + src1) * stride_2, mask=col_b, other=0.0).to(tl.float32)
         y2 = tl.load(x_ptr + base + (dim0 + src2) * stride_2, mask=col_b, other=0.0).to(tl.float32)
         wv1 = tl.load(tail_w_ptr + src1, mask=col_b, other=0.0).to(tl.float32)
         wv2 = tl.load(tail_w_ptr + src2, mask=col_b, other=0.0).to(tl.float32)
         y1n = y1 * inv_b * wv1
         y2n = y2 * inv_b * wv2
+
         c1 = tl.load(
             cos1_ptr + token * axis_half + dj,
             mask=col_b & (~is_second_axis),
@@ -554,6 +578,7 @@ if triton is not None:
         ).to(tl.float32)
         cb = tl.where(is_second_axis, c2, c1)
         sb = tl.where(is_second_axis, s2, s1)
+
         first_b = (offs_b % axis_dim) < axis_half
         rot_b = tl.where(first_b, y1n * cb - y2n * sb, y2n * cb + y1n * sb)
         tl.store(out_ptr + out_base + dim0 + offs_b, rot_b, mask=col_b)
@@ -673,10 +698,12 @@ def try_triton_rotary_factors(positions, frequencies, scale, *, dtype):
         or dtype not in floating
     ):
         return None
+
     shape = (*positions.shape, frequencies.numel())
     cosine = torch.empty(shape, device=positions.device, dtype=dtype)
     sine = torch.empty_like(cosine)
     total = cosine.numel()
+
     if total:
         # Triton launches on the thread's current device, whereas this public
         # numerical operation follows its input tensors, as PyTorch does.
@@ -840,10 +867,12 @@ def try_triton_qk_rms_norm_rope(
     shape = _qk_rms_norm_rope_shape(q, k)
     assert shape is not None
     q_tokens, k_tokens, q_heads, k_heads, dim = shape
+
     q_out = torch.empty_like(q, memory_format=torch.contiguous_format)
     k_out = torch.empty_like(k, memory_format=torch.contiguous_format)
     q_rows = q_tokens * q_heads
     k_rows = k_tokens * k_heads
+
     block = triton.next_power_of_2(dim)
     # Small heads share a CTA; bounding the feature tile limits register growth
     # for wider heads. At width 128, each of four warps reduces one head.
@@ -927,6 +956,8 @@ def try_triton_qk_split_rms_norm_rope(
 
     q_rows = q_tokens * q_heads
     k_rows = k_tokens * k_heads
+
+    # One program per flattened token/head row across the Q and K ranges.
     _qk_split_rms_norm_rope_kernel[(q_rows + k_rows,)](
         q,
         k,
@@ -1010,6 +1041,8 @@ def try_triton_qk_multi_axis_rms_norm_rope(
     k_out = torch.empty_like(k, memory_format=torch.contiguous_format)
     q_rows = tokens * q_heads
     k_rows = tokens * k_heads
+
+    # One program per flattened token/head row across the Q and K ranges.
     _qk_multi_axis_rms_norm_rope_kernel[(q_rows + k_rows,)](
         q,
         k,
@@ -1338,6 +1371,7 @@ class _TritonPackedRope:
         half = dim // 2
         tokens = int(x.shape[0])
         heads = int(x.numel() // max(1, tokens * dim))
+
         out = torch.empty_like(x)
         block = _TRITON_ROPE_BLOCK
         total = int(x.numel())
@@ -1381,6 +1415,7 @@ class _EagerPackedRope:
         # heads associated with each token.
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
+
         out = torch.empty_like(x)
         out[..., :half] = x1 * cos - x2 * sin
         out[..., half:] = x2 * cos + x1 * sin
@@ -1419,6 +1454,8 @@ if triton is not None:
         columns = tl.arange(0, HEAD_BLOCK)
         valid = (row[:, None] < rows) & (columns[None, :] < HEAD_DIM)
         offsets = row[:, None] * row_stride + head * head_stride + columns[None, :]
+
+        # query/key tiles: [ROW_BLOCK, HEAD_BLOCK] for one head.
         query = tl.load(query_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
         key = tl.load(key_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
         if HAS_BIAS:
@@ -1437,6 +1474,7 @@ if triton is not None:
                 other=0.0,
             ).to(tl.float32)
             tl.store(value_ptr + offsets, value.to(value_ptr.dtype.element_ty), mask=valid)
+
         query_rstd = tl.rsqrt(tl.sum(query * query, axis=1) / HEAD_DIM + EPS)
         key_rstd = tl.rsqrt(tl.sum(key * key, axis=1) / HEAD_DIM + EPS)
         query = query * query_rstd[:, None]
@@ -1451,6 +1489,7 @@ if triton is not None:
         )
         partner_columns = tl.where(columns < ROTARY_DIM, partner_columns, columns)
         partner_offsets = row[:, None] * row_stride + head * head_stride + partner_columns[None, :]
+
         query_partner = tl.load(query_ptr + partner_offsets, mask=valid, other=0.0).to(tl.float32)
         key_partner = tl.load(key_ptr + partner_offsets, mask=valid, other=0.0).to(tl.float32)
         if HAS_BIAS:
@@ -1468,6 +1507,7 @@ if triton is not None:
         rotary_offsets = row[:, None] * rotary_row_stride + columns[None, :]
         cosine = tl.load(cosine_ptr + rotary_offsets, mask=rotary_mask, other=1.0).to(tl.float32)
         sine = tl.load(sine_ptr + rotary_offsets, mask=rotary_mask, other=0.0).to(tl.float32)
+
         sign = tl.where(columns[None, :] < half_rotary, -1.0, 1.0)
         query_rotated = query * cosine + sign * query_partner * sine
         key_rotated = key * cosine + sign * key_partner * sine

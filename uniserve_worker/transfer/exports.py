@@ -57,6 +57,8 @@ def release_exports(
         locations = exports.get(buffer)
         if locations is None:
             continue
+        # Retirement futures are recorded once per buffer so repeated releases
+        # observe the exact same physical completion, never a fresh revocation.
         if buffer not in retirements:
             retirements[buffer] = tuple(
                 future
@@ -80,6 +82,7 @@ def forget_exports(
         futures = retirements.get(buffer)
         if futures is None or any(not future.done() for future in futures):
             raise RuntimeError("transport registration has not retired")
+        # Propagate any retirement failure before dropping the registration.
         for future in futures:
             future.result()
         del exports[buffer]

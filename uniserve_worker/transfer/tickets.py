@@ -128,10 +128,13 @@ def _publication_views(
         for span in spans
     ):
         raise invalid_descriptor("publication spans disagree on their representation")
+
     shape = (sum(int(span.shape[0]) for span in spans), *first.shape[1:])
     value = (0,) * len(shape) if offset is None else offset
     if len(value) != len(shape) or any(not isinstance(start, int) or start < 0 for start in value):
         raise invalid_descriptor("publication offset does not match its tensor shape")
+
+    # Detach so autograd metadata never reaches readers of the published view.
     source = tuple(span.detach() for span in spans)
     return (source if isinstance(tensor, tuple) else source[0]), shape, value
 
@@ -140,7 +143,12 @@ def _copy_pairs(
     source: "torch.Tensor | tuple[torch.Tensor, ...]",
     destination: "torch.Tensor | tuple[torch.Tensor, ...]",
 ):
-    """Walk two first-axis partitions together without constructing a packed tensor."""
+    """Walk two first-axis partitions together without constructing a packed tensor.
+
+    Yields (target, value) view pairs whose first-axis lengths match, splitting
+    at span boundaries on both sides. Both partitions must cover the same
+    logical first-axis length.
+    """
 
     sources = source if isinstance(source, tuple) else (source,)
     targets = destination if isinstance(destination, tuple) else (destination,)
@@ -241,14 +249,24 @@ class TransferTicket:
         self._error: BaseException | None = None
         self._cancelled = False
         self._state_lock = threading.RLock()
+
+        # Physical retirement: the backend has stopped all access to source
+        # and destination storage. Resources whose completion could not be
+        # drained stay listed in _unretired and block retirement forever.
         self._unretired: tuple[object, ...] = ()
         self._retirement: concurrent.futures.Future[None] = concurrent.futures.Future()
         self._work: concurrent.futures.Future[None] | None = None
+
+        # Borrowed-view consumption: streams that received the views and the
+        # release that returns the source grant once they all complete.
         self._consumer_release: Any = None
         self._consumer_streams: dict[int, torch.cuda.Stream] = {}
         self._destination_stream: torch.cuda.Stream | None = None
         self._consumer_events: tuple[torch.cuda.Event, ...] = ()
         self._closed = False
+
+        # Stream-readiness result: destination views plus the device fence a
+        # consumer must wait on before touching them.
         self._future: concurrent.futures.Future[
             tuple[torch.Tensor | tuple[torch.Tensor, ...], torch.cuda.Event | None]
         ] = concurrent.futures.Future()
@@ -317,6 +335,7 @@ class TransferTicket:
             raise self._error
         if self._closed:
             raise RuntimeError("transfer consumption has already closed")
+
         value, event = self._future.result()
         if event is not None:
             import torch
@@ -330,11 +349,17 @@ class TransferTicket:
             for span in spans:
                 span.record_stream(consumer)
             if self._consumer_release is not None:
+                # Borrowed views: track every consuming stream so close() can
+                # fence each one before returning the source grant.
                 self._consumer_streams[int(consumer.cuda_stream)] = consumer
         return value
 
     def close(self) -> None:
-        """End a borrowed-view read after work already submitted by its consumers."""
+        """End a borrowed-view read after work already submitted by its consumers.
+
+        Records one fence on every consumer stream observed by result(); the
+        source grant returns only after all of those fences complete.
+        """
 
         if self._consumer_release is None or self._closed:
             return
@@ -350,6 +375,7 @@ class TransferTicket:
                 self._events.schedule_completion_wake(stream.device, event)
                 events.append(event)
         self._consumer_events = tuple(events)
+
         if events:
             self._events.defer_release(events, self, completed=self.events_released)
         else:
@@ -528,6 +554,7 @@ class _BoundedTransferPool:
         with self._lock:
             if self._error is not None:
                 raise self._error
+
         if not self._entries.acquire(blocking=False):
             raise resource_error("asynchronous transfer ticket capacity is exhausted")
         try:
@@ -535,6 +562,7 @@ class _BoundedTransferPool:
         except BaseException:
             self._entries.release()
             raise
+
         ticket = TransferTicket(self._events)
         if destination is not None:
             first = destination[0] if isinstance(destination, tuple) else destination
@@ -575,6 +603,7 @@ class _BoundedTransferPool:
         if self._completion_wake is not None:
             ticket.add_done_callback(self._completion_wake)
             ticket.add_retirement_callback(self._completion_wake)
+
         try:
             work = self._executor.submit(run)
         except BaseException:
@@ -600,16 +629,20 @@ class _BoundedTransferPool:
         spans = destination if isinstance(destination, tuple) else (destination,)
         pairs = tuple(_copy_pairs(source, destination))
         device = spans[0].device
+
         if device.type != "cuda":
             for target, value in pairs:
                 target.copy_(value)
             ticket._complete(destination)
             return
+
+        # Each transport thread reuses one dedicated copy stream per device.
         key = (threading.get_ident(), str(device))
         stream = self._read_streams.get(key)
         if stream is None:
             stream = torch.cuda.Stream(device=device)
             self._read_streams[key] = stream
+
         completed = None
         try:
             with torch.cuda.device(device), torch.cuda.stream(stream):
@@ -630,12 +663,15 @@ class _BoundedTransferPool:
                         target.copy_(value, non_blocking=True)
                 completed = self._events.acquire(device)
                 self._events.record(completed, device)
+
             ticket._complete(destination, completed)
             completed.synchronize()
         except BaseException as error:
             ticket._fail(error)
             raise
         finally:
+            # A stream that cannot be drained keeps every allocation it may
+            # still be touching; the ticket never reports physical retirement.
             try:
                 stream.synchronize()
             except BaseException:
@@ -732,12 +768,17 @@ class LocalTransport(Transport):
         self._events.reap()
         nbytes = _nbytes(t)
         self._bytes.acquire(nbytes)
+
+        # A CUDA source carries a producer fence recorded on the caller's
+        # current stream; readers order their copies behind it.
         event = None
         if first.is_cuda:
             event = self._events.acquire(first.device)
             self._events.record(event, first.device)
             self._events.retain(event, first.device)
+
         with self._lock:
+            # Drop table entries whose physical ownership already completed.
             self._table = {
                 key: source for key, source in self._table.items() if not source.retirement.done()
             }
@@ -781,10 +822,12 @@ class LocalTransport(Transport):
             or locator.source.address_space != self.source.address_space
         ):
             raise invalid_descriptor("local locator belongs to another address space")
+
         with _endpoint_lock:
             owner = _endpoints.get(handle.endpoint)
         if not isinstance(owner, LocalTransport) or owner.source != locator.source:
             raise invalid_descriptor("local publication belongs to another rank incarnation")
+
         with owner._lock:
             source = owner._table.get(handle.key)
             if source is None or source.released:
@@ -805,8 +848,11 @@ class LocalTransport(Transport):
                 else _read_destination(locator, device, destination, region)
             )
             source.readers += 1
+
         try:
             if target is not None:
+                # Copy path: the pool ticket retires when the copy's physical
+                # access ends, then the source's reader count drops.
                 ticket = self._reads.submit(
                     self._reads.copy,
                     tensor,
@@ -817,6 +863,9 @@ class LocalTransport(Transport):
                 )
                 ticket.add_retirement_callback(lambda: owner._release_reader(source))
                 return ticket
+
+            # Borrow path: no copy. The source views themselves are handed out
+            # and the reader count drops when every consumer stream completes.
             if not self._borrow_slots.acquire(blocking=False):
                 raise resource_error("local borrowed-view ticket capacity is exhausted")
             try:
@@ -986,6 +1035,8 @@ class ShmTransport(Transport):
             while not closing or len(selector.get_map()) > 1:
                 for key, _events in selector.select():
                     if key.fileobj is self._publication_control_rx:
+                        # Drain the wakeup, then register each queued
+                        # publication's stream signal for readiness.
                         while True:
                             try:
                                 if not self._publication_control_rx.recv(4096):
@@ -1003,6 +1054,10 @@ class ShmTransport(Transport):
                             else:
                                 selector.register(item[1].signal, selectors.EVENT_READ, item)
                         continue
+
+                    # A stream signal fired: the device-to-host DMA is done,
+                    # so move the staged bytes into the shared segment and
+                    # expose (or fail) the publication.
                     locator, source = key.data
                     selector.unregister(source.signal)
                     failure = None
@@ -1043,6 +1098,7 @@ class ShmTransport(Transport):
         first = source[0] if isinstance(source, tuple) else source
         nbytes = _nbytes(source)
         self._bytes.acquire(nbytes)
+
         shm = None
         registered = False
         submitted = False
@@ -1051,7 +1107,10 @@ class ShmTransport(Transport):
             buffer = shm.buf
             if buffer is None:
                 raise RuntimeError("shared-memory publication has no writable buffer")
+
             if first.is_cuda:
+                # Device bytes move through a pinned staging buffer; the
+                # stream signal marks the DMA complete on the worker thread.
                 from .._uniserve_ipc import StreamSignal
 
                 host = torch.empty(shape, dtype=first.dtype, device="cpu", pin_memory=True)
@@ -1063,6 +1122,7 @@ class ShmTransport(Transport):
                 for target, value in _copy_pairs(source, packed):
                     target.copy_(value)
                 del packed, target, value
+
             publication = _ShmSource(shm, nbytes, host, signal)
             locator = Locator(
                 source=self.source,
@@ -1078,6 +1138,7 @@ class ShmTransport(Transport):
             )
             self._publications.publish(locator, publication, pending=first.is_cuda)
             registered = True
+
             if first.is_cuda:
                 assert host is not None
                 assert signal is not None
@@ -1126,6 +1187,9 @@ class ShmTransport(Transport):
         failure: BaseException | None = None
         try:
             ticket._require_active()
+            # Copy the bytes out of the segment up front so the reader grant
+            # can be returned before the (possibly asynchronous) destination
+            # copy; the grant only needs to cover access to the segment.
             shm = _open_shared_memory(handle.name, locator.nbytes)
             try:
                 buf = bytearray(shm[: locator.nbytes])
@@ -1151,6 +1215,7 @@ class ShmTransport(Transport):
             pinned = torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
             pinned.copy_(source)
             source = pinned
+
         target = _read_destination(locator, device, destination, region)
         if region is not None:
             source = source[region]
@@ -1303,9 +1368,11 @@ class CudaIpcTransport(Transport):
             raise invalid_descriptor("CUDA IPC publication spans require one allocation and stride")
         if self._failed_publication is not None:
             raise self._failed_publication[0]
+
         self._events.reap()
         nbytes = _nbytes(tensor)
         self._bytes.acquire(nbytes)
+
         event = None
         publication = None
         descriptor = None
@@ -1331,6 +1398,9 @@ class CudaIpcTransport(Transport):
             self._events.retain(event, first.device)
             self._events.record(event, first.device)
             publication = _CudaSource(source, event, nbytes, self._bytes, descriptor, copied_source)
+
+            # Run-length encode first-axis span lengths so the importer can
+            # rebuild every span view without a per-span locator entry.
             length_runs = tuple(
                 (length, sum(1 for _ in values))
                 for length, values in groupby(int(span.shape[0]) for span in spans)
@@ -1421,6 +1491,8 @@ class CudaIpcTransport(Transport):
             destination = _read_destination(locator, device, destination, region)
             with torch.cuda.device(device):
                 if locator.source.address_space == self.source.address_space:
+                    # Same address space: borrow the owner's registered tensor
+                    # and producer fence directly; no IPC mapping is needed.
                     with _endpoint_lock:
                         owner = _endpoints.get(handle.endpoint)
                     if not isinstance(owner, CudaIpcTransport) or owner.source != locator.source:
@@ -1469,6 +1541,8 @@ class CudaIpcTransport(Transport):
             raise
         finally:
             try:
+                # An undrained read keeps its mapping and fence through the
+                # ticket; only a physically settled read returns its grant.
                 if not ticket._unretired:
                     mapped = None
                     event = None

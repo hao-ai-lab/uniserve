@@ -54,6 +54,8 @@ def _numerical_signature(value: object) -> Hashable:
 def restore_samples(inputs: DenoiserInput):
     """Snapshot solver samples while keeping disposable prediction storage separate."""
 
+    # Keying by identity snapshots each backing tensor once, even when several
+    # latent views alias the same storage.
     samples = {
         id(value.tensor): value.tensor for values in inputs.latents.values() for value in values
     }
@@ -91,14 +93,18 @@ class DenoisingRunner(Generic[InputT, SizeT]):
     ):
         if capacity < 1:
             raise ValueError("denoising requires a positive resident request capacity")
+
         self.model, self.device = model, device
         self.capture_stream, self.groups, self.capacity = capture_stream, groups, capacity
         self.cache, self.attention, self.matmul = cache, attention, matmul
+
+        # Captured graphs draw their workspace from per-device memory pools.
         self.device_pools = {}
         if capture_stream is not None:
             for target in dict.fromkeys((device, *additional_devices)):
                 with torch.cuda.device(target):
                     self.device_pools[target] = torch.cuda.MemPool()
+
         self.graphs: dict[tuple[Hashable, Hashable, Hashable], tuple[CUDAGraph, tuple]] = {}
         self.prepared_inputs: OrderedDict[Hashable, ExecutionContext] = OrderedDict()
         self._slots: OrderedDict[Hashable, tuple[Hashable, Hashable]] = OrderedDict()
@@ -109,9 +115,11 @@ class DenoisingRunner(Generic[InputT, SizeT]):
 
         if self._closed:
             raise RuntimeError("denoising runner is closed")
+
         if key not in self.prepared_inputs:
             if len(self.prepared_inputs) >= self.capacity:
                 self.release_inputs(next(iter(self.prepared_inputs)))
+
             context = ExecutionContext(
                 self.model,
                 cache=self.cache,
@@ -127,6 +135,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                 context.close()
                 raise
             self.prepared_inputs[key] = context
+
         self.prepared_inputs.move_to_end(key)
         return self.prepared_inputs[key]
 
@@ -152,12 +161,14 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         context, operation = self._operation(inputs, schedules, state, input_key)
         if context.stream is not None:
             context.stream.wait_stream(torch.cuda.current_stream(self.device))
+
         with context.activate():
             restore = restore_samples(inputs)
             try:
                 operation()
             finally:
                 restore()
+
         if self.device.type == "cuda":
             (context.stream or torch.cuda.current_stream(self.device)).synchronize()
 
@@ -177,6 +188,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         if self.capture_stream is None:
             with context.activate():
                 return operation(), "eager"
+
         # Request slots retain sample and conditioning backing. Schedules are
         # rebuilt per trajectory, so their values are copied into graph-owned
         # storage on every invocation instead of making addresses part of reuse.
@@ -206,6 +218,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         temporal = schedules, timesteps
         variant = inputs.step_index, input_signature(timesteps)
         key = (slot, signature, variant)
+
         missing = capture_required(key not in self.graphs, self.groups, self.device)
         if missing:
             resident = self._slots.get(slot)
@@ -214,11 +227,15 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                 resident = None
             if resident is None and len(self._slots) >= self.capacity:
                 self.release_slot(next(iter(self._slots)))
+
             self._discard_graph(key)
             self.warmup(inputs, schedules, state=state, input_key=input_key)
+
             graph = CUDAGraph(context=context, pools=self.device_pools)
             try:
                 with context.activate():
+                    # Bind graph-owned schedule and timestep copies so replay
+                    # only needs their values refreshed, never new addresses.
                     staged = clone_inputs(temporal)
                     bound = replace(
                         inputs,
@@ -240,9 +257,11 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                 raise
             self.graphs[key] = graph, staged
             self._slots[slot] = signature, input_key
+
         self._slots.move_to_end(slot)
         current = torch.cuda.current_stream(self.device)
         context.stream.wait_stream(current)
+
         graph, staged = self.graphs[key]
         with context.activate():
             copy_inputs(staged, temporal)
@@ -273,6 +292,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         for slot, (_signature, resident_key) in tuple(self._slots.items()):
             if resident_key == key:
                 self.release_slot(slot)
+
         context = self.prepared_inputs.pop(key, None)
         if context is not None:
             if self.device.type == "cuda":
@@ -282,6 +302,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
     def close(self) -> None:
         if self._closed:
             return
+
         for key in tuple(self.prepared_inputs):
             self.release_inputs(key)
         self.device_pools.clear()

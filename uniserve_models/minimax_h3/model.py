@@ -45,6 +45,7 @@ entry_paths = MappingProxyType(
 
 
 def entry_points(config: Config):
+    """Declare each component's callable stages and their parallel groups."""
     return MappingProxyType(
         {
             "text_encoder": (EntryPoint("encode", groups=("tp",)),),

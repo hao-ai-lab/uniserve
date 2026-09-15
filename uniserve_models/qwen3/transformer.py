@@ -27,6 +27,7 @@ from .config import Config
 
 
 def _activation(name: str) -> str:
+    """Map checkpoint activation aliases onto the library's implemented kernels."""
     if name in {"silu", "swish", "silu_and_mul", "swiglu"}:
         return "silu"
     if name in {"gelu", "gelu_and_mul", "geglu"}:
@@ -69,6 +70,8 @@ class Attention(nn.Module):
         cos, sin = self.rotary(
             positions.reshape(-1), dtype=torch.float32, sequence_length=positions.numel()
         )
+
+        # hidden: [tokens, hidden_size]; q/k/v: [tokens, heads, head_dim]
         query, key, value = self.qkv(hidden, (cos,), (sin,))
         attended = self.attention(query, key, value, attention)
         return self.output(attended.flatten(1))
@@ -112,6 +115,8 @@ class TransformerLayer(nn.Module):
         )
 
     def forward(self, hidden, residual, positions, attention):
+        # The first layer has no incoming residual; later layers fuse the
+        # residual add into the norm to keep one kernel per normalization.
         if residual is None:
             residual = hidden
             hidden = self.input_norm(hidden)
@@ -119,6 +124,7 @@ class TransformerLayer(nn.Module):
             hidden, residual = add_rms_norm(
                 hidden, residual, self.input_norm.weight, self.input_norm.eps
             )
+
         hidden = self.attention(hidden, positions, attention)
         hidden, residual = add_rms_norm(
             hidden, residual, self.post_attention_norm.weight, self.post_attention_norm.eps
@@ -127,6 +133,8 @@ class TransformerLayer(nn.Module):
 
 
 class Transformer(TransformerDecoder):
+    """Qwen3 decoder stack: embedding, pre-norm layers, and the final RMS norm."""
+
     def __init__(self, config: Config):
         super().__init__(
             VocabParallelEmbedding(config.vocab_size, config.hidden_size),

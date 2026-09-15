@@ -53,6 +53,8 @@ if triton is not None:
         mask = columns < WIDTH
         offsets = row * WIDTH + columns
         modulation_row = tl.load(row_indices_ptr + row)
+
+        # value: one [WIDTH] activation row, accumulated in FP32.
         value = tl.load(hidden_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         if HAS_UPDATE:
             update = tl.load(update_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
@@ -61,6 +63,7 @@ if triton is not None:
             ).to(tl.float32)
             value = value + gate * update
             tl.store(update_ptr + offsets, value, mask=mask)
+
         mean_square = tl.sum(value * value, axis=0) / WIDTH
         weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(tl.float32)
         shift = tl.load(
@@ -70,11 +73,15 @@ if triton is not None:
             scale_ptr + modulation_row * scale_row_stride + columns, mask=mask, other=0.0
         ).to(tl.float32)
         output = value * tl.rsqrt(mean_square + EPS) * weight * (1.0 + scale) + shift
+
         if FP8_OUTPUT:
+            # Per-row E4M3 dequantization scale from the row's absolute max,
+            # clamped away from zero so the division stays well-defined.
             output = tl.where(mask, output, 0.0)
             output_scale = tl.maximum(tl.max(tl.abs(output), axis=0), 1.0e-12) / 448.0
             output = tl.minimum(tl.maximum(output / output_scale, -448.0), 448.0)
             tl.store(output_scale_ptr + row, output_scale)
+
         tl.store(output_ptr + offsets, output, mask=mask)
 
     @triton.jit
@@ -98,6 +105,7 @@ if triton is not None:
         gate = tl.load(
             gate_ptr + modulation_row * gate_row_stride + columns, mask=mask, other=0.0
         ).to(tl.float32)
+
         tl.store(update_ptr + offsets, hidden + gate * update, mask=mask)
 
 
@@ -149,6 +157,9 @@ def _fused_modulation(
     rows = value.numel() // width
     output = torch.empty_like(value, dtype=torch.float8_e4m3fn if fp8 else value.dtype)
     output_scale = torch.empty((rows, 1), dtype=torch.float32, device=value.device) if fp8 else None
+
+    # Pointer slots disabled by the constexpr flags still need valid tensors;
+    # reuse an existing buffer as a placeholder the kernel never dereferences.
     _modulated_rms_kernel[(rows,)](
         value,
         value if update is None else update,
@@ -187,6 +198,7 @@ def modulated_rms_norm(
         value, weight, shift, scale, row_indices
     ):
         return _fused_modulation(value, weight, shift, scale, row_indices, eps)[0]
+
     return _modulate(value, weight, shift, scale, row_indices, eps).to(value.dtype)
 
 
@@ -211,6 +223,7 @@ def gated_residual(
             num_warps=4,
         )
         return update
+
     return (hidden.float() + gate.index_select(0, row_indices).float() * update.float()).to(
         hidden.dtype
     )
@@ -242,6 +255,7 @@ def gated_residual_rms_norm(
             hidden, weight, shift, scale, row_indices, eps, update=update, gate=gate
         )
         return update, normalized
+
     residual = hidden.float() + gate.index_select(0, row_indices).float() * update.float()
     normalized = _modulate(residual, weight, shift, scale, row_indices, eps)
     return residual.to(hidden.dtype), normalized.to(hidden.dtype)
@@ -274,6 +288,7 @@ def gated_residual_rms_norm_fp8(
         )
         assert scales is not None
         return update, values, scales
+
     from uniserve.quantization import Quantizer
 
     residual = hidden.float() + gate.index_select(0, row_indices).float() * update.float()

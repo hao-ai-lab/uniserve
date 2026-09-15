@@ -155,6 +155,7 @@ class RotaryEmbedding(nn.Module):
             raise ValueError("rotary context and partial width must define a valid domain")
         if scaling is not None and type(scaling) not in _RECIPE_NAMES:
             raise TypeError("rotary scaling must use a typed numerical recipe")
+
         self.dim = (
             dim if isinstance(scaling, ProportionalScaling) else int(dim * partial_rotary_factor)
         )
@@ -162,6 +163,7 @@ class RotaryEmbedding(nn.Module):
             raise ValueError("the partial rotary width must remain positive and even")
         if isinstance(scaling, DynamicScaling) and self.dim == 2:
             raise ValueError("dynamic NTK scaling requires a width greater than two")
+
         self.theta = theta
         self.scaling = scaling
         self.attention_scale = attention_scale
@@ -169,10 +171,12 @@ class RotaryEmbedding(nn.Module):
         self._maximum = max_position_embeddings
         self._partial = partial_rotary_factor
         self._head_dim = dim
+
         if isinstance(scaling, LongRoPEScaling):
             expected = self.dim if keep_freq_range else self.dim // 2
             if len(scaling.short_factor) != expected or len(scaling.long_factor) != expected:
                 raise ValueError("LongRoPE factors must cover every constructed frequency")
+
         # Small derived model constants remain real tensors under meta model
         # construction. Loading moves each registered buffer with its module.
         actual_device = torch.device("cpu") if device is None else torch.device(device)
@@ -183,12 +187,15 @@ class RotaryEmbedding(nn.Module):
 
     def _frequencies(self, device, *, sequence_length):
         if self.scaling is None:
+            # keep_freq_range computes over the doubled width, then decimates
+            # to retain the original frequency range at compact width.
             width = self.dim * 2 if self.keep_freq_range else self.dim
             inverse = 1.0 / (
                 self.theta
                 ** (torch.arange(0, width, 2, dtype=torch.float32, device=device) / width)
             )
             return inverse[::2] if self.keep_freq_range else inverse, 1.0
+
         from transformers import PretrainedConfig
         from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
@@ -214,6 +221,8 @@ class RotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, positions, *, dtype: torch.dtype, sequence_length: int):
+        """Return ``(cos, sin)`` factors of shape [..., dim / 2] for ``positions``."""
+
         if type(sequence_length) is not int or sequence_length < 0:
             raise ValueError("rotary sequence length must be a nonnegative host integer")
         if not dtype.is_floating_point or (
@@ -222,6 +231,7 @@ class RotaryEmbedding(nn.Module):
             raise ValueError(
                 "rotary factors require numerical positions and a floating output dtype"
             )
+
         dynamic = isinstance(self.scaling, (DynamicScaling, LongRoPEScaling))
         if dynamic:
             frequencies, scale = self._frequencies(
@@ -230,6 +240,7 @@ class RotaryEmbedding(nn.Module):
         else:
             frequencies = self.inv_freq.to(device=positions.device)
             scale = self._frequency_scale
+
         from uniserve.ops.rope_kernels import try_triton_rotary_factors
 
         factors = try_triton_rotary_factors(
@@ -237,14 +248,18 @@ class RotaryEmbedding(nn.Module):
         )
         if factors is not None:
             return factors
+
         device_type = positions.device.type if positions.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
+            # [..., dim / 2] phases: positions broadcast against frequencies.
             phases = positions.float().unsqueeze(-1) * frequencies.float()
             cosine = phases.cos() * (scale * self.attention_scale)
             sine = phases.sin() * (scale * self.attention_scale)
         return cosine.to(dtype=dtype), sine.to(dtype=dtype)
 
     def constant_buffers(self, max_position: int):
+        """Describe the FP32 cosine/sine table storage for ``max_position`` rows."""
+
         if type(max_position) is not int or max_position < 0:
             raise ValueError("rotary table extent must be a nonnegative integer")
         return {

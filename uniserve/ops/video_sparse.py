@@ -51,6 +51,9 @@ if triton is not None:
     ):
         """Average valid Q/K/V rows for one tile and attention head."""
 
+        # Sources are [rows, heads, width]; pooled outputs are
+        # [tiles, heads, width]. Rows beyond ``valid_sizes`` are masked out,
+        # and the clamped divisor keeps empty tiles finite.
         tile = tl.program_id(0)
         head = tl.program_id(1)
         row_offsets = (tile * tile_rows + tl.arange(0, tile_rows)).to(tl.int64)
@@ -70,6 +73,7 @@ if triton is not None:
                 mask=tl.arange(0, tile_rows)[:, None] < query_valid_rows,
                 other=0.0,
             ).to(tl.float32)
+
             query_mean = tl.sum(query_values, axis=0) / tl.maximum(query_valid_rows, 1)
             tl.store(pooled_query + output_offsets, query_mean)
 
@@ -78,6 +82,7 @@ if triton is not None:
             mask=mask,
             other=0.0,
         ).to(tl.float32)
+
         key_mean = tl.sum(key_values, axis=0) / tl.maximum(valid_rows, 1)
         tl.store(pooled_key + output_offsets, key_mean)
 
@@ -89,6 +94,7 @@ if triton is not None:
             mask=mask,
             other=0.0,
         ).to(tl.float32)
+
         value_mean = tl.sum(value_values, axis=0) / tl.maximum(valid_rows, 1)
         tl.store(pooled_value + output_offsets, value_mean)
 
@@ -111,6 +117,7 @@ if triton is not None:
         row = tl.program_id(0)
         head = row // rows_per_head
         query_row = row % rows_per_head
+
         offsets = tl.arange(0, block)
         valid = offsets < columns
         values = tl.load(
@@ -126,7 +133,10 @@ if triton is not None:
         upper = tl.max(tl.where(valid, values, -float("inf"))) + 1.0
         lower_count = tl.sum(valid.to(tl.int32), axis=0).to(tl.float32)
         upper_count = 0.0
+
         for _ in tl.static_range(iterations):
+            # Interpolate the next threshold between the bounds; clamping the
+            # step keeps each iteration strictly inside the bracket.
             denominator = lower_count - upper_count
             fraction = (lower_count - selected) / tl.where(
                 denominator > 0.5,
@@ -134,11 +144,13 @@ if triton is not None:
                 1.0,
             )
             fraction = tl.minimum(tl.maximum(fraction, 0.05), 0.95)
+
             threshold = lower + (upper - lower) * fraction
             count = tl.sum(
                 ((values >= threshold) & valid).to(tl.int32),
                 axis=0,
             ).to(tl.float32)
+
             enough = count >= selected
             lower = tl.where(enough, threshold, lower)
             lower_count = tl.where(enough, count, lower_count)
@@ -181,6 +193,7 @@ if triton is not None:
         head = tl.program_id(1)
         columns = tl.arange(0, width)
         mask = row_offsets[:, None] < rows
+
         destination = head * rows * width + row_offsets[:, None] * width + columns[None, :]
 
         # Each component uses its own source strides and a component-sized
@@ -194,6 +207,7 @@ if triton is not None:
             other=0.0,
         )
         tl.store(packed + destination, query_values, mask=mask)
+
         key_values = tl.load(
             key
             + row_offsets[:, None] * key_stride_0
@@ -203,6 +217,7 @@ if triton is not None:
             other=0.0,
         )
         tl.store(packed + heads * rows * width + destination, key_values, mask=mask)
+
         value_values = tl.load(
             value
             + row_offsets[:, None] * value_stride_0
@@ -238,6 +253,7 @@ if triton is not None:
         head = tl.program_id(1)
         columns = tl.arange(0, width)
         mask = row_offsets[:, None] < rows
+
         attended_values = tl.load(
             attended
             + head * attended_stride_head
@@ -302,6 +318,7 @@ if triton is not None:
         head = tl.program_id(1)
         columns = tl.arange(0, width)
         valid = row_offsets[:, None] < rows
+
         attended_values = tl.load(
             attended
             + head * attended_stride_head
@@ -326,6 +343,7 @@ if triton is not None:
             mask=valid,
             other=0.0,
         ).to(tl.float32)
+
         values = attended_values + gate_values * compressed_values
 
         # Consecutive ``local_rows`` source ranges target distinct destination
@@ -365,6 +383,7 @@ def _pack_qkv(
     # The output orders components before heads and rows, matching the sparse
     # attention kernel while avoiding an intermediate permuted tensor.
     block_rows = 8
+
     _pack_qkv_kernel[(triton.cdiv(rows, block_rows), heads)](
         query,
         key,
@@ -408,6 +427,7 @@ def _pool_qkv_means(
     rows, heads, width = (int(size) for size in query.shape)
     tiles = key.shape[0] // 64
     query_tiles = rows // 64
+
     if (
         rows % 64
         or key.shape[0] % 64
@@ -559,6 +579,7 @@ def _unpack_add_compression(
     # Attention and compression are head-major; gate and destination are
     # row-major. The kernel composes values while converting between layouts.
     block_rows = 8
+
     _unpack_add_compression_kernel[(triton.cdiv(rows, block_rows), heads)](
         attended,
         gate,
@@ -600,6 +621,7 @@ def _compose_to_head_shards(
     # The source row axis concatenates destination-rank segments. Each
     # output receives one segment in the global head range owned by source_rank.
     block_rows = 8
+
     _compose_to_head_shards_kernel[(triton.cdiv(rows, block_rows), local_heads)](
         attended,
         gate,

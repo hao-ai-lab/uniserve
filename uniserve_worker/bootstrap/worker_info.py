@@ -181,6 +181,8 @@ class EntryInfo:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "entry") -> EntryInfo:
+        """Decode one entry and its tensor results from the wire mapping."""
+
         data = _map(value, where)
         return cls(
             name=_str(data.get("name"), f"{where}.name"),
@@ -194,6 +196,8 @@ class EntryInfo:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode entry membership and publishable results for IPC discovery."""
+
         return {
             "name": self.name,
             **self.config.to_dict(),
@@ -264,6 +268,7 @@ class WorkerInfo:
             or any(name not in {"local", "shm", "cuda_ipc"} for name in self.transfer_backends)
         ):
             raise invalid_descriptor("worker physical transfer capabilities are incomplete")
+
         for name in (
             "queue_depth",
             "max_batch_ops",
@@ -273,14 +278,17 @@ class WorkerInfo:
         ):
             if getattr(self, name) < 1:
                 raise invalid_descriptor(f"worker info.{name} must be positive")
+
         if self.world_size < 1 or self.endpoint.rank >= self.world_size:
             raise invalid_descriptor("endpoint rank must satisfy 0 <= rank < world_size")
+
         requires_kv = any(
             variant in {ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY}
             for variant in self.supported_ops
         )
         if requires_kv and self.kv_cache is None:
             raise invalid_descriptor("worker advertises AR work without a KV cache")
+
         for name in (
             "latent_page_units",
             "latent_pages",
@@ -290,10 +298,12 @@ class WorkerInfo:
         ):
             if getattr(self, name) < 0:
                 raise invalid_descriptor(f"worker info.{name} must not be negative")
+
         if not self.supported_ops:
             raise invalid_descriptor("worker info must support a work variant")
         if len(set(self.supported_ops)) != len(self.supported_ops):
             raise invalid_descriptor("worker info repeats a work variant")
+
         if self.pipeline_components:
             if self.num_inference_steps < 1 or set(self.pipeline_components) != set(VIDEO_STAGES):
                 raise invalid_descriptor("video components or diffusion step count are incomplete")
@@ -302,10 +312,12 @@ class WorkerInfo:
                 for stage, component in self.pipeline_components.items()
             ):
                 raise invalid_descriptor("pipeline component uses an unsupported operation")
+
         has_latent_geometry = bool(self.latent_page_units or self.latent_pages)
         if has_latent_geometry:
             if self.latent_page_units < 1 or self.latent_pages < 2:
                 raise invalid_descriptor("worker info declares incomplete latent pool capacity")
+
         if not self.model_name:
             raise invalid_descriptor("worker model name is empty")
 

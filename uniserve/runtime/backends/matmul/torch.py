@@ -13,6 +13,7 @@ class _TorchOperator(_Operator):
     def __call__(self, x, bias, *, out):
         x = self._input(x, out)
         weight = self.weight
+
         encoded = isinstance(x, QuantizedTensor) or isinstance(weight, QuantizedTensor)
         if encoded:
             if any(

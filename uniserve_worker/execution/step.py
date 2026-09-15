@@ -97,6 +97,7 @@ def execute_batch(
     batch = state.batch
     if not state.inputs_ready():
         raise RuntimeError("prepared execution was observed before transfer readiness")
+
     predicate_values = state.predicate_values()
     started = time.perf_counter_ns()
 
@@ -109,6 +110,7 @@ def execute_batch(
         raise invalid_descriptor(
             "completion-predicated operations require exact prepared predicate values"
         )
+
     if not batch.operations:
         state.launched = True
         return
@@ -145,6 +147,7 @@ def execute_batch(
                 phase="completion group registration",
                 state=state,
             )
+
             if propagate_errors or classified.fatal:
                 for completion_group in completion_groups:
                     _discard_group(
@@ -158,6 +161,7 @@ def execute_batch(
                         state=state,
                     )
                 raise classified
+
             _error_outputs(
                 state,
                 completion_group,
@@ -193,6 +197,7 @@ def execute_batch(
             phase="completion group execution",
             state=state,
         )
+
         for completion_group in completion_groups:
             _discard_group(
                 completion_group,
@@ -204,8 +209,10 @@ def execute_batch(
                 transfer_backends=transfer_backends,
                 state=state,
             )
+
         if propagate_errors or classified.fatal:
             raise classified
+
         for completion_group in completion_groups:
             _error_outputs(
                 state,
@@ -219,6 +226,7 @@ def execute_batch(
                 ),
                 request_pool=request_pool,
             )
+
         completion_groups.clear()
         outcomes, execution_errors = {}, {}
 
@@ -232,6 +240,7 @@ def execute_batch(
             phase="completion group execution",
             state=state,
         )
+
         for completion_group in completion_groups:
             _discard_group(
                 completion_group,
@@ -243,6 +252,7 @@ def execute_batch(
                 transfer_backends=transfer_backends,
                 state=state,
             )
+
         raise classified
 
     for completion_group in completion_groups:
@@ -264,8 +274,10 @@ def execute_batch(
                 transfer_backends=transfer_backends,
                 state=state,
             )
+
             if propagate_errors or classified.fatal:
                 raise classified
+
             _error_outputs(
                 state,
                 completion_group,
@@ -279,6 +291,7 @@ def execute_batch(
                 request_pool=request_pool,
             )
             continue
+
         group_outcomes = outcomes[completion_group]
         try:
             _commit_group(
@@ -319,8 +332,10 @@ def execute_batch(
                     transfer_backends=transfer_backends,
                     state=state,
                 )
+
             if propagate_errors or classified.fatal:
                 raise classified
+
             _error_outputs(
                 state,
                 completion_group,
@@ -353,11 +368,14 @@ def _classify_group_failure(
         )
         for operation in state.group_operations(completion_group)
     )
+
+    # Attach request coordinates when the group holds exactly one operation.
     sole = (
         state.group_operations(completion_group)[0]
         if len(state.group_operations(completion_group)) == 1
         else None
     )
+
     classified = classify(
         error,
         context=phase,
@@ -458,6 +476,7 @@ def _error_outputs(
             runtime = None
         else:
             runtime = request.accepted_progress
+
         placeholder = RequestOutput(
             request_key=operation.request_key,
             op_id=operation.op_id,
@@ -474,6 +493,7 @@ def _error_outputs(
             finish_flags=FinishFlags(),
         )
         records.append(placeholder)
+
     state.record_outputs(
         completion_group,
         tuple(records),

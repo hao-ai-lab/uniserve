@@ -68,6 +68,7 @@ class MediaBuilder:
         return result
 
     def schedules(self, *, device: torch.device | str) -> Mapping[str, Schedule]:
+        """Build the fixed denoising schedule for every modality."""
         return self.denoiser.make_schedules(self.num_steps, shift=None, device=device)
 
     @torch.inference_mode()
@@ -83,8 +84,10 @@ class MediaBuilder:
         """Fill CPU transfer sources and return destination/source pairs to stage."""
 
         names = self.denoiser.modalities
+        # The denoiser's numerical calls batch over leading size 1.
         noise = {name: tensors[f"{name}_noise"].unsqueeze(0) for name in names}
         source = {name: tensors[f"{name}_source"].unsqueeze(0) for name in names}
+
         normal_noise((seed,), out=tuple(noise.values()))
         self.denoiser.prepare_latents(
             (size,), noise=noise, state=source, constants=constants, workspace=workspace
@@ -98,8 +101,10 @@ class MediaBuilder:
         schedules: Mapping[str, Schedule],
         index: int,
     ) -> DenoiserInput:
+        """Assemble one denoising step's typed input from resident tensors."""
         if not 0 <= index < self.num_steps:
             raise ValueError("denoising index is outside the fixed schedule")
+
         return DenoiserInput(
             latents={
                 name: (LatentInput(tensors[name], schedules[name].timesteps[index]),)

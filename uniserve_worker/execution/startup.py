@@ -45,6 +45,7 @@ def stage_text(
         torch.arange(prefix, prefix + length, dtype=torch.int64)
         for prefix, length in zip(prefixes, lengths, strict=True)
     )
+
     attention = from_blocks(
         pages=pages,
         query_lengths=lengths,
@@ -53,6 +54,7 @@ def stage_text(
         write=(True,) * rows,
         block_size=cache.info.block_size,
     )
+
     slots = slots or tuple(range(1, rows + 1))
     mode = ForwardMode.DECODE if decode else ForwardMode.PREFILL
     batch = buffers.stage(
@@ -96,8 +98,10 @@ def prepare_prefill(
         key=lambda item: (item.token_bucket * item.row_bucket, item.token_bucket),
         reverse=True,
     ):
+        # One row holds the long prompt; the remaining live rows hold one token.
         lengths = (shape.token_bucket - shape.live_rows + 1, *(1,) * (shape.live_rows - 1))
         counts = tuple(ceil_div(length, runner.worker_config.block_size) for length in lengths)
+
         with runner.kv_cache.startup_pages(sum(counts)) as scratch:
             pages = tuple(
                 scratch[sum(counts[:index]) : sum(counts[: index + 1])]
@@ -130,8 +134,12 @@ def prepare_decode(
     for rows in row_counts:
         with runner.kv_cache.startup_pages(rows) as scratch:
             pages = tuple((page,) for page in scratch)
+
+            # Warm the one-token prompt eagerly so the decode capture below
+            # reads valid K/V prefixes instead of uninitialized pages.
             prompt = stage_text(buffers, runner.kv_cache, ((0,),) * rows, pages)
             runner.eager_batch(entry, prompt, forward)
+
             batch = stage_text(
                 buffers,
                 runner.kv_cache,
@@ -140,6 +148,8 @@ def prepare_decode(
                 prefixes=(1,) * rows,
                 decode=True,
             )
+
+            # Capture with every row live, then restore the caller's predicates.
             predicates = runner.decode_predicates
             saved = None if predicates is None else predicates.clone()
             try:

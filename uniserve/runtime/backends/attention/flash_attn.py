@@ -45,20 +45,26 @@ class _FlashOperator(_Operator):
         if isinstance(batch, DenseInput) and batch.mask is not None:
             raise ValueError("this FlashAttention kernel does not implement dense masks")
         self._validate(q, k, v, batch, out)
+
         if isinstance(batch, PagedInput) and batch.write_indices is not None:
             self.update_cache(k, v, indices=batch.write_indices)
+
         if q.numel() == 0:
             return out
+
         if isinstance(batch, DenseInput):
             return out.copy_(self._dense(q, k, v, batch.causal, scale))
+
         if q.ndim != 3 or (
             batch.queries.num_tokens is not None and q.shape[0] != batch.queries.num_tokens
         ):
             raise ValueError("packed attention rows must match the declared query lengths")
+
         for query_slice, key_slice, run in causal_runs(batch):
             query = q[query_slice]
             if query.numel() == 0:
                 continue
+
             if isinstance(run, PagedInput):
                 key, value = (k, v) if self.cache is None else (self.cache.key, self.cache.value)
                 if key.ndim != 4 or key.shape[1] % 256:
@@ -90,6 +96,7 @@ class _FlashOperator(_Operator):
         count = batch.queries.batch_size
         lengths = self.workspace["lengths"][:count]
         torch.add(batch.prefixes.values, batch.queries.values, out=lengths)
+
         if batch.queries.host is not None and len(set(batch.queries.host)) == 1:
             # Cache updates already occurred through the public State method.
             # Omit current K/V so the native kernel reads each write once.
@@ -107,9 +114,12 @@ class _FlashOperator(_Operator):
         return self._paged_varlen(q, k, v, batch, lengths, scale)
 
     def _paged_varlen(self, q, k, v, batch, lengths, scale):
+        # The varlen kernel consumes cumulative KV offsets; build them from
+        # the per-sequence lengths held in workspace.
         offsets = self.workspace["offsets"][: lengths.numel() + 1]
         offsets[0].zero_()
         torch.cumsum(lengths, dim=0, out=offsets[1:])
+
         return self._varlen_kernel(
             q,
             k,

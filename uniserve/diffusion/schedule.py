@@ -9,6 +9,12 @@ import torch
 
 @dataclass(frozen=True, slots=True)
 class Schedule:
+    """Trajectory endpoints: FP32 network times, sigmas, and host coordinates.
+
+    All three hold ``num_steps + 1`` aligned entries. ``coordinates`` retains
+    the unrounded analytical values that guidance interval comparisons use.
+    """
+
     timesteps: torch.Tensor
     sigmas: torch.Tensor
     coordinates: tuple[float, ...]
@@ -53,9 +59,12 @@ def make_schedule(
     for index in range(steps + 1):
         value = index / steps if direction == "ascending" else 1.0 - index / steps
         if shift != 1:
+            # The shift formula operates on the increasing coordinate; shifting
+            # in the sigma domain mirrors the time coordinate into it.
             coordinate = value if shift_domain == "time" else 1.0 - value
             shifted = shift * coordinate / (1.0 + (shift - 1.0) * coordinate)
             value = shifted if shift_domain == "time" else 1.0 - shifted
         coordinates.append(value)
+
     times = torch.tensor(coordinates, dtype=torch.float32, device=device)
     return Schedule(times, times if direction == "descending" else 1.0 - times, tuple(coordinates))

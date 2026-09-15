@@ -27,6 +27,7 @@ if triton is not None:
     ):
         """Quantize one BF16 activation row and publish its E4M3 scale."""
 
+        # One program per row; each program publishes one max-abs E4M3 scale.
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
         mask = columns < width
@@ -35,12 +36,14 @@ if triton is not None:
             mask=mask,
             other=0.0,
         ).to(tl.float32)
+
         maximum = tl.maximum(tl.max(tl.abs(values), axis=0), _FP8_SCALE_EPS_TL)
         scale = maximum / _FP8_MAX_TL
         quantized = tl.maximum(
             tl.minimum(values / scale, _FP8_MAX_TL),
             -_FP8_MAX_TL,
         )
+
         tl.store(output_ptr + row * width + columns, quantized, mask=mask)
         tl.store(scale_ptr + row, scale)
 
@@ -59,6 +62,7 @@ def rowwise(x: torch.Tensor, values: torch.Tensor, scale: torch.Tensor) -> bool:
         and triton_available(x.device)
     ):
         return False
+
     width = x.shape[1]
     _rowwise_fp8_quant_kernel[(x.shape[0],)](
         x,

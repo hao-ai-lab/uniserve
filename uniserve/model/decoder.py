@@ -21,10 +21,12 @@ class ImageDecoder(nn.Module):
             raise ValueError("image latents and raster sizes must align")
         if not latents:
             return ()
+
         results = [None] * len(latents)
         groups = {}
         for index, (latent, size) in enumerate(zip(latents, sizes, strict=True)):
             groups.setdefault((size, latent.dtype, latent.device), []).append(index)
+
         for (size, _, _), indices in groups.items():
             pixels = self.decoder.decode(
                 torch.stack(tuple(latents[index] for index in indices)), size

@@ -7,10 +7,13 @@ from .image import ImageBuilder
 
 
 class StubBuilder(ImageBuilder):
+    """Construct the simulator's denoising inputs with its framing tokens."""
+
     framing = 2
     max_tokens = 1024
 
     def bind(self, *, samples, sizes, timesteps, positions, attention, step_index):
+        """Assemble one denoising step's typed input from resident tensors."""
         return DenoiserInput(
             latents={
                 "image": tuple(

@@ -31,6 +31,7 @@ def supports_peer_reduction(group: Communicator) -> bool:
     process_group = group._require()
     if dist.get_backend(process_group) != "nccl":
         return False
+
     from flashinfer.utils import is_confidential_compute
 
     device = group.device.index
@@ -43,6 +44,7 @@ def supports_peer_reduction(group: Communicator) -> bool:
     )
     identities: list[Any] = [None] * group.size
     dist.all_gather_object(identities, identity, group=process_group)
+
     accessible = True
     for host, peer_device, uuid, major in identities:
         if (
@@ -55,6 +57,7 @@ def supports_peer_reduction(group: Communicator) -> bool:
         elif peer_device != device:
             accessible &= torch.cuda.can_device_access_peer(device, peer_device)
     accessible &= len({item[2] for item in identities}) == group.size
+
     capabilities: list[Any] = [None] * group.size
     dist.all_gather_object(capabilities, bool(accessible), group=process_group)
     return all(capabilities)
@@ -76,6 +79,9 @@ class PeerReduction:
         self.device = group.device
         self._reduce = allreduce_fusion
         self._pattern = AllReduceFusionPattern.kAllReduce
+
+        # max_token_num rows of hidden_dim BF16 elements fill exactly the
+        # 8 MiB small-message budget above.
         self._workspace: TRTLLMAllReduceFusionWorkspace | None = TRTLLMAllReduceFusionWorkspace(
             tp_size=group.size,
             tp_rank=dist.get_rank(group._require()),
@@ -99,6 +105,8 @@ class PeerReduction:
             or value.shape[-1] > 8192
         ):
             return False
+
+        # The kernel consumes a [rows, hidden] matrix; leading axes collapse.
         rows = value.view(-1, value.shape[-1])
         self._reduce(
             input=rows,
@@ -170,16 +178,19 @@ class NcclCommunicator:
         self._rank = dist.get_rank(group)
         self._size = dist.get_world_size(group)
         self._ranks = tuple(dist.get_process_group_ranks(group))
+
         identity = [bytes(nccl.get_unique_id()) if self._rank == 0 else None]
         dist.broadcast_object_list(identity, src=self._ranks[0], group=group)
         unique_id = identity[0]
         if not isinstance(unique_id, bytes):
             raise RuntimeError("NCCL initialization did not receive a unique identifier")
+
         try:
             with torch.cuda.device(stream.device):
                 cu = driver()
                 origin = cu.CUstream(stream.cuda_stream)
                 green = cuda_value(cu.cuStreamGetGreenCtx(origin), "query communication context")
+
                 config = nccl.Config()
                 # The deployed Green Context driver cannot batch-copy mapped
                 # peer windows. Keep NCCL's native CTA algorithms on that
@@ -188,6 +199,7 @@ class NcclCommunicator:
                 nccl.comm_init_rank_config(
                     addressof(self._comm), self._size, bytearray(unique_id), self._rank, config.ptr
                 )
+
                 # Reuse the computation's actual context, including its SM
                 # partition. Communication owns a stream, not another resource
                 # partition, and every transfer rejoins its numerical consumer.
@@ -207,9 +219,12 @@ class NcclCommunicator:
                         )
                     finally:
                         cuda_status(cu.cuCtxPopCurrent(), "leave communication context")
+
                 self._raw_transfer = raw
                 self._transfer = torch.cuda.ExternalStream(int(raw), device=stream.device)
         except BaseException as error:
+            # Partial construction still attempts every acquired resource's
+            # release, recording cleanup failures on the original error.
             if self._raw_transfer is not None:
                 try:
                     cuda_status(
@@ -229,6 +244,8 @@ class NcclCommunicator:
     def _arguments(
         self, value: torch.Tensor, output: torch.Tensor | None = None, *, asynchronous: bool = False
     ) -> tuple[int, int]:
+        """Validate operands and return the communicator and stream for a launch."""
+
         if not self._comm.value:
             raise RuntimeError("computation collective is closed")
         if value.device != self._stream.device or not value.is_contiguous():
@@ -239,8 +256,10 @@ class NcclCommunicator:
             or not output.is_contiguous()
         ):
             raise ValueError("collective output must match input dtype, device, and layout")
+
         if asynchronous:
             return self._comm.value, self._transfer.cuda_stream
+
         if self._pending is not None:
             # Synchronous collectives keep the same communicator order even
             # when a projection consumer invokes one before exhausting a gather.
@@ -249,14 +268,19 @@ class NcclCommunicator:
         return self._comm.value, self._stream.cuda_stream
 
     def _start(self, operation, *args) -> _CollectiveWork:
+        """Launch on the transfer stream after the computation stream's inputs."""
+
         self._transfer.wait_stream(self._stream)
         completed = torch.cuda.Event()
         try:
             operation(*args)
         except BaseException:
+            # Join the partial launch back so the computation stream never
+            # overtakes a failed transfer's still-running kernel.
             completed.record(self._transfer)
             self._stream.wait_event(completed)
             raise
+
         completed.record(self._transfer)
         work = _CollectiveWork(completed, self)
         self._pending = work
@@ -336,6 +360,7 @@ class NcclCommunicator:
         self._arguments(value, output)
         if len(input_splits) != self._size or len(output_splits) != self._size:
             raise ValueError("collective exchange requires one split per rank")
+
         if len(set(input_splits + output_splits)) == 1:
             self._nccl.allto_all(
                 value.data_ptr(),
@@ -345,6 +370,8 @@ class NcclCommunicator:
                 *self._arguments(value, output),
             )
             return
+
+        # Uneven exchanges decompose into one grouped send/recv pair per peer.
         send_rows, receive_rows = value.split(input_splits), output.split(output_splits)
         self._nccl.group_start()
         try:
@@ -366,6 +393,7 @@ class NcclCommunicator:
                 self._arguments(value, output)
                 if output.numel() != value.numel():
                     raise ValueError("gather destination must match the contribution size")
+
         self._nccl.group_start()
         try:
             self.send(value, root)
@@ -435,6 +463,7 @@ class NcclCommunicator:
 
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("register communication buffers before CUDA graph capture")
+
         for value in buffers:
             self._arguments(value)
             key = (value.data_ptr(), value.numel() * value.element_size())
@@ -451,12 +480,14 @@ class NcclCommunicator:
 
         if self._transfer is not None:
             self._transfer.synchronize()
+
         if self._comm.value:
             for window, _ in self._windows.values():
                 self._nccl.comm_window_deregister(self._comm.value, window.value)
             self._windows.clear()
             communicator, self._comm = self._comm.value, c_void_p()
             self._nccl.comm_destroy(communicator)
+
         if self._raw_transfer is not None:
             cuda_status(
                 driver().cuStreamDestroy(self._raw_transfer), "destroy communication stream"

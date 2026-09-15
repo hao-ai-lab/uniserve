@@ -51,6 +51,8 @@ class Logits:
             out.shape != shape or out.dtype != self.values.dtype or out.device != self.values.device
         ):
             raise ValueError("global logits output must match unpadded shape, dtype and device")
+
+        # Without padding, the gather writes the caller's storage directly.
         target = out if self.vocab.padded_size == self.vocab.size else None
         result = self.vocab.group.all_gather(self.values, dim=-1, out=target)[
             ..., : self.vocab.size

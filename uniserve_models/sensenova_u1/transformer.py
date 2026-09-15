@@ -42,6 +42,8 @@ class TransformerLayer(nn.Module):
         self.outputs = nn.ModuleDict()
         self.post_attention_norms = nn.ModuleDict()
         self.mlps = nn.ModuleDict()
+
+        # Checkpoint activation aliases collapse onto three kernel names.
         activation = (
             "silu"
             if config.hidden_act in {"silu", "swish", "silu_and_mul", "swiglu"}
@@ -51,6 +53,8 @@ class TransformerLayer(nn.Module):
         )
         for route in ("text", "flow"):
             self.input_norms[route] = RMSNorm(hidden, eps)
+            # Head width splits into temporal / height / width rotary partitions
+            # with per-axis QK norms (temporal half, then two spatial quarters).
             self.projections[route] = AxialQKVProjection(
                 QKVParallelLinear(
                     hidden,
@@ -69,6 +73,7 @@ class TransformerLayer(nn.Module):
             )
             self.post_attention_norms[route] = RMSNorm(hidden, eps)
             self.mlps[route] = GatedMLP(hidden, config.intermediate_size, activation=activation)
+
         self.attention = Attention(
             config.num_attention_heads,
             config.num_key_value_heads,
@@ -106,12 +111,18 @@ class TransformerLayer(nn.Module):
     ):
         hidden = hidden if residual is None else hidden.add(residual)
         normalized = hidden.apply(self.input_norms)
+
+        # Text-only callers pass one temporal axis; height and width default to
+        # zero so text tokens share one spatial origin.
         if positions.ndim == 1:
             positions = torch.stack(
                 (positions, torch.zeros_like(positions), torch.zeros_like(positions))
             )
         if positions.ndim != 2 or positions.shape[0] != 3:
             raise ValueError("SenseNova positions require temporal, height and width axes")
+
+        # Dynamic and LongRoPE scalings are functions of the full sequence
+        # length, which cached attention knows only from its host metadata.
         dynamic = isinstance(self.temporal_rotary.scaling, (DynamicScaling, LongRoPEScaling))
         if not dynamic:
             length = positions.shape[1]
@@ -135,6 +146,7 @@ class TransformerLayer(nn.Module):
             )
         if length is None:
             raise ValueError("dynamic rotary scaling requires exact host sequence lengths")
+
         names = frozenset(hidden.values)
         # Height and width use the same frequency recipe. Evaluate their
         # independent coordinates in one call, then restore the two axes.
@@ -153,6 +165,7 @@ class TransformerLayer(nn.Module):
             tuple(RoutedTensor.from_packed(pair[index], routes, routes=names) for pair in pairs)
             for index in (0, 1)
         )
+
         projected = {
             route: self.projections[route](
                 value,
@@ -167,6 +180,7 @@ class TransformerLayer(nn.Module):
             )
             for index in range(3)
         )
+
         attended = self.attention(query, key, value, attention).flatten(1)
         update = RoutedTensor.from_packed(attended, routes, routes=names).apply(self.outputs)
         residual = hidden.add(update)
@@ -174,6 +188,8 @@ class TransformerLayer(nn.Module):
 
 
 class Transformer(TransformerDecoder):
+    """Stack routed MoT layers over a shared embedding with per-route norms."""
+
     def __init__(self, config: TransformerConfig):
         super().__init__(
             VocabParallelEmbedding(

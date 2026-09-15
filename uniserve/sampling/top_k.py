@@ -70,6 +70,9 @@ def _sample_top_k_tensor(
         torch.zeros_like(sampled),
     )
     tokens = token_indexes.gather(1, selected.unsqueeze(1))[:, 0]
+
+    # Rows with NaN or +inf candidates, or with no finite candidate at all,
+    # have no well-defined distribution; the caller rejects their tokens.
     valid = (
         ~torch.isnan(candidates).any(dim=-1)
         & ~torch.isposinf(candidates).any(dim=-1)
@@ -89,8 +92,6 @@ def _compiled_sampling(top_k: int) -> _SamplingKernel:
         top_p: torch.Tensor,
         min_p: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Execute the fixed-top-k sampling graph used by the compiled specialization."""
-
         return _sample_top_k_tensor(
             logits,
             draws,

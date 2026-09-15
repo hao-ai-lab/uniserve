@@ -79,6 +79,7 @@ def forward_values(
         state.group_buffers[completion_group].register_device(
             model_runner.operation_devices(_operation)[1]
         )
+
     outputs = model_runner.forward(
         tuple((row, operation) for row, operation, _scope in inputs),
         cache=cache,
@@ -93,11 +94,13 @@ def forward_values(
             for index in indexes:
                 errors[inputs[index][2]] = output
             continue
+
         try:
             if output.stats is None or output.request_pool_indices is None:
                 raise RuntimeError("numerical forward lost statistics or request slot views")
             stats = output.stats
             request_pool_indices = output.request_pool_indices
+
             selected = graph_decode_samples(
                 tuple(inputs[index][1] for index in indexes),
                 tuple(
@@ -114,6 +117,8 @@ def forward_values(
             if selected is None:
                 output = output.materialize()
 
+            # One forward output group maps back to its input rows; bind each
+            # row's value, request slot view, graph sample, and output layout.
             state.group_forward_stats[inputs[indexes[0]][2]].append(stats)
             for local, (index, value) in enumerate(zip(indexes, output.values, strict=True)):
                 values[index] = (
@@ -153,6 +158,8 @@ def _publish_sample_groups(
 
         completion_group = scheduled[candidates[0][0]][1]
         try:
+            # Rows already sampled inside a graph replay carry a selection;
+            # sample only the rows that still need one, preserving order.
             sample_started = time.perf_counter_ns()
             sampling_inputs = tuple(
                 work for _index, _task, _logits, work, _selected in candidates if work is not None
@@ -402,6 +409,7 @@ def prepare_forward_rows(
                 staging = row.latent_staging
                 if params is None or staging is None:
                     raise invalid_descriptor("trajectory operation has no staged latent inputs")
+
                 rows = flow.flow_rows(
                     flow.require_inputs(model_runner),
                     trajectories[index],
@@ -470,6 +478,7 @@ def prepare_forward_rows(
                 staging = row.latent_staging
                 if params is None or staging is None:
                     raise invalid_descriptor("trajectory operation has no staged latent inputs")
+
                 forward.append(
                     (
                         index,

@@ -104,6 +104,7 @@ def _float(value: object, where: str) -> float:
     if kind is not float and kind is not int:
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise invalid_descriptor(f"{where} must be a number")
+
     result = float(cast(int | float, value))
     if not math.isfinite(result):
         raise invalid_descriptor(f"{where} must be finite")
@@ -114,6 +115,8 @@ def _uints(value: object, where: str) -> tuple[int, ...]:
     """Decode a sequence of non-negative integer wire values."""
 
     items = _seq(value, where)
+    # Fast path: copy directly when every item already validates, and only
+    # rebuild per item to locate the first invalid value for the error message.
     for item in items:
         if not (type(item) is int and item >= 0):
             return tuple(_uint(item, f"{where}[{index}]") for index, item in enumerate(items))

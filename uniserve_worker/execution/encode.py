@@ -68,6 +68,7 @@ def text(
         raise invalid_descriptor("text conditioning requires admitted prompt tokens")
     if not operation.outputs:
         raise invalid_descriptor("text encoder outputs must declare conditioning tensors")
+
     tokens = model_runner.stage_text_tokens(admission.prompt_token_ids)
     result = model_runner.run_encoder(
         "text",
@@ -75,6 +76,7 @@ def text(
     )
     if len(result.values) != len(operation.outputs):
         raise invalid_descriptor("text encoder output declarations disagree with the loaded entry")
+
     products = transfer.publish_tensors(
         operation,
         result.values,
@@ -86,6 +88,7 @@ def text(
     if result.stats is None:
         raise RuntimeError("module output has no execution statistics")
     state.group_forward_stats[completion_group].append(result.stats)
+
     request.status = OpStatus.OK
     request.projected_progress = operations.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
@@ -116,6 +119,7 @@ def prepare_features(
         raise invalid_descriptor("encode operation requires one resident feature output")
     if int(feature_output.generation) < 1:
         raise invalid_descriptor("encode feature output requires a positive generation")
+
     source = encode_source(
         operation,
         completion_group,
@@ -163,6 +167,7 @@ def publish_features(
         features,
         metadata=FeatureMetadata(height=prepared.height, width=prepared.width),
     )
+
     products: tuple[TensorPublication, ...] = ()
     if any(
         name != "local" for name in publication_transports
@@ -210,6 +215,7 @@ def materialization_latent(
     image_params = request.request.image
     if image_params is None:
         raise invalid_descriptor("image materialization has no admitted image parameters")
+
     row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
@@ -217,6 +223,7 @@ def materialization_latent(
         raise invalid_descriptor("trajectory operation has no staged latent inputs")
     if int(params.start_step) != int(image_params.steps):
         raise invalid_descriptor("image materialization requires a completed latent trajectory")
+
     current = latent_pool.gather_current(
         row.request.request_pool_idx,
         staging,
@@ -249,6 +256,7 @@ def publish_image(
     latent_input = operation.latent_input
     if latent_input is None:
         raise invalid_descriptor("image publication lost its latent input")
+
     resident_output = operation.image_output
     if resident_output is not None:
         if int(resident_output.generation) < 1:
@@ -269,6 +277,7 @@ def publish_image(
         request = state.pending_output(completion_group, operation.request_key.request_id)
         if request.producer_write is None:
             request.producer_write = write
+
     image_task = defer_image_encoding(
         operation,
         image_tensor,
@@ -306,6 +315,7 @@ def state_outcome(
     if not isinstance(selected, int):
         raise RuntimeError("visual state completion has a dynamic KV length")
     cache = (cache[0], cache[1], selected, cache[3])
+
     request.status = OpStatus.OK
     request.projected_progress = operations.execution_runtime(request, cache)
     request.finish_flags = FinishFlags()
@@ -347,6 +357,7 @@ def encode_source(
 
     if operation.input_image is not None:
         return operation.input_image
+
     reference = operation.image_input
     if reference is not None:
         read = tensor_store.consume(
@@ -365,6 +376,7 @@ def encode_source(
         ):
             raise invalid_descriptor("resident image product has incomplete dimensions")
         return read.tensor, metadata
+
     raise invalid_descriptor("encode operation has no source image product")
 
 
@@ -405,11 +417,16 @@ def vision_state_row(
     injection = model_runner.image_processor().feature_injection
     if injection is None:
         raise invalid_descriptor("vision state stage requires declared feature injection")
+
+    # Accept a leading singleton batch axis; the row layout is [tokens, hidden].
     embeddings = (
         features.squeeze(0) if features.ndim == 3 and int(features.shape[0]) == 1 else features
     )
     if embeddings.ndim != 2 or int(embeddings.shape[0]) < 1:
         raise invalid_descriptor("vision features must have shape [tokens, hidden]")
+
+    # The sequence is [start marker?, feature tokens..., end marker?]; marker
+    # slots keep placeholder token ids while feature slots carry embeddings.
     leading = injection.layout is FeatureLayout.FRAMED
     trailing = leading or close_image
     query = int(leading) + int(embeddings.shape[0]) + int(trailing)
@@ -423,6 +440,7 @@ def vision_state_row(
         token_ids[0] = _feature_token_id(injection, start=True)
     if trailing:
         token_ids[-1] = _feature_token_id(injection, start=False)
+
     positions = _vision_positions(
         injection.positions,
         int(embeddings.shape[0]),
@@ -475,11 +493,15 @@ def _vision_positions(
     query = int(leading) + feature_tokens + int(trailing)
     if layout is PositionLayout.TEMPORAL:
         return torch.full((query,), int(conditioning_position), dtype=torch.long)
+
     transform = model_runner.image_processor().vit
     if not isinstance(transform, PatchTransform):
         raise invalid_descriptor(
             "temporal-spatial feature injection requires a patch image transform"
         )
+
+    # The encoder may pool patches, so the feature count can be a square
+    # downscale of the raw patch grid; recover the per-axis grid factor.
     raw_height, raw_width = patch_grid_shape(transform, height, width)
     factor_squared, remainder = divmod(raw_height * raw_width, feature_tokens)
     factor = math.isqrt(factor_squared)
@@ -488,11 +510,13 @@ def _vision_positions(
     grid_height, grid_width = raw_height // factor, raw_width // factor
     if grid_height * grid_width != feature_tokens:
         raise invalid_descriptor("vision output grid is not integral")
+
     temporal = torch.full(
         (query,),
         int(conditioning_position + (1 if close_image else 0)),
         dtype=torch.long,
     )
+    # Raster-order [feature_tokens] grid coordinates for the feature slots.
     y = torch.arange(grid_height, dtype=torch.long).repeat_interleave(grid_width)
     x = torch.arange(grid_width, dtype=torch.long).repeat(grid_height)
     spatial_y = torch.zeros(query, dtype=torch.long)
@@ -502,6 +526,7 @@ def _vision_positions(
     spatial_x[begin : begin + feature_tokens] = x
     if trailing and close_image:
         temporal[-1] = conditioning_position + 2
+
     return torch.stack((temporal, spatial_y, spatial_x))
 
 
@@ -522,14 +547,19 @@ def latent_state_row(
     builder = model_runner.image_builder
     if builder is None or builder.framing != 2:
         raise invalid_descriptor("latent feature publication requires framed image conditioning")
+
     size = image.Config(height, width)
     image_tokens = builder.denoiser.latent_shape("image", size)[0]
     if latent.reshape(-1, latent.shape[-1]).shape[0] != image_tokens:
         raise invalid_descriptor("state latent does not match the declared image dimensions")
+
     query = builder.sequence_length(size)
     positions = builder.positions(size, conditioning_position + 1, device=latent.device)
+    # Frame markers bound the image span: the first sits at the conditioning
+    # position, the last advances past the rope range of the image tokens.
     positions[0, 0] = conditioning_position
     positions[0, -1] = conditioning_position + builder.rope_advance
+
     cache = operations.cache_coordinates(
         state.pending_output(completion_group, operation.request_key.request_id),
         tables=request_tables,
@@ -570,6 +600,7 @@ def diffusion_finalize_frames(
     if not isinstance(metadata, ImageMetadata) or min(metadata.height, metadata.width) < 1:
         raise invalid_descriptor("frame materialization source is not an image tensor")
     value_range = metadata.value_range or (-1.0, 1.0)
+
     image_task = defer_image_encoding(
         operation,
         image,
@@ -596,12 +627,14 @@ def defer_image_encoding(
 
     if max_bytes < 1:
         raise invalid_descriptor("image materialization requires a positive completion bound")
+
     quantized = quantize_image_hwc(
         image,
         value_range=value_range,
     )
     if int(quantized.numel()) > max_bytes:
         raise invalid_descriptor("image staging exceeds its registered completion byte bound")
+
     capture = state.group_buffers[completion_group].capture_bytes(quantized)
     pending = state.pending_output(completion_group, operation.request_key.request_id)
     if len(pending.completion_tasks) != 1:

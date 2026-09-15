@@ -54,6 +54,7 @@ class BufferPool:
         if self.byte_capacity < 0:
             raise ValueError("persistent buffer capacity must not be negative")
         self.compact = bool(compact)
+
         normalized: list[torch.device] = []
         for raw in devices:
             device = canonical_device(raw)
@@ -62,6 +63,7 @@ class BufferPool:
         if not normalized:
             normalized.append(torch.device("cpu"))
         self.devices = tuple(normalized)
+
         self._arenas = {}
         for device in self.devices:
             if device.type == "cuda":
@@ -73,6 +75,7 @@ class BufferPool:
             else:
                 arena = torch.empty((self.byte_capacity,), dtype=torch.uint8, device=device)
             self._arenas[str(device)] = arena
+
         self._active: dict[tuple[str, BufferId], BufferBinding] = {}
         self._next_binding_id = 1
         self._lock = RLock()
@@ -85,11 +88,14 @@ class BufferPool:
             (binding for binding in self._active.values() if binding.device_name == device_name),
             key=lambda binding: binding.physical_offset,
         )
+
+        # Bindings start on 256-byte boundaries so any dtype view stays aligned.
         for active in active_bindings:
             start = ((cursor + 255) // 256) * 256
             if start + extent <= active.physical_offset:
                 return start
             cursor = max(cursor, active.physical_offset + active.physical_bytes)
+
         start = ((cursor + 255) // 256) * 256
         if start + extent > self.byte_capacity:
             spans = tuple(
@@ -126,10 +132,12 @@ class BufferPool:
         element_bytes = int(torch.empty((), dtype=dtype).element_size())
         if int(allocation.offset) % element_bytes != 0:
             raise invalid_descriptor("buffer allocation is not aligned for its output dtype")
+
         key = (device_name, allocation.buffer)
         with self._lock:
             if key in self._active:
                 raise invalid_descriptor("buffer allocation is already bound")
+
             extent = ((required + 255) // 256) * 256 if self.compact else int(allocation.bytes)
             start = (
                 self._compact_offset_locked(device_name, extent)
@@ -139,6 +147,7 @@ class BufferPool:
             end = start + extent
             if end > self.byte_capacity:
                 raise invalid_descriptor("buffer allocation exceeds the worker buffer pool")
+
             for active in self._active.values():
                 if active.device_name != device_name:
                     continue
@@ -147,6 +156,7 @@ class BufferPool:
                     and active.physical_offset < end
                 ):
                     raise invalid_descriptor("buffer allocation overlaps a live worker buffer")
+
             tensor = arena.narrow(0, start, required).view(dtype).reshape(shape)
             binding = BufferBinding(
                 buffer=allocation.buffer,

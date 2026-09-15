@@ -148,6 +148,7 @@ def _shared_norm_group_end(
     k_weight = k_weights[start]
     group_end = start + 1
     group_dim = int(axis_dims[start])
+
     while (
         group_end < len(axis_dims)
         and q_weights[group_end] is q_weight

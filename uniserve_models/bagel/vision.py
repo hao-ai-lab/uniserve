@@ -24,6 +24,7 @@ class Encoder(nn.Module):
         self.position = PositionEmbedding((side, side), config.text.hidden_size)
 
     def forward(self, pixels, grids, grid_shapes):
+        # [total_patches, text_hidden] after connector projection.
         features = self.connector(self.encoder(pixels, grids, grid_shapes))
         columns, rows = build_abs_positions_from_grid_hw(
             grids, total=sum(height * width for height, width in grid_shapes)

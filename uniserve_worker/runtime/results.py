@@ -63,6 +63,8 @@ def resolve_outputs(model: nn.Module, config: WorkerConfig) -> Mapping[str, tupl
                     raise ValueError(f"result {entry}.{name} has no protocol dtype")
                 if len(layout.variable_axes) > 1:
                     raise ValueError(f"result {entry}.{name} exceeds the protocol dynamic axes")
+                # A variable axis becomes a device-sized bound; every other
+                # extent is a static protocol dimension.
                 outputs.append(
                     OutputInfo(
                         product_name(call.module, name),
@@ -79,4 +81,5 @@ def resolve_outputs(model: nn.Module, config: WorkerConfig) -> Mapping[str, tupl
                 )
         if outputs:
             result[entry] = tuple(outputs)
+
     return MappingProxyType(result)

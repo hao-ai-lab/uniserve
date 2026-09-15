@@ -49,9 +49,14 @@ def subtract(
 
     if any(axis.start == axis.stop for axis in region):
         return ()
+
     overlap = intersection(region, covered)
     if overlap is None:
         return (region,)
+
+    # Peel the overlap dimension by dimension. Each axis contributes the slabs
+    # before and after it, then narrows the remainder to the overlap so slabs
+    # from later axes stay disjoint from the earlier ones.
     remainder = list(region)
     pieces = []
     for dim, axis in enumerate(overlap):
@@ -65,6 +70,7 @@ def subtract(
             piece[dim] = slice(axis.stop, current.stop)
             pieces.append(tuple(piece))
         remainder[dim] = axis
+
     return tuple(pieces)
 
 

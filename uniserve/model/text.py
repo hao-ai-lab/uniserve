@@ -31,6 +31,7 @@ class CausalLM(nn.Module):
                 hidden = torch.where(
                     replacement.mask.reshape(-1, 1), replacement.values.to(hidden.dtype), hidden
                 )
+
         return self.backbone(hidden, inputs.positions, inputs.attention, routes=inputs.routes)
 
     def compute_logits(self, hidden: torch.Tensor, *, token_indices: torch.Tensor) -> Logits | None:
@@ -46,5 +47,6 @@ class CausalLM(nn.Module):
             raise ValueError("logits require packed hidden rows and one-dimensional token indices")
         if token_indices.dtype not in {torch.int32, torch.int64}:
             raise ValueError("token indices must be integers")
+
         selected = hidden.index_select(0, token_indices)
         return Logits(self.lm_head(selected), self.lm_head.vocab)

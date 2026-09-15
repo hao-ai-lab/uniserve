@@ -66,6 +66,7 @@ class Dispatcher(Generic[Req, Res]):
         self._by_name = {provider.name: provider for provider in self._providers}
         if len(self._by_name) != len(self._providers):
             raise ValueError(f"operator {operator!r} has duplicate provider names")
+
         self._env_override = env_override
         self._signature = signature
         self._memo: dict[tuple[str | None, Any], str] = {}

@@ -81,12 +81,14 @@ class QuantizedTensor(torch.Tensor):
             raise ValueError("FP8 supports only linear scale storage")
         if out is not None:
             self._validate_output(out, scale_layout=scale_layout)
+
         if scale_layout is self.scale_layout:
             if out is None:
                 return self
             for name, value in self._buffers.items():
                 out._buffers[name].copy_(value)
             return out
+
         fields = dict(self._buffers)
         name = "block_scale" if self.quantizer.format == "nvfp4" else "scale"
         rows = prod(self.shape[:-1])
@@ -100,6 +102,7 @@ class QuantizedTensor(torch.Tensor):
         result = self.quantizer.from_tensors(
             fields, shape=tuple(self.shape), dtype=self.dtype, scale_layout=scale_layout
         )
+
         if out is None:
             return result
         for name, value in result._buffers.items():
@@ -166,6 +169,8 @@ class QuantizedTensor(torch.Tensor):
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         aten = torch.ops.aten
+
+        # View-like operations rebuild the wrapper over transformed buffers.
         if func in (
             aten.detach.default,
             aten.alias.default,
@@ -189,6 +194,7 @@ class QuantizedTensor(torch.Tensor):
             return value.quantizer.from_tensors(
                 fields, shape=tuple(value.shape), dtype=dtype, scale_layout=value.scale_layout
             )
+
         if func is aten.copy_.default:
             target, source = args[:2]
             if isinstance(target, QuantizedTensor):
@@ -206,11 +212,13 @@ class QuantizedTensor(torch.Tensor):
                         source.to(device=target.device, dtype=target.dtype), out=target
                     )
                 return target
+
         if func._schema.is_mutable:
             raise NotImplementedError(
                 f"quantized in-place operation {func} requires an encoding-aware implementation"
             )
 
+        # Remaining operations decode their operands and produce dense results.
         def dense(value):
             return value.dequantize() if isinstance(value, QuantizedTensor) else value
 
@@ -227,6 +235,7 @@ class _MXFP8Tensor(QuantizedTensor):
         rows, width = prod(self.shape[:-1]), self.shape[-1]
         scales = _linear_scales(self._buffers["scale"], rows, width // 32, self.scale_layout)
         scales = scales.view(torch.float8_e8m0fnu).float()
+        # [rows, width // 32, 32] blocks, one E8M0 exponent per block
         values = self._buffers["values"].float().reshape(rows, width // 32, 32)
         return (values * scales.unsqueeze(-1)).reshape(self.shape)
 
@@ -235,6 +244,7 @@ class _NVFP4Tensor(QuantizedTensor):
     def _decode(self):
         rows, width = prod(self.shape[:-1]), self.shape[-1]
         packed = self._buffers["values"]
+        # Two 4-bit codes per byte, low nibble first.
         codes = torch.stack((packed & 15, packed >> 4), dim=-1).long()
         # E2M1 has a sign bit and eight exactly representable magnitudes.
         magnitudes = torch.tensor((0, 0.5, 1, 1.5, 2, 3, 4, 6), device=self.device)
@@ -245,6 +255,7 @@ class _NVFP4Tensor(QuantizedTensor):
 
 
 def _linear_scales(scales, rows, columns, layout):
+    """Restore the [rows, columns] block-scale matrix from its storage layout."""
     if layout is ScaleLayout.LINEAR:
         return scales.reshape(rows, columns)
     padded_rows = (rows + 127) // 128 * 128
@@ -258,6 +269,7 @@ def _linear_scales(scales, rows, columns, layout):
 
 
 def _swizzle_scales(scales):
+    """Pack a [rows, columns] scale matrix into 128x4-swizzled flat storage."""
     rows, columns = scales.shape
     padded_rows = (rows + 127) // 128 * 128
     padded_columns = (columns + 3) // 4 * 4

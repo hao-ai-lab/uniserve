@@ -52,6 +52,9 @@ def prepare_image(
         height, width = image.height, image.width
         resized = _resize_patch_image(image, transform)
         normalized = _normalize(resized, transform.normalization)
+
+        # Unfold the [channels, height, width] image into row-major patches:
+        # [grid_height * grid_width, channels * patch * patch].
         patch = int(transform.patch_size)
         channels, resized_height, resized_width = normalized.shape
         grid_height = resized_height // patch
@@ -62,6 +65,7 @@ def prepare_image(
             .reshape(grid_height * grid_width, channels * patch * patch)
         )
         grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
+
         return PreparedImage(
             _stage(pixels, processor, device),
             grid.to(device=device, non_blocking=True),
@@ -70,10 +74,12 @@ def prepare_image(
             width,
         )
 
+    # The tower consumes the VAE-bounded canvas resized to its own stride.
     canvas = image
     if processor.vae is not None:
         canvas = _resize_stride(canvas, processor.vae.resize)
     height, width = canvas.height, canvas.width
+
     tower_image = _resize_stride(canvas, transform.resize)
     pixels = _normalize(tower_image, transform.normalization)
     return PreparedImage(_stage(pixels, processor, device), None, None, height, width)
@@ -96,10 +102,12 @@ def prepare_tensor_image(
         value = value[0]
     if value.ndim != 3 or int(value.shape[0]) != 3:
         raise invalid_descriptor("generated image tensor must have shape [3, height, width]")
+
     if signed_unit:
         value = (value + 1.0) * 0.5
     value = value.clamp(0.0, 1.0)
     source_height, source_width = int(value.shape[1]), int(value.shape[2])
+
     transform = processor.vit if kind is PipelineStage.VISION_ENCODING else processor.vae
     if transform is None:
         raise invalid_descriptor(f"model declares no {kind.value} image transform")
@@ -112,6 +120,8 @@ def prepare_tensor_image(
         )
         value = _resize_tensor(value, resized_height, resized_width)
         normalized = _normalize_tensor(value, transform.normalization)
+
+        # Unfold into row-major patches: [grid_height * grid_width, channels * patch * patch].
         patch = int(transform.patch_size)
         channels = int(normalized.shape[0])
         grid_height = resized_height // patch
@@ -122,6 +132,7 @@ def prepare_tensor_image(
             .reshape(grid_height * grid_width, channels * patch * patch)
         )
         grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
+
         return PreparedImage(
             _stage(pixels, processor, device),
             grid.to(device=device, non_blocking=True),
@@ -130,6 +141,8 @@ def prepare_tensor_image(
             source_width,
         )
 
+    # Fit within the long-edge, short-edge, pixel-count, and stride bounds in
+    # order; each violated bound rescales and re-aligns the target.
     resize = transform.resize
     scale = min(int(resize.max_size) / max(source_width, source_height), 1.0)
     scale = max(scale, int(resize.min_size) / min(source_width, source_height))
@@ -139,6 +152,7 @@ def prepare_tensor_image(
         scale,
         int(resize.stride),
     )
+
     if target_width * target_height > int(resize.max_pixels):
         scale = int(resize.max_pixels) / (target_width * target_height)
         target_width, target_height = _stride_shape(
@@ -155,6 +169,7 @@ def prepare_tensor_image(
             scale,
             int(resize.stride),
         )
+
     value = _resize_tensor(value, target_height, target_width)
     normalized = _normalize_tensor(value, transform.normalization)
     return PreparedImage(
@@ -177,6 +192,8 @@ def _decode_rgb(encoded: str) -> Image.Image:
         image.load()
     except (binascii.Error, OSError, ValueError) as error:
         raise invalid_descriptor("inline image payload is not a valid encoded image") from error
+
+    # Composite transparency onto white so alpha never reaches the towers.
     if image.mode == "RGBA" or image.info.get("transparency") is not None:
         rgba = image.convert("RGBA")
         rgb = Image.new("RGB", rgba.size, (255, 255, 255))
@@ -240,6 +257,7 @@ def _bounded_grid_shape(
         raise invalid_descriptor("image dimensions must be positive")
     if max(height, width) / min(height, width) > 200:
         raise invalid_descriptor("image aspect ratio must be at most 200")
+
     result_height = max(factor, round(height / factor) * factor)
     result_width = max(factor, round(width / factor) * factor)
     if result_height * result_width > maximum:

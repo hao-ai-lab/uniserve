@@ -16,6 +16,8 @@ from .config import Config, TransformerConfig
 
 
 class Attention(nn.Module):
+    """Multi-head self-attention over a variable-length patch sequence."""
+
     def __init__(self, config: TransformerConfig):
         super().__init__()
         heads = config.num_attention_heads
@@ -26,6 +28,7 @@ class Attention(nn.Module):
 
     def forward(self, patches: torch.Tensor, attention: VarlenInput) -> torch.Tensor:
         projections = self.qkv(patches)
+        # [total_patches, heads, head_dim]
         query, key, value = (
             projections[name].reshape(patches.shape[0], -1, self.attention.head_dim)
             for name in ("q", "k", "v")
@@ -35,6 +38,8 @@ class Attention(nn.Module):
 
 
 class TransformerLayer(nn.Module):
+    """Pre-norm attention and GELU MLP with residual connections."""
+
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.input_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -55,7 +60,8 @@ class Encoder(nn.Module):
     """Encode canonical HWC patch rows with separate attention per image.
 
     grids supplies one (height, width) pair per image. grid_shapes supplies
-    the corresponding host dimensions without reading device values. NCHW pixels may also be supplied with those same coordinates.
+    the corresponding host dimensions without reading device values. NCHW
+    pixels may also be supplied with those same coordinates.
     """
 
     def __init__(self, config: Config):
@@ -79,6 +85,9 @@ class Encoder(nn.Module):
     ) -> torch.Tensor:
         if pixels.ndim == 4:
             pixels = patchify(pixels, patch_size=self.config.patch_size).flatten(0, 1)
+
+        # pixels: [total_patches, channels * patch_size**2] after flattening;
+        # every image grid must fit the fixed learned position table.
         counts = tuple(height * width for height, width in grid_shapes)
         side = self.config.image_size // self.config.patch_size
         if (
@@ -91,10 +100,15 @@ class Encoder(nn.Module):
             raise ValueError(
                 "SigLIP patches and grid coordinates must cover the declared image grids"
             )
+
+        # Row-major absolute position index within the side x side patch grid.
         columns, rows = build_abs_positions_from_grid_hw(grids, total=sum(counts))
         positions = rows * side + columns
         features = self.patch_embedding(pixels.to(self.patch_embedding.weight.dtype))
         features = features + self.position_embedding(positions)
+
+        # Varlen attention needs each image's patch count on device and their
+        # prefix-sum offsets, while the host copy drives kernel launch shapes.
         values = grids.prod(dim=1).to(torch.int32)
         offsets = torch.cat((values.new_zeros(1), values.cumsum(0, dtype=torch.int32)))
         lengths = SequenceLengths(host=counts, values=values, offsets=offsets)

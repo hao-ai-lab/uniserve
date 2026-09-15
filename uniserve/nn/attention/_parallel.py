@@ -102,9 +102,11 @@ class AttentionRowExchange:
         chunk_rows = self.chunk_rows(self.tensor)
         outgoing = self.tensor.view(group.size, rows, *self.tensor.shape[1:])
         incoming, _ = self.partition_workspace(self.receive_workspace, self.tensor)
+
         producer, self.producer = self.producer, None
         if producer is None:
             raise RuntimeError("attention row production has already been consumed")
+
         intervals = _produce_chunks(
             group, outgoing.shape, self.tensor, incoming, chunk_rows, producer
         )
@@ -132,6 +134,7 @@ class ParallelAttention(torch.nn.Module):
         parallel: AttentionParallelConfig = AttentionParallelConfig(),
     ) -> None:
         torch.nn.Module.__init__(self)
+
         heads = () if parallel.heads is None else (parallel.heads.axis,)
         context = parallel.context
         context_axes = (
@@ -145,8 +148,10 @@ class ParallelAttention(torch.nn.Module):
         # disappear, and flattened token order follows the declared mesh.
         mesh.size((*heads, *context_axes))
         context_axes = tuple(axis for axis in mesh.axes if axis in context_axes)
+
         self.ulysses_group = mesh.get_group(heads)
         self.context_group = mesh.get_group(context_axes)
+
         self.mapped = (
             context is not None
             and context.peer_axis is not None
@@ -191,6 +196,7 @@ class ParallelAttention(torch.nn.Module):
         context = self.context_group
         if context.size == 1:
             return key, value
+
         workspace = self.context_buffers
         assert workspace is not None
         owner_rows = key.shape[0] * (self.col_group.size if self.col_group is not None else 1)
@@ -205,6 +211,7 @@ class ParallelAttention(torch.nn.Module):
             or value.device != workspace.value.device
         ):
             raise ValueError("context K/V exceeds its declared tensor storage")
+
         if self.mapped:
             if self.col_group is not None:
                 rows = key.shape[0] * self.col_group.size
@@ -218,6 +225,7 @@ class ParallelAttention(torch.nn.Module):
                 workspace.local_value[:rows].copy_(value)
             self.key_group._all_gather_into_tensor(workspace.sync_output, workspace.sync_input)
             return workspace.key, workspace.value
+
         rows = key.shape[0] * context.size
         context_key, context_value = workspace.key[:rows], workspace.value[:rows]
         context._all_gather_into_tensor(context_key, key.contiguous())
@@ -260,6 +268,8 @@ class ParallelAttention(torch.nn.Module):
         group = self.ulysses_group
         if query.ndim != 3 or query.shape[0] % group.size:
             raise ValueError("attention output rows must divide Ulysses membership")
+
+        # [tokens / group, heads * group, head_dim]: the row owner's compact view.
         shape = (
             query.shape[0] // group.size,
             query.shape[1] * group.size,
@@ -278,6 +288,8 @@ class ParallelAttention(torch.nn.Module):
         return tuple(peer.view(-1)[: query.numel()].view(shape) for peer in peers)
 
 
+# Call-scoped buffer bindings: layers borrow caller-owned storage through these
+# context variables instead of holding references between invocations.
 _CONTEXT: ContextVar[Mapping[ParallelAttention, AttentionBuffers]] = ContextVar(
     "parallel_attention_context", default={}
 )

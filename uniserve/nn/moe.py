@@ -61,11 +61,12 @@ class FusedMoE(nn.Module):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        """Route flattened rows to top-k experts and reduce tensor-parallel partial outputs."""
+        """Route flattened rows to top-k experts and accumulate their gated outputs."""
 
         original_shape = hidden_states.shape
         flat = hidden_states.reshape(-1, original_shape[-1])
         flat_logits = router_logits.reshape(-1, router_logits.shape[-1])
+
         weights, expert_ids = self.topk(flat_logits)
         weights = weights.to(flat.dtype)
         out = torch.zeros_like(flat)
@@ -75,4 +76,5 @@ class FusedMoE(nn.Module):
             gate = (weights * (expert_ids == expert_idx)).sum(dim=-1)
             expert_out = expert(flat)
             out += expert_out * gate.unsqueeze(-1).to(expert_out.dtype)
+
         return out.reshape(original_shape)

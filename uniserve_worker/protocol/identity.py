@@ -19,6 +19,8 @@ class ComputationId:
     _hash_value: int | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        """Validate the uint64 batch, uint32 request ordinal, and admission-identity rule."""
+
         if not 0 <= self.batch_id <= 0xFFFFFFFFFFFFFFFF:
             raise invalid_descriptor("computation batch id is outside uint64")
         if not 0 <= self.request_index <= 0xFFFFFFFF:
@@ -37,6 +39,8 @@ class ComputationId:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "computation_id") -> ComputationId:
+        """Parse a batch and request-ordinal pair, passing through live instances."""
+
         if isinstance(value, cls):
             return value
         data = _map(value, where)
@@ -46,6 +50,8 @@ class ComputationId:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize the computation identity for IPC."""
+
         return {"batch_id": self.batch_id, "request_index": self.request_index}
 
 
@@ -154,6 +160,8 @@ class BufferId:
 def _interned_request_key(engine_id: int, request_id: int, request_epoch: int) -> RequestKey:
     """Reuse an immutable request key for identical engine, request, and epoch values."""
 
+    # Callers have already validated the coordinates, so __post_init__ is skipped
+    # to keep interning a pure allocation on the hot decode path.
     key = object.__new__(RequestKey)
     object.__setattr__(key, "engine_id", engine_id)
     object.__setattr__(key, "request_id", request_id)

@@ -30,7 +30,9 @@ class LatentStaging:
     """Fixed-address page-table and contiguous value views for one operation."""
 
     page_table: tuple[int, ...]
+    # Device page indices for this operation, [len(page_table)] int64.
     pages: torch.Tensor
+    # Contiguous staged values, [len(page_table) * page_units, latent_width].
     value: torch.Tensor
 
 
@@ -41,6 +43,7 @@ class LatentImport:
     product: TensorRef
     request_pool_idx: int
     page_table: tuple[int, ...]
+    # Per-page value views, padding excluded: [units_in_page, latent_width].
     spans: tuple[torch.Tensor, ...]
     transfers: tuple[TransferTicket, ...] = ()
     adopted: bool = False
@@ -82,6 +85,7 @@ class LatentPool:
             raise ValueError("latent-pool shape must contain slots, pages, and elements")
         if not dtype.is_floating_point:
             raise ValueError("latent-pool storage must use a floating dtype")
+
         self.request_pool_size = int(request_pool_size)
         self.num_pages = int(num_pages)
         self.page_units = int(page_units)
@@ -92,21 +96,25 @@ class LatentPool:
 
         # Page zero remains outside scheduler capacity; the two banks alternate
         # source and destination roles across diffusion steps.
+        # [2, num_pages, page_units, latent_width]
         self.storage = torch.zeros(
             (2, self.num_pages, self.page_units, self.latent_width),
             dtype=self.dtype,
             device=self.device,
         )
+        # [capacity_units, latent_width]
         self.step_buffer = torch.empty(
             (self.capacity_units, self.latent_width),
             dtype=self.dtype,
             device=self.device,
         )
+        # [num_pages - 1]
         self.page_table_buffer = torch.empty(
             self.num_pages - 1,
             dtype=torch.int64,
             device=self.device,
         )
+        # [request_pool_size + 1, 2]
         self.timestep_pairs = torch.empty(
             (self.request_pool_size + 1, 2),
             dtype=torch.float32,
@@ -154,12 +162,15 @@ class LatentPool:
 
         if any(self._slot_pages) or self._imports or self._sources:
             raise RuntimeError("startup scratch requires an idle latent pool")
+
         count = (units + self.page_units - 1) // self.page_units
         pages = tuple(tuple(range(1 + row * count, 1 + (row + 1) * count)) for row in range(rows))
         views = tuple(item.value[:units] for item in self.stage(pages, (units,) * rows))
         try:
             yield views
         finally:
+            # The buffer is borrowed again by the first admitted operation, so
+            # startup writes must be complete before control returns.
             if self.device.type == "cuda":
                 torch.cuda.current_stream(self.device).synchronize()
 
@@ -179,6 +190,7 @@ class LatentPool:
 
         if not page_tables or len(page_tables) != len(latent_units):
             raise invalid_descriptor("latent staging columns are not aligned")
+
         canonical: list[tuple[int, ...]] = []
         total_pages = 0
         for page_table, units in zip(page_tables, latent_units, strict=True):
@@ -187,11 +199,14 @@ class LatentPool:
             total_pages += len(pages)
         if total_pages > self.num_pages - 1:
             raise invalid_descriptor("latent staging exceeds the fixed step buffer")
+
         flattened = tuple(page for pages in canonical for page in pages)
         if len(set(flattened)) != len(flattened):
             raise invalid_descriptor("latent staging page tables overlap")
         if set(flattened).intersection(page for item in occupied for page in item.page_table):
             raise invalid_descriptor("latent staging page tables overlap live operations")
+
+        # Place this batch in the lowest free range past every occupied view.
         ranges = sorted(
             (int(item.pages.storage_offset()), len(item.page_table)) for item in occupied
         )
@@ -202,6 +217,7 @@ class LatentPool:
             page_offset = max(page_offset, start + count)
         if page_offset + total_pages > self.num_pages - 1:
             raise resource_error("live latent staging exceeds the fixed step buffer")
+
         self._device_pages(flattened, offset=page_offset)
         result: list[LatentStaging] = []
         unit_offset = page_offset * self.page_units
@@ -232,6 +248,9 @@ class LatentPool:
         pages = self._validate_staging(staging, int(latent_units))
         self._require_empty(slot)
         self._require_page_owners(pages, 0)
+
+        # A fresh trajectory starts in bank one; bank zero stays reserved for
+        # adopted imports.
         self._require_writable(1, pages)
         self._write_pages(1, staging.pages, staging.value)
 
@@ -260,6 +279,7 @@ class LatentPool:
         )
         self._require_slot_pages(slot, pages)
         self._require_page_owners(pages, slot)
+
         bank = int(self._active[slot].item())
         torch.index_select(
             self.storage[bank],
@@ -294,6 +314,7 @@ class LatentPool:
         )
         self._require_slot_pages(slot, pages)
         self._require_page_owners(pages, slot)
+
         bank = 1 - int(self._active[slot].item())
         self._require_writable(bank, pages)
         self._write_pages(bank, staging.pages, staging.value)
@@ -316,6 +337,8 @@ class LatentPool:
         self._reap_sources()
         slot = self._validate_slot(request_pool_idx)
         pages = self._validate_page_table(page_table, latent_units)
+
+        # The successor was written to the inactive bank and is not yet active.
         bank = 1 - int(self._active[slot].item())
         self._require_writable(bank, pages)
         return self._reserve_source(product, slot, bank, pages, latent_units)
@@ -365,8 +388,12 @@ class LatentPool:
         pages: tuple[int, ...],
         latent_units: int,
     ) -> LatentExport:
+        """Register one immutable bank version with its per-page value spans."""
+
         if product.buffer_id in self._sources:
             raise invalid_descriptor("latent publication generation is already registered")
+
+        # Each span excludes its page's padding: [units_in_page, latent_width].
         source = LatentExport(
             product.buffer_id,
             slot,
@@ -414,6 +441,8 @@ class LatentPool:
         )
 
     def _require_writable(self, bank: int, pages: Sequence[int]) -> None:
+        """Reject writes that would clobber a published version's pages."""
+
         self._reap_sources()
         selected = set(pages)
         if any(
@@ -423,6 +452,8 @@ class LatentPool:
             raise resource_error("latent page bank still has a published version")
 
     def _reap_sources(self) -> None:
+        """Drop fully retired sources and finish clearing their slots."""
+
         for buffer, source in tuple(self._sources.items()):
             if not source.released or any(
                 not future.done() or future.exception() is not None for future in source.retirements
@@ -472,6 +503,7 @@ class LatentPool:
         )
         if len(set(slots)) != len(slots):
             raise invalid_descriptor("latent commit repeats a request slot")
+
         claimed_pages: set[int] = set()
         for publication in publications:
             params = publication.latent_params
@@ -485,6 +517,9 @@ class LatentPool:
                 height=int(params.height),
                 width=int(params.width),
             )
+
+            # An expected generation of zero marks slot initialization; every
+            # later publication must advance the committed trajectory.
             expected = int(publication.latent_expected_generation)
             if expected == 0:
                 if int(publication.latent_expected_step) != 0 or int(publication.latent_step) != 0:
@@ -509,6 +544,7 @@ class LatentPool:
             if not claimed_pages.isdisjoint(pages):
                 raise invalid_descriptor("latent commit publications overlap physical pages")
             claimed_pages.update(pages)
+
         for release in releases:
             params = release.latent_params
             assert params is not None
@@ -550,6 +586,8 @@ class LatentPool:
                 for page in pages:
                     self._owners[page] = slot
                 self._slot_pages[slot] = pages
+
+            # The successor was written to the inactive bank; flip it active.
             bank = 1 - int(self._active[slot].item())
             self._active[slot] = bank
             self._steps[slot] = int(publication.latent_step)
@@ -557,6 +595,7 @@ class LatentPool:
             self._units[slot] = int(params.latent_units)
             self._heights[slot] = int(params.height)
             self._widths[slot] = int(params.width)
+
         for release in releases:
             params = release.latent_params
             assert params is not None
@@ -585,6 +624,8 @@ class LatentPool:
         self._require_empty(slot)
         pages = self._validate_page_table(page_table, int(latent_units))
         self._require_page_owners(pages, 0)
+
+        # One span per page, padding excluded: [units_in_page, latent_width].
         spans = tuple(
             self.storage[0, page, : min(self.page_units, int(latent_units) - offset)]
             for page, offset in zip(
@@ -626,12 +667,15 @@ class LatentPool:
         # stream; readiness alone does not authorize use of the page contents.
         for transfer in write.transfers:
             transfer.result()
+
         units = sum(int(span.shape[0]) for span in write.spans)
         self._validate_metadata(
             generation=generation, step=step, latent_units=units, height=height, width=width
         )
         if generation != write.product.generation:
             raise invalid_descriptor("latent import generation disagrees with its product")
+
+        # Imported pages live in bank zero, which becomes the active bank.
         slot = write.request_pool_idx
         self._slot_pages[slot] = write.page_table
         self._active[slot] = 0
@@ -651,6 +695,7 @@ class LatentPool:
         self._require_import(write)
         if write.adopted:
             raise invalid_descriptor("resident latent import cannot be abandoned")
+
         write.released = True
         for transfer in write.transfers:
             transfer.cancel()
@@ -665,11 +710,13 @@ class LatentPool:
             if write.product.request_key in requests:
                 for transfer in write.transfers:
                     transfer.retirement_ready()
+
         for source in self._sources.values():
             if source.buffer.owner in requests:
                 for future in source.retirements:
                     if future.done():
                         future.result()
+
         self._reap_imports()
         self._reap_sources()
         return all(
@@ -684,10 +731,14 @@ class LatentPool:
                 self.abandon_import(write)
 
     def _require_import(self, write: LatentImport) -> None:
+        """Reject stale handles whose reservation was adopted or revoked."""
+
         if self._imports.get(write.request_pool_idx) is not write or write.released:
             raise invalid_descriptor("latent import reservation is no longer writable")
 
     def _reap_imports(self) -> None:
+        """Drop finished imports and release the pages of abandoned ones."""
+
         for slot, write in tuple(self._imports.items()):
             if not write.adopted and not write.released:
                 continue
@@ -721,8 +772,10 @@ class LatentPool:
         self._reap_sources()
         if self._imports or self._sources:
             raise resource_error("latent physical reads must retire before pool shutdown")
+
         self.exports.clear()
         self.export_releases.clear()
+        # Drop device allocations while keeping each attribute well-typed.
         for name, dtype in (
             ("storage", self.dtype),
             ("step_buffer", self.dtype),
@@ -790,6 +843,8 @@ class LatentPool:
             else tuple(int(value) for value in pages)
         )
         self._reap_sources()
+
+        # Fresh pages (owner 0) must also be free of published bank versions.
         if owner == 0 and any(
             source.request_pool_idx != publication_slot
             and not set(canonical).isdisjoint(source.page_table)
@@ -863,16 +918,20 @@ class LatentPool:
             if not write.adopted:
                 for transfer in write.transfers:
                     transfer.cancel()
+
         sources = tuple(
             source for source in self._sources.values() if source.request_pool_idx == slot
         )
         if write is not None or sources:
+            # Physical readers may still hold the pages; defer the metadata
+            # reset until every import and source of this slot retires.
             self._retiring_slots.add(slot)
             # A provisional producer can publish before the first lane commit.
             # Remember its pages so abandoning that lane cannot leak ownership.
             if not self._slot_pages[slot]:
                 self._slot_pages[slot] = tuple(pages)
             return
+
         self._retiring_slots.discard(slot)
         for page in pages:
             self._owners[int(page)] = 0
@@ -896,6 +955,9 @@ class LatentPool:
 
         slot, host = self._page_table_staging.acquire()
         fill_cpu_ints(host, pages)
+
+        # The copy may be asynchronous; the staging slot keeps the pinned host
+        # source alive until the copy is known to be complete.
         target = self.page_table_buffer[offset : offset + len(pages)]
         target.copy_(host[: len(pages)], non_blocking=self.device.type == "cuda")
         self._page_table_staging.record_copy(slot)

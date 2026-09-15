@@ -43,12 +43,14 @@ def allocate_output_storage(
 
     if min(rows, heads, head_dim) < 1:
         raise ValueError("attention output extents must be positive")
+
     allocations = {}
     bindings = {}
     for layer in layers:
         group = layer.ulysses_group
         if rows % group.size:
             raise ValueError("attention output rows must divide Ulysses membership")
+
         schema = {
             "output": BufferConfig((rows // group.size, heads * group.size, head_dim), dtype),
             "receive": BufferConfig((rows // group.size, heads * group.size, head_dim), dtype),
@@ -59,8 +61,10 @@ def allocate_output_storage(
             allocation = TensorBuffers.allocate(
                 schema, device=group.device, symmetric={"output": group, "receive": group}
             )
+            # Each rank seeds its own sync slot for the peer rendezvous.
             allocation.view(schema)["sync_input"].fill_(group.rank)
             allocations[group] = allocation
+
         allocation = allocations[group]
         views = allocation.view(schema)
         bindings[layer] = OutputBuffers(
@@ -88,6 +92,7 @@ def allocate_attention_context(
         raise ValueError("attention context extents must be positive")
     if rows % block_size:
         raise ValueError("attention context rows must align to its validity blocks")
+
     shape = (rows, heads, head_dim)
     if mapped:
         keys = allocate_peer_workspace(
@@ -105,10 +110,13 @@ def allocate_attention_context(
         key, value = keys.global_tensor, values.global_tensor
         local_key, local_value = keys.local, values.local
     else:
+        # Replicated compact domain: each rank owns one contiguous row window.
         key = torch.empty((rows * group.size, *shape[1:]), dtype=dtype, device=group.device)
         value = torch.empty_like(key)
         begin = group.rank * rows
         local_key, local_value = key[begin : begin + rows], value[begin : begin + rows]
+
+    # Trailing fields: per-block valid-row counts, local fence, per-peer fences.
     return AttentionBuffers(
         key,
         value,
@@ -143,6 +151,7 @@ def allocate_context_storage(
     for layer in layers:
         if layer.context_group.size == 1:
             continue
+
         group = layer.key_group
         gathered_rows = rows * (layer.col_group.size if layer.col_group is not None else 1)
         key = (group, gathered_rows, layer.mapped)
@@ -156,5 +165,7 @@ def allocate_context_storage(
                 dtype=dtype,
                 block_size=block_size,
             )
+
         bindings[layer] = allocations[key]
+
     return MappingProxyType(bindings)

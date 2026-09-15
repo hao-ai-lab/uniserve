@@ -40,10 +40,13 @@ def _prepare_kernel(
     # execution. Scatter CTAs preserve update()'s checks and initialization.
     if tl.program_id(0) == tl.num_programs(0) - 1:
         if tl.program_id(1) == 0:
+            # queries/prefixes are per-sequence length columns; offsets are
+            # cumulative over the batch with one extra leading zero entry.
             rows = tl.arange(0, sequence_block)
             q = tl.load(queries + rows * sequence_strides[0], rows < batch_size, 0)
             p = tl.load(prefixes + rows * sequence_strides[1], rows < batch_size, 0)
             tl.store(lengths + rows, q + p, rows < batch_size)
+
             q_offset = tl.load(query_offsets + rows * sequence_strides[2], rows <= batch_size, 0)
             p_offset = tl.load(prefix_offsets + rows * sequence_strides[3], rows <= batch_size, 0)
             # Prefix and query offsets are cumulative in the same sequence
@@ -79,6 +82,7 @@ def prepare(state, key, value, batch, *, lengths, offsets):
 
     indices = batch.write_indices
     fused = False
+
     if indices is not None:
         if state is None:
             raise RuntimeError("attention cache update requires bound prefix state")
@@ -86,6 +90,9 @@ def prepare(state, key, value, batch, *, lengths, offsets):
         fused = _triton_paged_kv_write_eligible(state.key, state.value, indices, None, key, value)
         if not fused:
             state.update(key, value, indices=indices)
+
+    # The last CTA builds the metadata columns; the leading CTAs scatter the
+    # current K/V rows into the cache when the write was fused into this launch.
     rows = key.shape[0] if fused else 0
     width = key.shape[1] * key.shape[2] if fused else 0
     columns = (
@@ -94,6 +101,7 @@ def prepare(state, key, value, batch, *, lengths, offsets):
         batch.queries.offsets,
         batch.prefixes.offsets,
     )
+
     with torch.cuda.device(lengths.device):
         _prepare_kernel[(rows + 1, max(1, triton.cdiv(width, 256)))](
             *columns,

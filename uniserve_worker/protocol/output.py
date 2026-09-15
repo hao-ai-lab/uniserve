@@ -22,6 +22,7 @@ from .validation import _bool, _enum, _map, _optional_uint, _seq, _str, _uint, _
 def _logprob_entries(value: object) -> tuple[tuple[int, float, int], ...]:
     """Read ranked scores carried directly by a result record."""
 
+    # Each entry decodes to (token_id, logprob, rank) for one candidate token.
     entries = []
     for item in _seq(value, "logprob entries"):
         data = _map(item, "logprob entry")
@@ -32,6 +33,7 @@ def _logprob_entries(value: object) -> tuple[tuple[int, float, int], ...]:
                 _uint(data.get("rank"), "logprob.rank"),
             )
         )
+
     return tuple(entries)
 
 
@@ -269,6 +271,7 @@ class RequestOutput:
             if data.get("media_output") is None
             else MediaOutput.from_mapping(data["media_output"], f"{where}.media_output"),
         )
+
         record.validate()
         return record
 
@@ -362,6 +365,7 @@ class ForwardStats:
             return cls()
         if len(values) == 1:
             return values[0]
+
         merged: dict[str, object] = {}
         for name in cls.__dataclass_fields__:
             fields = tuple(getattr(value, name) for value in values)
@@ -373,6 +377,7 @@ class ForwardStats:
                 merged[name] = totals
             else:
                 merged[name] = sum(cast(tuple[int, ...], fields))
+
         return cls(**cast(Any, merged))
 
     @classmethod
@@ -430,6 +435,7 @@ class ForwardStats:
                 "spec_verify_committed_tokens",
             )
         }
+
         return cls(
             mode_counts=map_fields["mode_counts"],
             mode_tokens=map_fields["mode_tokens"],
@@ -498,6 +504,9 @@ class BatchOutput:
             (value.batch_id, value.run_id) != (first.batch_id, first.run_id) for value in fragments
         ):
             raise invalid_descriptor("output fragments belong to different batches")
+
+        # Only fragments that carry results participate in merged timing,
+        # stats, and registration visibility; empty fragments are inert.
         payloads = tuple(
             value
             for value in fragments
@@ -510,6 +519,7 @@ class BatchOutput:
             value.worker_exec_us for value in payloads if value.worker_exec_us is not None
         )
         stats = tuple(value.forward_stats for value in payloads if value.forward_stats is not None)
+
         return cls(
             batch_id=first.batch_id,
             run_id=first.run_id,

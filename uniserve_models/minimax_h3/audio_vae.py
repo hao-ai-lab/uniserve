@@ -111,6 +111,7 @@ class Config:
                 raise ValueError(f"H3 {name} must be finite")
         if any(value <= 0 for value in self.latents_std):
             raise ValueError("H3 latent standard deviations must be positive")
+
         for name in (
             "encoder_dim",
             "latent_dim",
@@ -137,6 +138,7 @@ class Config:
                 )
             ):
                 raise ValueError(f"H3 audio {name} must contain positive integers")
+
         if len(self.decoder_rates) != len(self.decoder_kernel_sizes):
             raise ValueError("H3 audio decoder rates and kernels must have matching stages")
         if not isinstance(self.resblock_dilation_sizes, tuple) or len(
@@ -206,6 +208,7 @@ class Model(LatentDecoder):
         decoded = super().forward(latents).float()
         if decoded.ndim != 3 or decoded.shape[:2] != (2, 1):
             raise RuntimeError("audio decoder must produce two mono channel timelines")
+        # [stereo, samples] float waveforms become [samples, 2] int16 PCM.
         return (
             decoded[:, 0]
             .transpose(0, 1)
@@ -223,6 +226,7 @@ def assignments(model: Model, reader):
 
     available = frozenset(reader.names())
     values = []
+    # Translate the module's sequential container names to native field names.
     for name, parameter in model.named_parameters():
         source = name.replace("decoder.input.", "dec_in_proj.").replace(
             "decoder.network.", "decoder."

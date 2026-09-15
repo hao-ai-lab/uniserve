@@ -59,6 +59,8 @@ class Pattern:
 
 @dataclass(frozen=True, slots=True)
 class BlockInput:
+    """Per-head selected key-block indices over the declared query-tile domain."""
+
     pattern: Pattern
     block_indices: torch.Tensor
     block_counts: torch.Tensor
@@ -85,6 +87,8 @@ class BlockInput:
 
 @dataclass(frozen=True, slots=True)
 class Input:
+    """Dense tile-64 prefix and video domains that selection and compression share."""
+
     padded_tokens: int
     prefix_tiles: int
     video_tiles: int
@@ -120,10 +124,18 @@ class Input:
     def pattern(
         self, query_tiles: int, *, selected_tiles: int, query_tile_offset: int = 0
     ) -> Pattern:
+        """Key-tile counts per query tile for a window of the token domain.
+
+        Prefix query tiles see every dense key tile; video query tiles see the
+        dense prefix plus their selected video tiles; trailing padding tiles
+        attend to a single tile so their count stays positive.
+        """
+
         if not 1 <= selected_tiles <= self.video_tiles or query_tiles < 1 or query_tile_offset < 0:
             raise ValueError("VSA selection requires positive bounded video and query tile counts")
         if query_tile_offset + query_tiles > self.padded_tokens // 64:
             raise ValueError("VSA query tiles exceed their complete token domain")
+
         counts = tuple(
             self.valid_tiles
             if tile < self.prefix_tiles

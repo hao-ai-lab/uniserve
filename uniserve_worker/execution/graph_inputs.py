@@ -67,12 +67,19 @@ def select_flow_captures(
 
 
 def select_prefill_captures(token_sizes, row_sizes, *, max_rows, max_tokens, visual=False):
+    """Build prefill capture buckets from configured token and row sizes.
+
+    Each row bucket carries the previous bucket's row count as its live-row
+    minimum, so a bucket only serves batches larger than the next smaller one.
+    """
+
     buckets = []
     variants = ((True, TokenSelection.LAST_LOGITS),)
     if visual:
         # Feature appends expose the whole image to each query, optionally
         # sampling at its trailing marker after publishing the prefix.
         variants += ((False, TokenSelection.LAST_LOGITS), (False, TokenSelection.HIDDEN))
+
     minimum_rows = 1
     for rows in sorted({int(value) for value in row_sizes if value > 1}):
         if minimum_rows > max_rows:
@@ -106,6 +113,8 @@ def tensor_leaves(value):
 
 
 def map_tensors(value, transform):
+    """Apply transform to every tensor leaf, preserving the record structure."""
+
     if isinstance(value, torch.Tensor):
         return transform(value)
     if is_dataclass(value) and not isinstance(value, type):
@@ -145,6 +154,8 @@ def clone_inputs(value):
 
 
 def copy_inputs(target, source):
+    """Copy every tensor leaf of source into the matching leaf of target."""
+
     _copy_tensors(tuple(tensor_leaves(target)), tuple(tensor_leaves(source)))
 
 
@@ -227,6 +238,7 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
     inputs = batch.inputs
     if not isinstance(inputs, TextInput) or not isinstance(inputs.attention, PagedInput):
         return None
+
     attention = inputs.attention
     selection = batch.token_selections[0]
     causal = attention.causal[0]
@@ -236,6 +248,7 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
         length < 1 for length in attention.queries.host
     ):
         return None
+
     width = max(context_blocks, attention.block_table.indices.shape[1])
     if (
         batch.forward_mode is ForwardMode.DECODE
@@ -246,6 +259,7 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
         rows = next((value for value in decode_sizes if value >= batch.row_count), None)
         if rows is not None:
             return rows, rows, width, True
+
     shapes = tuple(
         shape
         for shape in prefill_shapes
@@ -261,6 +275,8 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
 
 
 def _fixed_view(tensor, shape):
+    """Borrow a leading view of shape from a bucket tensor's captured storage."""
+
     strides = tensor.stride()
     if len(shape) != tensor.ndim or any(value < 0 for value in shape):
         raise GraphMiss("graph view rank changed")
@@ -284,6 +300,7 @@ def pad_text(batch, rows, tokens, width, decode):
     attention, live_tokens = inputs.attention, inputs.input_ids.numel()
     if rows < live_rows or tokens < live_tokens:
         raise GraphMiss("graph shape is smaller than its live inputs")
+
     padding, extra = tokens - live_tokens, rows - live_rows
     if padding and not extra:
         raise GraphMiss("token padding requires an additional sequence")
@@ -291,16 +308,22 @@ def pad_text(batch, rows, tokens, width, decode):
         # The staged lengths and offsets already describe the whole bucket.
         # Only page-table capacity can differ from the captured view.
         return widen_prefix(batch, width)
+
+    # Padding tokens belong to one additional inert sequence; any further
+    # padding rows are empty sequences.
     dummy = (1,) * extra if decode else ((padding,) + (0,) * (extra - 1) if extra else ())
     host_queries = attention.queries.host + dummy
+
     ids = _fixed_view(inputs.input_ids, (tokens,))
     ids[live_tokens:].zero_()
     positions = _fixed_view(inputs.positions, (*inputs.positions.shape[:-1], tokens))
     positions[..., live_tokens:].zero_()
+
     slots = _fixed_view(batch.request_pool_indices, (rows,))
     slots[live_rows:].zero_()
     table = _fixed_view(attention.block_table.indices, (rows, width))
     table[live_rows:].zero_()
+
     queries = _fixed_view(attention.queries.values, (rows,))
     queries[live_rows:].zero_()
     if decode:
@@ -309,14 +332,17 @@ def pad_text(batch, rows, tokens, width, decode):
         queries[live_rows : live_rows + 1].fill_(padding)
     query_offsets = _fixed_view(attention.queries.offsets, (rows + 1,))
     torch.cumsum(queries, dim=0, out=query_offsets[1:])
+
     prefix = _fixed_view(attention.prefixes.values, (rows,))
     prefix[live_rows:].zero_()
     prefix_offsets = _fixed_view(attention.prefixes.offsets, (rows + 1,))
     torch.cumsum(prefix, dim=0, out=prefix_offsets[1:])
+
     writes = attention.write_indices
     if writes is not None:
         writes = _fixed_view(writes, (tokens,))
         writes[live_tokens:].fill_(-1)
+
     padded = PagedInput(
         SequenceLengths(host=host_queries, values=queries, offsets=query_offsets),
         SequenceLengths(
@@ -326,6 +352,7 @@ def pad_text(batch, rows, tokens, width, decode):
         writes,
         (attention.causal[0],) * rows,
     )
+
     embeddings = inputs.embeddings
     if embeddings is not None:
         values = _fixed_view(embeddings.values, (tokens, embeddings.values.shape[1]))
@@ -333,10 +360,12 @@ def pad_text(batch, rows, tokens, width, decode):
         values[live_tokens:].zero_()
         mask[live_tokens:].zero_()
         embeddings = EmbeddingReplacement(values, mask)
+
     finish = batch.decode_force_finish
     if finish is not None:
         finish = _fixed_view(finish, (rows,))
         finish[live_rows:].zero_()
+
     return replace(
         batch,
         inputs=replace(
@@ -464,6 +493,7 @@ class BatchGraph:
             attention = getattr(batch.inputs, "attention", None)
             if attention is not None:
                 context.bind_attention(bind_inputs(self.inputs.inputs.attention, attention))
+
             output, greedy = self.graph.replay()
             count = batch.row_count if rows is None else rows
             values = output.values
@@ -486,6 +516,8 @@ class BatchGraph:
 
 
 def private_pool_bytes(device, pools):
+    """Sum memory-pool segment bytes the given pools hold on this device."""
+
     if device.type != "cuda" or not pools:
         return 0
     index = torch.cuda.current_device() if device.index is None else device.index
@@ -514,6 +546,7 @@ def greedy_decode(
         or any(selection is not TokenSelection.LAST_LOGITS for selection in batch.token_selections)
     ):
         return None
+    # [rows, vocab] logits, gathered from one contiguous graph output.
     rows = tuple(value.reshape(-1) for value in output.values)
     logits = adjacent_view(rows)
     if logits is None:
@@ -522,6 +555,7 @@ def greedy_decode(
     partitions = output.vocabularies
     if any(partition != partitions[0] for partition in partitions):
         return None
+
     max_values, tokens = greedy(logits, partitions[0])
     valid = torch.isfinite(max_values)
     active = predicate_state.index_select(0, batch.request_pool_indices.reshape(-1))
@@ -529,6 +563,9 @@ def greedy_decode(
     continuation = valid & active & ~finish
     tags = torch.where(continuation, TOKEN_CONTINUATION_BIT, 0)
     tagged_tokens = tokens.bitwise_or(tags)
+
+    # Fixed four-section layout [valid | active | tokens | reserved] per row;
+    # trim_greedy depends on these exact sections when slicing padded rows.
     completion = torch.cat(
         (
             valid,
@@ -561,6 +598,9 @@ def trim_greedy(
         raise CUDAGraphError("CUDA graph greedy output has invalid row count")
     if rows == total:
         return output
+
+    # Slice each of the four completion sections independently; they are
+    # concatenated along the row axis, so a plain [:rows] cut would mix them.
     completion = torch.cat(
         tuple(output.completion[index * total : index * total + rows] for index in range(4))
     )

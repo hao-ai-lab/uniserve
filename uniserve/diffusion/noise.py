@@ -9,6 +9,13 @@ import torch
 
 @dataclass(frozen=True, slots=True)
 class NoiseScale:
+    """Resolution-dependent scale for initial normal draws.
+
+    ``constant`` keeps ``value``. ``resolution`` multiplies by
+    ``sqrt(tokens / base_tokens)``; ``dynamic_sqrt`` additionally takes the
+    square root of the result. The scale is capped at ``maximum``.
+    """
+
     value: float
     mode: Literal["constant", "resolution", "dynamic_sqrt"]
     base_tokens: float

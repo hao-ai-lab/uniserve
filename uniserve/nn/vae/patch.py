@@ -49,11 +49,16 @@ class PatchAutoencoder(nn.Module):
     def encode(
         self, pixels: torch.Tensor, *, generator: torch.Generator | None = None
     ) -> torch.Tensor:
+        """Sample NCHW pixels into normalized latent patch rows."""
+
         if pixels.ndim != 4:
             raise ValueError("latent encoding requires NCHW pixels")
+
         dtype = next(self.encoder.parameters()).dtype
         moments = self.encoder(pixels.to(dtype))
         latents = self.scale * (self.posterior(moments, generator=generator) - self.shift)
+
+        # Trim to complete latent patches before serialization.
         height = pixels.shape[-2] // self.downsample * self.patch_size
         width = pixels.shape[-1] // self.downsample * self.patch_size
         return self.patchify(latents[:, :, :height, :width]).to(self.latent_dtype)
@@ -71,9 +76,12 @@ class PatchAutoencoder(nn.Module):
         )
 
     def decode(self, patches: torch.Tensor, size: image.Config) -> torch.Tensor:
+        """Restore patch rows to clamped [0, 1] pixels of the given image size."""
+
         latents = self.unpatchify(patches, size)
         if latents.ndim == 3:
             latents = latents.unsqueeze(0)
+
         dtype = next(self.decoder.parameters()).dtype
         latents = latents.to(dtype) / self.scale + self.shift
         pixels = self.decoder(latents)

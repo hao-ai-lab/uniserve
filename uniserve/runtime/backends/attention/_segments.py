@@ -28,12 +28,15 @@ def _pack(
     QUANTIZED: tl.constexpr,
     TILE: tl.constexpr,
 ):
+    # FEATURES is one token's flattened feature width (kv_heads * head_dim).
     sequence = tl.program_id(1)
     indices = tl.program_id(0) * TILE + tl.arange(0, TILE)
     token, feature = indices // FEATURES, indices % FEATURES
     prefix, count = tl.load(PREFIXES + sequence), tl.load(QUERIES + sequence)
     valid = token < prefix + count
     from_prefix = token < prefix
+
+    # Prefix tokens live in paged cache rows addressed through the block table.
     block = tl.load(TABLE + sequence * TABLE_STRIDE + token // BLOCK_SIZE, from_prefix, 0)
     cache_index = (block * BLOCK_SIZE + token % BLOCK_SIZE) * FEATURES + feature
     key = tl.load(KEYS + cache_index, from_prefix, 0)
@@ -41,9 +44,12 @@ def _pack(
     if QUANTIZED:
         key = key.to(tl.float32) * tl.load(KEY_SCALE + block, from_prefix, 0)
         value = value.to(tl.float32) * tl.load(VALUE_SCALE + block, from_prefix, 0)
+
+    # Current tokens are packed per sequence, right after that sequence's prefix.
     current = (tl.load(CURRENT_OFFSETS + sequence) + token - prefix) * FEATURES + feature
     key = tl.where(from_prefix, key, tl.load(CURRENT_KEY + current, valid & ~from_prefix, 0))
     value = tl.where(from_prefix, value, tl.load(CURRENT_VALUE + current, valid & ~from_prefix, 0))
+
     destination = (tl.load(OFFSETS + sequence) + token) * FEATURES + feature
     tl.store(OUTPUT_KEY + destination, key, valid)
     tl.store(OUTPUT_VALUE + destination, value, valid)
@@ -53,6 +59,7 @@ def pack(cache, k, v, batch, offsets, *, out):
     """Return compact K/V within fixed capacity; offsets delimit its live rows."""
 
     if k.device.type != "cuda":
+        # Reference path: gather each sequence's pages with plain indexing.
         from .torch import _paged
 
         keys, values, start = [], [], 0
@@ -62,6 +69,7 @@ def pack(cache, k, v, batch, offsets, *, out):
             values.extend((_paged(cache.value, table, prefix), v[start : start + count]))
             start += count
         return torch.cat(keys), torch.cat(values)
+
     prefix_capacity = batch.block_table.indices.shape[1] * cache.block_size
     key, value = out
     encoded = isinstance(cache.key, QuantizedTensor)
@@ -71,6 +79,7 @@ def pack(cache, k, v, batch, offsets, *, out):
     )
     features = k.shape[1] * k.shape[2]
     extent = (prefix_capacity + batch.queries.maximum) * features
+
     if extent and batch.queries.batch_size:
         _pack[(triton.cdiv(extent, 256), batch.queries.batch_size)](
             fields[0]["values"],

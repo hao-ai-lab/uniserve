@@ -33,7 +33,11 @@ def _normalize(guided, reference, renorm, minimum):
     if renorm is Renorm.NONE:
         return guided
     if renorm is Renorm.CFG_ZERO_STAR:
+        # Zero-center each sample instead of rescaling its norm.
         return guided - guided.mean(dim=tuple(range(1, guided.ndim)), keepdim=True)
+
+    # GLOBAL reduces over every non-batch axis; the channel modes reduce over
+    # the trailing channel axis only.
     dimensions = (
         (tuple(range(1, guided.ndim)) if guided.ndim >= 3 else tuple(range(guided.ndim)))
         if renorm is Renorm.GLOBAL
@@ -42,6 +46,9 @@ def _normalize(guided, reference, renorm, minimum):
     epsilon = torch.finfo(guided.dtype).eps
     norm = guided.float().norm(dim=dimensions, keepdim=True).clamp_min(epsilon)
     target = reference.float().norm(dim=dimensions, keepdim=True).clamp_min(minimum)
+
+    # The clamp only shrinks an over-normed guidance toward the reference;
+    # RESCALE then interpolates back toward the raw guidance to bound drift.
     result = guided * (target / norm).clamp(max=1.0).to(guided.dtype)
     return 0.7 * result + 0.3 * guided if renorm is Renorm.RESCALE else result
 
@@ -81,11 +88,17 @@ class Guidance:
             raise ValueError("guidance scales must be finite and its norm floor nonnegative")
 
     def branches(self, schedule: Schedule, index: int) -> tuple[Branch, ...]:
+        """Return the model branches this step must evaluate, conditioned first."""
+
         if type(index) is not int or not 0 <= index < schedule.num_steps:
             raise IndexError(index)
+
         conditioned = (Branch.CONDITIONED,)
         if not self.interval[0] <= schedule.coordinates[index] <= self.interval[1]:
             return conditioned
+
+        # A scale of 1.0 (within tolerance) makes its unconditional branch
+        # redundant; equal text/image scales collapse to one shared branch.
         text_off, image_off = _equal(self.text_scale, 1.0), _equal(self.image_scale, 1.0)
         if text_off and image_off:
             return conditioned
@@ -98,6 +111,12 @@ class Guidance:
         return (*conditioned, Branch.TEXT_UNCONDITIONAL, Branch.IMAGE_UNCONDITIONAL)
 
     def combine(self, outputs, schedule: Schedule, index: int, *, out=None):
+        """Combine one step's branch predictions into the guided prediction.
+
+        ``outputs`` maps every branch returned by :meth:`branches` to its
+        model prediction. With ``out``, the result is copied into that tensor.
+        """
+
         branches = self.branches(schedule, index)
         if any(branch not in outputs for branch in branches):
             raise ValueError("guidance requires every selected numerical prediction")
@@ -109,9 +128,11 @@ class Guidance:
             for branch in branches
         ):
             raise ValueError("guidance predictions must have identical representations")
+
         if len(branches) == 1:
             guided = conditioned
         elif len(branches) == 2:
+            # Single-branch CFG: base + scale * (conditioned - base).
             base = outputs[branches[1]]
             scale = (
                 self.image_scale
@@ -122,6 +143,7 @@ class Guidance:
                 base + scale * (conditioned - base), conditioned, self.renorm, self.renorm_min
             )
         elif self._nested and self.renorm is Renorm.TEXT_CHANNEL:
+            # Text guidance with per-channel norms, then image guidance on top.
             base = outputs[Branch.TEXT_UNCONDITIONAL]
             guided = _normalize(
                 base + self.text_scale * (conditioned - base),
@@ -133,6 +155,8 @@ class Guidance:
                 image = outputs[Branch.IMAGE_UNCONDITIONAL]
                 guided = image + self.image_scale * (guided - image)
         else:
+            # Combine all three predictions in one weighted sum. The nested
+            # coefficients apply image guidance to the text-guided prediction.
             text, image = self.text_scale, self.image_scale
             coefficients = (
                 (1.0 - image, image * (1.0 - text), image * text)
@@ -150,6 +174,7 @@ class Guidance:
             guided = _normalize(
                 (values * factors).sum(0), conditioned, self.renorm, self.renorm_min
             )
+
         if out is None:
             return guided
         if out.shape != guided.shape or out.dtype != guided.dtype or out.device != guided.device:

@@ -66,6 +66,8 @@ class _Residual(nn.Module):
 
 
 class _Output(nn.Module):
+    """Project to patch values after adaptive shift/scale normalization."""
+
     def __init__(self, hidden_size: int, output_size: int):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -148,6 +150,9 @@ class Velocity(nn.Module):
         rows, columns = height // self.patch_size, width // self.patch_size
         if hidden.ndim != 2 or hidden.shape[0] != rows * columns:
             raise ValueError("flow hidden rows must cover the image patch grid")
+
+        # hidden is [rows*columns, text_hidden]; predictions are per-patch
+        # clean values in the same canonical patch order as the sample below.
         if isinstance(self.decoder, Decoder):
             spatial = (
                 self.head(hidden).reshape(1, rows, columns, -1).permute(0, 3, 1, 2).contiguous()
@@ -159,6 +164,7 @@ class Velocity(nn.Module):
                 self.head(hidden, time) if isinstance(self.head, Head) else self.head(hidden)
             )
             prediction = self.decoder(prediction)
+
         sample = patchify(pixels, patch_size=self.patch_size)[0]
         # A one-dimensional FP32 time retains the checkpoint's FP32 velocity
         # promotion after the BF16 clean-sample subtraction.

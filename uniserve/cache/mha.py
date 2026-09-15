@@ -20,6 +20,8 @@ from .state import StateConfig, _blocks
 def _spans(
     blocks: tuple[int, ...], start: int, length: int, block_size: int
 ) -> tuple[tuple[int, int, int], ...]:
+    """Split a token interval into ``(block, offset, count)`` segments."""
+
     if (
         type(start) is not int
         or type(length) is not int
@@ -90,6 +92,8 @@ class Config(StateConfig):
             raise ValueError("K/V storage dtype must be a logical floating-point dtype")
         if quantizer is not None and quantizer != Quantizer("fp8", axis=0):
             raise ValueError("MHA state supports only FP8 with one scale per block")
+
+        # Values are stored as [blocks, tokens, local heads, head dim].
         shape = (num_blocks, block_size, self.local_heads, self.head_dim)
         result = {}
         for name in ("key", "value"):
@@ -113,6 +117,7 @@ class Config(StateConfig):
         expected = self.buffers(
             num_blocks=count, block_size=block_size, dtype=dtype, quantizer=quantizer
         )
+
         if set(tensors) != set(expected):
             raise ValueError("K/V backing fields do not match the state layout")
         for name, requirement in expected.items():
@@ -125,6 +130,7 @@ class Config(StateConfig):
                 raise ValueError(f"K/V backing {name!r} disagrees with its layout")
         if len({tensor.device for tensor in tensors.values()}) != 1:
             raise ValueError("K/V backing and initialization flags must share one device")
+
         fields = {}
         for name in ("key", "value"):
             values = tensors[f"{name}.values"]
@@ -145,8 +151,9 @@ class State(PrefixState):
     """Borrow [blocks, tokens, heads, dim] keys and values.
 
     A block's first write chooses its FP8 scale; larger writes grow it and
-    re-encode existing values while preserving uncovered token/head regions. Copying from encoded sources rounds through the source's
-    logical dtype before applying the destination encoding.
+    re-encode existing values while preserving uncovered token/head regions.
+    Copying from encoded sources rounds through the source's logical dtype
+    before applying the destination encoding.
     """
 
     def __post_init__(self) -> None:
@@ -179,8 +186,11 @@ class State(PrefixState):
     def read(
         self, block_ids: tuple[int, ...], *, start: int, length: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather decoded [tokens, heads, dim] keys and values over the interval."""
+
         _blocks(block_ids, self.key.shape[0])
         spans = _spans(block_ids, start, length, self.block_size)
+
         outputs = []
         for name in ("key", "value"):
             tensor = self.tensors[name]
@@ -210,10 +220,15 @@ class State(PrefixState):
         index = (block, *interval)
         if isinstance(values, QuantizedTensor):
             values = values.dequantize()
+
         if isinstance(tensor, QuantizedTensor):
             fields = tensor.buffers()
             values = values.to(device=tensor.device, dtype=torch.float32)
             scale = fields["scale"][block]
+
+            # The block scale must cover both the resident values and this
+            # write; 448.0 is the finite e4m3 maximum, and the 1e-12 floor
+            # keeps an all-zero write from producing a zero scale.
             maximum = (
                 values.abs().amax() if values.numel() else torch.zeros((), device=values.device)
             )
@@ -222,6 +237,7 @@ class State(PrefixState):
             updated = torch.where(
                 initialized.reshape(1, 1, 1), torch.maximum(scale, proposed), proposed
             )
+
             rescale_(
                 fields["values"][block : block + 1], scale, updated, initialized, dtype=tensor.dtype
             )
@@ -231,13 +247,17 @@ class State(PrefixState):
             )
         else:
             tensor[index].copy_(values)
+
         self.initialized[name][block] = True
 
     def write(
         self, block_ids: tuple[int, ...], *, start: int, key: torch.Tensor, value: torch.Tensor
     ) -> None:
+        """Store [tokens, heads, dim] keys and values into the token interval."""
+
         if key.shape != value.shape or key.ndim != 3 or key.shape[1:] != self.key.shape[2:]:
             raise ValueError("K/V writes require matching [tokens, heads, dim] tensors")
+
         _blocks(block_ids, self.key.shape[0])
         spans = _spans(block_ids, start, key.shape[0], self.block_size)
         written = 0
@@ -281,6 +301,7 @@ class State(PrefixState):
         self._validate_update(key, value, indices)
         if not indices.numel():
             return
+
         if not isinstance(self.key, QuantizedTensor) and not isinstance(
             self.value, QuantizedTensor
         ):
@@ -295,6 +316,7 @@ class State(PrefixState):
                 initialized=(self.initialized["key"], self.initialized["value"]),
             )
             return
+
         # The dense scatter validates addresses in its owning kernel. Encoded
         # updates also index per-block scale metadata before scattering, so
         # they must validate the same domain before those accesses.
@@ -303,13 +325,16 @@ class State(PrefixState):
             torch._assert_async(valid.all(), "cache write index out of bounds")
         elif not bool(valid.all()):
             raise ValueError("cache write index out of bounds")
+
         count = self.key.shape[0]
         blocks = torch.where(indices >= 0, indices // self.block_size, count)
+
         # The final slot collects excluded tokens. Fixed-size scatter metadata
         # avoids copying addresses to the host and supports graph replay.
         touched = torch.zeros(count + 1, dtype=torch.bool, device=indices.device)
         touched.scatter_(0, blocks, True)
         touched = touched[:count]
+
         encoded = []
         for name, source in (("key", key), ("value", value)):
             target = self.tensors[name]
@@ -319,6 +344,8 @@ class State(PrefixState):
                 encoded.append(source.to(target.dtype))
                 self.initialized[name].logical_or_(touched)
                 continue
+
+            # Grow each touched block's scale to cover this update's maxima.
             fields = target.buffers()
             maximum = source.float().abs().amax((1, 2))
             proposed = torch.zeros(count + 1, device=indices.device)
@@ -332,6 +359,7 @@ class State(PrefixState):
             )
             rescale_(fields["values"], scales, updated, self.initialized[name], dtype=target.dtype)
             scales.copy_(updated)
+
             # An excluded token reads a neutral scale from the extra slot and
             # never writes payload, scale or initialization state.
             selected = torch.cat((scales, torch.ones(1, device=scales.device))).index_select(
@@ -343,6 +371,7 @@ class State(PrefixState):
                 .to(torch.float8_e4m3fn)
             )
             self.initialized[name].logical_or_(touched)
+
         stores = tuple(
             tensor.buffers()["values"] if isinstance(tensor, QuantizedTensor) else tensor
             for tensor in (self.key, self.value)
@@ -352,6 +381,8 @@ class State(PrefixState):
     def transfer_blocks(
         self, block_ids: tuple[int, ...], *, start: int, length: int
     ) -> Mapping[str, tuple[torch.Tensor, ...]]:
+        """Borrow one encoded storage view per physical field and span."""
+
         _blocks(block_ids, self.key.shape[0])
         spans = _spans(block_ids, start, length, self.block_size)
         result = {}
@@ -386,6 +417,7 @@ class State(PrefixState):
             raise ValueError("MHA field must be key or value")
         target = self.tensors[field]
         _blocks((block,), target.shape[0])
+
         if (
             not _slices.within(source_slice, tuple(source.shape))
             or not _slices.within(target_slice, tuple(target.shape[1:]))
@@ -395,10 +427,12 @@ class State(PrefixState):
         shape = _slices.shape(target_slice)
         if not all(shape):
             return
+
         if isinstance(source, QuantizedTensor):
             if source.quantizer.format != "fp8":
                 raise ValueError("MHA transfer requires dense or FP8 source storage")
             fields = source.buffers()
+
             values = (
                 workspace["values"].flatten()[: fields["values"][source_slice].numel()].view(shape)
             )
@@ -413,6 +447,9 @@ class State(PrefixState):
                 else fields["scale"][source_slice[0]]
             )
             values.mul_(scale.to(target.device))
+
+            # Encoded sources round through their logical dtype before the
+            # destination encoding is applied.
             if source.dtype != torch.float32:
                 rounded = workspace["rounded"].flatten()[: values.numel()].view(shape)
                 if rounded.dtype != source.dtype or rounded.device != target.device:
@@ -421,4 +458,5 @@ class State(PrefixState):
                 values.copy_(rounded)
         else:
             values = source[source_slice]
+
         self._write(field, block, target_slice, values)

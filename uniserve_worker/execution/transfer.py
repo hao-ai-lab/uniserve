@@ -85,14 +85,17 @@ def execute(
             transports=transports,
         )
         request.cache_publication = (output, snapshot)
+
         for tensor in snapshot.tensors:
             for locator in tensor.locations:
                 request.exported_locators.append(locator)
+
         request.cache_exports[output] = tuple(
             (transports[location.backend], location)
             for tensor in snapshot.tensors
             for location in tensor.locations
         )
+
         outcome = encode.non_state_outcome(operation, completion_group, state=state)
         outcome.kv_output = snapshot
     elif mode is TransferMode.KV_INSTALL:
@@ -117,6 +120,7 @@ def execute(
             write=write,
         )
         request.cache_installation = (source, output, installed)
+
         outcome = encode.non_state_outcome(operation, completion_group, state=state)
         if outcome.projected_progress is not None:
             outcome.projected_progress = replace(
@@ -174,16 +178,21 @@ def _publish_current_latent(
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
 ) -> TensorPublication:
+    """Publish the committed trajectory's current latent pages as a product."""
+
     request = state.pending_output(completion_group, operation.request_key.request_id)
     if operations.require_progress(request).latent_product != reference:
         raise invalid_descriptor("latent transfer does not name the committed trajectory")
+
     if product != operation.latent_output:
         raise invalid_descriptor("product transfer changes the physical product kind")
+
     row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
         raise invalid_descriptor("trajectory operation has no staged latent inputs")
+
     source = latent_pool.reserve_current_publication(
         product,
         request_pool_idx=row.request.request_pool_idx,
@@ -194,6 +203,7 @@ def _publish_current_latent(
         height=params.height,
         width=params.width,
     )
+
     return publish_latent_source(
         product,
         source,
@@ -222,10 +232,12 @@ def publish_latent_source(
     params = row.input_latent_params
     if params is None:
         raise invalid_descriptor("latent publication has no staged parameters")
+
     request = state.pending_output(completion_group, product.request_key.request_id)
     transports = publication_transports
     if not transports:
         raise unsupported_setup("latent publication requires a configured transport")
+
     pool = latent_pool
     shape = (params.latent_units, pool.latent_width)
     assert shape is not None
@@ -236,6 +248,7 @@ def publish_latent_source(
         product,
     ):
         raise invalid_descriptor("latent publication disagrees with its declared representation")
+
     locations = publish_tensor(
         transports, source.spans, retain=partial(pool.retain_publication, source)
     )
@@ -243,6 +256,7 @@ def publish_latent_source(
     request.latent_exports[product.buffer_id] = tuple(
         (transports[location.backend], location) for location in locations
     )
+
     descriptor = LatentTransferValue(
         height=params.height,
         width=params.width,
@@ -301,6 +315,7 @@ def publish_product(
     transports = publication_transports
     if not transports:
         raise unsupported_setup("product publication requires a configured transport")
+
     request = state.pending_output(completion_group, product.request_key.request_id)
     encoder_write = next(
         (write for write in request.writes if write.reference == product and write.feature), None
@@ -310,6 +325,7 @@ def publish_product(
         if encoder_write is not None
         else bound_device_write(completion_group, product, state=state)
     )
+
     height = 0 if source_metadata is None else source_metadata.height
     width = 0 if source_metadata is None else source_metadata.width
     value_range = (
@@ -317,6 +333,7 @@ def publish_product(
         if isinstance(source_metadata, ImageMetadata) and source_metadata.value_range is not None
         else ""
     )
+
     source_kind = ""
     if encoder_write is not None:
         if not isinstance(source_metadata, FeatureMetadata):
@@ -332,9 +349,11 @@ def publish_product(
         raise invalid_descriptor("device tensor transfer cannot carry feature dimensions")
     elif height == 0 and value_range:
         raise invalid_descriptor("non-image tensor carries an image range")
+
     region = None if device_write is None else device_write.region
     if region is not None and tuple(value.shape) != _slices.shape(region):
         raise invalid_descriptor("product tensor disagrees with its assigned region")
+
     shape = (
         device_write.logical_shape
         if device_write is not None and region is not None
@@ -342,6 +361,7 @@ def publish_product(
     )
     if shape is None:
         raise invalid_descriptor("tensor region publication has no logical shape")
+
     if not _representation_matches_product(
         shape,
         str(value.dtype).removeprefix("torch."),
@@ -358,11 +378,13 @@ def publish_product(
             value,
             metadata=source_metadata,
         )
+
     if encoder_write is not None:
         retain = partial(tensor_store.retain_publication, encoder_write)
     else:
         assert device_write is not None
         retain = partial(tensor_store.retain_publication, device_write)
+
     locations = publish_tensor(
         transports, value, retain=retain, offset=None if region is None else _slices.offset(region)
     )
@@ -370,6 +392,7 @@ def publish_product(
     request.tensor_exports[product.buffer_id] = tuple(
         (transports[location.backend], location) for location in locations
     )
+
     if encoder_write is not None:
         descriptor: TransferValue = EncoderTransferValue(
             height=height,
@@ -384,6 +407,7 @@ def publish_product(
             value_range=value_range,
             tensor=TensorTransfer(shape=shape, locations=locations),
         )
+
     return TensorPublication(product=product, value=descriptor)
 
 

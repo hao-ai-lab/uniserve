@@ -24,16 +24,20 @@ def cache_info(model: CausalLM, config: WorkerConfig, *, num_blocks: int) -> KVC
     layers = model.cache_config.layers
     if not layers or any(not isinstance(value, mha.Config) for value in layers.values()):
         raise ValueError("the worker K/V protocol requires resident MHA state layers")
+
     names = model.backbone.cache_names
     indexes = tuple(names.index(name) for name in layers)
     if indexes != tuple(range(indexes[0], indexes[0] + len(indexes))):
         raise ValueError("the worker K/V protocol requires consecutive logical cache layers")
+
     layout = next(iter(layers.values()))
     if any(value != layout for value in layers.values()):
         raise ValueError("the worker K/V protocol requires matching per-layer head layouts")
+
     heads = layout.head_indices
     if heads != tuple(range(heads[0], heads[0] + len(heads))):
         raise ValueError("the worker K/V protocol requires consecutive logical cache heads")
+
     dtype = (
         layout.compute_dtype
         if config.kv_cache_dtype is None
@@ -49,6 +53,7 @@ def cache_info(model: CausalLM, config: WorkerConfig, *, num_blocks: int) -> KVC
     bytes_per_token = ceil_div(
         len(layers) * sum(field.nbytes for field in fields.values()), config.block_size
     )
+
     return KVCacheInfo(
         block_size=config.block_size,
         num_blocks=num_blocks,

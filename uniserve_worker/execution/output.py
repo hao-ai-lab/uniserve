@@ -49,6 +49,11 @@ __all__ = [
     "OutputPool",
 ]
 
+# The sampler packs one operation's completion column as four consecutive
+# row-major fields: [valid | active | token | accepted], each `count` wide.
+# `valid` marks a usable sampling distribution, `active` the resolved device
+# predicate, `token` the selected token, and `accepted` the speculative
+# acceptance count.
 _SAMPLING_FIELDS_PER_OPERATION: Final[int] = 4
 _next_buffer_generation = 1
 
@@ -118,16 +123,21 @@ class OutputBuffer:
             raise ValueError("a pinned output buffer must contain at least one operation row")
         if capacity < count:
             raise resource_error("completion row count exceeds pinned output capacity")
+
         normalized: list[torch.device] = []
         for value in devices:
             device = canonical_device(value)
             if device.type == "cuda" and device not in normalized:
                 normalized.append(device)
+
         self.event_pool = event_pool
         self.devices = tuple(normalized)
         self._rows = count
         self._generation = _next_buffer_generation
         _next_buffer_generation += 1
+
+        # Token captures fill this int64 buffer from the head upward; byte
+        # captures share the same allocation from the tail downward.
         self._host = torch.empty(
             capacity,
             dtype=torch.long,
@@ -136,6 +146,7 @@ class OutputBuffer:
         )
         self._token_cursor = 0
         self._byte_cursor = 0
+
         self._token_cache: dict[tuple[int, int], tuple[int, ...]] = {}
         self.logprob_layouts: dict[
             tuple[int, int],
@@ -147,11 +158,13 @@ class OutputBuffer:
         self._start_events: dict[str, torch.cuda.Event] = {}
         self._producer_events: dict[str, torch.cuda.Event] = {}
         self._events: dict[str, torch.cuda.Event] = {}
+
         self._observed: set[int] = set()
         self._sealed = False
         self._abandoned = False
         self._events_released = False
         self._release_pending = False
+
         self._reserved_ns = time.perf_counter_ns()
         self._device_started_ns = 0
         self._copy_started_ns = 0
@@ -159,8 +172,10 @@ class OutputBuffer:
         self._ready_ns = 0
         self._timing: tuple[int, int, int, int] | None = None
         self._timing_events = timing_events_enabled()
+
         self._completion_future: concurrent.futures.Future[None] | None = None
         self._completion_registered = False
+
         self._release_to_pool = release_to_pool
         self._released_to_pool = False
         self._cpu_readers = 0
@@ -182,11 +197,15 @@ class OutputBuffer:
         capacity = int(token_capacity)
         if count < 1 or capacity < count:
             raise resource_error("output lease shape is invalid")
+
         normalized: list[torch.device] = []
         for value in devices:
             device = canonical_device(value)
             if device.type == "cuda" and device not in normalized:
                 normalized.append(device)
+
+        # Grow the pinned allocation when the new lease needs more words, or
+        # re-pin it when this lease introduces CUDA producers.
         if capacity > int(self._host.numel()):
             self._host = torch.empty(
                 capacity,
@@ -201,10 +220,12 @@ class OutputBuffer:
                 device="cpu",
                 pin_memory=True,
             )
+
         self.devices = tuple(normalized)
         self._rows = count
         self._generation = _next_buffer_generation
         _next_buffer_generation += 1
+
         self._token_cursor = 0
         self._byte_cursor = 0
         self._token_cache.clear()
@@ -213,11 +234,13 @@ class OutputBuffer:
         self._start_events.clear()
         self._producer_events.clear()
         self._events.clear()
+
         self._observed.clear()
         self._sealed = False
         self._abandoned = False
         self._events_released = False
         self._release_pending = False
+
         self._reserved_ns = time.perf_counter_ns()
         self._device_started_ns = 0
         self._copy_started_ns = 0
@@ -225,6 +248,7 @@ class OutputBuffer:
         self._ready_ns = 0
         self._timing = None
         self._timing_events = timing_events_enabled()
+
         self._completion_future = None
         self._completion_registered = False
         self._released_to_pool = False
@@ -257,6 +281,7 @@ class OutputBuffer:
         self.register_device(target)
         if not self._timing_events:
             return
+
         name = str(target)
         if name in self._start_events:
             return
@@ -273,6 +298,7 @@ class OutputBuffer:
         name = str(device)
         if not self._timing_events:
             return
+
         if name in self._producer_events:
             return
         if name not in self._start_events:
@@ -289,10 +315,12 @@ class OutputBuffer:
             raise _invariant("completion capture was registered after its buffer was sealed")
         flat = tokens.reshape(-1).to(dtype=torch.long)
         count = int(flat.numel())
+
         offset = self._token_cursor
         end = offset + count
         if end * int(self._host.element_size()) > self._byte_floor():
             raise resource_error("completion token span exceeds pinned output capacity")
+
         host = self._host[offset:end]
         if flat.device.type == "cuda":
             if not bool(host.is_pinned()):
@@ -303,6 +331,7 @@ class OutputBuffer:
             host.copy_(flat, non_blocking=True)
         else:
             host.copy_(flat.to(device="cpu"))
+
         self._token_cursor = end
         return offset, count
 
@@ -317,14 +346,18 @@ class OutputBuffer:
             raise ValueError("completion byte capture requires uint8 storage")
         if self._sealed:
             raise _invariant("completion byte capture was registered after its buffer was sealed")
+
         contiguous = value.detach().contiguous()
         count = int(contiguous.numel())
         if count < 1:
             raise ValueError("completion byte capture must not be empty")
+
+        # Byte captures descend from the allocation tail toward the token head.
         end = self._byte_floor()
         offset = end - count
         if offset < self._token_cursor * int(self._host.element_size()):
             raise resource_error("completion byte span exceeds pinned output capacity")
+
         host = self._host.view(torch.uint8)[offset:end]
         flat = contiguous.reshape(-1)
         if flat.device.type == "cuda":
@@ -336,6 +369,7 @@ class OutputBuffer:
             host.copy_(flat, non_blocking=True)
         else:
             host.copy_(flat.to(device="cpu"))
+
         self._byte_cursor += count
         return host.view(contiguous.shape)
 
@@ -356,12 +390,14 @@ class OutputBuffer:
             raise _invariant("completion byte capture was registered after its buffer was sealed")
         if storage.device.type != "cpu" or storage.dtype is not torch.uint8:
             raise ValueError("external completion storage must be a CPU uint8 tensor")
+
         contiguous = value.detach().contiguous()
         count = int(contiguous.numel())
         if count < 1:
             raise ValueError("completion byte capture must not be empty")
         if int(storage.numel()) < count:
             raise resource_error("external completion byte storage is too small")
+
         host = storage.reshape(-1)[:count]
         flat = contiguous.reshape(-1)
         if flat.device.type == "cuda":
@@ -376,7 +412,12 @@ class OutputBuffer:
         return host.view(contiguous.shape)
 
     def _byte_floor(self) -> int:
-        """Return the first byte offset not reserved for fixed completion words."""
+        """Return the byte offset where the captured byte tail begins.
+
+        Byte captures fill the allocation from its end downward, so this is
+        both the end offset of the next capture and the lower bound that token
+        captures from the head must not cross.
+        """
 
         return int(self._host.numel()) * int(self._host.element_size()) - self._byte_cursor
 
@@ -397,6 +438,7 @@ class OutputBuffer:
             self.event_pool.record(event, device)
             self._events[name] = event
             self.event_pool.schedule_completion_wake(device, event)
+
         self._sealed = True
         self._sealed_ns = time.perf_counter_ns()
         self._bind_completion()
@@ -437,6 +479,7 @@ class OutputBuffer:
         if self._ready_ns or self._events_released or not self._events:
             self._resolve_completion(future)
             return
+
         # Physical retirement is independent of whether a host reads the output
         # report. Retain the existing fences until the event loop observes them,
         # and bind the callback to this lease's future across buffer reuse.
@@ -499,6 +542,8 @@ class OutputBuffer:
             raise _invariant("completion record was observed before query-ready")
         observed_ns = time.perf_counter_ns()
         if self._timing is None:
+            # All reported durations are microseconds. CUDA elapsed_time()
+            # yields milliseconds; host-clock deltas are nanoseconds.
             queued_us = (
                 max(0, self._device_started_ns - self._reserved_ns) // 1000
                 if self._device_started_ns
@@ -520,12 +565,17 @@ class OutputBuffer:
                         copy_us,
                         max(0, round(float(producer_event.elapsed_time(end_event)) * 1000.0)),
                     )
+
+            # Without CUDA events (host-only copies), derive the same phases
+            # from host-clock milestones.
             if not self._events and self._device_started_ns:
                 copy_started_ns = self._copy_started_ns or self._sealed_ns
                 device_us = max(0, copy_started_ns - self._device_started_ns) // 1000
                 copy_us = max(0, self._sealed_ns - copy_started_ns) // 1000
+
             ready_to_observed_us = max(0, observed_ns - self._ready_ns) // 1000
             self._timing = (queued_us, device_us, copy_us, ready_to_observed_us)
+
         self._observed.add(index)
         if len(self._observed) == self._rows:
             self._release_events()
@@ -653,6 +703,7 @@ class OutputPool:
         self.max_words = int(max_words)
         if self.capacity < 1 or self.max_words < 1:
             raise ValueError("output-pool bounds must be positive")
+
         self.event_pool = event_pool
         self._buffers: list[OutputBuffer] = []
         self._free: list[OutputBuffer] = []
@@ -671,6 +722,7 @@ class OutputPool:
         words = int(token_capacity)
         if words > self.max_words:
             raise resource_error("lane output exceeds its startup storage bound")
+
         with self._lock:
             if self._closed:
                 raise resource_error("output pool is closed")
@@ -708,6 +760,7 @@ class OutputPool:
             buffers = tuple(self._buffers)
             self._free.clear()
             self._buffers.clear()
+
         for buffer in buffers:
             if not buffer._events_released:
                 buffer.seal()
@@ -764,6 +817,9 @@ def capture_samples(
             0 <= sample.index < count
         ):
             raise RuntimeError("sampling completion vectors do not align")
+
+        # Rows of a shared batch reference one completion column; capture it
+        # on first encounter and hand each request its row span.
         key = id(metadata)
         span = spans.get(key)
         if span is None:
@@ -771,6 +827,7 @@ def capture_samples(
             span = capture
             spans[key] = span
         request.sampling_range = (*span, sample.index)
+
         if sample.batch.logprobs is not None:
             key = id(sample.batch.logprobs)
             if key not in details:
@@ -790,6 +847,8 @@ def sampled_tokens(record: PendingOutput) -> tuple[int, ...]:
             raise RuntimeError("sampling output lost its pinned range")
         values = record._buffer.read_tokens(offset, extent)
         record._sampling_values = values
+    # Field layout of the packed sampling column is documented at
+    # _SAMPLING_FIELDS_PER_OPERATION.
     count = extent // _SAMPLING_FIELDS_PER_OPERATION
     if not bool(values[count + index]):
         raise _PredicatedOperation("operation predicate selected no state")
@@ -797,6 +856,7 @@ def sampled_tokens(record: PendingOutput) -> tuple[int, ...]:
         raise _InvalidSamplingDistribution("sampling policy produced an invalid distribution")
     token = values[count * 2 + index]
     accepted = values[count * 3 + index]
+
     draft = record.draft_tokens
     if not draft:
         return (token,)
@@ -828,6 +888,7 @@ def decode_logprobs(
 
     rows, counts, requested_ids, max_count, max_requested = layout
 
+    # Score columns travel as little-endian float bits inside int64 words.
     def float_value(value: int) -> float:
         return struct.unpack("<f", struct.pack("<I", value & 0xFFFFFFFF))[0]
 
@@ -845,6 +906,8 @@ def decode_logprobs(
         cursor += total
         return tuple(tuple(part[row * width : (row + 1) * width]) for row in range(row_count))
 
+    # The packed column is a fixed sequence of row-major vectors; each
+    # vector(width) call consumes the next one in this exact order.
     selected_tokens = vector(1)
     selected_values = vector(1)
     selected_ranks = vector(1)
@@ -855,6 +918,7 @@ def decode_logprobs(
     candidate_ranks = vector(max_requested)
     if cursor != len(values):
         raise RuntimeError("logprob completion metadata has trailing values")
+
     details: dict[int, tuple[float, tuple[tuple[int, float, int], ...]]] = {}
     for local, result_index in enumerate(rows):
         selected = selected_tokens[local][0]
@@ -863,6 +927,7 @@ def decode_logprobs(
             (selected, selected_value, selected_ranks[local][0])
         ]
         seen = {selected}
+
         for index in range(counts[local]):
             candidate = top_indexes[local][index]
             if candidate not in seen:
@@ -874,6 +939,7 @@ def decode_logprobs(
                     )
                 )
                 seen.add(candidate)
+
         for index, candidate in enumerate(requested_ids[local]):
             if candidate not in seen:
                 entries.append(
@@ -884,6 +950,7 @@ def decode_logprobs(
                     )
                 )
                 seen.add(candidate)
+
         details[result_index] = (selected_value, tuple(entries))
     return details
 
@@ -914,6 +981,7 @@ class PendingOutput:
         )
         self.accepted_progress: RequestProgress | None = None
         self.successors_ready: bool = False
+
         self.status = OpStatus.OK
         self.committed_tokens: tuple[int, ...] = ()
         self.sampling_range: tuple[int, int, int] | None = None
@@ -925,6 +993,7 @@ class PendingOutput:
         self.finish_flags = FinishFlags()
         self.product_generations: tuple[int, ...] = ()
         self.error_code: ErrorCode | None = None
+
         # Numerical updates are borrowed until the completed group commits to
         # DecodeState. Host acceptance continues to use projected_progress and
         # the completion ranges, independently of these device references.
@@ -943,14 +1012,17 @@ class PendingOutput:
         self.completion_write: TensorRecord | None = None
         self.producer_write: TensorRecord | None = None
         self.sampled: SamplerRow | None = None
+
         self.runtime_logical_position: int | torch.Tensor = 0
         self.runtime_sampling_position: int | torch.Tensor = 0
         self.runtime_penalty_base: torch.Tensor | None = None
         self.runtime_decode_increment = False
         self.runtime_cache_length: int | torch.Tensor | None = None
         self.runtime_prompt_logits: torch.Tensor | None = None
+
         self.kv_output: KvTransfer | None = None
         self.products: tuple[TensorPublication, ...] = ()
+
         # Physical latent versions are staged here and committed with the output group.
         self.input_latent_params: LatentParams | None = None
         self.latent_staging: LatentStaging | None = None
@@ -961,6 +1033,7 @@ class PendingOutput:
         self.latent_generation = 0
         self.latent_step = 0
         self.latent_release = False
+
         # Verification keeps only the host metadata needed to check acceptance.
         self.draft_tokens: tuple[int, ...] | None = None
         self.terminal_prefix: int | None = None
@@ -968,11 +1041,13 @@ class PendingOutput:
         self.base_rng_counter = 0
         self.base_kv_visible = 0
         self.initialized_kv = 0
+
         self._buffer: OutputBuffer | None = buffer
         self._row = int(row)
         self._generation = int(buffer.generation)
         self._completion_timing: tuple[int, int, int, int] | None = None
         self._observed = False
+
         self.completion_tasks: tuple[CpuTask, ...] = ()
         self.media_lease: MediaLease | None = None
         self._reports_output = True
@@ -994,15 +1069,18 @@ class PendingOutput:
         self.exported_locators.clear()
         self.cache_publication = None
         self.cache_installation = None
+
         self.input_latent_params = None
         self.latent_staging = None
         self.latent_imported = False
+
         self.predicate = None
         self.token_write = None
         self.transition_write = None
         self.completion_write = None
         self.producer_write = None
         self.sampled = None
+
         self.runtime_penalty_base = None
         self.runtime_prompt_logits = None
         self.runtime_cache_length = None
@@ -1049,6 +1127,7 @@ class PendingOutput:
             accepted_parent = parent.accepted_progress
         else:
             accepted_parent = parent
+
         status = self.status
         error_code = self.error_code
         runtime = self.projected_progress
@@ -1067,6 +1146,7 @@ class PendingOutput:
                         if self._media_output is not None:
                             raise RuntimeError("completion produced more than one media output")
                         self._media_output = result
+
                 if self._buffer is None:
                     raise RuntimeError("completion lost its pinned output buffer")
                 if self.logprob_range is not None:
@@ -1123,6 +1203,7 @@ class PendingOutput:
         if suppressed:
             tokens = ()
         scores = None if suppressed or not self._reports_output else self.logprobs
+
         buffer = self._buffer
         if buffer is None:
             raise RuntimeError("completion lost its pinned output buffer")
@@ -1130,6 +1211,7 @@ class PendingOutput:
         self._completion_timing = buffer.timing()
         self._observed = True
         self._buffer = None
+
         timing = TimingCounters(
             queued_us=self._completion_timing[0],
             device_us=self._completion_timing[1],
@@ -1163,6 +1245,7 @@ class PendingOutput:
         self.accepted_progress = (
             accepted_parent if status in (OpStatus.PREDICATED, OpStatus.ERROR) else runtime
         )
+
         concrete.validate()
         self.value = concrete
         self.completion_tasks = ()
@@ -1173,13 +1256,16 @@ class PendingOutput:
 
         tasks, self.completion_tasks = self.completion_tasks, ()
         actions = [task.abandon for task in tasks]
+
         lease, self.media_lease = self.media_lease, None
         if lease is not None:
             if self._buffer is None:
                 raise RuntimeError("unconsumed media storage lost its producer buffer")
             actions.append(partial(lease.defer_until_ready, self._buffer.completion_future()))
+
         buffer, self._buffer = self._buffer, None
         if buffer is not None and not self._observed:
             self._observed = True
             actions.append(partial(buffer.discard, self._row, self._generation))
+
         close_resources(*actions)

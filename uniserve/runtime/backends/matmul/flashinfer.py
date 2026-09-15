@@ -20,6 +20,7 @@ class _FlashInferOperator(_Operator):
             raise ValueError("block GEMM operands must use the same MXFP8 or NVFP4 format")
         if out.dtype != torch.bfloat16:
             raise ValueError("block GEMM requires BF16 output")
+
         # FlashInfer's CuTe wrapper reconstructs the output matrix from its
         # pointer and dimensions, ignoring tensor strides. Keep that native
         # layout requirement at the backend boundary for borrowed branch views.
@@ -28,6 +29,7 @@ class _FlashInferOperator(_Operator):
             if out.is_contiguous()
             else torch.empty(out.shape, dtype=out.dtype, device=out.device)
         )
+
         left = x.repack(scale_layout=ScaleLayout.SWIZZLED_128X4).buffers()
         right = self.weight.repack(scale_layout=ScaleLayout.SWIZZLED_128X4).buffers()
         if format == "mxfp8":
@@ -55,6 +57,7 @@ class _FlashInferOperator(_Operator):
                 backend=backend,
                 enable_pdl=False,
             )
+
         if bias is not None:
             target.add_(bias.to(out.dtype))
         return out if target is out else out.copy_(target)

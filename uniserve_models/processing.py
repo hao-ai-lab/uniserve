@@ -123,6 +123,7 @@ class FlowPrompt:
 
         if tokenizer is None:
             raise ValueError("the configured generation prompt requires a tokenizer")
+
         append = self.conditioned_append if conditioned else self.unconditional_append
         framed = (
             self.system_prefix
@@ -148,6 +149,7 @@ def resolve_input_tokens(
     if processor is None or processor.feature_injection is None:
         return processor
     injection = processor.feature_injection
+
     updates: dict[str, int] = {}
     for token_field, id_field in (("start_token", "start_token_id"), ("end_token", "end_token_id")):
         token = getattr(injection, token_field)
@@ -164,6 +166,7 @@ def resolve_input_tokens(
         ):
             raise ValueError(f"tokenizer does not define declared token {token!r}")
         updates[id_field] = int(resolved)
+
     if not updates:
         return processor
     resolved_injection = replace(

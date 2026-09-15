@@ -30,6 +30,7 @@ class TimestepEmbedding(nn.Module):
         self.audio_projection = self.video_projection
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        # timesteps carries [..., 2] coordinates in fixed (video, audio) order.
         if timesteps.ndim < 1 or timesteps.shape[-1] != 2:
             raise ValueError("H3 timesteps must end in the ordered video/audio coordinates")
         features = timestep_embedding(timesteps, self.frequency_dim)
@@ -45,6 +46,7 @@ class OutputNorm(nn.Module):
         self.norm = RMSNorm(config.hidden_size, config.norm_eps)
 
     def forward(self, hidden: torch.Tensor, modulation: torch.Tensor) -> torch.Tensor:
+        # modulation is [..., 2 * hidden]: one shift and one scale per token.
         if (
             modulation.shape[-1] != 2 * hidden.shape[-1]
             or torch.broadcast_shapes(modulation.shape[:-1], hidden.shape[:-1]) != hidden.shape[:-1]

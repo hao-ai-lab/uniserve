@@ -67,6 +67,9 @@ class Encoder(nn.Module):
         super().__init__()
         channels = config.base_channels
         self.input = nn.Conv2d(config.in_channels, channels, 3, padding=1)
+
+        # Each level holds num_res_blocks residual blocks at one channel width,
+        # followed by a 2x downsampling between levels.
         self.levels = nn.ModuleList()
         for index, multiplier in enumerate(config.channel_multipliers):
             width = config.base_channels * multiplier
@@ -77,12 +80,14 @@ class Encoder(nn.Module):
             if index + 1 < len(config.channel_multipliers):
                 blocks.append(Downsample(channels))
             self.levels.append(nn.Sequential(*blocks))
+
         self.middle = nn.Sequential(
             ResidualBlock(channels, channels),
             AttentionBlock(channels),
             ResidualBlock(channels, channels),
         )
         self.norm = nn.GroupNorm(32, channels, eps=1e-6)
+        # Concatenated posterior mean and log-variance per spatial location.
         self.output = nn.Conv2d(channels, 2 * config.latent_channels, 3, padding=1)
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
@@ -104,6 +109,9 @@ class Decoder(nn.Module):
             AttentionBlock(channels),
             ResidualBlock(channels, channels),
         )
+
+        # Mirror of the encoder: one extra residual block per level, with 2x
+        # upsampling between levels, executing from the latent end outward.
         self.levels = nn.ModuleList()
         for index in reversed(range(len(config.channel_multipliers))):
             width = config.base_channels * config.channel_multipliers[index]
@@ -114,6 +122,7 @@ class Decoder(nn.Module):
             if index:
                 blocks.append(Upsample(channels))
             self.levels.append(nn.Sequential(*blocks))
+
         self.norm = nn.GroupNorm(32, channels, eps=1e-6)
         self.output = nn.Conv2d(channels, config.out_channels, 3, padding=1)
 
@@ -158,10 +167,12 @@ def assignments(module: nn.Module, reader: checkpoint.Reader) -> tuple[weights.A
     """
     result = []
     available = frozenset(reader.names())
+
     for tower_name in ("encoder", "decoder"):
         tower = getattr(module, tower_name)
         parameters = dict(tower.named_parameters())
         names = {"input": "conv_in", "norm": "norm_out", "output": "conv_out"}
+
         for name, layer in tower.named_modules():
             if isinstance(layer, ResidualBlock):
                 if name.startswith("middle."):
@@ -182,15 +193,19 @@ def assignments(module: nn.Module, reader: checkpoint.Reader) -> tuple[weights.A
                     ("shortcut", "nin_shortcut"),
                 ):
                     names[f"{name}.{target}"] = f"{source}.{suffix}"
+
             elif isinstance(layer, (Downsample, Upsample)):
                 index = int(name.split(".")[1])
                 if tower_name == "decoder":
                     index = len(tower.levels) - 1 - index
                 direction = "down" if tower_name == "encoder" else "up"
                 names[f"{name}.convolution"] = f"{direction}.{index}.{direction}sample.conv"
+
             elif isinstance(layer, AttentionBlock):
                 names[f"{name}.norm"] = "mid.attn_1.norm"
                 names[f"{name}.output"] = "mid.attn_1.proj_out"
+                # The module packs Q/K/V into one tensor; each checkpoint branch
+                # covers a disjoint third of its output channels.
                 for field in ("weight", "bias"):
                     target = parameters[f"{name}.qkv.{field}"]
                     channels = target.shape[0] // 3
@@ -202,6 +217,7 @@ def assignments(module: nn.Module, reader: checkpoint.Reader) -> tuple[weights.A
                                 slice(0, size) for size in target.shape[1:]
                             )
                             result.append(weights.Assignment(target, source, target_slice=region))
+
         for name, target in parameters.items():
             parent, field = name.rsplit(".", 1)
             if parent in names:
@@ -209,4 +225,5 @@ def assignments(module: nn.Module, reader: checkpoint.Reader) -> tuple[weights.A
                 if source_name in available:
                     source = reader.get(source_name)
                     result.append(weights.Assignment(target, source))
+
     return tuple(result)

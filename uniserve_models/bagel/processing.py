@@ -15,15 +15,9 @@ from .config import Config
 
 _BAGEL_VIT_MIN_SIZE = 224
 
-
 _BAGEL_VAE_MIN_SIZE = 512
-
-
 _BAGEL_VAE_MAX_SIZE = 1024
-
-
 _BAGEL_VAE_STRIDE = 16
-
 
 _BAGEL_MAX_IMAGE_PIXELS = 14 * 14 * 9 * 1024
 
@@ -57,4 +51,5 @@ def image_processor(config: Config) -> ImageProcessor:
     )
 
 
+# BAGEL has no guidance prompt framing beyond its chat template.
 flow_prompt = None

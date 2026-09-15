@@ -12,6 +12,8 @@ __all__ = ["Backend"]
 
 
 class _SGL(_FlashOperator):
+    """SGLang's FlashAttention build, sharing the FlashAttention operator flow."""
+
     def requires_host_lengths(self, batch):
         # This native entry takes rectangular queries; variable paged batches
         # need exact host boundaries to select their separate query views.
@@ -35,8 +37,11 @@ class _SGL(_FlashOperator):
         batches, queries, keys = query.shape[0], query.shape[1], key.shape[1]
         if keys == 0:
             return torch.zeros_like(q)
+
+        # No native dense entry: flatten the rectangular batch into varlen form.
         query_offsets = torch.arange(batches + 1, dtype=torch.int32, device=q.device) * queries
         key_offsets = torch.arange(batches + 1, dtype=torch.int32, device=q.device) * keys
+
         result = self._varlen_kernel(
             query.flatten(0, 1),
             key.flatten(0, 1),

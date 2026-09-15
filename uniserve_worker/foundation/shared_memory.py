@@ -16,6 +16,7 @@ def allocate_shared_memory(size: int) -> shared_memory.SharedMemory:
 
     if size < 1:
         raise ValueError("shared-memory capacity must be positive")
+
     storage = shared_memory.SharedMemory(create=True, size=size)
     try:
         descriptor = os.open(f"/dev/shm/{storage.name}", os.O_RDWR)

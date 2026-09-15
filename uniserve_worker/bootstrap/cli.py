@@ -26,11 +26,15 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     """Build the worker CLI parser with launch, params, resource, execution, and loading options."""
 
     parser = argparse.ArgumentParser()
+
+    # Service identity and IPC transport bounds.
     parser.add_argument("--service-name", required=True)
     parser.add_argument("--worker-id", default="worker")
     parser.add_argument("--pipeline-depth", type=int, default=2)
     parser.add_argument("--ipc-payload-cap", type=int, required=True)
     parser.add_argument("--ipc-max-inflight", type=int, default=1)
+
+    # Checkpoint selection and device placement.
     parser.add_argument("--model", default="")
     parser.add_argument(
         "--supported-ops",
@@ -47,6 +51,8 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
             "tower-kv-capacity=<tokens>"
         ),
     )
+
+    # Host product transfer and publication mechanisms.
     parser.add_argument(
         "--transfer-backends",
         default="local",
@@ -57,6 +63,8 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         default="local",
         help="comma-separated bound backends required for outbound products",
     )
+
+    # Numerical backends and checkpoint loading policy.
     parser.add_argument("--attention-backend", default="auto")
     parser.add_argument(
         "--quantization-config",
@@ -75,6 +83,8 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--download-dir", default=None)
     parser.add_argument("--load-threads", type=int, default=None)
     parser.add_argument("--checksum-manifest", default=None)
+
+    # Batching and KV pool bounds.
     parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     parser.add_argument("--max-batch-operations", type=int, default=DEFAULT_MAX_BATCH_OPS)
     parser.add_argument("--max-batch-tokens", type=int, required=True)
@@ -82,6 +92,8 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-cache-dtype", default=None)
     parser.add_argument("--kv-memory-fraction", type=float, default=0.70)
     parser.add_argument("--model-dtype", default="bfloat16")
+
+    # Process topology and component placement.
     parser.add_argument(
         "--rank",
         type=int,
@@ -109,6 +121,8 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         default=[],
         help="repeatable JSON lane descriptor with lane_id, sm_budget, and domains",
     )
+
+    # CUDA graph capture policy.
     parser.add_argument("--graph-policy", choices=("off", "auto", "full"), default="auto")
     parser.add_argument("--decode-graph-batch-sizes", default=None)
     parser.add_argument(
@@ -119,6 +133,8 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefill-graph-token-sizes", default=None)
     parser.add_argument("--flow-graph-batch-sizes", default=None)
     parser.add_argument("--flow-graph-shapes", default=None)
+
+    # FlashInfer attention backend tuning.
     parser.add_argument(
         "--flashinfer-workspace-size",
         type=int,
@@ -147,6 +163,8 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+
+    # Synthetic-model escape hatch and admission bounds.
     parser.add_argument("--no-model", action="store_true")
     parser.add_argument("--allow-stub", action="store_true", default=False)
     parser.add_argument("--max-model-len", type=int, default=8192)

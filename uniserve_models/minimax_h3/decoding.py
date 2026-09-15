@@ -29,6 +29,7 @@ class VideoDecoder(BaseVideoDecoder):
 
     def output_layout(self, num_frames: int) -> Mapping[str, OutputLayout]:
         units = len(self.frame_slices(num_frames))
+        # Each unit decodes one native 25-frame RGB window at the output raster.
         shape = (units, 1, 3, 25, self.frame_size.height, self.frame_size.width)
         return {
             "video": OutputLayout(
@@ -86,6 +87,8 @@ class VideoDecoder(BaseVideoDecoder):
             raise ValueError(
                 f"video decoder requires complete final latent tokens with shape {shape}"
             )
+        # Each 17-frame unit consumes a 7-latent-frame VAE window: 5 new frames
+        # beyond the previous unit plus the 2-frame temporal overlap behind them.
         unit = frames.start // 17
         start = unit * 5 * tokens_per_frame
         indices = constants["video_raster_order"][start : start + 7 * tokens_per_frame]
@@ -140,6 +143,8 @@ class AudioDecoder(BaseAudioDecoder):
         backing = workspace["audio_latents"]
         if backing.ndim != 3 or backing.shape[:2] != (2, channels) or backing.shape[2] < frames:
             raise ValueError("audio workspace must cover both channel-major latent sequences")
+        # Repack [2 * frames, channels] token rows into the VAE's channel-major
+        # [stereo, channels, frames] layout.
         inputs = backing[:, :, :frames]
         inputs.copy_(latent.reshape(2, frames, channels).permute(0, 2, 1))
         return inputs

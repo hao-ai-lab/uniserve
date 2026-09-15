@@ -47,10 +47,14 @@ if triton is not None:
         head = tl.program_id(1)
         columns = tl.arange(0, width)
         row_mask = input_offsets[:, None] < input_rows
+
+        # K/V rows past a tile's valid size are masked out, leaving zeros in
+        # the packed buffer for the attention provider to ignore.
         valid_rows = tl.load(
             valid_sizes + row_offsets // tile_rows, mask=input_offsets < input_rows, other=0
         )
         key_mask = row_mask & ((row_offsets % tile_rows)[:, None] < valid_rows[:, None])
+
         if row_major:
             destination = row_offsets[:, None] * heads * width + head * width + columns[None, :]
         else:
@@ -80,6 +84,9 @@ if triton is not None:
             mask=key_mask,
             other=0.0,
         )
+        # Queries are reordered into per-chunk intervals that group every
+        # owner's rows together, so each owner receives one contiguous span.
+        # K/V keep global row order; only the query component is rearranged.
         component_size = heads * rows * width
         owner_rows = rows // owners
         owner = row_offsets // owner_rows
@@ -88,12 +95,14 @@ if triton is not None:
         count = tl.minimum(chunk_rows, owner_rows - segment * chunk_rows)
         interval_offset = segment * chunk_rows * owners * heads * width
         interval_row = owner * count + local_row % chunk_rows
+
         if row_major:
             query_destination = interval_offset + interval_row * heads * width + head * width
         else:
             query_destination = (
                 interval_offset + head * owners * count * width + interval_row * width
             )
+
         tl.store(packed + query_destination[:, None] + columns, query_values, mask=row_mask)
         tl.store(packed + component_size + destination, key_values, mask=row_mask)
         tl.store(packed + 2 * component_size + destination, value_values, mask=row_mask)
@@ -140,6 +149,7 @@ if triton is not None:
             mask=mask,
             other=0.0,
         ).to(tl.float32)
+
         values = attended_values + gate_values * compressed_values
         tl.store(
             output + row_offsets[:, None] * tl.num_programs(1) * width + head * width + columns,
@@ -172,8 +182,12 @@ if triton is not None:
         """Compose sparse outputs and route local heads into row-owner shards."""
 
         row_offsets = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
+
+        # row_offsets enumerate (destination shard, local row) pairs; gate and
+        # compressed rows are indexed by the owning shard's global row.
         local_row_offsets = row_offsets % local_rows
         global_row_offsets = row_offsets // local_rows * owner_rows + start_row + local_row_offsets
+
         head = tl.program_id(1)
         columns = tl.arange(0, width)
         mask = row_offsets[:, None] < rows
@@ -202,6 +216,9 @@ if triton is not None:
             other=0.0,
         ).to(tl.float32)
         values = attended_values + gate_values * compressed_values
+
+        # Local heads land at their global head offset inside each row-owner
+        # shard; only the shard matching the row's destination rank is written.
         destination = (
             local_row_offsets[:, None] * global_heads * width
             + (source_rank * local_heads + head) * width
@@ -240,9 +257,11 @@ def pack_sparse_input_rows(
 
     assert triton is not None
     input_rows, heads, width = (int(size) for size in query.shape)
+
     if packed is None:
         shape = (3, input_rows, heads, width) if row_major else (3, heads, input_rows, width)
         packed = torch.empty(shape, dtype=query.dtype, device=query.device)
+
     rows = packed.shape[1 if row_major else 2]
     expected_shape = (3, rows, heads, width) if row_major else (3, heads, rows, width)
     if (
@@ -259,6 +278,7 @@ def pack_sparse_input_rows(
         or (chunk_rows is not None and chunk_rows < 1)
     ):
         raise ValueError("sparse input rows must fit matching packed owner storage")
+
     block_rows = 8
     _pack_masked_qkv_kernel[(triton.cdiv(input_rows, block_rows), heads)](
         query,
@@ -308,6 +328,7 @@ def compose_attention(
     heads, rows, width = (int(size) for size in attended.shape[1:])
     block_rows = 8
     grid = (triton.cdiv(rows, block_rows), heads)
+
     if len(outputs) == 1 and owner_rows is None:
         _compose_rows_kernel[grid](
             attended,
@@ -326,6 +347,7 @@ def compose_attention(
             num_stages=1,
         )
         return
+
     _compose_shards_kernel[grid](
         attended,
         gate,

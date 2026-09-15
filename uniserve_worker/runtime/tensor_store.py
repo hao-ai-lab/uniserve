@@ -25,6 +25,7 @@ from ..transfer.layout import fetch_tensor
 from ..transfer.tickets import TransferTicket, Transport
 from .buffer_pool import BufferBinding, BufferPool
 
+# Relay slot physical generations are 32-bit tags that wrap back to one.
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
 _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
     DType.U8: torch.uint8,
@@ -82,6 +83,7 @@ def _invariant(message: str) -> WorkerError:
     )
 
 
+# Logical product identity: (engine, request, epoch, producer op, output index).
 _ReferenceKey = tuple[int, int, int, ComputationId, int]
 _OperationKey = tuple[RequestKey, ComputationId]
 _SlotStorageKey = tuple[str, tuple[int, ...], torch.dtype]
@@ -178,13 +180,20 @@ class TensorRecord:
     buffer_binding: BufferBinding | None = None
     relay_slot: RelaySlot | None = None
     feature: bool = False
+
+    # Lifecycle: reserved, published by its producer, committed for logical
+    # consumption, logically released, then physically retired.
     retired: bool = False
     # Publication exposes the logical product; release may precede retirement.
     committed: bool = False
+
     region: tuple[slice, ...] | None = None
     logical_shape: tuple[int, ...] | None = None
     transfers: tuple[TransferTicket, ...] = ()
     publications: tuple[Future[None], ...] = ()
+
+    # Stream-safety state: reader leases plus producer/reader events order
+    # reclamation without ever synchronizing a device stream.
     readers: int = 0
     producer_event: torch.cuda.Event | None = None
     producer_stream: int | None = None
@@ -192,6 +201,8 @@ class TensorRecord:
     reader_events: torch.cuda.Event | list[torch.cuda.Event] | None = None
     released: bool = False
     _indexed: bool = False
+
+    # Extent actually published by the producer, bounded by the reserved shape.
     actual_extent: int = 0
     actual_shape: tuple[int, ...] = ()
     metadata: ImageMetadata | FeatureMetadata | None = None
@@ -253,11 +264,13 @@ class TensorStore:
         self.devices = tuple(canonical_device(device) for device in devices)
         if self.capacity < 0 or self.entry_capacity < 0 or self.max_entry_bytes < 1:
             raise ValueError("tensor store capacities are invalid")
+
         self.byte_capacity = int(
             buffer_pool.byte_capacity if byte_capacity is None else byte_capacity
         )
         if self.byte_capacity < 1:
             raise ValueError("device-product byte capacity must be positive")
+
         self.request_capacity = int(request_capacity)
         self.relay_depth = int(relay_depth)
         self.buffer_pool = buffer_pool
@@ -304,6 +317,9 @@ class TensorStore:
             tensors.extend(
                 entry.tensor for entry in self._writes.values() if entry.device_name == name
             )
+
+            # Arena slices and region views share one backing storage; count
+            # each physical allocation once, keyed by its storage pointer.
             storages = {
                 tensor.untyped_storage().data_ptr(): tensor.untyped_storage() for tensor in tensors
             }
@@ -372,12 +388,15 @@ class TensorStore:
             for reference, _device in device_bindings
         )
         if any(persistent):
+            # Persistent and generic storage have independent lifetimes, so one
+            # group may not mix them.
             if not all(persistent):
                 raise invalid_descriptor("persistent-buffer bindings cannot share a generic group")
             assert buffer_allocations is not None
             return self._bind_persistent_outputs(
                 device_bindings, buffer_allocations, regions, shapes
             )
+
         if request_slots is not None:
             return self._bind_relay_outputs(device_bindings, request_slots)
         raise invalid_descriptor("tensor output requires a buffer allocation or request relay slot")
@@ -410,8 +429,12 @@ class TensorStore:
         keys = tuple(_reference_key(reference) for reference, _device in bindings)
         if len(set(keys)) != len(keys):
             raise invalid_descriptor("tensor registration repeats an output identity")
+
         with self._lock:
             self._reclaim_ready_locked()
+
+            # Generic products share the per-device slot bound; features and
+            # relay lanes are bounded independently and do not consume slots.
             records = self._writes.values()
             counts: dict[str, int] = {}
             for entry in records:
@@ -422,6 +445,7 @@ class TensorStore:
                 and sum(entry.feature for entry in records) + len(bindings) > self.entry_capacity
             ):
                 raise resource_error("encoder cache has no query-ready entry capacity")
+
             for (reference, raw_device), key in zip(bindings, keys, strict=True):
                 device = canonical_device(raw_device)
                 if key in self._products:
@@ -456,6 +480,7 @@ class TensorStore:
                         else shapes.get(reference, _device_shape(reference))
                     )
                     region = None if regions is None else regions.get(reference)
+                    # A region spanning the full logical shape is no region at all.
                     if region == tuple(
                         slice(start, start + extent)
                         for start, extent in zip(
@@ -465,6 +490,9 @@ class TensorStore:
                         region = None
                     shape = logical_shape if region is None else _slices.shape(region)
                     allocation = allocations[reference.buffer_id]
+                    # When the allocation covers the full logical tensor, bind
+                    # the whole storage so a later import can expand this shard
+                    # in place; otherwise bind only the shard region.
                     full_storage = region is not None and allocation.bytes >= self._tensor_bytes(
                         logical_shape, dtype
                     )
@@ -497,6 +525,8 @@ class TensorStore:
                     self._products[key] = write
                     writes.append(write)
             except BaseException:
+                # Roll back in reverse so a partial batch leaves no resident
+                # record or borrowed storage behind.
                 for write in reversed(writes):
                     self._writes.pop(write.binding_id)
                     self._products.pop(_reference_key(write.reference))
@@ -513,6 +543,9 @@ class TensorStore:
 
         if self.request_capacity < 1 or self.relay_depth < 1:
             raise resource_error("worker has no request-relay arena")
+
+        # Number each output within its (device, request slot, operation,
+        # dtype) field group before touching shared relay state.
         fields: dict[tuple[str, int, RequestKey, ComputationId, torch.dtype], int] = {}
         requested_rows = []
         for reference, raw_device in bindings:
@@ -530,11 +563,15 @@ class TensorStore:
             fields[field_key] = field + 1
             requested_rows.append((reference, device, request_slot, dtype, field))
         requested = tuple(requested_rows)
+
+        # Relay lanes carry one scalar element per field; larger products use
+        # persistent buffer storage instead.
         if any(
             slot < 1 or slot > self.request_capacity or math.prod(_device_shape(reference)) != 1
             for reference, _device, slot, _dtype, _field in requested
         ):
             raise invalid_descriptor("request-relay output has an invalid slot or scalar shape")
+
         keys = tuple(
             _reference_key(reference) for reference, _device, _slot, _dtype, _field in requested
         )
@@ -557,6 +594,8 @@ class TensorStore:
                         raise invalid_descriptor("stale request-relay logical generation")
                     raise invalid_descriptor("request-relay output is already registered")
 
+            # Keep one operation on one lane: reuse its established lane, or
+            # take the first lane whose fields all have no bound owner.
             operation_lanes: dict[tuple[str, int, RequestKey, ComputationId], int] = {}
             for reference, device, request_slot, _dtype, _field in requested:
                 operation = (
@@ -604,6 +643,8 @@ class TensorStore:
                     )
                     if slot.owner is not None:
                         raise _invariant("request-relay lane was assigned more than once")
+                    # Bump the slot's physical generation so handles held by
+                    # its previous owner fail validation.
                     generation = slot.generation + 1
                     slot.generation = 1 if generation > _MAX_GENERATION else generation
                     write = TensorRecord(
@@ -663,6 +704,9 @@ class TensorStore:
             arena_key = (device_name, dtype, int(field))
             arena = self._relay_arenas.get(arena_key)
             if arena is None:
+                # Every (request_slot, lane) pair of this storage class shares
+                # one flat arena so each slot keeps a fixed device address that
+                # captured graphs can target.
                 elements = (self.request_capacity + 1) * self.relay_depth
                 projected = self._allocated_bytes + elements * _TORCH_DTYPE_BYTES[dtype]
                 self._require_byte_capacity_locked(projected)
@@ -674,6 +718,8 @@ class TensorStore:
                     arena = torch.empty((elements,), dtype=dtype, device=device)
                 self._relay_arenas[arena_key] = arena
                 self._allocated_bytes = projected
+
+            # Flat [request_slot, lane] position of this scalar view.
             index = request_slot * self.relay_depth + lane
             slot = RelaySlot(
                 index=index,
@@ -683,6 +729,7 @@ class TensorStore:
                 dtype=dtype,
             )
             fields[key] = slot
+
         if slot.relay_lane is not None and slot.relay_lane[:4] != operation:
             raise _invariant("request-relay slot retained a conflicting operation identity")
         slot.relay_lane = (*operation, lane)
@@ -745,6 +792,7 @@ class TensorStore:
             entries = tuple(self._require_write_locked(write) for write in writes)
             if any(entry.producer_recorded for entry in entries):
                 raise _invariant("device product was published more than once")
+
             tensors = tuple(entry.tensor for entry in entries)
             if any(tensor is None for tensor in tensors):
                 raise _invariant("device product has no physical tensor")
@@ -794,6 +842,7 @@ class TensorStore:
             shape_matches = entry.reference.shape_bound.contains_shape(tuple(value.shape))
         if not shape_matches:
             raise invalid_descriptor("tensor publication changes its declared shape")
+
         flat = value.detach().reshape(-1)
         if flat.numel() > target.numel():
             raise _invariant("device product exceeds its registered shape bound")
@@ -802,6 +851,9 @@ class TensorStore:
             if entry.region is not None
             else target.reshape(-1)[: flat.numel()].reshape(value.shape)
         )
+
+        # Skip the copy when the value already aliases the target exactly
+        # (same storage, dtype, and strides).
         source = value.detach()
         if (
             view.data_ptr() != source.data_ptr()
@@ -809,12 +861,15 @@ class TensorStore:
             or view.stride() != source.stride()
         ):
             view.copy_(source.to(dtype=target.dtype), non_blocking=value.device.type == "cuda")
+
+        # Record or adopt the event that orders consumers after the producer.
         if target.device.type == "cuda":
             entry.producer_event, entry.producer_stream = self._producer_event_locked(
                 target.device,
                 producer_event,
             )
             self.event_pool.retain(entry.producer_event, target.device)
+
         entry.actual_extent = int(flat.numel())
         entry.actual_shape = tuple(int(size) for size in value.shape)
         entry.producer_recorded = True
@@ -855,6 +910,7 @@ class TensorStore:
             )
         if any(entry.producer_recorded for entry in entries):
             raise _invariant("device product was published more than once")
+
         targets = tuple(entry.tensor for entry in entries)
         if any(target is None or int(target.numel()) != 1 for target in targets):
             raise invalid_descriptor(
@@ -883,9 +939,12 @@ class TensorStore:
                 first.device,
                 producer_event,
             )
+            # One shared event guards the batch; each entry releases one of
+            # these references when it is reclaimed.
             self.event_pool.retain(event, first.device, len(entries))
         else:
             stream_id = None
+
         for entry in entries:
             entry.producer_event = event
             entry.producer_stream = stream_id
@@ -925,6 +984,7 @@ class TensorStore:
         tensor = entry.tensor
         if tensor is None:
             raise _invariant("device product has no physical tensor")
+
         tensor.reshape(-1)[:1].fill_(int(value))
         if tensor.device.type == "cuda":
             entry.producer_event, entry.producer_stream = self._producer_event_locked(
@@ -932,6 +992,7 @@ class TensorStore:
                 producer_event,
             )
             self.event_pool.retain(entry.producer_event, tensor.device)
+
         entry.actual_extent = 1
         entry.actual_shape = (1,)
         entry.producer_recorded = True
@@ -1003,6 +1064,9 @@ class TensorStore:
                         entry.producer_event is first_event
                         for entry, _tensor, _op in shared_resolved
                     ):
+                        # One producer event covers the batch: a single wait
+                        # suffices, and only when the consumer runs on a
+                        # different stream than the producer.
                         stream = torch.cuda.current_stream(shared_target)
                         stream_id = int(stream.cuda_stream)
                         if any(
@@ -1011,6 +1075,7 @@ class TensorStore:
                         ):
                             stream.wait_event(first_event)
                     else:
+                        # Distinct producer events: wait on each unique one once.
                         shared_waited: set[int] = set()
                         stream = torch.cuda.current_stream(shared_target)
                         for entry, _tensor, _consumer_op_id in shared_resolved:
@@ -1072,6 +1137,8 @@ class TensorStore:
                     target == first_target and entry.producer_event is first_event
                     for entry, _tensor, target, _consumer_op_id in resolved
                 ):
+                    # One device and one producer event: wait once, unless the
+                    # consumer already runs on the producer stream.
                     stream = torch.cuda.current_stream(first_target)
                     if any(
                         entry.producer_stream != int(stream.cuda_stream)
@@ -1079,6 +1146,7 @@ class TensorStore:
                     ):
                         stream.wait_event(first_event)
                 else:
+                    # Mixed devices or events: wait each (device, event) once.
                     waited: set[tuple[str, int]] = set()
                     for entry, _tensor, target, _consumer_op_id in resolved:
                         if target.type != "cuda":
@@ -1124,10 +1192,13 @@ class TensorStore:
                 entry = self._require_read_locked(read)
                 entry.readers -= 1
                 read._recorded = True
+
                 imported = read.imported
                 if imported is not None:
                     imported.users -= 1
                     if imported.users == 0:
+                        # The last user drops the shared materialization and
+                        # cancels or closes its tickets.
                         self._imports.pop(_reference_key(entry.reference))
                         for ticket in imported.tickets:
                             if not imported.committed:
@@ -1136,6 +1207,7 @@ class TensorStore:
                         if not entry.producer_recorded:
                             self.abandon_writes((entry,))
                     read.imported = None
+
                 if entry.released:
                     self._wake_retirement_locked(entry)
 
@@ -1152,6 +1224,10 @@ class TensorStore:
             return
         declared_target = None if device is None else canonical_device(device)
         with self._lock:
+            # Pairwise fast path: when every read pairs with the write its own
+            # consumer operation produced on the same stream, that write's
+            # producer event already fences the read. Any mismatch breaks out
+            # to the per-stream fence path below.
             if len(after_writes) == len(reads):
                 target = reads[0].tensor.device
                 if declared_target is not None and declared_target != target:
@@ -1189,6 +1265,8 @@ class TensorStore:
                         event is first_event and entry.reader_events is None
                         for entry, event in aligned
                     ):
+                        # One shared fence with no prior reader events: attach
+                        # it once and hold one pooled reference per entry.
                         retained_event = cast(torch.cuda.Event, first_event)
                         for entry, _event in aligned:
                             entry.reader_events = retained_event
@@ -1205,6 +1283,10 @@ class TensorStore:
                             target,
                         )
                     return
+
+            # Fallback: prefer a producer event recorded by the read's own
+            # consumer operation when it matches the current stream; record a
+            # fresh event for anything else.
             write_fences: dict[ComputationId, TensorRecord] = {}
             for write in after_writes:
                 entry = self._require_write_locked(write)
@@ -1219,6 +1301,7 @@ class TensorStore:
                     if target != read.tensor.device:
                         raise _invariant("device-product reader completed on a different device")
                     entries.append((read, entry))
+
                 if target.type == "cuda":
                     stream = torch.cuda.current_stream(target)
                     stream_id = int(stream.cuda_stream)
@@ -1240,6 +1323,9 @@ class TensorStore:
                             self._append_reader_event_locked(entry, event, target)
                         else:
                             pending.append(entry)
+
+                    # Entries without a matching write fence share one event
+                    # recorded on the current stream.
                     if pending:
                         event, _stream_id = self._record_event_locked(target)
                         for entry in pending:
@@ -1250,6 +1336,8 @@ class TensorStore:
                 str,
                 tuple[torch.device, list[tuple[TensorRead, TensorRecord]]],
             ] = {}
+            # No declared device: group reads by their tensor's device and
+            # fence each device independently.
             for read in reads:
                 entry = self._require_read_locked(read)
                 target = read.tensor.device
@@ -1259,6 +1347,7 @@ class TensorStore:
                     grouped[device_name] = (target, [(read, entry)])
                 else:
                     group[1].append((read, entry))
+
             for target, entries in grouped.values():
                 if target.type != "cuda":
                     continue
@@ -1282,6 +1371,9 @@ class TensorStore:
                         self._append_reader_event_locked(entry, event, target)
                     else:
                         pending.append(entry)
+
+                # Entries without a matching write fence share one event
+                # recorded on this device's current stream.
                 if pending:
                     event, _stream_id = self._record_event_locked(target)
                     for entry in pending:
@@ -1303,6 +1395,9 @@ class TensorStore:
                     if isinstance(operation_writes, list)
                     else (() if operation_writes is None else (operation_writes,))
                 )
+
+                # A committed product not indexed under its operation is still
+                # reachable through its logical identity at output index zero.
                 direct_key = (
                     int(request_key.engine_id),
                     int(request_key.request_id),
@@ -1319,6 +1414,7 @@ class TensorStore:
                     and all(entry is not direct for entry in entries)
                 ):
                     entries.append(direct)
+
                 for entry in entries:
                     entry._indexed = False
                     if entry.released:
@@ -1387,14 +1483,19 @@ class TensorStore:
             )
 
     def _release_entry_locked(self, entry: TensorRecord) -> None:
+        """Logically release one write and arrange its retirement wake."""
+
         self._detach_write_locked(entry)
         entry.released = True
         self._wake_retirement_locked(entry)
+        # Transfers into a never-published destination can never complete.
         if not entry.producer_recorded:
             for transfer in entry.transfers:
                 transfer.cancel()
 
     def _wake_retirement_locked(self, entry: TensorRecord) -> None:
+        """Schedule a reclamation wake on each event still guarding an entry."""
+
         readers = entry.reader_events
         events = (
             entry.producer_event,
@@ -1409,6 +1510,8 @@ class TensorStore:
 
         with self._lock:
             entry = self._require_write_locked(write)
+            # Keep unfinished and failed retirements: a failed publication
+            # blocks reclamation so the failure surfaces to its owner.
             retained = tuple(
                 publication
                 for publication in entry.publications
@@ -1425,6 +1528,8 @@ class TensorStore:
                 raise _invariant("transfer destination already has a producer")
             entry.transfers = (*entry.transfers, ticket)
 
+        # The ticket may retire after the write was released; re-run
+        # reclamation so the storage is not stranded.
         def reclaim() -> None:
             with self._lock:
                 self._reclaim_ready_locked()
@@ -1485,8 +1590,10 @@ class TensorStore:
                     imported=pending,
                 )
             existing = self._products.get(key)
+            # Uncommitted candidates are not consumable coverage.
             if existing is not None and not existing.committed:
                 existing = None
+
             missing: tuple[tuple[slice, ...], ...]
             full = tuple(
                 slice(start, start + extent)
@@ -1540,10 +1647,12 @@ class TensorStore:
                     tensor.shape
                 )
                 missing = (full,)
+
             if str(destination.dtype).removeprefix("torch.") != tensor.dtype:
                 if existing is None:
                     self.abandon_writes((write,))
                 raise invalid_descriptor("product import changes resident tensor dtype")
+
             # This lease protects both existing readers and a not-yet-published
             # destination through submission, cancellation and final adoption.
             write.readers += 1
@@ -1559,6 +1668,7 @@ class TensorStore:
 
                 ticket.add_retirement_callback(reclaim)
 
+            # Fetch only the regions not already resident.
             try:
                 for region in missing:
                     fetch_tensor(
@@ -1569,6 +1679,7 @@ class TensorStore:
                         retain=retain,
                     )
             except BaseException:
+                # Drop the lease and every reservation made for this attempt.
                 for ticket in tickets:
                     ticket.cancel()
                     ticket.close()
@@ -1576,6 +1687,7 @@ class TensorStore:
                 if existing is None:
                     self.abandon_writes((write,))
                 raise
+
             materialization = TensorImport(
                 write,
                 destination,
@@ -1616,6 +1728,7 @@ class TensorStore:
                 ticket.result()
             if value.committed:
                 return
+
             if not write.producer_recorded:
                 self.publish_write(write, value.tensor, metadata=value.metadata)
                 self.commit_writes((write,))
@@ -1666,6 +1779,9 @@ class TensorStore:
                     raise _invariant("device-product candidate has no producer readiness")
                 if self._products.get(key) is not entry:
                     raise _invariant("device-product publication lost its reserved identity")
+
+            # Index each committed product under its operation so it can be
+            # released by operation identity later.
             for entry in entries:
                 entry.committed = True
                 operation_key = (
@@ -1682,6 +1798,8 @@ class TensorStore:
                 entry._indexed = True
 
     def _require_locked(self, reference: TensorRef) -> TensorRecord:
+        """Resolve a committed product and reject stale logical generations."""
+
         entry = self._products.get(_reference_key(reference))
         if entry is None or not entry.committed:
             raise invalid_descriptor("unknown device-product reference")
@@ -1690,6 +1808,8 @@ class TensorStore:
         return self._require_write_locked(entry)
 
     def _require_write_locked(self, write: TensorRecord) -> TensorRecord:
+        """Reject stale physical handles, including recycled relay slots."""
+
         if write.retired or self._writes.get(write.binding_id) is not write:
             raise _invariant("stale device-product physical generation")
         slot = write.relay_slot
@@ -1700,6 +1820,8 @@ class TensorStore:
         return write
 
     def _require_read_locked(self, read: TensorRead) -> TensorRecord:
+        """Resolve the live write behind a read lease."""
+
         return self._require_write_locked(read._write)
 
     def _release_storage_locked(self, entry: TensorRecord) -> None:
@@ -1707,6 +1829,7 @@ class TensorStore:
 
         if entry.retired:
             raise _invariant("tensor storage was retired more than once")
+
         slot = entry.relay_slot
         if slot is not None:
             slot.owner = None
@@ -1714,6 +1837,8 @@ class TensorStore:
             if association is not None:
                 operation = association[:4]
                 self._release_relay_operation_locked(operation)
+                # Once the operation loses its lane, clear the association on
+                # every field so the lane becomes fully reusable.
                 if operation not in self._relay_operation_lanes:
                     fields = self._relay_slots[(association[0], association[1], association[4])]
                     for candidate in fields.values():
@@ -1724,6 +1849,7 @@ class TensorStore:
                             candidate.relay_lane = None
         elif entry.buffer_binding is not None:
             self.buffer_pool.release(entry.buffer_binding)
+
         entry.retired = True
 
     def _detach_write_locked(self, entry: TensorRecord) -> None:
@@ -1740,6 +1866,8 @@ class TensorStore:
         if operation_writes is entry:
             self._operation_writes.pop(operation_key, None)
         elif isinstance(operation_writes, list):
+            # The index stores a bare entry for one product and a list for
+            # several; collapse back to a bare entry when one remains.
             remaining = [candidate for candidate in operation_writes if candidate is not entry]
             if not remaining:
                 self._operation_writes.pop(operation_key, None)
@@ -1785,6 +1913,8 @@ class TensorStore:
             entry.reader_events = event
         else:
             entry.reader_events = [current, event]
+
+        # One pooled reference per attached entry, released at reclamation.
         self.event_pool.retain(event, device)
 
     def _reclaim_ready_locked(self) -> int:
@@ -1857,6 +1987,9 @@ class TensorStore:
                 elif reader_events is not None:
                     release_event(reader_events)
                 reclaimed += 1
+
+        # Return pooled-event references only after the pass, so no event
+        # identity can be reused while entries are still being queried.
         for event, count in released_events.values():
             self.event_pool.release(event, count)
         return reclaimed

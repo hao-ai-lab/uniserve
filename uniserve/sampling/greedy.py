@@ -27,12 +27,17 @@ def greedy(
         values, tokens = torch.max(logits[:, :valid], dim=-1)
         tokens = tokens + begin
     else:
+        # A fully padded shard contributes -inf scores and the sentinel token
+        # id ``vocab.size``, which loses every comparison with a real token.
         values = logits.new_full((logits.shape[0],), float("-inf"))
         tokens = torch.full_like(values, vocab.size, dtype=torch.int64)
 
     if vocab.group.size == 1:
         return values, tokens
 
+    # Ship each rank's (score, token) pair as two int64 lanes through one
+    # integer all-gather; the float64 bit pattern is viewed back for the
+    # exact-ordering max reduction across ranks.
     candidates = torch.stack((values.to(torch.float64).view(torch.int64), tokens), dim=-1)
     gathered = vocab.group.all_gather(candidates, dim=0).reshape(vocab.group.size, -1, 2)
     scores = gathered[..., 0].contiguous().view(torch.float64)

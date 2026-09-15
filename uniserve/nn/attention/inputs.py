@@ -180,6 +180,7 @@ class PagedInput:
         prefixes = SequenceLengths.from_lengths(prefix_lengths, device=device)
         flags = (causal,) * len(blocks) if type(causal) is bool else causal
         _causal(flags, len(blocks))
+
         width = max(map(len, blocks), default=0)
         rows = []
         addresses = []
@@ -191,11 +192,15 @@ class PagedInput:
                 raise ValueError("physical block IDs must be nonnegative int32 integers")
             if len(row) * block_size < prefix + query:
                 raise ValueError("block table does not cover the prefix and query")
+            # Short rows are zero-padded to the shared table width; padded
+            # entries are never read because lengths bound the valid span.
             rows.append((*row, *((0,) * (width - len(row)))))
+            # One physical token address per appended query position.
             addresses.extend(
                 row[position // block_size] * block_size + position % block_size
                 for position in range(prefix, prefix + query)
             )
+
         table = torch.tensor(rows, dtype=torch.int32, device=device).reshape(len(blocks), width)
         return cls(
             queries,
@@ -250,4 +255,5 @@ def _visibility(value: torch.Tensor, queries: SequenceLengths) -> None:
         raise ValueError("visibility must provide an integer endpoint per query token")
 
 
+# Union of every index representation the numerical attention layers accept.
 AttentionInput = DenseInput | VarlenInput | PagedInput | VisibleInput | SegmentedInput

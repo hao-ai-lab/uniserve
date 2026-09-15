@@ -24,14 +24,23 @@ from .vision import Encoder
 
 
 class Model(nn.Module):
+    """Compose text, denoising, vision, and latent codec over one backbone.
+
+    The text LM and the image denoiser share the same MoT transformer; the
+    vision encoder feeds SigLIP features into it, and the latent codec maps
+    between pixels and the VAE latents the denoiser predicts.
+    """
+
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
+
         backbone = Transformer(config.text)
         self.text = CausalLM(
             backbone, VocabParallelHead(config.text.hidden_size, config.text.vocab_size)
         )
         self.denoiser = Denoiser(config, backbone)
+
         self.vision_encoder = PatchEncoder(
             Encoder(config),
             nn.Identity(),
@@ -40,6 +49,7 @@ class Model(nn.Module):
             output_size=config.text.hidden_size,
             output_dtype=torch.bfloat16,
         )
+
         autoencoder = vae.Model(config.vae)
         self.latent_encoder = PatchAutoencoder(
             autoencoder.encoder,

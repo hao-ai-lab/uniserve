@@ -49,10 +49,13 @@ class AttentionBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, channels, height, width = x.shape
+
+        # [batch, 1 head, H*W tokens, channels] per projection.
         query, key, value = (
             tensor.flatten(2).transpose(1, 2).unsqueeze(1).contiguous()
             for tensor in self.qkv(self.norm(x)).chunk(3, dim=1)
         )
+
         # Every query chunk attends to the full spatial context. This bounds
         # portable score workspace without changing the attention equation.
         result = torch.cat(
@@ -67,15 +70,20 @@ class AttentionBlock(nn.Module):
 
 
 class Downsample(nn.Module):
+    """Halve the spatial extent with a strided convolution and asymmetric pad."""
+
     def __init__(self, channels: int):
         super().__init__()
         self.convolution = nn.Conv2d(channels, channels, 3, stride=2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pad bottom/right only so the output extent follows the input parity.
         return self.convolution(F.pad(x, (0, 1, 0, 1)))
 
 
 class Upsample(nn.Module):
+    """Double the spatial extent with nearest interpolation and a convolution."""
+
     def __init__(self, channels: int):
         super().__init__()
         self.convolution = nn.Conv2d(channels, channels, 3, padding=1)
@@ -96,8 +104,10 @@ class DiagonalGaussian(nn.Module):
     ) -> torch.Tensor:
         if moments.shape[self.chunk_dim] % 2:
             raise ValueError("posterior moments require equally sized mean and log-variance fields")
+
         mean, log_variance = moments.chunk(2, dim=self.chunk_dim)
         if not self.sample:
             return mean
+
         noise = torch.randn(mean.shape, dtype=mean.dtype, device=mean.device, generator=generator)
         return mean + torch.exp(0.5 * log_variance) * noise

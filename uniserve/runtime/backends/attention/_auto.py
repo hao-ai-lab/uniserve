@@ -26,6 +26,8 @@ def _available(module, names):
 
 
 class _Automatic(_Operator):
+    """Dispatching operator selecting a native provider for each numerical input."""
+
     def __init__(self, providers, requirements, architecture, **kwargs):
         super().__init__(**kwargs)
         self._providers = providers
@@ -59,13 +61,17 @@ class _Automatic(_Operator):
 
     def _operator(self, batch, *, ndim=None):
         name = next(name for name in self._names(batch, ndim=ndim) if name in self._providers)
+
         if name not in self._operators:
+            # Workspace buffers are namespaced per provider; the shared
+            # FlashInfer scratch grant keeps its plain name for TensorRT-LLM.
             arguments = dict(self._arguments)
             arguments["workspace"] = {
                 key: self.workspace["scratch" if key == "scratch" else f"{name}.{key}"]
                 for key in self._requirements[name]
             }
             self._operators[name] = self._providers[name].prepare(**arguments)
+
         return self._operators[name]
 
     def bind(self, batch):
@@ -90,6 +96,8 @@ class _Automatic(_Operator):
 
 
 class Backend(_Backend):
+    """Provider factory probing the native libraries installed for this device."""
+
     def __init__(self, device, *, flashinfer=None):
         self.device = device
         self._architecture = (
@@ -98,6 +106,9 @@ class Backend(_Backend):
         self._factories = {"torch": import_module(f"{__package__}.torch").Backend()}
         if device.type != "cuda":
             return
+
+        # Probe each native library's entry points; uninstalled or incomplete
+        # builds never become selection candidates.
         libraries = {
             "sgl_kernel": (
                 "sgl_kernel.flash_attn",
@@ -131,10 +142,14 @@ class Backend(_Backend):
             self._factories["flash_attn_4"] = import_module(f"{__package__}.flash_attn_4").Backend()
 
     def _providers(self, dtype, head_dim, cache):
+        # Native kernels require half precision and unquantized cache state.
         if dtype not in {torch.float16, torch.bfloat16} or (
             cache is not None and isinstance(cache.key, QuantizedTensor)
         ):
             return {"torch": self._factories["torch"]}
+
+        # Restrict candidates to each kernel's head-dimension and cache-block
+        # constraints.
         return {
             name: backend
             for name, backend in self._factories.items()
@@ -171,6 +186,9 @@ class Backend(_Backend):
     def workspace_buffers(self, **kwargs):
         _, requirements = self._requirements(kwargs)
         result = {}
+
+        # Providers share the scratch grant; other buffers are namespaced per
+        # provider so independently prepared operators cannot collide.
         for name, buffers in requirements.items():
             for key, config in buffers.items():
                 target = "scratch" if key == "scratch" else f"{name}.{key}"

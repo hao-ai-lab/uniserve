@@ -40,6 +40,7 @@ class GELUAndMul(nn.Module):
         return functional.gelu_and_mul(x, approximate=self.approximate, out=out)
 
 
+# Checkpoint activation aliases resolve to one module per numerical formula.
 _ACT_FN_REGISTRY: dict[str, Callable[[], nn.Module]] = {
     "silu": nn.SiLU,
     "swish": nn.SiLU,

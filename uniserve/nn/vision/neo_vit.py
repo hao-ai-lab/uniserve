@@ -65,6 +65,7 @@ class NeoVitEncoder(nn.Module):
         channels = int(cfg.num_channels)
         self.num_channels = channels
         theta = float(cfg.rope_theta_vision)
+
         self.patch_embedding = nn.Conv2d(
             channels,
             hidden,
@@ -78,10 +79,10 @@ class NeoVitEncoder(nn.Module):
             stride=self.downsample_factor,
         )
         self.gelu = nn.GELU()
-        # Per-axis rotary frequencies; the rotation convention is passed as data
-        # to the shared RoPE helper.
-        # Reuse the shared RotaryEmbedding so the inv_freq / cos-sin construction has a
-        # single owner; dim is hidden//2 because the head is split into x/y halves.
+
+        # Per-axis rotary frequencies from the shared helper, so the inv_freq /
+        # cos-sin construction has a single owner. dim is hidden // 2 because
+        # the feature width is split into x/y halves.
         self.rope = RotaryEmbedding(dim=hidden // 2, theta=theta)
 
     def forward(
@@ -97,6 +98,7 @@ class NeoVitEncoder(nn.Module):
             pixels = pixels.view(-1, self.num_channels, self.patch_size, self.patch_size)
         if pixels.ndim != 4:
             raise ValueError("NeoVitEncoder expects flattened patches or NCHW patch pixels")
+
         # ``grid_hw`` carries the (h, w) of each image and drives the 2D RoPE
         # positions and dense downsample; require the (B, 2) shape so the
         # downstream ``[0][0]`` / ``[:, 0]`` indexing is well-defined.
@@ -104,6 +106,7 @@ class NeoVitEncoder(nn.Module):
             raise ValueError(
                 f"NeoVitEncoder expects grid_hw of shape (B, 2), got {tuple(grid_hw.shape)}"
             )
+
         patch_embeds = self.gelu(self.patch_embedding(pixels)).view(
             -1, self.patch_embedding.out_channels
         )
@@ -113,10 +116,10 @@ class NeoVitEncoder(nn.Module):
         return self._dense_downsample(patch_embeds, grid_shapes=grid_shapes)
 
     def _apply_2d_rope(self, patch_embeds: torch.Tensor, grid_hw: torch.Tensor) -> torch.Tensor:
-        # ``patch_embeds.shape[0]`` is the total patch count as a static tensor
-        # shape, so passing it avoids a host sync and keeps this capturable.
         """Apply independent height and width rotary coordinates to patch embeddings."""
 
+        # ``patch_embeds.shape[0]`` is the total patch count as a static tensor
+        # shape, so passing it avoids a host sync and keeps this capturable.
         abs_x, abs_y = build_abs_positions_from_grid_hw(
             grid_hw, device=patch_embeds.device, total=int(patch_embeds.shape[0])
         )
@@ -143,16 +146,17 @@ class NeoVitEncoder(nn.Module):
         *,
         grid_shapes: tuple[tuple[int, int], ...] | None,
     ) -> torch.Tensor:
+        """Merge fixed patch neighborhoods and project them to language width."""
+
         # Host-known per-image (h, w) grids drive convolution dimensions, so the
         # downsample never reads the device ``grid_hw`` tensor back to the host;
         # ``grid_hw`` remains the device source of truth for 2D RoPE positions.
-        """Merge fixed patch neighborhoods and project them to language width."""
-
         if grid_shapes is None:
             raise ValueError("NeoVitEncoder requires host-known grid shapes for dense downsample")
         shapes = [(int(h), int(w)) for h, w in grid_shapes]
         if not shapes:
             return patch_embeds.new_empty((0, self.dense_embedding.out_channels))
+
         # Conv2d acts independently per batch element, so when every image shares
         # the same (h, w) grid (the common batched-serving case) the per-image
         # Python loop is equivalent to a single batched conv over (N, C, h, w):
@@ -165,6 +169,7 @@ class NeoVitEncoder(nn.Module):
             image = patch_embeds.view(n, h0, w0, -1).permute(0, 3, 1, 2)
             dense = self.dense_embedding(image).permute(0, 2, 3, 1)
             return dense.reshape(-1, self.dense_embedding.out_channels)
+
         out = []
         cursor = 0
         for h, w in shapes:

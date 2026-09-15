@@ -12,12 +12,14 @@ def timestep_embedding(
     timesteps: torch.Tensor, dim: int, max_period: float = 10000.0
 ) -> torch.Tensor:
     """Return cosine-then-sine FP32 features in GLIDE/DiT frequency order."""
+
     half = dim // 2
     frequency = torch.exp(
         -math.log(max_period)
         * torch.arange(half, dtype=torch.float32, device=timesteps.device)
         / half
     )
+    # [num_timesteps, dim]: cosine half followed by sine half.
     angles = timesteps.reshape(-1, 1).float() * frequency[None]
     values = torch.cat((angles.cos(), angles.sin()), dim=-1)
     if dim % 2:
@@ -26,6 +28,8 @@ def timestep_embedding(
 
 
 class TimestepEmbedding(nn.Module):
+    """Project sinusoidal timestep features through a learned SiLU MLP."""
+
     def __init__(self, hidden_size: int, frequency_dim: int = 256):
         super().__init__()
         if type(frequency_dim) is not int or frequency_dim < 2:

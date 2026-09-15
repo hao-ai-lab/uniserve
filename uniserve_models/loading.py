@@ -79,11 +79,13 @@ def _json(path: Path) -> dict:
 
 
 def _root(path: str | Path, io: loading.Config):
+    """Resolve a local checkpoint directory or pin a Hub snapshot to a local snapshot root."""
     candidate = Path(path).expanduser()
     if candidate.exists():
         return (candidate.parent if candidate.is_file() else candidate), None, None
     if isinstance(path, Path) or candidate.is_absolute():
         raise FileNotFoundError(candidate)
+
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError
 
@@ -106,12 +108,14 @@ def _root(path: str | Path, io: loading.Config):
 
 
 def _inventory(root, repository, revision, io):
+    """List checkpoint files, excluding caller-configured ignore patterns."""
     if repository is None:
         names = (path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file())
     else:
         from huggingface_hub import HfApi
 
         names = HfApi().list_repo_files(repo_id=repository, revision=revision)
+
     return frozenset(
         name
         for name in names
@@ -144,6 +148,8 @@ def _source_files(source, root, inventory, io):
     available = {name for name in inventory if PurePosixPath(name).parent == directory}
     formats = ("safetensors", "pt") if io.format == "auto" else (io.format,)
     suffixes = {"safetensors": {".safetensors"}, "pt": {".pt", ".bin"}}
+
+    # An explicit filename list wins over any index or layout convention.
     if source.filenames:
         for filename in source.filenames:
             name = (directory / filename).as_posix()
@@ -152,6 +158,7 @@ def _source_files(source, root, inventory, io):
             ):
                 return (name,)
         raise FileNotFoundError(f"source {source.name!r} requires one of {source.filenames!r}")
+
     for format in formats:
         pattern = "*.safetensors.index.json" if format == "safetensors" else "*.bin.index.json"
         indexes = sorted(
@@ -159,7 +166,9 @@ def _source_files(source, root, inventory, io):
         )
         if len(indexes) > 1:
             raise ValueError(f"source {source.name!r} has multiple {format} indexes")
+
         if indexes:
+            # A sharded index declares its payload files relative to the source directory.
             mapping = _json(root / indexes[0]).get("weight_map")
             if not isinstance(mapping, dict) or not mapping:
                 raise ValueError("checkpoint index requires a nonempty weight_map")
@@ -170,6 +179,9 @@ def _source_files(source, root, inventory, io):
             if set(names).difference(inventory):
                 raise FileNotFoundError("checkpoint index references a missing or excluded shard")
             return names
+
+        # Without an index, every weight file in the directory is a payload;
+        # training state saved alongside the model is not part of it.
         names = tuple(
             name
             for name in available
@@ -185,10 +197,12 @@ def _source_files(source, root, inventory, io):
         )
         if names:
             return names
+
     raise FileNotFoundError(f"source {source.name!r} has no {io.format} checkpoint weights")
 
 
 def _tokens(processor, root):
+    """Fill declared start/end feature-injection token IDs from checkpoint tokenizer files."""
     if processor is None or processor.feature_injection is None:
         return processor
     injection = processor.feature_injection
@@ -199,6 +213,9 @@ def _tokens(processor, root):
     }
     if not required:
         return processor
+
+    # Merge every vocabulary spelling a checkpoint may carry; later files
+    # override earlier ones for the same token text.
     vocabulary = {}
     path = root / "tokenizer.json"
     if path.is_file():
@@ -222,6 +239,7 @@ def _tokens(processor, root):
                 .items()
             }
         )
+
     updates = {}
     for name, token in required.items():
         index = vocabulary.get(token)
@@ -244,17 +262,25 @@ def _exclusions(model, declarations, sources, ignored, io):
     """Translate checkpoint exclusions through the same explicit assignments."""
     if not isinstance(ignored, (tuple, list)) or any(not isinstance(name, str) for name in ignored):
         raise ValueError("checkpoint ignored_layers must contain module paths")
+
+    # One parameter can be reachable under several module paths (tied or shared
+    # weights); excluding any alias must exclude the shared parameter everywhere.
     aliases = {}
     paths = dict(model.named_modules(remove_duplicate=False))
     for path, module in paths.items():
         for parameter in module.parameters(recurse=False):
             aliases.setdefault(id(parameter), set()).add(path)
+
+    # Exclusions given as module paths match directly against the model tree.
     targets, matched = set(), set()
     for name in ignored:
         if name in paths:
             matched.add(name)
             for parameter in paths[name].parameters():
                 targets.update(aliases[id(parameter)])
+
+    # Exclusions given as checkpoint tensor prefixes match through each source's
+    # weight assignments back to the target parameters they would load into.
     for source in sources:
         with source.open(io=io) as reader:
             for component in declarations:
@@ -265,6 +291,7 @@ def _exclusions(model, declarations, sources, ignored, io):
                         if assignment.source.name.startswith(name + "."):
                             matched.add(name)
                             targets.update(aliases[id(assignment.target)])
+
     if set(ignored).difference(matched):
         raise ValueError(
             f"checkpoint exclusions do not match numerical weights: {sorted(set(ignored) - matched)}"
@@ -299,6 +326,7 @@ def read_config(
         )
     architecture = architectures[0]
     package = import_module(_catalog[architecture])
+
     inventory = _inventory(root, repository, revision, io)
     # All architecture/index/tokenizer sidecars are small and required to
     # normalize the same complete configuration on participating and remote ranks.
@@ -320,6 +348,7 @@ def read_config(
                 revision,
                 io,
             )
+
     model_config = package.read_config(root, io)
     with torch.device("meta"):
         model = package.Model(model_config)
@@ -347,6 +376,7 @@ def read_config(
         if repository is not None and io.mode != "dummy":
             _fetch(root, _source_files(declaration, root, inventory, io), repository, revision, io)
         sources.append(declaration.resolve(root, io=io))
+
     processor = None if package.image_processor is None else package.image_processor(model_config)
     processor = _tokens(processor, root)
     tokenizer_root = root / "tokenizer" if (root / "tokenizer").is_dir() else root
@@ -364,6 +394,7 @@ def read_config(
         )
         else None
     )
+
     precision = package.precisions.get(
         "default", package.precisions.get("bf16", weight_options.Config())
     )
@@ -388,6 +419,7 @@ def read_config(
                     **_exclusions(model, declarations, sources, ignored, io),
                 },
             )
+
     return Config(
         model_config,
         package.Model,
@@ -424,12 +456,16 @@ def load_model(
                 f"unknown precision {precision!r}; choose from {tuple(config.precisions)}"
             )
         weights = config.precisions[precision]
+
+    # A caller may narrow the resolved module selection but never widen it:
+    # read_config fetched payloads only for the resolved selection.
     selected = config.modules if modules is None else modules
     if config.modules is not None and selected is not None:
         with torch.device("meta"):
             model = config.model_class(config.model)
         if not _selection(model, selected).issubset(_selection(model, config.modules)):
             raise ValueError("load selection exceeds the modules resolved by read_config")
+
     return loading.load_model(
         config.model_class,
         config.model,

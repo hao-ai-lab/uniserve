@@ -204,6 +204,7 @@ class Config:
 
 
 def _encoded_input(layer, hidden, maximum):
+    """Quantize a projection input, reusing the caller's tensor-wide amax if any."""
     quantizer = layer.input_quantizer
     if quantizer is None or isinstance(hidden, QuantizedTensor):
         return hidden
@@ -289,6 +290,7 @@ def _feed_forward(mlp, hidden, maximum=None):
         activated, maximum = value_first_swiglu_absmax(packed, bias)
     else:
         activated, maximum = value_first_swiglu(packed, bias), None
+
     return _project(mlp.down, activated, maximum)
 
 
@@ -340,6 +342,7 @@ class TransformerLayer(nn.Module):
         attended, bias = _project(
             self.output, attended.transpose(1, 2).reshape(batch, sequence, -1)
         )
+
         quantized = isinstance(self.mlp.gate_up.projections["gate"].weight, QuantizedTensor)
         if quantized:
             hidden, normalized, maximum = scaled_residual_rms_norm_absmax_(
@@ -399,6 +402,7 @@ class Transformer(nn.Module):
         )
 
     def forward(self, latents):
+        # [B, C, T, H, W] latents become [B, T*H*W, C] token rows.
         batch, channels, frames, height, width = latents.shape
         hidden = self.input(
             latents.permute(0, 2, 3, 4, 1).reshape(batch, frames * height * width, channels)
@@ -406,8 +410,11 @@ class Transformer(nn.Module):
         compute_dtype = hidden.dtype
         # FP32 register parameters promote the residual stream. The fused
         # normalizations separately select the activation compute dtype.
+        # One trailing zero slot completes the checkpoint's token rows.
         registers = self.register_tokens.expand(batch, -1, -1)
         hidden = torch.cat((hidden, registers, torch.zeros_like(hidden[:, :1])), dim=1)
+
+        # Cell-center coordinates in [-1, 1) along each spatiotemporal axis.
         axes = tuple(
             2.0 * (torch.arange(0.5, size, device=hidden.device, dtype=torch.float32) / size) - 1.0
             for size in (frames, height, width)
@@ -425,10 +432,13 @@ class Transformer(nn.Module):
             dtype=torch.float32,
             sequence_length=max(frames, height, width),
         )
+        # Repeat each rotary frequency for its rotate-half pair, then cast the
+        # tables to the activation dtype: [B, heads, tokens, rope_width].
         cos, sin = (
             value.flatten(2, 3).repeat(1, 1, 2).unsqueeze(2).to(compute_dtype)
             for value in (cos, sin)
         )
+
         first = self.layers[0]
         if isinstance(first.qkv.projections["q"].weight, QuantizedTensor):
             normalized, maximum = weighted_rms_norm_absmax(
@@ -462,6 +472,7 @@ class Transformer(nn.Module):
                 maximum = None
             hidden, update, bias = layer._advance(hidden, normalized, cos, sin, maximum)
             previous = layer
+
         if isinstance(self.output.weight, QuantizedTensor):
             hidden, maximum = scaled_residual_layer_norm_absmax(
                 hidden,
@@ -525,6 +536,8 @@ class Model(LatentDecoder):
         ):
             raise ValueError("video raster must align with spatial compression")
         self.frame_size = frame_size
+        # A clip covers `span` latent frames; cropping `token_drop` frames per
+        # clip leaves consecutive native windows sharing `overlap` latent frames.
         span = math.ceil(config.clip_length / config.temporal_compression)
         overlap = (-config.token_drop) % span
         super().__init__(
@@ -555,6 +568,8 @@ class Model(LatentDecoder):
             enabled=latents.device.type == "cuda",
         ):
             decoded = super().forward(latents)
+        # The VAE left-pads each clip to a multiple of its temporal compression;
+        # crop those leading frames from the decoded timeline.
         padding = (-self.decoder.config.clip_length) % self.decoder.config.temporal_compression
         return decoded[:, :, padding:].to(torch.float16).contiguous()
 
@@ -597,6 +612,7 @@ def assignments(model: Decoder | Model, reader):
         if source not in available:
             continue
         value = reader.get(source)
+
         region = None
         if branch is not None:
             if value.shape[0] % 2:

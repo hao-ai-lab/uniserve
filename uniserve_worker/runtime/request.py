@@ -85,9 +85,12 @@ class RequestPool:
         if size < 1:
             raise ValueError("request-pool capacity must be positive")
         self.max_request_pool_size = size
+
         self._closed = False
+        # Rows are one-based to match scheduler slot ids; row 0 stays empty.
         self._rows: list[RequestState | None] = [None] * (size + 1)
         self._slots_by_request: dict[int, int] = {}
+
         self.tensor_slots = (
             tuple(
                 TensorBuffers.allocate(
@@ -154,9 +157,11 @@ class RequestPool:
             raise invalid_descriptor("request-pool indices are not aligned with operations")
         if len({operation.request_key for operation in operations}) != len(operations):
             raise invalid_descriptor("a completion group repeats a request")
+
         slots = tuple(self._validate_slot(value) for value in request_pool_indices)
         if len(set(slots)) != len(slots):
             raise invalid_descriptor("a completion group repeats a request-pool index")
+
         outputs = []
         for index, (operation, slot) in enumerate(zip(operations, slots, strict=True)):
             request = self.get(operation.request_key.request_id)
@@ -211,15 +216,18 @@ class RequestPool:
         from ..execution.output import PendingOutput
 
         for output in outputs:
+            # Acceptance applies in causal order: the predecessor first.
             predecessor = output.predecessor
             if isinstance(predecessor, PendingOutput):
                 self.apply_outputs((predecessor,))
+
             request = output.request
             if request.pending_operations.get(output.op_id) is not output:
                 continue
             if output.value is None:
                 raise RuntimeError("request output has not been materialized")
             del request.pending_operations[output.op_id]
+
             if self.peek(request.request_id) is request:
                 if output.accepted_progress is not None and output.op_id > request.accepted_op_id:
                     request.accepted_progress = output.accepted_progress
@@ -299,6 +307,8 @@ class RequestPool:
 
     def _apply_start(self, admission: NewRequest) -> int | None:
         slot = self._validate_slot(admission.request_pool_idx)
+
+        # Evict a retired epoch still occupying the request id or the slot.
         base = self.peek(admission.request_key.request_id)
         if base is not None and base.retired and base.request_key != admission.request_key:
             self.drop(base.request_id)
@@ -311,12 +321,14 @@ class RequestPool:
         ):
             self.drop(occupant.request_id)
             occupant = None
+
         if base is not None:
             if base.admission != admission or occupant is not base:
                 raise invalid_descriptor("request admission conflicts with resident state")
             return None
         if occupant is not None:
             raise invalid_descriptor(f"request-pool index {slot} is occupied")
+
         prefix = 0 if admission.generation is None else int(admission.generation.initial_position)
         self._rows[slot] = RequestState(
             request_key=admission.request_key,

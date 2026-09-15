@@ -37,15 +37,18 @@ class PrefixCache:
         self._states: dict[str, State] = {}
         self._backing: dict[str, TensorBuffers] = {}
         self._fills: dict[str, BlockFill] = {}
+
         if quantization is not None and set(quantization) - set(config.layers):
             raise ValueError("cache quantization names must identify resident state layers")
         for parameter in (num_blocks, block_size):
             if isinstance(parameter, Mapping) and set(parameter) != set(config.layers):
                 raise ValueError("per-layer block allocation must cover every state layer")
+
         for name, layout in config.layers.items():
             count = num_blocks[name] if isinstance(num_blocks, Mapping) else num_blocks
             size = block_size[name] if isinstance(block_size, Mapping) else block_size
             quantizer = None if quantization is None else quantization.get(name)
+
             requirements = layout.buffers(
                 num_blocks=count, block_size=size, dtype=dtype, quantizer=quantizer
             )
@@ -56,6 +59,9 @@ class PrefixCache:
             state = layout.bind(tensors, block_size=size, dtype=dtype, quantizer=quantizer)
             self._backing[name] = allocation
             self._states[name] = state
+
+            # Block reset values: multiplicative scales restart at one, while
+            # encoded values, metadata, and initialized flags restart at zero.
             fields, values = [], []
             for field, tensor in state.tensors.items():
                 buffers = (
@@ -83,12 +89,15 @@ class PrefixCache:
 
         state = self.state(name)
         _blocks(blocks, next(iter(state.tensors.values())).shape[0])
+
+        # Adjacent blocks merge into one fill range per contiguous run.
         ranges = []
         for block in sorted(set(blocks)):
             if ranges and ranges[-1][1] == block:
                 ranges[-1] = (ranges[-1][0], block + 1)
             else:
                 ranges.append((block, block + 1))
+
         fill = self._fills[name]
         for start, stop in ranges:
             fill(start, stop)
@@ -102,6 +111,7 @@ class PrefixCache:
         _blocks(blocks, next(iter(state.tensors.values())).shape[0])
         if any(field not in state.initialized for field in fields):
             raise ValueError("initialized fields must belong to the selected state")
+
         for field in fields:
             for block in blocks:
                 state.initialized[field][block] = True
