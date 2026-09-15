@@ -2,7 +2,7 @@
 
 Qwen3, SenseNova and BAGEL use the same tensor, sequence and pipeline parallel execution boundaries. Model definitions supply their layer mathematics, routing, positional embeddings and checkpoint names. The runtime owns device groups, communication, cache regions, output publication and physical retirement.
 
-## Configure a packed model
+## Configure model parallelism
 
 Use `--workers` to declare participating devices and the parallel configuration of the `model` entry. This four-device example combines TP2 with Ulysses SP2:
 
@@ -59,7 +59,7 @@ MiniMax H3 has multiple component entries for conditioning, denoising and media 
 
 Attention transfer capacity is allocated before graph capture and variable memory pools. Serialized layers and shape buckets reuse the same buffers; independent execution lanes own disjoint storage. The current attention output exchange and the following layer's projected inputs use separate regions. Registered memory enables supported NCCL collective algorithms without changing the numerical provider or logical row ownership.
 
-Graph execution requires a provider that supports the selected attention mode. A backend's eager support does not imply graph support: FlashInfer segmented attention performs host planning, while FA4 provides a capturable packed path on supported devices. Cached prefix lengths and the lengths after adding current tokens are separate domains; each attention segment is planned from its own boundaries.
+Graph execution requires a provider that supports the selected attention mode. FlashInfer performs its paged and segmented planning before capture and binds fixed-address numerical inputs for replay; FA4 uses the same explicit sequence and visibility contracts on supported devices. Cached prefix lengths and the lengths after adding current tokens are separate domains; each attention segment is planned from its own boundaries.
 
 Product release and request retirement have different scopes. Releasing a completed image or latent publication does not wait for unrelated KV computation belonging to the same request. Reusing physical pages still waits for every computation or transfer that can access those pages.
 
@@ -67,11 +67,11 @@ The physical verification matrix covers GB200 with two and four participating de
 
 Floating-point equivalence is evaluated with dtype-appropriate error bounds and model quality. Implementations may fuse operations and choose different reduction orders; no model requires bitwise reproduction of a particular provider or GPU topology. Data transport and integer control metadata retain their exact contracts.
 
-Mixed-batch startup measures service time to select useful execution geometries. It does not require identical greedy tokens or compare full-model outputs using a single operator's dtype tolerance. Numerical conformance is verified separately against independent references; small score changes near a tie may change greedy selection.
+Startup prepares homogeneous text and diffusion calls on their configured execution lanes. Numerical conformance uses independent references and appropriate numerical tolerances; small score changes near a tie may change greedy selection.
 
 ## Worker computation resources
 
-A worker's logical domains (`decode`, `prefill`, and `flow`) resolve to ModelEntry bindings during construction. Without `--lane`, they use the full-device execution stream. An explicit lane configuration creates a CudaStream with a Green Context and SM quota. Domains assigned to the same stream share compatible InputBuffers and graph storage; separate streams have independent mutable computation storage and NCCL communicators. The explicit-stream NCCL provider keeps communication kernels inside the assigned Green Context during eager execution and capture. ModelRunner owns numerical grouping and synchronization for each actual forward call while preserving result alignment and completion boundaries.
+A worker's logical domains (`decode`, `prefill`, and `flow`) resolve to ModelEntry bindings during construction. Without `--lane`, numerical entries use full-device execution streams; independent entries can progress concurrently. An explicit lane configuration creates a CudaStream with a Green Context and SM quota. Domains assigned to the same stream share compatible InputBuffers and graph storage; separate streams have independent mutable computation storage and NCCL communicators. The explicit-stream NCCL provider keeps communication kernels inside the assigned Green Context during eager execution and capture. ModelRunner owns numerical grouping and synchronization for each actual forward call while preserving result alignment and completion boundaries.
 
 The following server options configure a shared 152-SM binding or independent 64/88-SM bindings on a device supporting those quotas:
 

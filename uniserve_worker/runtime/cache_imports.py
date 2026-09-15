@@ -13,8 +13,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.runtime.kv_cache import page_spans
-from uniserve.tensors import TensorRegion
+from uniserve.quantization import QuantizedTensor
+
+from .block_tables import page_spans
 
 from ..foundation.errors import invalid_descriptor, resource_error
 from ..protocol.batch import BufferId, KvTransfer, RequestKey, TensorTransfer
@@ -32,15 +33,14 @@ def cache_transfer_workspace_bytes(
     """Return the startup bytes for every bounded import workspace.
 
     Each worker has two raw pages large enough for float64, one FP32 conversion
-    page, at most one source scale per destination token and head, and a per-layer scale
-    reduction. The raw page becomes rounding/absolute-value scratch after its
+    page and at most one source scale per destination token and head. The raw page becomes rounding/absolute-value scratch after its
     input has been consumed. No prefix-sized conversion allocation is needed.
     """
 
     workers = min(4, int(capacity))
     elements = int(page_size) * int(num_layers) * int(num_kv_heads) * int(head_dim)
     scales = 2 * int(page_size) * int(num_layers) * int(num_kv_heads)
-    return workers * (20 * elements + 4 * (scales + int(num_layers)))
+    return workers * (20 * elements + 4 * scales)
 
 
 @dataclass(slots=True)
@@ -71,7 +71,6 @@ class TransferBuffer:
     raw: torch.Tensor
     values: torch.Tensor
     scales: torch.Tensor
-    scale: torch.Tensor
     stream: torch.cuda.Stream | None
 
 
@@ -83,34 +82,31 @@ class CacheImports:
         workers = min(4, int(capacity))
         self._tasks = CpuPool(capacity=capacity, workers=workers)
         shape = (
-            pool.cache.page_size,
-            pool.cache.config.num_layers,
-            pool.cache.config.num_kv_heads,
-            pool.cache.config.head_dim,
+            pool.info.block_size,
+            pool.info.num_layers,
+            pool.info.num_kv_heads,
+            pool.info.head_dim,
         )
         elements = (
-            pool.cache.page_size
-            * pool.cache.config.num_layers
-            * pool.cache.config.num_kv_heads
-            * pool.cache.config.head_dim
+            pool.info.block_size
+            * pool.info.num_layers
+            * pool.info.num_kv_heads
+            * pool.info.head_dim
         )
-        device = pool.cache.k.device
+        device = pool.cache.device
         self._available = deque(
             TransferBuffer(
                 raw=torch.empty((2, elements * 8), dtype=torch.uint8, device=device),
                 values=torch.empty(shape, dtype=torch.float32, device=device),
                 scales=torch.empty(
                     (
-                        pool.cache.page_size,
+                        pool.info.block_size,
                         2,
-                        pool.cache.config.num_layers,
-                        pool.cache.config.num_kv_heads,
+                        pool.info.num_layers,
+                        pool.info.num_kv_heads,
                     ),
                     dtype=torch.float32,
                     device=device,
-                ),
-                scale=torch.empty(
-                    (pool.cache.config.num_layers,), dtype=torch.float32, device=device
                 ),
                 stream=torch.cuda.Stream(device=device) if device.type == "cuda" else None,
             )
@@ -158,10 +154,10 @@ class CacheImports:
         ranges = {
             page: (offset, count)
             for page, offset, count in page_spans(
-                pages, publication.base_extent, suffix, page_size=self.pool.cache.page_size
+                pages, publication.base_extent, suffix, page_size=self.pool.info.block_size
             )
         }
-        ranges.update((page, (0, self.pool.cache.page_size)) for page in initialized_pages)
+        ranges.update((page, (0, self.pool.info.block_size)) for page in initialized_pages)
         for page, (offset, count) in ranges.items():
             self.pool.require_reusable((page,), group=group, start=offset, length=count)
         reservation = self._tasks.reserve() if publication.tensors or initialized_pages else None
@@ -303,7 +299,7 @@ class CacheImports:
         destination: torch.Tensor | tuple[torch.Tensor, ...],
         transports: Mapping[str, Transport],
         *,
-        region: TensorRegion | None = None,
+        region: tuple[slice, ...] | None = None,
     ) -> tuple[TransferTicket, ...]:
         self._require_active(write)
         return fetch_tensor(
@@ -346,24 +342,18 @@ class CacheImports:
                 publication = write.publication
                 if not publication.tensors:
                     return
-                same_format = publication.tensors[0].dtype == str(
-                    self.pool.cache.k.dtype
-                ).removeprefix("torch.")
+                same_format = publication.tensors[0].dtype == self.pool.info.dtype
                 direct = same_format and (
-                    not self.pool.cache.is_quantized
+                    self.pool.info.dtype != "float8_e4m3fn"
                     or (
-                        publication.page_size == self.pool.cache.page_size
+                        publication.page_size == self.pool.info.block_size
                         # A partial installed page owns its destination scale.
                         # Its base may have arrived through another TP layout.
-                        and publication.base_extent % self.pool.cache.page_size == 0
+                        and publication.base_extent % self.pool.info.block_size == 0
                         and publication.compute_dtype
-                        == str(self.pool.cache.config.dtype).removeprefix("torch.")
-                        and self.pool.cache.config.kv_head_offset // publication.scale_head_size
-                        == (
-                            self.pool.cache.config.kv_head_offset
-                            + self.pool.cache.config.num_kv_heads
-                            - 1
-                        )
+                        == str(self.pool.compute_dtype).removeprefix("torch.")
+                        and self.pool.info.kv_head_offset // publication.scale_head_size
+                        == (self.pool.info.kv_head_offset + self.pool.info.num_kv_heads - 1)
                         // publication.scale_head_size
                     )
                 )
@@ -392,43 +382,57 @@ class CacheImports:
     ) -> None:
         publication = write.publication
         suffix = publication.published_extent - publication.base_extent
-        fields = self.pool.cache.transfer_views(
-            write.pages, start=publication.base_extent, length=suffix
-        )
-        tickets: list[TransferTicket] = []
-        for index, (tensor, destination) in enumerate(
-            zip(publication.tensors, fields, strict=True)
-        ):
-            if index < 2:
-                region = TensorRegion(
-                    (
-                        0,
-                        self.pool.cache.config.layer_offset,
-                        self.pool.cache.config.kv_head_offset,
-                        0,
-                    ),
-                    (
-                        suffix,
-                        self.pool.cache.config.num_layers,
-                        self.pool.cache.config.num_kv_heads,
-                        self.pool.cache.config.head_dim,
-                    ),
+        spans = page_spans(write.pages, publication.base_extent, suffix, self.pool.info.block_size)
+        info = self.pool.info
+        for layer, name in enumerate(self.pool.layers, info.layer_offset):
+            # Limit physical reads to one layer, independent of model depth.
+            tickets = []
+            state = self.pool.cache.state(name)
+            for index, field in enumerate(("key", "value")):
+                tensor = state.tensors[field]
+                values = (
+                    tensor.buffers()["values"] if isinstance(tensor, QuantizedTensor) else tensor
                 )
-            else:
-                region = TensorRegion(
-                    (
-                        0,
-                        0,
-                        self.pool.cache.config.layer_offset,
-                        self.pool.cache.config.kv_head_offset // publication.scale_head_size,
-                    ),
-                    (len(destination), 2, self.pool.cache.config.num_layers, 1),
+                destination = tuple(
+                    values[page, offset : offset + count].unsqueeze(1)
+                    for page, offset, count in spans
                 )
-            tickets.extend(self._fetch(write, tensor, destination, transports, region=region))
-        self._consume(tuple(tickets), workspace)
+                tickets.extend(
+                    self._fetch(
+                        write,
+                        publication.tensors[index],
+                        destination,
+                        transports,
+                        region=(
+                            slice(0, suffix),
+                            slice(layer, layer + 1),
+                            slice(info.kv_head_offset, info.kv_head_offset + info.num_kv_heads),
+                            slice(0, info.head_dim),
+                        ),
+                    )
+                )
+                if isinstance(tensor, QuantizedTensor):
+                    scales = tensor.buffers()["scale"]
+                    destination = tuple(scales[page : page + 1] for page, _, _ in spans)
+                    head = info.kv_head_offset // publication.scale_head_size
+                    tickets.extend(
+                        self._fetch(
+                            write,
+                            publication.tensors[2],
+                            destination,
+                            transports,
+                            region=(
+                                slice(0, len(spans)),
+                                slice(index, index + 1),
+                                slice(layer, layer + 1),
+                                slice(head, head + 1),
+                            ),
+                        )
+                    )
+            self._consume(tuple(tickets), workspace)
+            for ticket in tickets:
+                ticket.close()
         self.pool.mark_import_scales(write)
-        for ticket in tickets:
-            ticket.close()
 
     def _copy_converted(
         self,
@@ -442,33 +446,37 @@ class CacheImports:
         dtype = getattr(torch, publication.tensors[0].dtype)
         quantized = dtype is torch.float8_e4m3fn
         trailing = (
-            self.pool.cache.config.num_layers,
-            self.pool.cache.config.num_kv_heads,
-            self.pool.cache.config.head_dim,
+            self.pool.info.num_layers,
+            self.pool.info.num_kv_heads,
+            self.pool.info.head_dim,
         )
         itemsize = workspace.raw.view(dtype).element_size()
         logical = 0
         for page, offset, count in page_spans(
-            write.pages, start, suffix, page_size=self.pool.cache.page_size
+            write.pages, start, suffix, page_size=self.pool.info.block_size
         ):
             elements = (
                 count
-                * self.pool.cache.config.num_layers
-                * self.pool.cache.config.num_kv_heads
-                * self.pool.cache.config.head_dim
+                * self.pool.info.num_layers
+                * self.pool.info.num_kv_heads
+                * self.pool.info.head_dim
             )
             raw = tuple(
                 workspace.raw[field, : elements * itemsize].view(dtype).reshape(count, *trailing)
                 for field in range(2)
             )
-            region = TensorRegion(
-                (
-                    logical,
-                    self.pool.cache.config.layer_offset,
-                    self.pool.cache.config.kv_head_offset,
-                    0,
-                ),
-                (count, *trailing),
+            region = tuple(
+                slice(start, start + extent)
+                for start, extent in zip(
+                    (
+                        logical,
+                        self.pool.info.layer_offset,
+                        self.pool.info.kv_head_offset,
+                        0,
+                    ),
+                    (count, *trailing),
+                    strict=True,
+                )
             )
             tickets = tuple(
                 ticket
@@ -477,9 +485,9 @@ class CacheImports:
             )
             source_offset = (start + logical) % publication.page_size
             if quantized:
-                head_start = self.pool.cache.config.kv_head_offset // publication.scale_head_size
+                head_start = self.pool.info.kv_head_offset // publication.scale_head_size
                 head_end = (
-                    self.pool.cache.config.kv_head_offset + self.pool.cache.config.num_kv_heads - 1
+                    self.pool.info.kv_head_offset + self.pool.info.num_kv_heads - 1
                 ) // publication.scale_head_size + 1
                 scale_start = (
                     start + logical
@@ -492,27 +500,69 @@ class CacheImports:
                     publication.tensors[2],
                     workspace.scales[:scale_count, :, :, : head_end - head_start],
                     transports,
-                    region=TensorRegion(
-                        (scale_start, 0, self.pool.cache.config.layer_offset, head_start),
-                        (scale_count, 2, self.pool.cache.config.num_layers, head_end - head_start),
+                    region=(
+                        slice(scale_start, scale_start + scale_count),
+                        slice(0, 2),
+                        slice(
+                            self.pool.info.layer_offset,
+                            self.pool.info.layer_offset + self.pool.info.num_layers,
+                        ),
+                        slice(head_start, head_start + head_end - head_start),
                     ),
                 )
             self._consume(tickets, workspace)
-            for field_index, values in enumerate(raw):
-                self.pool.cache.copy_page(
-                    values,
-                    source_page_size=publication.page_size,
-                    source_head_size=publication.scale_head_size,
-                    source_compute_dtype=getattr(torch, publication.compute_dtype),
-                    source_scales=workspace.scales,
-                    values_buffer=workspace.values,
-                    raw_buffer=workspace.raw,
-                    scale_buffer=workspace.scale,
-                    field=field_index,
-                    page=page,
-                    offset=offset,
-                    source_offset=source_offset,
-                )
+            for field_index, source in enumerate(raw):
+                values = source
+                if quantized:
+                    values = workspace.values[:count]
+                    values.copy_(source)
+                    position, scale_index, token_offset = 0, 0, source_offset
+                    while position < count:
+                        length = min(publication.page_size - token_offset, count - position)
+                        head, group = 0, 0
+                        while head < self.pool.info.num_kv_heads:
+                            heads = min(
+                                publication.scale_head_size
+                                - (self.pool.info.kv_head_offset + head)
+                                % publication.scale_head_size,
+                                self.pool.info.num_kv_heads - head,
+                            )
+                            scale = workspace.scales[scale_index, field_index, :, group].reshape(
+                                1, self.pool.info.num_layers, 1, 1
+                            )
+                            values[position : position + length, :, head : head + heads].mul_(scale)
+                            head += heads
+                            group += 1
+                        position += length
+                        scale_index += 1
+                        token_offset = 0
+                    compute_dtype = getattr(torch, publication.compute_dtype)
+                    if compute_dtype != torch.float32:
+                        # An encoded source first rounds through its original
+                        # compute representation, before destination encoding.
+                        rounded = (
+                            workspace.raw[
+                                field_index,
+                                : elements * torch.empty((), dtype=compute_dtype).element_size(),
+                            ]
+                            .view(compute_dtype)
+                            .reshape_as(values)
+                        )
+                        rounded.copy_(values)
+                        values.copy_(rounded)
+                for layer, name in enumerate(self.pool.layers):
+                    trailing_slice = (
+                        slice(0, self.pool.info.num_kv_heads),
+                        slice(0, self.pool.info.head_dim),
+                    )
+                    self.pool.cache.state(name).copy_region(
+                        values[:, layer],
+                        field=("key", "value")[field_index],
+                        block=page,
+                        source_slice=(slice(0, count), *trailing_slice),
+                        target_slice=(slice(offset, offset + count), *trailing_slice),
+                        workspace={},
+                    )
             if workspace.stream is not None:
                 workspace.stream.synchronize()
             for ticket in tickets:

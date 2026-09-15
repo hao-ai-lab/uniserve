@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
-from uniserve.model.media import VideoInfo
+from uniserve.media.video import Config
 
 from ..foundation.errors import invalid_descriptor
 from ..protocol.batch import ComputationId, MediaOutput, MediaTrack, PosixShmArtifact, RequestKey
@@ -288,7 +288,13 @@ class MediaMux:
         self._sessions: dict[RequestKey, MuxSession] = {}
 
     def open(
-        self, request_key: RequestKey, *, video: VideoInfo, video_unit_frames: tuple[int, ...]
+        self,
+        request_key: RequestKey,
+        *,
+        video: Config,
+        frame_rate: int,
+        audio_rate: int,
+        video_unit_frames: tuple[int, ...],
     ) -> None:
         """Create the request-owned mux session for a validated output geometry."""
 
@@ -297,11 +303,11 @@ class MediaMux:
         self._sessions[request_key] = MuxSession(
             AvMuxSession(
                 AvMuxConfig(
-                    width=int(video.width),
-                    height=int(video.height),
-                    frame_count=int(video.frame_count),
-                    frame_rate=int(video.frame_rate),
-                    audio_rate=int(video.audio_rate),
+                    width=int(video.frame.width),
+                    height=int(video.frame.height),
+                    frame_count=int(video.num_frames),
+                    frame_rate=int(frame_rate),
+                    audio_rate=int(audio_rate),
                     video_unit_frames=video_unit_frames,
                 )
             )
@@ -375,7 +381,8 @@ class MediaMux:
             ring_lease,
             profile_name=(
                 f"uniserve.video.mux request={_key_label(request_key)} "
-                f"op={operation_id} kind=video start_unit={start_unit} "
+                f"step={operation_id.batch_id} op={operation_id.request_index} "
+                f"kind=video start_unit={start_unit} "
                 f"unit_count={unit_count} rank={self.rank}"
             ),
         )
@@ -407,7 +414,7 @@ class MediaMux:
             ring_lease,
             profile_name=(
                 f"uniserve.video.mux request={_key_label(request_key)} "
-                f"op={operation_id} kind=audio rank={self.rank}"
+                f"step={operation_id.batch_id} op={operation_id.request_index} kind=audio rank={self.rank}"
             ),
         )
         self._sessions[request_key].audio_tail = task.promise
@@ -457,7 +464,7 @@ class MediaMux:
             dependencies,
             profile_name=(
                 f"uniserve.video.mux request={_key_label(request_key)} "
-                f"op={operation_id} kind=artifact rank={self.rank}"
+                f"step={operation_id.batch_id} op={operation_id.request_index} kind=artifact rank={self.rank}"
             ),
         )
         state.finalized = True

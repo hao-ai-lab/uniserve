@@ -7,39 +7,38 @@ from typing import Any
 
 import torch
 
-from uniserve.model.image_diffusion import BranchSource
-from uniserve.model.media import ImageSize, VideoSize
-from uniserve.model.tensors import TensorViews
-from uniserve.nn.diffusion.cfg import Branch
-from uniserve.nn.diffusion.config import DiffusionConfig
-from uniserve.nn.diffusion.schedule import DiffusionSchedule
-from uniserve_models.processing import FlowPrompt
+from uniserve.diffusion import Branch, Guidance, Schedule
+from uniserve.media.image import Config
+from uniserve_models.processing import BranchSource, FlowPrompt
 
 from ..foundation.errors import invalid_descriptor
 
 
 @dataclass(slots=True)
-class DiffusionState:
-    """Reuse schedules, conditioning prefixes, numerical sizes, and request tensor views.
+class ImageState:
+    """Retain numerical schedules and conditioning for one admitted image.
 
-    Image latent workspaces belong to the current pending operation and are never
-    retained here. Video tensor views borrow the request slot through retirement.
-    Accepted step and latent generation remain in RequestProgress and LatentPool.
-    Cache coordinates are refreshed from each operation's physical descriptors.
+    Solver samples borrow the pending operation's latent staging and are not
+    retained here. Accepted progress and product generations belong to the
+    request and latent pool; physical prefix coordinates refresh per operation.
     """
 
-    size: ImageSize | VideoSize
-    config: DiffusionConfig | None = None
-    schedule: DiffusionSchedule | None = None
-    tensors: dict[str, TensorViews] = field(default_factory=dict)
-    constants: dict[str, TensorViews] = field(default_factory=dict)
-    scratch: dict[str, TensorViews] = field(default_factory=dict)
+    size: Config
+    schedule: Schedule
+    guidance: Guidance
     prefixes: dict[BranchSource, tuple[tuple[int, ...], bool]] = field(default_factory=dict)
-    positions: dict[int, tuple[torch.Tensor, torch.Tensor, int, tuple[int, ...]]] = field(
-        default_factory=dict
-    )
+    positions: dict[int, torch.Tensor] = field(default_factory=dict)
     cache: tuple[int, int, int, int] = (0, 0, 0, 0)
     entries: dict[Branch, tuple[int, int, int, int]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class VideoState:
+    """Borrow request media tensors while their execution owners retain backing."""
+
+    size: Any
+    schedules: dict[str, Schedule]
+    tensors: dict[str, dict[str, torch.Tensor]] = field(default_factory=dict)
 
 
 def resolve_prefix(

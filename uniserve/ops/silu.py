@@ -117,13 +117,13 @@ def silu_and_mul_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply packed SwiGLU and emit its row-scaled E4M3 output."""
 
     if not _act_inputs_eligible(x) or triton is None or not triton_available(x.device):
-        from uniserve.nn.quant.fp8 import quantize_fp8_rowwise
+        from uniserve.quantization import Quantizer
 
         gate, value = x.chunk(2, dim=-1)
         output = F.silu(gate.float()) * value.float()
         flat_output = output.reshape(-1, output.shape[-1])
-        quantized, scale = quantize_fp8_rowwise(flat_output)
-        return quantized.reshape(output.shape), scale
+        encoded = Quantizer("fp8", axis=0).quantize(flat_output)
+        return encoded.buffers()["values"].reshape(output.shape), encoded.buffers()["scale"]
 
     n_cols = int(x.shape[-1] // 2)
     rows = x.numel() // (2 * n_cols)
@@ -448,11 +448,11 @@ def value_first_swiglu_fp8(value_gate: torch.Tensor) -> tuple[torch.Tensor, torc
 
     width = _validate_value_first(value_gate, None)
     if not _value_first_inputs_eligible(value_gate) or width > 32768:
-        from uniserve.nn.quant.fp8 import quantize_fp8_rowwise
+        from uniserve.quantization import Quantizer
 
         output = _value_first_tensor(value_gate, None)
-        values, scales = quantize_fp8_rowwise(output.reshape(-1, width))
-        return values.reshape(output.shape), scales
+        encoded = Quantizer("fp8", axis=0).quantize(output.reshape(-1, width))
+        return encoded.buffers()["values"].reshape(output.shape), encoded.buffers()["scale"]
     rows = value_gate.numel() // (2 * width)
     output = torch.empty(
         (*value_gate.shape[:-1], width), dtype=torch.float8_e4m3fn, device=value_gate.device

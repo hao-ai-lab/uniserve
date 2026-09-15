@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import struct
 import time
 from collections.abc import Callable, Sequence
@@ -44,6 +45,8 @@ from ..runtime.request import RequestProgress, RequestState
 from ..runtime.tensor_store import TensorRead, TensorRecord
 from ..transfer.exports import ExportLocations
 from .sampling import LogprobValues, SamplerRow
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "PendingOutput",
@@ -1077,6 +1080,12 @@ class PendingOutput:
                     self._buffer.logprob_values(span)[1] for span in self.prompt_logprob_ranges
                 )
             except Exception:
+                logger.exception(
+                    "completion materialization failed: request=%s operation=%s computation=%s",
+                    self.request_key,
+                    self.op_id,
+                    self.kind,
+                )
                 status = OpStatus.ERROR
                 error_code = ErrorCode.COMPUTE_ERROR
                 suppressed = True

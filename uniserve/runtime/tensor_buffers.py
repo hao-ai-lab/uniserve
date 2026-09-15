@@ -1,133 +1,138 @@
-"""Capacity-owned tensors with validated, shape-keyed layout views."""
+"""Owned or externally borrowed backing for compact numerical tensor views."""
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Mapping
+from collections.abc import Mapping
+from math import prod
 from types import MappingProxyType
+from typing import Self
 
 import torch
 
-from uniserve.distributed.mesh import Communicator, SymmetricMemory
-from uniserve.distributed.peer_memory import allocate_symmetric_memory
+from uniserve.distributed.mesh import Communicator
+from uniserve.runtime._peer_memory import SymmetricMemory
+from uniserve.runtime._peer_memory import allocate_symmetric_memory
 from uniserve.tensors import BufferConfig
-
-__all__ = ["TensorBuffers"]
 
 
 class TensorBuffers:
-    """Own fixed-capacity tensors and cache prefix views for legal shape keys."""
+    """Retain tensor backing and peer mappings independently of numerical views.
 
-    def __init__(self, tensors: Mapping[str, torch.Tensor]) -> None:
-        """Take ownership of named capacity tensors and initialize an empty view cache."""
+    ``allocate`` owns newly allocated storage; ``from_tensors`` retains borrowed
+    external tensors. Both keep their views live until the caller retires all
+    numerical readers and closes this object. Closing does not mutate backing.
+    """
 
-        if not tensors:
-            raise ValueError("bounded tensor storage requires at least one field")
-        self._tensors = dict(tensors)
-        if len(self._tensors) != len(tensors):
-            raise ValueError("bounded tensor storage field names must be unique")
-        if any(not tensor.is_contiguous() for tensor in self._tensors.values()):
-            raise ValueError("bounded tensor storage fields must be contiguous")
-        self._views: dict[Hashable, Mapping[str, torch.Tensor]] = {}
+    def __init__(self) -> None:
+        self._tensors: dict[str, torch.Tensor] = {}
+        self._views: dict[tuple[tuple[str, BufferConfig], ...], Mapping[str, torch.Tensor]] = {}
         self._peers: dict[str, tuple[torch.Tensor, ...]] = {}
         self._symmetric: list[SymmetricMemory] = []
+        self._closed = False
+
+    @classmethod
+    def from_tensors(cls, tensors: Mapping[str, torch.Tensor]) -> TensorBuffers:
+        """Borrow contiguous named backing without copying or changing values."""
+
+        if any(
+            not isinstance(name, str) or not name or not tensor.is_contiguous()
+            for name, tensor in tensors.items()
+        ):
+            raise ValueError("tensor backing requires nonempty names and contiguous storage")
+        result = cls()
+        result._tensors = dict(tensors)
+        return result
 
     @classmethod
     def allocate(
         cls,
         configs: Mapping[str, BufferConfig],
-        device: torch.device | str,
         *,
+        device: torch.device | str,
         pin_memory: bool = False,
         symmetric: Mapping[str, Communicator] | None = None,
-        fill: Mapping[str, int | float] | None = None,
     ) -> TensorBuffers:
-        """Allocate numerical capacities with caller-selected physical resources.
+        """Allocate capacity, with optional host pinning and ordered peer views.
 
-        ``pin_memory`` applies only to host fields. ``symmetric`` binds named
-        device fields to communication groups; their local and peer views share
-        the same owner. Initialization happens once, before views are borrowed.
-        The caller retires graphs and asynchronous readers before releasing this owner.
+        Initialization belongs to the numerical caller. The caller must retain
+        this owner through asynchronous transfers and graph use of its backing.
         """
 
-        symmetric = symmetric or {}
-        fill = fill or {}
-        unknown = (symmetric.keys() | fill.keys()) - configs.keys()
-        if unknown:
-            raise ValueError(f"allocation options refer to unknown fields: {sorted(unknown)}")
-        for name, member in symmetric.items():
-            if configs[name].host or member.device != torch.device(device):
+        device = torch.device(device)
+        symmetric = {} if symmetric is None else symmetric
+        if symmetric.keys() - configs.keys():
+            raise ValueError("symmetric allocations must name declared buffer fields")
+        for name, group in symmetric.items():
+            if configs[name].host or group.device != device:
                 raise ValueError("symmetric storage requires the group's assigned device")
-        tensors: dict[str, torch.Tensor] = {}
-        peers: dict[str, tuple[torch.Tensor, ...]] = {}
-        workspaces: list[SymmetricMemory] = []
-        for name, field in configs.items():
-            shape = field.capacity_shape if field.capacity_shape is not None else field.shape
-            group = symmetric.get(name)
-            if group is not None:
-                workspace = allocate_symmetric_memory(group, shape, dtype=field.dtype)
-                workspaces.append(workspace)
-                tensors[name] = workspace.local
-                peers[name] = workspace.peers
+        result = cls()
+        for name, config in configs.items():
+            shape = config.capacity_shape if config.capacity_shape is not None else config.shape
+            if name in symmetric:
+                allocation = allocate_symmetric_memory(symmetric[name], shape, dtype=config.dtype)
+                result._symmetric.append(allocation)
+                result._tensors[name] = allocation.local
+                result._peers[name] = allocation.peers
             else:
-                tensors[name] = torch.empty(
+                result._tensors[name] = torch.empty(
                     shape,
-                    dtype=field.dtype,
-                    device="cpu" if field.host else device,
-                    pin_memory=field.host and pin_memory,
+                    dtype=config.dtype,
+                    device="cpu" if config.host else device,
+                    pin_memory=config.host and pin_memory,
                 )
-            if name in fill:
-                tensors[name].fill_(fill[name])
-        storage = cls(tensors)
-        storage._peers = peers
-        storage._symmetric = workspaces
-        return storage
+        return result
+
+    def view(self, configs: Mapping[str, BufferConfig]) -> Mapping[str, torch.Tensor]:
+        """Borrow compact prefixes matching shape, dtype and host requirements.
+
+        Each requested dimension must fit its backing dimension. Smaller views
+        compact their leading elements; they are not strided rectangular crops.
+        Equivalent requests reuse views without changing any numerical values.
+        """
+
+        if self._closed:
+            raise RuntimeError("tensor buffers are closed")
+        key = tuple(configs.items())
+        cached = self._views.get(key)
+        if cached is not None:
+            return cached
+        views = {}
+        for name, config in configs.items():
+            value = self._tensors.get(name)
+            if value is None or value.dtype != config.dtype:
+                raise ValueError(f"tensor {name!r} has no backing with the declared dtype")
+            if config.host and value.device.type != "cpu":
+                raise ValueError(f"tensor {name!r} requires host representation")
+            if value.ndim != len(config.shape) or any(
+                extent > capacity
+                for extent, capacity in zip(config.shape, value.shape, strict=True)
+            ):
+                raise ValueError(f"tensor {name!r} exceeds resident capacity")
+            views[name] = value.reshape(-1)[: prod(config.shape)].view(config.shape)
+        result = MappingProxyType(views)
+        self._views[key] = result
+        return result
 
     def peers(self, name: str) -> tuple[torch.Tensor, ...]:
-        """Borrow ordered member views of an explicitly shared allocation."""
+        """Borrow peer views in the allocation communicator's logical order."""
 
+        if self._closed:
+            raise RuntimeError("tensor buffers are closed")
         return self._peers[name]
 
-    @property
-    def capacity(self) -> Mapping[str, torch.Tensor]:
-        """Expose read-only names for the fixed-capacity backing tensors."""
+    def close(self) -> None:
+        """Release references after the caller retires all borrowed uses."""
 
-        return MappingProxyType(self._tensors)
+        self._views.clear()
+        self._peers.clear()
+        self._tensors.clear()
+        self._symmetric.clear()
+        self._closed = True
 
-    def bind(
-        self,
-        shape_key: Hashable,
-        shapes: Mapping[str, tuple[int, ...]],
-    ) -> Mapping[str, torch.Tensor]:
-        """Borrow a call's named subset of the storage's fixed backing tensors.
+    def __enter__(self) -> Self:
+        if self._closed:
+            raise RuntimeError("tensor buffers are closed")
+        return self
 
-        Different computations can share one request allocation while receiving
-        only their declared fields. Each key retains one exact view geometry.
-        """
-
-        cached = self._views.get(shape_key)
-        if cached is not None:
-            requested = {
-                name: tuple(int(value) for value in shape) for name, shape in shapes.items()
-            }
-            resident = {name: tuple(tensor.shape) for name, tensor in cached.items()}
-            if requested != resident:
-                raise ValueError("bounded shape key was rebound with different view geometry")
-            return cached
-        extra = shapes.keys() - self._tensors.keys()
-        if extra:
-            raise ValueError(f"bounded views have no backing for {sorted(extra)}")
-        views: dict[str, torch.Tensor] = {}
-        for name in shapes:
-            storage = self._tensors[name]
-            shape = tuple(int(value) for value in shapes[name])
-            if len(shape) != storage.ndim or any(value < 0 for value in shape):
-                raise ValueError(f"bounded view {name!r} has an invalid rank or extent")
-            if any(value > capacity for value, capacity in zip(shape, storage.shape, strict=True)):
-                raise ValueError(f"bounded view {name!r} exceeds resident capacity")
-            elements = 1
-            for extent in shape:
-                elements *= extent
-            views[name] = storage.reshape(-1)[:elements].view(shape)
-        result = MappingProxyType(views)
-        self._views[shape_key] = result
-        return result
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()

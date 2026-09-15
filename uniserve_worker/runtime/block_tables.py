@@ -57,15 +57,14 @@ class BlockTables:
             raise invalid_descriptor("request-to-token pool geometry is invalid")
 
         self._table_capacity = self.request_pool_size * self.group_count
-        tensors = TensorBuffers.allocate(
-            self.buffers(
-                group_count=self.group_count,
-                request_pool_size=self.request_pool_size,
-                max_blocks_per_request=self.max_blocks_per_request,
-            ),
-            device,
-            fill={"page_tables": 0, "verified_lengths": 0, "alloced_lens": 0},
-        ).capacity
+        buffer_configs = self.buffers(
+            group_count=self.group_count,
+            request_pool_size=self.request_pool_size,
+            max_blocks_per_request=self.max_blocks_per_request,
+        )
+        tensors = TensorBuffers.allocate(buffer_configs, device=device).view(buffer_configs)
+        for name, value in {"page_tables": 0, "verified_lengths": 0, "alloced_lens": 0}.items():
+            tensors[name].fill_(value)
         self.page_tables = tensors["page_tables"]
         self.verified_lengths = tensors["verified_lengths"]
         self.alloced_lens = tensors["alloced_lens"]
@@ -307,3 +306,18 @@ class BlockTables:
                 del self._host_tables[identity]
         for slot in selected:
             self._host_alloced_lens.pop(slot, None)
+
+
+def page_spans(page_ids, start: int, length: int, page_size: int):
+    """Map a logical token interval to scheduler-owned page/offset/count spans."""
+
+    if page_size < 1 or start < 0 or length < 0 or start + length > len(page_ids) * page_size:
+        raise ValueError("KV token interval exceeds its block table")
+    spans = []
+    while length:
+        logical, offset = divmod(start, page_size)
+        count = min(length, page_size - offset)
+        spans.append((page_ids[logical], offset, count))
+        start += count
+        length -= count
+    return tuple(spans)

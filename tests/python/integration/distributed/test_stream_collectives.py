@@ -1,16 +1,18 @@
-"""Bound communication preserves logical members through Green Context graph replay."""
+"""Public execution contexts bind direct communicators to Green Context streams."""
 
 from pathlib import Path
 
 import pytest
 import torch
 import torch.multiprocessing as mp
+from torch import nn
 
-from uniserve.distributed.collectives import allocate_stream_collectives
-from uniserve.distributed.parallel import ParallelConfig
-from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
-from uniserve.nn.collective import stream_collective_scope
-from uniserve.runtime.cuda_graph import CudaGraph
+from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.model import TextSize
+from uniserve.nn import ColumnParallelLinear
+from uniserve.nn.attention import AttentionParallelConfig, Ulysses
+from uniserve.runtime import CUDAGraph, ExecutionContext
+from uniserve.runtime.process_groups import initialize_process_groups
 from uniserve_worker.config import LaneConfig
 from uniserve_worker.execution.cuda_stream import create_partitioned_streams
 from uniserve_worker.protocol.batch import COMPUTATIONS, ForwardMode
@@ -18,6 +20,57 @@ from uniserve_worker.protocol.batch import COMPUTATIONS, ForwardMode
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
+class _Collectives(nn.Module):
+    def __init__(self, mesh):
+        super().__init__()
+        group = mesh.get_group("tokens")
+        self.group = group
+        self.register_buffer("reference", torch.empty(0, device=group.device))
+        self.projection = ColumnParallelLinear(4, 4, bias=False, device=group.device)
+        parallelize_(
+            self.projection, mesh, attention=AttentionParallelConfig(heads=Ulysses("tokens"))
+        )
+        self.projection.weight = nn.Parameter(
+            torch.eye(4, device=group.device), requires_grad=False
+        )
+
+    def forward(self, value):
+        group = self.group
+        half = value.shape[0] // 2
+        destination = (
+            value.new_empty((2 * value.shape[0], value.shape[1])) if group.rank == 0 else None
+        )
+        projected = value.new_empty((group.size * value.shape[0], value.shape[1]))
+        total = None
+        start = group.rank * value.shape[0]
+        for interval, chunk in self.projection.forward_chunks(
+            value,
+            token_slice=slice(start, start + value.shape[0]),
+            num_tokens=projected.shape[0],
+        ):
+            # A numerical consumer can invoke a collective while its outer
+            # projection still retains unread remote rows.
+            if total is None:
+                total = group.all_reduce(value, out=torch.empty_like(value))
+            projected[interval].copy_(chunk)
+        return (
+            group.all_reduce(value, out=torch.empty_like(value)),
+            group.all_reduce(value, op="max", out=torch.empty_like(value)),
+            group.all_reduce(value, op="min", out=torch.empty_like(value)),
+            group.all_gather(value),
+            group.broadcast(value, src=0, out=torch.empty_like(value)),
+            group.reduce_scatter(value),
+            group.all_to_all(value, input_splits=(half, half), output_splits=(half, half)),
+            group.gather(value, dst=0, out=destination),
+            group.send_recv(
+                value, dst=1 - group.rank, src=1 - group.rank, out=torch.empty_like(value)
+            ),
+            projected,
+            total,
+        )
+
+
+@torch.inference_mode()
 def _run_collectives(rank: int, rendezvous: str):
     device = torch.device("cuda", rank)
     with initialize_process_groups(
@@ -28,28 +81,11 @@ def _run_collectives(rank: int, rendezvous: str):
         backend="nccl",
         init_method=rendezvous,
     ) as environment:
-        mesh = initialize_model_parallel(environment, {"model": ((1, 0), ParallelConfig(2))})[
-            "model"
-        ]
-        group = mesh.get_group("tp")
-        value = torch.full((4,), float(rank + 1), device=device)
-        with stream_collective_scope({}):
-            with pytest.raises(RuntimeError, match="stream scope has no binding"):
-                group.all_reduce(value)
-        torch.testing.assert_close(value, torch.full_like(value, float(rank + 1)), rtol=0, atol=0)
-        # An ordinary device-stream call explicitly selects native process-group
-        # communication, including when nested in another caller's strict scope.
-        with stream_collective_scope({}):
-            with stream_collective_scope(None):
-                torch.testing.assert_close(
-                    group.all_reduce(value), torch.full_like(value, 3), rtol=0, atol=0
-                )
-            with pytest.raises(RuntimeError, match="stream scope has no binding"):
-                group.all_reduce(value)
-        value.fill_(rank + 1)
-        torch.testing.assert_close(
-            group.all_reduce(value), torch.full_like(value, 3), rtol=0, atol=0
+        mesh = environment.bind(
+            DeviceMesh(ranks=(1, 0), shape=(2,), axes=("tokens",), rank=rank), device=device
         )
+        group = mesh.get_group("tokens")
+        module = _Collectives(mesh)
         greens = create_partitioned_streams(
             (
                 LaneConfig("decode", 64, (ForwardMode.DECODE, ForwardMode.VERIFY)),
@@ -67,76 +103,55 @@ def _run_collectives(rank: int, rendezvous: str):
         )
         try:
             for green in greens:
-                bindings = allocate_stream_collectives((group,), green.stream)
-                graph = CudaGraph(
-                    device=device, stream=green.stream, expected_context=int(green.context)
-                )
-                value = torch.arange(8, dtype=torch.float32, device=device).view(2, 4) + rank * 10
-
-                def execute():
-                    with stream_collective_scope(bindings):
-                        total = group.all_reduce(value.clone())
-                        maximum = group.all_reduce_max(value.clone())
-                        minimum = group.all_reduce_min(value.clone())
-                        gathered = torch.empty((4, 4), device=device)
-                        group.all_gather_into_tensor(gathered, value)
-                        broadcast = group.broadcast(value.clone(), src=0)
-                        reduced = group.reduce_scatter(value)
-                        exchanged = torch.empty_like(value)
-                        group.all_to_all_single_into(exchanged, value, [1, 1], [1, 1])
-                        destination = torch.empty((2, 2, 4), device=device) if rank == 1 else None
-                        group.gather_into_tensor(destination, value, dst=0)
-                        peer = torch.empty_like(value)
-                        group.send_recv(
-                            value, peer, dst=1 - group.rank_in_group, src=1 - group.rank_in_group
+                with ExecutionContext(module, stream=green.stream) as context:
+                    # Replacing a preparation must retire its registrations and
+                    # plans. The same numerical module remains callable with a
+                    # different row capacity after every graph reader retires.
+                    for rows in (2, 4):
+                        context.prepare(TextSize(2 * rows, 1))
+                        value = (
+                            torch.arange(rows * 4, dtype=torch.float32, device=device).view(rows, 4)
+                            + rank * 10
                         )
-                        return (
-                            total,
-                            maximum,
-                            minimum,
-                            gathered,
-                            broadcast,
-                            reduced,
-                            exchanged,
-                            destination,
-                            peer,
-                        )
-
-                try:
-                    graph.capture(execute, keepalive=(value,))
-                    for iteration in range(2):
-                        with torch.cuda.stream(green.stream):
-                            value.copy_(
-                                torch.arange(8, device=device).view(2, 4) + rank * 10 + iteration
-                            )
-                            actual = graph.replay()
+                        module(value)
+                        with CUDAGraph(context=context) as graph:
+                            graph.capture(lambda: module(value))
+                            for iteration in range(2):
+                                value.copy_(
+                                    torch.arange(rows * 4, device=device).view(rows, 4)
+                                    + rank * 10
+                                    + iteration
+                                )
+                                actual = graph.replay()
+                                green.stream.synchronize()
+                                base = (
+                                    torch.arange(rows * 4, dtype=torch.float32, device=device).view(
+                                        rows, 4
+                                    )
+                                    + iteration
+                                )
+                                peers = [base + member * 10 for member in group.ranks]
+                                expected = (
+                                    base * 2 + 10,
+                                    base + 10,
+                                    base,
+                                    torch.cat(peers),
+                                    base + 10,
+                                    (base * 2 + 10).chunk(2)[group.rank],
+                                    torch.cat([peer.chunk(2)[group.rank] for peer in peers]),
+                                    torch.cat(peers) if group.rank == 0 else None,
+                                    base + (1 - rank) * 10,
+                                    torch.cat(peers),
+                                    base * 2 + 10,
+                                )
+                                for result, reference in zip(actual, expected, strict=True):
+                                    if reference is None:
+                                        assert result is None
+                                    else:
+                                        torch.testing.assert_close(
+                                            result, reference, rtol=0, atol=0
+                                        )
                         green.stream.synchronize()
-                        base = (
-                            torch.arange(8, dtype=torch.float32, device=device).view(2, 4)
-                            + iteration
-                        )
-                        peers = [base + member * 10 for member in group.ranks]
-                        expected = (
-                            base * 2 + 10,
-                            base + 10,
-                            base,
-                            torch.cat(peers),
-                            base + 10,
-                            (base * 2 + 10).chunk(2)[group.rank_in_group],
-                            torch.cat([peer.chunk(2)[group.rank_in_group] for peer in peers]),
-                            torch.stack(peers) if rank == 1 else None,
-                            base + (1 - rank) * 10,
-                        )
-                        for result, reference in zip(actual, expected, strict=True):
-                            if reference is None:
-                                assert result is None
-                            else:
-                                torch.testing.assert_close(result, reference, rtol=0, atol=0)
-                finally:
-                    green.stream.synchronize()
-                    graph.close()
-                    for binding in bindings.values():
-                        binding.close()
         finally:
             for green in greens:
                 green.close()

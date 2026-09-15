@@ -156,6 +156,8 @@ table WorkerInfo {
   latent_page_units:uint;
   latent_pages:uint;
   buffer_pool_bytes:ulong;
+  encoder_cache_entries:uint;
+  encoder_entry_bytes:ulong;
   max_unresolved_ops:uint = 1;
   pipeline_components:[PipelineComponent];
   num_inference_steps:uint;
@@ -404,7 +406,6 @@ table Locator {
   key:ulong;
   name:string;
   publication_id:string;
-  storage_handle:[ubyte];
   storage_size_bytes:ulong;
   storage_offsets_bytes:[ulong];
   span_lengths:[ulong];

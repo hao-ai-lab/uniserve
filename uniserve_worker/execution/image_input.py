@@ -331,9 +331,7 @@ def _resize_tensor(value: torch.Tensor, height: int, width: int) -> torch.Tensor
 def _stage(value: torch.Tensor, processor: ImageProcessor, device: torch.device) -> torch.Tensor:
     """Convert preprocessing output to the processor staging dtype and device."""
 
-    dtype = (
-        None if processor.staging_dtype is None else getattr(torch, processor.staging_dtype, None)
-    )
+    dtype = processor.staging_dtype
     if processor.staging_dtype is not None and not isinstance(dtype, torch.dtype):
         raise invalid_descriptor(f"unknown image staging dtype {processor.staging_dtype!r}")
     return value.to(device=device, dtype=dtype, non_blocking=True)

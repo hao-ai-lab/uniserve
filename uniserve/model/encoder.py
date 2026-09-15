@@ -1,95 +1,185 @@
-"""Shared encoder batching over ordinary numerical modules."""
+"""Shared homogeneous feature batching with explicit numerical boundaries."""
 
-from __future__ import annotations
-
-from typing import Any, Literal, Protocol, cast
+from collections import defaultdict
+from typing import Generic, TypeVar
 
 import torch
+from torch import nn
 
-from uniserve.model.batch import EncodeBatch, TensorOutput
-from uniserve.model.tensors import TensorViews
+from uniserve.media import image
+from uniserve.nn.attention import SequenceLengths, VarlenInput
+from uniserve.tensors import OutputLayout
 
-EncodeKind = Literal["text", "vision", "latent", "conditioning"]
+from .inputs import VisionInput
+from .transformer import TransformerDecoder
 
-
-class LatentEncoder(Protocol):
-    def encode(self, pixels: torch.Tensor) -> torch.Tensor: ...
-
-
-class _FeatureEncoder(Protocol):
-    downsample_factor: int
-
-    def __call__(self, *args: Any, **kwargs: Any) -> torch.Tensor: ...
+InputT = TypeVar("InputT")
 
 
-class _LatentModules(Protocol):
-    @property
-    def latent_encoder(self) -> LatentEncoder: ...
+class Encoder(nn.Module, Generic[InputT]):
+    """Stack equal-shaped feature samples and restore their original order.
 
-
-class _EncoderModules(Protocol):
-    text_encoder: torch.nn.Module | None
-    conditioner: torch.nn.Module | None
-
-    @property
-    def vision_encoder(self) -> _FeatureEncoder: ...
-
-
-class EncoderMixin:
-    """Encode aligned rows using the declared kind and numerical representation.
-
-    Text and conditioning modules consume each variable-length row. Vision uses
-    uniform image tensors or packed patch tensors with explicit grids.
-    VAE inputs use ``encode`` to preserve posterior sampling semantics. Modules
-    and borrowed inputs must already reside on the participating device.
+    The network preserves its leading sample dimension. It must apply token
+    operations independently within each sample, as ordinary batched modules do.
     """
 
-    max_vit_grid_tokens: int = 0
-    encoder_kinds: frozenset[EncodeKind] = frozenset({"latent"})
+    def __init__(self, network: nn.Module):
+        super().__init__()
+        self.network = network
 
-    def encode(
+    def encode(self, inputs: InputT) -> tuple[torch.Tensor, ...]:
+        groups = defaultdict(list)
+        for index, value in enumerate(inputs):
+            groups[(value.shape, value.dtype, value.device)].append(index)
+        result = [None] * len(inputs)
+        for indices in groups.values():
+            values = self.network(torch.stack(tuple(inputs[index] for index in indices)))
+            if values.shape[0] != len(indices):
+                raise ValueError("encoder network must preserve the sample dimension")
+            for index, value in zip(indices, values.unbind(), strict=True):
+                result[index] = value
+        return tuple(result)
+
+
+class PatchEncoder(Encoder[VisionInput]):
+    """Pack image samples and split their spatially downsampled features.
+
+    downsample counts input patches per output feature on each spatial axis.
+    Patch serialization for an architecture is defined by its network;
+    complete CHW images are stacked without altering their pixel order.
+    """
+
+    def __init__(
         self,
-        kind: EncodeKind,
-        batch: EncodeBatch,
+        network: nn.Module,
+        connector: nn.Module,
         *,
-        constants: TensorViews,
-        scratch: TensorViews,
-    ) -> TensorOutput:
-        if kind not in self.encoder_kinds:
-            raise ValueError(f"unsupported encoder kind {kind!r}")
-        modules = cast(_EncoderModules, self)
-        if kind in {"text", "conditioning"}:
-            encoder = modules.text_encoder if kind == "text" else modules.conditioner
-            if encoder is None:
-                raise ValueError(f"this model partition does not participate in {kind} encoding")
-            return TensorOutput({"conditioning": tuple(encoder(value) for value in batch.values)})
-        if kind == "latent":
-            latents = cast(_LatentModules, self).latent_encoder.encode(torch.stack(batch.values))
-            if latents.shape[0] != len(batch.values):
-                raise ValueError("latent encoder must preserve its input batch dimension")
-            return TensorOutput({"latents": tuple(latents.unbind(0))})
-
-        if all(value.ndim == 3 for value in batch.values):
-            features = modules.vision_encoder(torch.stack(batch.values))
-            if features.shape[0] != len(batch.values):
-                raise ValueError("vision encoder must preserve its input batch dimension")
-            return TensorOutput({"features": tuple(features.unbind(0))})
-        if (
-            not batch.grids
-            or not batch.grid_shapes
-            or any(grid is None for grid in batch.grids)
-            or any(shape is None for shape in batch.grid_shapes)
+        patch_size: int,
+        downsample: int,
+        output_size: int,
+        output_dtype: torch.dtype,
+    ):
+        super().__init__(network)
+        if any(
+            type(value) is not int or value < 1 for value in (patch_size, downsample, output_size)
         ):
-            raise TypeError("packed vision encoding requires patch grids")
-        grids = torch.cat(tuple(grid for grid in batch.grids if grid is not None), dim=0)
-        grid_shapes = tuple(shape for shape in batch.grid_shapes if shape is not None)
-        features = modules.vision_encoder(
-            torch.cat(batch.values, dim=0), grids, grid_shapes=grid_shapes
+            raise ValueError("patch encoding requires positive spatial and feature dimensions")
+        self.connector, self.patch_size, self.downsample = connector, patch_size, downsample
+        self._output_size, self._output_dtype = output_size, output_dtype
+
+    def encode(self, inputs: VisionInput) -> tuple[torch.Tensor, ...]:
+        groups = defaultdict(list)
+        for index, value in enumerate(inputs.images):
+            key = (
+                value.ndim,
+                value.shape[1:] if value.ndim == 2 else value.shape,
+                value.dtype,
+                value.device,
+            )
+            groups[key].append(index)
+        result = [None] * inputs.batch_size
+        for indices in groups.values():
+            pixels, grids, shapes = [], [], []
+            for index in indices:
+                value, grid, shape = (
+                    inputs.images[index],
+                    inputs.grids[index],
+                    inputs.grid_shapes[index],
+                )
+                if value.ndim == 3:
+                    if any(axis % self.patch_size for axis in value.shape[-2:]):
+                        raise ValueError("image pixels must contain complete input patches")
+                    shape = (value.shape[-2] // self.patch_size, value.shape[-1] // self.patch_size)
+                    grid = value.new_empty((1, 2), dtype=torch.int64)
+                    grid[:, 0].fill_(shape[0])
+                    grid[:, 1].fill_(shape[1])
+                elif value.ndim != 2 or grid is None or shape is None:
+                    raise ValueError("packed vision samples require their grid and host shape")
+                elif value.shape[0] != shape[0] * shape[1]:
+                    raise ValueError("vision grid dimensions must cover their patch rows")
+                if (
+                    grid.shape != (1, 2)
+                    or min(shape) < 1
+                    or any(axis % self.downsample for axis in shape)
+                ):
+                    raise ValueError("vision grids must align with spatial downsampling")
+                pixels.append(value)
+                grids.append(grid)
+                shapes.append(shape)
+            values = torch.stack(pixels) if pixels[0].ndim == 3 else torch.cat(pixels)
+            features = self.network(values, torch.cat(grids), tuple(shapes))
+            features = self.connector(features).to(self._output_dtype)
+            counts = tuple(height * width // self.downsample**2 for height, width in shapes)
+            if features.shape != (sum(counts), self._output_size):
+                raise ValueError("vision features must cover the declared spatial output grids")
+            for index, features in zip(indices, features.split(counts), strict=True):
+                result[index] = features
+        return tuple(result)
+
+    def output_layout(self, size: image.Config):
+        stride = self.patch_size * self.downsample
+        shape = (size.height // stride * (size.width // stride), self._output_size)
+        return {
+            "features": OutputLayout(
+                shape, self._output_dtype, tuple(slice(0, n) for n in shape), variable_axes=(0,)
+            )
+        }
+
+
+class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
+    """Encode independent token sequences through the retained decoder layers.
+
+    retained_layers names the checkpoint layers participating in the numerical
+    encoder, in execution order. Output normalization belongs to the supplied
+    network; an Identity norm exposes its unnormalized final residual stream.
+    """
+
+    def __init__(self, network: TransformerDecoder, retained_layers: tuple[int, ...]):
+        super().__init__(network)
+        if not retained_layers or tuple(sorted(set(retained_layers))) != retained_layers:
+            raise ValueError("retained decoder layers must be a nonempty increasing tuple")
+        if any(str(index) not in network.layers for index in retained_layers):
+            raise ValueError("retained decoder layers must exist in the supplied network")
+        self.retained_layers = retained_layers
+        network.layers = nn.ModuleDict(
+            (str(index), network.layers[str(index)]) for index in retained_layers
         )
-        # Dense spatial downsampling preserves one contiguous feature interval
-        # per image. The host-known ratio avoids reading device grids for sizes.
-        factor = modules.vision_encoder.downsample_factor
-        counts = tuple(int(value.shape[0]) // (factor * factor) for value in batch.values)
-        if sum(counts) != int(features.shape[0]):
-            raise ValueError("vision encoder output does not align with input rows")
-        return TensorOutput({"features": tuple(features.split(counts))})
+
+    def encode(self, tokens: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...] | None:
+        """Return complete sequence features on the final pipeline stage.
+
+        All participating stages execute the retained network. Earlier stages
+        return None after forwarding their activations; sequence partitions
+        are gathered by the final decoder stage before restoring sample bounds.
+        """
+        if not tokens:
+            return () if self.network._pipeline.rank == self.network._pipeline.size - 1 else None
+        if any(value.ndim != 1 for value in tokens):
+            raise ValueError("text encoding requires one-dimensional token sequences")
+        counts = tuple(value.numel() for value in tokens)
+        packed = torch.cat(tokens)
+        positions = torch.cat(tuple(torch.arange(count, device=packed.device) for count in counts))
+        values = torch.cat(
+            tuple(packed.new_full((1,), count, dtype=torch.int32) for count in counts)
+        )
+        offsets = torch.cat((values.new_zeros(1), values.cumsum(0, dtype=torch.int32)))
+        lengths = SequenceLengths(host=counts, values=values, offsets=offsets)
+        attention = VarlenInput(lengths, lengths, (True,) * len(counts))
+        embeddings = (
+            self.network.embed_input_ids(packed) if self.network._pipeline.rank == 0 else None
+        )
+        features = self.network(embeddings, positions, attention)
+        if self.network._pipeline.rank != self.network._pipeline.size - 1:
+            return None
+        return tuple(features.split(counts))
+
+    def output_layout(self, num_tokens: int):
+        if type(num_tokens) is not int or num_tokens < 0:
+            raise ValueError("text output length must be a nonnegative integer")
+        shape = (num_tokens, self.network.hidden_size)
+        dtype = next(self.network.parameters()).dtype
+        return {
+            "conditioning": OutputLayout(
+                shape, dtype, tuple(slice(0, n) for n in shape), variable_axes=(0,)
+            )
+        }

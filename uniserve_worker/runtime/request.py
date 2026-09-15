@@ -27,7 +27,7 @@ from ..protocol.batch import (
 )
 
 if TYPE_CHECKING:
-    from ..execution.diffusion_state import DiffusionState
+    from ..execution.diffusion_state import ImageState, VideoState
     from ..execution.output import OutputBuffer, PendingOutput
 
 
@@ -63,7 +63,7 @@ class RequestState:
     finish_token_ids: tuple[int, ...]
     accepted_progress: RequestProgress
     accepted_op_id: ComputationId = ComputationId(0, 0)
-    diffusion: DiffusionState | None = None
+    diffusion: ImageState | VideoState | None = None
     tail: PendingOutput | None = None
     pending_operations: dict[ComputationId, PendingOutput] = field(default_factory=dict)
     closed: bool = False
@@ -94,7 +94,7 @@ class RequestPool:
         self.tensor_slots = (
             tuple(
                 TensorBuffers.allocate(
-                    state_buffers, device, pin_memory=torch.device(device).type == "cuda"
+                    state_buffers, device=device, pin_memory=torch.device(device).type == "cuda"
                 )
                 for _ in range(size)
             )

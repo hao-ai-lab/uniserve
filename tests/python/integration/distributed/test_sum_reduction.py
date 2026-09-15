@@ -1,15 +1,16 @@
 """Communicator sums preserve values across mutable graph bucket reuse."""
 
+from uniserve.distributed import DeviceMesh
 from pathlib import Path
 
 import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve.distributed.collectives import allocate_peer_reductions
-from uniserve.distributed.parallel import ParallelConfig
-from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
-from uniserve.nn.collective import collective_scope
+from uniserve.runtime._collectives import allocate_peer_reductions
+from uniserve_worker.parallel import ParallelConfig
+from uniserve.runtime.process_groups import initialize_process_groups
+from uniserve.runtime._communication import collective_scope
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -24,9 +25,18 @@ def _run_sum_reduction(rank: int, rendezvous: str, world_size: int) -> None:
         backend="nccl",
         init_method=rendezvous,
     )
-    mesh = initialize_model_parallel(
-        environment, {"model": (tuple(reversed(range(world_size))), ParallelConfig(world_size))}
-    )["model"]
+    bound_meshes = {}
+    for mesh_name, (mesh_ranks, mesh_parallel) in sorted(({'model': (tuple(reversed(range(world_size))), ParallelConfig(world_size))}).items()):
+        topology = DeviceMesh(
+            ranks=mesh_ranks,
+            shape=tuple(size for _, size in mesh_parallel.dimensions),
+            axes=tuple(axis for axis, _ in mesh_parallel.dimensions),
+            rank=environment.rank,
+        )
+        bound_mesh = environment.bind(topology, device=environment.device)
+        if environment.rank in mesh_ranks:
+            bound_meshes[mesh_name] = bound_mesh
+    mesh = bound_meshes['model']
     group = mesh.get_group("tp")
     reductions = allocate_peer_reductions((group,))
     stream = torch.cuda.Stream(device=device)

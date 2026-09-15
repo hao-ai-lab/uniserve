@@ -32,8 +32,10 @@ fn resolve_generation_limits(
     let latent_bound = limits.max_latent_units.min(u64::from(u32::MAX)) as u32;
     limits.max_vae_grid_tokens = limits.max_vae_grid_tokens.min(latent_bound);
     limits.max_vit_grid_tokens = limits.max_vit_grid_tokens.min(info.max_batch_tokens);
-    limits.max_latent_feature_bytes = limits.max_latent_feature_bytes.min(info.buffer_pool_bytes);
-    limits.max_vision_feature_bytes = limits.max_vision_feature_bytes.min(info.buffer_pool_bytes);
+    let feature_bytes = info.encoder_entry_bytes.min(info.buffer_pool_bytes);
+    limits.max_latent_feature_bytes = limits.max_latent_feature_bytes.min(feature_bytes);
+    limits.max_vision_feature_bytes = limits.max_vision_feature_bytes.min(feature_bytes);
+    limits.encoder_cache_entries = limits.encoder_cache_entries.min(info.encoder_cache_entries);
     if info.buffer_pool_bytes == 0 {
         limits.encoder_cache_entries = 0;
     }

@@ -7,8 +7,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from uniserve.model.diffusion import DiffusionMixin
-from uniserve.model.tensors import TokenSelection, packed_tensor_views
+from uniserve_worker.execution.tensors import TokenSelection, packed_tensor_views
 from uniserve.nn.rng import DRAW_LAYOUT_TARGET, sampling_key, sampling_uniform
 from uniserve_worker.execution.output import (
     PendingOutput,
@@ -40,7 +39,7 @@ from .sampling import SamplerOutput, SamplerRow, SamplingMetadata, sample_column
 
 if TYPE_CHECKING:
     from uniserve.distributed.mesh import Communicator
-    from uniserve.model.model import Model
+    from .inputs.image import ImageInputs
 
     from ..runtime.block_tables import BlockTables
     from ..runtime.decode_state import DecodeState
@@ -149,7 +148,7 @@ def prepare_sampling(
     state: BatchState,
     request_pool_index: torch.Tensor,
     tensor_store: TensorStore,
-    execution_model: Model,
+    image_inputs: ImageInputs | None,
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> SamplingMetadata | PendingOutput:
@@ -165,7 +164,7 @@ def prepare_sampling(
             task,
             output,
             request_pool_index=request_pool_index,
-            execution_model=execution_model,
+            image_inputs=image_inputs,
             request_tables=request_tables,
             decode_state=decode_state,
             state=state,
@@ -241,7 +240,7 @@ def publish_sample(
     sampled: SamplerRow,
     *,
     state: BatchState,
-    execution_model: Model,
+    image_inputs: ImageInputs | None,
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> PendingOutput:
@@ -258,7 +257,7 @@ def publish_sample(
             operations.require_progress(request),
             rng_counter=operations.require_progress(request).rng_counter + (1),
         )
-        flow = execution_model.generation if isinstance(execution_model, DiffusionMixin) else None
+        flow = image_inputs
         logical_position = start + (
             max(1, 1 if flow is None else int(flow.rope_advance))
             if operation.completion_output is not None
@@ -275,7 +274,7 @@ def publish_sample(
         return _finish_visual(
             operation,
             completion_group,
-            execution_model=execution_model,
+            image_inputs=image_inputs,
             request_tables=request_tables,
             state=state,
         )
@@ -416,7 +415,7 @@ def _prepare_visual_sampling(
     *,
     state: BatchState,
     request_pool_index: torch.Tensor,
-    execution_model: Model,
+    image_inputs: ImageInputs | None,
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> SamplingMetadata | PendingOutput:
@@ -430,9 +429,7 @@ def _prepare_visual_sampling(
     )
     if operation.token_output is not None:
         assert value is not None
-        generation = (
-            execution_model.generation if isinstance(execution_model, DiffusionMixin) else None
-        )
+        generation = image_inputs
         sample = build_sampling_metadata(
             operation,
             value[-1],
@@ -450,7 +447,7 @@ def _prepare_visual_sampling(
     return _finish_visual(
         operation,
         completion_group,
-        execution_model=execution_model,
+        image_inputs=image_inputs,
         request_tables=request_tables,
         state=state,
     )
@@ -461,7 +458,7 @@ def _finish_visual(
     completion_group: int,
     *,
     state: BatchState,
-    execution_model: Model,
+    image_inputs: ImageInputs | None,
     request_tables: BlockTables | None,
 ) -> PendingOutput:
     """Finalize visual feature publication and advance the encode operation state."""
@@ -469,7 +466,7 @@ def _finish_visual(
     request = state.pending_output(completion_group, operation.request_key.request_id)
     position = int(operations.require_progress(request).logical_position)
     if operation.completion_output is not None:
-        flow = execution_model.generation if isinstance(execution_model, DiffusionMixin) else None
+        flow = image_inputs
         request.projected_progress = replace(
             operations.require_progress(request),
             logical_position=position + max(1, 1 if flow is None else int(flow.rope_advance)),

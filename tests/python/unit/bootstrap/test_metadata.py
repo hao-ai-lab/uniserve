@@ -6,10 +6,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from uniserve.loading.source import WeightSourceSet
-from uniserve.model.limits import ModelLimits
-from uniserve_models.metadata import bagel_config
-from uniserve_models.minimax_h3.config import H3Config
+from uniserve.loading import Config as IOConfig
+from uniserve_models.bagel import read_config as bagel_config
 
 pytestmark = pytest.mark.unit
 
@@ -39,71 +37,55 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(tmp_path,
             (tmp_path / f"{name}.json").write_text(json.dumps(values))
     path = tmp_path / "ema.safetensors"
     save_file({"latent_pos_embed.pos_embed": torch.zeros(9, 16)}, path)
-    source = WeightSourceSet(tmp_path, (path,), (path.name,))
 
     raw = {**(towers if inline else {}), "start_of_image_id": 62, "end_of_image_id": 63}
-    config = bagel_config(raw, tmp_path, (source,))
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    config = bagel_config(tmp_path, IOConfig())
 
     assert config.text.hidden_size == 16
     assert config.text.num_attention_heads == 4
-    assert config.vision.hidden_size == 24
-    assert config.vision.num_hidden_layers == 2
+    assert config.vision.encoder.hidden_size == 24
+    assert config.vision.encoder.num_hidden_layers == 2
     assert config.vae.scale_factor == 0.5
-    assert config.vit_token_capacity == 64
-    assert config.latent_channel == 4
-    assert config.latent_downsample == 4
+    assert config.vae.latent_channels == 4
+    assert config.vae.downsample * config.latent_patch_size == 4
     assert config.max_latent_size == 3
-    assert config.latent_token_capacity == 9
 
     # Released checkpoints may serialize a constructor default; actual learned
     # positions determine both numerical packing and allocation bounds.
-    normalized = bagel_config({**raw, "max_latent_size": 4}, tmp_path, (source,))
+    (tmp_path / "config.json").write_text(json.dumps({**raw, "max_latent_size": 4}))
+    normalized = bagel_config(tmp_path, IOConfig())
     assert normalized.max_latent_size == 3
-    assert normalized.latent_token_capacity == 9
 
     save_file({"latent_pos_embed.pos_embed": torch.zeros(9, 12)}, path)
-    with pytest.raises(ValueError, match="text hidden size"):
-        bagel_config(raw, tmp_path, (source,))
+    with pytest.raises(ValueError, match="square grid at text width"):
+        bagel_config(tmp_path, IOConfig())
 
     # Positional vectors must form the square grid used by latent patch indexing.
     save_file({"latent_pos_embed.pos_embed": torch.zeros(10, 16)}, path)
-    with pytest.raises(ValueError, match="position count 10 is not square"):
-        bagel_config(raw, tmp_path, (source,))
+    with pytest.raises(ValueError, match="square grid at text width"):
+        bagel_config(tmp_path, IOConfig())
 
 
-def test_h3_worker_advertises_numerical_components_and_media_delivery():
-    from tests.python.fixtures.model_execution import h3_arguments
-    from uniserve.distributed.mesh import DeviceMesh
-    from uniserve.distributed.parallel import ParallelConfig
-    from uniserve_models.catalog import MINIMAX_H3_ENTRY
-    from uniserve_models.minimax_h3.model import MiniMaxH3Model
-    from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
+def test_h3_worker_advertises_bounded_media_products():
+    from uniserve_models.minimax_h3 import Config, Model
+    from uniserve_worker.bootstrap.components import media_components, supported_operations
     from uniserve_worker.config import WorkerConfig
     from uniserve_worker.protocol.batch import VIDEO_STAGES, PipelineStage, TransferMode
+    from uniserve_worker.runtime.results import resolve_outputs
 
-    parallel = ParallelConfig()
-    # Output metadata has no learned parameters. Its real component context
-    # retains the numerical declarations and postprocessing geometry.
-    arguments = h3_arguments(
-        parallel={"video_output": parallel},
-        meshes={"video_output": DeviceMesh((0,), 0, parallel)},
-        limits=ModelLimits(text_tokens=64, video_frames=22),
-        precisions=MINIMAX_H3_ENTRY.component_precisions({"mode": "quality"}),
-    )
-    model = MiniMaxH3Model(H3Config(), **arguments)
+    with torch.device("meta"):
+        model = Model(Config())
     config = WorkerConfig(
         device="cpu",
-        max_batch_operations=2,
-        max_batch_tokens=2,
+        max_sequence_tokens=65,
+        max_video_seconds=1.0,
         max_request_pool_size=2,
+        min_request_pool_size=2,
     )
-
-    info = build_worker_layout(model, config, queue_depth=6).info
-
-    assert info.kv_cache is None
-    assert info.num_inference_steps == 4
-    assert set(info.supported_ops) == {*VIDEO_STAGES, TransferMode.TENSOR}
-    assert info.pipeline_components == {
+    outputs = resolve_outputs(model, config)
+    assert set(supported_operations(model)) == {*VIDEO_STAGES, TransferMode.TENSOR}
+    assert media_components(model) == {
         PipelineStage.TEXT_ENCODING: "text_encoder",
         PipelineStage.LATENT_PREPARATION: "denoiser",
         PipelineStage.DENOISING: "denoiser",
@@ -113,6 +95,27 @@ def test_h3_worker_advertises_numerical_components_and_media_delivery():
         PipelineStage.AUDIO_ENCODING: "output",
         PipelineStage.MUXING: "output",
     }
+    products = {value.name: value for values in outputs.values() for value in values}
+    # One second is covered by two native 17-frame windows and the final
+    # five-frame overlap. Each video latent frame contains 24x42 patch tokens.
+    expected = {
+        "conditioning": (65, 5120),
+        "video_latents": (12 * 24 * 42, 96),
+        "audio_latents": (2 * 65, 32),
+        "video_segments": (2, 1, 3, 25, 768, 1344),
+        "audio_samples": (52_000, 2),
+    }
+    assert products.keys() == expected.keys()
+    for name, shape in expected.items():
+        assert products[name].shape_bound.max_elements == torch.Size(shape).numel()
+
+    from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
+
+    info = build_worker_info(model, config, queue_depth=6)
+    assert info.num_inference_steps == 4
+    assert info.request_slots == 2
+    assert info.kv_cache is None
+    assert info.max_batch_ops == 2
 
 
 def _neo_metadata():
@@ -132,20 +135,21 @@ def _neo_metadata():
     }
 
 
-def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes():
-    from uniserve_models.sensenova.config import read_config
+def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes(tmp_path):
+    from uniserve_models.sensenova_u1 import read_config
 
     raw = _neo_metadata()
     raw["llm_config"].update(use_sliding_window=False, sliding_window=64, max_window_layers=1)
-    config = read_config(raw)
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    config = read_config(tmp_path, IOConfig())
     assert config.text.layer_types == ("full_attention",) * 3
     assert config.text.sliding_window == 64
     assert config.text.pad_token_id == 3
-    assert config.vision.llm_hidden_size == 16
+    assert config.vision.output_size == 16
     assert config.vision.downsample_ratio == 0.5
     raw["llm_config"]["hidden_size"] = 32
     raw["vision_config"]["llm_hidden_size"][0] = 32
-    assert config.text.hidden_size == config.vision.llm_hidden_size == 16
+    assert config.text.hidden_size == config.vision.output_size == 16
 
 
 @pytest.mark.parametrize(
@@ -157,29 +161,80 @@ def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes():
         ("num_experts", 8, "sparse MoE is not supported"),
     ],
 )
-def test_sensenova_reader_rejects_inconsistent_checkpoint_math(field, value, error):
-    from uniserve_models.sensenova.config import read_config
+def test_sensenova_reader_rejects_inconsistent_checkpoint_math(tmp_path, field, value, error):
+    from uniserve_models.sensenova_u1 import read_config
 
     raw = _neo_metadata()
     raw["llm_config"][field] = value
+    (tmp_path / "config.json").write_text(json.dumps(raw))
     with pytest.raises(ValueError, match=error):
-        read_config(raw)
+        read_config(tmp_path, IOConfig())
 
 
-def test_sensenova_direct_config_rejects_mismatched_vision_features():
+def test_sensenova_direct_config_rejects_mismatched_vision_features(tmp_path):
     from dataclasses import replace
 
-    from uniserve_models.sensenova.config import read_config
+    from uniserve_models.sensenova_u1 import read_config
 
-    config = read_config(_neo_metadata())
+    (tmp_path / "config.json").write_text(json.dumps(_neo_metadata()))
+    config = read_config(tmp_path, IOConfig())
     with pytest.raises(ValueError, match="vision output must match"):
-        replace(config, vision=replace(config.vision, llm_hidden_size=32))
+        replace(config, vision=replace(config.vision, output_size=32))
 
 
-def test_sensenova_reader_rejects_unimplemented_sliding_attention():
-    from uniserve_models.sensenova.config import read_config
+def test_sensenova_reader_rejects_unimplemented_sliding_attention(tmp_path):
+    from uniserve_models.sensenova_u1 import read_config
 
     raw = _neo_metadata()
     raw["llm_config"].update(use_sliding_window=True, sliding_window=64, max_window_layers=1)
+    (tmp_path / "config.json").write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="sliding_attention is not supported"):
-        read_config(raw)
+        read_config(tmp_path, IOConfig())
+
+
+@pytest.mark.parametrize("storage", ("bfloat16", "float8_e4m3fn"))
+def test_text_worker_reports_exact_cache_capacity(storage):
+    from uniserve_models.qwen3 import Config, Model
+    from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
+    from uniserve_worker.config import WorkerConfig
+
+    with torch.device("meta"):
+        model = Model(
+            Config(
+                vocab_size=65,
+                hidden_size=32,
+                intermediate_size=48,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=8,
+                hidden_act="silu",
+                rms_norm_eps=1e-6,
+                rope_theta=10000.0,
+                max_position_embeddings=128,
+                attention_bias=False,
+                tie_word_embeddings=False,
+                num_experts=0,
+                num_experts_per_tok=1,
+                moe_intermediate_size=48,
+            )
+        ).to(dtype=torch.bfloat16)
+    config = WorkerConfig(
+        device="cpu",
+        block_size=64,
+        kv_token_capacity=256,
+        kv_cache_dtype=storage,
+        max_sequence_tokens=128,
+    )
+    info = build_worker_info(model, config)
+    cache = info.kv_cache
+    assert cache.num_blocks == 4
+    assert cache.total_layers == cache.num_layers == 2
+    assert cache.total_kv_heads == cache.num_kv_heads == 2
+    assert cache.layer_offset == cache.kv_head_offset == 0
+    assert cache.head_dim == 8
+    assert cache.dtype == storage
+    payload = 2 * 2 * 2 * 8 * (1 if storage == "float8_e4m3fn" else 2) * 64
+    scales = 2 * 2 * 4 if storage == "float8_e4m3fn" else 0
+    initialization = 2 * 2
+    assert cache.bytes_per_token == (payload + scales + initialization + 63) // 64

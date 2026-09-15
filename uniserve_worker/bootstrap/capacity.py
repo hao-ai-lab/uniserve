@@ -10,15 +10,13 @@ import torch
 
 from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
-from uniserve.model.diffusion import DiffusionMixin
-from uniserve.model.encoder import EncoderMixin
-from uniserve.model.image_diffusion import ImageDiffusion
-from uniserve.model.model import Model
-from uniserve.model.text import TextMixin
-from uniserve.model.video import VideoMixin
+from torch import nn
+
+from uniserve.model import CausalLM, PatchEncoder, VideoPostprocessor
+from uniserve.diffusion import Branch
 from uniserve.runtime.device import canonical_device, device_memory_budget
 from uniserve.tensors import BufferConfig
-from uniserve_models.processing import FeatureLayout, ImageProcessor
+from uniserve_models.processing import FeatureLayout, ImageProcessor, PatchTransform
 
 from ..config import WorkerConfig
 from ..execution.input_buffers import InputBufferConfig
@@ -30,6 +28,7 @@ from ..runtime.cache_manager import CacheManager
 from ..runtime.results import resolve_outputs
 from ..runtime.tensor_store import TensorStore, device_product_capacity_bytes
 from .components import media_components
+from .inputs import capability, image_inputs
 
 _DEVICE_PRODUCTS_PER_OPERATION = 6
 _DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
@@ -45,13 +44,13 @@ DEFAULT_BLOCK_SIZE = 64
 
 
 def input_buffer_config(
-    model: Model, config: WorkerConfig, *, processor: ImageProcessor | None = None
+    model: nn.Module, config: WorkerConfig, *, processor: ImageProcessor | None = None
 ) -> InputBufferConfig:
     """Size staging for the admitted text span plus one atomic image or CFG operation."""
 
-    if not isinstance(model, TextMixin):
-        raise ValueError("text input staging requires a text backbone")
-
+    text = capability(model, CausalLM)
+    if text is None:
+        raise ValueError("text input staging requires a causal language model")
     max_rows = min(
         config.max_request_pool_size,
         config.max_batch_operations,
@@ -65,40 +64,57 @@ def input_buffer_config(
         if config.lanes
         else config.max_batch_tokens
     )
-    flow = model.generation if isinstance(model, DiffusionMixin) else None
-    branches = 1 if flow is None else int(flow.max_cfg_branches)
+    flow = image_inputs(model)
+    branches = 1 if flow is None else len(Branch)
     injection = None if processor is None else processor.feature_injection
     image_span = (
         0
         if injection is None
         else max(
-            (int(model.max_vit_grid_tokens) if isinstance(model, EncoderMixin) else 0),
-            0 if flow is None else int(flow.max_vae_grid_tokens),
+            vision_tokens(model, processor),
+            0 if flow is None else flow.max_tokens,
         )
         + (2 if injection.layout is FeatureLayout.FRAMED else 0)
     )
     text_tokens = max_tokens + image_span
-    flow_tokens = (
-        0
-        if flow is None
-        else branches
-        * max(
+    if flow is None:
+        flow_tokens = 0
+    else:
+        from uniserve.media import image
+
+        flow_tokens = branches * max(
             (
-                int(flow.max_latent_tokens),
+                flow.max_tokens + flow.framing,
                 *(
-                    flow.sequence_length(height, width)
+                    flow.sequence_length(image.Config(height, width))
                     for height, width in config.flow_graph_shapes
                 ),
             )
         )
-    )
     return InputBufferConfig(
         max_rows=max_rows * branches,
-        max_tokens=text_tokens + flow_tokens,
+        # Text and diffusion use separate homogeneous calls on this lane.
+        max_tokens=max(text_tokens, flow_tokens),
         max_text_tokens=text_tokens,
-        max_blocks_per_row=max(1, ceil_div(model.text_backbone.max_tokens, config.block_size)),
-        hidden_size=model.text_backbone.hidden_size,
+        max_blocks_per_row=max(1, ceil_div(config.max_sequence_tokens, config.block_size)),
+        hidden_size=text.backbone.hidden_size,
+        embedding_dtype=getattr(torch, config.model_dtype.removeprefix("torch.")),
     )
+
+
+def vision_tokens(model: nn.Module, processor: ImageProcessor | None) -> int:
+    """Bound feature rows from the actual image transform and encoder stride."""
+
+    encoder = capability(model, PatchEncoder)
+    if encoder is None or processor is None or processor.vit is None:
+        return 0
+    transform = processor.vit
+    pixels = (
+        transform.max_pixels
+        if isinstance(transform, PatchTransform)
+        else min(transform.resize.max_pixels, transform.resize.max_size**2)
+    )
+    return pixels // (encoder.patch_size * encoder.downsample) ** 2
 
 
 def tensor_slot_capacity(
@@ -127,7 +143,7 @@ def tensor_slot_capacity(
         dtype=torch.int32,
         device=group.device,
     )
-    group.all_reduce_min(agreed)
+    group.all_reduce(agreed, op="min")
     feasible = [count for count, fits in zip(candidates, agreed.cpu().tolist()) if fits]
     if feasible:
         return feasible[-1]
@@ -210,7 +226,9 @@ def local_product_storage_bytes(
     for entry, outputs in entry_outputs.items():
         producer = bindings.get(entry)
         if bindings:
-            produces = producer is not None and producer.process_group.rank in producer.output_ranks
+            produces = (
+                producer is not None and producer.process_group.global_rank in producer.output_ranks
+            )
             consumes = any(
                 consumer in bindings and bindings[consumer].owns
                 for consumer in consumers.get(entry, ())
@@ -348,7 +366,7 @@ def request_tensor_arena_capacity(
 
 
 def model_arena_capacity(
-    model: Model,
+    model: nn.Module,
     worker_config: WorkerConfig,
     *,
     pipeline_depth: int,
@@ -374,13 +392,13 @@ def model_arena_capacity(
 
     slots = depth * max_operations
     if state_buffers is None:
-        state_buffers = media_state_buffers(model, bindings or {})
-    if isinstance(model, VideoMixin) or state_buffers:
+        state_buffers = media_state_buffers(model, bindings or {}, worker_config)
+    if capability(model, VideoPostprocessor) is not None or state_buffers:
         return request_tensor_arena_capacity(
             worker_config,
             pipeline_depth=depth,
             product_bytes_per_request=local_product_storage_bytes(
-                resolve_outputs(model),
+                resolve_outputs(model, worker_config),
                 bindings=bindings or {},
                 pipeline_components=media_components(model),
                 max_unresolved_ops=request_tensor_window(depth, request_pool_size),
@@ -388,9 +406,7 @@ def model_arena_capacity(
         )
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
     block_size = int(worker_config.block_size)
-    flow = model.generation if isinstance(model, DiffusionMixin) else None
-    if flow is not None and not isinstance(flow, ImageDiffusion):
-        raise ValueError("model generation behavior has an invalid type")
+    flow = image_inputs(model)
     latent_pool_bytes = 0
     latent_transfer_bytes = 0
     if flow is not None:
@@ -409,7 +425,7 @@ def model_arena_capacity(
             dtype_bytes=dtype_bytes,
         )
         latent_transfer_bytes = latent_trajectory_bytes(
-            int(flow.max_latent_tokens),
+            flow.max_tokens,
             int(latent_width),
             dtype_bytes,
         )
@@ -554,7 +570,7 @@ __all__ = [
 
 
 def resolve_request_capacity(
-    model: Model,
+    model: nn.Module,
     worker_config: WorkerConfig,
     *,
     pipeline_depth: int,
@@ -570,9 +586,11 @@ def resolve_request_capacity(
         )
         worker_config = replace(worker_config, pool_memory_bytes=available)
         schema = (
-            media_state_buffers(model, bindings or {}) if state_buffers is None else state_buffers
+            media_state_buffers(model, bindings or {}, worker_config)
+            if state_buffers is None
+            else state_buffers
         )
-        if isinstance(model, VideoMixin) or schema:
+        if capability(model, VideoPostprocessor) is not None or schema:
             if capacity_group is None:
                 raise unsupported_setup("request tensor sizing requires its rank group")
 
@@ -584,7 +602,7 @@ def resolve_request_capacity(
                     max_batch_tokens=min(count, worker_config.max_batch_tokens),
                 )
                 product_bytes = local_product_storage_bytes(
-                    resolve_outputs(model),
+                    resolve_outputs(model, worker_config),
                     bindings=bindings or {},
                     pipeline_components=media_components(model),
                     max_unresolved_ops=request_tensor_window(pipeline_depth, count),
@@ -614,19 +632,19 @@ def resolve_request_capacity(
 
 
 def decode_context_blocks(
-    model: Model, worker_config: WorkerConfig, pool: CacheManager | None
+    model: nn.Module, worker_config: WorkerConfig, pool: CacheManager | None
 ) -> int:
     """Return the maximum paged-decode context blocks supported by this worker."""
 
-    if not isinstance(model, TextMixin):
+    if capability(model, CausalLM) is None:
         return 0
-    max_tokens = int(model.text_backbone.max_tokens)
+    max_tokens = worker_config.max_sequence_tokens
     if max_tokens < 1:
         return 0
     blocks = (max_tokens + int(worker_config.block_size) - 1) // int(worker_config.block_size)
     if pool is None:
         return 0
-    return min(blocks, max(0, int(pool.cache.num_pages) - 1))
+    return min(blocks, max(0, int(pool.info.num_blocks) - 1))
 
 
 def check_startup_memory(

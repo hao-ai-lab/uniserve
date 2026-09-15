@@ -4,13 +4,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 import torch
 
-from uniserve.attention.metadata import AttentionMetadata
-from uniserve.model.batch import TextOutput
-from uniserve.model.tensors import FlowPatches, TokenSelection
+from uniserve.model.logits import Logits, VocabShard
+from uniserve_worker.execution.tensors import TokenSelection, packed_tensor_views
 from uniserve.tensors import OutputLayout
 from uniserve_worker.protocol.batch import ForwardMode, ForwardStats, PipelineStage
 
@@ -18,111 +17,44 @@ if TYPE_CHECKING:
     from .sampling import SamplerOutput
 
 
+InputT = TypeVar("InputT")
+
+
 @dataclass(frozen=True, slots=True)
-class InputBatch:
-    """One borrowed columnar view over execution-lane input buffers."""
+class InputBatch(Generic[InputT]):
+    """One typed numerical input and the worker's aligned output controls."""
 
     forward_mode: ForwardMode | PipelineStage
-    row_count: int
-    attention: AttentionMetadata
+    inputs: InputT
     request_pool_indices: torch.Tensor
-    binding: int = 0
-    cuda_graph_capture: bool = False
-    decode_force_finish: torch.Tensor | None = None
-    token_row_indices: tuple[int, ...] = ()
-    flow_row_indices: tuple[int, ...] = ()
-    input_ids: torch.Tensor | None = None
-    input_embeddings: torch.Tensor | None = None
-    embedding_mask: torch.Tensor | None = None
-    positions: torch.Tensor | None = None
     token_selections: tuple[TokenSelection, ...] = ()
-    flow_positions: tuple[torch.Tensor, ...] = ()
-    flow_timesteps: tuple[torch.Tensor, ...] = ()
-    flow_latents: tuple[torch.Tensor, ...] = ()
-    flow_conditioning: tuple[FlowPatches | None, ...] = ()
-    flow_image_tokens: tuple[int, ...] = ()
-    flow_heights: tuple[int, ...] = ()
-    flow_widths: tuple[int, ...] = ()
-    encode_pixels: tuple[torch.Tensor, ...] = ()
-    encode_grids: tuple[torch.Tensor | None, ...] = ()
-    encode_grid_shapes: tuple[tuple[int, int] | None, ...] = ()
-    decode_latents: tuple[torch.Tensor, ...] = ()
-    decode_heights: tuple[int, ...] = ()
-    decode_widths: tuple[int, ...] = ()
+    decode_force_finish: torch.Tensor | None = None
 
-    def __post_init__(self) -> None:
-        """Validate borrowed batch columns against attention mode and row geometry."""
+    @property
+    def row_count(self) -> int:
+        return self.request_pool_indices.numel()
 
-        if self.row_count < 1:
-            raise ValueError("forward batch must contain at least one row")
-        if int(self.request_pool_indices.numel()) != self.row_count:
-            raise ValueError("forward request indices do not align with rows")
+    def __post_init__(self):
+        if self.request_pool_indices.ndim != 1 or self.row_count < 1:
+            raise ValueError("execution requires a nonempty vector of request slots")
         if (
-            int(self.attention.prefix_lens.numel()) != self.row_count
-            or int(self.attention.query_lens.numel()) != self.row_count
+            isinstance(self.forward_mode, ForwardMode)
+            and len(self.token_selections) != self.row_count
         ):
-            raise ValueError("forward KV lengths do not align with rows")
+            raise ValueError("text output selections must align with request slots")
         if self.decode_force_finish is not None and (
-            int(self.decode_force_finish.numel()) != self.row_count
-            or self.decode_force_finish.dtype is not torch.bool
+            self.decode_force_finish.shape != self.request_pool_indices.shape
+            or self.decode_force_finish.dtype != torch.bool
         ):
-            raise ValueError("forward decode finish column does not align with rows")
-        row_indices = (*self.token_row_indices, *self.flow_row_indices)
-        if row_indices and (
-            len(set(row_indices)) != len(row_indices)
-            or min(row_indices) < 0
-            or max(row_indices) >= self.row_count
-        ):
-            raise ValueError("forward row indexes are invalid")
-        if len(self.token_row_indices) != len(self.token_selections):
-            raise ValueError("forward token columns are not aligned")
-        if any(
-            len(lengths) != self.row_count
-            for lengths in (
-                self.attention.prefix_lens_cpu,
-                self.attention.seq_lens_cpu,
-                self.attention.query_lens_cpu,
-            )
-        ):
-            raise ValueError("forward host KV lengths do not align with rows")
-        if any(
-            prefix < 0 or query < 0 or total != prefix + query
-            for prefix, query, total in zip(
-                self.attention.prefix_lens_cpu,
-                self.attention.query_lens_cpu,
-                self.attention.seq_lens_cpu,
-                strict=True,
-            )
-        ):
-            raise ValueError("forward sequence lengths must equal cached prefix plus query")
-        flow_count = len(self.flow_row_indices)
-        if any(
-            len(values) != flow_count
-            for values in (
-                self.flow_positions,
-                self.flow_timesteps,
-                self.flow_latents,
-                self.flow_conditioning,
-                self.flow_image_tokens,
-                self.flow_heights,
-                self.flow_widths,
-            )
-        ):
-            raise ValueError("forward flow columns are not aligned")
-        encode_count = len(self.encode_pixels)
-        if any(
-            len(values) != encode_count for values in (self.encode_grids, self.encode_grid_shapes)
-        ):
-            raise ValueError("forward encoder columns are not aligned")
-        decode_count = len(self.decode_latents)
-        if any(len(values) != decode_count for values in (self.decode_heights, self.decode_widths)):
-            raise ValueError("forward decoder columns are not aligned")
+            raise ValueError("decode completion controls must align with request slots")
 
 
 @dataclass(frozen=True, slots=True)
-class ExecutionOutput(TextOutput):
+class ExecutionOutput:
     """Row-aligned numerical results with execution observations and reader fences."""
 
+    values: tuple[torch.Tensor, ...]
+    vocabularies: tuple[VocabShard | None, ...] = ()
     request_pool_indices: torch.Tensor | None = None
     output_event: torch.cuda.Event | None = None
     stats: ForwardStats | None = None
@@ -131,7 +63,16 @@ class ExecutionOutput(TextOutput):
     layouts: tuple[OutputLayout | None, ...] = ()
 
     def __post_init__(self) -> None:
-        TextOutput.__post_init__(self)
+        if not self.vocabularies:
+            object.__setattr__(self, "vocabularies", (None,) * len(self.values))
+        if len(self.vocabularies) != len(self.values):
+            raise ValueError("vocabulary metadata must align with output rows")
+        for value, vocab in zip(self.values, self.vocabularies, strict=True):
+            if vocab is not None and (
+                value.ndim != 2
+                or value.shape[-1] != vocab.local_slice.stop - vocab.local_slice.start
+            ):
+                raise ValueError("vocabulary output rows disagree with their shard")
         if not self.layouts:
             object.__setattr__(self, "layouts", (None,) * len(self.values))
         if len(self.layouts) != len(self.values):
@@ -146,8 +87,37 @@ class ExecutionOutput(TextOutput):
             torch.cuda.current_stream(self.values[0].device).wait_event(self.output_event)
         if not any(self.vocabularies):
             return self
-        output = TextOutput(self.values, self.vocabularies).materialize()
-        return replace(self, values=output.values, vocabularies=output.vocabularies)
+        groups = {}
+        for index, vocab in enumerate(self.vocabularies):
+            if vocab is not None:
+                key = (
+                    vocab.size,
+                    vocab.padded_size,
+                    vocab.local_slice.start,
+                    vocab.local_slice.stop,
+                    id(vocab.group),
+                    self.values[index].device,
+                    self.values[index].dtype,
+                )
+                groups.setdefault(key, []).append(index)
+        values = list(self.values)
+        for indexes in groups.values():
+            vocab = self.vocabularies[indexes[0]]
+            sources = tuple(self.values[index] for index in indexes)
+            # Adjacent request rows already share backing; gather them together
+            # without adding another allocation or collective per request.
+            packed = packed_tensor_views(sources)
+            rows = (
+                torch.cat(sources, dim=0)
+                if packed is None
+                else packed.reshape(-1, vocab.local_slice.stop - vocab.local_slice.start)
+            )
+            gathered = Logits(rows, vocab).gather()
+            for index, value in zip(
+                indexes, gathered.split(tuple(source.shape[0] for source in sources)), strict=True
+            ):
+                values[index] = value
+        return replace(self, values=tuple(values), vocabularies=())
 
     def clone(self) -> ExecutionOutput:
         """Own detached copies that survive reuse of the producer's storage.

@@ -9,7 +9,7 @@ from typing import cast
 import torch
 
 from uniserve.distributed.mesh import Communicator
-from uniserve.model.tensors import packed_tensor_views
+from uniserve_worker.execution.tensors import packed_tensor_views
 from uniserve.runtime.triton import triton_available
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.protocol.batch import SamplingParams

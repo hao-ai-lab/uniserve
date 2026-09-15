@@ -11,7 +11,9 @@ from threading import RLock
 
 import torch
 
-from uniserve.runtime.kv_cache import KVCache, page_spans
+from uniserve.runtime import PrefixCache
+from uniserve.quantization import QuantizedTensor
+from uniserve_worker.bootstrap.worker_info import KVCacheInfo
 
 from ..foundation.errors import invalid_descriptor, resource_error
 from ..protocol.batch import (
@@ -24,7 +26,7 @@ from ..protocol.batch import (
 )
 from ..transfer.exports import ExportLocations, release_exports
 from ..transfer.tickets import Transport, publish_tensor
-from .block_tables import BlockTables
+from .block_tables import BlockTables, page_spans
 from .cache_imports import CacheImport, CacheImports
 
 __all__ = ["CacheManager"]
@@ -59,15 +61,29 @@ class CacheManager:
 
     def __init__(
         self,
-        cache: KVCache,
+        cache: PrefixCache,
         *,
+        info: KVCacheInfo,
         group_ranges: Sequence[tuple[int, int]] | None = None,
         import_capacity: int = 1,
         request_pool_size: int = 1,
         max_blocks_per_request: int | None = None,
         staging_depth: int = 1,
     ) -> None:
-        self.cache = cache
+        self.cache, self.info = cache, info
+        self.layers = tuple(cache.config.layers)
+        if len(self.layers) != info.num_layers:
+            raise ValueError("cache backing must cover the advertised resident layers")
+        for name in self.layers:
+            state = cache.state(name)
+            if state.key.shape != (
+                info.num_blocks,
+                info.block_size,
+                info.num_kv_heads,
+                info.head_dim,
+            ):
+                raise ValueError("cache backing must match the advertised page and head extents")
+        self.compute_dtype = cache.config.layers[self.layers[0]].compute_dtype
         self.group_ranges = self._group_ranges(group_ranges)
         self.group_count = len(self.group_ranges)
         # Reuse normalized page tuples after their bounds and group ownership
@@ -84,11 +100,11 @@ class CacheManager:
         self.block_tables = BlockTables(
             group_count=self.group_count,
             request_pool_size=request_pool_size,
-            max_blocks_per_request=max(1, self.cache.num_pages - 1)
+            max_blocks_per_request=max(1, self.info.num_blocks - 1)
             if max_blocks_per_request is None
             else max_blocks_per_request,
-            block_size=self.cache.page_size,
-            device=cache.k.device,
+            block_size=self.info.block_size,
+            device=cache.device,
             staging_depth=staging_depth,
         )
         self._publications: dict[BufferId, KvTransfer] = {}
@@ -115,8 +131,8 @@ class CacheManager:
         try:
             yield pages
         finally:
-            if self.cache.k.is_cuda:
-                torch.cuda.current_stream(self.cache.k.device).synchronize()
+            if self.cache.device.type == "cuda":
+                torch.cuda.current_stream(self.cache.device).synchronize()
             self.zero_pages(group, pages)
 
     @property
@@ -144,7 +160,7 @@ class CacheManager:
         if not length:
             return
         pages = self.validate_pages(page_ids, group=group)
-        ranges = tuple(page_spans(pages, 0, length, page_size=self.cache.page_size))
+        ranges = tuple(page_spans(pages, 0, length, page_size=self.info.block_size))
         with self._execution_lock:
             if completion.done():
                 completion.result()
@@ -199,7 +215,7 @@ class CacheManager:
 
         self.require_writable(page_ids, group=group, start=start, length=length)
         if self._execution_dependencies(
-            tuple(page_spans(page_ids, start, length, page_size=self.cache.page_size))
+            tuple(page_spans(page_ids, start, length, page_size=self.info.block_size))
         ):
             raise resource_error("KV interval still has an executing producer or consumer")
 
@@ -223,7 +239,7 @@ class CacheManager:
         ranges = {
             page: (offset, count)
             for page, offset, count in page_spans(
-                pages, start, length, page_size=self.cache.page_size
+                pages, start, length, page_size=self.info.block_size
             )
         }
         if not ranges or buffer in self._sources:
@@ -300,7 +316,7 @@ class CacheManager:
             return ()
         self._reap_sources()
         pages = self.validate_pages(page_ids, group=group)
-        ranges = tuple(page_spans(pages, start, length, page_size=self.cache.page_size))
+        ranges = tuple(page_spans(pages, start, length, page_size=self.info.block_size))
         return (
             self._execution_dependencies(ranges)
             + self.imports.dependencies(ranges)
@@ -328,7 +344,7 @@ class CacheManager:
             return
         self._reap_sources()
         pages = self.validate_pages(page_ids, group=group)
-        ranges = tuple(page_spans(pages, start, length, page_size=self.cache.page_size))
+        ranges = tuple(page_spans(pages, start, length, page_size=self.info.block_size))
         if any(self._ranges_overlap(source.ranges, ranges) for source in self._sources.values()):
             raise resource_error("KV interval still has a published version")
         if self.imports.dependencies(ranges):
@@ -378,16 +394,16 @@ class CacheManager:
         """Normalize physical cache-group ranges and require exact non-overlapping page coverage."""
 
         ranges = (
-            ((0, self.cache.num_pages),)
+            ((0, self.info.num_blocks),)
             if declared is None
             else tuple((int(offset), int(count)) for offset, count in declared)
         )
         if not ranges:
             raise invalid_descriptor("KVCache declares no KV groups")
-        covered = [False] * self.cache.num_pages
+        covered = [False] * self.info.num_blocks
         for group, (offset, count) in enumerate(ranges):
             end = offset + count
-            if offset < 0 or count < 1 or end > self.cache.num_pages:
+            if offset < 0 or count < 1 or end > self.info.num_blocks:
                 raise invalid_descriptor(f"KV group {group} has invalid physical page bounds")
             for page in range(offset, end):
                 if covered[page]:
@@ -436,7 +452,7 @@ class CacheManager:
         if len(set(real_pages)) != len(real_pages):
             raise invalid_descriptor("KV allocation repeats a physical page")
         lower = 0 if allow_sentinel else 1
-        upper = self.cache.num_pages
+        upper = self.info.num_blocks
         if pages and (min(pages) < lower or max(pages) >= upper):
             raise invalid_descriptor("KV allocation exceeds the fixed physical pool")
         if group is not None:
@@ -456,8 +472,9 @@ class CacheManager:
         pages = self.validate_pages(page_ids, group=group)
         if not pages:
             return
-        self.require_reusable(pages, group=group, start=0, length=len(pages) * self.cache.page_size)
-        self.cache.zero_pages(pages)
+        self.require_reusable(pages, group=group, start=0, length=len(pages) * self.info.block_size)
+        for name in self.layers:
+            self.cache.zero_blocks(name, pages)
 
     def initialize_import(self, write: CacheImport) -> None:
         """Initialize the new pages covered by this active import reservation."""
@@ -465,7 +482,8 @@ class CacheManager:
         if not self.imports.owns(write):
             raise invalid_descriptor("KV initialization has no destination reservation")
         if write.initialized_pages:
-            self.cache.zero_pages(write.initialized_pages)
+            for name in self.layers:
+                self.cache.zero_blocks(name, write.initialized_pages)
 
     def mark_import_scales(self, write: CacheImport) -> None:
         """Commit copied scale initialization for a still-owned import destination."""
@@ -473,16 +491,17 @@ class CacheManager:
         if not self.imports.owns(write):
             raise invalid_descriptor("KV scale import has no destination reservation")
         publication = write.publication
-        pages = (
+        pages = tuple(
             page
             for page, _, _ in page_spans(
                 write.pages,
                 publication.base_extent,
                 publication.published_extent - publication.base_extent,
-                self.cache.page_size,
+                self.info.block_size,
             )
         )
-        self.cache.mark_initialized(pages)
+        for name in self.layers:
+            self.cache.mark_initialized(name, pages, fields=("key", "value"))
 
     def destination_base(self, request_key: RequestKey, destination: str) -> BufferId | None:
         """Resolve the newest publication published to one destination for a request."""
@@ -531,41 +550,79 @@ class CacheManager:
         try:
             if suffix:
                 assert source is not None
-                fields = self.cache.transfer_views(pages, start=base_extent, length=suffix)
-                for index, views in enumerate(fields):
-                    shape = (
-                        (
-                            suffix,
-                            self.cache.config.total_layers,
-                            self.cache.config.total_kv_heads,
-                            self.cache.config.head_dim,
+                spans = page_spans(pages, base_extent, suffix, self.info.block_size)
+                fields = ("key", "value")
+                for field in fields:
+                    locations = []
+                    for layer, name in enumerate(self.layers, self.info.layer_offset):
+                        tensor = self.cache.state(name).tensors[field]
+                        values = (
+                            tensor.buffers()["values"]
+                            if isinstance(tensor, QuantizedTensor)
+                            else tensor
                         )
-                        if index < 2
-                        else (
-                            len(views),
-                            2,
-                            self.cache.config.total_layers,
-                            self.cache.config.total_kv_heads // self.cache.config.num_kv_heads,
+                        views = tuple(
+                            values[page, start : start + count].unsqueeze(1)
+                            for page, start, count in spans
+                        )
+                        if isinstance(tensor, QuantizedTensor):
+                            # Appending can enlarge a block's scale and re-encode
+                            # its prefix. Freeze exported bytes so an immutable
+                            # publication survives later numerical block updates.
+                            views = (torch.cat(views, dim=0),)
+                        exported = publish_tensor(
+                            transports,
+                            views,
+                            retain=partial(self.retain_publication, source),
+                            offset=(0, layer, self.info.kv_head_offset, 0),
+                        )
+                        locations.extend(exported)
+                        locators.extend(exported)
+                    tensors.append(
+                        TensorTransfer(
+                            shape=(
+                                suffix,
+                                self.info.total_layers,
+                                self.info.total_kv_heads,
+                                self.info.head_dim,
+                            ),
+                            locations=tuple(locations),
                         )
                     )
-                    offset = (
-                        (0, self.cache.config.layer_offset, self.cache.config.kv_head_offset, 0)
-                        if index < 2
-                        else (
-                            0,
-                            0,
-                            self.cache.config.layer_offset,
-                            self.cache.config.kv_head_offset // self.cache.config.num_kv_heads,
+                if self.info.dtype == "float8_e4m3fn":
+                    locations = []
+                    for layer, name in enumerate(self.layers, self.info.layer_offset):
+                        for field_index, field in enumerate(fields):
+                            scales = self.cache.state(name).tensors[field].buffers()["scale"]
+                            views = (
+                                torch.cat(
+                                    tuple(scales[page : page + 1] for page, _, _ in spans), dim=0
+                                ),
+                            )
+                            exported = publish_tensor(
+                                transports,
+                                views,
+                                retain=partial(self.retain_publication, source),
+                                offset=(
+                                    0,
+                                    field_index,
+                                    layer,
+                                    self.info.kv_head_offset // self.info.num_kv_heads,
+                                ),
+                            )
+                            locations.extend(exported)
+                            locators.extend(exported)
+                    tensors.append(
+                        TensorTransfer(
+                            shape=(
+                                len(spans),
+                                2,
+                                self.info.total_layers,
+                                self.info.total_kv_heads // self.info.num_kv_heads,
+                            ),
+                            locations=tuple(locations),
                         )
                     )
-                    locations = publish_tensor(
-                        transports,
-                        views,
-                        retain=partial(self.retain_publication, source),
-                        offset=offset,
-                    )
-                    locators.extend(locations)
-                    tensors.append(TensorTransfer(shape=shape, locations=locations))
         except BaseException:
             for locator in locators:
                 transports[locator.backend].release(locator)
@@ -579,8 +636,8 @@ class CacheManager:
             base_extent=base_extent,
             published_extent=visible,
             group_id=int(group_id),
-            compute_dtype=str(self.cache.config.dtype).removeprefix("torch."),
-            page_size=self.cache.page_size,
+            compute_dtype=str(self.compute_dtype).removeprefix("torch."),
+            page_size=self.info.block_size,
         )
         return publication
 
@@ -640,9 +697,9 @@ class CacheManager:
             suffix = publication.published_extent - publication.base_extent
             expected = (
                 suffix,
-                self.cache.config.total_layers,
-                self.cache.config.total_kv_heads,
-                self.cache.config.head_dim,
+                self.info.total_layers,
+                self.info.total_kv_heads,
+                self.info.head_dim,
             )
             if publication.tensors[0].shape != expected:
                 raise invalid_descriptor("KV transfer geometry does not match destination layers")
@@ -665,15 +722,15 @@ class CacheManager:
         pages = self.validate_pages(page_ids, group=group_id)
         initialized = self.validate_pages(initialized_pages, group=group_id)
         if (
-            allocated_length > len(pages) * self.cache.page_size
+            allocated_length > len(pages) * self.info.block_size
             or allocated_length < publication.published_extent
             or not set(initialized).issubset(pages)
         ):
             raise invalid_descriptor("KV import exceeds its scheduler block table")
         if publication.base_extent:
             base_pages = (
-                publication.base_extent + self.cache.page_size - 1
-            ) // self.cache.page_size
+                publication.base_extent + self.info.block_size - 1
+            ) // self.info.block_size
             installed_pages = self.block_tables.pages(request_pool_idx, group_id)[:base_pages]
             if pages[:base_pages] != installed_pages or set(initialized).intersection(
                 installed_pages

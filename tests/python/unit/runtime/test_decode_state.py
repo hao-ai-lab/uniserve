@@ -1,5 +1,7 @@
 """Request continuation coordinates remain coherent as live batches change."""
 
+from itertools import accumulate
+
 import pytest
 import torch
 
@@ -9,11 +11,12 @@ from uniserve_worker.runtime.decode_state import DecodeState
 pytestmark = [pytest.mark.unit, pytest.mark.gpu]
 
 
-def test_decode_publication_and_staging_follow_live_request_coordinates():
-    capacity = 17
+@pytest.mark.parametrize("capacity", (17, 257))
+@pytest.mark.parametrize("axes", (1, 3))
+def test_decode_publication_and_staging_follow_live_request_coordinates(capacity, axes):
     device = torch.device("cuda:0")
     state = DecodeState(
-        request_pool_size=capacity, vocab_size=32, continuation_width=1, device=device
+        request_pool_size=capacity, vocab_size=capacity + 1, continuation_width=1, device=device
     )
     slots = list(range(1, capacity + 1))
     state.reset(
@@ -36,18 +39,18 @@ def test_decode_publication_and_staging_follow_live_request_coordinates():
         name: torch.empty(capacity, dtype=dtype, device=device)
         for name, dtype in (
             ("input_ids", torch.int64),
-            ("positions", torch.int64),
             ("cache_lengths", torch.int32),
-            ("kv_lengths", torch.int32),
             ("query_lengths", torch.int32),
-            ("decode_page_ids", torch.int64),
-            ("decode_page_offsets", torch.int64),
+            ("write_indices", torch.int64),
         )
     }
+    outputs["positions"] = torch.full((axes, capacity), -9, dtype=torch.int64, device=device)
+    for name in ("query_offsets", "prefix_offsets"):
+        outputs[name] = torch.empty(capacity + 1, dtype=torch.int32, device=device)
 
     # Exercise a singleton, a partial batch and the non-power-of-two capacity,
     # then shrink again while changing the page horizon and selected KV group.
-    for count, width, group in ((1, 1, 0), (3, 3, 1), (17, 5, 0), (1, 3, 1)):
+    for count, width, group in ((1, 1, 0), (3, 3, 1), (capacity, 5, 0), (1, 3, 1)):
         live = slots[::-1][:count]
         indices = torch.tensor(live, dtype=torch.int64, device=device)
         tokens = torch.tensor([slot | (1 << 31) for slot in live], device=device)
@@ -91,23 +94,22 @@ def test_decode_publication_and_staging_follow_live_request_coordinates():
         assert staging_slots.tolist() == live + [0] * padding
         assert outputs["input_ids"].tolist() == live + [1] * padding
         assert (
-            outputs["positions"].tolist() == [expected_positions[s] for s in live] + [0] * padding
+            outputs["positions"].tolist()
+            == [[expected_positions[s] for s in live] + [0] * padding]
+            + [[0] * capacity] * (axes - 1)
         )
         assert (
             outputs["cache_lengths"].tolist() == [expected_lengths[s] for s in live] + [0] * padding
         )
-        assert (
-            outputs["kv_lengths"].tolist()
-            == [expected_lengths[s] + 1 for s in live] + [1] * padding
-        )
         assert outputs["query_lengths"].tolist() == [1] * capacity
         assert tables.tolist() == pages[group, live, :width].tolist() + [[0] * width] * padding
+        assert outputs["query_offsets"].tolist() == list(range(capacity + 1))
         assert (
-            outputs["decode_page_offsets"].tolist()
-            == [expected_lengths[s] % 2 for s in live] + [0] * padding
+            outputs["prefix_offsets"].tolist()
+            == list(accumulate([expected_lengths[s] for s in live] + [0] * padding, initial=0))
         )
         assert (
-            outputs["decode_page_ids"].tolist()
-            == [(group * (capacity + 1) + s) * 5 + expected_lengths[s] // 2 for s in live]
-            + [0] * padding
+            outputs["write_indices"].tolist()
+            == [(group * (capacity + 1) + s) * 10 + expected_lengths[s] for s in live]
+            + [-1] * padding
         )

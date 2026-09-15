@@ -9,27 +9,10 @@ from types import MappingProxyType
 import torch
 
 from uniserve.distributed.mesh import Communicator
-from uniserve.distributed.peer_memory import allocate_peer_workspace
-from uniserve.nn.attention import RadixAttention
-from uniserve.nn.attention_storage import ExchangeBuffers
-from uniserve.nn.parallel_attention import AttentionBuffers, OutputBuffers, ParallelAttention
+from uniserve.nn.attention._parallel import AttentionBuffers, OutputBuffers, ParallelAttention
+from uniserve.runtime._peer_memory import allocate_peer_workspace
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig
-
-
-@dataclass(frozen=True)
-class AttentionStorage:
-    """Retain exchange allocations while exposing only borrowed numerical views.
-
-    The caller keeps this owner alive until its streams, captured graphs, and
-    output readers finish. Scope-bound numerical layers only receive ``views``.
-    """
-
-    allocations: tuple[TensorBuffers, ...]
-    views: Mapping[Communicator, ExchangeBuffers]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "views", MappingProxyType(dict(self.views)))
 
 
 @dataclass(frozen=True)
@@ -64,73 +47,29 @@ def allocate_output_storage(
     bindings = {}
     for layer in layers:
         group = layer.ulysses_group
-        if rows % group.world_size:
+        if rows % group.size:
             raise ValueError("attention output rows must divide Ulysses membership")
+        schema = {
+            "output": BufferConfig((rows // group.size, heads * group.size, head_dim), dtype),
+            "receive": BufferConfig((rows // group.size, heads * group.size, head_dim), dtype),
+            "sync_input": BufferConfig((1,), torch.int32),
+            "sync_output": BufferConfig((group.size,), torch.int32),
+        }
         if group not in allocations:
             allocation = TensorBuffers.allocate(
-                {
-                    "output": BufferConfig(
-                        (rows // group.world_size, heads * group.world_size, head_dim), dtype
-                    ),
-                    "sync_input": BufferConfig((1,), torch.int32),
-                    "sync_output": BufferConfig((group.world_size,), torch.int32),
-                },
-                group.device,
-                symmetric={"output": group},
-                fill={"sync_input": group.rank_in_group},
+                schema, device=group.device, symmetric={"output": group, "receive": group}
             )
+            allocation.view(schema)["sync_input"].fill_(group.rank)
             allocations[group] = allocation
         allocation = allocations[group]
+        views = allocation.view(schema)
         bindings[layer] = OutputBuffers(
             allocation.peers("output"),
-            allocation.capacity["sync_input"],
-            allocation.capacity["sync_output"],
+            views["receive"],
+            views["sync_input"],
+            views["sync_output"],
         )
     return OutputStorage(tuple(allocations.values()), bindings)
-
-
-def allocate_attention_exchange_storage(
-    modules: Iterable[RadixAttention],
-    *,
-    max_tokens: int,
-    dtype: torch.dtype,
-) -> AttentionStorage:
-    """Share each group's maximum payload capacity across serialized layers.
-
-    Each scope must own an independent stream execution domain. The logical
-    row bound includes transport padding; head widths come from loaded module
-    geometry. NCCL buffers use symmetric windows; other backends use ordinary
-    device storage with the same capacity and lifetime contract.
-    """
-
-    widths: dict[Communicator, tuple[int, int]] = {}
-    for module in modules:
-        group = module.exchange.ulysses_group
-        if group.world_size == 1:
-            continue
-        query, key = widths.get(group, (0, 0))
-        widths[group] = (
-            max(query, module.num_heads * module.head_dim),
-            max(key, module.num_kv_heads * module.head_dim),
-        )
-    result = {}
-    allocations = []
-    for group, (query, key) in widths.items():
-        rows = (max_tokens + group.world_size - 1) // group.world_size * group.world_size
-        symmetric = torch.distributed.get_backend(group._require()) == "nccl"
-        schema = {
-            f"{role}_{direction}": BufferConfig((rows * width * dtype.itemsize,), torch.uint8)
-            for role, width in (("query", query), ("key", key), ("value", key), ("output", query))
-            for direction in (
-                ("send", "receive") if role == "output" else ("send", "receive", "staging")
-            )
-        }
-        allocation = TensorBuffers.allocate(
-            schema, group.device, symmetric={name: group for name in schema} if symmetric else {}
-        )
-        allocations.append(allocation)
-        result[group] = ExchangeBuffers(allocation.capacity)
-    return AttentionStorage(tuple(allocations), result)
 
 
 def allocate_attention_context(
@@ -166,9 +105,9 @@ def allocate_attention_context(
         key, value = keys.global_tensor, values.global_tensor
         local_key, local_value = keys.local, values.local
     else:
-        key = torch.empty((rows * group.world_size, *shape[1:]), dtype=dtype, device=group.device)
+        key = torch.empty((rows * group.size, *shape[1:]), dtype=dtype, device=group.device)
         value = torch.empty_like(key)
-        begin = group.rank_in_group * rows
+        begin = group.rank * rows
         local_key, local_value = key[begin : begin + rows], value[begin : begin + rows]
     return AttentionBuffers(
         key,
@@ -177,7 +116,7 @@ def allocate_attention_context(
         local_value,
         torch.empty(key.shape[0] // block_size, dtype=torch.int32, device=group.device),
         torch.zeros(1, dtype=torch.int32, device=group.device),
-        torch.empty(group.world_size, dtype=torch.int32, device=group.device),
+        torch.empty(group.size, dtype=torch.int32, device=group.device),
     )
 
 
@@ -202,10 +141,10 @@ def allocate_context_storage(
     allocations: dict[tuple[Communicator, int, bool], AttentionBuffers] = {}
     bindings = {}
     for layer in layers:
-        if layer.context_group.world_size == 1:
+        if layer.context_group.size == 1:
             continue
         group = layer.key_group
-        gathered_rows = rows * (layer.col_group.world_size if layer.col_group is not None else 1)
+        gathered_rows = rows * (layer.col_group.size if layer.col_group is not None else 1)
         key = (group, gathered_rows, layer.mapped)
         if key not in allocations:
             allocations[key] = allocate_attention_context(

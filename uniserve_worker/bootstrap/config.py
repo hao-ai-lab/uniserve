@@ -7,7 +7,7 @@ import math
 import os
 from dataclasses import dataclass
 
-from uniserve.loading.config import LoadConfig
+from uniserve.loading import Config as IOConfig
 from uniserve_worker.config import ComponentConfig, parse_entries
 from uniserve_worker.protocol.batch import Computation, ForwardMode, PipelineStage, TransferMode
 
@@ -45,12 +45,10 @@ class WorkerIpcConfig:
 
 @dataclass(frozen=True)
 class ModelLaunchConfig:
-    """Selects checkpoint identity, precision policy, and bounded text/video geometry."""
+    """Selects checkpoint identity, precision policy."""
 
     path: str
     quantization_config: dict[str, object]
-    max_text_rows: int
-    max_video_seconds: float
 
 
 @dataclass(frozen=True)
@@ -74,7 +72,7 @@ class WorkerProcessArgs:
     model: ModelLaunchConfig | None
     data_plane: DataPlaneConfig
     execution: WorkerConfig
-    load: LoadConfig
+    load: IOConfig
     use_stub_model: bool
     components: tuple[tuple[str, ComponentConfig], ...] = ()
 
@@ -128,8 +126,6 @@ class WorkerProcessArgs:
                 ModelLaunchConfig(
                     path=model_path,
                     quantization_config=dict(namespace.quantization_config),
-                    max_text_rows=int(namespace.max_model_len),
-                    max_video_seconds=float(namespace.max_video_seconds),
                 )
                 if model_path
                 else None
@@ -175,24 +171,17 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
         raise ValueError("--rank must satisfy 0 <= rank < world-size")
 
 
-def _load_config(namespace: argparse.Namespace) -> LoadConfig:
-    """Build and validate process configuration from parsed command-line values."""
+def _load_config(namespace: argparse.Namespace) -> IOConfig:
+    """Separate the serialized reader selector into file format and loading mode."""
 
-    threads = getattr(namespace, "load_threads", None)
-    load_format = str(getattr(namespace, "load_format", "auto"))
-    download_dir = _optional_text(getattr(namespace, "download_dir", None))
-    checksum_manifest = _optional_text(getattr(namespace, "checksum_manifest", None))
-    if threads is None:
-        return LoadConfig(
-            load_format=load_format,
-            download_dir=download_dir,
-            checksum_manifest=checksum_manifest,
-        )
-    return LoadConfig(
-        load_format=load_format,
-        download_dir=download_dir,
-        num_threads=int(threads),
-        checksum_manifest=checksum_manifest,
+    selected = str(namespace.load_format)
+    mode = selected if selected in {"dummy", "layered"} else "eager"
+    return IOConfig(
+        format="auto" if selected in {"dummy", "layered"} else selected,
+        mode=mode,
+        download_dir=_optional_text(namespace.download_dir),
+        num_threads=namespace.load_threads,
+        checksum_manifest=_optional_text(namespace.checksum_manifest),
     )
 
 

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from uniserve import _slices
 from uniserve_worker.execution import operations as operations
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
@@ -313,7 +314,7 @@ def publish_product(
     height = 0 if source_metadata is None else source_metadata.height
     width = 0 if source_metadata is None else source_metadata.width
     value_range = (
-        source_metadata.value_range.value
+        ("signed_unit" if source_metadata.value_range == (-1.0, 1.0) else "unit")
         if isinstance(source_metadata, ImageMetadata) and source_metadata.value_range is not None
         else ""
     )
@@ -333,7 +334,7 @@ def publish_product(
     elif height == 0 and value_range:
         raise invalid_descriptor("non-image tensor carries an image range")
     region = None if device_write is None else device_write.region
-    if region is not None and tuple(value.shape) != region.shape:
+    if region is not None and tuple(value.shape) != _slices.shape(region):
         raise invalid_descriptor("product tensor disagrees with its assigned region")
     shape = (
         device_write.logical_shape
@@ -364,7 +365,7 @@ def publish_product(
         assert device_write is not None
         retain = partial(tensor_store.retain_publication, device_write)
     locations = publish_tensor(
-        transports, value, retain=retain, offset=None if region is None else region.offset
+        transports, value, retain=retain, offset=None if region is None else _slices.offset(region)
     )
     request.exported_locators.extend(locations)
     request.tensor_exports[product.buffer_id] = tuple(

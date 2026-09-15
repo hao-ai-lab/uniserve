@@ -1,0 +1,133 @@
+"""Worker image batches preserve the codec's spatial numerical domain."""
+
+import pytest
+import torch
+
+from tests.python.integration.model_loading.test_bagel import _checkpoint
+from uniserve.media import image
+from uniserve.runtime import PrefixCache
+from uniserve_models import bagel
+from uniserve_worker.bootstrap.cache import cache_info
+from uniserve_worker.bootstrap.capacity import input_buffer_config
+from uniserve_worker.config import WorkerConfig
+from uniserve_worker.execution.model_runner import ModelRunner
+from uniserve_worker.execution.rows import ForwardRow
+from uniserve_worker.protocol.batch import (
+    Bounds,
+    ComputationId,
+    PipelineStage,
+    RequestKey,
+    ScheduledRequest,
+)
+from uniserve_worker.runtime.cache_manager import CacheManager
+from uniserve_worker.runtime.latent_pool import LatentPool
+
+pytestmark = pytest.mark.integration
+
+
+@torch.inference_mode()
+def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
+    _, _, architecture = _checkpoint(tmp_path)
+    model = bagel.Model(architecture).eval()
+    config = WorkerConfig(
+        device="cpu",
+        attention_backend="torch",
+        model_dtype="float32",
+        block_size=16,
+        max_sequence_tokens=32,
+        max_batch_operations=3,
+        max_request_pool_size=3,
+        max_batch_tokens=64,
+        graph_policy="off",
+        flow_graph_shapes=((16, 16),),
+        flow_graph_batch_sizes=(1,),
+    )
+    runner = ModelRunner(model, config)
+    cache = PrefixCache(model.text.cache_config, num_blocks=8, block_size=16, device="cpu")
+    manager = CacheManager(
+        cache,
+        info=cache_info(model.text, config, num_blocks=8),
+        request_pool_size=3,
+        max_blocks_per_request=2,
+    )
+    latents = LatentPool(
+        request_pool_size=3,
+        num_pages=4,
+        page_units=16,
+        latent_width=8,
+        dtype=torch.bfloat16,
+        device="cpu",
+    )
+    try:
+        runner.configure_inputs(
+            input_config=input_buffer_config(model, config),
+            kv_cache=manager,
+            latent_pool=latents,
+            decode_predicates=torch.tensor([False, True, True, True]),
+            max_operations=3,
+            request_slots=3,
+            max_tokens=64,
+            latent_capacity_units=16,
+            decode_context_blocks=2,
+            variants=(),
+            max_inflight=1,
+        )
+        runner.complete_startup()
+        size = image.Config(16, 16)
+        retained = []
+        for count in (1, 3, 1):
+            # Three images contain 48 canonical latent patches but 192
+            # spatial attention queries, beyond the text token grant of 64.
+            pixels = torch.arange(count * 3 * 16 * 16).reshape(count, 3, 16, 16).float().sin()
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(129)
+                expected = model.latent_encoder.encode(pixels)
+                torch.manual_seed(129)
+                rows = tuple(
+                    ForwardRow(PipelineStage.LATENT_ENCODING, encode_pixels=value)
+                    for value in pixels
+                )
+                encoded = _run(runner, manager, rows)
+            torch.testing.assert_close(torch.stack(encoded), expected)
+            expected_pixels = model.image_decoder.decode(
+                tuple(expected.unbind(0)), sizes=(size,) * count
+            )
+            rows = tuple(
+                ForwardRow(
+                    PipelineStage.IMAGE_DECODING,
+                    latent=value,
+                    image_height=size.height,
+                    image_width=size.width,
+                )
+                for value in encoded
+            )
+            decoded = _run(runner, manager, rows)
+            for actual, reference in zip(decoded, expected_pixels, strict=True):
+                torch.testing.assert_close(actual, reference)
+                retained.append((actual, reference.clone()))
+        for actual, reference in retained:
+            torch.testing.assert_close(actual, reference)
+    finally:
+        runner.close()
+        latents.close()
+        manager.close()
+
+
+def _run(runner, manager, rows):
+    operations = tuple(
+        ScheduledRequest(
+            RequestKey(1, index, 0), ComputationId(1, 0), None, row.forward_mode, Bounds()
+        )
+        for index, row in enumerate(rows)
+    )
+    return (
+        runner.run_forward_group(
+            rows,
+            operations=operations,
+            cache=manager,
+            tables=manager.block_tables,
+            states=None,
+        )
+        .materialize()
+        .values
+    )

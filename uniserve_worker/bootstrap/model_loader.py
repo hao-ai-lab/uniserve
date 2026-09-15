@@ -1,30 +1,29 @@
-"""Bind numerical loading results to worker placement, inputs and capacity."""
+"""Load public numerical modules and bind worker-owned execution choices."""
 
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from importlib import import_module
 from typing import Any
 
 import torch
+from torch import nn
 
-from uniserve.loading import load_model
-from uniserve.model.limits import ModelLimits
-from uniserve.model.model import Model
-from uniserve.model.video import VideoMixin
-from uniserve.nn.diffusion.schedule import DiffusionSchedule
-from uniserve.nn.layer import LayerConfig
-from uniserve_models import ModelSource, resolve_model
-from uniserve_models.processing import FlowPrompt, ImageProcessor, stub_processor
+from uniserve.loading import weights
+from uniserve.model import CausalLM, Denoiser, ImageDecoder, VideoDecoder
+from uniserve.nn.attention import AttentionParallelConfig, ContextParallelConfig, Ulysses
+from uniserve.nn.vae.patch import PatchAutoencoder
+from uniserve.quantization import QuantizationConfig, Quantizer
+from uniserve_models import loading as models
+from uniserve_models.processing import FlowPrompt, ImageProcessor, load_tokenizer, stub_processor
 
-from ..config import WorkerConfig
+from ..config import ComponentConfig, WorkerConfig
 from ..execution.model_entry import ModelEntry
-from ..execution.resources import media_state_buffers
 from ..foundation.errors import unsupported_setup
 from ..runtime.results import resolve_outputs
-from .components import bind_components, validate_components
+from .components import bind_components, describe_components, validate_components
 from .config import WorkerProcessArgs
 
 logger = logging.getLogger(__name__)
@@ -32,135 +31,215 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class WorkerModel:
-    """Numerical composition and the worker's resolved execution inputs."""
+    """Loaded composition and caller-owned input processing."""
 
-    model: Model
+    model: nn.Module
     config: WorkerConfig
     tokenizer: Any | None = None
-    schedule: DiffusionSchedule | None = None
     image_processor: ImageProcessor | None = None
     flow_prompt: FlowPrompt | None = None
 
 
-def prepare_worker_model(config: WorkerProcessArgs) -> ModelSource | None:
-    """Resolve typed architecture and validate placement before process groups."""
+def prepare_worker_model(config: WorkerProcessArgs) -> models.Config | None:
+    """Resolve the resident checkpoint closure before creating process groups."""
 
     if config.use_stub_model:
         return None
     launch = config.model
     if launch is None:
         raise RuntimeError("validated model worker is missing model configuration")
-    components = dict(config.components)
-    source = resolve_model(
-        launch.path,
-        load=config.load,
-        components=frozenset(
-            name for name, value in components.items() if config.execution.rank in value.ranks
-        ),
-        quantization=launch.quantization_config,
+    metadata = models.read_config(launch.path, io=config.load, modules=frozenset())
+    with torch.device("meta"):
+        model = metadata.model_class(metadata.model)
+    declared = validate_components(model, dict(config.components), entries=metadata.entry_points)
+    resident = frozenset(
+        call.path
+        for name, component in config.components
+        if config.execution.rank in component.ranks
+        for call in declared[name]
     )
-    paths = dict(source.entry.component_paths)
-    validate_components(source.model_class, source.config, components, paths=paths)
-    source.model_class.validate_parallel(
-        source.config,
-        {paths[name]: value.parallel_config for name, value in components.items()},
+    source = models.read_config(launch.path, io=config.load, modules=resident)
+    return replace(
+        source, weights=_weight_config(source, launch.quantization_config, config.execution)
     )
-    capability = source.model_class.minimum_cuda_capability
-    device = torch.device(config.execution.device)
-    if capability is not None and (
-        device.type != "cuda" or torch.cuda.get_device_capability(device) < capability
-    ):
-        raise unsupported_setup(
-            f"{source.entry.architecture} requires CUDA compute capability {capability[0]}.{capability[1]}"
+
+
+def _weight_config(source, options, execution) -> weights.Config:
+    """Translate launch precision selectors into the public loading value."""
+
+    unknown = options.keys() - {
+        "mode",
+        "quant_method",
+        "components",
+        "ignored_layers",
+        "kv_cache_dtype",
+    }
+    if unknown:
+        raise ValueError(f"quantization_config has unknown fields {sorted(unknown)}")
+    if "mode" in options and "quant_method" in options:
+        raise ValueError("precision mode and quant_method are mutually exclusive")
+    selected = options.get("mode", options.get("quant_method"))
+    components = options.get("components", {})
+    if not isinstance(components, Mapping):
+        raise TypeError("precision components must be an object")
+    package = import_module(source.model_class.__module__)
+    if components:
+        factory = getattr(package, "weight_config", None)
+        if factory is None:
+            raise ValueError(
+                "this model exposes complete precision presets without component selectors"
+            )
+        result = factory(preset="default" if selected is None else selected, **components)
+    elif selected is None:
+        result = source.weights
+    elif selected in source.precisions:
+        result = source.precisions[selected]
+    elif "quant_method" in options and selected in {"unquantized", "fp8", "mxfp8", "nvfp4"}:
+        quantizer = (
+            None
+            if selected == "unquantized"
+            else Quantizer(selected, axis=0 if selected == "fp8" else None)
         )
-    return source
+        result = replace(
+            source.weights,
+            quantization={
+                "": None if quantizer is None else QuantizationConfig(quantizer, quantizer)
+            },
+        )
+    else:
+        raise ValueError(f"unknown precision {selected!r}; choose from {tuple(source.precisions)}")
+    ignored = options.get("ignored_layers", ())
+    if not isinstance(ignored, (tuple, list)) or any(not isinstance(path, str) for path in ignored):
+        raise TypeError("ignored_layers must contain numerical module paths")
+    return replace(
+        result,
+        dtype=getattr(torch, execution.model_dtype),
+        quantization={**result.quantization, **dict.fromkeys(ignored)},
+    )
+
+
+def attention_parallel(component: ComponentConfig) -> AttentionParallelConfig:
+    """Translate process degree declarations into mathematical attention axes."""
+
+    sequence = component.parallel_config.sequence_parallel
+    heads = Ulysses() if sequence.kind in {"ulysses", "hybrid", "attention2d"} else None
+    context = None
+    if sequence.kind == "allgather":
+        context = ContextParallelConfig(gather_axis="cp")
+    elif sequence.kind in {"ring", "hybrid"}:
+        context = ContextParallelConfig(peer_axis="cp")
+    elif sequence.kind == "attention2d":
+        context = ContextParallelConfig(gather_axis="cp_col", peer_axis="cp_row")
+    return AttentionParallelConfig(heads=heads, context=context)
 
 
 def load_worker_model(
     config: WorkerProcessArgs,
     bindings: Mapping[str, ModelEntry],
     *,
-    source: ModelSource | None,
+    source: models.Config | None,
 ) -> WorkerModel:
-    """Load numerical modules, then bind worker calls and execution capacity."""
+    """Materialize selected modules and attach borrowed capability methods."""
 
     if config.use_stub_model:
-        from uniserve_models.stub import StubModel
+        from uniserve_models.stub import Model
 
-        model: Model = StubModel()
-        bind_components(model, bindings, paths={name: "" for name in bindings})
+        model = Model().to(config.execution.device)
+        for path, device in (_devices(model, config.execution.generation_device) or {}).items():
+            model.get_submodule(path).to(device)
+        bind_components(model, bindings)
         return WorkerModel(
             model,
-            replace(config.execution, attention_backend="torch_sdpa", encoder_cache_entries=1024),
+            replace(config.execution, attention_backend="torch", encoder_cache_entries=1024),
             image_processor=stub_processor(),
         )
-    launch = config.model
-    if launch is None or source is None:
+    if config.model is None or source is None:
         raise RuntimeError("validated model worker is missing model configuration")
-    paths = dict(source.entry.component_paths)
-    meshes = {
-        paths[name]: binding.mesh for name, binding in bindings.items() if binding.mesh is not None
-    }
-    parallel = {paths[name]: binding.config.parallel_config for name, binding in bindings.items()}
-    dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[
-        config.execution.model_dtype
-    ]
-    layers = source.configure_layers(
-        {
-            name: LayerConfig(
-                mesh.get_group("tp"),
-                None,
-                pipeline=mesh.get_group("pp"),
-                sequence=mesh.get_group("ulysses"),
-                dense_dtype=dtype,
+    with torch.device("meta"):
+        description = source.model_class(source.model)
+    declarations = describe_components(description, entries=source.entry_points)
+    meshes, attention = {}, {}
+    for name, binding in bindings.items():
+        if binding.mesh is None:
+            continue
+        paths = {call.path for call in declarations[name]}
+        # Contained encoders are bound by their numerical parent's traversal;
+        # siblings sharing a backbone retain their independent capability roots.
+        roots = {
+            path
+            for path in paths
+            if not any(
+                parent != path and (not parent or path.startswith(parent + ".")) for parent in paths
             )
-            for name, mesh in meshes.items()
         }
-    )
-    loaded = load_model(
-        source.model_class,
-        source.config,
-        sources=source.weights,
-        load=config.load,
+        for path in sorted(roots):
+            meshes[path] = binding.mesh
+            attention[path] = attention_parallel(binding.config)
+    loaded = models.load_model(
+        source,
         device=config.execution.device,
-        dtype=dtype,
-        parallel=parallel,
         meshes=meshes,
-        layers=layers,
-        limits=ModelLimits(launch.max_text_rows, math.floor(launch.max_video_seconds * 24.0 + 0.5)),
-        flow_device=config.execution.generation_device,
+        attention=attention,
+        devices=_devices(description, config.execution.generation_device),
     )
     model = loaded.model
-    bind_components(model, bindings, paths=paths)
-    outputs = resolve_outputs(model)
+    bind_components(model, bindings, entries=source.entry_points)
+    worker_config = loaded_worker_config(model, config.execution, config.ipc.pipeline_depth)
+    override = config.model.quantization_config.get("kv_cache_dtype")
+    if override is not None:
+        worker_config = replace(worker_config, kv_cache_dtype=override)
+    outputs = resolve_outputs(model, worker_config)
     for name, binding in bindings.items():
         binding.outputs = outputs.get(name, ())
-    worker_config = loaded_worker_config(
-        model, config.execution, bindings, config.ipc.pipeline_depth
-    )
-    create_schedule = source.entry.create_schedule
-    schedule = (
-        create_schedule(source.config, torch.device(config.execution.device))
-        if create_schedule is not None
-        and any("forward_diffusion" in binding.methods for binding in bindings.values())
-        else None
-    )
-    logger.info(
-        "loaded model architecture=%s precisions=%s", model.architecture, dict(source.precisions)
-    )
+    logger.info("loaded numerical model %s", type(model).__qualname__)
     return WorkerModel(
-        model, worker_config, source.tokenizer, schedule, source.image_processor, source.flow_prompt
+        model,
+        worker_config,
+        None if source.tokenizer is None else load_tokenizer(source.tokenizer),
+        source.image_processor,
+        source.flow_prompt,
     )
+
+
+def _devices(model: nn.Module, generation_device: str | None) -> Mapping[str, str] | None:
+    """Place the flow route and denoiser-specific modules on the selected device."""
+
+    if generation_device is None:
+        return None
+    text_modules = {
+        id(child)
+        for module in model.modules()
+        if isinstance(module, CausalLM)
+        for child in module.modules()
+    }
+    placed = set()
+    for module in model.modules():
+        if isinstance(module, Denoiser):
+            for child in module.children():
+                if id(child) not in text_modules:
+                    placed.add(id(child))
+        if isinstance(module, nn.ModuleDict) and "flow" in module:
+            placed.add(id(module["flow"]))
+        if isinstance(module, (ImageDecoder, PatchAutoencoder)):
+            placed.add(id(module))
+    # Shared backbones and codecs have multiple ordinary module paths. Every
+    # alias must express the same placement before the loader materializes it.
+    paths = {
+        path: generation_device
+        for path, module in model.named_modules(remove_duplicate=False)
+        if id(module) in placed
+    }
+    if not paths:
+        raise unsupported_setup("generation device requires a model with a distinct flow route")
+    return paths
 
 
 def loaded_worker_config(
-    model: Model, config: WorkerConfig, bindings: Mapping[str, ModelEntry], pipeline_depth: int
+    model: nn.Module, config: WorkerConfig, pipeline_depth: int
 ) -> WorkerConfig:
-    """Resolve worker storage capacity from resident numerical state buffers."""
+    """Resolve media request slots from the worker's publication lifetime."""
 
-    if isinstance(model, VideoMixin) or media_state_buffers(model, bindings):
-        # Two unresolved outputs and one further physical position permit
-        # publication retirement before a resident request slot is reused.
+    if any(isinstance(module, VideoDecoder) for module in model.modules()):
         state_slots = min(config.max_batch_operations, pipeline_depth // 3)
         if state_slots < 2:
             raise unsupported_setup(

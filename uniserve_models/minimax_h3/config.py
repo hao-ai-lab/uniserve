@@ -1,69 +1,15 @@
-"""Validated H3 component formats and fixed precision preset values."""
+"""Normalize the fixed FastH3 checkpoint architecture and diffusion recipe."""
 
+from __future__ import annotations
+
+import json
 import math
 from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import Any, Mapping
 
-from uniserve.nn.quant.config import LinearPrecision
-from uniserve_models.minimax_h3.audio_vae import AudioDecoderConfig
-from uniserve_models.minimax_h3.encoder import H3TextEncoderConfig
-from uniserve_models.minimax_h3.video_vae import VideoDecoderConfig
-
-SUPPORTED_PRECISIONS: Mapping[str, tuple[LinearPrecision, ...]] = {
-    "transformer.attention": ("bf16", "fp8", "nvfp4"),
-    "transformer.mlp": ("bf16", "fp8", "mxfp8", "nvfp4"),
-    "text_encoder": ("bf16", "fp8", "nvfp4"),
-    "video_vae": ("fp16", "bf16", "nvfp4"),
-}
-
-PRECISION_PRESETS: Mapping[str, Mapping[str, LinearPrecision]] = {
-    "quality": {
-        "transformer.attention": "bf16",
-        "transformer.mlp": "bf16",
-        "text_encoder": "bf16",
-        "video_vae": "fp16",
-    },
-    "balanced": {
-        "transformer.attention": "bf16",
-        "transformer.mlp": "bf16",
-        "text_encoder": "bf16",
-        "video_vae": "nvfp4",
-    },
-    "performance": {
-        "transformer.attention": "bf16",
-        "transformer.mlp": "fp8",
-        "text_encoder": "bf16",
-        "video_vae": "nvfp4",
-    },
-    "maximum": {
-        "transformer.attention": "nvfp4",
-        "transformer.mlp": "mxfp8",
-        "text_encoder": "fp8",
-        "video_vae": "nvfp4",
-    },
-}
-
-PRECISION_SHORTHANDS: Mapping[str, Mapping[str, LinearPrecision]] = {
-    "bf16": PRECISION_PRESETS["quality"],
-    "fp8": {
-        "transformer.attention": "fp8",
-        "transformer.mlp": "fp8",
-        "text_encoder": "bf16",
-        "video_vae": "fp16",
-    },
-    "mxfp8": {
-        "transformer.attention": "bf16",
-        "transformer.mlp": "mxfp8",
-        "text_encoder": "bf16",
-        "video_vae": "fp16",
-    },
-    "nvfp4": {
-        "transformer.attention": "nvfp4",
-        "transformer.mlp": "nvfp4",
-        "text_encoder": "nvfp4",
-        "video_vae": "nvfp4",
-    },
-}
+from . import audio_vae, output, video_vae
+from .encoder import TextEncoderConfig
 
 
 FASTH3_LADDER = (1000, 750, 500, 250)
@@ -106,15 +52,15 @@ def _validate_manifest(manifest: Mapping[str, object]) -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class H3TransformerConfig:
+class TransformerConfig:
     """Defines H3 multimodal width, layer, attention, expert, modulation, and sparse-video geometry."""
 
     hidden_size: int = 5376
-    heads: int = 56
+    num_attention_heads: int = 56
     head_dim: int = 128
-    layers: int = 50
-    refiner_layers: int = 2
-    ffn_dim: int = 14336
+    num_hidden_layers: int = 50
+    num_refiner_layers: int = 2
+    intermediate_size: int = 14336
     video_channels: int = 24
     audio_channels: int = 32
     text_dim: int = 5120
@@ -129,11 +75,11 @@ class H3TransformerConfig:
     def __post_init__(self) -> None:
         for name in (
             "hidden_size",
-            "heads",
+            "num_attention_heads",
             "head_dim",
-            "layers",
-            "refiner_layers",
-            "ffn_dim",
+            "num_hidden_layers",
+            "num_refiner_layers",
+            "intermediate_size",
             "video_channels",
             "audio_channels",
             "text_dim",
@@ -150,11 +96,13 @@ class H3TransformerConfig:
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"H3 transformer {name} must be finite and positive")
         if self.frequency_dim % 2 or self.rope_frequency_dim * 6 > self.head_dim:
-            raise ValueError("H3 transformer rotary dimensions must fit its attention heads")
+            raise ValueError(
+                "H3 transformer rotary dimensions must fit its attention num_attention_heads"
+            )
 
 
 @dataclass(frozen=True, slots=True)
-class H3DiffusionConfig:
+class DiffusionConfig:
     """The supported four-evaluation clean-sample Euler recipe."""
 
     ladder: tuple[int, ...] = FASTH3_LADDER
@@ -177,14 +125,15 @@ class H3DiffusionConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class H3Config:
+class Config:
     """Compose the fixed FastH3 networks and their diffusion mathematics."""
 
-    text_encoder: H3TextEncoderConfig = H3TextEncoderConfig()
-    denoiser: H3TransformerConfig = H3TransformerConfig()
-    video_decoder: VideoDecoderConfig = VideoDecoderConfig()
-    audio_decoder: AudioDecoderConfig = AudioDecoderConfig()
-    diffusion: H3DiffusionConfig = H3DiffusionConfig()
+    text_encoder: TextEncoderConfig = TextEncoderConfig()
+    denoiser: TransformerConfig = TransformerConfig()
+    video_decoder: video_vae.Config = video_vae.Config()
+    audio_decoder: audio_vae.Config = audio_vae.Config()
+    diffusion: DiffusionConfig = DiffusionConfig()
+    output: output.Config = output.Config()
 
     def __post_init__(self) -> None:
         if self.text_encoder.hidden_size != self.denoiser.text_dim:
@@ -196,10 +145,11 @@ class H3Config:
         # Packing, sparse attention, native reconstruction and checkpoint identity
         # implement this architecture. Typed configs do not imply arbitrary variants.
         for name, expected in (
-            ("text_encoder", H3TextEncoderConfig()),
-            ("denoiser", H3TransformerConfig()),
-            ("video_decoder", VideoDecoderConfig()),
-            ("audio_decoder", AudioDecoderConfig()),
+            ("text_encoder", TextEncoderConfig()),
+            ("denoiser", TransformerConfig()),
+            ("video_decoder", video_vae.Config()),
+            ("audio_decoder", audio_vae.Config()),
+            ("output", output.Config()),
         ):
             actual = getattr(self, name)
             for field in fields(expected):
@@ -216,12 +166,12 @@ class H3Config:
 # Checkpoint field names differ from the mathematical modules' established names.
 # The reader and native weight-name enumeration use this single correspondence.
 TRANSFORMER_FIELDS = {
-    "num_attention_heads": "heads",
+    "num_attention_heads": "num_attention_heads",
     "attention_head_dim": "head_dim",
     "hidden_size": "hidden_size",
-    "num_layers": "layers",
-    "num_refiner_layers": "refiner_layers",
-    "ffn_dim": "ffn_dim",
+    "num_layers": "num_hidden_layers",
+    "num_refiner_layers": "num_refiner_layers",
+    "ffn_dim": "intermediate_size",
     "in_channels": "video_channels",
     "audio_in_channels": "audio_channels",
     "text_dim": "text_dim",
@@ -237,17 +187,17 @@ TEXT_FIELDS = {
     "vocab_size": "vocab_size",
     "hidden_size": "hidden_size",
     "intermediate_size": "intermediate_size",
-    "num_hidden_layers": "checkpoint_layers",
-    "num_attention_heads": "heads",
-    "num_key_value_heads": "kv_heads",
+    "num_hidden_layers": "num_checkpoint_layers",
+    "num_attention_heads": "num_attention_heads",
+    "num_key_value_heads": "num_key_value_heads",
     "head_dim": "head_dim",
     "rope_theta": "rope_theta",
-    "rms_norm_eps": "norm_eps",
+    "rms_norm_eps": "rms_norm_eps",
     "max_position_embeddings": "max_position_embeddings",
 }
 
 
-def read_config(metadata: Mapping[str, Mapping[str, Any]]) -> H3Config:
+def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
     """Normalize the seven checkpoint sidecars without allocating model resources."""
 
     for name in (
@@ -270,7 +220,7 @@ def read_config(metadata: Mapping[str, Mapping[str, Any]]) -> H3Config:
         raise ValueError("FastH3 transformer patch_size must be [1, 2, 2]")
     if transformer.get("final_norm_eps") != transformer.get("norm_eps"):
         raise ValueError("FastH3 transformer final_norm_eps must equal norm_eps")
-    denoiser = H3TransformerConfig(
+    denoiser = TransformerConfig(
         **{target: transformer[source] for source, target in TRANSFORMER_FIELDS.items()}
     )
     text = metadata["text_encoder"].get("text_config")
@@ -300,13 +250,9 @@ def read_config(metadata: Mapping[str, Mapping[str, Any]]) -> H3Config:
         raise ValueError(
             f"FastH3 text_encoder.text_config is missing fields: {', '.join(sorted(missing))}"
         )
-    encoder = H3TextEncoderConfig(
-        **{target: text[source] for source, target in TEXT_FIELDS.items()}
-    )
+    encoder = TextEncoderConfig(**{target: text[source] for source, target in TEXT_FIELDS.items()})
     video_values = {}
-    for field in fields(VideoDecoderConfig):
-        if field.name in {"width", "height", "fps"}:
-            continue
+    for field in fields(video_vae.Config):
         if field.name not in metadata["video_vae"]:
             raise ValueError(f"FastH3 video_vae is missing field {field.name}")
         value = metadata["video_vae"][field.name]
@@ -316,7 +262,7 @@ def read_config(metadata: Mapping[str, Mapping[str, Any]]) -> H3Config:
             value = tuple(value)
         video_values[field.name] = value
     audio_values = {}
-    for field in fields(AudioDecoderConfig):
+    for field in fields(audio_vae.Config):
         if field.name not in metadata["audio_vae"]:
             raise ValueError(f"FastH3 audio_vae is missing field {field.name}")
         value = metadata["audio_vae"][field.name]
@@ -332,13 +278,31 @@ def read_config(metadata: Mapping[str, Mapping[str, Any]]) -> H3Config:
     for name in ("scheduler", "audio_scheduler"):
         if "shift" not in metadata[name]:
             raise ValueError(f"FastH3 {name} is missing field shift")
-    return H3Config(
+    return Config(
         text_encoder=encoder,
         denoiser=denoiser,
-        video_decoder=VideoDecoderConfig(**video_values),
-        audio_decoder=AudioDecoderConfig(**audio_values),
-        diffusion=H3DiffusionConfig(
+        video_decoder=video_vae.Config(**video_values),
+        audio_decoder=audio_vae.Config(**audio_values),
+        diffusion=DiffusionConfig(
             video_shift=metadata["scheduler"]["shift"],
             audio_shift=metadata["audio_scheduler"]["shift"],
         ),
     )
+
+
+def read_config(root: Path, io) -> Config:
+    """Read all architecture sidecars before any numerical module construction."""
+    metadata = {}
+    for name, relative in (
+        ("inference", "fastvideo_inference.json"),
+        ("transformer", "transformer/config.json"),
+        ("text_encoder", "text_encoder/config.json"),
+        ("audio_vae", "audio_vae/config.json"),
+        ("video_vae", "vae/config.json"),
+        ("scheduler", "scheduler/scheduler_config.json"),
+        ("audio_scheduler", "audio_scheduler/scheduler_config.json"),
+    ):
+        metadata[name] = json.loads((root / relative).read_text(encoding="utf-8"))
+    if metadata["audio_vae"].get("sampling_rate") != 32000:
+        raise ValueError("FastH3 audio output requires a 32000 Hz sampling clock")
+    return _normalize(metadata)

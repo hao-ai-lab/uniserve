@@ -9,10 +9,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.model.image_diffusion import LatentLayout
-from uniserve.model.tensors import PositionLayout, TokenSelection
-from uniserve.nn.vision import get_flattened_position_ids_extrapolate
-from uniserve.tensors import ImageRange
+from uniserve.media import image
+from uniserve_models.processing import PositionLayout
+from uniserve_worker.execution.tensors import TokenSelection
 from uniserve_models.processing import FeatureInjection, FeatureLayout, PatchTransform
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.foundation.errors import invalid_descriptor
@@ -129,7 +128,7 @@ def prepare_features(
             mode,
             source_tensor,
             device=target_device,
-            signed_unit=source_metadata.value_range is ImageRange.SIGNED_UNIT,
+            signed_unit=source_metadata.value_range == (-1.0, 1.0),
         )
     else:
         prepared = prepare_image(image_processor, mode, source, device=target_device)
@@ -231,7 +230,7 @@ def publish_image(
     operation: ScheduledRequest,
     completion_group: int,
     image_tensor: torch.Tensor,
-    image_range: ImageRange,
+    image_range: tuple[float, float],
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -444,7 +443,6 @@ def vision_state_row(
         group_id=cache[1],
         write_kv=True,
         causal=False,
-        attention_indexes=positions_as_three_axis(positions, query),
     )
 
 
@@ -518,23 +516,17 @@ def latent_state_row(
 ) -> ForwardRow:
     """Publish encoded image latents and construct the request runtime for diffusion conditioning."""
 
-    flow = model_runner.generation()
-    if flow.latent_layout is not LatentLayout.PATCH_TOKENS:
-        raise invalid_descriptor("flow state publication requires patch-token latents")
-    image_tokens = (height // int(flow.latent_downsample)) * (width // int(flow.latent_downsample))
-    if int(latent.reshape(-1, latent.shape[-1]).shape[0]) != image_tokens:
-        raise invalid_descriptor("state latent does not match the declared image geometry")
-    query = image_tokens + int(flow.marker_tokens)
-    positions = get_flattened_position_ids_extrapolate(
-        height,
-        width,
-        int(flow.latent_downsample),
-        int(math.isqrt(flow.max_latent_tokens)),
-    )
-    temporal = torch.full((query,), conditioning_position + 1, dtype=torch.long)
-    temporal[0] = conditioning_position
-    temporal[-1] = conditioning_position + int(flow.rope_advance)
-    indexes = torch.stack((temporal, torch.zeros_like(temporal), torch.zeros_like(temporal)))
+    factory = model_runner.images
+    if factory is None or factory.framing != 2:
+        raise invalid_descriptor("latent feature publication requires framed image conditioning")
+    size = image.Config(height, width)
+    image_tokens = factory.denoiser.latent_shape("image", size)[0]
+    if latent.reshape(-1, latent.shape[-1]).shape[0] != image_tokens:
+        raise invalid_descriptor("state latent does not match the declared image dimensions")
+    query = factory.sequence_length(size)
+    positions = factory.positions(size, conditioning_position + 1, device=latent.device)
+    positions[0, 0] = conditioning_position
+    positions[0, -1] = conditioning_position + factory.rope_advance
     cache = operations.cache_coordinates(
         state.pending_output(completion_group, operation.request_key.request_id),
         tables=request_tables,
@@ -550,10 +542,8 @@ def latent_state_row(
         request_pool_idx=cache[0],
         seq_len=cache[2],
         group_id=cache[1],
-        write_kv=False,
+        write_kv=True,
         causal=False,
-        attention_indexes=indexes,
-        text_local_indices=(0, query - 1),
     )
 
 
@@ -576,7 +566,7 @@ def diffusion_finalize_frames(
     )
     if not isinstance(metadata, ImageMetadata) or min(metadata.height, metadata.width) < 1:
         raise invalid_descriptor("frame materialization source is not an image tensor")
-    value_range = metadata.value_range or ImageRange.SIGNED_UNIT
+    value_range = metadata.value_range or (-1.0, 1.0)
     image_task = defer_image_encoding(
         operation,
         image,
@@ -593,7 +583,7 @@ def diffusion_finalize_frames(
 def defer_image_encoding(
     operation: ScheduledRequest,
     image: torch.Tensor,
-    value_range: ImageRange,
+    value_range: tuple[float, float],
     completion_group: int,
     *,
     state: BatchState,
@@ -605,7 +595,7 @@ def defer_image_encoding(
         raise invalid_descriptor("image materialization requires a positive completion bound")
     quantized = quantize_image_hwc(
         image,
-        value_range=((-1.0, 1.0) if value_range is ImageRange.SIGNED_UNIT else (0.0, 1.0)),
+        value_range=value_range,
     )
     if int(quantized.numel()) > max_bytes:
         raise invalid_descriptor("image staging exceeds its registered completion byte bound")
@@ -667,16 +657,6 @@ def bound_encoder_write(
             "encoder feature does not have exactly one atomic registration binding"
         )
     return matches[0]
-
-
-def positions_as_three_axis(positions: torch.Tensor, query: int) -> torch.Tensor:
-    """Expand temporal positions into the three-axis layout required by multimodal decoders."""
-
-    if positions.ndim == 1 and int(positions.numel()) == query:
-        return torch.stack((positions, torch.zeros_like(positions), torch.zeros_like(positions)))
-    if positions.ndim == 2 and tuple(positions.shape) == (3, query):
-        return positions
-    raise invalid_descriptor("state positions do not align with their physical token row")
 
 
 __all__ = [

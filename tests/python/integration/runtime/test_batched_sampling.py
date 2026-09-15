@@ -23,7 +23,8 @@ from tests.python.fixtures.depth_one import (
     token_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_models.stub import STUB_IMG_START_TOKEN_ID, _next_token
+from tests.python.fixtures.simulation import expected_successor
+from uniserve_models.stub import STUB_IMG_START_TOKEN_ID
 from uniserve_worker.protocol.batch import (
     ArRequestParams,
     BatchOutput,
@@ -131,7 +132,7 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
                 op_id=ComputationId(4, index),
                 predecessor=observation.op_id,
                 mode=ForwardMode.DECODE,
-                tokens=(_next_token(prompt_ends[index]),),
+                tokens=(expected_successor(prompt_ends[index]),),
                 logprobs=index == 1,
             )
             decode_ops.append(operation)
@@ -150,7 +151,7 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
         )
 
         for completion, prompt_end in zip(result.completions, prompt_ends, strict=True):
-            assert completion.committed_tokens == (_next_token(_next_token(prompt_end)),)
+            assert completion.committed_tokens == (expected_successor(expected_successor(prompt_end)),)
             assert (completion.position, completion.kv_visible_len, completion.kv_computed_len) == (
                 3,
                 3,
@@ -162,7 +163,7 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> Non
     worker = execution_worker()
     first = ar_params(24, block_ids=(3,))
     second_base = ar_params(25, block_ids=(4,))
-    expected = _next_token(4)
+    expected = expected_successor(4)
     assert second_base.ar is not None
     second = NewRequest(
         second_base.request_key,
@@ -313,13 +314,13 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(dev
     following = finalized_report(worker, worker.submit(successor_batch))
 
     completion = result.completions[0]
-    assert completion.committed_tokens == (_next_token(prime.completions[0].committed_tokens[0]),)
+    assert completion.committed_tokens == (expected_successor(prime.completions[0].committed_tokens[0]),)
     assert completion.kv_computed_len == 5
     assert completion.kv_visible_len == 3
 
     assert following.completions[0].status is OpStatus.OK
     assert following.completions[0].committed_tokens == (
-        _next_token(completion.committed_tokens[0]),
+        expected_successor(completion.committed_tokens[0]),
     )
     assert following.completions[0].kv_visible_len == 4
 

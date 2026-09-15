@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from itertools import product
 from typing import TYPE_CHECKING
 
-from uniserve.tensors import TensorRegion
+from uniserve import _slices
 
 from ..foundation.errors import invalid_descriptor
 from ..protocol.batch import (
@@ -88,18 +88,18 @@ def validate_destination(
 
 
 def region_view(
-    destination: torch.Tensor | tuple[torch.Tensor, ...], region: TensorRegion
+    destination: torch.Tensor | tuple[torch.Tensor, ...], region: tuple[slice, ...]
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Select a region of one view or logical first-axis page spans without packing."""
 
     if not isinstance(destination, tuple):
-        if not region.within(tuple(destination.shape)):
+        if not _slices.within(region, tuple(destination.shape)):
             raise invalid_descriptor("tensor region exceeds its destination")
-        return destination[region.slices()]
+        return destination[region]
     if not destination:
         raise invalid_descriptor("tensor destination has no spans")
     logical = (sum(int(span.shape[0]) for span in destination), *destination[0].shape[1:])
-    if not region.within(logical):
+    if not _slices.within(region, logical):
         raise invalid_descriptor("tensor region exceeds its destination spans")
     pieces = []
     position = 0
@@ -107,10 +107,13 @@ def region_view(
         shape = tuple(span.shape)
         if shape[1:] != logical[1:]:
             raise invalid_descriptor("tensor destination spans disagree on trailing dimensions")
-        covered = TensorRegion((position, *(0 for _ in shape[1:])), shape)
-        overlap = region.intersection(covered)
+        covered = tuple(
+            slice(start, start + extent)
+            for start, extent in zip((position, *(0 for _ in shape[1:])), shape, strict=True)
+        )
+        overlap = _slices.intersection(region, covered)
         if overlap is not None:
-            pieces.append(span[overlap.relative_to(covered.offset).slices()])
+            pieces.append(span[_slices.relative(overlap, _slices.offset(covered))])
         position += int(span.shape[0])
     return tuple(pieces)
 
@@ -120,7 +123,7 @@ def fetch_tensor(
     destination: torch.Tensor | tuple[torch.Tensor, ...],
     *,
     bindings: Mapping[tuple[WorkerEndpoint, str], Transport],
-    region: TensorRegion | None = None,
+    region: tuple[slice, ...] | None = None,
     retain: Callable[[TransferTicket], None] | None = None,
 ) -> tuple[TransferTicket, ...]:
     """Deliver exactly the requested coverage using explicitly bound source edges.
@@ -133,36 +136,44 @@ def fetch_tensor(
 
     from .tickets import _read_destination
 
-    region = region or TensorRegion((0,) * len(tensor.shape), tensor.shape)
-    if not region.within(tensor.shape):
+    region = region or tuple(
+        slice(start, start + extent)
+        for start, extent in zip((0,) * len(tensor.shape), tensor.shape, strict=True)
+    )
+    if not _slices.within(region, tensor.shape):
         raise invalid_descriptor("consumer region exceeds the logical tensor")
     spans = destination if isinstance(destination, tuple) else (destination,)
     if not spans:
         raise invalid_descriptor("tensor destination has no spans")
     device = spans[0].device
-    validate_destination(destination, shape=region.shape, dtype=tensor.dtype, device=device)
+    validate_destination(
+        destination, shape=_slices.shape(region), dtype=tensor.dtype, device=device
+    )
     missing = [region]
-    reads: list[tuple[Transport, Locator, TensorRegion, TensorRegion]] = []
+    reads: list[tuple[Transport, Locator, tuple[slice, ...], tuple[slice, ...]]] = []
     for location in tensor.locations:
         transport = bindings.get((location.source, location.backend))
         if transport is None:
             continue
         if transport.name != location.backend:
             raise invalid_descriptor("bound transport disagrees with the physical edge")
-        coverage = TensorRegion(location.offset, location.shape)
-        remaining: list[TensorRegion] = []
+        coverage = tuple(
+            slice(start, start + extent)
+            for start, extent in zip(location.offset, location.shape, strict=True)
+        )
+        remaining: list[tuple[slice, ...]] = []
         for required in missing:
-            overlap = required.intersection(coverage)
+            overlap = _slices.intersection(required, coverage)
             if overlap is not None:
                 reads.append(
                     (
                         transport,
                         location,
-                        overlap.relative_to(location.offset),
-                        overlap.relative_to(region.offset),
+                        _slices.relative(overlap, location.offset),
+                        _slices.relative(overlap, _slices.offset(region)),
                     )
                 )
-            remaining.extend(required.subtract(coverage))
+            remaining.extend(_slices.subtract(required, coverage))
         missing = remaining
         if not missing:
             break

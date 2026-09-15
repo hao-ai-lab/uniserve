@@ -1,78 +1,96 @@
-"""Image autoencoders over spatial patch sequences."""
-
-from __future__ import annotations
+"""Image latent posterior sampling and canonical patch serialization."""
 
 import torch
 from torch import nn
 
-from uniserve.nn.vae.autoencoder import AutoEncoder
-from uniserve.nn.vision.patching import patchify_batch, unpatchify_batch
-from uniserve.tensors import ImageRange
+from uniserve.media import image
+from uniserve.nn.functional import patchify, unpatchify
+
+from .layers import DiagonalGaussian
 
 
 class PatchAutoencoder(nn.Module):
-    """VAE posterior sampling and reconstruction in latent patch coordinates.
+    """Compose numerical encoder/decoder modules with latent patch coordinates.
 
-    The registered autoencoder retains its native posterior and decoder. The
-    patch codec supplies the geometry and dtype of the diffusion representation.
+    downsample is the output-pixel stride of one latent patch token. Scale and
+    shift normalize posterior samples before their canonical patch conversion.
+    The posterior generator and every input tensor belong to the caller.
     """
 
-    value_range = ImageRange.UNIT
+    value_range = (0.0, 1.0)
 
     def __init__(
         self,
-        autoencoder: AutoEncoder,
+        encoder: nn.Module,
+        decoder: nn.Module,
+        posterior: DiagonalGaussian,
         *,
         patch_size: int,
-        downsample: int,
-        channels: int,
+        latent_channels: int,
         latent_dtype: torch.dtype,
-    ) -> None:
+        downsample: int,
+        scale: float,
+        shift: float,
+    ):
         super().__init__()
-        self.autoencoder = autoencoder
-        self.patch_size = patch_size
-        self.downsample = downsample
-        self.channels = channels
-        self.latent_dtype = latent_dtype
+        self.encoder, self.decoder, self.posterior = encoder, decoder, posterior
+        if (
+            any(
+                type(value) is not int or value < 1
+                for value in (patch_size, latent_channels, downsample)
+            )
+            or scale <= 0
+        ):
+            raise ValueError("latent patch dimensions and scale must be positive")
+        self.patch_size, self.latent_channels = patch_size, latent_channels
+        self.latent_dtype, self.downsample = latent_dtype, downsample
+        self.scale, self.shift = scale, shift
 
     def encode(
-        self, pixels: torch.Tensor, generator: torch.Generator | None = None
+        self, pixels: torch.Tensor, *, generator: torch.Generator | None = None
     ) -> torch.Tensor:
-        """Sample the native posterior, crop to complete patches, and flatten."""
-
-        dtype = next(self.parameters()).dtype
-        latents = self.autoencoder.encode(pixels.to(dtype), generator)
+        if pixels.ndim != 4:
+            raise ValueError("latent encoding requires NCHW pixels")
+        dtype = next(self.encoder.parameters()).dtype
+        moments = self.encoder(pixels.to(dtype))
+        latents = self.scale * (self.posterior(moments, generator=generator) - self.shift)
         height = pixels.shape[-2] // self.downsample * self.patch_size
         width = pixels.shape[-1] // self.downsample * self.patch_size
-        return patchify_batch(latents[:, :, :height, :width], self.patch_size).to(self.latent_dtype)
+        return self.patchify(latents[:, :, :height, :width]).to(self.latent_dtype)
 
-    def decode(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
-        """Restore spatial VAE latents and reconstruct unit-range pixels."""
+    def patchify(self, latents: torch.Tensor) -> torch.Tensor:
+        return patchify(latents, patch_size=self.patch_size)
 
-        rows = height // self.downsample * (width // self.downsample)
-        patches = latents.reshape(-1, rows, self.patch_size**2 * self.channels)
-        images = unpatchify_batch(
-            patches,
-            self.patch_size,
-            height=height // self.downsample * self.patch_size,
-            width=width // self.downsample * self.patch_size,
-            channels=self.channels,
+    def unpatchify(self, patches: torch.Tensor, size: image.Config) -> torch.Tensor:
+        latent_size = image.Config(
+            size.height // self.downsample * self.patch_size,
+            size.width // self.downsample * self.patch_size,
         )
-        decoded = self.autoencoder.decode(images.to(next(self.parameters()).dtype))
-        # Preserve the VAE's arithmetic dtype and order before pixel quantization.
-        return (decoded * 0.5 + 0.5).clamp(0, 1)
+        return unpatchify(
+            patches, latent_size, patch_size=self.patch_size, channels=self.latent_channels
+        )
+
+    def decode(self, patches: torch.Tensor, size: image.Config) -> torch.Tensor:
+        latents = self.unpatchify(patches, size)
+        if latents.ndim == 3:
+            latents = latents.unsqueeze(0)
+        dtype = next(self.decoder.parameters()).dtype
+        latents = latents.to(dtype) / self.scale + self.shift
+        pixels = self.decoder(latents)
+        return (pixels * 0.5 + 0.5).clamp(0, 1)
 
 
-class RgbDecoder(nn.Module):
-    """Restore signed RGB patch values without a learned autoencoder."""
+class RGBDecoder(nn.Module):
+    """Restore signed RGB pixels from canonical spatial patch rows."""
 
-    value_range = ImageRange.SIGNED_UNIT
+    value_range = (-1.0, 1.0)
 
-    def __init__(self, patch_size: int) -> None:
+    def __init__(self, patch_size: int):
         super().__init__()
+        if type(patch_size) is not int or patch_size < 1:
+            raise ValueError("RGB patch size must be positive")
         self.patch_size = patch_size
 
-    def decode(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
-        rows = height // self.patch_size * (width // self.patch_size)
-        patches = latents.reshape(-1, rows, self.patch_size**2 * 3)
-        return unpatchify_batch(patches, self.patch_size, height=height, width=width, channels=3)
+    def decode(self, patches: torch.Tensor, size: image.Config) -> torch.Tensor:
+        pixels = unpatchify(patches, size, patch_size=self.patch_size, channels=3)
+        return pixels.unsqueeze(0) if pixels.ndim == 3 else pixels

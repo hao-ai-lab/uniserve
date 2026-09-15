@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve.distributed.process_groups import initialize_process_groups
+from uniserve.runtime.process_groups import initialize_process_groups
 from uniserve.tensors import BufferConfig
 from uniserve_worker.bootstrap.capacity import tensor_slot_capacity
 

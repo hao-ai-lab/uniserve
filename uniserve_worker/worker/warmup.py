@@ -10,9 +10,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from uniserve.math import ceil_div
-from uniserve.model.diffusion import DiffusionMixin
-from uniserve.model.image_diffusion import ImageDiffusion
-from uniserve.nn.diffusion.cfg import build_flow_cfg_plan
+from uniserve.media.image import Config as ImageConfig
+from ..execution.flow import image_state
 from uniserve_worker.protocol.batch import (
     ComputationId,
     ForwardMode,
@@ -409,7 +408,7 @@ def _build_warmup_batch(
             block_table = requests._kv_pages.setdefault(lease_key, [])
             target_pages = ceil_div(
                 visible + input_length,
-                int(requests.worker.kv_cache.cache.page_size),
+                int(requests.worker.kv_cache.info.block_size),
             )
             missing = target_pages - len(block_table)
             if missing < 0:
@@ -434,7 +433,7 @@ def _build_warmup_batch(
                     request_pool_idx=request_pool_indices[operation.request_key],
                     group_id=group_id,
                     page_ids=tuple(block_table),
-                    allocated_tokens=len(block_table) * requests.worker.kv_cache.cache.page_size,
+                    allocated_tokens=len(block_table) * requests.worker.kv_cache.info.block_size,
                 )
             )
             if allocated:
@@ -544,27 +543,19 @@ def _warmup_flow_tables(
 
     request = requests.worker.requests.get(operation.request_key.request_id)
     image = request.image
-    generation = (
-        requests.worker.model.generation
-        if isinstance(requests.worker.model, DiffusionMixin)
-        else None
-    )
+    generation = requests.worker.runner.images
     if image is None or generation is None:
         raise invalid_descriptor("generation warmup has no admitted image runtime")
-    guide = build_flow_cfg_plan(
-        cfg_text_scale=float(image.cfg_text_scale),
-        cfg_img_scale=float(image.cfg_img_scale),
-        recipe=generation.cfg_recipe,
-        renorm=image.cfg_renorm_type,
-        renorm_min=float(image.cfg_renorm_min),
-        use_cfg=True,
+    trajectory = image_state(generation, ImageConfig(height, width), image)
+    branches = trajectory.guidance.branches(
+        trajectory.schedule, request.accepted_progress.flow_step
     )
     runtime = request.accepted_progress
-    query = generation.sequence_length(height, width)
+    query = generation.sequence_length(ImageConfig(height, width))
     image_prompt = image.image_prompts[0] if image.image_prompts else ""
     # Branches either reuse the conditioned request slot or share one alternative prefix.
     branch_prefixes: list[tuple[tuple[int, ...], bool]] = []
-    for branch in guide.branches:
+    for branch in branches:
         prefix, copy_conditioning = resolve_prefix(
             requests.worker.runner.flow_prompt,
             generation.branch_source(branch),
@@ -582,7 +573,7 @@ def _warmup_flow_tables(
     alternative = next(iter(alternatives), ())
     if requests.worker.kv_cache is None:
         raise invalid_descriptor("warmup flow requires KV cache storage")
-    required = ceil_div(len(alternative), requests.worker.kv_cache.cache.page_size)
+    required = ceil_div(len(alternative), requests.worker.kv_cache.info.block_size)
     lease = requests._prefix_pages.setdefault(operation.request_key, [])
     missing = required - len(lease)
     occupied = {
@@ -618,7 +609,7 @@ def _warmup_flow_tables(
                 request_pool_idx=alternative_slot,
                 group_id=0,
                 page_ids=tuple(lease),
-                allocated_tokens=len(lease) * requests.worker.kv_cache.cache.page_size,
+                allocated_tokens=len(lease) * requests.worker.kv_cache.info.block_size,
             ),
         )
         if allocated:
@@ -659,10 +650,7 @@ def warmup_requests(worker: Worker) -> None:
         if ForwardMode.PREFILL in worker.info.supported_ops:
             _warmup_tokens(requests)
             logger.info("completed token runtime warmup")
-        if isinstance(
-            (worker.model.generation if isinstance(worker.model, DiffusionMixin) else None),
-            ImageDiffusion,
-        ):
+        if worker.runner.images is not None:
             _warmup_flow(requests)
             logger.info("completed flow runtime warmup")
 
@@ -824,15 +812,14 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         UmmRequestParams,
     )
 
-    generation = (
-        requests.worker.model.generation
-        if isinstance(requests.worker.model, DiffusionMixin)
-        else None
-    )
-    if not {
-        PipelineStage.LATENT_PREPARATION,
-        PipelineStage.DENOISING,
-    }.issubset(requests.worker.info.supported_ops) or not isinstance(generation, ImageDiffusion):
+    generation = requests.worker.runner.images
+    if (
+        not {
+            PipelineStage.LATENT_PREPARATION,
+            PipelineStage.DENOISING,
+        }.issubset(requests.worker.info.supported_ops)
+        or generation is None
+    ):
         return
     if requests.worker.requests.request_ids():
         return
@@ -911,7 +898,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         )
         max_latent_elements = max(
             1,
-            math.prod(generation.latent_shape(height, width)),
+            math.prod(generation.denoiser.latent_shape("image", ImageConfig(height, width))),
         )
         initial_latents: list[TensorRef] = []
         transitions: list[ScheduledRequest] = []

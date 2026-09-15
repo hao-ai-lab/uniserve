@@ -14,7 +14,7 @@ from tests.python.fixtures.depth_one import (
     token_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_models.stub import _next_token
+from tests.python.fixtures.simulation import expected_successor
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.protocol.batch import (
     ComputationId,
@@ -34,7 +34,7 @@ pytestmark = [
 
 @pytest.mark.parametrize("graphs", [False, True])
 @pytest.mark.parametrize("finish_policy", ["admission", "operation", "force"])
-def test_decode_terminal_policy_suppresses_only_its_own_successor(graphs, finish_policy) -> None:
+def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(graphs, finish_policy) -> None:
     policy = WorkerConfig(
         graph_policy="full" if graphs else "off",
         prefill_cuda_graph=False,
@@ -42,7 +42,7 @@ def test_decode_terminal_policy_suppresses_only_its_own_successor(graphs, finish
     )
     first = ar_params(34, block_ids=(0,))
     second = ar_params(35, block_ids=(1,))
-    terminal = _next_token(_next_token(4))
+    terminal = expected_successor(expected_successor(4))
     if finish_policy == "admission":
         assert first.ar is not None
         first = replace(first, ar=replace(first.ar, finish_token_ids=(terminal,)))
@@ -105,7 +105,7 @@ def test_decode_terminal_policy_suppresses_only_its_own_successor(graphs, finish
         assert following[0].status is OpStatus.PREDICATED
         assert following[0].committed_tokens == ()
         assert following[1].status is OpStatus.OK
-        assert following[1].committed_tokens == (_next_token(terminal),)
+        assert following[1].committed_tokens == (expected_successor(terminal),)
 
 
 def test_same_request_continues_before_parent_report_materialization() -> None:
@@ -168,9 +168,9 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
     parent_report = finalized_report(worker, parent_report)
     successor_report = finalized_report(worker, successor_report)
 
-    first = _next_token(4)
+    first = expected_successor(4)
     assert parent_report.completions[0].committed_tokens == (first,)
-    assert successor_report.completions[0].committed_tokens == (_next_token(first),)
+    assert successor_report.completions[0].committed_tokens == (expected_successor(first),)
 
 
 def test_device_continuation_chain_matches_serial_token_sequence() -> None:
@@ -225,7 +225,7 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
     expected = []
     current = 4
     for _ in range(4):
-        current = _next_token(current)
+        current = expected_successor(current)
         expected.append(current)
     assert tokens == tuple(expected)
 
@@ -277,7 +277,7 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
     expected = []
     current = 4
     for _ in range(4):
-        current = _next_token(current)
+        current = expected_successor(current)
         expected.append(current)
     assert tokens == tuple(expected)
 

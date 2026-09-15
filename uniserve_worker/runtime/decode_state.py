@@ -55,24 +55,23 @@ class DecodeState:
             ):
                 raise ValueError("runtime cache-length storage is incompatible")
             self.valid_cache_lengths = valid_cache_lengths
-        tensors = TensorBuffers.allocate(
-            self.buffers(
-                request_pool_size=self.request_pool_size,
-                vocab_size=self.vocab_size,
-                continuation_width=self.continuation_width,
-                logits_dtype=self.logits_dtype,
-            ),
-            self.device,
-            fill={
-                "logical_lengths": 0,
-                "sampling_positions": 0,
-                "future_input_tokens": 1,
-                "penalty_counts": 0,
-                "predicates": 0,
-                "_ones_int32": 1,
-                "_ones_int64": 1,
-            },
-        ).capacity
+        buffer_configs = self.buffers(
+            request_pool_size=self.request_pool_size,
+            vocab_size=self.vocab_size,
+            continuation_width=self.continuation_width,
+            logits_dtype=self.logits_dtype,
+        )
+        tensors = TensorBuffers.allocate(buffer_configs, device=self.device).view(buffer_configs)
+        for name, value in {
+            "logical_lengths": 0,
+            "sampling_positions": 0,
+            "future_input_tokens": 1,
+            "penalty_counts": 0,
+            "predicates": 0,
+            "_ones_int32": 1,
+            "_ones_int64": 1,
+        }.items():
+            tensors[name].fill_(value)
         self.logical_lengths = tensors["logical_lengths"]
         self.sampling_positions = tensors["sampling_positions"]
         self.future_input_tokens = tensors["future_input_tokens"]

@@ -1,120 +1,17 @@
-"""Component rank geometry and explicitly bound tensor communication groups."""
+"""Logical rank topology and borrowed numerical communication interfaces."""
 
 from __future__ import annotations
 
-from collections import deque
-from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from functools import partial
-from itertools import product
 from math import prod
-from typing import Any, Mapping
+from types import MappingProxyType
+from typing import Any, Literal, Mapping
 
 import torch
 import torch.distributed as dist
 
-from uniserve.distributed.parallel import ParallelConfig
-from uniserve.nn.collective import stream_collectives, try_sum_reduction
 from uniserve.profiling import profile_range
-
-RowChunkProducer = Callable[[slice, tuple[torch.Tensor, ...]], None]
-
-
-class RowGather:
-    """Exchange ordered row publications through two caller-owned gather slots.
-
-    The consumer receives each logical interval on the current stream. It must
-    enqueue all reads before returning; the transport then owns slot reuse and
-    peer readiness. Local rows are immediately readable while remote rows are
-    delivered after their transfer. Numerical work belongs to the consumer.
-    """
-
-    def __init__(
-        self,
-        group: Communicator,
-        rows: int,
-        width: int,
-        dtype: torch.dtype,
-        workspace: torch.Tensor,
-        consumer: Callable[[slice, torch.Tensor], None],
-    ) -> None:
-        if min(rows, width) < 1 or not workspace.is_contiguous():
-            raise ValueError("row gathering requires positive geometry and contiguous scratch")
-        self.group = group
-        self.rows = rows
-        self.width = width
-        self.dtype = dtype
-        self.consumer = consumer
-        members = group.world_size
-        element_bytes = dtype.itemsize
-        elements = workspace.numel() * workspace.element_size() // element_bytes
-        capacity_rows = elements // (2 * members * width)
-        if capacity_rows < 1:
-            raise ValueError("row gathering scratch must hold two complete member rows")
-        capacity_rows = min(capacity_rows, (64 * 1024 * 1024) // (width * element_bytes))
-        self.chunk_rows = capacity_rows // 128 * 128 if capacity_rows >= 128 else capacity_rows
-        byte_count = 2 * members * self.chunk_rows * width * element_bytes
-        self.storage = workspace.view(torch.uint8).view(-1)[:byte_count].view(dtype)
-        self.storage = self.storage.view(2, members, self.chunk_rows, width)
-        self.pending: deque[tuple[int, int, torch.Tensor, Any]] = deque()
-        self.published_rows = 0
-        self.next_slot = 0
-
-    def _consume(self) -> None:
-        start, count, gathered, work = self.pending.popleft()
-        if work is not None:
-            _finish(work, gathered)
-        for backend_rank, logical_rank in enumerate(self.group._backend_order):
-            if logical_rank != self.group.rank_in_group:
-                begin = logical_rank * self.rows + start
-                self.consumer(slice(begin, begin + count), gathered[backend_rank])
-
-    def append(self, start: int, input: torch.Tensor) -> None:
-        """Publish the next contiguous local interval without mutating its values."""
-
-        if (
-            input.ndim != 2
-            or input.shape[1] != self.width
-            or input.dtype != self.dtype
-            or input.device != self.storage.device
-            or start != self.published_rows
-            or input.shape[0] < 1
-            or start + input.shape[0] > self.rows
-        ):
-            raise ValueError("row gathering requires ordered matching input intervals")
-        backend_rank = self.group._backend_order.index(self.group.rank_in_group)
-        for offset in range(0, input.shape[0], self.chunk_rows):
-            if len(self.pending) == 2:
-                self._consume()
-            count = min(self.chunk_rows, input.shape[0] - offset)
-            # Tail segments compact the member stride for equal-count gather.
-            gathered = (
-                self.storage[self.next_slot]
-                .view(-1)[: self.group.world_size * count * self.width]
-                .view(self.group.world_size, count, self.width)
-            )
-            local = input[offset : offset + count]
-            gathered[backend_rank].copy_(local)
-            if self.group.world_size > 1:
-                work = _start_all_gather(
-                    gathered.flatten(0, 1), gathered[backend_rank], self.group._require()
-                )
-            else:
-                work = None
-            begin = start + offset
-            logical_begin = self.group.rank_in_group * self.rows + begin
-            self.consumer(slice(logical_begin, logical_begin + count), local)
-            self.pending.append((begin, count, gathered, work))
-            self.next_slot = (self.next_slot + 1) % 2
-        self.published_rows += input.shape[0]
-
-    def finish(self) -> None:
-        """Consume every published transfer before the caller reuses scratch."""
-
-        if self.published_rows != self.rows:
-            raise ValueError("row gathering must publish every row before completion")
-        while self.pending:
-            self._consume()
+from uniserve.runtime._communication import stream_collectives, try_sum_reduction
 
 
 def divide(numerator: int, denominator: int) -> int:
@@ -143,12 +40,11 @@ def _finish(work: Any, tensor: torch.Tensor) -> None:
 
 
 def _start_all_gather(output: torch.Tensor, input: torch.Tensor, group):
-    """Enqueue a gather using the computation stream or the default group stream."""
+    """Publish a gather and return its deferred consumer dependency."""
 
     bound = stream_collectives(group.group_name)
     if bound is not None:
-        bound.all_gather(output, input)
-        return None
+        return bound.start_all_gather(output, input)
     return dist.all_gather_into_tensor(output, input, group=group, async_op=True)
 
 
@@ -163,8 +59,13 @@ def _all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor, group_nam
         local = output.view(-1).narrow(0, group.rank() * input.numel(), input.numel())
         local = local.view_as(input)
         local.copy_(input)
-        work = _start_all_gather(output, local, group)
-        _finish(work, input)
+        bound = stream_collectives(group_name)
+        if bound is not None:
+            # Immediate consumers need no fork onto the transport stream.
+            bound.all_gather(output, local)
+        else:
+            work = _start_all_gather(output, local, group)
+            _finish(work, input)
 
 
 @_all_gather_into_tensor.register_fake
@@ -257,50 +158,20 @@ def _send_recv_fake(value, output, dst, src, group_name):
     pass
 
 
-@dataclass(frozen=True)
-class SymmetricMemory:
-    """Runtime-owned allocation with peer views ordered by logical membership."""
-
-    coordinator: Communicator
-    local: torch.Tensor
-    peers: tuple[torch.Tensor, ...]
-    handle: Any
-
-    @property
-    def rank(self) -> int:
-        return self.coordinator.rank_in_group
-
-    @property
-    def size(self) -> int:
-        return self.coordinator.world_size
-
-    def fence(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        """Publish arrival on the allocation's group with stream ordering."""
-
-        if tuple(input.shape) != (1,) or tuple(output.shape) != (self.size,):
-            raise ValueError("symmetric-memory fence buffers do not match group membership")
-        self.coordinator.all_gather_into_tensor(output, input)
+def _dimension(value: torch.Tensor, dim: int) -> int:
+    if type(dim) is not int or not -value.ndim <= dim < value.ndim:
+        raise ValueError("collective dimension is outside the input tensor")
+    return dim % value.ndim
 
 
-@dataclass(frozen=True)
-class PeerTensor:
-    """A logically contiguous tensor whose leading-axis storage lives on peers.
-
-    Each owner writes its local allocation. A group fence must complete before
-    kernels read the global view, and again before any owner reuses its local
-    storage. The numerical owner retains both the allocation and its mapping.
-    """
-
-    coordinator: Communicator
-    local: torch.Tensor
-    global_tensor: torch.Tensor
-
-    def fence(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        """Order owner publication or reader completion on the current stream."""
-
-        if tuple(input.shape) != (1,) or tuple(output.shape) != (self.coordinator.world_size,):
-            raise ValueError("peer-memory fence buffers do not match group membership")
-        self.coordinator.all_gather_into_tensor(output, input)
+def _destination(
+    value: torch.Tensor, shape: tuple[int, ...], out: torch.Tensor | None
+) -> torch.Tensor:
+    if out is None:
+        return torch.empty(shape, dtype=value.dtype, device=value.device)
+    if tuple(out.shape) != shape or out.dtype != value.dtype or out.device != value.device:
+        raise ValueError("collective output must match shape, dtype and device")
+    return out
 
 
 @dataclass(frozen=True)
@@ -323,16 +194,16 @@ class Communicator:
             raise ValueError(f"group {self.name!r} requires unique non-empty membership")
         if any(type(rank) is not int or rank < 0 for rank in self.ranks):
             raise ValueError(f"group {self.name!r} ranks must be nonnegative integers")
-        if self.rank not in self.ranks:
-            raise ValueError(f"rank {self.rank} is outside group {self.name!r}: {self.ranks}")
+        if type(self.rank) is not int or not 0 <= self.rank < len(self.ranks):
+            raise ValueError(f"local rank {self.rank} is outside group {self.name!r}: {self.ranks}")
 
     @property
-    def world_size(self) -> int:
+    def size(self) -> int:
         return len(self.ranks)
 
     @property
-    def rank_in_group(self) -> int:
-        return self.ranks.index(self.rank)
+    def global_rank(self) -> int:
+        return self.ranks[self.rank]
 
     def _require(self):
         if self._group is None or not dist.is_initialized():
@@ -342,70 +213,137 @@ class Communicator:
         return self._group
 
     @property
-    def backend_name(self) -> str | None:
+    def _backend_name(self) -> str | None:
         """Expose a non-owning collective identity for tensor-layout metadata."""
 
-        return None if self.world_size == 1 else self._require().group_name
+        return None if self.size == 1 else self._require().group_name
 
     def _peer(self, peer: int) -> int:
-        if not 0 <= peer < self.world_size:
-            raise ValueError(
-                f"peer {peer} is outside group {self.name!r} of size {self.world_size}"
-            )
+        if not 0 <= peer < self.size:
+            raise ValueError(f"peer {peer} is outside group {self.name!r} of size {self.size}")
         return self.ranks[peer]
 
     @property
     def _backend_order(self) -> tuple[int, ...]:
         return tuple(self.ranks.index(rank) for rank in sorted(self.ranks))
 
-    def all_reduce(self, value: torch.Tensor) -> torch.Tensor:
-        if self.world_size > 1:
+    def all_reduce(
+        self,
+        value: torch.Tensor,
+        *,
+        op: Literal["sum", "min", "max"] = "sum",
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Reduce in place, or into matching output storage when supplied."""
+
+        operations = {"sum": dist.ReduceOp.SUM, "min": dist.ReduceOp.MIN, "max": dist.ReduceOp.MAX}
+        if op not in operations:
+            raise ValueError(f"unsupported reduction {op!r}")
+        result = value if out is None else _destination(value, tuple(value.shape), out)
+        if result is not value:
+            result.copy_(value)
+        if self.size > 1:
             group = self._require()
             bound = stream_collectives(group.group_name)
             if bound is not None:
-                bound.all_reduce(value)
-            elif not try_sum_reduction(group, value):
-                dist.all_reduce(value, group=group)
-        return value
+                bound.all_reduce(result, op)
+            elif op == "max":
+                _all_reduce_max(result, group.group_name)
+            elif op != "sum" or not try_sum_reduction(group, result):
+                dist.all_reduce(result, op=operations[op], group=group)
+        return result
 
-    def all_reduce_max(self, value: torch.Tensor) -> torch.Tensor:
-        if self.world_size > 1:
-            _all_reduce_max(value, self._require().group_name)
-        return value
+    def all_gather(
+        self,
+        value: torch.Tensor,
+        *,
+        dim: int = 0,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Concatenate equal tensors in logical membership order."""
 
-    def all_reduce_min(self, value: torch.Tensor) -> torch.Tensor:
-        """Resolve a capacity or bound shared by all members."""
-
-        if self.world_size > 1:
-            group = self._require()
-            bound = stream_collectives(group.group_name)
-            if bound is not None:
-                bound.all_reduce(value, "min")
-            else:
-                dist.all_reduce(value, op=dist.ReduceOp.MIN, group=group)
-        return value
-
-    def all_gather(self, value: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        if self.world_size == 1:
-            return value
+        dim = _dimension(value, dim)
+        shape = list(value.shape)
+        shape[dim] *= self.size
+        result = _destination(value, tuple(shape), out)
+        if self.size == 1:
+            return result.copy_(value)
+        if dim == 0 and result.is_contiguous():
+            self._all_gather_into_tensor(result, value.contiguous())
+            return result
         group = self._require()
         bound = stream_collectives(group.group_name)
+        storage = torch.empty((self.size, *value.shape), dtype=value.dtype, device=value.device)
+        chunks = list(storage.unbind(0))
         if bound is not None:
-            gathered = torch.empty(
-                (self.world_size, *value.shape), dtype=value.dtype, device=value.device
-            )
-            bound.all_gather(gathered, value.contiguous())
-            chunks = list(gathered.unbind(0))
+            bound.all_gather(storage, value.contiguous())
         else:
-            chunks = [torch.empty_like(value) for _ in self.ranks]
             dist.all_gather(chunks, value.contiguous(), group=group)
-        backend_ranks = sorted(self.ranks)
-        return torch.cat([chunks[backend_ranks.index(rank)] for rank in self.ranks], dim=dim)
+        for backend_rank, logical_rank in enumerate(self._backend_order):
+            result.narrow(dim, logical_rank * value.shape[dim], value.shape[dim]).copy_(
+                chunks[backend_rank]
+            )
+        return result
 
-    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor) -> None:
-        if output.numel() != input.numel() * self.world_size:
+    def gather(
+        self,
+        value: torch.Tensor,
+        *,
+        dst: int,
+        dim: int = 0,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        """Concatenate tensors on the destination's group-local rank."""
+
+        self._peer(dst)
+        dim = _dimension(value, dim)
+        if self.rank != dst and out is not None:
+            raise ValueError("only the gather destination may provide output storage")
+        shape = list(value.shape)
+        shape[dim] *= self.size
+        result = _destination(value, tuple(shape), out) if self.rank == dst else None
+        if dim == 0 and (result is None or result.is_contiguous()):
+            storage = None if result is None else result.view(self.size, *value.shape)
+        else:
+            storage = (
+                None
+                if result is None
+                else torch.empty((self.size, *value.shape), dtype=value.dtype, device=value.device)
+            )
+        self._gather_into_tensor(storage, value.contiguous(), dst=dst)
+        if result is not None and storage is not None and storage.data_ptr() != result.data_ptr():
+            for index, chunk in enumerate(storage.unbind(0)):
+                result.narrow(dim, index * value.shape[dim], value.shape[dim]).copy_(chunk)
+        return result
+
+    def all_to_all(
+        self,
+        value: torch.Tensor,
+        *,
+        input_splits: tuple[int, ...],
+        output_splits: tuple[int, ...],
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Exchange leading-axis partitions in logical membership order."""
+
+        for splits in (input_splits, output_splits):
+            if (
+                not isinstance(splits, tuple)
+                or len(splits) != self.size
+                or any(type(count) is not int or count < 0 for count in splits)
+            ):
+                raise ValueError("all-to-all requires one nonnegative count per member")
+        if value.ndim == 0 or sum(input_splits) != value.shape[0]:
+            raise ValueError("all-to-all counts must cover the input leading axis")
+        result = _destination(value, (sum(output_splits), *value.shape[1:]), out)
+        target = result if result.is_contiguous() else torch.empty_like(result).contiguous()
+        self._all_to_all_single_into(target, value.contiguous(), output_splits, input_splits)
+        return result if target is result else result.copy_(target)
+
+    def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        if output.numel() != input.numel() * self.size:
             raise ValueError("all-gather output size must equal input size times group size")
-        if self.world_size == 1:
+        if self.size == 1:
             output.reshape(-1).copy_(input.reshape(-1))
             return
         name = self._require().group_name
@@ -414,58 +352,12 @@ class Communicator:
         else:
             scratch = torch.empty_like(output)
             _all_gather_into_tensor(scratch, input, name)
-            sources = scratch.reshape(self.world_size, *input.shape)
-            targets = output.reshape(self.world_size, *input.shape)
+            sources = scratch.reshape(self.size, *input.shape)
+            targets = output.reshape(self.size, *input.shape)
             for backend_rank, logical_rank in enumerate(self._backend_order):
                 targets[logical_rank].copy_(sources[backend_rank])
 
-    def gather_row_chunks(
-        self, input: torch.Tensor, workspace: torch.Tensor
-    ) -> Iterator[tuple[slice, torch.Tensor]]:
-        """Expose complete local rows, then ready remote intervals in logical order.
-
-        All source staging precedes asynchronous gathers. Consumers may enqueue
-        numerical work between yields while subsequent transfers make progress.
-        Workspace is caller-owned and remains live until iterator exhaustion.
-        """
-
-        if input.ndim != 2 or min(input.shape) < 1:
-            raise ValueError("row gathering requires a nonempty matrix")
-        rows, width = input.shape
-        if self.world_size == 1:
-            yield slice(0, rows), input
-            return
-        byte_count = input.numel() * input.element_size() * self.world_size
-        if not workspace.is_contiguous() or workspace.device != input.device:
-            raise ValueError("row gathering requires contiguous scratch on the input device")
-        if workspace.numel() * workspace.element_size() < byte_count:
-            raise ValueError("row gathering scratch cannot hold all input rows")
-        storage = workspace.view(torch.uint8).view(-1)[:byte_count].view(input.dtype)
-        segment_rows = max(1, ((64 * 1024 * 1024) // (width * input.element_size()) // 128) * 128)
-        local_rank = self._backend_order.index(self.rank_in_group)
-        segments = []
-        for start in range(0, rows, segment_rows):
-            count = min(segment_rows, rows - start)
-            sources = storage.narrow(
-                0, start * self.world_size * width, count * self.world_size * width
-            )
-            sources = sources.view(self.world_size, count, width)
-            sources[local_rank].copy_(input[start : start + count])
-            segments.append((start, count, sources))
-        pending = [
-            _start_all_gather(sources.flatten(0, 1), sources[local_rank], self._require())
-            for _, _, sources in segments
-        ]
-        begin = self.rank_in_group * rows
-        yield slice(begin, begin + rows), input
-        for (start, count, sources), work in zip(segments, pending, strict=True):
-            _finish(work, input)
-            for backend_rank, logical_rank in enumerate(self._backend_order):
-                if backend_rank != local_rank:
-                    begin = logical_rank * rows + start
-                    yield slice(begin, begin + count), sources[backend_rank]
-
-    def all_to_all_single_into(
+    def _all_to_all_single_into(
         self,
         output: torch.Tensor,
         input: torch.Tensor,
@@ -473,11 +365,11 @@ class Communicator:
         input_splits: tuple[int, ...] | list[int],
     ) -> None:
         for tensor, splits in ((output, output_splits), (input, input_splits)):
-            if len(splits) != self.world_size or any(size < 0 for size in splits):
+            if len(splits) != self.size or any(size < 0 for size in splits):
                 raise ValueError("all-to-all requires one nonnegative row count per group member")
             if sum(splits) != tensor.shape[0]:
                 raise ValueError("all-to-all row counts must cover the tensor")
-        if self.world_size == 1:
+        if self.size == 1:
             output.copy_(input)
             return
         name = self._require().group_name
@@ -500,146 +392,12 @@ class Communicator:
         for index, chunk in zip(order, received.split(backend_output_splits, dim=0)):
             targets[index].copy_(chunk)
 
-    def produce_exchange(
-        self,
-        source: torch.Tensor,
-        destination: torch.Tensor,
-        producer: Callable[[tuple[torch.Tensor, ...]], None],
-    ) -> Callable[[], tuple[torch.Tensor, ...]]:
-        """Publish equal peer payloads and return their deferred completion.
-
-        Physical buffers have a leading member axis. Producer and consumer
-        views use logical member order. Contiguous registered buffers permit
-        NCCL's zero-CTA AlltoAll; tensor layout and numerical work belong to
-        the caller. Both buffers must remain live until completion is consumed.
-        """
-
-        if (
-            source.ndim < 2
-            or source.shape[0] != self.world_size
-            or source.shape != destination.shape
-            or source.dtype != destination.dtype
-            or source.device != destination.device
-            or not source.is_contiguous()
-            or not destination.is_contiguous()
-            or source.data_ptr() == destination.data_ptr()
-        ):
-            raise ValueError("produced exchange requires distinct matching peer buffers")
-        order = self._backend_order
-        producer(tuple(source[order.index(rank)] for rank in range(self.world_size)))
-        if self.world_size == 1:
-            destination.copy_(source)
-            work = None
-        else:
-            group = self._require()
-            bound = stream_collectives(group.group_name)
-            if bound is not None:
-                bound.all_to_all(destination, source, [1] * self.world_size, [1] * self.world_size)
-                work = None
-            else:
-                work = dist.all_to_all_single(destination, source, group=group, async_op=True)
-
-        def complete() -> tuple[torch.Tensor, ...]:
-            if work is not None:
-                _finish(work, source)
-            return tuple(destination[order.index(rank)] for rank in range(self.world_size))
-
-        return complete
-
-    def exchange_row_chunks(
-        self,
-        input: torch.Tensor,
-        workspace: torch.Tensor,
-        output: torch.Tensor,
-        chunk_rows: int,
-    ) -> Iterator[tuple[slice, tuple[torch.Tensor, ...]]]:
-        """Yield equal-count AlltoAll row intervals as their peer writes complete.
-
-        Input axes are logical destination, row, and payload features. Both
-        workspace buffers are consumed as scratch. Input storage stays live
-        independently of peer writes throughout staging and exchange. Each
-        yielded tuple orders source shards by logical membership. Consumers
-        must exhaust the iterator before either allocation is reused.
-        """
-
-        if input.ndim < 3 or input.shape[0] != self.world_size or chunk_rows < 1:
-            raise ValueError("chunked exchange requires a member axis and positive row chunks")
-        if (
-            not input.is_contiguous()
-            or not workspace.is_contiguous()
-            or workspace.numel() != input.numel()
-            or workspace.device != input.device
-            or workspace.dtype != input.dtype
-            or not output.is_contiguous()
-            or output.numel() != input.numel()
-            or output.device != input.device
-            or output.dtype != input.dtype
-            or len({input.data_ptr(), workspace.data_ptr(), output.data_ptr()}) != 3
-        ):
-            raise ValueError("chunked exchange requires distinct matching contiguous buffers")
-
-        def produce(interval: slice, destinations: tuple[torch.Tensor, ...]) -> None:
-            for rank, destination in enumerate(destinations):
-                destination.copy_(input[rank, interval])
-
-        return self.produce_row_chunks(input.shape, workspace, output, chunk_rows, produce)
-
-    def produce_row_chunks(
-        self,
-        shape: tuple[int, ...],
-        workspace: torch.Tensor,
-        output: torch.Tensor,
-        chunk_rows: int,
-        producer: RowChunkProducer,
-    ) -> Iterator[tuple[slice, tuple[torch.Tensor, ...]]]:
-        """Exchange row intervals as a stream-ordered producer publishes them.
-
-        Shape axes are logical destination, row, and payload. The producer
-        writes each supplied logical destination view on the current stream.
-        It must finish enqueuing its writes before returning. Transport owns
-        ordering and scratch layout, and starts each exchange immediately.
-        All production is enqueued before yielding to consumers, allowing its
-        temporary inputs to be released before consumer allocations begin.
-        Both distinct scratch buffers remain live until iterator exhaustion.
-        """
-
-        if len(shape) < 3 or shape[0] != self.world_size or min(shape) < 1 or chunk_rows < 1:
-            raise ValueError("row production requires a member axis and positive row chunks")
-        if (
-            not workspace.is_contiguous()
-            or not output.is_contiguous()
-            or workspace.numel() != prod(shape)
-            or output.numel() != prod(shape)
-            or workspace.device != output.device
-            or workspace.dtype != output.dtype
-            or workspace.data_ptr() == output.data_ptr()
-        ):
-            raise ValueError("row production requires distinct matching contiguous buffers")
-        rows = shape[1]
-        row_elements = prod(shape[2:])
-        source_flat, target_flat = workspace.view(-1), output.view(-1)
-        segments = []
-        for start in range(0, rows, chunk_rows):
-            count = min(chunk_rows, rows - start)
-            offset = start * self.world_size * row_elements
-            elements = count * self.world_size * row_elements
-            segment_shape = (self.world_size, count, *shape[2:])
-            source = source_flat.narrow(0, offset, elements).view(segment_shape)
-            target = target_flat.narrow(0, offset, elements).view(segment_shape)
-            interval = slice(start, start + count)
-            complete = self.produce_exchange(source, target, partial(producer, interval))
-            segments.append((interval, complete))
-
-        del producer
-        for interval, complete in segments:
-            yield interval, complete()
-
-    def gather_into_tensor(
+    def _gather_into_tensor(
         self, output: torch.Tensor | None, input: torch.Tensor, *, dst: int
     ) -> None:
         global_dst = self._peer(dst)
-        if self.rank == global_dst:
-            expected = (self.world_size, *input.shape)
+        if self.rank == dst:
+            expected = (self.size, *input.shape)
             if output is None or tuple(output.shape) != expected:
                 raise ValueError(f"gather output must have shape {expected}")
             if output.device != input.device or output.dtype != input.dtype:
@@ -650,7 +408,7 @@ class Communicator:
             if output is not None:
                 raise ValueError("only the gather destination may provide output storage")
             gather_list = None
-        if self.world_size == 1:
+        if self.size == 1:
             assert output is not None
             output[0].copy_(input)
             return
@@ -664,33 +422,47 @@ class Communicator:
         )
         _finish(work, input)
 
-    def broadcast(self, value: torch.Tensor, *, src: int = 0) -> torch.Tensor:
+    def broadcast(
+        self, value: torch.Tensor, *, src: int, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Broadcast from a group-local source into matching tensor storage."""
+
         global_src = self._peer(src)
-        if self.world_size > 1:
+        result = value if out is None else _destination(value, tuple(value.shape), out)
+        if result is not value:
+            result.copy_(value)
+        if self.size > 1:
             group = self._require()
             bound = stream_collectives(group.group_name)
             if bound is not None:
-                bound.broadcast(value, global_src)
+                bound.broadcast(result, global_src)
             else:
-                dist.broadcast(value, src=global_src, group=group)
-        return value
+                dist.broadcast(result, src=global_src, group=group)
+        return result
 
-    def reduce_scatter(self, value: torch.Tensor, dim: int = 0) -> torch.Tensor:
+    def reduce_scatter(
+        self, value: torch.Tensor, *, dim: int = 0, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Sum equal partitions and return the local logical member's partition."""
 
-        divide(value.shape[dim], self.world_size)
-        if self.world_size == 1:
-            return value
-        chunks = value.chunk(self.world_size, dim=dim)
+        dim = _dimension(value, dim)
+        shape = list(value.shape)
+        shape[dim] = divide(shape[dim], self.size)
+        result = _destination(value, tuple(shape), out)
+        if self.size == 1:
+            return result.copy_(value)
+        chunks = value.chunk(self.size, dim=dim)
         packed = torch.cat([chunks[index].movedim(dim, 0) for index in self._backend_order], dim=0)
-        output = torch.empty_like(chunks[0].movedim(dim, 0), memory_format=torch.contiguous_format)
+        output = result.movedim(dim, 0)
+        if not output.is_contiguous():
+            output = torch.empty_like(output, memory_format=torch.contiguous_format)
         group = self._require()
         bound = stream_collectives(group.group_name)
         if bound is not None:
             bound.reduce_scatter(output, packed.contiguous())
         else:
             dist.reduce_scatter_tensor(output, packed.contiguous(), group=group)
-        return output.movedim(0, dim)
+        return result.copy_(output.movedim(0, dim))
 
     def send(self, value: torch.Tensor, *, dst: int) -> None:
         """Send a tensor's logical bytes, including dtypes unsupported by NCCL."""
@@ -703,9 +475,10 @@ class Communicator:
         else:
             dist.send(payload, dst=self._peer(dst), group=group)
 
-    def recv(self, value: torch.Tensor, *, src: int) -> torch.Tensor:
+    def recv(self, *, src: int, out: torch.Tensor) -> torch.Tensor:
         """Receive bytes into caller-owned storage with the agreed shape and dtype."""
 
+        value = out
         storage = value if value.is_contiguous() else torch.empty_like(value).contiguous()
         group = self._require()
         bound = stream_collectives(group.group_name)
@@ -720,113 +493,155 @@ class Communicator:
     def send_recv(
         self,
         value: torch.Tensor,
-        output: torch.Tensor,
         *,
         dst: int,
         src: int,
-    ) -> None:
+        out: torch.Tensor,
+    ) -> torch.Tensor:
         """Exchange tensor bytes with group-local peers in one batched P2P launch.
 
         Callers keep send storage live until stream completion and supply
         contiguous receive storage with the peer's agreed tensor contract.
         """
 
+        output = out
         global_dst, global_src = self._peer(dst), self._peer(src)
         if not output.is_contiguous():
             raise ValueError("point-to-point exchange requires contiguous output storage")
-        if self.world_size == 1:
-            output.copy_(value)
-            return
+        if self.size == 1:
+            return output.copy_(value)
         _send_recv(value.contiguous(), output, global_dst, global_src, self._require().group_name)
+        return output
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class DeviceMesh:
-    """Rank mapping for one component, with named independent and composite groups."""
+    """An ordered mathematical topology borrowing any bound communicators.
 
-    ranks: tuple[int, ...] = (0,)
-    rank: int = 0
-    parallel_config: ParallelConfig = ParallelConfig()
-    local_device: torch.device = torch.device("cpu")
-    groups: Mapping[str, Communicator] = field(default_factory=dict)
+    Every process may inspect the topology. A process outside ``ranks`` cannot
+    borrow a local communicator or select its local submesh. Group creation,
+    streams and communication resource lifetimes belong to ProcessGroups.
+    """
+
+    ranks: tuple[int, ...]
+    shape: tuple[int, ...]
+    axes: tuple[str, ...]
+    rank: int
+    _groups: Mapping[tuple[str, ...], Communicator] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _device: torch.device = field(
+        default=torch.device("cpu"), init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
-        if len(self.ranks) != self.parallel_config.world_size:
-            raise ValueError(
-                f"component has {len(self.ranks)} members but parallel_config requires "
-                f"{self.parallel_config.world_size} (TP × sequence × pipeline)"
-            )
-        if len(set(self.ranks)) != len(self.ranks) or any(
-            type(rank) is not int or rank < 0 for rank in self.ranks
+        if (
+            not isinstance(self.ranks, tuple)
+            or not self.ranks
+            or len(set(self.ranks)) != len(self.ranks)
+            or any(type(rank) is not int or rank < 0 for rank in self.ranks)
+            or type(self.rank) is not int
+            or self.rank < 0
         ):
-            raise ValueError("component members must be unique nonnegative process ranks")
-        if self.rank not in self.ranks:
-            raise ValueError(f"rank {self.rank} is outside component membership {self.ranks}")
+            raise ValueError("mesh ranks must be unique nonnegative integers")
+        if (
+            not isinstance(self.shape, tuple)
+            or any(type(size) is not int or size < 1 for size in self.shape)
+            or prod(self.shape) != len(self.ranks)
+        ):
+            raise ValueError("mesh shape product must equal its membership")
+        if (
+            not isinstance(self.axes, tuple)
+            or len(self.axes) != len(self.shape)
+            or len(set(self.axes)) != len(self.axes)
+            or any(not isinstance(axis, str) or not axis for axis in self.axes)
+        ):
+            raise ValueError("mesh axes must uniquely name each dimension")
+        object.__setattr__(self, "_groups", MappingProxyType({}))
 
-    @property
-    def dimensions(self) -> tuple[tuple[str, int], ...]:
-        return self.parallel_config.dimensions
+    def coordinate(self, rank: int) -> tuple[int, ...]:
+        """Return a member's coordinates in the declared rank ordering."""
 
-    def get_coordinate(self, rank: int | None = None) -> tuple[int, ...]:
-        """Resolve a process rank through the component's ordered membership."""
-
-        index = self.ranks.index(self.rank if rank is None else rank)
+        index = self.ranks.index(rank)
         coordinates = []
-        for _, size in reversed(self.dimensions):
+        for size in reversed(self.shape):
             coordinates.append(index % size)
             index //= size
         return tuple(reversed(coordinates))
 
-    def _selection(self, name: str) -> tuple[str, ...]:
-        dimensions = tuple(name for name, _ in self.dimensions)
-        if name == "sp":
-            return tuple(axis for axis in dimensions if axis.startswith("cp") or axis == "ulysses")
-        if name == "cp" and "cp_row" in dimensions:
-            return ("cp_row", "cp_col")
-        if name not in dimensions:
-            raise ValueError(f"unknown mesh dimension {name!r}; declared: {(*dimensions, 'sp')}")
-        return (name,)
+    def _selection(self, axes: str | tuple[str, ...]) -> tuple[str, ...]:
+        selected = (axes,) if isinstance(axes, str) else axes
+        if (
+            not isinstance(selected, tuple)
+            or len(set(selected)) != len(selected)
+            or any(axis not in self.axes for axis in selected)
+        ):
+            raise ValueError(f"unknown or repeated mesh axes {axes!r}; declared: {self.axes}")
+        return selected
 
-    def group_members(self, name: str) -> tuple[tuple[int, ...], ...]:
-        """Enumerate every fiber, including composites over separated dimensions."""
+    def size(self, axes: str | tuple[str, ...]) -> int:
+        selected = self._selection(axes)
+        return prod(self.shape[self.axes.index(axis)] for axis in selected)
 
-        selected = self._selection(name)
-        names, sizes = zip(*self.dimensions)
-        fibers: dict[tuple[int, ...], list[int]] = {}
-        for rank, coordinate in zip(self.ranks, product(*(range(size) for size in sizes))):
-            fixed = tuple(coord for axis, coord in zip(names, coordinate) if axis not in selected)
-            fibers.setdefault(fixed, []).append(rank)
-        return tuple(tuple(fiber) for fiber in fibers.values())
+    def members(self, axes: tuple[str, ...]) -> tuple[tuple[int, ...], ...]:
+        """Enumerate fibers in topology order, ordering each by selected axes."""
 
-    def get_group(self, name: str) -> Communicator:
-        self._selection(name)
-        if name in self.groups:
-            return self.groups[name]
-        members = next(members for members in self.group_members(name) if self.rank in members)
-        if len(members) != 1:
-            raise RuntimeError(f"mesh group {name!r} has not been initialized")
-        return Communicator(ranks=members, rank=self.rank, name=name, device=self.local_device)
+        selected = self._selection(axes)
+        varying = tuple(self.axes.index(axis) for axis in selected)
+        fixed = tuple(index for index, axis in enumerate(self.axes) if axis not in selected)
+        fibers = {}
+        for rank in self.ranks:
+            coordinate = self.coordinate(rank)
+            key = tuple(coordinate[index] for index in fixed)
+            fibers.setdefault(key, []).append((tuple(coordinate[index] for index in varying), rank))
+        return tuple(tuple(rank for _, rank in sorted(fiber)) for fiber in fibers.values())
 
-    def size(self, name: str) -> int:
-        selected = self._selection(name)
-        return prod(size for axis, size in self.dimensions if axis in selected)
+    def get_group(self, axes: str | tuple[str, ...]) -> Communicator:
+        selected = self._selection(axes)
+        if self.rank not in self.ranks:
+            raise ValueError("nonparticipating rank cannot borrow a mesh communicator")
+        if selected in self._groups:
+            return self._groups[selected]
+        members = next(fiber for fiber in self.members(selected) if self.rank in fiber)
+        for axes, group in self._groups.items():
+            if set(axes) == set(selected):
+                return Communicator(
+                    members,
+                    members.index(self.rank),
+                    ".".join(selected) or "local",
+                    self._device,
+                    group._group,
+                )
+        # An unbound descriptor remains useful for mathematical queries. Any
+        # multi-rank numerical communication still requires runtime binding.
+        return Communicator(
+            ranks=members,
+            rank=members.index(self.rank),
+            name=".".join(selected) or "local",
+            device=self._device,
+        )
 
-    def coord(self, name: str) -> int:
-        selected = self._selection(name)
-        result = 0
-        for (axis, size), coordinate in zip(self.dimensions, self.get_coordinate()):
-            if axis in selected:
-                result = result * size + coordinate
+    def submesh(self, axes: tuple[str, ...]) -> DeviceMesh:
+        selected = self._selection(axes)
+        if self.rank not in self.ranks:
+            raise ValueError("nonparticipating rank has no local submesh")
+        members = next(fiber for fiber in self.members(selected) if self.rank in fiber)
+        result = DeviceMesh(
+            ranks=members,
+            shape=tuple(self.shape[self.axes.index(axis)] for axis in selected),
+            axes=selected,
+            rank=self.rank,
+        )
+        object.__setattr__(result, "_device", self._device)
+        object.__setattr__(
+            result,
+            "_groups",
+            MappingProxyType(
+                {
+                    axes: group
+                    for axes, group in self._groups.items()
+                    if all(axis in selected for axis in axes)
+                }
+            ),
+        )
         return result
-
-    @property
-    def tp_size(self) -> int:
-        return self.size("tp")
-
-    @property
-    def tp_rank(self) -> int:
-        return self.coord("tp")
-
-    @classmethod
-    def trivial(cls, device: torch.device | str = "cpu") -> DeviceMesh:
-        return cls(local_device=torch.device(device))

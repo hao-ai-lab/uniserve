@@ -11,8 +11,8 @@ from typing import Final, cast
 
 import torch
 
+from uniserve import _slices
 from uniserve.runtime.device import canonical_device
-from uniserve.tensors import ImageRange, TensorRegion
 from uniserve_worker.protocol.batch import ComputationId
 
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
@@ -149,7 +149,7 @@ class ImageMetadata:
 
     height: int = 0
     width: int = 0
-    value_range: ImageRange | None = None
+    value_range: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         """Require complete, nonnegative image geometry."""
@@ -188,7 +188,7 @@ class TensorRecord:
     retired: bool = False
     # Publication exposes the logical product; release may precede retirement.
     committed: bool = False
-    region: TensorRegion | None = None
+    region: tuple[slice, ...] | None = None
     logical_shape: tuple[int, ...] | None = None
     transfers: tuple[TransferTicket, ...] = ()
     publications: tuple[Future[None], ...] = ()
@@ -211,7 +211,7 @@ class TensorRead:
     tensor: torch.Tensor
     consumer_op_id: ComputationId | None
     _write: TensorRecord = field(repr=False, compare=False)
-    region: TensorRegion | None = None
+    region: tuple[slice, ...] | None = None
     metadata: ImageMetadata | FeatureMetadata | None = None
     imported: TensorImport | None = field(default=None, repr=False, compare=False)
     _recorded: bool = field(default=False, repr=False, compare=False)
@@ -351,7 +351,7 @@ class TensorStore:
         *,
         request_slots: Mapping[RequestKey, int] | None = None,
         buffer_allocations: Mapping[BufferId, BufferAllocation] | None = None,
-        regions: Mapping[TensorRef, TensorRegion] | None = None,
+        regions: Mapping[TensorRef, tuple[slice, ...]] | None = None,
         shapes: Mapping[TensorRef, tuple[int, ...]] | None = None,
     ) -> tuple[TensorRecord, ...]:
         """Atomically bind outputs and retain their direct scalar range."""
@@ -370,7 +370,7 @@ class TensorStore:
             )
             if not reference.shape_bound.contains_shape(logical_shape):
                 raise invalid_descriptor("tensor binding shape disagrees with its logical bounds")
-            if region is not None and not region.within(logical_shape):
+            if region is not None and not _slices.within(region, logical_shape):
                 raise invalid_descriptor("tensor binding region disagrees with its logical bounds")
         # Allocation records select physical ownership. Tensor identity carries
         # no semantic role or duplicate storage-class tag.
@@ -394,7 +394,7 @@ class TensorStore:
         bindings: tuple[tuple[TensorRef, torch.device | str], ...],
         *,
         buffer_allocations: Mapping[BufferId, BufferAllocation],
-        regions: Mapping[TensorRef, TensorRegion] | None = None,
+        regions: Mapping[TensorRef, tuple[slice, ...]] | None = None,
         shapes: Mapping[TensorRef, tuple[int, ...]] | None = None,
     ) -> tuple[TensorRecord, ...]:
         """Reserve features against their independent global entry and byte bounds."""
@@ -407,7 +407,7 @@ class TensorStore:
         self,
         bindings: tuple[tuple[TensorRef, torch.device | str], ...],
         allocations: Mapping[BufferId, BufferAllocation],
-        regions: Mapping[TensorRef, TensorRegion] | None,
+        regions: Mapping[TensorRef, tuple[slice, ...]] | None,
         shapes: Mapping[TensorRef, tuple[int, ...]] | None,
         *,
         feature: bool = False,
@@ -440,7 +440,8 @@ class TensorStore:
                         raise invalid_descriptor("encoder feature dtype is unsupported")
                     if reference.max_bytes > self.max_entry_bytes:
                         raise resource_error(
-                            "encoder feature exceeds the fixed entry byte capacity"
+                            "encoder feature exceeds the fixed entry byte capacity: "
+                            f"requested={reference.max_bytes}, capacity={self.max_entry_bytes}"
                         )
                     if device not in self.devices:
                         raise invalid_descriptor("encoder feature names an undeclared device")
@@ -462,9 +463,14 @@ class TensorStore:
                         else shapes.get(reference, _device_shape(reference))
                     )
                     region = None if regions is None else regions.get(reference)
-                    if region == TensorRegion((0,) * len(logical_shape), logical_shape):
+                    if region == tuple(
+                        slice(start, start + extent)
+                        for start, extent in zip(
+                            (0,) * len(logical_shape), logical_shape, strict=True
+                        )
+                    ):
                         region = None
-                    shape = logical_shape if region is None else region.shape
+                    shape = logical_shape if region is None else _slices.shape(region)
                     allocation = allocations[reference.buffer_id]
                     full_storage = region is not None and allocation.bytes >= self._tensor_bytes(
                         logical_shape, dtype
@@ -477,7 +483,7 @@ class TensorStore:
                         shape=logical_shape if full_storage else shape,
                     )
                     tensor = (
-                        binding.tensor[region.slices()]
+                        binding.tensor[region]
                         if full_storage and region is not None
                         else binding.tensor
                     )
@@ -667,7 +673,12 @@ class TensorStore:
                 elements = (self.request_capacity + 1) * self.relay_depth
                 projected = self._allocated_bytes + elements * _TORCH_DTYPE_BYTES[dtype]
                 self._require_byte_capacity_locked(projected)
-                arena = torch.empty((elements,), dtype=dtype, device=device)
+                if device.type == "cuda":
+                    from uniserve_kernel.peer_memory import empty
+
+                    arena = empty((elements,), dtype=dtype, device=device)
+                else:
+                    arena = torch.empty((elements,), dtype=dtype, device=device)
                 self._relay_arenas[arena_key] = arena
                 self._allocated_bytes = projected
             index = request_slot * self.relay_depth + lane
@@ -705,7 +716,7 @@ class TensorStore:
         *,
         request_slots: Mapping[RequestKey, int] | None = None,
         buffer_allocations: Mapping[BufferId, BufferAllocation] | None = None,
-        regions: Mapping[TensorRef, TensorRegion] | None = None,
+        regions: Mapping[TensorRef, tuple[slice, ...]] | None = None,
         shapes: Mapping[TensorRef, tuple[int, ...]] | None = None,
     ) -> tuple[tuple[TensorRecord, ...], ...]:
         """Atomically bind output groups while preserving direct producer ranges."""
@@ -785,7 +796,7 @@ class TensorStore:
         if value.dtype != target.dtype:
             raise invalid_descriptor("tensor publication changes its declared dtype")
         if entry.region is not None:
-            shape_matches = tuple(value.shape) == entry.region.shape
+            shape_matches = tuple(value.shape) == _slices.shape(entry.region)
         else:
             shape_matches = entry.reference.shape_bound.contains_shape(tuple(value.shape))
         if not shape_matches:
@@ -1483,8 +1494,11 @@ class TensorStore:
             existing = self._products.get(key)
             if existing is not None and not existing.committed:
                 existing = None
-            missing: tuple[TensorRegion, ...]
-            full = TensorRegion((0,) * len(tensor.shape), tensor.shape)
+            missing: tuple[tuple[slice, ...], ...]
+            full = tuple(
+                slice(start, start + extent)
+                for start, extent in zip((0,) * len(tensor.shape), tensor.shape, strict=True)
+            )
             if existing is not None:
                 write = self._require_locked(reference)
                 if write.released or not write.producer_recorded:
@@ -1511,7 +1525,7 @@ class TensorStore:
                     destination = persistent.tensor
                     if any(not ticket.retired() for ticket in write.transfers):
                         raise resource_error("product storage has pending physical reads")
-                    missing = full.subtract(write.region)
+                    missing = _slices.subtract(full, write.region)
             else:
                 if isinstance(metadata, FeatureMetadata):
                     write = self._bind_persistent_outputs(
@@ -1556,7 +1570,7 @@ class TensorStore:
                 for region in missing:
                     fetch_tensor(
                         tensor,
-                        destination[region.slices()],
+                        destination[region],
                         bindings=bindings,
                         region=region,
                         retain=retain,
@@ -1861,7 +1875,6 @@ __all__ = [
     "ImageMetadata",
     "TensorRecord",
     "FeatureMetadata",
-    "ImageRange",
     "device_product_capacity_bytes",
     "device_product_storage",
 ]

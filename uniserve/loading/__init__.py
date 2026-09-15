@@ -1,6 +1,13 @@
-"""Public checkpoint loading and numerical model materialization."""
+"""Public model loading, checkpoint reading and numerical weight assignment."""
 
-from uniserve.loading.config import LoadConfig, LoadFormat
-from uniserve.loading.loader import LoadedModel, load_model
+from .config import Config
 
-__all__ = ["LoadConfig", "LoadFormat", "LoadedModel", "load_model"]
+__all__ = ["Config", "Result", "load_model", "load_weights"]
+
+
+def __getattr__(name):
+    if name in {"Result", "load_model", "load_weights"}:
+        from . import loader
+
+        return getattr(loader, name)
+    raise AttributeError(name)

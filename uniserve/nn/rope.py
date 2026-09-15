@@ -1,357 +1,264 @@
-"""Rotary-position factor construction for packed and HF-shaped decoders.
-
-The implementations keep inverse frequencies in nonpersistent buffers so meta
-models can materialize them directly on the execution device. Callers can
-request either duplicated batch/sequence factors or compact one-dimensional
-factors, matching the two attention layouts used by the worker.
-"""
+"""Typed rotary recipes and stateless numerical position factors."""
 
 from __future__ import annotations
 
-import copy
-import math
 from dataclasses import asdict, dataclass
-from typing import Any
+from math import isfinite
+from typing import TypeAlias
 
 import torch
-import torch.nn as nn
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from torch import nn
 
-from uniserve.ops import apply_rotary_emb, apply_rotary_pos_emb, qk_norm_rope, rotate_half
+from uniserve.tensors import BufferConfig
 
-__all__ = [
-    "rotate_half",
-    "apply_rotary_emb",
-    "qk_norm_rope",
-    "apply_rotary_pos_emb",
-    "RopeScaling",
-    "RotaryEmbedding",
-    "HFRotaryEmbedding",
-    "get_rope",
-]
+
+def _positive(value, name):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"rotary {name} must be finite and positive")
+
+
+def _recipe_values(recipe):
+    for name, value in asdict(recipe).items():
+        if value is None or name == "truncate":
+            continue
+        if isinstance(value, tuple):
+            if not value:
+                raise ValueError(f"rotary {name} cannot be empty")
+            for factor in value:
+                _positive(factor, name)
+        else:
+            _positive(value, name)
+    original = getattr(recipe, "original_max_position_embeddings", None)
+    if original is not None and type(original) is not int:
+        raise ValueError("the original rotary context length must be an integer")
 
 
 @dataclass(frozen=True, slots=True)
-class RopeScaling:
-    """Numerical scaling recipe consumed by Transformers' rotary initializers.
+class LinearScaling:
+    factor: float
 
-    Fixed factor sequences are immutable. Dimensions and the frequency base
-    belong to the rotary module, so one recipe can serve temporal and spatial
-    partitions without copying or mutating the model's configuration.
-    """
+    def __post_init__(self):
+        _recipe_values(self)
 
-    rope_type: str
-    factor: float | None = 1.0
-    original_max_position_embeddings: int | None = None
+
+@dataclass(frozen=True, slots=True)
+class DynamicScaling:
+    factor: float
+
+    def __post_init__(self):
+        _recipe_values(self)
+
+
+@dataclass(frozen=True, slots=True)
+class YaRNScaling:
+    factor: float | None
+    original_max_position_embeddings: int
     attention_factor: float | None = None
     beta_fast: float = 32.0
     beta_slow: float = 1.0
-    low_freq_factor: float = 1.0
-    high_freq_factor: float = 4.0
-    short_factor: tuple[float, ...] = ()
-    long_factor: tuple[float, ...] = ()
     mscale: float | None = None
     mscale_all_dim: float | None = None
     truncate: bool = True
 
-    def __post_init__(self) -> None:
-        if self.rope_type not in {
-            "linear",
-            "dynamic",
-            "yarn",
-            "longrope",
-            "llama3",
-            "proportional",
-        }:
-            raise ValueError(f"unsupported rotary scaling {self.rope_type!r}")
-        for name in (
-            "factor",
-            "attention_factor",
-            "beta_fast",
-            "beta_slow",
-            "low_freq_factor",
-            "high_freq_factor",
-            "mscale",
-            "mscale_all_dim",
-        ):
-            value = getattr(self, name)
-            if value is not None and (
-                not isinstance(value, (int, float))
-                or isinstance(value, bool)
-                or not math.isfinite(value)
-                or value <= 0
-            ):
-                raise ValueError(f"rotary {name} must be finite and positive")
-        if self.factor is None and self.rope_type not in {"yarn", "longrope"}:
-            raise ValueError(f"{self.rope_type} requires a scaling factor")
-        original = self.original_max_position_embeddings
-        if original is not None and (
-            not isinstance(original, int) or isinstance(original, bool) or original <= 0
-        ):
-            raise ValueError("rotary original_max_position_embeddings must be a positive integer")
-        if self.rope_type in {"yarn", "longrope", "llama3"} and original is None:
-            raise ValueError(f"{self.rope_type} requires original_max_position_embeddings")
-        if self.rope_type == "llama3" and self.high_freq_factor <= self.low_freq_factor:
-            raise ValueError("Llama rotary high_freq_factor must exceed low_freq_factor")
-        for name in ("short_factor", "long_factor"):
-            values = getattr(self, name)
-            if not isinstance(values, tuple) or any(
-                not isinstance(value, (int, float))
-                or isinstance(value, bool)
-                or not math.isfinite(value)
-                or value <= 0
-                for value in values
-            ):
-                raise ValueError(f"rotary {name} must be a tuple of positive finite factors")
-            if self.rope_type == "longrope" and not values:
-                raise ValueError(f"longrope requires {name}")
-        if not isinstance(self.truncate, bool):
-            raise ValueError("rotary truncate must be boolean")
+    def __post_init__(self):
+        _recipe_values(self)
+        if type(self.truncate) is not bool:
+            raise ValueError("YaRN truncation must be boolean")
 
 
-def _cos_sin_bshd(
-    inv_freq: torch.Tensor,
-    attention_scaling: float,
-    x: torch.Tensor,
-    position_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return duplicated cosine and sine factors shaped ``[batch, seq, dim]``."""
+@dataclass(frozen=True, slots=True)
+class LongRoPEScaling:
+    factor: float | None
+    original_max_position_embeddings: int
+    attention_factor: float | None
+    short_factor: tuple[float, ...]
+    long_factor: tuple[float, ...]
 
-    # Form every batch/position phase as an outer product with the frequency
-    # vector. Duplicating the phases matches the two halves consumed by
-    # ``rotate_half``-style rotary application.
-    inv_freq_expanded = (
-        inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-    )
-    position_ids_expanded = position_ids[:, None, :].float()
-    device_type = (
-        x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-    )
+    def __post_init__(self):
+        _recipe_values(self)
+        if not isinstance(self.short_factor, tuple) or not isinstance(self.long_factor, tuple):
+            raise ValueError("LongRoPE factors must be immutable tuples")
 
-    # Phase construction stays in fp32 with autocast disabled; the final
-    # factors return to the activation dtype at the operator boundary.
-    with torch.autocast(device_type=device_type, enabled=False):
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos() * attention_scaling
-        sin = emb.sin() * attention_scaling
 
-    return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+@dataclass(frozen=True, slots=True)
+class LlamaScaling:
+    factor: float
+    original_max_position_embeddings: int
+    low_freq_factor: float
+    high_freq_factor: float
+
+    def __post_init__(self):
+        _recipe_values(self)
+        if self.high_freq_factor <= self.low_freq_factor:
+            raise ValueError("Llama's high-frequency boundary must exceed its low boundary")
+
+
+@dataclass(frozen=True, slots=True)
+class ProportionalScaling:
+    factor: float
+
+    def __post_init__(self):
+        _recipe_values(self)
+
+
+RoPEScaling: TypeAlias = (
+    LinearScaling
+    | DynamicScaling
+    | YaRNScaling
+    | LongRoPEScaling
+    | LlamaScaling
+    | ProportionalScaling
+)
+
+_RECIPE_NAMES = {
+    LinearScaling: "linear",
+    DynamicScaling: "dynamic",
+    YaRNScaling: "yarn",
+    LongRoPEScaling: "longrope",
+    LlamaScaling: "llama3",
+    ProportionalScaling: "proportional",
+}
 
 
 class RotaryEmbedding(nn.Module):
-    """Default rotary-factor generator parameterized by an explicit dimension.
+    """Produce compact [..., dimension / 2] cosine and sine factors.
 
-    ``keep_freq_range`` constructs frequencies over twice the rotary dimension
-    and keeps alternating entries. This gives a smaller per-axis factor the
-    frequency span of the corresponding full-width embedding.
+    Positions select coordinates; sequence_length independently selects a
+    dynamic recipe's frequency domain. Calls never mutate model frequencies,
+    so separate contexts can evaluate different lengths on shared weights.
     """
-
-    inv_freq: torch.Tensor
 
     def __init__(
         self,
         dim: int,
         *,
         theta: float = 10000.0,
-        attention_scaling: float = 1.0,
+        scaling: RoPEScaling | None = None,
+        attention_scale: float = 1.0,
         keep_freq_range: bool = False,
-        device: torch.device | str | None = None,
-    ) -> None:
-        """Initialize inverse frequencies for the requested rotary geometry."""
-
-        super().__init__()
-        self.dim = dim
-        self.theta = theta
-        self.attention_scaling = attention_scaling
-        self.keep_freq_range = bool(keep_freq_range)
-
-        # Frequency-range preservation derives the geometric progression at
-        # double width, then decimates it to the requested number of factors.
-        inv_dim = dim * 2 if keep_freq_range else dim
-        inv_freq = 1.0 / (
-            theta ** (torch.arange(0, inv_dim, 2, dtype=torch.float32, device=device) / inv_dim)
-        )
-        if keep_freq_range:
-            inv_freq = inv_freq[::2]
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def materialize_load_buffers(self, device: torch.device | str) -> None:
-        """Materialize a meta-initialized frequency buffer on ``device``."""
-
-        if not self.inv_freq.is_meta:
-            return
-
-        inv_dim = self.dim * 2 if self.keep_freq_range else self.dim
-        inv_freq = 1.0 / (
-            self.theta
-            ** (torch.arange(0, inv_dim, 2, dtype=torch.float32, device=device) / inv_dim)
-        )
-        self.inv_freq = inv_freq[::2] if self.keep_freq_range else inv_freq
-
-    @torch.no_grad()
-    def forward(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return duplicated factors shaped ``[batch, seq, dim]`` in ``x``'s dtype."""
-
-        return _cos_sin_bshd(self.inv_freq, self.attention_scaling, x, position_ids)
-
-    @torch.no_grad()
-    def cos_sin_1d(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return compact packed-decoder factors shaped ``[seq, dim/2]``."""
-
-        freqs = position_ids.float()[:, None] * self.inv_freq[None, :].to(position_ids.device)
-        return freqs.cos(), freqs.sin()
-
-
-class HFRotaryEmbedding(nn.Module):
-    """Rotary-factor generator driven by a model configuration's HF recipe.
-
-    The selected recipe owns attention scaling and may update frequencies as
-    sequence lengths change. Frequency-range preservation applies the recipe at
-    double head width and retains alternating frequencies.
-    """
-
-    inv_freq: torch.Tensor
-
-    def __init__(
-        self,
-        dim: int,
-        *,
-        theta: float,
-        max_position_embeddings: int,
-        scaling: RopeScaling,
+        max_position_embeddings: int = 10000,
         partial_rotary_factor: float = 1.0,
-        device=None,
-        keep_freq_range: bool = False,
+        device: torch.device | str | None = None,
     ):
-        """Bind a typed recipe at the third-party rotary API boundary."""
-
-        from transformers import PretrainedConfig
-
         super().__init__()
-        self.rope_type = scaling.rope_type
-        self.max_seq_len_cached = max_position_embeddings
-        self.original_max_seq_len = max_position_embeddings
+        if type(dim) is not int or dim < 2 or dim % 2:
+            raise ValueError("rotary dimension must be a positive even width")
+        _positive(theta, "theta")
+        _positive(attention_scale, "attention_scale")
+        _positive(partial_rotary_factor, "partial_rotary_factor")
+        if partial_rotary_factor > 1 or max_position_embeddings < 1:
+            raise ValueError("rotary context and partial width must define a valid domain")
+        if scaling is not None and type(scaling) not in _RECIPE_NAMES:
+            raise TypeError("rotary scaling must use a typed numerical recipe")
+        self.dim = (
+            dim if isinstance(scaling, ProportionalScaling) else int(dim * partial_rotary_factor)
+        )
+        if self.dim < 2 or self.dim % 2:
+            raise ValueError("the partial rotary width must remain positive and even")
+        if isinstance(scaling, DynamicScaling) and self.dim == 2:
+            raise ValueError("dynamic NTK scaling requires a width greater than two")
+        self.theta = theta
+        self.scaling = scaling
+        self.attention_scale = attention_scale
         self.keep_freq_range = keep_freq_range
-        # Transformers' numerical recipes and update decorator require their
-        # native mutable config. It stays inside this API binding; models only
-        # supply the immutable scaling recipe and explicit numerical dimensions.
-        parameters = {key: value for key, value in asdict(scaling).items() if value is not None}
-        parameters.update(
-            rope_theta=theta, partial_rotary_factor=partial_rotary_factor, factor=scaling.factor
-        )
-        self.config = PretrainedConfig.from_dict(
-            {
-                "head_dim": dim,
-                "hidden_size": dim,
-                "num_attention_heads": 1,
-                "max_position_embeddings": max_position_embeddings,
-                "rope_parameters": parameters,
-            }
-        )
-        base_rope_init_fn = ROPE_INIT_FUNCTIONS[scaling.rope_type]
-
-        # Wrap the selected recipe before materialization so meta-buffer reloads
-        # reproduce the same frequency geometry.
-        if self.keep_freq_range:
-            self.rope_init_fn = self._keep_freq_range(base_rope_init_fn)
-        else:
-            self.rope_init_fn = base_rope_init_fn
-
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        self._maximum = max_position_embeddings
+        self._partial = partial_rotary_factor
+        self._head_dim = dim
+        if isinstance(scaling, LongRoPEScaling):
+            expected = self.dim if keep_freq_range else self.dim // 2
+            if len(scaling.short_factor) != expected or len(scaling.long_factor) != expected:
+                raise ValueError("LongRoPE factors must cover every constructed frequency")
+        # Small derived model constants remain real tensors under meta model
+        # construction. Loading moves each registered buffer with its module.
+        actual_device = torch.device("cpu") if device is None else torch.device(device)
+        if actual_device.type == "meta":
+            actual_device = torch.device("cpu")
+        inv_freq, self._frequency_scale = self._frequencies(actual_device, sequence_length=0)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        # Dynamic HF recipes restore this baseline when their cache contracts.
-        self.original_inv_freq = self.inv_freq
 
-    def materialize_load_buffers(self, device: torch.device | str) -> None:
-        """Materialize meta frequency state on ``device`` using the selected recipe."""
+    def _frequencies(self, device, *, sequence_length):
+        if self.scaling is None:
+            width = self.dim * 2 if self.keep_freq_range else self.dim
+            inverse = 1.0 / (
+                self.theta
+                ** (torch.arange(0, width, 2, dtype=torch.float32, device=device) / width)
+            )
+            return inverse[::2] if self.keep_freq_range else inverse, 1.0
+        from transformers import PretrainedConfig
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-        if not self.inv_freq.is_meta:
-            return
-
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
-        self.inv_freq = inv_freq
-        self.original_inv_freq = inv_freq
-
-    def _keep_freq_range(self, base_rope_init_fn):
-        """Wrap a RoPE initializer with double-width frequency construction."""
-
-        def _rope_init_fn_keep_freq_range(cfg: Any, device=None, **kwargs):
-            """Return decimated double-width frequencies and the recipe's scaling."""
-
-            # Attention scaling belongs to the selected recipe and is unchanged
-            # by the frequency-width transformation.
-            inv_freq, attention_scaling = base_rope_init_fn(cfg, device, **kwargs)
-            del inv_freq
-
-            # RoPE initializers read scalar geometry from the configuration, so
-            # a shallow copy isolates the temporary head-width override.
-            cfg2 = copy.copy(cfg)
-            cfg2.head_dim = cfg.head_dim * 2
-
-            inv_freq_full, _ = base_rope_init_fn(cfg2, device, **kwargs)
-            return inv_freq_full[::2], attention_scaling
-
-        return _rope_init_fn_keep_freq_range
-
-    @torch.no_grad()
-    @dynamic_rope_update
-    def forward(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return duplicated factors shaped ``[batch, seq, dim]`` in ``x``'s dtype."""
-
-        return _cos_sin_bshd(self.inv_freq, self.attention_scaling, x, position_ids)
-
-    @torch.no_grad()
-    def cos_sin_1d(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return scaled compact factors for packed one-dimensional attention."""
-
-        freqs = position_ids.float()[:, None] * self.inv_freq[None, :].to(position_ids.device)
-        cos = freqs.cos() * self.attention_scaling
-        sin = freqs.sin() * self.attention_scaling
-        return cos, sin
-
-
-def get_rope(
-    dim: int | None = None,
-    *,
-    theta: float = 10000.0,
-    attention_scaling: float = 1.0,
-    keep_freq_range: bool = False,
-    scaling: RopeScaling | None = None,
-    max_position_embeddings: int = 10000,
-    partial_rotary_factor: float = 1.0,
-    device: torch.device | str | None = None,
-) -> RotaryEmbedding | HFRotaryEmbedding:
-    """Build RoPE from explicit dimensions and an optional typed scaling recipe.
-
-    ``keep_freq_range`` retains the full-width frequency span when a model uses
-    reduced per-axis rotary dimensions.
-    """
-
-    if dim is None:
-        raise ValueError("rotary dimension is required")
-    if scaling is not None:
-        return HFRotaryEmbedding(
-            dim,
-            theta=theta,
-            max_position_embeddings=max_position_embeddings,
-            scaling=scaling,
-            partial_rotary_factor=partial_rotary_factor,
-            device=device,
-            keep_freq_range=keep_freq_range,
+        # These are the upstream recipe's numerical arguments, assembled from
+        # typed fields. Checkpoint dictionaries never enter a numerical layer.
+        parameters = asdict(self.scaling)
+        parameters.update(
+            rope_type=_RECIPE_NAMES[type(self.scaling)],
+            rope_theta=self.theta,
+            partial_rotary_factor=self._partial,
         )
-    return RotaryEmbedding(
-        int(dim * partial_rotary_factor),
-        theta=theta,
-        attention_scaling=attention_scaling,
-        keep_freq_range=keep_freq_range,
-        device=device,
-    )
+        config = PretrainedConfig(
+            head_dim=self._head_dim * (2 if self.keep_freq_range else 1),
+            hidden_size=self._head_dim,
+            num_attention_heads=1,
+            max_position_embeddings=self._maximum,
+            rope_parameters=parameters,
+        )
+        frequencies, scale = ROPE_INIT_FUNCTIONS[parameters["rope_type"]](
+            config, device, seq_len=sequence_length
+        )
+        return frequencies[::2] if self.keep_freq_range else frequencies, scale
+
+    @torch.no_grad()
+    def forward(self, positions, *, dtype: torch.dtype, sequence_length: int):
+        if type(sequence_length) is not int or sequence_length < 0:
+            raise ValueError("rotary sequence length must be a nonnegative host integer")
+        if not dtype.is_floating_point or (
+            positions.dtype not in {torch.int32, torch.int64} and not positions.is_floating_point()
+        ):
+            raise ValueError("rotary factors require numerical positions and a floating output dtype")
+        dynamic = isinstance(self.scaling, (DynamicScaling, LongRoPEScaling))
+        if dynamic:
+            frequencies, scale = self._frequencies(
+                positions.device, sequence_length=sequence_length
+            )
+        else:
+            frequencies = self.inv_freq.to(device=positions.device)
+            scale = self._frequency_scale
+        from uniserve.ops.rope_kernels import try_triton_rotary_factors
+
+        factors = try_triton_rotary_factors(
+            positions, frequencies, scale * self.attention_scale, dtype=dtype
+        )
+        if factors is not None:
+            return factors
+        device_type = positions.device.type if positions.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            phases = positions.float().unsqueeze(-1) * frequencies.float()
+            cosine = phases.cos() * (scale * self.attention_scale)
+            sine = phases.sin() * (scale * self.attention_scale)
+        return cosine.to(dtype=dtype), sine.to(dtype=dtype)
+
+    def constant_buffers(self, max_position: int):
+        if type(max_position) is not int or max_position < 0:
+            raise ValueError("rotary table extent must be a nonnegative integer")
+        return {
+            name: BufferConfig((max_position, self.dim // 2), torch.float32)
+            for name in ("cos", "sin")
+        }
+
+    def prepare_constants(self, max_position: int, *, out):
+        """Fill caller-owned factors for one complete sequence-length domain."""
+
+        from .functional import _result
+
+        expected = self.constant_buffers(max_position)
+        if set(out) != set(expected):
+            raise ValueError("rotary constant storage must supply cosine and sine tables")
+        positions = torch.arange(max_position, device=out["cos"].device)
+        values = self(positions, dtype=torch.float32, sequence_length=max_position)
+        for name, value in zip(("cos", "sin"), values, strict=True):
+            _result(value, out[name])

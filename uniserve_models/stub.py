@@ -1,271 +1,234 @@
-"""Defines a deterministic CPU model for exercising every worker execution route.
+"""Deterministic numerical modules for the CPU serving simulator."""
 
-The model implements the same cache, forward, projection, vision, latent, and
-diffusion boundaries as a neural worker_config while deriving outputs entirely from
-request coordinates. Its fixed token cycle makes scheduler outcomes reproducible.
-"""
-
-from __future__ import annotations
+from dataclasses import dataclass
+from types import MappingProxyType
 
 import torch
+from torch import nn
 
-from uniserve.attention.metadata import AttentionMode
-from uniserve.model.batch import DiffusionBatch, EncodeBatch, TensorOutput, TextBatch, TextOutput
-from uniserve.model.components import ComponentCall
-from uniserve.model.decoder import DecoderMixin
-from uniserve.model.diffusion import DiffusionMixin
-from uniserve.model.encoder import EncodeKind, EncoderMixin
-from uniserve.model.image_diffusion import BranchSource, ImageDiffusion, LatentLayout
-from uniserve.model.model import Model
-from uniserve.model.tensors import PositionLayout, TensorViews, TokenSelection, VocabularyPartition
-from uniserve.model.text import TextMixin
-from uniserve.nn.attention import CacheWrite
-from uniserve.nn.diffusion.cfg import CfgRecipe
-from uniserve.nn.diffusion.integrator import EulerSolver
-from uniserve.nn.diffusion.schedule import ScheduleDirection, ScheduleShiftDomain
-from uniserve.nn.vae.patch import RgbDecoder
-from uniserve.runtime.kv_cache import KVCacheConfig
+from uniserve.diffusion import AdditiveGuidance, EulerSolver, NoiseScale, make_schedule
+from uniserve.distributed import Communicator
+from uniserve.media import image
+from uniserve.model import (
+    CausalLM,
+    DenoiserInput as NumericalDenoiserInput,
+    EntryPoint,
+    ImageDecoder,
+    ImageDenoiser,
+    PatchEncoder,
+    TransformerDecoder,
+    VocabShard,
+)
+from uniserve.nn.attention import Attention, AttentionInput, PagedInput, SegmentedInput
+from uniserve.nn.functional import patchify
+from uniserve.nn.vae.layers import DiagonalGaussian
+from uniserve.nn.vae.patch import PatchAutoencoder, RGBDecoder
+from uniserve.tensors import OutputLayout, TensorOutput
 
 STUB_EOS_TOKEN_ID = 151645
 STUB_IMG_START_TOKEN_ID = 151670
-STUB_NUM_LAYERS = 1
-STUB_MAX_LATENT_SIZE = 1024
-STUB_LATENT_DOWNSAMPLE = 16
-_STUB_VOCAB_SIZE = STUB_IMG_START_TOKEN_ID + 1
-_STUB_HIDDEN_SIZE = 4
-
-__all__ = [
-    "STUB_EOS_TOKEN_ID",
-    "STUB_IMG_START_TOKEN_ID",
-    "StubModel",
-]
+_VOCAB_SIZE = STUB_IMG_START_TOKEN_ID + 1
+_HIDDEN_SIZE = 4
 
 
-class _Coordinates(torch.nn.Module):
-    """Deterministic numerical token embeddings for the simulator."""
+@dataclass(frozen=True, slots=True)
+class Config:
+    patch_size: int = 16
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Embed integer coordinates in the simulator's four-channel feature space."""
-
-        coordinates = input_ids.reshape(-1).to(torch.bfloat16)
-        return torch.stack(
-            (
-                coordinates,
-                coordinates.remainder(17),
-                coordinates.remainder(31),
-                torch.ones_like(coordinates),
-            ),
-            dim=-1,
-        )
+    def __post_init__(self):
+        if type(self.patch_size) is not int or self.patch_size < 1:
+            raise ValueError("simulation patches must have a positive pixel width")
 
 
-class _StubText(torch.nn.Module):
-    """Compose coordinate embeddings and the simulator's scalar cache writer."""
+class _Embedding(nn.Module):
+    """Represent token IDs exactly using three base-128 BF16 digits."""
 
-    dtype = torch.bfloat16
-    max_tokens = STUB_MAX_LATENT_SIZE
-    attention_mode = AttentionMode.PACKED
+    embedding_dim = _HIDDEN_SIZE
+    num_embeddings = _VOCAB_SIZE
 
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
-        self.hidden_size = _STUB_HIDDEN_SIZE
-        self.embed_tokens = _Coordinates()
-        self.cache_write = CacheWrite()
-        self.cache_config = KVCacheConfig(
-            num_layers=STUB_NUM_LAYERS,
-            total_layers=STUB_NUM_LAYERS,
-            num_kv_heads=1,
-            total_kv_heads=1,
-            head_dim=1,
-            dtype=torch.bfloat16,
-            store_dtype=torch.bfloat16,
-        )
+        self.weight = nn.Parameter(torch.ones((), dtype=torch.bfloat16), requires_grad=False)
 
-
-class StubModel(TextMixin, EncoderMixin, DiffusionMixin, DecoderMixin, Model):
-    """Implements every execution route with deterministic coordinate-derived output."""
-
-    architectures = ("UniServeStubForUnifiedGeneration",)
-
-    @property
-    def vocabulary(self) -> VocabularyPartition:
-        """Describe the complete unpadded deterministic vocabulary."""
-
-        return VocabularyPartition(_STUB_VOCAB_SIZE, _STUB_VOCAB_SIZE, 0, (0,), None)
-
-    @classmethod
-    def component_calls(cls, config: object) -> tuple[ComponentCall, ...]:
-        """Declare actual numerical methods and their mathematical participation."""
-
+    def forward(self, tokens):
         return (
-            ComponentCall("", "forward"),
-            ComponentCall("", "forward_diffusion"),
-            ComponentCall("", "encode:vision"),
-            ComponentCall("", "encode:latent"),
-            ComponentCall("", "decode:image"),
+            torch.stack(
+                (tokens % 128, tokens // 128 % 128, tokens // 16384, torch.ones_like(tokens)),
+                dim=-1,
+            ).to(self.weight.dtype)
+            * self.weight
         )
 
-    def __init__(self) -> None:
-        """Declare fixed numerical feature, cache, and diffusion geometry."""
 
+class _Head(nn.Module):
+    """Project the fixed multimodal successor cycle from numerical features."""
+
+    def __init__(self):
         super().__init__()
-        self.architecture = "UniServeStubForUnifiedGeneration"
+        self.vocab = VocabShard(_VOCAB_SIZE, slice(0, _VOCAB_SIZE), _VOCAB_SIZE, Communicator())
 
-        self.text = _StubText()
+    def forward(self, hidden):
+        digits = hidden[..., :3].long()
+        tokens = digits[..., 0] + 128 * digits[..., 1] + 16384 * digits[..., 2]
+        targets = torch.full_like(tokens, 1000)
+        targets = torch.where(tokens == 1000, 1001, targets)
+        targets = torch.where(tokens == 1001, STUB_IMG_START_TOKEN_ID, targets)
+        targets = torch.where(tokens == STUB_IMG_START_TOKEN_ID, 1002, targets)
+        targets = torch.where((tokens >= 1002) & (tokens < 1007), tokens + 1, targets)
+        targets = torch.where(tokens == 1007, STUB_EOS_TOKEN_ID, targets)
+        logits = hidden.new_full((*tokens.shape, _VOCAB_SIZE), -16.0)
+        return logits.scatter_(1, targets.reshape(-1, 1), 16.0)
 
-        # Deterministic zero velocity keeps the diffusion route stable at every point.
-        self.solver: EulerSolver = EulerSolver()
-        self.generation = ImageDiffusion(
-            latent_downsample=STUB_LATENT_DOWNSAMPLE,
-            prediction_dtype=torch.bfloat16,
-            schedule_direction=ScheduleDirection.ASCENDING,
-            schedule_shift_domain=ScheduleShiftDomain.TIME,
-            max_latent_tokens=STUB_MAX_LATENT_SIZE,
-            max_vae_grid_tokens=STUB_MAX_LATENT_SIZE,
-            marker_tokens=2,
-            rope_advance=2,
-            max_cfg_branches=3,
-            latent_layout=LatentLayout.IMAGE_NCHW,
+
+class _Layer(nn.Module):
+    """Preserve features while publishing zero scalar K/V at supplied indices."""
+
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.zeros((), dtype=torch.bfloat16), requires_grad=False)
+        self.attention = Attention(1, 1, 1, cache_name="backbone.layers.0.attention")
+
+    def forward(self, hidden, residual, positions, attention):
+        values = hidden.new_zeros((hidden.shape[0], 1, 1)) + self.scale
+        if (
+            isinstance(attention, (PagedInput, SegmentedInput))
+            and attention.write_indices is not None
+        ):
+            self.attention.update_cache(values, values, indices=attention.write_indices)
+        return hidden, torch.zeros_like(hidden) if residual is None else residual
+
+
+class _Vision(nn.Module):
+    def __init__(self, patch_size: int):
+        super().__init__()
+        self.patch_size = patch_size
+
+    def forward(self, pixels, grids, grid_shapes):
+        patches = patchify(pixels, patch_size=self.patch_size) if pixels.ndim == 4 else pixels
+        return (
+            patches.reshape(-1, patches.shape[-1]).mean(-1, keepdim=True).expand(-1, _HIDDEN_SIZE)
+        )
+
+
+class _Scale(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones((), dtype=torch.bfloat16), requires_grad=False)
+
+    def forward(self, pixels):
+        return pixels * self.weight
+
+
+class _Moments(_Scale):
+    def forward(self, pixels):
+        means = super().forward(pixels)
+        return torch.cat((means, torch.zeros_like(means)), dim=1)
+
+
+@dataclass(frozen=True)
+class DenoiserInput(NumericalDenoiserInput[image.Config]):
+    attention: AttentionInput
+
+
+class Denoiser(ImageDenoiser):
+    def __init__(self, config: Config, backbone: TransformerDecoder):
+        super().__init__(
+            patch_size=config.patch_size,
             latent_channels=3,
-            latent_patch_size=STUB_LATENT_DOWNSAMPLE,
-            positions=PositionLayout.TEMPORAL_SPATIAL,
-            text_unconditional=BranchSource.START,
-            image_unconditional=BranchSource.START,
-            cfg_recipe=CfgRecipe.ADDITIVE_DELTAS,
+            downsample=config.patch_size,
+            noise_scale=NoiseScale(1.0, "constant", 1.0, 1.0),
+            prediction_dtype=torch.bfloat16,
+            solver=EulerSolver(),
         )
-        self.image_decoder = RgbDecoder(STUB_LATENT_DOWNSAMPLE)
-        self.max_vit_grid_tokens = STUB_MAX_LATENT_SIZE
+        self.backbone = backbone
 
-    @property
-    def text_backbone(self):
-        return self.text
-
-    @property
-    def text_pipeline(self) -> None:
-        return None
-
-    @torch.inference_mode()
-    def forward(
-        self, batch: TextBatch, *, constants: TensorViews, scratch: TensorViews
-    ) -> torch.Tensor:
-        """Encode temporal coordinates while writing deterministic KV values."""
-
-        query_tokens = sum(batch.attention.query_lens_cpu)
-        kv = torch.zeros((query_tokens, 1, 1), dtype=torch.bfloat16, device=batch.positions.device)
-        self.text.cache_write(batch.attention.out_cache_loc, kv, kv)
-        temporal = batch.positions if batch.positions.ndim == 1 else batch.positions[0]
-        hidden = self.embed_input_ids(temporal[:query_tokens])
-        if batch.inputs_embeds is not None:
-            assert batch.embedding_mask is not None
-            hidden = torch.where(
-                batch.embedding_mask[:query_tokens].reshape(-1, 1),
-                batch.inputs_embeds[:query_tokens].to(hidden.dtype),
-                hidden,
+    def make_schedules(self, steps, *, shift, device):
+        return {
+            "image": make_schedule(
+                steps,
+                shift=1.0 if shift is None else shift,
+                direction="ascending",
+                shift_domain="time",
+                device=device,
             )
-        return hidden
+        }
 
-    def compute_logits(self, hidden: torch.Tensor, batch: TextBatch) -> TextOutput:
-        """Select deterministic successor logits or the supplied hidden rows."""
+    def make_guidance(self, *, text_scale, image_scale, interval, renorm, renorm_min):
+        return AdditiveGuidance(text_scale, image_scale, interval, renorm, renorm_min)
 
-        lengths = batch.attention.query_lens_cpu
-        rows = hidden[: sum(lengths)].split(lengths)
-        token_rows = batch.input_ids[: sum(lengths)].split(lengths)
-        logit_rows = sum(
-            1 if selection is TokenSelection.LAST_LOGITS else count
-            for selection, count in zip(batch.selections, lengths, strict=True)
-            if selection is not TokenSelection.HIDDEN
-        )
-        storage = torch.full(
-            (logit_rows, _STUB_VOCAB_SIZE), -16.0, dtype=torch.bfloat16, device=hidden.device
-        )
-        offset = 0
+    def forward(self, inputs: DenoiserInput, *, state, constants, workspace):
+        if set(inputs.latents) != {"image"}:
+            raise ValueError("simulation predicts the image latent modality")
+        # Latent-feature prefill and image prediction share the scalar cache
+        # layer. Read-only attention inputs leave the prefix untouched.
+        count = inputs.attention.queries.num_tokens
+        reference = inputs.latents["image"][0].tensor
+        values = reference.new_zeros((count, 1, 1))
+        if (
+            isinstance(inputs.attention, (PagedInput, SegmentedInput))
+            and inputs.attention.write_indices is not None
+        ):
+            self.backbone.layers["0"].attention.update_cache(
+                values, values, indices=inputs.attention.write_indices
+            )
         outputs = []
-        for row, ids, selection in zip(rows, token_rows, batch.selections, strict=True):
-            if selection is TokenSelection.HIDDEN:
-                outputs.append(row)
-                continue
-            targets = _next_tokens(ids)
-            if selection is TokenSelection.LAST_LOGITS:
-                targets = targets[-1:]
-            count = targets.numel()
-            logits = storage[offset : offset + count]
-            offset += count
-            logits.scatter_(1, targets.reshape(-1, 1), 16.0)
-            outputs.append(logits)
-        return TextOutput(tuple(outputs))
-
-    def forward_diffusion(
-        self,
-        batch: DiffusionBatch,
-        *,
-        state: TensorViews,
-        constants: TensorViews,
-        scratch: TensorViews,
-    ) -> TensorOutput:
-        """Return zero velocity for each independent latent row."""
-
-        return TensorOutput(
-            {
-                "image": tuple(
-                    torch.zeros_like(latent, dtype=torch.bfloat16)
-                    for latent in batch.latents["image"]
+        for latent, size in zip(inputs.latents["image"], inputs.sizes, strict=True):
+            shape = self.latent_shape("image", size)
+            if tuple(latent.tensor.shape) != shape:
+                raise ValueError("simulation latents must match their canonical image patches")
+            outputs.append(
+                TensorOutput(
+                    torch.zeros_like(latent.tensor, dtype=self.prediction_dtype),
+                    OutputLayout(shape, self.prediction_dtype, tuple(slice(0, n) for n in shape)),
                 )
-            }
-        )
-
-    encoder_kinds: frozenset[EncodeKind] = frozenset({"vision", "latent"})
-
-    def encode(
-        self, kind: EncodeKind, batch: EncodeBatch, *, constants: TensorViews, scratch: TensorViews
-    ) -> TensorOutput:
-        """Compute deterministic vision features or BF16 image latents."""
-
-        if kind == "latent":
-            return TensorOutput(
-                {
-                    "latents": tuple(
-                        value.to(torch.bfloat16).unsqueeze(0)
-                        if value.ndim == 3
-                        else value.to(torch.bfloat16)
-                        for value in batch.values
-                    )
-                }
             )
-        if kind != "vision":
-            raise ValueError(f"unsupported encoder kind {kind!r}")
-        outputs = []
-        for value, grid in zip(batch.values, batch.grids, strict=True):
-            typed = value.to(torch.bfloat16)
-            if grid is not None:
-                features = typed.mean(dim=-1, keepdim=True).repeat(1, _STUB_HIDDEN_SIZE)
-            else:
-                features = typed.mean().reshape(1, 1).repeat(1, _STUB_HIDDEN_SIZE)
-            outputs.append(features)
-        return TensorOutput({"features": tuple(outputs)})
+        return {"image": tuple(outputs)}
 
 
-def _next_token(token: int) -> int:
-    """Return the scalar successor in the deterministic multimodal token cycle."""
+class Model(CausalLM):
+    """Compose deterministic text, vision, latent and image capabilities."""
 
-    if token == 1000:
-        return 1001
-    if token == 1001:
-        return STUB_IMG_START_TOKEN_ID
-    if token == STUB_IMG_START_TOKEN_ID:
-        return 1002
-    if 1002 <= token < 1007:
-        return token + 1
-    if token == 1007:
-        return STUB_EOS_TOKEN_ID
-    return 1000
+    def __init__(self, config: Config = Config()):
+        backbone = TransformerDecoder(_Embedding(), nn.ModuleDict({"0": _Layer()}), nn.Identity())
+        super().__init__(backbone, _Head())
+        self.config = config
+        self.denoiser = Denoiser(config, backbone)
+        self.vision_encoder = PatchEncoder(
+            _Vision(config.patch_size),
+            nn.Identity(),
+            patch_size=config.patch_size,
+            downsample=1,
+            output_size=_HIDDEN_SIZE,
+            output_dtype=torch.bfloat16,
+        )
+        self.latent_encoder = PatchAutoencoder(
+            _Moments(),
+            _Scale(),
+            DiagonalGaussian(sample=False),
+            patch_size=config.patch_size,
+            latent_channels=3,
+            latent_dtype=torch.bfloat16,
+            downsample=config.patch_size,
+            scale=1.0,
+            shift=0.0,
+        )
+        self.image_decoder = ImageDecoder(RGBDecoder(config.patch_size))
 
 
-def _next_tokens(tokens: torch.Tensor) -> torch.Tensor:
-    """Vectorize the deterministic multimodal token cycle over a tensor."""
+def entry_points(config: Config):
+    return MappingProxyType(
+        {
+            "": (
+                EntryPoint("forward"),
+                EntryPoint("embed_input_ids"),
+                EntryPoint("compute_logits"),
+                EntryPoint("denoiser.forward"),
+                EntryPoint("vision_encoder.encode"),
+                EntryPoint("latent_encoder.encode"),
+                EntryPoint("image_decoder.decode"),
+            ),
+        }
+    )
 
-    targets = torch.full_like(tokens, 1000)
-    targets = torch.where(tokens == 1000, 1001, targets)
-    targets = torch.where(tokens == 1001, STUB_IMG_START_TOKEN_ID, targets)
-    targets = torch.where(tokens == STUB_IMG_START_TOKEN_ID, 1002, targets)
-    targets = torch.where((tokens >= 1002) & (tokens < 1007), tokens + 1, targets)
-    return torch.where(tokens == 1007, STUB_EOS_TOKEN_ID, targets)
+
+entry_paths = MappingProxyType({"model": "forward"})

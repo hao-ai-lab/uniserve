@@ -385,6 +385,20 @@ impl ExecutorInfo {
             .filter(|capacity| *capacity > 0)
             .min()
             .unwrap_or(0);
+        merged.encoder_cache_entries = self
+            .workers
+            .iter()
+            .map(|(_, info)| info.encoder_cache_entries)
+            .filter(|capacity| *capacity > 0)
+            .min()
+            .unwrap_or(0);
+        merged.encoder_entry_bytes = self
+            .workers
+            .iter()
+            .map(|(_, info)| info.encoder_entry_bytes)
+            .filter(|capacity| *capacity > 0)
+            .min()
+            .unwrap_or(0);
         merged.validate()?;
         Ok(merged)
     }

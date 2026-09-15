@@ -21,8 +21,6 @@ def prepare_decode(
     entry: ModelEntry,
     buffers: InputBuffers,
     forward: Callable[[InputBatch], ExecutionOutput],
-    *,
-    packed: bool,
 ) -> None:
     """Prepare valid one-token prefixes, then capture each decode batch bucket."""
 
@@ -33,14 +31,13 @@ def prepare_decode(
     ):
         with runner.kv_cache.startup_pages(rows) as scratch:
             pages = tuple((page,) for page in scratch)
-            prompt = stage_text(buffers, runner.kv_cache, ((0,),) * rows, pages, packed=packed)
-            forward(prompt)
+            prompt = stage_text(buffers, runner.kv_cache, ((0,),) * rows, pages)
+            runner.eager_batch(entry, prompt, forward)
             batch = stage_text(
                 buffers,
                 runner.kv_cache,
                 ((0,),) * rows,
                 pages,
-                packed=packed,
                 prefixes=(1,) * rows,
                 decode=True,
             )

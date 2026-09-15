@@ -70,41 +70,46 @@ def stitch_tiles(
 
 
 class SpatialDecoder(nn.Module):
-    """Decode spatial tiles through a model's projection and ordinary forward.
+    """Decode an aligned raster directly or as one batch of overlapping tiles.
 
-    Concrete decoders supply ``post_quant_conv`` and their learned ``forward``.
-    Geometry is expressed in output pixels; the shared implementation packs
-    all spatial tiles as one batch and reconstructs their overlapping raster.
-    It does not allocate persistent storage or select execution resources.
+    The concrete ``forward`` defines any latent-channel projection before its
+    decoder. Tile extents and overlaps are output pixels, aligned to the
+    spatial compression ratio. Blending retains decoded-dtype rounding.
     """
 
-    post_quant_conv: nn.Module
-    use_tiling: bool
-    spatial_compression_ratio: int
-    tile_sample_min_height: int
-    tile_sample_min_width: int
-    tile_sample_min_overlap_height: int
-    tile_sample_min_overlap_width: int
+    def __init__(
+        self,
+        decoder: nn.Module,
+        *,
+        spatial_compression: int,
+        tile_height: int,
+        tile_width: int,
+        overlap_height: int,
+        overlap_width: int,
+    ):
+        super().__init__()
+        for extent, overlap in ((tile_height, overlap_height), (tile_width, overlap_width)):
+            split_tiles(extent, extent, overlap, spatial_compression)
+        self.decoder = decoder
+        self.spatial_compression = spatial_compression
+        self.tile_height, self.tile_width = tile_height, tile_width
+        self.overlap_height, self.overlap_width = overlap_height, overlap_width
 
-    def decode(self, latents: torch.Tensor) -> torch.Tensor:
-        """Restore [N, C, T, H, W] latents with checkpoint-defined tile overlap."""
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        return self.decoder(latents)
 
+    def decode(self, latents: torch.Tensor, *, tiled: bool) -> torch.Tensor:
+        """Restore NCTHW latents, preserving sample independence within each tile."""
         if latents.ndim != 5 or latents.shape[0] < 1:
             raise ValueError("spatial decoding requires a nonempty NCTHW latent")
-        if not self.use_tiling:
-            return self(self.post_quant_conv(latents))
-        ratio = self.spatial_compression_ratio
+        if not tiled:
+            return self(latents)
+        ratio = self.spatial_compression
         y_indices, y_lengths, y_overlaps = split_tiles(
-            int(latents.shape[-2]) * ratio,
-            self.tile_sample_min_height,
-            self.tile_sample_min_overlap_height,
-            ratio,
+            int(latents.shape[-2]) * ratio, self.tile_height, self.overlap_height, ratio
         )
         x_indices, x_lengths, x_overlaps = split_tiles(
-            int(latents.shape[-1]) * ratio,
-            self.tile_sample_min_width,
-            self.tile_sample_min_overlap_width,
-            ratio,
+            int(latents.shape[-1]) * ratio, self.tile_width, self.overlap_width, ratio
         )
         tiles = torch.cat(
             tuple(
@@ -118,7 +123,7 @@ class SpatialDecoder(nn.Module):
             ),
             dim=0,
         )
-        decoded = self(self.post_quant_conv(tiles))
+        decoded = self(tiles)
         flat_tiles = decoded.split(latents.shape[0], dim=0)
         columns = len(x_indices)
         rows = [

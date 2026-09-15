@@ -1,153 +1,137 @@
-"""One captured CUDA executable and the numerical storage it keeps alive."""
+"""Captured numerical calls and the borrowed resources they keep alive."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack
-from typing import Any, Generic, TypeVar, cast
+from typing import Generic, TypeVar
 
 import torch
 
-from uniserve.runtime.cuda import verify_graph_context
-from uniserve.runtime.resources import close_resources
+from .cuda import cuda_value, driver, verify_graph_context
+from .execution import ExecutionContext
 
-T = TypeVar("T")
-
-
-def capture_pools(devices: Iterable[torch.device]) -> dict[torch.device, torch.cuda.MemPool]:
-    """Own each additional capture device's allocator backing on that device.
-
-    MemPool's lifetime reference belongs to the CUDA device selected at its
-    construction. Allocation routing must use that same device to keep captured
-    intermediate addresses reserved after the routing scope exits.
-    """
-
-    pools = {}
-    for device in dict.fromkeys(devices):
-        with torch.cuda.device(device):
-            pools[device] = torch.cuda.MemPool()
-    return pools
+ResultT = TypeVar("ResultT")
 
 
-class GraphExecutionError(RuntimeError):
-    """A configured CUDA graph could not execute safely."""
+class CUDAGraphError(RuntimeError):
+    """A capture or replay failure retaining the original exception as its cause."""
 
 
-class CudaGraph(Generic[T]):
-    """Own one executable and its borrowed output views.
+class CUDAGraph(Generic[ResultT]):
+    """Own a captured call, its output views and execution resource references.
 
-    Capture warms providers twice and restores mutable numerical state after
-    every invocation, including failures. Replay uses the caller's stream.
-    The owner must order output consumers before replay and drain GPU use before
-    close. Shared pool identities belong to that owner's serial reuse domain.
-    Calls spanning GPUs require a pool for every additional device, constructed
-    by capture_pools. Concurrent calls must use distinct pools on every device.
+    Warm every kernel specialization before capture. Capture invokes the call
+    once and optionally restores mutable input state afterward. The caller
+    orders final readers before replay, resource reuse or close. Cross-device
+    calls require caller-owned MemPools for their additional device allocations.
+    Construct each pool with its mapped device current, and retain it until all
+    graphs and tensors using its allocations have retired.
     """
 
     def __init__(
         self,
         *,
-        device: torch.device,
-        stream: torch.cuda.Stream,
-        pool: Any = None,
-        expected_context: int | None = None,
-        device_pools: Mapping[torch.device, torch.cuda.MemPool] | None = None,
-    ) -> None:
-        self.device = device
-        self.stream = stream
-        self.pool = pool
-        self.expected_context = expected_context
-        self.device_pools = dict(device_pools or {})
-        if self.device in self.device_pools:
-            raise ValueError("the capture device already uses the graph's primary pool")
-        self.graph: torch.cuda.CUDAGraph | None = None
-        self.output: T | None = None
-        self.keepalive: tuple[object, ...] = ()
-        self.releases: tuple[Callable[[], None], ...] = ()
+        context: ExecutionContext,
+        pools: Mapping[torch.device, torch.cuda.MemPool] | None = None,
+    ):
+        context._open()
+        if context._device.type != "cuda":
+            raise ValueError("CUDA graph execution requires a CUDA module")
+        self.context = context
+        self.pools = dict(pools or {})
+        self._stream = context.stream or torch.cuda.Stream(device=context._device)
+        self._graph = None
+        self._output = None
+        self._call = None
         self._closed = False
 
     @torch.inference_mode()
     def capture(
-        self,
-        forward: Callable[[], T],
-        *,
-        keepalive: tuple[object, ...] = (),
-        restore: Callable[[], None] | None = None,
+        self, call: Callable[[], ResultT], *, restore: Callable[[], None] | None = None
     ) -> None:
-        """Record exactly one computation while preserving its entry state."""
-
-        if self._closed:
-            raise GraphExecutionError("CUDA graph is closed")
-        if self.graph is not None:
-            raise GraphExecutionError("CUDA graph is already captured")
-        current = torch.cuda.current_stream(self.device)
-        self.stream.wait_stream(current)
+        if self._closed or self._graph is not None:
+            raise CUDAGraphError("capture requires an open uncaptured graph")
+        self.context._open()
         graph = torch.cuda.CUDAGraph(keep_graph=True)
+        device = self.context._device
+        current = torch.cuda.current_stream(device)
+        self._stream.wait_stream(current)
         try:
             with (
-                ExitStack() as allocations,
-                torch.cuda.device(self.device),
-                torch.cuda.stream(self.stream),
+                ExitStack() as scope,
+                torch.cuda.device(device),
+                torch.cuda.stream(self._stream),
+                self.context.activate(),
             ):
-                # PyTorch's graph owns allocation backing on its capture device.
-                # Other devices retain explicit pools through the same executable
-                # lifetime, including intermediates freed during Python capture.
-                for device, pool in self.device_pools.items():
-                    allocations.enter_context(torch.cuda.use_mem_pool(pool, device))
-                for _ in range(2):
-                    try:
-                        forward()
-                    finally:
-                        if restore is not None:
-                            restore()
-                    self.stream.synchronize()
+                for target, pool in self.pools.items():
+                    if target != device:
+                        scope.enter_context(torch.cuda.use_mem_pool(pool, target))
+                pool = self.pools.get(device)
                 try:
-                    with torch.cuda.graph(graph, pool=self.pool, stream=self.stream):
-                        output = forward()
+                    with torch.cuda.graph(
+                        graph, stream=self._stream, pool=None if pool is None else pool.id
+                    ):
+                        output = call()
                     graph.instantiate()
-                    verify_graph_context(graph, self.expected_context)
+                    if self.context.stream is not None:
+                        cu = driver()
+                        streams = (self._stream, *self.context._transfers.streams.values())
+                        expected = frozenset(
+                            int(
+                                cuda_value(
+                                    cu.cuStreamGetCtx(cu.CUstream(stream.cuda_stream)),
+                                    "query capture stream context",
+                                )
+                            )
+                            for stream in streams
+                        )
+                        verify_graph_context(graph, expected)
                 finally:
                     if restore is not None:
                         restore()
-                self.stream.synchronize()
         except BaseException as error:
             try:
-                self.stream.synchronize()
                 graph.reset()
             except BaseException as cleanup:
                 error.add_note(f"CUDA graph cleanup failed: {cleanup!r}")
-            error.add_note(f"CUDA graph capture device={self.device}")
-            raise
+            raise CUDAGraphError(f"CUDA graph capture failed on {device}: {error}") from error
         finally:
-            current.wait_stream(self.stream)
-        self.graph = graph
-        self.pool = graph.pool()
-        self.output = output
-        self.keepalive = (forward, *keepalive)
+            current.wait_stream(self._stream)
+        self._graph, self._output, self._call = graph, output, call
 
-    def replay(self) -> T:
-        """Enqueue this executable and borrow its output until the next replay."""
-
-        if self._closed:
-            raise GraphExecutionError("CUDA graph is closed")
-        if self.graph is None:
-            raise GraphExecutionError("CUDA graph is not captured")
-        self.graph.replay()
-        return cast(T, self.output)
+    def replay(self) -> ResultT:
+        if self._closed or self._graph is None:
+            raise CUDAGraphError("replay requires an open captured graph")
+        self.context._open()
+        try:
+            with self.context.activate():
+                self._graph.replay()
+        except BaseException as error:
+            raise CUDAGraphError(f"CUDA graph replay failed: {error}") from error
+        return self._output
 
     def close(self) -> None:
-        """Release a drained executable before its numerical backing is discarded."""
-
         if self._closed:
             return
         self._closed = True
         try:
-            actions = [] if self.graph is None else [self.graph.reset]
-            close_resources(*actions, *reversed(self.releases))
+            if self._graph is not None:
+                self._graph.reset()
         finally:
-            self.graph = None
-            self.output = None
-            self.keepalive = ()
-            self.releases = ()
-            self.pool = None
-            self.device_pools.clear()
+            self._graph = self._output = self._call = None
+            self.pools.clear()
+            self.context = None
+
+    def __enter__(self):
+        if self._closed:
+            raise CUDAGraphError("CUDA graph is closed")
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        try:
+            self.close()
+        except BaseException as error:
+            if exc is None:
+                raise
+            exc.add_note(f"CUDA graph cleanup failed: {error!r}")

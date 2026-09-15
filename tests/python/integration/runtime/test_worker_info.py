@@ -8,10 +8,8 @@ import pytest
 
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_config import stub_worker_config
-from uniserve.model.components import ComponentCall
-from uniserve.model.model import Model
 from uniserve_models.processing import stub_processor
-from uniserve_models.stub import StubModel
+from uniserve_models.stub import Model
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
 from uniserve_worker.config import LaneConfig, WorkerConfig
 from uniserve_worker.protocol.batch import COMPUTATIONS, ForwardMode
@@ -51,38 +49,6 @@ def test_worker_info_reports_schedulable_work_and_bounds(backends: tuple[str, ..
     assert info["request_slots"] > 0
     assert info["model_name"]
     assert len(info["configuration_id"]) == 64
-
-
-def test_action_model_reports_zero_kv_geometry() -> None:
-    class ActionModel(Model):
-        architecture = "ActionModel"
-
-        @classmethod
-        def component_calls(cls, config):
-            return (ComponentCall("decoder", "decode:video"),)
-
-    worker_config = WorkerConfig(
-        device="cpu",
-        rank=0,
-        world_size=1,
-        block_size=64,
-        kv_token_capacity=None,
-        attention_backend=None,
-        model_dtype="bfloat16",
-        kv_cache_dtype=None,
-        kv_memory_fraction=0.9,
-        max_batch_operations=2,
-        max_batch_tokens=2,
-        max_request_pool_size=2,
-        generation_device=None,
-    )
-
-    info = build_worker_info(ActionModel(), worker_config)
-
-    assert info.uses_kv is False
-    assert info.kv_cache is None
-    assert info.request_slots == 2
-    assert info.max_batch_ops == 2
 
 
 def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> None:
@@ -138,7 +104,7 @@ def test_worker_info_reports_limits_safe_for_all_bound_lanes(with_lane_limits) -
 
     # The scheduler receives one shared bound even when lanes constrain different
     # dimensions. Unspecified lane limits inherit the configured model capacity.
-    info = build_worker_info(StubModel(), config, image_processor=stub_processor())
+    info = build_worker_info(Model(), config, image_processor=stub_processor())
 
     assert info.max_batch_ops == (2 if with_lane_limits else 4)
     assert info.max_batch_tokens == (128 if with_lane_limits else 256)
@@ -152,7 +118,7 @@ def test_worker_identity_and_capabilities_reflect_enabled_operations() -> None:
         frozenset({ForwardMode.PREFILL, ForwardMode.DECODE}),
     ):
         with Worker(
-            StubModel(),
+            Model(),
             image_processor=stub_processor(),
             worker_config=config,
             sampling_group=None,

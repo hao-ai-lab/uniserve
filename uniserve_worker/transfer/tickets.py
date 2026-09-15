@@ -23,7 +23,7 @@ from enum import StrEnum
 from itertools import groupby, repeat
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from uniserve.tensors import TensorRegion
+from uniserve import _slices
 
 from ..foundation.errors import invalid_descriptor, resource_error, unsupported_setup
 from ..foundation.shared_memory import allocate_shared_memory
@@ -89,19 +89,24 @@ def _read_destination(
     locator: Locator,
     device: "torch.device",
     destination: "torch.Tensor | tuple[torch.Tensor, ...] | None",
-    region: TensorRegion | None = None,
+    region: tuple[slice, ...] | None = None,
 ) -> "torch.Tensor | tuple[torch.Tensor, ...]":
     """Validate exact read bounds and writable, disjoint destination spans."""
 
     import torch
 
-    region = region or TensorRegion((0,) * len(locator.shape), locator.shape)
-    if not region.within(locator.shape):
+    region = region or tuple(
+        slice(start, start + extent)
+        for start, extent in zip((0,) * len(locator.shape), locator.shape, strict=True)
+    )
+    if not _slices.within(region, locator.shape):
         raise invalid_descriptor("read region exceeds the published view")
     dtype = _dtype_from_str(locator.dtype)
     if destination is None:
-        return torch.empty(region.shape, dtype=dtype, device=device)
-    validate_destination(destination, shape=region.shape, dtype=locator.dtype, device=device)
+        return torch.empty(_slices.shape(region), dtype=dtype, device=device)
+    validate_destination(
+        destination, shape=_slices.shape(region), dtype=locator.dtype, device=device
+    )
     return destination
 
 
@@ -191,7 +196,7 @@ class Transport(ABC):
         *,
         device: "torch.device",
         destination: "torch.Tensor | tuple[torch.Tensor, ...] | None" = None,
-        region: TensorRegion | None = None,
+        region: tuple[slice, ...] | None = None,
     ) -> "TransferTicket":
         """Read into one tensor or ordered first-axis spans on the destination device.
 
@@ -760,7 +765,7 @@ class LocalTransport(Transport):
         *,
         device: "torch.device",
         destination: "torch.Tensor | tuple[torch.Tensor, ...] | None" = None,
-        region: TensorRegion | None = None,
+        region: tuple[slice, ...] | None = None,
     ) -> TransferTicket:
         """Borrow or copy from a verified publisher in this address space.
 
@@ -791,7 +796,7 @@ class LocalTransport(Transport):
             if locator != source.locator:
                 raise invalid_descriptor("local locator changed its registered view")
             if region is not None:
-                if not region.within(locator.shape):
+                if not _slices.within(region, locator.shape):
                     raise invalid_descriptor("read region exceeds the published view")
                 tensor = region_view(tensor, region)
             target = (
@@ -1108,7 +1113,7 @@ class ShmTransport(Transport):
         locator: Locator,
         device: "torch.device",
         destination: "torch.Tensor | tuple[torch.Tensor, ...] | None",
-        region: TensorRegion | None,
+        region: tuple[slice, ...] | None,
     ) -> None:
         """Hold host bytes through source retirement and asynchronous destination copying."""
 
@@ -1117,7 +1122,7 @@ class ShmTransport(Transport):
         handle = locator.transport
         if not isinstance(handle, PosixShmTransfer):
             raise invalid_descriptor("shared-memory read requires a shared-memory locator")
-        connection = open_reader(locator)
+        connection, _descriptor = open_reader(locator)
         failure: BaseException | None = None
         try:
             ticket._require_active()
@@ -1148,7 +1153,7 @@ class ShmTransport(Transport):
             source = pinned
         target = _read_destination(locator, device, destination, region)
         if region is not None:
-            source = source[region.slices()]
+            source = source[region]
         self._reads.copy(ticket, source, target)
 
     def fetch(
@@ -1157,7 +1162,7 @@ class ShmTransport(Transport):
         *,
         device: "torch.device",
         destination: "torch.Tensor | tuple[torch.Tensor, ...] | None" = None,
-        region: TensorRegion | None = None,
+        region: tuple[slice, ...] | None = None,
     ) -> TransferTicket:
         if locator.source.node != self.source.node:
             raise invalid_descriptor("shared-memory transport requires the source node")
@@ -1200,9 +1205,12 @@ class _CudaSource:
     event: "torch.cuda.Event"
     nbytes: int
     capacity: TransferCapacity
+    descriptor: int
+    copied_source: torch.Tensor | tuple[torch.Tensor, ...] | None = None
     retirement: concurrent.futures.Future[None] | None = None
 
     def events_released(self) -> None:
+        os.close(self.descriptor)
         self.capacity.release(self.nbytes)
         if self.retirement is not None:
             self.retirement.set_result(None)
@@ -1230,6 +1238,7 @@ class CudaIpcTransport(Transport):
                 BaseException,
                 torch.Tensor | tuple[torch.Tensor, ...] | None,
                 torch.cuda.Event | None,
+                torch.Tensor | tuple[torch.Tensor, ...] | None,
             ]
             | None
         ) = None
@@ -1239,6 +1248,7 @@ class CudaIpcTransport(Transport):
             publication_capacity=256,
             reclaim=self._reclaim,
             drain=self._drain,
+            descriptor=lambda source: source.descriptor,
         )
         self._reads = _BoundedTransferPool(
             workers=2,
@@ -1278,7 +1288,7 @@ class CudaIpcTransport(Transport):
         """Export an immutable source and retain capacity until its producer fence retires."""
 
         import torch
-        from uniserve_kernel.peer_memory import export_ipc
+        from uniserve_kernel.peer_memory import empty, export_fd
 
         source, shape, offset = _publication_views(tensor, offset)
         spans = source if isinstance(source, tuple) else (source,)
@@ -1298,12 +1308,29 @@ class CudaIpcTransport(Transport):
         self._bytes.acquire(nbytes)
         event = None
         publication = None
+        descriptor = None
+        copied_source = None
         try:
+            exported = export_fd(first)
+            if exported is None:
+                # Arbitrary CUDA tensors retain the same publication contract.
+                # Materialize only their logical spans, never their enclosing
+                # allocator segment. Shared worker arenas export directly.
+                shared = empty(shape, dtype=first.dtype, device=first.device)
+                for target, value in _copy_pairs(source, shared):
+                    target.copy_(value, non_blocking=True)
+                copied_source = source
+                source = shared
+                spans = (shared,)
+                first = shared
+                exported = export_fd(first)
+                if exported is None:
+                    raise RuntimeError("shared allocation cannot be exported")
+            descriptor, storage_size, storage_offset = exported
             event = self._events.acquire(first.device, interprocess=True)
             self._events.retain(event, first.device)
             self._events.record(event, first.device)
-            publication = _CudaSource(source, event, nbytes, self._bytes)
-            storage_handle, storage_size, storage_offset = export_ipc(first)
+            publication = _CudaSource(source, event, nbytes, self._bytes, descriptor, copied_source)
             length_runs = tuple(
                 (length, sum(1 for _ in values))
                 for length, values in groupby(int(span.shape[0]) for span in spans)
@@ -1313,7 +1340,6 @@ class CudaIpcTransport(Transport):
                 transport=CudaIpcTransfer(
                     endpoint=self.endpoint(),
                     publication_id=uuid.uuid4().hex,
-                    storage_handle=storage_handle,
                     storage_size_bytes=storage_size,
                     storage_offsets_bytes=tuple(
                         storage_offset + span.data_ptr() - first.data_ptr() for span in spans
@@ -1335,6 +1361,10 @@ class CudaIpcTransport(Transport):
             if publication is not None:
                 self._reclaim(publication)
             else:
+                # No reader can own an unregistered descriptor. Its allocation
+                # remains retained separately if producer draining fails.
+                if descriptor is not None:
+                    os.close(descriptor)
                 try:
                     # No usable producer fence exists on this failure path.
                     # Keep its allocation and quota if draining also fails.
@@ -1342,7 +1372,7 @@ class CudaIpcTransport(Transport):
                     if event is not None:
                         self._events.defer_release((event,), source)
                 except BaseException as error:
-                    self._failed_publication = (error, source, event)
+                    self._failed_publication = (error, source, event, copied_source)
                     raise
                 self._bytes.release(nbytes)
             raise
@@ -1353,7 +1383,7 @@ class CudaIpcTransport(Transport):
         *,
         device: "torch.device",
         destination: "torch.Tensor | tuple[torch.Tensor, ...] | None" = None,
-        region: TensorRegion | None = None,
+        region: tuple[slice, ...] | None = None,
     ) -> TransferTicket:
         if locator.source.node != self.source.node:
             raise invalid_descriptor("CUDA IPC transport requires the source node")
@@ -1374,14 +1404,15 @@ class CudaIpcTransport(Transport):
         locator: Locator,
         device: "torch.device",
         destination: "torch.Tensor | tuple[torch.Tensor, ...] | None",
-        region: TensorRegion | None,
+        region: tuple[slice, ...] | None,
     ) -> None:
         import torch
-        from uniserve_kernel.peer_memory import import_ipc
+        from uniserve_kernel.peer_memory import import_fd
 
         handle = locator.transport
         assert isinstance(handle, CudaIpcTransfer)
-        connection = open_reader(locator)
+        connection, descriptor = open_reader(locator)
+        assert descriptor is not None
         mapped = None
         event = None
         failure: BaseException | None = None
@@ -1403,13 +1434,10 @@ class CudaIpcTransport(Transport):
                     if any(offset % itemsize for offset in handle.storage_offsets_bytes):
                         raise invalid_descriptor("CUDA IPC span offset is not element aligned")
                     # One mapping owns every span; tensor views share its deleter.
-                    allocation = import_ipc(
+                    allocation = import_fd(
                         prototype,
-                        handle.storage_handle,
+                        descriptor,
                         handle.storage_size_bytes,
-                        0,
-                        (handle.storage_size_bytes // itemsize,),
-                        (1,),
                     )
                     lengths = (
                         length
@@ -1451,6 +1479,7 @@ class CudaIpcTransport(Transport):
                             raise failure from cleanup_error
                         raise
             finally:
+                os.close(descriptor)
                 connection.close()
 
     def release(self, locator: Locator) -> concurrent.futures.Future[None] | None:

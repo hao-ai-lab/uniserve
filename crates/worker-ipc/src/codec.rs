@@ -978,6 +978,8 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
         latent_page_units: info.latent_page_units(),
         latent_pages: info.latent_pages(),
         buffer_pool_bytes: info.buffer_pool_bytes(),
+        encoder_cache_entries: info.encoder_cache_entries(),
+        encoder_entry_bytes: info.encoder_entry_bytes(),
         max_unresolved_ops: info.max_unresolved_ops(),
         pipeline_components: {
             let mut components = std::collections::BTreeMap::new();
@@ -2004,6 +2006,8 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
         latent_page_units: info.latent_page_units,
         latent_pages: info.latent_pages,
         buffer_pool_bytes: info.buffer_pool_bytes,
+        encoder_cache_entries: info.encoder_cache_entries,
+        encoder_entry_bytes: info.encoder_entry_bytes,
         max_unresolved_ops: info.max_unresolved_ops,
         pipeline_components: Some(
             info.pipeline_components
@@ -2331,10 +2335,6 @@ fn transfer_locator_from_table(value: fbs::Locator<'_>) -> CodecResult<Locator> 
                 .publication_id()
                 .context("CUDA IPC publication identity is missing")?
                 .to_owned(),
-            storage_handle: value
-                .storage_handle()
-                .map(|bytes| bytes.bytes().to_vec())
-                .unwrap_or_default(),
             storage_size_bytes: value.storage_size_bytes(),
             storage_offsets_bytes: value
                 .storage_offsets_bytes()
@@ -2497,7 +2497,6 @@ fn transfer_locator_to_fb(value: &Locator) -> fbs::LocatorT {
         TransferTransport::CudaIpc {
             endpoint,
             publication_id,
-            storage_handle,
             storage_size_bytes,
             storage_offsets_bytes,
             span_lengths,
@@ -2508,7 +2507,6 @@ fn transfer_locator_to_fb(value: &Locator) -> fbs::LocatorT {
             output.transport = fbs::TransferTransportKind::CudaIpc;
             output.endpoint = Some(endpoint.clone());
             output.publication_id = Some(publication_id.clone());
-            output.storage_handle = Some(storage_handle.clone());
             output.storage_size_bytes = *storage_size_bytes;
             output.storage_offsets_bytes = Some(storage_offsets_bytes.clone());
             output.span_lengths = Some(span_lengths.clone());

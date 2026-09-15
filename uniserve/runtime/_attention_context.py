@@ -1,0 +1,252 @@
+"""Prepare packed context attention over borrowed head and K/V transports."""
+
+from dataclasses import replace
+
+import torch
+
+from uniserve.distributed._tokens import _TokenShard
+from uniserve.nn.attention.inputs import (
+    DenseInput,
+    PagedInput,
+    SegmentedInput,
+    SequenceLengths,
+    VarlenInput,
+    VisibleInput,
+)
+
+
+class _ContextPlan:
+    """Map physical collective slots to global sequence coordinates.
+
+    Token ownership follows topology order. A head exchange can join several
+    disjoint token intervals; context publication can order them differently
+    again. These maps preserve the logical sequences and exclude all transport
+    padding, including entirely empty rank shards.
+    """
+
+    def __init__(self, layer, batch, *, cache, transport, allocate, dtype):
+        if isinstance(batch, DenseInput):
+            raise ValueError("context attention requires explicit packed sequence lengths")
+        self.layer, self.cache = layer, cache
+        table = getattr(batch, "block_table", None)
+        if cache is not None and table is not None and table.block_size != cache.block_size:
+            raise ValueError("attention block table and cache block sizes differ")
+        self.parallel = layer._context
+        self.mesh = layer._parallel_mesh
+        axes = layer._attention_parallel
+        self.head_axes = () if axes.heads is None else (axes.heads.axis,)
+        context_axes = tuple(
+            axis
+            for axis in self.mesh.axes
+            if axis in (axes.context.gather_axis, axes.context.peer_axis)
+        )
+        token_axes = tuple(
+            axis for axis in self.mesh.axes if axis in (*context_axes, *self.head_axes)
+        )
+        self.tokens = self.mesh.get_group(token_axes)
+        self.queries = _TokenShard(batch.queries.num_tokens, self.tokens)
+        key_lengths = (
+            batch.keys if isinstance(batch, (VarlenInput, VisibleInput)) else batch.queries
+        )
+        self.keys = _TokenShard(key_lengths.num_tokens, self.tokens)
+        device = batch.queries.values.device
+        self.query_members = layer._exchange.group.ranks
+        query_slots = self._slots(self.query_members, self.queries)
+        self.query_indices = torch.tensor(
+            [slot for slot, _ in query_slots], dtype=torch.long, device=device
+        )
+        query_ids = [index for _, index in query_slots]
+        self.query_counts, self.query_columns = [], []
+        start = 0
+        for count in batch.queries.host:
+            indices = [index - start for index in query_ids if start <= index < start + count]
+            self.query_counts.append(len(indices))
+            self.query_columns.append(torch.tensor(indices, dtype=torch.long, device=device))
+            start += count
+        local = SequenceLengths.from_lengths(tuple(self.query_counts), device=device)
+        self.visible = torch.empty(
+            (local.batch_size, local.maximum), dtype=torch.int32, device=device
+        )
+        self.key_values = torch.empty(local.batch_size, dtype=torch.int32, device=device)
+        self.key_offsets = torch.empty(local.batch_size + 1, dtype=torch.int32, device=device)
+        self.packed = None
+        if isinstance(batch, SegmentedInput) and device.type == "cuda":
+            from uniserve.tensors import BufferConfig
+
+            capacity = table.indices.numel() * table.block_size + batch.queries.num_tokens
+            shape = (capacity, layer._local_kv_heads, layer.head_dim)
+            views = allocate(
+                {name: BufferConfig(shape, dtype) for name in ("key", "value")}, device
+            )
+            self.packed = views["key"], views["value"]
+        self._key_lengths = key_lengths
+        self._transport = (
+            None
+            if isinstance(batch, VisibleInput) and batch.block_table is not None
+            else transport(layer, self.keys.capacity * layer._exchange.group.size, dtype)
+        )
+        if self._transport is None:
+            self.key_indices = None
+        else:
+            # A peer allocation has page-aligned owner capacity. Gathered
+            # columns occupy its prefix in column order, followed by Ulysses.
+            peer_axis = axes.context.peer_axis
+            gather_axis = axes.context.gather_axis
+            members = self.parallel.key_group.ranks
+            owner_capacity = (
+                self._transport.local_key.shape[0]
+                if self.parallel.mapped
+                else self.keys.capacity * layer._exchange.group.size
+            )
+            physical = []
+            for owner_index, rank in enumerate(members):
+                columns = (
+                    next(fiber for fiber in self.mesh.members((gather_axis,)) if rank in fiber)
+                    if peer_axis is not None and gather_axis is not None
+                    else (rank,)
+                )
+                offset = owner_index * owner_capacity
+                for column in columns:
+                    heads = next(
+                        fiber for fiber in self.mesh.members(self.head_axes) if column in fiber
+                    )
+                    physical.extend(
+                        (offset + slot, index) for slot, index in self._slots(heads, self.keys)
+                    )
+                    offset += self.keys.capacity * len(heads)
+            physical.sort(key=lambda item: item[1])
+            if [index for _, index in physical] != list(range(key_lengths.num_tokens)):
+                raise ValueError("context publication must cover each logical key token once")
+            self.key_indices = torch.tensor(
+                [slot for slot, _ in physical], dtype=torch.long, device=device
+            )
+        self.batch = VisibleInput(local, key_lengths, self.visible, None, False, False)
+        self.refresh(batch)
+
+    @staticmethod
+    def signature(batch):
+        if isinstance(batch, DenseInput):
+            return (DenseInput,)
+        lengths = batch.keys if isinstance(batch, (VarlenInput, VisibleInput)) else batch.queries
+        table = getattr(batch, "block_table", None)
+        return (
+            type(batch),
+            batch.queries.host,
+            lengths.host,
+            None if table is None else (tuple(table.indices.shape), table.block_size),
+        )
+
+    def _slots(self, members, partition):
+        return [
+            (owner * partition.capacity + offset, index)
+            for owner, rank in enumerate(members)
+            for offset, index in enumerate(
+                range(
+                    min(partition.num_tokens, self.tokens.ranks.index(rank) * partition.capacity),
+                    min(
+                        partition.num_tokens,
+                        (self.tokens.ranks.index(rank) + 1) * partition.capacity,
+                    ),
+                )
+            )
+        ]
+
+    def refresh(self, batch):
+        """Read live device lengths and endpoints into the localized metadata."""
+
+        paged = isinstance(batch, (PagedInput, SegmentedInput))
+        if paged:
+            host = tuple(
+                a + b for a, b in zip(batch.prefixes.host, batch.queries.host, strict=True)
+            )
+            torch.add(batch.prefixes.values, batch.queries.values, out=self.key_values)
+            self.key_offsets[0].zero_()
+            torch.cumsum(self.key_values, 0, dtype=torch.int32, out=self.key_offsets[1:])
+            keys = SequenceLengths(host=host, values=self.key_values, offsets=self.key_offsets)
+        else:
+            keys = batch.keys
+        for row, columns in enumerate(self.query_columns):
+            count = columns.numel()
+            if isinstance(batch, (PagedInput, VarlenInput)):
+                ends = (
+                    columns + keys.values[row] - batch.queries.values[row] + 1
+                    if batch.causal[row]
+                    else keys.values[row].expand(count)
+                )
+            elif isinstance(batch, SegmentedInput):
+                ends = (
+                    keys.values[row].expand(count)
+                    if batch.fully_visible_current
+                    else batch.prefixes.values[row]
+                    + batch.visible_current_end[row].index_select(0, columns)
+                )
+            else:
+                ends = (
+                    keys.values[row].expand(count)
+                    if batch.fully_visible
+                    else batch.visible_end[row].index_select(0, columns)
+                )
+            self.visible[row, :count].copy_(ends)
+        table = (
+            batch.block_table
+            if isinstance(batch, PagedInput) or isinstance(batch, VisibleInput)
+            else None
+        )
+        self.batch = replace(self.batch, keys=keys, block_table=table)
+        return self.batch
+
+    def exchange(self, k, v, *, storage):
+        exchange = self.layer._exchange
+        key, value = (
+            exchange.heads(self.keys.pad(tensor), storage=storage, role=role)
+            for role, tensor in (("key", k), ("value", v))
+        )
+        if self.keys.num_tokens == 0:
+            return key[:0], value[:0]
+        from uniserve.nn.attention._parallel import context_scope
+
+        with context_scope({self.parallel: self._transport}):
+            key, value = self.parallel.distribute_key_value(key, value)
+            if self.key_indices is not None:
+                # Dense kernels consume compact sequences. This copy reads peer
+                # mappings directly; its completion precedes the reuse fence.
+                key = key.index_select(0, self.key_indices)
+                value = value.index_select(0, self.key_indices)
+            else:
+                key, value = key[: self.keys.num_tokens], value[: self.keys.num_tokens]
+            self.parallel.finish_context()
+        return key, value
+
+    def inputs(self, q, k, v, batch, *, storage):
+        query = self.layer._exchange.heads(
+            self.queries.pad(q), storage=storage, role="query"
+        ).index_select(0, self.query_indices)
+        cached = isinstance(batch, VisibleInput) and batch.block_table is not None
+        if cached:
+            if self.cache is not None:
+                k, v = self.cache.key, self.cache.value
+            else:
+                heads = self.layer._exchange.head_slice(k.shape[2])
+                k, v = k[:, :, heads], v[:, :, heads]
+        else:
+            k, v = self.exchange(k, v, storage=storage)
+        if isinstance(batch, (PagedInput, SegmentedInput)) and batch.write_indices is not None:
+            if self.cache is None:
+                raise RuntimeError("context cache writes require bound prefix state")
+            self.cache.update(k, v, indices=batch.write_indices)
+        if isinstance(batch, SegmentedInput):
+            if self.cache is None:
+                raise RuntimeError("segmented context attention requires bound prefix state")
+            from .backends.attention._segments import pack
+
+            localized = self.refresh(batch)
+            k, v = pack(self.cache, k, v, batch, localized.keys.offsets, out=self.packed)
+            return query, k, v, localized
+        return query, k, v, self.refresh(batch)
+
+    def restore(self, result, *, storage, out):
+        count = self.queries.capacity * self.layer._exchange.group.size
+        physical = result.new_zeros((count, *result.shape[1:]))
+        physical.index_copy_(0, self.query_indices, result)
+        local = self.layer._exchange.tokens(physical, storage=storage)[: self.queries.count]
+        return out.copy_(local)

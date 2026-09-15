@@ -217,6 +217,8 @@ class WorkerInfo:
     latent_pages: int
     buffer_pool_bytes: int
     max_unresolved_ops: int
+    encoder_cache_entries: int = 0
+    encoder_entry_bytes: int = 0
     configuration_id: str = ""
     components: tuple[EntryInfo, ...] = ()
     device: str = "cpu"
@@ -282,6 +284,8 @@ class WorkerInfo:
             "latent_page_units",
             "latent_pages",
             "buffer_pool_bytes",
+            "encoder_cache_entries",
+            "encoder_entry_bytes",
         ):
             if getattr(self, name) < 0:
                 raise invalid_descriptor(f"worker info.{name} must not be negative")
@@ -354,6 +358,12 @@ class WorkerInfo:
             latent_page_units=_uint(data.get("latent_page_units"), f"{where}.latent_page_units"),
             latent_pages=_uint(data.get("latent_pages"), f"{where}.latent_pages"),
             buffer_pool_bytes=_uint(data.get("buffer_pool_bytes"), f"{where}.buffer_pool_bytes"),
+            encoder_cache_entries=_uint(
+                data.get("encoder_cache_entries"), f"{where}.encoder_cache_entries"
+            ),
+            encoder_entry_bytes=_uint(
+                data.get("encoder_entry_bytes"), f"{where}.encoder_entry_bytes"
+            ),
             max_unresolved_ops=_uint(data.get("max_unresolved_ops"), f"{where}.max_unresolved_ops"),
         )
 
@@ -381,6 +391,8 @@ class WorkerInfo:
             "latent_page_units": self.latent_page_units,
             "latent_pages": self.latent_pages,
             "buffer_pool_bytes": self.buffer_pool_bytes,
+            "encoder_cache_entries": self.encoder_cache_entries,
+            "encoder_entry_bytes": self.encoder_entry_bytes,
             "max_unresolved_ops": self.max_unresolved_ops,
         }
 

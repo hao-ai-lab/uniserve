@@ -7,11 +7,12 @@ Bootstrap passes the immutable value into every configured subsystem.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any, cast
 
-from uniserve.attention.tuning import FlashInferTuningConfig
-from uniserve.distributed.parallel import ParallelConfig
+from uniserve.runtime.backends.attention.flashinfer import Config as FlashInferConfig
+from uniserve_worker.parallel import ParallelConfig
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.protocol.batch import (
     COMPUTATIONS,
@@ -262,6 +263,8 @@ class WorkerConfig:
     attention_backend: str | None = None
     max_batch_operations: int = 1024
     max_batch_tokens: int = 8192
+    max_sequence_tokens: int = 16384
+    max_video_seconds: float = 15.0
     max_request_pool_size: int = 128
     encoder_cache_entries: int = 256
     generation_device: str | None = None
@@ -277,7 +280,7 @@ class WorkerConfig:
     prefill_graph_token_sizes: tuple[int, ...] = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
     flow_graph_batch_sizes: tuple[int, ...] = (1, 2, 3, 4)
     flow_graph_shapes: tuple[tuple[int, int], ...] = ((1152, 2048), (2048, 1152))
-    flashinfer: FlashInferTuningConfig = FlashInferTuningConfig()
+    flashinfer: FlashInferConfig = FlashInferConfig()
 
     def __post_init__(self) -> None:
         """Validate topology axes, device identity, batch bounds, and dtype policies."""
@@ -296,10 +299,13 @@ class WorkerConfig:
             self.block_size < 1
             or self.max_batch_operations < 1
             or self.max_batch_tokens < 1
+            or self.max_sequence_tokens < 1
             or self.max_request_pool_size < 1
             or self.encoder_cache_entries < 1
         ):
             raise invalid_descriptor("worker configuration capacities must be positive")
+        if not math.isfinite(self.max_video_seconds) or self.max_video_seconds <= 0:
+            raise invalid_descriptor("video duration capacity must be finite and positive")
         if not 0 < self.kv_memory_fraction <= 1:
             raise invalid_descriptor("worker configuration KV memory fraction must be in (0, 1]")
         if self.model_dtype not in {"float16", "bfloat16", "float32"}:
@@ -326,6 +332,8 @@ def worker_config_from_namespace(
         block_size=int(namespace.block_size),
         max_batch_operations=int(namespace.max_batch_operations),
         max_batch_tokens=int(namespace.max_batch_tokens),
+        max_sequence_tokens=int(namespace.max_model_len),
+        max_video_seconds=float(namespace.max_video_seconds),
         kv_token_capacity=_positive_optional_int(namespace.kv_token_capacity),
         attention_backend=str(namespace.attention_backend),
         model_dtype=str(namespace.model_dtype),
@@ -350,7 +358,7 @@ def worker_config_from_namespace(
             default=(1, 2, 3, 4),
         ),
         flow_graph_shapes=_parse_image_shapes(namespace.flow_graph_shapes),
-        flashinfer=FlashInferTuningConfig(
+        flashinfer=FlashInferConfig(
             workspace_size=max(
                 1,
                 int(namespace.flashinfer_workspace_size),

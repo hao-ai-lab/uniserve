@@ -33,23 +33,26 @@ if triton is not None:
         offsets_ptr,
         k_src_ptr,
         v_src_ptr,
+        k_initialized_ptr,
+        v_initialized_ptr,
         num_pages: tl.constexpr,
         page_size: tl.constexpr,
         row_width: tl.constexpr,
-        k_row_stride: tl.constexpr,
-        v_row_stride: tl.constexpr,
+        head_dim: tl.constexpr,
+        k_strides: tl.constexpr,
+        v_strides: tl.constexpr,
         block_size: tl.constexpr,
     ):
-        """Scatter contiguous key and value rows into physical page-offset locations."""
+        """Scatter borrowed key and value views into physical page-offset locations."""
 
         row = tl.program_id(0)
         columns = tl.program_id(1) * block_size + tl.arange(0, block_size)
         location = tl.load(locations_ptr + row)
         if offsets_ptr is None:
-            # Runtime locations already encode the physical token slot. Zero
-            # and negative values are non-writing rows, including graph padding.
+            # -1 excludes the token from both payload and initialization state.
+            # Physical block zero is an ordinary, writable numerical block.
             cache_row = location
-            persists = location > 0
+            persists = location >= 0
             valid_address = location < num_pages * page_size
         else:
             page_offset = tl.load(offsets_ptr + row)
@@ -57,16 +60,26 @@ if triton is not None:
             persists = location >= 0
             valid_address = (location < num_pages) & (page_offset >= 0)
             valid_address &= page_offset < page_size
+        tl.device_assert(location >= -1, "paged KV write index below -1")
         tl.device_assert((~persists) | valid_address, "paged KV write index out of bounds")
 
-        k_source_offsets = row * k_row_stride + columns
-        v_source_offsets = row * v_row_stride + columns
+        heads = columns // head_dim
+        dimensions = columns % head_dim
+        k_source_offsets = row * k_strides[0] + heads * k_strides[1] + dimensions * k_strides[2]
+        v_source_offsets = row * v_strides[0] + heads * v_strides[1] + dimensions * v_strides[2]
         cache_offsets = cache_row * row_width + columns
         mask = persists & valid_address & (columns < row_width)
         k = tl.load(k_src_ptr + k_source_offsets, mask=mask, other=0.0)
         v = tl.load(v_src_ptr + v_source_offsets, mask=mask, other=0.0)
         tl.store(k_cache_ptr + cache_offsets, k, mask=mask)
         tl.store(v_cache_ptr + cache_offsets, v, mask=mask)
+        if k_initialized_ptr is not None:
+            # Every writing token commits the same true bit, independently of
+            # head width. The block's payload and flag share stream ordering.
+            if tl.program_id(1) == 0:
+                block = cache_row // page_size
+                tl.store(k_initialized_ptr + block, 1, mask=persists & valid_address)
+                tl.store(v_initialized_ptr + block, 1, mask=persists & valid_address)
 
 
 def write_locations(
@@ -132,15 +145,6 @@ def _triton_paged_kv_write_eligible(
         return False
     if not all(tensor.is_contiguous() for tensor in (k_cache, v_cache, *addresses)):
         return False
-    head_dim = int(k_src.shape[2])
-    row_width = int(k_src.shape[1]) * head_dim
-    if not all(
-        int(tensor.stride(2)) == 1
-        and int(tensor.stride(1)) == head_dim
-        and int(tensor.stride(0)) >= row_width
-        for tensor in (k_src, v_src)
-    ):
-        return False
     num_rows = int(locations.numel())
     return (
         num_rows > 0
@@ -158,6 +162,7 @@ def _triton_paged_kv_write(
     offsets: torch.Tensor | None,
     k_src: torch.Tensor,
     v_src: torch.Tensor,
+    initialized: tuple[torch.Tensor, torch.Tensor] | None,
 ) -> None:
     """Launch the fused paged KV scatter over flattened token rows."""
 
@@ -171,11 +176,14 @@ def _triton_paged_kv_write(
         offsets,
         k_src,
         v_src,
+        None if initialized is None else initialized[0],
+        None if initialized is None else initialized[1],
         num_pages,
         page_size,
         row_width,
-        int(k_src.stride(0)),
-        int(v_src.stride(0)),
+        head_dim,
+        k_src.stride(),
+        v_src.stride(),
         _TRITON_KV_WRITE_BLOCK,
         num_warps=4,
         debug=True,
@@ -191,13 +199,13 @@ def paged_kv_write(
     v_current: torch.Tensor,
     *,
     cast: bool = False,
+    initialized: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Scatter current K/V into physical token slots or page/offset addresses.
 
     ``k_cache``/``v_cache`` are ``[pages, page_size, heads, dim]``. With
-    ``offsets=None``, locations are encoded physical token slots and nonpositive
-    entries mask writes. Otherwise, locations are page IDs, negative page IDs
-    mask writes, and offsets select the token within each page. Address columns
+    ``offsets=None``, locations are encoded physical token slots and -1
+    masks writes. Otherwise, locations are page IDs, -1 masks writes, and offsets select the token within each page. Address columns
     and K/V share their leading shape: ``[N]`` with ``[N, heads, dim]``, or
     ``[batch, n]`` with ``[batch, n, heads, dim]``. When ``cast`` is set, sources
     are converted to the cache dtype; otherwise their dtype must match. Callers
@@ -214,6 +222,11 @@ def paged_kv_write(
     v_src = v_current.reshape(-1, heads, head_dim)
     locations = locations.reshape(-1)
     offsets = None if offsets is None else offsets.reshape(-1)
+    if initialized is not None and any(
+        flags.shape != (num_pages,) or flags.dtype != torch.bool or flags.device != k_cache.device
+        for flags in initialized
+    ):
+        raise ValueError("cache initialization flags must match block count and device")
     if _triton_paged_kv_write_eligible(
         k_cache,
         v_cache,
@@ -222,9 +235,17 @@ def paged_kv_write(
         k_src,
         v_src,
     ):
-        _triton_paged_kv_write(k_cache, v_cache, locations, offsets, k_src, v_src)
+        with torch.cuda.device(k_cache.device):
+            _triton_paged_kv_write(k_cache, v_cache, locations, offsets, k_src, v_src, initialized)
         return
-    persists = locations > 0 if offsets is None else locations >= 0
+    valid = (locations >= -1) & (
+        locations < (num_pages * page_size if offsets is None else num_pages)
+    )
+    if offsets is not None:
+        valid &= (locations == -1) | ((offsets >= 0) & (offsets < page_size))
+    if not bool(valid.all()):
+        raise ValueError("paged KV write index out of bounds")
+    persists = locations >= 0
     selected = torch.nonzero(persists, as_tuple=False).reshape(-1)
     if int(selected.numel()) == 0:
         return
@@ -236,5 +257,12 @@ def paged_kv_write(
         k_src = k_src.to(dtype=k_cache.dtype)
         v_src = v_src.to(dtype=v_cache.dtype)
     flat_index = locations if offsets is None else locations * page_size + offsets
-    k_flat.index_copy_(0, flat_index, k_src)
-    v_flat.index_copy_(0, flat_index, v_src)
+    for target, source in ((k_flat, k_src), (v_flat, v_src)):
+        if target.dtype is torch.float8_e4m3fn:
+            target.view(torch.uint8).index_copy_(0, flat_index, source.view(torch.uint8))
+        else:
+            target.index_copy_(0, flat_index, source)
+    if initialized is not None:
+        blocks = flat_index // page_size
+        for flags in initialized:
+            flags.index_fill_(0, blocks, True)

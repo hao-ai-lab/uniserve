@@ -12,10 +12,8 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from uniserve.model.video import VideoMixin
-from uniserve.nn.diffusion.cfg import Branch, CfgPlan
+from uniserve.diffusion import Branch
 from uniserve.tensors import OutputLayout
-from uniserve_models.processing import PatchTransform
 from uniserve_worker.execution import operations as operations
 from uniserve_worker.execution.batch_state import BatchState
 from uniserve_worker.execution.commit import _commit_group, _discard_group
@@ -48,7 +46,7 @@ from uniserve_worker.protocol.batch import (
     TransferMode,
 )
 
-from .diffusion_state import DiffusionState
+from .diffusion_state import ImageState
 from .output import capture_samples
 from .sampling import SamplerRow, SamplingMetadata
 
@@ -56,7 +54,6 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from uniserve.distributed.mesh import Communicator
-    from uniserve.model.model import Model
     from uniserve_worker.bootstrap.worker_info import WorkerInfo
     from uniserve_worker.config import WorkerConfig
     from uniserve_worker.execution.model_runner import ModelRunner
@@ -103,7 +100,6 @@ def execute_batch(
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     media_buffers: MediaBuffers | None,
-    execution_model: Model,
     output_pool: OutputPool,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
@@ -156,7 +152,6 @@ def execute_batch(
                     latent_pool=latent_pool,
                     media_mux=media_mux,
                     media_buffers=media_buffers,
-                    execution_model=execution_model,
                     output_pool=output_pool,
                     request_tables=request_tables,
                     request_pool=request_pool,
@@ -204,7 +199,6 @@ def execute_batch(
             worker_info=worker_info,
             latent_pool=latent_pool,
             media_mux=media_mux,
-            execution_model=execution_model,
             publication_transports=publication_transports,
             request_tables=request_tables,
             request_pool=request_pool,
@@ -470,7 +464,6 @@ def _execute_groups(
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
-    execution_model: Model,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
@@ -489,10 +482,13 @@ def _execute_groups(
             if state.pending_output(completion_group, operation.request_key.request_id).status
             is not OpStatus.PREDICATED
         )
-        for device in dict.fromkeys(
-            device for operation in active for device in model_runner.operation_devices(operation)
-        ):
-            state.group_buffers[completion_group].begin_device(device)
+        with state.group_scope(completion_group):
+            for device in dict.fromkeys(
+                device
+                for operation in active
+                for device in model_runner.operation_devices(operation)
+            ):
+                state.group_buffers[completion_group].begin_device(device)
     grouped: list[list[PendingOutput | None]] = [
         [None] * len(state.group_operations(completion_group))
         for completion_group in completion_groups
@@ -518,7 +514,6 @@ def _execute_groups(
         worker_info=worker_info,
         latent_pool=latent_pool,
         media_mux=media_mux,
-        execution_model=execution_model,
         publication_transports=publication_transports,
         request_tables=request_tables,
         request_pool=request_pool,
@@ -623,7 +618,6 @@ def _execute_operations(
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
-    execution_model: Model,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
@@ -637,7 +631,7 @@ def _execute_operations(
 
     Each index addresses an original operation. Only completed products unlock
     successors; an error suppresses its completion group while independent
-    groups continue. CFG prefixes precede the mixed token/denoise forward.
+    groups continue. CFG prefixes precede their homogeneous denoiser calls.
     """
 
     from . import encode, flow, token, transfer, video
@@ -697,63 +691,63 @@ def _execute_operations(
                 if not live(index):
                     continue
                 try:
-                    if isinstance(operation.kind, TransferMode):
-                        result = transfer.execute(
-                            operation,
-                            completion_group,
-                            kv_cache=kv_cache,
-                            tensor_store=tensor_store,
-                            latent_pool=latent_pool,
-                            publication_transports=publication_transports,
-                            request_tables=request_tables,
-                            model_runner=model_runner,
-                            state=state,
-                        )
-                    elif (
-                        operation.kind is PipelineStage.LATENT_PREPARATION
-                        and latent_pool is not None
-                    ):
-                        result = flow.prepare_latent(
-                            operation,
-                            completion_group,
-                            kv_cache=kv_cache,
-                            worker_info=worker_info,
-                            latent_pool=latent_pool,
-                            publication_transports=publication_transports,
-                            request_tables=request_tables,
-                            model_runner=model_runner,
-                            config=config,
-                            state=state,
-                        )
-                    elif operation.kind is PipelineStage.TEXT_ENCODING:
-                        result = encode.text(
-                            operation,
-                            completion_group,
-                            tensor_store=tensor_store,
-                            publication_transports=publication_transports,
-                            model_runner=model_runner,
-                            state=state,
-                        )
-                    elif isinstance(execution_model, VideoMixin):
-                        result = video.execute(
-                            operation,
-                            completion_group,
-                            tensor_store=tensor_store,
-                            media_mux=media_mux,
-                            execution_model=execution_model,
-                            publication_transports=publication_transports,
-                            request_pool=request_pool,
-                            model_runner=model_runner,
-                            state=state,
-                        )
-                    else:
-                        raise invalid_descriptor(f"unsupported operation {operation.kind!r}")
+                    with state.group_scope(completion_group):
+                        if isinstance(operation.kind, TransferMode):
+                            result = transfer.execute(
+                                operation,
+                                completion_group,
+                                kv_cache=kv_cache,
+                                tensor_store=tensor_store,
+                                latent_pool=latent_pool,
+                                publication_transports=publication_transports,
+                                request_tables=request_tables,
+                                model_runner=model_runner,
+                                state=state,
+                            )
+                        elif (
+                            operation.kind is PipelineStage.LATENT_PREPARATION
+                            and latent_pool is not None
+                        ):
+                            result = flow.prepare_latent(
+                                operation,
+                                completion_group,
+                                kv_cache=kv_cache,
+                                worker_info=worker_info,
+                                latent_pool=latent_pool,
+                                publication_transports=publication_transports,
+                                request_tables=request_tables,
+                                model_runner=model_runner,
+                                config=config,
+                                state=state,
+                            )
+                        elif operation.kind is PipelineStage.TEXT_ENCODING:
+                            result = encode.text(
+                                operation,
+                                completion_group,
+                                tensor_store=tensor_store,
+                                publication_transports=publication_transports,
+                                model_runner=model_runner,
+                                state=state,
+                            )
+                        elif model_runner.video_postprocessor is not None:
+                            result = video.execute(
+                                operation,
+                                completion_group,
+                                tensor_store=tensor_store,
+                                media_mux=media_mux,
+                                publication_transports=publication_transports,
+                                request_pool=request_pool,
+                                model_runner=model_runner,
+                                state=state,
+                            )
+                        else:
+                            raise invalid_descriptor(f"unsupported operation {operation.kind!r}")
                     outcomes[index] = result
                 except BaseException as error:
                     errors[completion_group] = error
             continue
 
-        trajectories: dict[int, DiffusionState] = {}
+        trajectories: dict[int, ImageState] = {}
         for index in numerical:
             operation, completion_group = scheduled[index]
             if operation.kind is not PipelineStage.DENOISING or not live(index):
@@ -782,7 +776,7 @@ def _execute_operations(
         for offset in range(step_count):
             # The numerical schedule is local to this loop. Accepted request
             # progress is published only after the complete declared interval.
-            step_inputs: dict[int, tuple[CfgPlan, torch.Tensor, torch.Tensor]] = {}
+            step_inputs: dict[int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]] = {}
             prefixes: list[tuple[int, Branch, ForwardRow]] = []
             for index, trajectory in trajectories.items():
                 if not live(index):
@@ -877,12 +871,8 @@ def _execute_operations(
                         request = state.pending_output(
                             completion_group, operation.request_key.request_id
                         )
-                        diffusion = model_runner.diffusion
-                        if diffusion is None:
-                            raise RuntimeError("flow execution lost its diffusion owner")
-                        processor = model_runner.processor
-                        transform = None if processor is None else processor.vit
-                        rows = diffusion.flow_rows(
+                        rows = flow.flow_rows(
+                            flow.require_inputs(model_runner),
                             trajectories[index],
                             staging.value[: int(params.latent_units)],
                             guide,
@@ -890,11 +880,6 @@ def _execute_operations(
                             conditioning_position=int(
                                 operations.require_progress(request).logical_position
                             ),
-                            height=int(params.height),
-                            width=int(params.width),
-                            patch_size=int(transform.patch_size)
-                            if isinstance(transform, PatchTransform)
-                            else None,
                             device=model_runner.operation_devices(operation)[1],
                         )
                         forward.extend((index, task) for task in rows)
@@ -1029,7 +1014,7 @@ def _execute_operations(
                                 value,
                                 request_pool_index=sampling_index,
                                 tensor_store=tensor_store,
-                                execution_model=execution_model,
+                                image_inputs=model_runner.images,
                                 request_tables=request_tables,
                                 decode_state=decode_state,
                                 state=state,
@@ -1120,7 +1105,7 @@ def _execute_operations(
                             logits,
                             work,
                             selected,
-                            execution_model=execution_model,
+                            image_inputs=model_runner.images,
                             request_tables=request_tables,
                             decode_state=decode_state,
                             state=state,
@@ -1141,15 +1126,14 @@ def _execute_operations(
                     staging = row.latent_staging
                     if params is None or staging is None:
                         raise invalid_descriptor("trajectory operation has no staged latent inputs")
-                    diffusion = model_runner.diffusion
-                    if diffusion is None:
-                        raise RuntimeError("flow execution lost its diffusion owner")
-                    # Page staging includes allocation padding; solver updates
-                    # only this operation's model-visible latent units.
-                    diffusion.integrate(
+                    # The solver updates only the model-visible portion of
+                    # this operation's staging, preserving page padding.
+                    flow.integrate(
+                        flow.require_inputs(model_runner),
+                        trajectories[index],
                         staging.value[: int(params.latent_units)],
                         tuple(outputs),
-                        guide,
+                        int(params.start_step) + offset,
                         timestep,
                         next_timestep,
                     )

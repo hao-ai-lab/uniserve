@@ -872,12 +872,29 @@ def qk_rms_norm_partial_rope_(
             raise ValueError("projection bias must match the complete head width and device")
     if value is not None and (value.shape != query.shape or value.device != query.device):
         raise ValueError("value projection must match Q/K geometry and device")
-    operands = (query, key, cosine, sine, query_bias, key_bias, value, value_bias)
+    # Merged projections lend disjoint Q/K/V views with gaps between token
+    # rows. The kernel supports these strides when leading token dimensions
+    # flatten affinely and each head and row owns nonoverlapping coordinates.
+    row_stride, head_stride = int(query.stride(-3)), int(query.stride(-2))
+    row_span = row_stride
+    affine_rows = True
+    for dimension in range(query.ndim - 4, -1, -1):
+        row_span *= query.shape[dimension + 1]
+        if query.shape[dimension] != 1 and query.stride(dimension) != row_span:
+            affine_rows = False
+            break
+    projections = (query, key) if value is None else (query, key, value)
+    tables = (cosine, sine, query_bias, key_bias, value_bias)
     if not (
         query.is_cuda
         and triton_available(query.device)
         and head_dim <= 256
-        and all(tensor is None or tensor.is_contiguous() for tensor in operands)
+        and affine_rows
+        and query.stride(-1) == 1
+        and head_stride >= head_dim
+        and row_stride >= (heads - 1) * head_stride + head_dim
+        and all(tensor.stride() == query.stride() for tensor in projections)
+        and all(tensor is None or tensor.is_contiguous() for tensor in tables)
     ):
         q, k = query.float(), key.float()
         if query_bias is not None and key_bias is not None:
@@ -916,8 +933,8 @@ def qk_rms_norm_partial_rope_(
         sine,
         rows,
         heads,
-        int(query.stride(-3)),
-        int(query.stride(-2)),
+        row_stride,
+        head_stride,
         rotary_dim,
         HAS_BIAS=query_bias is not None,
         HAS_VALUE_BIAS=value_bias is not None,

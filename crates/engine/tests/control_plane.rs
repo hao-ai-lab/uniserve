@@ -87,6 +87,20 @@ fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
     }
 }
 
+#[test]
+fn encoder_products_obey_worker_entry_capacity() {
+    let mut sim = SimEngine::new();
+    let info = sim.mut_info_for_test();
+    info.buffer_pool_bytes = 8 << 30;
+    info.encoder_entry_bytes = 128 << 20;
+    info.encoder_cache_entries = 64;
+    let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let limits = scheduler.generation_limits();
+    assert_eq!(limits.max_vision_feature_bytes, 128 << 20);
+    assert_eq!(limits.max_latent_feature_bytes, 128 << 20);
+    assert_eq!(limits.encoder_cache_entries, 64);
+}
+
 fn text_input(token_ids: Vec<u32>) -> (Vec<u32>, MultimodalInputs) {
     (token_ids, MultimodalInputs::default())
 }

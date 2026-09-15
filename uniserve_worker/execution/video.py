@@ -1,25 +1,17 @@
-"""Common bounded video decode, capture, and artifact actions."""
+"""Bounded execution of numerical video capabilities and media artifact actions."""
 
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.model.batch import DecodeBatch, DiffusionBatch
-from uniserve.model.decoder import DecodeKind
-from uniserve.model.diffusion import DiffusionMixin
-from uniserve.model.media import VideoSize
-from uniserve.model.tensors import TensorViews
-from uniserve.model.video import VideoMixin
-from uniserve.nn.rng import normal_noise
+from uniserve.media import video
+from uniserve.model import AudioDecoder, VideoDecoder, VideoPostprocessor
 from uniserve.profiling import profile_range
-from uniserve.runtime.tensors import bind_scratch, bind_state, prepare_constants, stage_tensor
-from uniserve_worker.foundation.errors import (
-    invalid_descriptor,
-    unsupported_setup,
-)
+from uniserve.tensors import TensorOutput
+from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.media.buffers import MediaBuffers
 from uniserve_worker.media.mux import MediaMux, require_media_codecs
 from uniserve_worker.protocol.batch import (
@@ -38,14 +30,13 @@ from uniserve_worker.runtime.cpu import CpuTask
 
 from . import operations
 from .batch_state import BatchState
-from .denoising import denoising_batch
-from .diffusion_state import DiffusionState
+from .diffusion_state import VideoState
 from .output import PendingOutput
+from .tensors import concatenate_views
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from uniserve.model.model import Model
     from uniserve.runtime.tensor_buffers import TensorBuffers
 
     from ..runtime.request import RequestPool
@@ -55,257 +46,193 @@ if TYPE_CHECKING:
 
 
 def require_video_codecs() -> None:
-    """Verify that the model’s configured video and audio codec dependencies are installed."""
-
+    """Verify the output owner's configured video and audio encoders."""
     require_media_codecs("libx264", "aac")
 
 
-def warmup_denoising(model: Model, runner: ModelRunner, storage: tuple[TensorBuffers, ...]) -> None:
-    """Prepare representative legal media geometries using the runtime cache."""
-
-    if runner.diffusion is None:
-        return
-    if not isinstance(model, VideoMixin) or not isinstance(model, DiffusionMixin):
-        raise TypeError("video denoising requires its numerical capabilities")
-    scratch, diffusion, schedule = runner.scratch, runner.diffusion, runner.schedule
-    if scratch is None or diffusion is None or schedule is None or not storage:
-        raise RuntimeError("denoiser warmup requires its bound state, scratch, and schedule")
-    maximum = model.output_capacity.frame_count
-    alignment = model.text_alignment
-    shapes = (
-        (maximum, alignment + 1),
-        (model.min_frames, 1),
-        *((maximum, pages * alignment + 1) for pages in (2, 3, 4)),
-        (maximum, cast(int, getattr(model.text_encoder, "max_tokens"))),
-    )
-    prepared = set()
-    for frames, tokens in shapes:
-        if tokens > cast(int, getattr(model.text_encoder, "max_tokens")):
-            continue
-        shape = model.video_info(frames)
-        geometry = DiffusionSamplingParams(
-            num_frames=frames,
-            num_decode_chunks=len(model.decode_windows(shape)),
-            num_inference_steps=cast(int, model.num_inference_steps),
-            seed=0,
-        )
-        numerical_shape = video_shape(model, geometry, tokens)
-        if numerical_shape in prepared:
-            continue
-        prepared.add(numerical_shape)
-        page_shape = metadata_shape(model, numerical_shape)
-        constants, views_scratch = diffusion.prepare_inputs(
-            page_shape,
-            lambda: (
-                prepare_constants(
-                    runner.component("forward_diffusion"),
-                    VideoSize(page_shape.frames, page_shape.prompt_tokens),
-                    device=runner.worker_config.device,
-                ),
-                bind_scratch(
-                    runner.component("forward_diffusion").workspace_buffers(
-                        VideoSize(numerical_shape.frames, numerical_shape.prompt_tokens)
-                    ),
-                    scratch,
-                ),
-            ),
-        )
-        # Warmup executes one numerical request. Other slots are initialized
-        # with their own prompt state when a request is actually admitted.
-        views = bind_state(
-            runner.component("forward_diffusion").state_buffers(
-                VideoSize(numerical_shape.frames, numerical_shape.prompt_tokens)
-            ),
-            storage[0],
-        )
-        initialize_latents(
-            runner.component("forward_diffusion"),
-            numerical_shape,
-            views,
-            constants,
-            views_scratch,
-            0,
-        )
-        views["text_condition"].zero_()
-        for name in model.modalities:
-            views[name].zero_()
-        diffusion.warmup(
-            denoising_batch(model, numerical_shape, views, schedule, 0),
-            schedule,
-            state=views,
-            constants=constants,
-            scratch=views_scratch,
-            input_key=page_shape,
-        )
-
-
-def initialize_latents(
-    model: DiffusionMixin[VideoSize],
-    shape: VideoSize,
-    tensors: TensorViews,
-    constants: TensorViews,
-    scratch: TensorViews,
-    seed: int,
-) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
-    """Generate complete native modalities, then stage their numerical shards.
-
-    Request storage owns normal-draw and shard-staging buffers. Their leading
-    batch views represent this one logical request; preparation itself receives
-    only numerical tensors and cached mathematical indices.
-    """
-
-    if not isinstance(model, DiffusionMixin):
-        raise TypeError("latent initialization requires diffusion capability")
-    noise = {name: tensors[f"{name}_noise"].unsqueeze(0) for name in model.modalities}
-    sources = {name: tensors[f"{name}_source"].unsqueeze(0) for name in model.modalities}
-    state = {**{name: value.unsqueeze(0) for name, value in tensors.items()}, **sources}
-    normal_noise((seed,), tuple(noise.values()))
-    model.prepare_latents(
-        DiffusionBatch({name: (value[0],) for name, value in sources.items()}, (shape,)),
-        noise=noise,
-        state=state,
-        constants=constants,
-        scratch=scratch,
-    )
-    return tuple((tensors[name], tensors[f"{name}_source"]) for name in model.modalities)
-
-
-def video_shape(model: Model, media: DiffusionSamplingParams, tokens: int) -> VideoSize:
-    """Resolve admitted protocol bounds into one exact numerical media shape."""
-
-    if not isinstance(model, VideoMixin):
-        raise TypeError("video geometry requires video capability")
-    output = model.video_info(media.num_frames)
-    if (
-        media.num_decode_chunks != len(model.decode_windows(output))
-        or media.num_inference_steps != cast(int, model.num_inference_steps)
-        or not 0 < tokens <= cast(int, getattr(model.text_encoder, "max_tokens"))
-    ):
+def video_shape(runner: ModelRunner, media: DiffusionSamplingParams, tokens: int):
+    """Resolve admission into exact numerical dimensions, without prompt padding."""
+    factory = runner.media
+    decoder = runner.video_decoder
+    if factory is None or decoder is None:
+        raise invalid_descriptor("video input requires denoising and reconstruction capabilities")
+    try:
+        size = factory.size(media.num_frames, tokens)
+        windows = decoder.frame_slices(size.num_frames)
+    except ValueError as error:
+        raise invalid_descriptor(str(error)) from error
+    if media.num_decode_chunks != len(windows) or media.num_inference_steps != factory.num_steps:
         raise invalid_descriptor("video request has invalid computation bounds")
-    return VideoSize(media.num_frames, prompt_tokens=tokens)
+    return size
 
 
-def metadata_shape(model: VideoMixin, shape: VideoSize) -> VideoSize:
-    """Cache page geometry independently of request-specific prompt validity."""
-
-    alignment = model.text_alignment
-    tokens = ((shape.prompt_tokens + alignment - 1) // alignment) * alignment
-    return replace(shape, prompt_tokens=tokens)
+def audio_samples(runner: ModelRunner, num_frames: int) -> int:
+    decoder = runner.audio_decoder
+    output = runner.video_postprocessor
+    return round(num_frames * decoder.sample_rate / output.frame_rate)
 
 
-def prepare_call(
-    model: Model,
-    runner: ModelRunner,
-    trajectory: DiffusionState,
-    call: str,
-    shape: VideoSize,
-    storage: TensorBuffers | None,
-) -> tuple[TensorViews, TensorViews, TensorViews]:
-    """Retain only the current call's declared numerical resources for a request.
+def prepare_call(runner: ModelRunner, trajectory: VideoState, operation, storage):
+    """Bind request state and prepare the exact call's runtime-owned resources.
 
-    Denoising shares immutable geometry through the runner's bounded cache.
-    Reconstruction constants belong to this request through its final window;
-    backing allocations and graph retirement stay outside model preparation.
+    Only request state survives in the trajectory. Contexts own their constants
+    and workspace and may be retired after their dependent graphs drain.
     """
-
-    if call not in trajectory.constants:
-        backing = runner.scratch
-        if backing is None:
-            raise RuntimeError("media computation requires allocated scratch")
-        component = runner.component(call)
-        size = VideoSize(shape.frames, shape.prompt_tokens)
-        if call in {"forward_diffusion", "postprocess_video"}:
-            trajectory.tensors[call] = bind_state(component.state_buffers(size), storage)
-        else:
-            trajectory.tensors[call] = {}
-        if call == "forward_diffusion":
-            diffusion = runner.diffusion
-            if diffusion is None:
-                raise RuntimeError("denoising requires its execution owner")
-            if not isinstance(model, VideoMixin):
-                raise TypeError("media diffusion requires video dimensions")
-            page_shape = metadata_shape(model, shape)
-            constants, scratch = diffusion.prepare_inputs(
-                page_shape,
-                lambda: (
-                    prepare_constants(
-                        component,
-                        VideoSize(page_shape.frames, page_shape.prompt_tokens),
-                        device=runner.worker_config.device,
-                    ),
-                    bind_scratch(component.workspace_buffers(size), backing),
-                ),
+    kind, size = operation.kind, trajectory.size
+    if kind in {PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING}:
+        if runner.diffusion is None:
+            raise RuntimeError("rank does not own denoising execution")
+        if "denoising" not in trajectory.tensors:
+            if storage is None:
+                raise RuntimeError("denoising requires reserved request storage")
+            trajectory.tensors["denoising"] = storage.view(runner.media.buffers(size))
+        context = runner.diffusion.prepare_inputs(size, size)
+        return trajectory.tensors["denoising"], context
+    if kind is PipelineStage.VIDEO_DECODING:
+        return {}, runner.prepare_module(operation.entry, size.num_frames, method="decode")
+    if kind is PipelineStage.AUDIO_DECODING:
+        decoder = runner.component(kind)
+        frames = decoder.latent_frames(audio_samples(runner, size.num_frames))
+        return {}, runner.prepare_module(operation.entry, frames, method="decode")
+    if kind is PipelineStage.VIDEO_ENCODING:
+        component = runner.component(kind)
+        if "video_overlap" not in trajectory.tensors:
+            if storage is None:
+                raise RuntimeError("video assembly requires reserved overlap storage")
+            trajectory.tensors["video_overlap"] = storage.view(
+                component.state_buffers(size.num_frames)
             )
-        elif call == "decode:audio":
-            if not isinstance(model, VideoMixin):
-                raise TypeError("audio reconstruction requires its declared sample timing")
-            video = model.video_info(size.frames)
-            samples = round(video.frame_count * video.audio_rate / video.frame_rate)
-            constants = {}
-            scratch = bind_scratch(
-                component.workspace_buffers(component.latent_frames(samples)), backing
-            )
-        elif call in {"decode:video", "postprocess_video"}:
-            constants = prepare_constants(component, size, device=runner.worker_config.device)
-            scratch = bind_scratch(component.workspace_buffers(size), backing)
-        else:
-            raise ValueError(f"media resources are not defined for {call}")
-        trajectory.constants[call] = constants
-        trajectory.scratch[call] = scratch
-    return trajectory.tensors[call], trajectory.constants[call], trajectory.scratch[call]
+        return trajectory.tensors["video_overlap"], runner.prepare_module(
+            operation.entry, size.num_frames, method="forward"
+        )
+    return {}, None
 
 
-def warmup_postprocess(
-    model: Model, runner: ModelRunner, storage: tuple[TensorBuffers, ...]
-) -> None:
-    """Exercise one real output window using runtime-owned numerical storage."""
-
-    if not isinstance(model, VideoMixin):
-        raise TypeError("video postprocessing requires video capability")
-    output = runner.bindings.get("output")
-    if output is None or not output.owns:
+@torch.inference_mode()
+def warmup_denoising(runner: ModelRunner, storage: tuple[TensorBuffers, ...]) -> None:
+    """Compile representative native tile boundaries without advancing samples."""
+    factory, diffusion = runner.media, runner.diffusion
+    if diffusion is None:
         return
-    if not storage or runner.scratch is None:
-        raise RuntimeError("video warmup requires bound state and scratch")
-    shape = model.video_info(model.output_capacity.frame_count)
-    numerical_shape = VideoSize(shape.frame_count)
-    component = runner.component("postprocess_video")
-    size = VideoSize(numerical_shape.frames)
-    constants = prepare_constants(component, size, device=runner.worker_config.device)
-    state = bind_state(component.state_buffers(size), storage[0])
-    views = bind_scratch(component.workspace_buffers(size), runner.scratch)
-    window = model.decode_windows(shape)[0]
-    segment = torch.zeros(
-        (1, 3, window.segment_frames, shape.height, shape.width),
-        dtype=state["video_overlap"].dtype,
-        device=state["video_overlap"].device,
+    if factory is None or not storage:
+        raise RuntimeError("denoising warmup requires its input factory and request storage")
+    maximum = factory.maximum
+    decoder = runner.video_decoder
+    final_window = decoder.frame_slices(maximum.num_frames)[-1]
+    minimum = final_window.stop - final_window.start
+    shapes = (
+        (maximum.num_frames, 65),
+        (minimum, 1),
+        *((maximum.num_frames, tokens) for tokens in (129, 193, 257)),
+        (maximum.num_frames, maximum.num_text_tokens),
     )
-    component.postprocess_video(
-        (segment,), (window,), state=state, constants=constants, scratch=views
+    schedules, prepared = factory.schedules(device=runner.worker_config.device), set()
+    for frames, tokens in shapes:
+        if tokens > maximum.num_text_tokens:
+            continue
+        size = factory.size(frames, tokens)
+        if size in prepared:
+            continue
+        prepared.add(size)
+        context = diffusion.prepare_inputs(size, size)
+        views = storage[0].view(factory.buffers(size))
+        # Warmup has no prompt and uses zero numerical samples. The first real
+        # request draws and stages its own seeded native noise before execution.
+        with context.activate():
+            views["text_condition"].zero_()
+            for name in factory.denoiser.modalities:
+                views[name].zero_()
+        diffusion.warmup(
+            factory.bind(size, views, schedules, 0), schedules, state=views, input_key=size
+        )
+
+
+@torch.inference_mode()
+def warmup_decoders(runner: ModelRunner) -> None:
+    """Prepare reconstruction kernels with the admitted maximum latent extent."""
+    size = runner.media.maximum
+    for (name, _, method), (binding, call) in runner._module_entries.items():
+        if method != "decode":
+            continue
+        module = call.module
+        if isinstance(module, VideoDecoder):
+            shape = runner.media.denoiser.latent_shape("video", size)
+            latent = torch.zeros(shape, dtype=torch.float32, device=binding.device)
+            runner.run_module(
+                name,
+                (latent,),
+                method="decode",
+                size=size.num_frames,
+                frames=(module.frame_slices(size.num_frames)[0],),
+                num_frames=(size.num_frames,),
+            )
+        elif isinstance(module, AudioDecoder):
+            shape = runner.media.denoiser.latent_shape("audio", size)
+            latent = torch.zeros(shape, dtype=torch.float32, device=binding.device)
+            samples = audio_samples(runner, size.num_frames)
+            runner.run_module(
+                name,
+                (latent,),
+                method="decode",
+                size=module.latent_frames(samples),
+                num_samples=(samples,),
+            )
+
+
+@torch.inference_mode()
+def warmup_postprocess(runner: ModelRunner, storage: tuple[TensorBuffers, ...]) -> None:
+    """Exercise one real output window using its public numerical interface."""
+    entries = [
+        (name, call)
+        for (name, _, _), (_, call) in runner._module_entries.items()
+        if isinstance(call.module, VideoPostprocessor)
+    ]
+    if not entries:
+        return
+    if not storage:
+        raise RuntimeError("video output warmup requires request storage")
+    name, call = entries[0]
+    frames = runner.media.maximum.num_frames
+    decoder = runner.video_decoder
+    window = decoder.frame_slices(frames)[0]
+    layout = decoder.output_layout(frames)["video"]
+    segment = torch.zeros(
+        (1, *layout.shape[1:]), dtype=layout.dtype, device=runner.bindings[name].device
+    )
+    state = storage[0].view(call.module.state_buffers(frames))
+    runner.run_module(
+        name,
+        (
+            TensorOutput(
+                segment, replace(layout, local_slice=(slice(0, 1), *layout.local_slice[1:]))
+            ),
+        ),
+        method="forward",
+        size=frames,
+        frames=(window,),
+        num_frames=(frames,),
+        state=state,
     )
 
 
 def create_media_resources(
-    model: VideoMixin,
-    *,
-    rank: int,
-    owns_output: bool,
-    state_slots: int,
-    unresolved_window: int,
-) -> tuple[MediaMux | None, MediaBuffers | None]:
-    """Provision public output resources from the declared media geometry."""
-
+    runner: ModelRunner, *, rank: int, owns_output: bool, state_slots: int, unresolved_window: int
+):
+    """Reserve output captures from duration, raster and explicit sampling clocks."""
     if not owns_output:
         return None, None
     require_video_codecs()
-    return (
-        MediaMux(rank=rank),
-        MediaBuffers(
-            state_slots=state_slots,
-            unresolved_window=unresolved_window,
-            max_video_frames_per_round=model.decode_frame_capacity,
-            video=model.output_capacity,
-        ),
+    decoder = runner.video_decoder
+    output = runner.video_postprocessor
+    audio = runner.audio_decoder
+    frames = runner.media.maximum.num_frames
+    return MediaMux(rank=rank), MediaBuffers(
+        state_slots=state_slots,
+        unresolved_window=unresolved_window,
+        max_video_frames_per_round=frames,
+        video=video.Config(frames, decoder.frame_size),
+        frame_rate=output.frame_rate,
+        audio_rate=audio.sample_rate,
     )
 
 
@@ -335,10 +262,12 @@ def decode_range(operation: ScheduledRequest, *, state: BatchState) -> DecodeRan
     return selected[0]
 
 
-def validate_batch(batch: ScheduleBatch, *, execution_model: Model) -> None:
+def validate_batch(
+    batch: ScheduleBatch, *, postprocessor: VideoPostprocessor | None
+) -> None:
     """Validate video admission requirements before staging state."""
 
-    if not isinstance(execution_model, VideoMixin):
+    if postprocessor is None:
         return
     for operation in batch.operations:
         if operation.kind is not PipelineStage.LATENT_PREPARATION:
@@ -354,51 +283,37 @@ def execute(
     state: BatchState,
     tensor_store: TensorStore,
     media_mux: MediaMux | None,
-    execution_model: Model,
     publication_transports: Mapping[str, Transport],
     request_pool: RequestPool,
     model_runner: ModelRunner,
 ) -> PendingOutput:
     """Land one ready video action without constructing a packed forward row."""
 
-    if not isinstance(execution_model, VideoMixin):
+    if model_runner.video_postprocessor is None:
         raise invalid_descriptor("video execution requires a video model")
-    model = execution_model
     request = state.pending_output(completion_group, operation.request_key.request_id)
     media = request.request.admission.diffusion
     if media is None:
         raise invalid_descriptor("video operation has no admitted media geometry")
-    scratch = model_runner.scratch
-    if scratch is None:
-        raise RuntimeError("video execution has no allocated scratch storage")
-    numerical_shape = video_shape(model, media, len(request.request.admission.prompt_token_ids))
+    numerical_shape = video_shape(
+        model_runner, media, len(request.request.admission.prompt_token_ids)
+    )
     trajectory = request.request.diffusion
     if trajectory is None:
-        trajectory = DiffusionState(size=numerical_shape, schedule=model_runner.schedule)
-        request.request.diffusion = trajectory
-    calls = {
-        PipelineStage.LATENT_PREPARATION: "forward_diffusion",
-        PipelineStage.DENOISING: "forward_diffusion",
-        PipelineStage.VIDEO_DECODING: "decode:video",
-        PipelineStage.AUDIO_DECODING: "decode:audio",
-        PipelineStage.VIDEO_ENCODING: "postprocess_video",
-    }
-    call = calls.get(operation.kind) if isinstance(operation.kind, PipelineStage) else None
-    slot, constants, call_scratch = (
-        ({}, {}, {})
-        if call is None
-        else prepare_call(
-            model,
-            model_runner,
-            trajectory,
-            call,
-            numerical_shape,
-            (
-                request_pool.tensors(request.request.request_pool_idx)
-                if model_runner.state_buffers
-                else None
-            ),
+        trajectory = VideoState(
+            size=numerical_shape,
+            schedules=dict(model_runner.media.schedules(device=model_runner.worker_config.device)),
         )
+        request.request.diffusion = trajectory
+    if not isinstance(trajectory, VideoState) or trajectory.size != numerical_shape:
+        raise invalid_descriptor("video request changed its admitted numerical dimensions")
+    slot, context = prepare_call(
+        model_runner,
+        trajectory,
+        operation,
+        request_pool.tensors(request.request.request_pool_idx)
+        if model_runner.state_buffers
+        else None,
     )
     mux = media_mux
     if (
@@ -412,8 +327,6 @@ def execute(
     tasks: tuple[CpuTask, ...] = ()
     products: tuple[TensorPublication, ...] = ()
     if operation.kind is PipelineStage.LATENT_PREPARATION:
-        if not isinstance(model, DiffusionMixin):
-            raise invalid_descriptor("latent preparation requires diffusion capability")
         params = trajectory_params(operation, state=state)
         if int(params.start_step) != 0 or int(params.step_count) != 0:
             raise invalid_descriptor("video preparation params must carry zero denoise steps")
@@ -429,17 +342,12 @@ def execute(
         if conditioning.region is not None:
             raise invalid_descriptor("video preparation requires complete conditioning coverage")
         encoded = conditioning.tensor
-        initial = (
-            initialize_latents(
-                model_runner.component("forward_diffusion"),
-                numerical_shape,
-                slot,
-                constants,
-                call_scratch,
-                media.seed,
-            )
-            if model_runner.bindings[operation.entry].owns
-            else ()
+        initial = model_runner.media.initialize(
+            numerical_shape,
+            slot,
+            seed=media.seed,
+            constants=context.constants,
+            workspace=context.workspace,
         )
         with model_runner.preparing_inputs(initial):
             if "conditioning" in model_runner.encoder_kinds:
@@ -455,34 +363,22 @@ def execute(
                 if len(result.values) != 1:
                     raise invalid_descriptor("conditioning computation must return one Tensor")
                 encoded = result.values[0]
-                stage_tensor(encoded, slot["text_condition"])
+                slot["text_condition"].copy_(
+                    encoded.reshape_as(slot["text_condition"]), non_blocking=True
+                )
     elif operation.kind is PipelineStage.DENOISING:
-        if not isinstance(model, DiffusionMixin):
-            raise invalid_descriptor("denoising requires diffusion capability")
         params = trajectory_params(operation, state=state)
         start_step, step_count = int(params.start_step), int(params.step_count)
         if start_step != operations.require_progress(request).flow_step:
             raise invalid_descriptor("denoising does not begin at the selected request step")
-        schedule = trajectory.schedule
-        if schedule is None:
-            raise RuntimeError("video execution lost its bound diffusion schedule")
-        if not call_scratch:
-            raise RuntimeError("denoising requires bound numerical scratch")
+        if step_count != 1:
+            raise invalid_descriptor("video denoising requires one selected numerical step")
         result = model_runner.run_denoising(
-            denoising_batch(
-                model,
-                numerical_shape,
-                slot,
-                schedule,
-                start_step,
-            ),
-            step_count,
-            schedule,
+            model_runner.media.bind(numerical_shape, slot, trajectory.schedules, start_step),
+            trajectory.schedules,
             state=slot,
-            constants=constants,
-            scratch=call_scratch,
             slot=request.request.request_pool_idx,
-            input_key=metadata_shape(model, numerical_shape),
+            input_key=numerical_shape,
         )
         if result.stats is None:
             raise RuntimeError("module output has no execution statistics")
@@ -528,27 +424,35 @@ def execute(
         if operation.kind in {PipelineStage.VIDEO_DECODING, PipelineStage.AUDIO_DECODING}:
             window = None
             if track is MediaTrack.VIDEO:
-                windows = model.decode_windows(model.video_info(media.num_frames))
+                windows = model_runner.video_decoder.frame_slices(media.num_frames)
                 binding = model_runner.bindings[operation.entry]
-                position = binding.config.ranks.index(binding.process_group.rank)
+                position = binding.config.ranks.index(binding.process_group.global_rank)
                 if position >= count or cursor < 0 or cursor + count > len(windows):
                     raise invalid_descriptor("video decoder assignment exceeds its window range")
                 window = windows[cursor + position]
             elif cursor != 0 or count != 1:
                 raise invalid_descriptor("audio decoding requires one complete stereo latent")
-            kind: DecodeKind = "video" if track is MediaTrack.VIDEO else "audio"
-            video = model.video_info(media.num_frames)
-            decoder_size = (
-                VideoSize(video.frame_count)
-                if kind == "video"
-                else round(video.frame_count * video.audio_rate / video.frame_rate)
-            )
-            result = model_runner.run_decoder(
-                kind,
-                DecodeBatch((read.tensor,), (decoder_size,), () if window is None else (window,)),
-                constants=constants,
-                scratch=call_scratch,
-            )
+            if read.tensor is None:
+                raise invalid_descriptor("media decoder has no complete numerical input")
+            if track is MediaTrack.VIDEO:
+                result = model_runner.run_module(
+                    operation.entry,
+                    (read.tensor,),
+                    method="decode",
+                    size=media.num_frames,
+                    frames=(window,),
+                    num_frames=(media.num_frames,),
+                )
+            else:
+                samples = audio_samples(model_runner, media.num_frames)
+                decoder = model_runner.component(operation.kind)
+                result = model_runner.run_module(
+                    operation.entry,
+                    (read.tensor,),
+                    method="decode",
+                    size=decoder.latent_frames(samples),
+                    num_samples=(samples,),
+                )
             if result.stats is None:
                 raise RuntimeError("module output has no execution statistics")
             state.group_forward_stats[completion_group].append(result.stats)
@@ -564,13 +468,14 @@ def execute(
             )
         else:
             assert mux is not None
-            shape = model.video_info(media.num_frames)
+            decoder = model_runner.video_decoder
+            windows = decoder.frame_slices(media.num_frames)
             mux.open(
                 operation.request_key,
-                video=shape,
-                video_unit_frames=tuple(
-                    window.frame_stop - window.frame_start for window in model.decode_windows(shape)
-                ),
+                video=video.Config(media.num_frames, decoder.frame_size),
+                frame_rate=model_runner.video_postprocessor.frame_rate,
+                audio_rate=model_runner.audio_decoder.sample_rate,
+                video_unit_frames=tuple(window.stop - window.start for window in windows),
             )
             mux.validate_track(operation.request_key, track, cursor, count)
             reservation = request.completion_tasks[0] if request.completion_tasks else None
@@ -578,24 +483,43 @@ def execute(
             if reservation is None or ring_lease is None:
                 raise RuntimeError("media output has no reserved capture storage")
             if track is MediaTrack.VIDEO:
-                windows = model.decode_windows(shape)[cursor : cursor + count]
+                windows = windows[cursor : cursor + count]
                 if len(windows) != count or read.tensor.shape[0] != count:
                     raise invalid_descriptor("video assembly exceeds its logical window range")
-                processed = model_runner.component("postprocess_video").postprocess_video(
-                    tuple(read.tensor.unbind(0)),
-                    windows,
-                    state=slot,
-                    constants=constants,
-                    scratch=call_scratch,
+                layout = decoder.output_layout(media.num_frames)["video"]
+                segments = tuple(
+                    TensorOutput(
+                        value.unsqueeze(0),
+                        replace(
+                            layout,
+                            local_slice=(
+                                slice(cursor + index, cursor + index + 1),
+                                *layout.local_slice[1:],
+                            ),
+                        ),
+                    )
+                    for index, value in enumerate(read.tensor.unbind(0))
                 )
-                frames = processed.values["video"][0]
-                if frames is None:
-                    raise RuntimeError("video postprocessing returned no frames")
-                value = frames
+                processed = model_runner.run_module(
+                    operation.entry,
+                    segments,
+                    method="forward",
+                    size=media.num_frames,
+                    frames=windows,
+                    num_frames=(media.num_frames,) * count,
+                    state=slot,
+                )
+                state.group_forward_stats[completion_group].append(processed.stats)
+                # Concatenation borrows one flat byte span. Restore the RGB
+                # raster axes before handing its pinned capture to the encoder.
+                value = concatenate_views(processed.values).view(
+                    -1, decoder.frame_size.height, decoder.frame_size.width, 3
+                )
             else:
                 value = read.tensor.view(torch.uint8)
             with profile_range(
-                f"uniserve.video.decode_copy request={_request_label(operation)} op={operation.op_id} kind={track.value}"
+                f"uniserve.video.decode_copy request={_request_label(operation)} "
+                f"step={operation.op_id.batch_id} op={operation.op_id.request_index} kind={track.value}"
             ):
                 capture = state.group_buffers[completion_group].capture_bytes_into(
                     value, ring_lease.storage

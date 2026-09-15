@@ -10,7 +10,6 @@ import threading
 import pytest
 import torch
 
-from uniserve.tensors import TensorRegion
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import (
     BufferAllocation,
@@ -97,7 +96,10 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
     locations = []
     try:
         for producer, piece, offset, store in zip(producers, pieces, offsets, stores, strict=True):
-            region = TensorRegion(offset=offset, shape=tuple(piece.shape))
+            region = tuple(
+                slice(start, start + extent)
+                for start, extent in zip(offset, tuple(piece.shape), strict=True)
+            )
             write = store.bind_outputs(
                 ((reference, device),),
                 buffer_allocations={
@@ -109,7 +111,7 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
             )[0]
             physical = store.publish_write(write, piece)
             store.commit_writes((write,))
-            location = producer.publish(physical, offset=region.offset)
+            location = producer.publish(physical, offset=tuple(axis.start for axis in region))
             store.retain_publication(write, producer.publication_retirement(location))
             locations.append(location)
             store.release_requests((reference.request_key,))
@@ -118,7 +120,7 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
         # has guard rows and columns outside the authorized write range.
         storage = torch.full((6, 6), -1.0, device=device)
         destination = storage[1:5, 1:5]
-        region = TensorRegion(offset=(1, 2), shape=(4, 4))
+        region = (slice(1, 5), slice(2, 6))
         _consume(
             fetch_tensor(
                 tensor,
@@ -233,7 +235,7 @@ def test_shm_cuda_region_fits_its_reserved_device_allocation() -> None:
                 tensor,
                 destination,
                 bindings={(location.source, location.backend): transport},
-                region=TensorRegion((0, 1), (4, 3)),
+                region=(slice(0, 4), slice(1, 4)),
             )
         )
         torch.cuda.synchronize()
@@ -308,6 +310,78 @@ def test_tensor_delivery_gathers_shards_across_processes(
             producers[location.backend].release(location)
         for producer in producers.values():
             producer.close()
+        events.close()
+        parent.close()
+        child.close()
+
+
+def _receive_independent_shards(channel) -> None:
+    events = EventPool()
+    consumer = make_transport(
+        "cuda_ipc", byte_capacity=12 << 20, ticket_capacity=4, event_pool=events
+    )
+    try:
+        tensor = TensorTransfer.from_mapping(channel.recv())
+        destination = torch.empty(tensor.shape, device="cuda:0")
+        independent = torch.cuda.Stream()
+        pending = torch.cuda.Event()
+        torch.cuda.synchronize()
+        with torch.cuda.stream(independent):
+            torch.cuda._sleep(2_000_000_000)
+            pending.record()
+        tickets = fetch_tensor(
+            tensor,
+            destination,
+            bindings={(location.source, "cuda_ipc"): consumer for location in tensor.locations},
+        )
+        _consume(tickets)
+        actual = destination.cpu()
+        progressed = not pending.query()
+        expected = torch.arange(3, dtype=torch.float32)[:, None, None].expand_as(actual)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        independent.synchronize()
+        consumer.close()
+        channel.send(
+            {"independent_pending": progressed, "retired": all(t.retired() for t in tickets)}
+        )
+    finally:
+        consumer.close()
+        events.close()
+        channel.close()
+
+
+def test_sharded_delivery_progresses_during_independent_device_work() -> None:
+    # Each published shard has its own allocation. Delivering their complete
+    # logical tensor must not depend on an unrelated consumer-GPU computation.
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe()
+    events = EventPool()
+    producer = make_transport(
+        "cuda_ipc", byte_capacity=12 << 20, ticket_capacity=4, event_pool=events
+    )
+    sources = tuple(
+        torch.full((1, 1024, 1024), float(index), device="cuda:1") for index in range(3)
+    )
+    locations = tuple(
+        producer.publish(source, offset=(index, 0, 0)) for index, source in enumerate(sources)
+    )
+    process = context.Process(target=_receive_independent_shards, args=(child,))
+    try:
+        process.start()
+        parent.send(TensorTransfer(shape=(3, 1024, 1024), locations=locations).to_mapping())
+        assert parent.poll(45), "cross-process tensor delivery did not complete"
+        result = parent.recv()
+        process.join(30)
+        assert process.exitcode == 0
+        assert result["independent_pending"], "sharded delivery waited for independent device work"
+        assert result["retired"]
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(10)
+        for location in locations:
+            producer.release(location)
+        producer.close()
         events.close()
         parent.close()
         child.close()
@@ -438,7 +512,10 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
     expected = torch.arange(48, dtype=torch.float32, device=device).reshape(6, 8)
     peer, resident = expected.chunk(2, dim=shard_axis)
     offset = (3, 0) if shard_axis == 0 else (0, 4)
-    region = TensorRegion(offset, tuple(resident.shape))
+    region = tuple(
+        slice(start, start + extent)
+        for start, extent in zip(offset, tuple(resident.shape), strict=True)
+    )
     reference = TensorRef(
         RequestKey(1, 1, 1),
         ComputationId(1, 0),
@@ -550,7 +627,7 @@ def test_full_region_publishes_complete_bounded_tensor() -> None:
             ((reference, "cpu"),),
             buffer_allocations={reference.buffer_id: allocation},
             shapes={reference: (6, 8)},
-            regions={reference: TensorRegion((0, 0), (6, 8))},
+            regions={reference: (slice(0, 6), slice(0, 8))},
         )
         store.publish_write(write, expected)
         store.commit_writes((write,))

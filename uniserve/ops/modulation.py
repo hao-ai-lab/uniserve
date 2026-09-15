@@ -274,9 +274,10 @@ def gated_residual_rms_norm_fp8(
         )
         assert scales is not None
         return update, values, scales
-    from uniserve.nn.quant.fp8 import quantize_fp8_rowwise
+    from uniserve.quantization import Quantizer
 
     residual = hidden.float() + gate.index_select(0, row_indices).float() * update.float()
     normalized = _modulate(residual, weight, shift, scale, row_indices, eps)
-    values, scales = quantize_fp8_rowwise(normalized.reshape(-1, normalized.shape[-1]))
-    return residual.to(hidden.dtype), values.reshape(normalized.shape), scales
+    encoded = Quantizer("fp8", axis=0).quantize(normalized.reshape(-1, normalized.shape[-1]))
+    buffers = encoded.buffers()
+    return residual.to(hidden.dtype), buffers["values"].reshape(normalized.shape), buffers["scale"]

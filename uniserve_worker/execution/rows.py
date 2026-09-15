@@ -7,7 +7,7 @@ from typing import TypeAlias
 
 import torch
 
-from uniserve.model.tensors import FlowPatches, TokenSelection
+from uniserve_worker.execution.tensors import TokenSelection
 from uniserve_worker.protocol.batch import (
     ComputationId,
     ForwardMode,
@@ -32,7 +32,6 @@ class ForwardRow:
     token_embedding_mask: torch.Tensor | None = None
     positions: torch.Tensor | None = None
     selection: TokenSelection | None = None
-    flow_conditioning: FlowPatches | None = None
     timestep: torch.Tensor | None = None
     latent: torch.Tensor | None = None
     image_tokens: int = 0
@@ -46,8 +45,6 @@ class ForwardRow:
     group_id: int = 0
     write_kv: bool = False
     causal: bool = True
-    attention_indexes: torch.Tensor | None = None
-    text_local_indices: tuple[int, ...] = ()
     decode_predicate: torch.Tensor | None = None
     decode_predicate_tagged: bool = False
     decode_force_finish: bool = False

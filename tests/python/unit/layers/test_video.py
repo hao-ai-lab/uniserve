@@ -1,20 +1,27 @@
 """Numerical video reconstruction preserves window order and decoded precision."""
 
-from dataclasses import replace
-
 import pytest
 import torch
 from torch import nn
 
-from uniserve.model.media import DecodeWindow
-from uniserve.model.video import VideoMixin
+from uniserve.media import image
+from uniserve.model import VideoPostprocessor
+from uniserve.tensors import OutputLayout, TensorOutput
 from uniserve.nn.vae.spatial import SpatialDecoder
 
 pytestmark = pytest.mark.unit
 
 
 def test_video_windows_preserve_pixels_across_separate_calls():
-    model = VideoMixin()
+    class ThreeFrameVideo(VideoPostprocessor):
+        def reconstruction_slices(self, frames, num_frames):
+            return slice(0, 3), slice(4, 6)
+
+    model = ThreeFrameVideo(
+        torch.tensor([0.0, 0.5], dtype=torch.float16),
+        frame_size=image.Config(2, 3),
+        frame_rate=24,
+    )
     frames = (
         (1, 0, 0.5, 1, 0.25, 0.75),
         (1, 1, 0.5, 0, 1, 0),
@@ -28,18 +35,13 @@ def test_video_windows_preserve_pixels_across_separate_calls():
         for values in frames
     )
     originals = tuple(segment.clone() for segment in segments)
-    windows = tuple(
-        DecodeWindow(
-            index * 2,
-            index * 2 + 3,
-            index * 3,
-            index * 3 + (5 if index == 2 else 3),
-            3,
-            2,
-            1,
-            final=index == 2,
+    windows = tuple(slice(index * 3, index * 3 + (5 if index == 2 else 3)) for index in range(3))
+    outputs = tuple(
+        TensorOutput(
+            value,
+            OutputLayout(tuple(value.shape), value.dtype, tuple(slice(0, n) for n in value.shape)),
         )
-        for index in range(3)
+        for value in segments
     )
     constants = {
         "pixel_mean": torch.zeros((1, 3, 1, 1, 1)),
@@ -50,13 +52,18 @@ def test_video_windows_preserve_pixels_across_separate_calls():
     # The first interval resets overlap numerically; later intervals consume
     # the exact successor state left by the previous independent call.
     parts = []
-    for segment, window in zip(segments, windows, strict=True):
-        result = model.postprocess_video(
-            (segment,), (window,), state=state, constants=constants, scratch=scratch
-        )
-        value = result.values["video"][0]
-        assert value is not None
-        assert result.layouts["video"][0].shape == tuple(value.shape)
+    for segment, window in zip(outputs, windows, strict=True):
+        result = model(
+            (segment,),
+            frames=(window,),
+            num_frames=(11,),
+            state=state,
+            constants=constants,
+            workspace=scratch,
+        )[0]
+        value = result.tensor
+        assert result.layout.shape == (11, 2, 3, 3)
+        assert result.layout.local_slice[0] == window
         parts.append(value.clone())
     expected = (
         torch.tensor([255, 0, 128, 64, 223, 128, 255, 0, 0, 128, 255], dtype=torch.uint8)
@@ -64,10 +71,17 @@ def test_video_windows_preserve_pixels_across_separate_calls():
         .expand(11, 2, 3, 3)
     )
     torch.testing.assert_close(torch.cat(parts), expected, rtol=0, atol=0)
-    together = model.postprocess_video(
-        segments, windows, state=state, constants=constants, scratch=scratch
+    together = model(
+        outputs,
+        frames=windows,
+        num_frames=(11, 11, 11),
+        state=state,
+        constants=constants,
+        workspace=scratch,
     )
-    torch.testing.assert_close(together.values["video"][0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.cat(tuple(part.tensor for part in together)), expected, rtol=0, atol=0
+    )
     torch.testing.assert_close(state["video_overlap"], segments[-1][:, :, -2:], rtol=0, atol=0)
     for segment, original in zip(segments, originals, strict=True):
         torch.testing.assert_close(segment, original, rtol=0, atol=0)
@@ -75,41 +89,31 @@ def test_video_windows_preserve_pixels_across_separate_calls():
     previous_state = state["video_overlap"].clone()
     previous_output = scratch["rgb_frames"].clone()
     with pytest.raises(ValueError, match="contiguous"):
-        model.postprocess_video(
-            segments[:2],
-            (windows[0], replace(windows[1], frame_start=4, frame_stop=7)),
+        model(
+            outputs[:2],
+            frames=(windows[0], slice(4, 7)),
+            num_frames=(11, 11),
             state=state,
             constants=constants,
-            scratch=scratch,
+            workspace=scratch,
         )
     torch.testing.assert_close(state["video_overlap"], previous_state, rtol=0, atol=0)
     torch.testing.assert_close(scratch["rgb_frames"], previous_output, rtol=0, atol=0)
 
     scratch["rgb_frames"][0].zero_()
-    assert torch.count_nonzero(together.values["video"][0][0]) == 0
-
-
-class RasterDecoder(SpatialDecoder):
-    """A separable numerical decoder with exactly known spatial reconstruction."""
-
-    use_tiling = True
-    spatial_compression_ratio = 2
-    tile_sample_min_height = 8
-    tile_sample_min_width = 8
-    tile_sample_min_overlap_height = 2
-    tile_sample_min_overlap_width = 2
-
-    def __init__(self):
-        super().__init__()
-        self.post_quant_conv = nn.Identity()
-
-    def forward(self, latents):
-        return latents.repeat_interleave(2, -2).repeat_interleave(2, -1)
+    assert torch.count_nonzero(together[0].tensor[0]) == 0
 
 
 @pytest.mark.parametrize("height,width", [(3, 4), (5, 7), (9, 13)])
 def test_spatial_decoder_preserves_batches_and_raster_alignment(height, width):
-    decoder = RasterDecoder()
+    decoder = SpatialDecoder(
+        nn.Upsample(scale_factor=(1, 2, 2), mode="nearest"),
+        spatial_compression=2,
+        tile_height=8,
+        tile_width=8,
+        overlap_height=2,
+        overlap_width=2,
+    )
     latents = torch.arange(2 * 3 * 2 * height * width, dtype=torch.float32).reshape(
         2, 3, 2, height, width
     )
@@ -124,11 +128,10 @@ def test_spatial_decoder_preserves_batches_and_raster_alignment(height, width):
         weights = (torch.arange(2, dtype=torch.float32) / 2).view(1, 1, 1, 1, 2)
         expected[..., 6:8] = raster[..., 6:8] * (1 - weights) + expected[..., 6:8] * weights
     original = latents.clone()
-    torch.testing.assert_close(decoder.decode(latents), expected, rtol=0, atol=0)
+    torch.testing.assert_close(decoder.decode(latents, tiled=True), expected, rtol=0, atol=0)
     torch.testing.assert_close(latents, original, rtol=0, atol=0)
-    decoder.use_tiling = False
     torch.testing.assert_close(
-        decoder.decode(latents),
+        decoder.decode(latents, tiled=False),
         latents.repeat_interleave(2, -2).repeat_interleave(2, -1),
         rtol=0,
         atol=0,

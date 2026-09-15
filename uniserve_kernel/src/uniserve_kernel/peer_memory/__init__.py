@@ -1,6 +1,7 @@
 """CUDA allocation, mapping, and asynchronous host-storage primitives."""
 
 from functools import lru_cache
+from math import prod
 from pathlib import Path
 
 import torch
@@ -39,34 +40,46 @@ def allocate(shape: tuple[int, ...], *, dtype: torch.dtype, device: torch.device
     return _extension().PeerAllocation(torch.empty(0, dtype=dtype, device=device), list(shape))
 
 
-def export_ipc(tensor: torch.Tensor) -> tuple[bytes, int, int]:
-    """Export an allocation handle, byte capacity, and tensor byte offset.
+def empty(shape: tuple[int, ...], *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Allocate exportable CUDA storage, rounding physical backing to CUDA pages.
 
-    The caller owns the source and must keep its published contents immutable
-    until all mapped readers have completed and closed their mappings.
+    The tensor owns its allocation and mapping. Its owner must retain it until
+    all local device accesses and remote grants have retired. Logical shape and
+    storage size remain distinct; views retain the complete physical backing.
     """
 
-    return _extension().export_ipc(tensor)
+    elements = prod(shape)
+    if elements == 0:
+        return torch.empty(shape, dtype=dtype, device=device)
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    page_bytes = allocation_granularity(device)
+    nbytes = ((elements * itemsize + page_bytes - 1) // page_bytes) * page_bytes
+    owner = allocate((nbytes // itemsize,), dtype=dtype, device=device)
+    storage = owner.map_local()
+    return storage[:elements].view(shape)
 
 
-def import_ipc(
-    prototype: torch.Tensor,
-    handle: bytes,
-    allocation_bytes: int,
-    byte_offset: int,
-    shape: tuple[int, ...],
-    strides: tuple[int, ...],
-) -> torch.Tensor:
-    """Map a bounded tensor on the prototype's CUDA device and dtype.
+def export_fd(tensor: torch.Tensor) -> tuple[int, int, int] | None:
+    """Export shared storage as an owned descriptor, byte capacity and offset.
 
-    The returned tensor closes its mapping when released. Its transfer lease
-    must retain it through the last GPU read and acknowledge the producer only
-    after releasing it. This primitive does not synchronize consumer streams.
+    Return None for storage without exportable physical backing. The caller
+    closes the descriptor and retains the source through every reader grant.
+    Other CUDA failures are raised.
     """
 
-    return _extension().import_ipc(
-        prototype, handle, allocation_bytes, byte_offset, list(shape), list(strides)
-    )
+    return _extension().export_fd(tensor)
+
+
+def import_fd(prototype: torch.Tensor, descriptor: int, allocation_bytes: int) -> torch.Tensor:
+    """Map a granted allocation on the prototype device as a flat typed tensor.
+
+    The descriptor remains caller-owned and may be closed after this call. The
+    returned tensor retains the imported physical handle. Retain its mapping
+    until all device reads complete, then release it before acknowledging the
+    source grant. This primitive does not synchronize consumer streams.
+    """
+
+    return _extension().import_fd(prototype, descriptor, allocation_bytes)
 
 
 def copy_host_device(

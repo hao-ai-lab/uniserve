@@ -1,50 +1,43 @@
-"""Direct staged execution of concrete model phases."""
+"""Worker-owned execution of declared numerical capabilities."""
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
-from collections import defaultdict
-from collections.abc import Callable, Hashable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager, nullcontext
+from collections import OrderedDict, defaultdict
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
 
 import torch
+from torch import nn
 
-from uniserve.attention.context import attention_scope
-from uniserve.distributed.mesh import Communicator, DeviceMesh
-from uniserve.model.batch import DecodeBatch, DiffusionBatch, EncodeBatch
-from uniserve.model.decoder import DecodeKind, DecoderMixin
-from uniserve.model.diffusion import DiffusionMixin
-from uniserve.model.encoder import EncodeKind, EncoderMixin
-from uniserve.model.image_diffusion import ImageDiffusion
-from uniserve.model.media import VideoSize
-from uniserve.model.model import Model
-from uniserve.model.tensors import TensorViews, TokenSelection
-from uniserve.model.text import TextMixin
-from uniserve.model.video import VideoMixin
-from uniserve.nn.attention import RadixAttention
-from uniserve.nn.attention_storage import attention_exchange_scope
-from uniserve.nn.collective import collective_scope
-from uniserve.nn.diffusion.schedule import DiffusionSchedule
-from uniserve.nn.vae.decoder import LatentDecoder, decoder_scope
-from uniserve.runtime.cuda_graph import CudaGraph, capture_pools
+from uniserve.distributed import Communicator, DeviceMesh
+from uniserve.model import (
+    AudioDecoder,
+    CausalLM,
+    Denoiser,
+    ImageDecoder,
+    ImageDenoiser,
+    PatchEncoder,
+    TextEncoder,
+    TextSize,
+    VideoDecoder,
+    VideoPostprocessor,
+)
+from uniserve.nn.vae import PatchAutoencoder
+from uniserve.runtime import CUDAGraph, ExecutionContext
+from uniserve.runtime.backends.attention import resolve as attention_backend
+from uniserve.runtime.backends.attention.flashinfer import Backend as FlashInfer
+from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.device import canonical_device, fill_cpu_ints
 from uniserve.runtime.resources import close_resources
-from uniserve.runtime.tensor_buffers import TensorBuffers
-from uniserve.runtime.tensors import workspace_groups
-from uniserve.tensors import BufferConfig, OutputLayout, TensorRegion
-from uniserve_models.processing import FlowPrompt, ImageProcessor, PatchTransform
+from uniserve.tensors import OutputLayout, TensorOutput
+from uniserve_models.processing import ImageProcessor
 from uniserve_worker.config import ComponentConfig, WorkerConfig
-from uniserve_worker.execution.batch import ExecutionOutput, InputBatch
-from uniserve_worker.execution.graph_inputs import (
-    DiffusionShape,
-    GraphExecutionError,
-)
 from uniserve_worker.foundation.errors import (
     ComputeError,
     InputError,
@@ -55,384 +48,186 @@ from uniserve_worker.foundation.errors import (
     invalid_descriptor,
 )
 from uniserve_worker.protocol.batch import (
-    COMPUTATIONS,
-    Computation,
     ComputationId,
-    DecodeRange,
-    DiffusionSamplingParams,
     ForwardMode,
     ForwardStats,
     ImageParams,
-    OutputInfo,
     PipelineStage,
     ScheduledRequest,
-    StaticDim,
 )
 from uniserve_worker.runtime.results import resolve_outputs
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
-from uniserve_worker.runtime.tensor_store import device_product_storage
 
-from ..bootstrap.components import bind_components, call_operations, supported_operations
+from ..bootstrap.components import bind_components, call_operations, describe_components
+from ..bootstrap.inputs import capability, image_inputs, media_inputs
 from ..profiling import record_component
+from .batch import ExecutionOutput, InputBatch
+from .cuda_stream import CudaStream, create_partitioned_streams
 from .diffusion_runner import DiffusionRunner
-from .input_buffers import InputBufferConfig, InputBuffers
-from .model_entry import ModelEntry, TensorOutput, capture_required, tensor_signature
-from .resources import media_state_buffers, media_workspace_buffers, output_layouts
+from .graph_inputs import (
+    BatchGraph,
+    PrefillShape,
+    clone_inputs,
+    copy_inputs,
+    input_signature,
+    pad_text,
+    private_pool_bytes,
+    select_flow_captures,
+    select_prefill_captures,
+    text_shape,
+    widen_prefix,
+)
+from .input_buffers import InputBuffers
+from .model_entry import ModelEntry, capture_required
+from .resources import media_state_buffers, output_layouts
+from .rows import ForwardRow
+from .tensors import TokenSelection
+from .text import TextCall
 
 if TYPE_CHECKING:
-    from uniserve.attention.selection import AttentionSelection
-
     from ..runtime.block_tables import BlockTables
     from ..runtime.cache_manager import CacheManager
     from ..runtime.decode_state import DecodeState
-from uniserve.attention.metadata import AttentionMode
-from uniserve.nn.collective import stream_collective_scope
-from uniserve.nn.sparse_attention import SparseAttention
-
-from ..config import LaneConfig
-from .cuda_stream import CudaStream, create_partitioned_streams
-from .graph_inputs import (
-    _GRAPH_BINDINGS,
-    BatchGraph,
-    PrefillShape,
-    _attention_inputs,
-    _batch_tensors,
-    _copy_tensors,
-    _cuda_batch,
-    _decode_shape,
-    _decode_signature,
-    _exact_signature,
-    _graph_batch,
-    _graph_provider,
-    _GraphMiss,
-    _greedy_decode,
-    _live_attention,
-    _normalize_exact_batch,
-    _pad_decode_batch,
-    _pad_prefill_batch,
-    _prefill_shape,
-    _prefill_signature,
-    _private_pool_bytes,
-    _release_call,
-    _trim_greedy,
-    _trim_output,
-)
-from .rows import ForwardRow
-from .sampling import SamplerOutput
 
 logger = logging.getLogger(__name__)
 
 
-def _validate_products(
-    name: str, outputs: tuple[OutputInfo, ...], values: tuple[torch.Tensor, ...]
-) -> None:
-    """Check numerical results against their advertised output bounds."""
-
-    if len(values) != len(outputs):
-        raise ComputeError(f"entry {name!r} returned the wrong number of tensor results")
-    for value, output in zip(values, outputs, strict=True):
-        dtype, _ = device_product_storage(output.dtype)
-        if str(value.dtype).removeprefix("torch.") != dtype:
-            raise ComputeError(f"entry {name!r} changed tensor result {output.name!r} dtype")
-        dims = output.shape_bound.dims
-        if value.ndim != len(dims) or any(
-            extent != dim.extent if isinstance(dim, StaticDim) else not 0 < extent <= dim.bound
-            for extent, dim in zip(value.shape, dims, strict=True)
-        ):
-            raise ComputeError(f"entry {name!r} exceeded tensor result {output.name!r} shape")
-
-
-def _invoke(
-    ids: torch.Tensor,
-    positions: torch.Tensor,
-    batch: InputBatch,
-    *,
-    text: TextMixin | None,
-    diffusion_model: DiffusionMixin | None,
-    encoder: EncoderMixin | None,
-    decoder: DecoderMixin | None,
-    pipeline: Communicator | None,
-) -> ExecutionOutput:
-    """Invoke one homogeneous numerical capability and wrap its result for execution."""
-
-    from uniserve.model.batch import DecodeBatch, DiffusionBatch, EncodeBatch, TextBatch
-    from uniserve.model.media import ImageSize
-
-    if isinstance(batch.forward_mode, ForwardMode):
-        if text is None:
-            raise InputError("text execution requires the text computational capability")
-        numerical = TextBatch(
-            ids,
-            positions,
-            batch.attention,
-            batch.token_selections,
-            batch.input_embeddings,
-            batch.embedding_mask,
-        )
-        hidden = text.forward(numerical, constants={}, scratch={})
-        text_result = text.compute_logits(hidden, numerical)
-        return ExecutionOutput(text_result.values, text_result.vocabularies)
-    if batch.forward_mode is PipelineStage.DENOISING:
-        if diffusion_model is None:
-            raise InputError("diffusion execution requires the diffusion computational capability")
-        diffusion = DiffusionBatch(
-            latents={"image": batch.flow_latents},
-            sizes=tuple(
-                ImageSize(height, width)
-                for height, width in zip(batch.flow_heights, batch.flow_widths, strict=True)
-            ),
-            timesteps={"image": batch.flow_timesteps},
-            positions=batch.flow_positions,
-            conditioning={"image": batch.flow_conditioning},
-            sequence_lengths=batch.flow_image_tokens,
-            attention=batch.attention,
-        )
-        result = diffusion_model.forward_diffusion(diffusion, state={}, constants={}, scratch={})
-        values = list(result.values["image"])
-        if pipeline is not None and pipeline.world_size > 1:
-            # All mathematical PP participants retain solver state. Only the
-            # final stage evaluates the head; execution distributes its result.
-            for index, value in enumerate(values):
-                if value is None:
-                    value = torch.empty_like(
-                        diffusion.latents["image"][index],
-                        dtype=diffusion_model.prediction_dtype,
-                    )
-                    values[index] = value
-                pipeline.broadcast(value, src=pipeline.world_size - 1)
-        if any(value is None for value in values):
-            raise RuntimeError("diffusion result is missing its output-stage value")
-        return ExecutionOutput(cast(tuple[torch.Tensor, ...], tuple(values)))
-    if batch.forward_mode in {PipelineStage.VISION_ENCODING, PipelineStage.LATENT_ENCODING}:
-        if encoder is None:
-            raise InputError("encoding requires the encoder computational capability")
-        kind: EncodeKind = (
-            "vision" if batch.forward_mode is PipelineStage.VISION_ENCODING else "latent"
-        )
-        encoding = EncodeBatch(batch.encode_pixels, batch.encode_grids, batch.encode_grid_shapes)
-        result = encoder.encode(
-            kind,
-            encoding,
-            constants={},
-            scratch={},
-        )
-        name = "features" if kind == "vision" else "latents"
-    elif batch.forward_mode is PipelineStage.IMAGE_DECODING:
-        if decoder is None:
-            raise InputError("decoding requires the decoder computational capability")
-        decoding = DecodeBatch(
-            batch.decode_latents,
-            tuple(
-                ImageSize(height, width)
-                for height, width, latent in zip(
-                    batch.decode_heights, batch.decode_widths, batch.decode_latents, strict=True
-                )
-            ),
-        )
-        result = decoder.decode(
-            "image",
-            decoding,
-            constants={},
-            scratch={},
-        )
-        name = "image"
-    else:
-        raise TypeError(f"unsupported model phase {batch.forward_mode.value!r}")
-    rows = result.values[name]
-    if any(value is None for value in rows):
-        raise RuntimeError("numerical result is missing its output-stage value")
-    return ExecutionOutput(cast(tuple[torch.Tensor, ...], rows), layouts=result.layouts[name])
-
-
-def _encode(encode: Callable[..., Any], *values: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    """Invoke a tensor-only encoder through its standard numerical batch."""
-
-    output = encode(EncodeBatch(values), constants={}, scratch={})
-    rows = output.values["conditioning"]
-    if any(value is None for value in rows):
-        raise RuntimeError("the bound encoder partition did not produce its conditioning")
-    return cast(tuple[torch.Tensor, ...], rows)
-
-
-def capture_image_parameters(
-    cfg_branches: int,
-    *,
-    steps: int,
-    height: int,
-    width: int,
-) -> ImageParams:
-    """Build deterministic bounded image-generation parameters for startup warmup."""
-
-    scales = {
-        1: (1.0, 1.0),
-        2: (4.0, 1.0),
-        3: (4.0, 2.0),
-    }
-    try:
-        text_scale, image_scale = scales[int(cfg_branches)]
-    except KeyError as error:
-        raise invalid_descriptor(
-            "flow CFG branch geometry exceeds the concrete branch set"
-        ) from error
+def capture_image_parameters(cfg_branches, *, steps, height, width):
+    text, image = {1: (1.0, 1.0), 2: (4.0, 1.0), 3: (4.0, 2.0)}[cfg_branches]
     return ImageParams(
-        steps=int(steps),
-        cfg_text_scale=text_scale,
-        cfg_img_scale=image_scale,
-        height=int(height),
-        width=int(width),
-        seed=0,
+        steps=steps, cfg_text_scale=text, cfg_img_scale=image, height=height, width=width, seed=0
+    )
+
+
+def _observations(name, started, path):
+    elapsed = (time.perf_counter_ns() - started) // 1000
+    return ForwardStats(
+        mode_counts={name: 1},
+        mode_tokens={name: 1},
+        mode_us={name: elapsed},
+        component_us={"forward": elapsed},
+        cuda_graph_runtime_mode_counts={path: 1},
+        cuda_graph_captures=int(path == "graph_capture"),
+        cuda_graph_replays=int(path == "graph_replay"),
     )
 
 
 class ModelRunner:
-    """Own model bindings, numerical input storage, and CUDA graph execution."""
+    """Own contexts, input storage, stream bindings and graph residency.
+
+    Each numerical call uses its declared capability. Shared Parameters remain
+    in the loaded module tree; independent call/lane contexts own mutable plans,
+    workspaces, communication resources and captured input/output storage.
+    """
 
     def __init__(
         self,
-        model: Model,
+        model: nn.Module,
         worker_config: WorkerConfig,
         *,
-        bindings: Mapping[str, ModelEntry] | None = None,
-        attention: AttentionSelection | None = None,
-        schedule: DiffusionSchedule | None = None,
-        image_processor: ImageProcessor | None = None,
-        flow_prompt: FlowPrompt | None = None,
-    ) -> None:
-        """Bind loaded compute modules to one public execution resource owner."""
-
-        from uniserve.attention import resolve_attention_selection
-        from uniserve.nn.attention import RadixAttention, bind_dense_attention_modules
-        from uniserve_models.catalog import entry_paths
-
-        self.attention = attention or resolve_attention_selection(
-            worker_config.attention_backend or "auto",
-            tuning=worker_config.flashinfer,
-            block_size=worker_config.block_size,
+        bindings=None,
+        attention=None,
+        image_processor=None,
+        flow_prompt=None,
+    ):
+        self.model, self.worker_config = model, worker_config
+        self.attention = attention_backend(
+            attention or worker_config.attention_backend or "auto",
+            device=canonical_device(worker_config.device),
+            flashinfer=FlashInfer(worker_config.flashinfer),
         )
-        bind_dense_attention_modules(model, self.attention)
-        self.model = model
-        self.processor = image_processor
-        self.flow_prompt = flow_prompt
-        declarations = model.component_calls(model.config)
-        self._output_calls = {}
-        self._media_modules = {}
-        for entry, path in entry_paths(type(model), model.config).items():
-            component = model.get_submodule(path)
-            methods = tuple(call.method for call in declarations if call.component == path)
-            self._output_calls[entry] = tuple(
-                (method, partial(output_layouts, model, method, component)) for method in methods
-            )
-            if isinstance(model, VideoMixin):
-                for method in methods:
-                    self._media_modules[method] = component
-        self.outputs = resolve_outputs(model)
-        self.bindings = MappingProxyType(dict(bindings or {}))
-        bind_components(model, self.bindings)
-        self.schedule = schedule
-        self.worker_config = worker_config
-        self.uses_lanes = False
-        self.flow_captures: tuple[DiffusionShape, ...] = ()
-        self.flow_cfg_branches: tuple[int, ...] = ()
-        self._startup_complete = False
-        self._forward_entries: dict[tuple[str, Computation], ModelEntry] = {}
-        self.batch_graphs: dict[ModelEntry, dict[Hashable, BatchGraph]] = {}
-        self.graph_streams: dict[ModelEntry, torch.cuda.Stream] = {}
-        self.graph_pools: dict[ModelEntry, Any] = {}
-        self.graph_device_pools: dict[ModelEntry, dict[torch.device, torch.cuda.MemPool]] = {}
-        self.graph_memory_budgets: dict[torch.device, int] = {}
-        self.decode_shapes: dict[ModelEntry, tuple[int, ...]] = {}
-        self.prefill_shapes: dict[ModelEntry, tuple[PrefillShape, ...]] = {}
-        self.prefill_row_sizes: tuple[int, ...] = ()
-        self.decode_context_blocks = 0
-        self.decode_predicates: torch.Tensor | None = None
-        self.kv_cache: CacheManager
-        self._streams: list[CudaStream] = []
-        self.entries: dict[tuple[str, str, str], ModelEntry] = {}
-        self.diffusion: DiffusionRunner | None = None
-        self._capture_stream: torch.cuda.Stream | None = None
-        self._text_staging: StagingBuffers | None = None
-        self._text_tokens: torch.Tensor | None = None
-        self._encoders: dict[EncodeKind, str] = {}
-        self._decoders: dict[DecodeKind, tuple[str, LatentDecoder, Callable[..., Any]]] = {}
-        self._preparation_stream: torch.cuda.Stream | None = None
-        self._sum_reductions = {}
-        self._attention_exchange_storage = {}
-        self.scratch: TensorBuffers | None = None
-        self.state_buffers: dict[str, BufferConfig] = {}
-        self._closed = False
-        try:
-            from uniserve.distributed.collectives import allocate_peer_reductions
-
-            meshes = (entry.mesh for entry in self.bindings.values() if entry.mesh is not None)
-            self._sum_reductions = allocate_peer_reductions(mesh.get_group("tp") for mesh in meshes)
-            exchange_modules = tuple(
-                module
-                for module in model.modules()
-                if isinstance(module, RadixAttention)
-                and module.exchange.ulysses_group.world_size > 1
-            )
-            if exchange_modules:
-                from uniserve.runtime.attention_storage import allocate_attention_exchange_storage
-
-                from ..bootstrap.capacity import input_buffer_config
-
-                input_config = input_buffer_config(model, worker_config, processor=self.processor)
-                dtype = getattr(torch, worker_config.model_dtype.removeprefix("torch."))
-                for lane in worker_config.lanes or (None,):
-                    lane_id = None if lane is None else lane.lane_id
-                    self._attention_exchange_storage[lane_id] = allocate_attention_exchange_storage(
-                        exchange_modules,
-                        max_tokens=input_config.max_tokens,
-                        dtype=dtype,
-                    )
-
-            self._bind_tensors()
-            self._bind_encoders()
-            self._bind_decoders()
-            self._bind_video()
-            if (
-                self.diffusion is None
-                and isinstance(model, DiffusionMixin)
-                and model.generation is not None
-            ):
-                self.diffusion = DiffusionRunner(
-                    generation=model.generation,
-                    solver=model.solver,
-                    device=canonical_device(
-                        worker_config.generation_device or worker_config.device
-                    ),
-                    capture_stream=None,
-                    groups=(),
-                    capacity=worker_config.max_request_pool_size,
+        self.processor, self.flow_prompt = image_processor, flow_prompt
+        self.images = image_inputs(model)
+        self.media = media_inputs(model, worker_config)
+        self.text = capability(model, CausalLM)
+        # Capability discovery belongs to initialization. Request execution uses
+        # these borrowed modules without walking the loaded parameter tree.
+        self.video_decoder = capability(model, VideoDecoder)
+        self.audio_decoder = capability(model, AudioDecoder)
+        self.video_postprocessor = capability(model, VideoPostprocessor)
+        self.outputs = resolve_outputs(model, worker_config)
+        self._declarations = describe_components(model)
+        if bindings is None:
+            device, rank = canonical_device(worker_config.device), worker_config.rank
+            group = Communicator((rank,), 0, device=device)
+            bindings = {}
+            for name, calls in self._declarations.items():
+                temporal = any(isinstance(call.module, VideoDecoder) for call in calls)
+                config = ComponentConfig(
+                    (rank,), distribution="temporal_units" if temporal else None
                 )
+                mesh = DeviceMesh(
+                    ranks=(rank,),
+                    rank=rank,
+                    shape=tuple(size for _, size in config.parallel_config.dimensions),
+                    axes=tuple(axis for axis, _ in config.parallel_config.dimensions),
+                )
+                bindings[name] = ModelEntry(name, config, group, mesh, device)
+        self.bindings = MappingProxyType(dict(bindings))
+        bind_components(model, self.bindings)
+        self.state_buffers = media_state_buffers(model, self.bindings, worker_config)
+        self.entries = {}
+        self._forward_entries = {}
+        self._module_entries = {}
+        self._module_contexts = OrderedDict()
+        self._module_pools = {}
+        self._module_graphs = {}
+        self._module_streams = {}
+        self._text_calls = {}
+        self._streams = []
+        self._capture_stream = None
+        self._preparation_stream = None
+        self._text_staging = self._text_tokens = None
+        self.batch_graphs = {}
+        self.graph_pools = {}
+        self.graph_memory_budgets = {}
+        self.decode_shapes, self.prefill_shapes = {}, {}
+        self.prefill_row_sizes = ()
+        self.flow_captures, self.flow_cfg_branches = (), ()
+        self.decode_context_blocks = 0
+        self.decode_predicates = None
+        self.kv_cache = None
+        self.diffusion = None
+        self.uses_lanes = False
+        self._startup_complete = self._closed = False
+        try:
+            for name, binding in self.bindings.items():
+                for call in binding.calls:
+                    if isinstance(call.module, CausalLM) and call.entry.method == "forward":
+                        self._text_calls[id(call.module)] = TextCall(call.module)
+                    elif isinstance(call.module, TextEncoder) and call.entry.method == "encode":
+                        device = binding.device
+                        self._text_tokens = torch.empty(
+                            worker_config.max_sequence_tokens, dtype=torch.int64, device=device
+                        )
+                        self._text_staging = StagingBuffers(
+                            tuple(self._text_tokens.shape),
+                            dtype=torch.int64,
+                            depth=2,
+                            device=device,
+                        )
+                    if not call_operations((call,)):
+                        continue
+                    key = (name, call.path, call.entry.method)
+                    self._module_entries[key] = (binding, call)
+                    if self.media is not None and isinstance(call.module, Denoiser):
+                        self.diffusion = DiffusionRunner(
+                            call.module,
+                            device=binding.device,
+                            capture_stream=self.capture_stream(),
+                            groups=call.groups,
+                            capacity=worker_config.max_request_pool_size,
+                            attention=self.attention,
+                            additional_devices=self._capture_devices(binding.device),
+                        )
         except BaseException as error:
             try:
                 self.close()
-            except BaseException as cleanup_error:
-                error.add_note(f"Resource cleanup also failed: {cleanup_error!r}")
+            except BaseException as cleanup:
+                error.add_note(f"execution resource cleanup failed: {cleanup!r}")
             raise
 
-    def component(self, method: str) -> Any:
-        """Borrow the numerical media module resolved during startup."""
-
-        return self._media_modules[method]
-
-    def _bind_tensors(self) -> None:
-        """Resolve local request state and allocate the caller's shared scratch."""
-
-        self.state_buffers = media_state_buffers(self.model, self.bindings)
-        workspace = media_workspace_buffers(self.model, self.bindings)
-        if workspace:
-            self.scratch = TensorBuffers.allocate(
-                workspace,
-                self.worker_config.device,
-                pin_memory=torch.device(self.worker_config.device).type == "cuda",
-                symmetric=workspace_groups(self.model, workspace),
-            )
-
-    def capture_stream(self) -> torch.cuda.Stream | None:
-        """Borrow the module capture stream when CUDA graph execution is enabled."""
-
+    def capture_stream(self):
         device = canonical_device(self.worker_config.device)
         if self.worker_config.graph_policy == "off" or device.type != "cuda":
             return None
@@ -440,392 +235,810 @@ class ModelRunner:
             self._capture_stream = torch.cuda.Stream(device=device)
         return self._capture_stream
 
-    def _bind_encoders(self) -> None:
-        """Bind encoder participation from the numerical kind and component mesh."""
-
-        model = self.model
-        kinds: dict[str, EncodeKind] = {
-            "encode:text": "text",
-            "encode:conditioning": "conditioning",
-        }
-        for component, binding in self.bindings.items():
-            if binding.mesh is None:
-                continue
-            for method, (forward, groups) in binding.methods.items():
-                kind = kinds.get(method)
-                if kind is None:
-                    continue
-                if kind in self._encoders:
-                    raise ValueError(f"{kind} encoding has multiple local component bindings")
-                name = "text_encoder" if kind == "text" else "conditioner"
-                entry = self.bind_module(
-                    name,
-                    partial(_encode, forward),
-                    groups=groups,
-                    placement=component,
-                )
-                if kind == "text":
-                    entry.outputs = binding.outputs
-                self._encoders[kind] = name
-                if kind == "text":
-                    max_tokens = cast(
-                        int, getattr(model.get_submodule(binding.component), "max_tokens")
-                    )
-                    self._text_staging = StagingBuffers(
-                        max_tokens,
-                        dtype=torch.int64,
-                        depth=2,
-                        device=binding.device,
-                    )
-                    self._text_tokens = torch.empty(
-                        max_tokens, dtype=torch.int64, device=binding.device
-                    )
-
-    def _bind_decoders(self) -> None:
-        """Bind declared decoder capabilities independently of model classification."""
-
-        model = self.model
-        kinds: dict[str, DecodeKind] = {
-            "decode:image": "image",
-            "decode:video": "video",
-            "decode:audio": "audio",
-        }
-        for component, binding in self.bindings.items():
-            for method, (forward, groups) in binding.methods.items():
-                kind = kinds.get(method)
-                if kind is None:
-                    continue
-                mesh = binding.mesh
-                if mesh is None or kind == "image":
-                    continue
-                component_module = model.get_submodule(binding.component)
-                module = component_module.native
-                if not isinstance(module, LatentDecoder):
-                    raise ValueError(
-                        f"resident component {component!r} has no native {kind} decoder"
-                    )
-                if kind in self._decoders:
-                    raise ValueError(f"{kind} decoding has multiple local component bindings")
-                fixed = None
-                if all(extent is not None for extent in module.latent_shape):
-                    # A fully specified native shape supports one fixed capture,
-                    # independent of the enclosing request's window or duration.
-                    fixed = (
-                        torch.zeros(
-                            cast(tuple[int, ...], module.latent_shape),
-                            dtype=torch.float32,
-                            device=binding.device,
-                        ),
-                    )
-                self.bind_module(component, module, inputs=fixed, groups=groups)
-                self._decoders[kind] = (component, module, forward)
-
-    def _bind_video(self) -> None:
-        """Bind resident media computations using declared calls and physical entries."""
-
-        from uniserve.model.video import VideoMixin
-
-        model = self.model
-        if not isinstance(model, VideoMixin):
-            return
-        for component, binding in self.bindings.items():
-            mesh = binding.mesh
-            if mesh is None:
-                continue
-            for method, (forward, groups) in binding.methods.items():
-                if method == "forward_diffusion":
-                    if self.diffusion is not None:
-                        raise ValueError("video diffusion requires one resident denoiser binding")
-                    from uniserve.nn.parallel_attention import AttentionBuffers, ParallelAttention
-                    from uniserve.nn.sparse_attention import TILE
-                    from uniserve.runtime.attention_storage import (
-                        allocate_context_storage,
-                        allocate_output_storage,
-                    )
-
-                    denoiser = model.get_submodule(binding.component)
-                    if not isinstance(denoiser, DiffusionMixin):
-                        raise ValueError("denoiser component must provide the diffusion capability")
-                    layers = tuple(
-                        layer
-                        for layer in denoiser.modules()
-                        if isinstance(layer, ParallelAttention)
-                    )
-                    contexts: Mapping[ParallelAttention, AttentionBuffers] = {}
-                    output_storage = None
-                    if layers:
-                        maximum = model.output_capacity
-                        workspace_buffers = cast(
-                            Callable[[VideoSize], Mapping[str, BufferConfig]],
-                            getattr(denoiser, "workspace_buffers"),
-                        )
-                        output = workspace_buffers(
-                            VideoSize(
-                                maximum.frame_count,
-                                cast(int, getattr(model.text_encoder, "max_tokens")),
-                            )
-                        )["attention_output"]
-                        rows, heads, width = output.shape
-                        contexts = allocate_context_storage(
-                            layers,
-                            rows=rows,
-                            heads=heads,
-                            head_dim=width,
-                            dtype=output.dtype,
-                            block_size=TILE,
-                        )
-                        output_storage = allocate_output_storage(
-                            layers,
-                            rows=rows,
-                            heads=heads,
-                            head_dim=width,
-                            dtype=output.dtype,
-                        )
-                    self.diffusion = DiffusionRunner(
-                        denoiser,
-                        device=binding.device,
-                        additional_devices=self._capture_devices(binding.device),
-                        capture_stream=self.capture_stream(),
-                        groups=groups,
-                        capacity=self.worker_config.max_request_pool_size,
-                        context_buffers=contexts,
-                        output_storage=output_storage,
-                        sparse_layers=tuple(
-                            layer
-                            for layer in denoiser.modules()
-                            if isinstance(layer, SparseAttention)
-                        ),
-                    )
-
-    def bind_module(
-        self,
-        name: str,
-        forward: Callable[..., TensorOutput],
-        *,
-        inputs: tuple[torch.Tensor, ...] | None = None,
-        groups: tuple[Communicator, ...] = (),
-        placement: str | None = None,
-        outputs: tuple[OutputInfo, ...] | None = None,
-    ) -> ModelEntry:
-        """Bind a local computation and optional caller-owned publication contract.
-
-        Explicit output descriptors serve standalone Python computations. Model
-        capabilities use the output requirements resolved during construction.
-        """
-
-        device = canonical_device(self.worker_config.device)
-        key = (name, str(device), "default")
-        if key in self.entries:
-            raise ValueError(f"numerical entry {name!r} is already bound")
-        module = self._entry(placement or name, device)
-        if placement is not None:
-            module = replace(module, name=name)
-        module.forward = forward
-        module.fixed_inputs = inputs
-        module.outputs = self.outputs.get(name, ()) if outputs is None else outputs
-        # Groups describe numerical participation, including rank-local calls
-        # with no collectives, independently of the enclosing component mesh.
-        module.groups = groups
-        self.entries[key] = module
-        return module
-
-    def _entry(self, name: str, device: torch.device) -> ModelEntry:
-        """Resolve checkpoint placement, or a standalone local model binding."""
-
-        if self.bindings:
-            entry = self.bindings.get(name)
-            if entry is None or not entry.owns:
-                raise ValueError(f"rank does not own computation entry {name!r}")
-            if entry.device == device:
-                return entry
-            # A model may place generation submodules on another local device.
-            # The physical binding shares rank geometry, not mutable GPU storage.
-            return ModelEntry(
-                name,
-                entry.config,
-                entry.process_group,
-                entry.mesh,
-                device,
-                component=entry.component,
-                methods=dict(entry.methods),
+    def _capture_devices(self, device):
+        return tuple(
+            value
+            for value in dict.fromkeys(
+                canonical_device(value)
+                for value in (self.worker_config.device, self.worker_config.generation_device)
+                if value is not None
             )
-        rank = self.worker_config.rank
-        group = Communicator((rank,), rank, device=device)
-        config = ComponentConfig((rank,))
-        mesh = DeviceMesh((rank,), rank, config.parallel_config, device)
-        return ModelEntry(name, config, group, mesh, device)
+            if value.type == "cuda" and value != device
+        )
 
-    def warmup(self, storage: tuple[TensorBuffers, ...]) -> None:
-        """Prepare model/provider geometry through its numerical execution owners."""
+    def component(self, kind, *, capability_type=None):
+        calls = [
+            call
+            for _, call in self._module_entries.values()
+            if kind in call_operations((call,))
+            and (capability_type is None or isinstance(call.module, capability_type))
+        ]
+        if len(calls) != 1:
+            raise InputError(f"computation {kind.value} requires one local capability")
+        return calls[0].module
 
-        started = time.perf_counter()
-        logger.info("starting numerical eager warmup device=%s", self.worker_config.device)
-        with torch.inference_mode(), collective_scope(self._sum_reductions):
-            from uniserve.model.video import VideoMixin
+    def _module_call(self, name, method=None):
+        entries = [
+            (binding, call)
+            for (entry, _, operation), (binding, call) in self._module_entries.items()
+            if entry == name and (method is None or operation == method)
+        ]
+        if len(entries) != 1:
+            raise InputError(f"entry {name!r} requires an unambiguous numerical method")
+        return entries[0]
 
-            from .video import warmup_denoising, warmup_postprocess
+    def prepare_module(self, name, size, *, method=None):
+        """Prepare one exact numerical size before dependent media calls."""
 
-            if isinstance(self.model, VideoMixin):
-                warmup_denoising(self.model, self, storage)
-                shape = self.model.output_capacity
-                for component, binding in self.bindings.items():
-                    if "decode:audio" in binding.methods:
-                        decoder = self.component("decode:audio")
-                        samples = round(shape.frame_count * shape.audio_rate / shape.frame_rate)
-                        native = decoder.workspace_buffers(decoder.latent_frames(samples))[
-                            "audio_latents"
-                        ]
-                        inputs = torch.zeros(
-                            native.shape, dtype=native.dtype, device=binding.device
-                        )
-                        self.warmup_module(component, inputs)
-                warmup_postprocess(self.model, self, storage)
-        self.synchronize()
-        logger.info("completed numerical eager warmup seconds=%.3f", time.perf_counter() - started)
+        binding, call = self._module_call(name, method)
+        key = (name, call.path, call.entry.method, input_signature(size))
+        if key not in self._module_contexts:
+            resident = tuple(value for value in self._module_contexts if value[:3] == key[:3])
+            if len(resident) >= self.worker_config.max_request_pool_size:
+                self._retire_module(resident[0])
+            stream = self.module_stream(name, method=call.entry.method)
+            context = ExecutionContext(call.module, attention=self.attention, stream=stream)
+            try:
+                if stream is not None:
+                    stream.wait_stream(torch.cuda.current_stream(binding.device))
+                context.prepare(size)
+            except BaseException:
+                context.close()
+                raise
+            self._module_contexts[key] = context
+            if stream is not None:
+                with torch.cuda.device(binding.device):
+                    self._module_pools[id(context)] = {binding.device: torch.cuda.MemPool()}
+        self._module_contexts.move_to_end(key)
+        return self._module_contexts[key]
 
-    def batch_forward(self, entry: ModelEntry, batch: InputBatch) -> ExecutionOutput:
-        """Use the same numerical and communication binding for startup and serving."""
+    def module_stream(self, name, *, method=None):
+        """Bind one numerical entry to a stream in its existing resource grant."""
 
-        lane = entry.cuda_stream
-        inputs = entry.input_buffers
-        assert inputs is not None
-        ids = inputs.input_ids[:0] if batch.input_ids is None else batch.input_ids
-        positions = inputs.positions[0, :0] if batch.positions is None else batch.positions
-        reductions = self._sum_reductions if lane is None or lane.full_device else {}
-        storage = self._attention_exchange_storage.get(None if lane is None else lane.name)
-        exchanges = {} if storage is None else storage.views
-        with (
-            collective_scope(reductions),
-            attention_exchange_scope(exchanges),
-            attention_scope(batch.binding, capture=batch.cuda_graph_capture),
+        binding, call = self._module_call(name, method)
+        if binding.device.type != "cuda":
+            return None
+        self._initialize_streams(event_slots=2)
+        key = (name, call.path, call.entry.method)
+        if key not in self._module_streams:
+            computations = call_operations((call,))
+            parents = tuple(
+                stream
+                for stream in self._streams
+                if stream.device == binding.device
+                and (stream.config is None or computations.intersection(stream.config.computations))
+            )
+            if len(parents) > 1:
+                raise InputError("one numerical entry requires an unambiguous execution partition")
+            if parents:
+                owner = parents[0].fork()
+            elif self.worker_config.lanes:
+                raise InputError("numerical entry has no initialized execution partition")
+            else:
+                owner = CudaStream(
+                    device=binding.device,
+                    stream=torch.cuda.Stream(device=binding.device),
+                    sm_count=torch.cuda.get_device_properties(binding.device).multi_processor_count,
+                )
+            # Weights and runtime backing are initialized before their first
+            # borrowed use. Later calls depend on tensor fences, not other entries.
+            try:
+                owner.wait(torch.cuda.current_stream(binding.device))
+            except BaseException:
+                owner.close()
+                raise
+            self._module_streams[key] = owner
+        return self._module_streams[key].stream
+
+    def operation_stream(self, operation):
+        """Select a standalone capability's stream; staged batches bind their own lanes."""
+
+        if (operation.entry, operation.kind) in self._forward_entries:
+            return None
+        if (
+            operation.kind is PipelineStage.LATENT_PREPARATION
+            and (operation.entry, PipelineStage.DENOISING) in self._forward_entries
         ):
-            assert entry.forward is not None
-            output = entry.forward(ids, positions, batch)
-            if not isinstance(output, ExecutionOutput):
-                raise TypeError("batch entry must return ExecutionOutput")
-            return output
+            return None
+        calls = tuple(
+            call
+            for (name, _, _), (_, call) in self._module_entries.items()
+            if name == operation.entry and operation.kind in call_operations((call,))
+        )
+        if not calls:
+            return None
+        if operation.kind is PipelineStage.LATENT_PREPARATION:
+            # Preparation composes the denoiser's initialization with optional
+            # conditioning encoders. The denoiser owns this operation's stream;
+            # its encoder calls retain their ordinary input/output dependencies.
+            calls = tuple(call for call in calls if isinstance(call.module, Denoiser))
+        if len(calls) != 1:
+            raise InputError("operation requires one bound numerical capability")
+        return self.module_stream(operation.entry, method=calls[0].entry.method)
+
+    def _initialize_streams(self, *, event_slots):
+        """Realize execution grants for both staged and standalone capabilities."""
+
+        if self._streams:
+            return
+        config, device = self.worker_config, canonical_device(self.worker_config.device)
+        self.uses_lanes = bool(config.lanes)
+        if config.lanes:
+            if self._capture_devices(device):
+                raise ValueError("Green Context lanes require one physical device")
+            self._streams.extend(
+                create_partitioned_streams(config.lanes, device, event_slots=event_slots)
+            )
+        else:
+            for target in (device, *self._capture_devices(device)):
+                if target.type == "cuda":
+                    self._streams.append(
+                        CudaStream(
+                            device=target,
+                            stream=torch.cuda.Stream(device=target),
+                            sm_count=torch.cuda.get_device_properties(target).multi_processor_count,
+                            event_slots=event_slots,
+                        )
+                    )
+
+    def _retire_module(self, key):
+        """Drain a producer before releasing the graphs that borrow its resources."""
+        context = self._module_contexts.pop(key)
+        if context.stream is not None:
+            context.stream.synchronize()
+        for graph_key in tuple(self._module_graphs):
+            if graph_key[0] == id(context):
+                self._module_graphs.pop(graph_key)[0].close()
+        context.close()
+        self._module_pools.pop(id(context), None)
+
+    @property
+    def encoder_kinds(self):
+        return frozenset(
+            self._encoder_kind(call.module)
+            for _, call in self._module_entries.values()
+            if call.entry.method == "encode"
+        )
+
+    @staticmethod
+    def _encoder_kind(module):
+        if isinstance(module, TextEncoder):
+            return "text"
+        if isinstance(module, PatchEncoder):
+            return "vision"
+        if isinstance(module, PatchAutoencoder):
+            return "latent"
+        return "conditioning"
+
+    def run_encoder(self, kind, *values):
+        found = [
+            (name, call)
+            for (name, _, _), (_, call) in self._module_entries.items()
+            if call.entry.method == "encode" and self._encoder_kind(call.module) == kind
+        ]
+        if len(found) != 1:
+            raise InputError(f"rank does not participate in {kind} encoding")
+        name, call = found[0]
+        inputs = tuple(value.reshape(-1) for value in values) if kind == "text" else values
+        size = (
+            TextSize(sum(value.numel() for value in inputs), len(inputs))
+            if kind == "text"
+            else tuple(value.shape for value in inputs)
+        )
+        return self.run_module(name, inputs, method="encode", size=size)
 
     @torch.inference_mode()
-    def capture(self, *, tokenizer, latents) -> None:
-        """Prepare configured entry inputs in dependency order before runtime warmup."""
+    def run_module(self, name, *args, method=None, size=None, **kwargs):
+        """Run an actual capability method with caller-supplied numerical arguments."""
 
-        from functools import partial
+        binding, call = self._module_call(name, method)
+        context = self.prepare_module(name, size, method=call.entry.method)
+        started, path = time.perf_counter_ns(), "eager"
+        stream = context.stream
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream(binding.device))
+        # These views belong to this prepared context. Graph input staging owns
+        # only changing numerical arguments, never a duplicate of the workspace.
+        resources = {}
+        if isinstance(call.module, (VideoDecoder, VideoPostprocessor)):
+            resources["constants"] = context.constants
+            resources["workspace"] = context.workspace
+        elif isinstance(call.module, AudioDecoder):
+            resources["workspace"] = context.workspace
+        values = (args, kwargs)
+        key = (id(context), input_signature(values))
+        graph = self._module_graphs.get(key)
+        can_capture = (
+            stream is not None
+            and self.worker_config.graph_policy != "off"
+            and not isinstance(call.module, VideoPostprocessor)
+        )
+        with context.activate():
+            if can_capture:
+                missing = capture_required(graph is None, call.groups, binding.device)
+                if missing:
+                    if graph is not None:
+                        graph[0].close()
+                    static = clone_inputs(values)
+                    call.forward(*static[0], **static[1], **resources)
+                    executable = CUDAGraph(context=context, pools=self._module_pools[id(context)])
+                    try:
+                        executable.capture(
+                            lambda: call.forward(*static[0], **static[1], **resources)
+                        )
+                    except BaseException:
+                        executable.close()
+                        raise
+                    graph = (executable, static)
+                    self._module_graphs[key] = graph
+                    path = "graph_capture"
+                else:
+                    path = "graph_replay"
+                copy_inputs(graph[1], values)
+                result = graph[0].replay()
+            else:
+                result = call.forward(*args, **kwargs, **resources)
+            output = self._result(result).clone()
+        if stream is not None:
+            torch.cuda.current_stream(binding.device).wait_stream(stream)
+        return replace(output, stats=_observations(name, started, path))
 
-        from .graph_inputs import PrefillShape
+    @staticmethod
+    def _result(result):
+        if isinstance(result, torch.Tensor):
+            result = (result,)
+        if isinstance(result, Mapping):
+            result = tuple(value for values in result.values() for value in values)
+        values, layouts = [], []
+        for value in result:
+            if isinstance(value, TensorOutput):
+                values.append(value.tensor)
+                layouts.append(value.layout)
+            elif isinstance(value, torch.Tensor):
+                values.append(value)
+                layouts.append(None)
+            else:
+                raise ComputeError("participating numerical call did not return a tensor")
+        return ExecutionOutput(tuple(values), layouts=tuple(layouts))
+
+    def run_denoising(self, inputs, schedules, *, state, slot, input_key):
+        if self.diffusion is None:
+            raise InputError("rank does not own denoising computation")
+        started = time.perf_counter_ns()
+        values, path = self.diffusion.step(
+            inputs, schedules, state=state, slot=slot, input_key=input_key
+        )
+        return replace(self._result(values), stats=_observations("denoiser", started, path))
+
+    def output_layout(self, entry, output_index, media, decode, num_prompt_tokens):
+        binding = self.bindings.get(entry)
+        if binding is not None and binding.process_group.global_rank not in binding.output_ranks:
+            return None
+        results = tuple(
+            (call, name, layout)
+            for call in self._declarations[entry]
+            for name, layout in output_layouts(
+                self.model,
+                self.worker_config,
+                call,
+                frames=None if media is None else media.num_frames,
+                prompt_tokens=num_prompt_tokens,
+            ).items()
+        )
+        call, name, layout = results[output_index]
+        if isinstance(call.module, Denoiser) and any(
+            axis.stop == axis.start for axis in layout.local_slice
+        ):
+            return None
+        if binding is None or binding.config.distribution is None:
+            return layout
+        # Protocol decoder outputs contain the units in this scheduled call;
+        # numerical decoder layouts describe their complete temporal timeline.
+        units = layout.shape[0] if decode is None else decode.max_units
+        position = binding.config.ranks.index(binding.process_group.global_rank)
+        start = position * binding.config.units_per_rank
+        count = min(binding.config.units_per_rank, units - start)
+        if count < 1:
+            return None
+        return replace(
+            layout,
+            shape=(units, *layout.shape[1:]),
+            local_slice=(slice(start, start + count), *layout.local_slice[1:]),
+        )
+
+    def configure_inputs(
+        self,
+        *,
+        input_config,
+        kv_cache,
+        latent_pool,
+        decode_predicates,
+        max_operations,
+        request_slots,
+        max_tokens,
+        latent_capacity_units,
+        decode_context_blocks,
+        variants,
+        max_inflight,
+    ):
+        from ..bootstrap.capacity import device_total_bytes
+        from ..config import DEFAULT_PREFILL_GRAPH_ROW_BUCKETS, graph_memory_budget_bytes
+
+        if self.batch_graphs:
+            raise RuntimeError("input execution resources are already bound")
+        self.kv_cache, self.decode_predicates = kv_cache, decode_predicates
+        self.decode_context_blocks = decode_context_blocks
+        self.prefill_row_sizes = DEFAULT_PREFILL_GRAPH_ROW_BUCKETS
+        config = self.worker_config
+        self._initialize_streams(event_slots=max_inflight + 1)
+        max_rows = min(max_operations, request_slots)
+        decode_sizes = tuple(
+            value
+            for value in config.decode_graph_batch_sizes
+            if 0 < value <= max_rows and value < kv_cache.info.num_blocks
+        )
+        prefill_capacity = min(
+            max_tokens,
+            config.max_sequence_tokens,
+            (kv_cache.info.num_blocks - 1) * config.block_size,
+        )
+        prefill_sizes = tuple(
+            value for value in config.prefill_graph_token_sizes if 0 < value <= prefill_capacity
+        )
+        if self.images is not None:
+            from uniserve.media import image
+
+            self.flow_cfg_branches = (1, 2, 3)
+            self.flow_captures = select_flow_captures(
+                config.flow_graph_shapes,
+                config.flow_graph_batch_sizes,
+                self.flow_cfg_branches,
+                max_operations=max_rows,
+                max_tokens=input_config.max_tokens,
+                per_image_capacity=latent_capacity_units,
+                latent_capacity=latent_pool.capacity_units,
+                physical_tokens=lambda height, width: self.images.sequence_length(
+                    image.Config(height, width)
+                ),
+                image_tokens=lambda height, width: self.images.denoiser.latent_shape(
+                    "image", image.Config(height, width)
+                )[0],
+            )
+        staged = {
+            ForwardMode.PREFILL,
+            ForwardMode.DECODE,
+            ForwardMode.VERIFY,
+            PipelineStage.VISION_ENCODING,
+            PipelineStage.LATENT_ENCODING,
+            PipelineStage.IMAGE_DECODING,
+        }
+        if self.images is not None:
+            staged.add(PipelineStage.DENOISING)
+        for (name, path, method), (placement, call) in self._module_entries.items():
+            operations = call_operations((call,)) & staged
+            if not operations:
+                continue
+            target = (
+                canonical_device(config.generation_device or config.device)
+                if operations & {PipelineStage.LATENT_ENCODING, PipelineStage.IMAGE_DECODING}
+                else placement.device
+            )
+            streams = [stream for stream in self._streams if stream.device == target]
+            for stream in streams or (None,):
+                kinds = (
+                    operations
+                    if stream is None or stream.config is None
+                    else operations.intersection(stream.config.computations)
+                )
+                if not kinds:
+                    continue
+                lane = None if stream is None else stream.config
+                rows = (
+                    max_rows
+                    if lane is None
+                    else min(max_rows, lane.max_batch_operations or max_rows)
+                )
+                tokens = (
+                    input_config.max_tokens
+                    if lane is None
+                    else min(
+                        input_config.max_tokens, lane.max_batch_tokens or input_config.max_tokens
+                    )
+                )
+                decode = (
+                    tuple(value for value in decode_sizes if value <= rows)
+                    if ForwardMode.DECODE in kinds
+                    else ()
+                )
+                prefill = (
+                    select_prefill_captures(
+                        prefill_sizes,
+                        self.prefill_row_sizes,
+                        max_rows=rows,
+                        max_tokens=tokens,
+                        visual=self.images is not None,
+                    )
+                    if ForwardMode.PREFILL in kinds
+                    else ()
+                )
+                # A prefill bucket includes a padding sequence beyond admitted
+                # requests. It consumes staging, but no scheduler request slot.
+                fields = (
+                    replace(
+                        input_config,
+                        max_rows=max(
+                            input_config.max_rows, *(shape.row_bucket for shape in prefill)
+                        ),
+                    )
+                    if prefill
+                    else input_config
+                )
+                entry = ModelEntry(
+                    name,
+                    placement.config,
+                    placement.process_group,
+                    placement.mesh,
+                    target,
+                    calls=(call,),
+                    computations=tuple(kinds),
+                    cuda_stream=stream,
+                )
+                try:
+                    if stream is not None:
+                        stream.wait(torch.cuda.current_stream(target))
+                    with nullcontext() if stream is None else torch.cuda.stream(stream.stream):
+                        entry.input_buffers = InputBuffers(
+                            config=fields,
+                            device=target,
+                            images=self.images,
+                            max_inflight=max_inflight,
+                        )
+                        entry.context = ExecutionContext(
+                            call.module,
+                            cache=kv_cache.cache
+                            if isinstance(call.module, (CausalLM, ImageDenoiser))
+                            else None,
+                            attention=self.attention,
+                            stream=None if stream is None else stream.stream,
+                        )
+                        # Text staging counts canonical tokens. Spatial codecs
+                        # and vision towers expand those into different query
+                        # domains, so their layer plans use the actual numerical
+                        # shapes encountered during preparation/eager execution.
+                        size = (
+                            TextSize(fields.max_tokens, fields.max_rows)
+                            if isinstance(call.module, (CausalLM, ImageDenoiser))
+                            else None
+                        )
+                        entry.context.prepare(size)
+                except BaseException as error:
+                    try:
+                        close_resources(
+                            *(
+                                owner.close
+                                for owner in (entry.context, entry.input_buffers)
+                                if owner is not None
+                            )
+                        )
+                    except BaseException as cleanup:
+                        error.add_note(f"input resource cleanup failed: {cleanup!r}")
+                    raise
+                self.entries[(name, path, None if stream is None else stream.name)] = entry
+                self.batch_graphs[entry] = {}
+                self.decode_shapes[entry], self.prefill_shapes[entry] = decode, prefill
+                if config.graph_policy != "off" and target.type == "cuda":
+                    pools = {}
+                    for graph_device in (target, *self._capture_devices(target)):
+                        with torch.cuda.device(graph_device):
+                            pools[graph_device] = torch.cuda.MemPool()
+                        self.graph_memory_budgets[graph_device] = graph_memory_budget_bytes(
+                            device_total_bytes(graph_device)
+                        )
+                    self.graph_pools[entry] = pools
+                for kind in kinds:
+                    key = (name, kind)
+                    if key in self._forward_entries:
+                        raise ValueError(f"computation {key} has multiple lane bindings")
+                    self._forward_entries[key] = entry
+
+    def batch_forward(self, entry, batch, *, padded=False):
+        call = entry.calls[0]
+        module, inputs = call.module, batch.inputs
+        if isinstance(module, CausalLM):
+            text = self._text_calls[id(module)]
+            return (
+                text.last_logits(inputs)
+                if padded and batch.token_selections[0] is TokenSelection.LAST_LOGITS
+                else text(inputs, batch.token_selections)
+            )
+        if isinstance(module, ImageDenoiser):
+            result = module(
+                inputs,
+                state={},
+                constants=entry.context.constants,
+                workspace=entry.context.workspace,
+            )["image"]
+            pipeline = module.mesh.get_group("pp" if "pp" in module.mesh.axes else ())
+            values = []
+            for prediction, size in zip(result, inputs.sizes, strict=True):
+                value = (
+                    prediction.tensor
+                    if prediction is not None
+                    else torch.empty(
+                        module.latent_shape("image", size),
+                        dtype=module.prediction_dtype,
+                        device=entry.device,
+                    )
+                )
+                pipeline.broadcast(value, src=pipeline.size - 1)
+                values.append(value)
+            return ExecutionOutput(tuple(values))
+        if isinstance(module, PatchEncoder):
+            return ExecutionOutput(module.encode(inputs))
+        if isinstance(module, PatchAutoencoder):
+            return ExecutionOutput(tuple(module.encode(torch.stack(inputs.images)).unbind(0)))
+        if isinstance(module, ImageDecoder):
+            values = module.decode(inputs.latents, sizes=inputs.sizes)
+            return ExecutionOutput(
+                values,
+                layouts=tuple(
+                    OutputLayout(
+                        tuple(value.shape),
+                        value.dtype,
+                        tuple(slice(0, extent) for extent in value.shape),
+                        value_range=module.decoder.value_range,
+                    )
+                    for value in values
+                ),
+            )
+        raise InputError("staged entry has no supported numerical capability")
+
+    def select_graph_shape(self, entry, batch, *, eligible):
+        if not eligible or entry not in self.graph_pools:
+            return None
+        text = isinstance(entry.calls[0].module, CausalLM)
+        decode = (
+            text
+            and batch.forward_mode is ForwardMode.DECODE
+            and batch.inputs.attention.queries.host == (1,) * batch.row_count
+        )
+        if not decode and not self.worker_config.prefill_cuda_graph:
+            return None
+        if text:
+            shape = text_shape(
+                batch,
+                decode_sizes=self.decode_shapes[entry],
+                prefill_shapes=self.prefill_shapes[entry],
+                context_blocks=self.decode_context_blocks,
+            )
+            if shape is None:
+                return None
+            if shape[-1] and batch.decode_force_finish is None:
+                # Direct token inputs and device continuations use the same
+                # numerical decode graph. Only the latter consumes its greedy
+                # continuation result; the former supplies an inert finish mask.
+                finish = entry.input_buffers.decode_force_finish[: batch.row_count]
+                finish.zero_()
+                batch = replace(batch, decode_force_finish=finish)
+            padded = pad_text(batch, *shape)
+            inputs = padded.inputs
+            key = (
+                "text",
+                shape,
+                inputs.input_ids.dtype,
+                inputs.positions.ndim,
+                inputs.embeddings is not None,
+                batch.decode_force_finish is not None,
+                inputs.attention.causal[0],
+                padded.token_selections[0],
+            )
+            return key, padded, True
+        execution = widen_prefix(batch, entry.input_buffers.max_blocks_per_row)
+        return ("exact", input_signature(execution)), execution, False
+
+    @torch.inference_mode()
+    def eager_batch(self, entry, batch, forward):
+        with entry.context.activate():
+            attention = getattr(batch.inputs, "attention", None)
+            if attention is not None:
+                entry.context.bind_attention(attention)
+            return forward(batch)
+
+    @torch.inference_mode()
+    def capture_batch(self, entry, batch, forward):
+        context = entry.context
+        current = torch.cuda.current_stream(entry.device) if entry.device.type == "cuda" else None
+        if context.stream is not None:
+            context.stream.wait_stream(current)
+        try:
+            with context.activate():
+                self._capture_batch(entry, batch, forward)
+        finally:
+            if context.stream is not None:
+                current.wait_stream(context.stream)
+
+    def _capture_batch(self, entry, batch, forward):
+        if self._startup_complete:
+            raise CUDAGraphError("batch capture is outside startup preparation")
+        selected = self.select_graph_shape(entry, batch, eligible=True)
+        if selected is None:
+            self.eager_batch(entry, batch, forward)
+            return
+        key, execution, padded = selected
+        if key in self.batch_graphs[entry]:
+            return
+        invoke = partial(self.batch_forward, entry, padded=True) if padded else forward
+        # Text buckets use the entry's stable staging addresses, ordered on
+        # its execution stream. Exact calls can include borrowed request
+        # latents; own those inputs independently of their pool-slot lifetime.
+        static = execution if padded else clone_inputs(execution)
+        graph = BatchGraph.capture(
+            entry.context,
+            static,
+            invoke,
+            pools=self.graph_pools[entry],
+            cache=self.kv_cache.cache,
+            predicates=self.decode_predicates,
+        )
+        self.batch_graphs[entry][key] = graph
+
+    @torch.inference_mode()
+    def run_batch(self, entry, batch, forward, *, eligible, borrow_output=False):
+        with entry.context.activate():
+            return self._run_batch(
+                entry, batch, forward, eligible=eligible, borrow_output=borrow_output
+            )
+
+    def _run_batch(self, entry, batch, forward, *, eligible, borrow_output=False):
+        selected = self.select_graph_shape(entry, batch, eligible=eligible)
+        if selected is None:
+            return replace(
+                self.eager_batch(entry, batch, forward),
+                stats=ForwardStats(cuda_graph_runtime_mode_counts={"eager": 1}),
+            )
+        key, execution, bucketed = selected
+        captured = False
+        if key not in self.batch_graphs[entry]:
+            if not bucketed:
+                return replace(
+                    self.eager_batch(entry, batch, forward),
+                    stats=ForwardStats(cuda_graph_runtime_mode_counts={"eager": 1}),
+                )
+            if self._startup_complete:
+                raise CUDAGraphError(f"configured graph bucket is not resident: {key!r}")
+            self.capture_batch(entry, batch, forward)
+            captured = True
+        result = self.batch_graphs[entry][key].replay(
+            execution, rows=batch.row_count, borrow=borrow_output
+        )
+        if batch.decode_force_finish is None:
+            result = replace(result, greedy=None)
+        return replace(
+            result,
+            stats=ForwardStats(
+                cuda_graph_runtime_mode_counts={"graph_capture" if captured else "graph_replay": 1},
+                cuda_graph_captures=int(captured),
+                cuda_graph_replays=int(not captured),
+                cuda_graph_unpadded_tokens=batch.row_count,
+                cuda_graph_padded_tokens=execution.row_count - batch.row_count,
+            ),
+        )
+
+    def operation_devices(self, operation):
+        binding = self.bindings.get(operation.entry)
+        source = canonical_device(self.worker_config.device) if binding is None else binding.device
+        if self.images is not None and operation.kind in {
+            PipelineStage.LATENT_PREPARATION,
+            PipelineStage.DENOISING,
+            PipelineStage.IMAGE_DECODING,
+        }:
+            source = canonical_device(
+                self.worker_config.generation_device or self.worker_config.device
+            )
+        entry = self._forward_entries.get((operation.entry, operation.kind))
+        return source, source if entry is None else entry.device, source
+
+    def warmup(self, storage):
+        if self.media is not None:
+            from .video import warmup_decoders, warmup_denoising, warmup_postprocess
+
+            warmup_denoising(self, storage)
+            warmup_decoders(self)
+            warmup_postprocess(self, storage)
+        self.synchronize()
+
+    @torch.inference_mode()
+    def capture(self, *, tokenizer, latents):
         from .runners.decode import prepare_decode
         from .runners.prefill import prepare_prefill
 
-        processor = self.processor
-        transform = None if processor is None else processor.vit
-        patch_size = int(transform.patch_size) if isinstance(transform, PatchTransform) else None
-
         for phase in ("prefill", "decode", "flow"):
-            started = time.perf_counter()
-            captures_before = sum(len(graphs) for graphs in self.batch_graphs.values())
-            logger.info("starting entry preparation phase=%s", phase)
             for entry in self.batch_graphs:
-                lane = entry.cuda_stream
-                assert entry.input_buffers is not None
-                if entry.device != canonical_device(self.worker_config.device):
-                    continue
-                context = nullcontext() if lane is None else torch.cuda.stream(lane.stream)
-                if lane is not None:
-                    lane.wait(torch.cuda.current_stream(lane.device))
-                with context:
-                    forward = partial(self.batch_forward, entry)
-                    if phase == "prefill" and ForwardMode.PREFILL in entry.computations:
-                        shapes = (
-                            self.prefill_shapes[entry]
-                            if (self.worker_config.graph_policy != "off")
-                            and self.worker_config.prefill_cuda_graph
-                            else (PrefillShape(1, 1, 1),)
-                        )
-                        prepare_prefill(
-                            self,
-                            entry,
-                            entry.input_buffers,
-                            forward,
-                            shapes,
-                            packed=cast(TextMixin, self.model).text_backbone.attention_mode
-                            is AttentionMode.PACKED,
-                        )
-                    elif phase == "decode" and ForwardMode.DECODE in entry.computations:
-                        prepare_decode(
-                            self,
-                            entry,
-                            entry.input_buffers,
-                            forward,
-                            packed=cast(TextMixin, self.model).text_backbone.attention_mode
-                            is AttentionMode.PACKED,
-                        )
-                    elif (
-                        phase == "flow"
-                        and PipelineStage.DENOISING in entry.computations
-                        and (
-                            self.model.generation
-                            if isinstance(self.model, DiffusionMixin)
-                            else None
-                        )
-                        is not None
-                        and latents is not None
-                    ):
-                        assert self.diffusion is not None
-                        if (
-                            (self.worker_config.graph_policy != "off")
-                            and self.worker_config.prefill_cuda_graph
-                            and self.flow_captures
-                        ):
-                            self.diffusion.prepare_flow(
-                                self,
-                                entry,
-                                latents,
-                                tokenizer,
-                                patch_size,
-                                self.flow_captures,
-                                capture=True,
-                            )
-                        else:
-                            import math
+                forward = partial(self.batch_forward, entry)
+                if phase == "prefill" and ForwardMode.PREFILL in entry.computations:
+                    shapes = (
+                        self.prefill_shapes[entry]
+                        if self.worker_config.graph_policy != "off"
+                        and self.worker_config.prefill_cuda_graph
+                        else (PrefillShape(1, 1, 1),)
+                    )
+                    prepare_prefill(self, entry, entry.input_buffers, forward, shapes)
+                elif phase == "decode" and ForwardMode.DECODE in entry.computations:
+                    prepare_decode(self, entry, entry.input_buffers, forward)
+                elif phase == "flow" and PipelineStage.DENOISING in entry.computations:
+                    from .flow import prepare_flow
 
-                            generation = (
-                                self.model.generation
-                                if isinstance(self.model, DiffusionMixin)
-                                else None
-                            )
-                            assert generation is not None
-                            capacity = min(
-                                generation.max_latent_tokens,
-                                generation.max_vae_grid_tokens,
-                                latents.capacity_units,
-                            )
-                            side = max(1, math.isqrt(capacity)) * generation.latent_downsample
-                            representative = tuple(
-                                next(
-                                    (
-                                        shape
-                                        for shape in reversed(self.flow_captures)
-                                        if shape.cfg_branches == branches
-                                    ),
-                                    DiffusionShape(1, side, side, branches),
-                                )
-                                for branches in self.flow_cfg_branches
-                            )
-                            self.diffusion.prepare_flow(
-                                self,
-                                entry,
-                                latents,
-                                tokenizer,
-                                patch_size,
-                                representative,
-                                capture=False,
-                            )
-            logger.info(
-                "completed entry preparation phase=%s captured_shapes=%d seconds=%.3f",
-                phase,
-                sum(len(graphs) for graphs in self.batch_graphs.values()) - captures_before,
-                time.perf_counter() - started,
-            )
+                    prepare_flow(self, entry, latents, tokenizer)
         self.synchronize()
+
+    def complete_startup(self):
+        for device, budget in self.graph_memory_budgets.items():
+            pools = {
+                tuple(values[device].id) for values in self.graph_pools.values() if device in values
+            }
+            if private_pool_bytes(device, pools) > budget:
+                raise CUDAGraphError("captured graph residency exceeds its device budget")
+        for stream in self._streams:
+            stream.verify()
+        self._startup_complete = True
+
+    def synchronize(self):
+        streams = [self._capture_stream, self._preparation_stream]
+        streams.extend(stream.stream for stream in self._streams)
+        streams.extend(stream.stream for stream in self._module_streams.values())
+        devices = {
+            canonical_device(self.worker_config.device),
+            *self._capture_devices(canonical_device(self.worker_config.device)),
+        }
+        streams.extend(
+            torch.cuda.current_stream(device) for device in devices if device.type == "cuda"
+        )
+        close_resources(
+            *(
+                stream.synchronize
+                for stream in dict.fromkeys(stream for stream in streams if stream is not None)
+            )
+        )
+
+    def close_graphs(self):
+        """The caller drains all borrowed output readers before this operation."""
+
+        actions = [
+            graph.graph.close for graphs in self.batch_graphs.values() for graph in graphs.values()
+        ]
+        actions.extend(graph.close for graph, _ in self._module_graphs.values())
+        if self.diffusion is not None:
+            actions.append(self.diffusion.close)
+        try:
+            close_resources(*actions)
+        finally:
+            for graphs in self.batch_graphs.values():
+                graphs.clear()
+            self._module_graphs.clear()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        actions = [self.synchronize, self.close_graphs]
+        actions.extend(context.close for context in self._module_contexts.values())
+        for entry in self.batch_graphs:
+            actions.extend((entry.context.close, entry.input_buffers.close))
+        if self._text_staging is not None:
+            actions.append(self._text_staging.close)
+        actions.extend(stream.close for stream in reversed(tuple(self._module_streams.values())))
+        actions.extend(stream.close for stream in reversed(self._streams))
+        try:
+            close_resources(*actions)
+        finally:
+            self.entries.clear()
+            self.batch_graphs.clear()
+            self.graph_pools.clear()
+            self._module_contexts.clear()
+            self._module_pools.clear()
+            self._module_streams.clear()
+            self._streams.clear()
+            self._text_tokens = self._text_staging = None
 
     def stage_text_tokens(self, tokens: tuple[int, ...]) -> torch.Tensor:
         """Stage one text encoder input on the caller's stream without a world broadcast.
@@ -845,850 +1058,6 @@ class ModelRunner:
         target.copy_(host[: len(tokens)], non_blocking=storage.is_cuda)
         staging.record_copy(index)
         return target.view(1, -1)
-
-    def run_entry(self, name: str, *inputs: torch.Tensor) -> ExecutionOutput:
-        """Execute an entry and validate its declared logical Tensor results."""
-
-        entry = self.entries.get(
-            (name, str(canonical_device(self.worker_config.device)), "default")
-        )
-        outputs = None if entry is None else entry.outputs
-        if not outputs:
-            raise InputError(f"model does not declare computation entry {name!r}")
-
-        return self._run_module(name, inputs, partial(_validate_products, name, outputs))
-
-    def run_module(self, name: str, *inputs: object) -> ExecutionOutput:
-        """Execute bound numerical modules over Tensor views and typed metadata.
-
-        Numerical returns may be rank-local intermediate values. Logical product
-        publication belongs to the caller and uses the entry's result declaration.
-        Captured inputs remain Tensors with stable storage; eager calls may also
-        receive mathematical metadata, explicit views and solver parameters.
-        """
-
-        return self._run_module(name, inputs)
-
-    def run_decoder(
-        self,
-        kind: DecodeKind,
-        batch: DecodeBatch,
-        *,
-        constants: TensorViews,
-        scratch: TensorViews,
-    ) -> ExecutionOutput:
-        """Run the standard decoder call with native graphs bound by this owner.
-
-        Packing and logical output trimming remain numerical model operations.
-        The native layer uses the same fixed inputs, capture policy, and graph
-        lifetime as its standalone entry. No runtime object enters the model.
-        """
-
-        binding = self._decoders.get(kind)
-        if binding is None:
-            raise InputError(f"rank does not participate in {kind} decoding")
-        name, layer, decode = binding
-        entry = self.entries[(name, str(canonical_device(self.worker_config.device)), "default")]
-        path = "eager"
-        layouts: tuple[OutputLayout | None, ...] = ()
-
-        def native(value: torch.Tensor) -> torch.Tensor:
-            nonlocal path
-            # Capture or replay the ordinary numerical layer, without recursively
-            # dispatching the same binding during eager execution or capture.
-            with decoder_scope(None):
-                output, observed = self._call_module(entry, (value,))
-            if path != "graph_capture":
-                path = observed
-            if not isinstance(output, torch.Tensor):
-                raise ComputeError("native decoder must return one tensor")
-            return output
-
-        def compute() -> tuple[TensorOutput, str]:
-            nonlocal layouts
-            with decoder_scope({layer: native}):
-                shape = batch.sizes[0]
-                if any(value != shape for value in batch.sizes):
-                    raise ValueError("decoder rows require one numerical size")
-                if kind == "video":
-                    if not isinstance(shape, VideoSize):
-                        raise ValueError("video decoding requires a VideoSize")
-                    output = decode(
-                        batch.latents,
-                        shape,
-                        batch.windows,
-                        constants=constants,
-                        scratch=scratch,
-                    )
-                else:
-                    if batch.windows or type(shape) is not int or shape < 1:
-                        raise ValueError(
-                            "audio decoding requires a positive sample count without windows"
-                        )
-                    output = decode(
-                        batch.latents,
-                        samples=shape,
-                        scratch=scratch,
-                    )
-            rows = output.values[kind]
-            if any(value is None for value in rows):
-                raise ComputeError("decoder partition did not produce its numerical output")
-            layouts = output.layouts[kind]
-            return cast(tuple[torch.Tensor, ...], rows), path
-
-        result = self._observe_module(name, compute)
-        return replace(result, layouts=layouts)
-
-    @property
-    def encoder_kinds(self) -> frozenset[EncodeKind]:
-        """Return encoder kinds that participate on this execution owner."""
-
-        return frozenset(self._encoders)
-
-    def run_encoder(self, kind: EncodeKind, *values: torch.Tensor) -> ExecutionOutput:
-        """Execute the encoder assigned to this partition's declared numerical call."""
-
-        name = self._encoders.get(kind)
-        if name is None:
-            raise InputError(f"rank does not participate in {kind} encoding")
-        entry = self.entries[(name, str(canonical_device(self.worker_config.device)), "default")]
-        validate = partial(_validate_products, name, entry.outputs) if entry.outputs else None
-        return self._run_module(name, values, validate)
-
-    def output_layout(
-        self,
-        entry: str,
-        output_index: int,
-        media: DiffusionSamplingParams | None,
-        decode: DecodeRange | None,
-        num_prompt_tokens: int,
-    ) -> OutputLayout | None:
-        """Combine numerical result geometry with physical output participation.
-
-        Temporal distribution assigns consecutive units along the declared
-        result's first dimension. Numerical models describe that complete range;
-        they do not select units using physical process ranks.
-        """
-
-        binding = self.bindings.get(entry)
-        if binding is not None and binding.process_group.rank not in binding.output_ranks:
-            return None
-        results = tuple(
-            (method, name, layout)
-            for method, query in self._output_calls[entry]
-            for name, layout in query(
-                frames=None if media is None else media.num_frames,
-                units=None if decode is None else decode.max_units,
-                prompt_tokens=num_prompt_tokens,
-            ).items()
-        )
-        call, name, layout = results[output_index]
-        if call == "forward_diffusion" and media is not None:
-            component = self.component(call)
-            if media is None:
-                raise ValueError("diffusion results require the declared video duration")
-            size = VideoSize(media.num_frames, num_prompt_tokens)
-            if component.state_buffers(size)[name].shape[0] == 0:
-                return None
-        if layout is None or binding is None or binding.config.distribution is None:
-            return layout
-        if layout.region is not None:
-            raise ValueError("temporal distribution requires complete numerical output geometry")
-        position = binding.config.ranks.index(binding.process_group.rank)
-        start = position * binding.config.units_per_rank
-        count = min(binding.config.units_per_rank, layout.shape[0] - start)
-        if count < 1:
-            return None
-        return replace(
-            layout,
-            region=TensorRegion(
-                (start, *((0,) * (len(layout.shape) - 1))),
-                (count, *layout.shape[1:]),
-            ),
-        )
-
-    @torch.inference_mode()
-    def _run_module(
-        self,
-        name: str,
-        inputs: tuple[object, ...],
-        validate: Callable[[tuple[torch.Tensor, ...]], None] | None = None,
-    ) -> ExecutionOutput:
-        """Own eager/captured selection and observations for numerical calls."""
-
-        module = self.entries.get(
-            (name, str(canonical_device(self.worker_config.device)), "default")
-        )
-        if module is None:
-            raise InputError(f"rank does not own computation entry {name!r}")
-        if any(not isinstance(value, torch.Tensor) for value in inputs):
-            raise InputError("module arguments must be tensors")
-        tensors = cast(tuple[torch.Tensor, ...], inputs)
-        return self._observe_module(name, lambda: self._call_module(module, tensors), validate)
-
-    @torch.inference_mode()
-    def warmup_module(self, name: str, *inputs: torch.Tensor) -> None:
-        """Initialize numerical providers using this entry's actual callable."""
-
-        entry = self.entries[(name, str(canonical_device(self.worker_config.device)), "default")]
-        values = inputs or entry.fixed_inputs
-        if values is None:
-            raise ValueError("module warmup requires representative inputs")
-        assert entry.forward is not None
-        entry.forward(*values)
-
-    def _capture_devices(self, device: torch.device) -> tuple[torch.device, ...]:
-        """Return additional local GPUs whose branches can join this capture."""
-
-        configured = (self.worker_config.device, self.worker_config.generation_device)
-        devices = dict.fromkeys(
-            canonical_device(value) for value in configured if value is not None
-        )
-        return tuple(value for value in devices if value.type == "cuda" and value != device)
-
-    def _capture_module(self, entry: ModelEntry, inputs: tuple[torch.Tensor, ...]) -> None:
-        stream = self.capture_stream()
-        if stream is None:
-            raise GraphExecutionError("module capture requires CUDA graph execution")
-        graph = CudaGraph[TensorOutput](
-            device=entry.device,
-            stream=stream,
-            device_pools=capture_pools(self._capture_devices(entry.device)),
-        )
-        graph.capture(
-            partial(cast(Callable[..., TensorOutput], entry.forward), *inputs), keepalive=inputs
-        )
-        entry.graph = graph
-        entry.capture_inputs = inputs
-        entry.signature = tensor_signature(inputs)
-
-    def _call_module(
-        self, entry: ModelEntry, inputs: tuple[torch.Tensor, ...]
-    ) -> tuple[TensorOutput, str]:
-        if self._closed:
-            raise GraphExecutionError("model runner is closed")
-        if any(value.device != entry.device for value in inputs):
-            raise GraphExecutionError("module input device changed")
-        key = tensor_signature(inputs)
-        if entry.fixed_inputs is not None:
-            fixed_key = tensor_signature(entry.fixed_inputs)
-            if tuple(value[:2] for value in key) != tuple(value[:2] for value in fixed_key):
-                raise GraphExecutionError("CUDA graph input geometry changed")
-            # Strided sources are copied into the fixed destination layout.
-            key = fixed_key
-        if self.capture_stream() is None:
-            assert entry.forward is not None
-            return cast(TensorOutput, entry.forward(*inputs)), "eager"
-        missing = (
-            False
-            if entry.fixed_inputs is not None
-            else capture_required(
-                entry.signature != key or entry.graph is None, entry.groups, entry.device
-            )
-        )
-        if missing:
-            torch.cuda.current_stream(entry.device).synchronize()
-            if entry.graph is not None:
-                entry.graph.close()
-                entry.graph = None
-            entry.capture_inputs = None
-            entry.signature = None
-            stable = tuple(
-                torch.empty_strided(
-                    value.shape, value.stride(), dtype=value.dtype, device=value.device
-                )
-                for value in inputs
-            )
-            for source, target in zip(inputs, stable, strict=True):
-                target.copy_(source)
-            self._capture_module(entry, stable)
-        if entry.graph is None:
-            raise GraphExecutionError("module graph is not captured")
-        stable_inputs = cast(tuple[torch.Tensor, ...], entry.capture_inputs)
-        for source, target in zip(inputs, stable_inputs, strict=True):
-            target.copy_(source)
-        return entry.graph.replay(), "graph_capture" if missing else "graph_replay"
-
-    @staticmethod
-    def _close_entry(entry: ModelEntry) -> None:
-        if entry.graph is not None:
-            entry.graph.close()
-            entry.graph = None
-        entry.fixed_inputs = None
-        entry.capture_inputs = None
-        entry.signature = None
-
-    def run_denoising(
-        self,
-        batch: DiffusionBatch,
-        count: int,
-        schedule: DiffusionSchedule,
-        *,
-        state: TensorViews,
-        constants: TensorViews,
-        scratch: TensorViews,
-        slot: Hashable,
-        input_key: Hashable,
-    ) -> ExecutionOutput:
-        diffusion = self.diffusion
-        if diffusion is None:
-            raise InputError("rank does not own denoising computation")
-        if count != 1:
-            raise InputError("denoising calls evaluate exactly one scheduled step")
-        return self._observe_module(
-            "denoiser",
-            lambda: diffusion.step(
-                batch,
-                schedule,
-                state=state,
-                constants=constants,
-                scratch=scratch,
-                slot=slot,
-                input_key=input_key,
-            ),
-        )
-
-    @torch.inference_mode()
-    def _observe_module(
-        self,
-        name: str,
-        run: Callable[[], tuple[TensorOutput, str]],
-        validate: Callable[[tuple[torch.Tensor, ...]], None] | None = None,
-    ) -> ExecutionOutput:
-        started = time.perf_counter_ns()
-        with collective_scope(self._sum_reductions):
-            output, path = run()
-        if path == "graph_capture":
-            logger.info(
-                "completed first-use capture entry=%s device=%s seconds=%.3f",
-                name,
-                self.worker_config.device,
-                (time.perf_counter_ns() - started) / 1e9,
-            )
-        values = (output,) if isinstance(output, torch.Tensor) else output
-        if not isinstance(values, tuple) or any(
-            not isinstance(value, torch.Tensor) for value in values
-        ):
-            raise ComputeError(f"entry {name!r} returned a non-tensor result")
-        if any(value.device != canonical_device(self.worker_config.device) for value in values):
-            raise ComputeError(f"entry {name!r} returned a tensor on another device")
-        if validate is not None:
-            validate(values)
-        elapsed = (time.perf_counter_ns() - started) // 1000
-        return ExecutionOutput(
-            values,
-            stats=ForwardStats(
-                mode_counts={name: 1},
-                mode_tokens={name: 1},
-                mode_us={name: elapsed},
-                component_us={"forward": elapsed},
-                cuda_graph_runtime_mode_counts={path: 1},
-                cuda_graph_captures=int(path == "graph_capture"),
-                cuda_graph_replays=int(path == "graph_replay"),
-            ),
-        )
-
-    def configure_inputs(
-        self,
-        *,
-        input_config: InputBufferConfig,
-        kv_cache,
-        latent_pool,
-        decode_predicates: torch.Tensor,
-        max_operations: int,
-        request_slots: int,
-        max_tokens: int,
-        latent_capacity_units: int,
-        decode_context_blocks: int,
-        variants,
-        max_inflight: int,
-    ) -> None:
-        """Resolve each lane's physical catalog from its bound capacities."""
-
-        from uniserve.nn.diffusion.cfg import build_flow_cfg_plan
-
-        from ..bootstrap.capacity import device_total_bytes
-        from ..config import DEFAULT_PREFILL_GRAPH_ROW_BUCKETS, graph_memory_budget_bytes
-        from .graph_inputs import (
-            PrefillShape,
-            select_flow_captures,
-            select_prefill_captures,
-        )
-
-        worker_config = self.worker_config
-        packed_model = self.model
-        flow = packed_model.generation if isinstance(packed_model, DiffusionMixin) else None
-        max_rows = min(
-            max_operations,
-            request_slots,
-        )
-
-        # Derive fixed staging and graph catalogs from the intersection of model,
-        # lane, cache, latent, and scheduler capacities.
-        decode_lane = next(
-            (lane for lane in worker_config.lanes if ForwardMode.DECODE in lane.computations),
-            None,
-        )
-        prefill_lane = next(
-            (lane for lane in worker_config.lanes if ForwardMode.PREFILL in lane.computations),
-            None,
-        )
-        flow_lane = next(
-            (lane for lane in worker_config.lanes if PipelineStage.DENOISING in lane.computations),
-            None,
-        )
-        decode_max_operations = min(
-            max_rows,
-            max_rows if decode_lane is None else int(decode_lane.max_batch_operations or max_rows),
-        )
-        prefill_max_tokens = min(
-            int(max_tokens),
-            (
-                int(max_tokens)
-                if prefill_lane is None
-                else int(prefill_lane.max_batch_tokens or max_tokens)
-            ),
-        )
-        flow_max_operations = min(
-            max_rows,
-            max_rows if flow_lane is None else int(flow_lane.max_batch_operations or max_rows),
-        )
-        decode_graph_batch_sizes = tuple(
-            value
-            for value in worker_config.decode_graph_batch_sizes
-            if 0 < int(value) <= decode_max_operations
-            and int(value) < int(kv_cache.cache.num_pages)
-        )
-        prefill_capacity = min(
-            int(max_tokens),
-            int(cast(TextMixin, packed_model).text_backbone.max_tokens),
-            max(0, int(kv_cache.cache.num_pages) - 1) * int(worker_config.block_size),
-        )
-        prefill_graph_token_sizes = tuple(
-            value
-            for value in worker_config.prefill_graph_token_sizes
-            if 0 < int(value) <= min(prefill_capacity, prefill_max_tokens)
-        )
-        prefill_graph_row_sizes = DEFAULT_PREFILL_GRAPH_ROW_BUCKETS
-        flow_cfg_branches: tuple[int, ...] = ()
-        if flow is not None:
-            branch_counts: list[int] = []
-            for cfg_branches in range(1, int(flow.max_cfg_branches) + 1):
-                image = capture_image_parameters(
-                    cfg_branches,
-                    steps=1,
-                    height=16,
-                    width=16,
-                )
-                guide = build_flow_cfg_plan(
-                    cfg_text_scale=float(image.cfg_text_scale),
-                    cfg_img_scale=float(image.cfg_img_scale),
-                    recipe=flow.cfg_recipe,
-                    renorm=image.cfg_renorm_type,
-                    renorm_min=float(image.cfg_renorm_min),
-                    use_cfg=True,
-                )
-                if len(guide.branches) != cfg_branches:
-                    raise invalid_descriptor(
-                        "flow CFG startup parameters do not realize their branch geometry"
-                    )
-                branch_counts.append(cfg_branches)
-            flow_cfg_branches = tuple(branch_counts)
-        flow_graph_buckets = (
-            select_flow_captures(
-                worker_config.flow_graph_shapes,
-                worker_config.flow_graph_batch_sizes,
-                flow_cfg_branches,
-                max_operations=flow_max_operations,
-                max_tokens=(input_config.max_tokens),
-                per_image_capacity=int(latent_capacity_units),
-                latent_capacity=int(latent_pool.capacity_units),
-                physical_tokens=flow.sequence_length,
-                image_tokens=flow.image_tokens,
-            )
-            if flow is not None and latent_pool is not None
-            else ()
-        )
-        self.flow_cfg_branches = flow_cfg_branches
-        self.kv_cache = kv_cache
-        self.decode_predicates = decode_predicates
-        self.decode_context_blocks = decode_context_blocks
-        self.prefill_row_sizes = prefill_graph_row_sizes
-
-        def configure_entry(entry: ModelEntry) -> None:
-            device = entry.device
-            binding = entry.cuda_stream
-            lane = None if binding is None else binding.config
-            computations = entry.computations
-            owns_model_compute = device == canonical_device(worker_config.device)
-            max_rows_for_entry = (
-                max_rows if lane is None else int(lane.max_batch_operations or max_rows)
-            )
-            max_tokens_for_entry = (
-                prefill_capacity if lane is None else int(lane.max_batch_tokens or prefill_capacity)
-            )
-            self.decode_shapes[entry] = (
-                tuple(value for value in decode_graph_batch_sizes if value <= max_rows_for_entry)
-                if owns_model_compute and ForwardMode.DECODE in computations
-                else ()
-            )
-            prefill_tokens = (
-                tuple(value for value in prefill_graph_token_sizes if value <= max_tokens_for_entry)
-                if owns_model_compute and ForwardMode.PREFILL in computations
-                else ()
-            )
-            self.prefill_shapes[entry] = (
-                tuple(PrefillShape(value, 1, 1) for value in prefill_tokens)
-                if cast(TextMixin, packed_model).text_backbone.attention_mode
-                is AttentionMode.PACKED
-                else select_prefill_captures(
-                    prefill_tokens,
-                    prefill_graph_row_sizes,
-                    max_rows=max_rows_for_entry,
-                    max_tokens=max_tokens_for_entry,
-                )
-            )
-            self.graph_memory_budgets[device] = graph_memory_budget_bytes(
-                device_total_bytes(device)
-            )
-            if worker_config.graph_policy != "off" and device.type == "cuda":
-                self.graph_streams[entry] = (
-                    binding.stream
-                    if binding is not None and binding.context is not None
-                    else torch.cuda.Stream(device=device)
-                )
-                self.graph_pools[entry] = torch.cuda.graph_pool_handle()
-                self.graph_device_pools[entry] = capture_pools(self._capture_devices(device))
-                for additional in self.graph_device_pools[entry]:
-                    self.graph_memory_budgets[additional] = graph_memory_budget_bytes(
-                        device_total_bytes(additional)
-                    )
-
-        self._bind_inputs(
-            input_config=input_config,
-            lanes=worker_config.lanes,
-            max_inflight=max_inflight,
-            configure_entry=configure_entry,
-            flow_captures=flow_graph_buckets,
-        )
-
-    def _bind_inputs(
-        self,
-        *,
-        input_config: InputBufferConfig,
-        configure_entry: Callable[[ModelEntry], None],
-        lanes: tuple[LaneConfig, ...] = (),
-        max_inflight: int = 1,
-        flow_captures: tuple[DiffusionShape, ...] = (),
-    ) -> None:
-        """Construct device-and-lane runtimes around one pure execution model."""
-
-        self.flow_captures = flow_captures
-        worker_config = self.worker_config
-        canonical = tuple(
-            dict.fromkeys(
-                (
-                    str(torch.device(worker_config.device)),
-                    str(torch.device(worker_config.generation_device or worker_config.device)),
-                )
-            )
-        )
-        if self.batch_graphs:
-            raise RuntimeError("entry execution resources are already bound")
-        self.uses_lanes = bool(lanes)
-
-        def make_buffer(device: str) -> InputBuffers:
-            """Allocate fixed-capacity staging storage for one execution device."""
-
-            return InputBuffers(
-                config=input_config,
-                device=device,
-                max_inflight=max_inflight,
-            )
-
-        if self.bindings:
-            placements = tuple(self.bindings.values())
-        else:
-            # Standalone callers supply no physical entries; every declared
-            # numerical component participates on the caller's local device.
-            from uniserve_models.catalog import entry_paths
-
-            local = {
-                name: self._entry(name, torch.device(canonical[0]))
-                for name in entry_paths(type(self.model), self.model.config)
-            }
-            bind_components(self.model, local)
-            placements = tuple(local.values())
-        batch_calls = {"forward", "encode:vision", "encode:latent", "decode:image"}
-        if (self.model.generation if isinstance(self.model, DiffusionMixin) else None) is not None:
-            batch_calls.add("forward_diffusion")
-        participants = tuple(
-            (placement, calls)
-            for placement in placements
-            if (calls := tuple(method for method in placement.methods if method in batch_calls))
-        )
-
-        startup = ExitStack()
-        bindings: list[tuple[torch.device, CudaStream | None, int | None]] = []
-        binding: CudaStream | None
-        entries: list[ModelEntry] = []
-        available = supported_operations(self.model)
-        try:
-            if lanes:
-                if len(canonical) != 1:
-                    raise ValueError("Green Context lanes require one physical CUDA device")
-                missing = available.difference(kind for lane in lanes for kind in lane.computations)
-                if missing:
-                    names = ", ".join(sorted(kind.value for kind in missing))
-                    raise ValueError(f"lane configuration has no binding for computations: {names}")
-                device = torch.device(canonical[0])
-                streams = create_partitioned_streams(lanes, device, event_slots=max_inflight + 1)
-                for binding in streams:
-                    startup.callback(binding.close)
-                    binding.verify()
-                    assert binding.context is not None
-                    bindings.append((device, binding, int(binding.context)))
-            else:
-                for device_name in canonical:
-                    device = torch.device(device_name)
-                    binding = (
-                        CudaStream(
-                            device=device,
-                            stream=torch.cuda.current_stream(device),
-                            sm_count=int(
-                                torch.cuda.get_device_properties(device).multi_processor_count
-                            ),
-                            event_slots=max_inflight + 1,
-                        )
-                        if device.type == "cuda"
-                        else None
-                    )
-                    if binding is not None:
-                        startup.callback(binding.close)
-                    bindings.append((device, binding, None))
-
-            for placement, calls in participants:
-                for device, binding, expected_context in bindings:
-                    context = (
-                        nullcontext() if binding is None else torch.cuda.stream(binding.stream)
-                    )
-                    with context:
-                        inputs = make_buffer(str(device))
-                    placement_entry = self._entry(placement.name, device)
-                    # Each component and stream owns its addresses. Numerical stage
-                    # participation comes from the component declaration, not its name.
-                    entry = ModelEntry(
-                        placement_entry.name,
-                        placement_entry.config,
-                        placement_entry.process_group,
-                        placement_entry.mesh,
-                        placement_entry.device,
-                        component=placement.component,
-                    )
-                    model = self.model.get_submodule(placement.component)
-                    entry.forward = partial(
-                        _invoke,
-                        text=model if isinstance(model, TextMixin) else None,
-                        diffusion_model=model if isinstance(model, DiffusionMixin) else None,
-                        encoder=model if isinstance(model, EncoderMixin) else None,
-                        decoder=model if isinstance(model, DecoderMixin) else None,
-                        pipeline=None if entry.mesh is None else entry.mesh.get_group("pp"),
-                    )
-                    entry.outputs = self.outputs.get(entry.name, ())
-                    configured = (
-                        COMPUTATIONS
-                        if binding is None or binding.config is None
-                        else binding.config.computations
-                    )
-                    operations = call_operations(calls)
-                    entry.computations = tuple(kind for kind in configured if kind in operations)
-                    entry.input_buffers = inputs
-                    entry.cuda_stream = binding
-                    self.batch_graphs[entry] = {}
-                    startup.callback(self._close_batch_entry, entry)
-                    configure_entry(entry)
-                    if expected_context is not None:
-                        from uniserve.distributed.collectives import allocate_stream_collectives
-
-                        assert binding is not None
-                        entry.collectives = allocate_stream_collectives(
-                            entry.groups, binding.stream
-                        )
-                    entries.append(entry)
-        except BaseException as error:
-            try:
-                self.synchronize()
-                for _device, binding, _context in bindings:
-                    if binding is not None:
-                        binding.stream.synchronize()
-            except BaseException as cleanup_error:
-                error.add_note(f"Resource synchronization also failed: {cleanup_error!r}")
-            try:
-                startup.close()
-            except BaseException as cleanup_error:
-                error.add_note(f"Resource cleanup also failed: {cleanup_error!r}")
-            raise
-        self._streams.extend(
-            binding for _device, binding, _context in bindings if binding is not None
-        )
-        for entry in entries:
-            key = (
-                entry.name,
-                str(entry.device),
-                "default" if entry.cuda_stream is None else entry.cuda_stream.name or "default",
-            )
-            self.entries[key] = entry
-            for kind in entry.computations:
-                if not isinstance(kind, ForwardMode) and kind not in {
-                    PipelineStage.VISION_ENCODING,
-                    PipelineStage.LATENT_ENCODING,
-                    PipelineStage.DENOISING,
-                    PipelineStage.IMAGE_DECODING,
-                }:
-                    continue
-                # VAE/image reconstruction inputs live with generation modules;
-                # token, vision, and learned denoising calls use the model binding.
-                device = canonical_device(
-                    worker_config.generation_device or worker_config.device
-                    if kind in {PipelineStage.LATENT_ENCODING, PipelineStage.IMAGE_DECODING}
-                    else worker_config.device
-                )
-                if entry.device == device:
-                    self._forward_entries[(entry.name, kind)] = entry
-        startup.pop_all()
-
-    @torch.inference_mode()
-    def prepare_fixed_modules(self) -> None:
-        """Warm up and capture fixed module inputs during worker startup."""
-
-        for module in self.entries.values():
-            name = module.name
-            if module.fixed_inputs is None:
-                continue
-            started = time.perf_counter()
-            with collective_scope(self._sum_reductions):
-                if self.capture_stream() is None:
-                    self.warmup_module(name)
-                else:
-                    self._capture_module(module, module.fixed_inputs)
-            logger.info(
-                "prepared fixed module entry=%s mode=%s seconds=%.3f",
-                name,
-                "eager" if module.graph is None else "capture",
-                time.perf_counter() - started,
-            )
-
-    def complete_startup(self) -> None:
-        """Freeze attention bindings and model state after warmup completes."""
-
-        for device, budget in self.graph_memory_budgets.items():
-            pools = {
-                tuple(pool) for entry, pool in self.graph_pools.items() if entry.device == device
-            }
-            pools.update(
-                tuple(bindings[device].id)
-                for bindings in self.graph_device_pools.values()
-                if device in bindings
-            )
-            if _private_pool_bytes(device, pools) > budget:
-                raise GraphExecutionError("captured graph residency exceeds its device budget")
-        for entry in self.batch_graphs:
-            if entry.cuda_stream is not None:
-                entry.cuda_stream.verify()
-        signature = tuple(
-            (
-                None if entry.cuda_stream is None else entry.cuda_stream.name,
-                0 if entry.cuda_stream is None else entry.cuda_stream.sm_count,
-                tuple(kind.value for kind in entry.computations),
-                self.decode_shapes[entry],
-                self.prefill_shapes[entry],
-                tuple(sorted(repr(key) for key in graphs)),
-            )
-            for entry, graphs in self.batch_graphs.items()
-        )
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            logger.info("verifying tensor-parallel execution lane agreement")
-            gathered: list[object] = [None] * torch.distributed.get_world_size()
-            torch.distributed.all_gather_object(gathered, signature)
-            if any(value != signature for value in gathered):
-                raise GraphExecutionError("tensor-parallel execution lanes disagree")
-            logger.info("verified tensor-parallel execution lane agreement")
-
-        self._startup_complete = True
-
-    def close_graphs(self) -> None:
-        """Release drained executables before backing, keeping streams alive for allocator cleanup.
-
-        The caller has stopped execution and drained output consumers. Runtime
-        pinned buffers can still enqueue allocator events while being freed, so
-        their producer streams remain owned until close finishes teardown.
-        """
-
-        actions: list[Callable[[], object]] = [
-            partial(self._close_entry, entry) for entry in self.entries.values()
-        ]
-        if self.diffusion is not None:
-            actions.append(self.diffusion.close)
-        actions.extend(
-            graph.graph.close for graphs in self.batch_graphs.values() for graph in graphs.values()
-        )
-        try:
-            close_resources(*actions)
-        finally:
-            for graphs in self.batch_graphs.values():
-                graphs.clear()
-
-    def close(self) -> None:
-        """Drain computation, then release graphs and staging before physical lanes."""
-
-        if self._closed:
-            return
-        self._closed = True
-        actions: list[Callable[[], object]] = [self.synchronize, self.close_graphs]
-        if self._text_staging is not None:
-            actions.append(self._text_staging.close)
-        actions.extend(
-            partial(self._close_batch_entry, entry) for entry in reversed(tuple(self.batch_graphs))
-        )
-        actions.extend(lane.close for lane in reversed(self._streams))
-        actions.extend(
-            reduction.close for reduction in reversed(tuple(self._sum_reductions.values()))
-        )
-        try:
-            close_resources(*actions)
-        finally:
-            self.entries.clear()
-            self._decoders.clear()
-            self.diffusion = None
-            self._capture_stream = None
-            self._preparation_stream = None
-            self._text_staging = None
-            self._text_tokens = None
-            self.batch_graphs.clear()
-            self.graph_pools.clear()
-            self.graph_device_pools.clear()
-            self.graph_streams.clear()
-            self.decode_shapes.clear()
-            self.prefill_shapes.clear()
-            self._sum_reductions.clear()
-            self.scratch = None
-            self._attention_exchange_storage.clear()
-            self._forward_entries.clear()
-            self._streams.clear()
-
-    def synchronize(self) -> None:
-        """Drain each compute and preparation stream before releasing resident resources."""
-
-        actions: list[Callable[[], object]] = []
-        if canonical_device(self.worker_config.device).type == "cuda":
-            actions.append(torch.cuda.current_stream(self.worker_config.device).synchronize)
-        if self._preparation_stream is not None:
-            actions.append(self._preparation_stream.synchronize)
-        if self._capture_stream is not None:
-            actions.append(self._capture_stream.synchronize)
-        actions.extend(stream.synchronize for stream in self.graph_streams.values())
-        actions.extend(lane.stream.synchronize for lane in self._streams if lane.stream is not None)
-        close_resources(*actions)
 
     @contextmanager
     def preparing_inputs(
@@ -1717,14 +1086,6 @@ class ModelRunner:
         finally:
             torch.cuda.current_stream(self.worker_config.device).wait_stream(stream)
 
-    def generation(self) -> ImageDiffusion:
-        """Require the model's diffusion generation contract for the active operation."""
-
-        value = self.model.generation if isinstance(self.model, DiffusionMixin) else None
-        if not isinstance(value, ImageDiffusion):
-            raise invalid_descriptor("operation requires model generation behavior")
-        return value
-
     def image_processor(self) -> ImageProcessor:
         """Require the caller's image preprocessing contract for the active operation."""
 
@@ -1732,445 +1093,6 @@ class ModelRunner:
         if not isinstance(value, ImageProcessor):
             raise invalid_descriptor("operation requires model image processing")
         return value
-
-    def operation_devices(
-        self, operation: ScheduledRequest
-    ) -> tuple[torch.device, torch.device, torch.device]:
-        """Resolve input consumption, numerical computation, and result publication.
-
-        Forward inputs and outputs use the concrete numerical entry. Image
-        trajectories consume and publish on the diffusion storage device, which
-        may differ from the learned prediction's device. Module/media entries
-        inherit their loaded placement. Completion storage must cover all three.
-        """
-
-        placement = self.bindings.get(operation.entry)
-        device = (
-            canonical_device(self.worker_config.device) if placement is None else placement.device
-        )
-        entry = self._forward_entries.get((operation.entry, operation.kind))
-        if (
-            self.model.generation if isinstance(self.model, DiffusionMixin) else None
-        ) is not None and operation.kind in {
-            PipelineStage.LATENT_PREPARATION,
-            PipelineStage.DENOISING,
-            PipelineStage.IMAGE_DECODING,
-        }:
-            if self.diffusion is None:
-                raise invalid_descriptor("image operation has no bound diffusion storage device")
-            device = self.diffusion.device
-        compute = device if entry is None else entry.device
-        return device, compute, device
-
-    def _close_batch_entry(self, entry: ModelEntry) -> None:
-        actions = [graph.graph.close for graph in self.batch_graphs.get(entry, {}).values()]
-        if entry.collectives is not None:
-            actions.extend(binding.close for binding in entry.collectives.values())
-        if entry.input_buffers is not None:
-            actions.append(entry.input_buffers.close)
-        close_resources(*actions)
-        self.batch_graphs.pop(entry, None)
-        self.graph_pools.pop(entry, None)
-        self.graph_device_pools.pop(entry, None)
-        self.graph_streams.pop(entry, None)
-        entry.collectives = None
-        entry.input_buffers = None
-
-    def select_graph_shape(
-        self,
-        entry: ModelEntry,
-        batch: InputBatch,
-        *,
-        eligible: bool,
-    ) -> tuple[tuple[object, ...], InputBatch, int, bool] | None:
-        """Select physical geometry while preserving each path's eager policy."""
-
-        rows = batch.row_count
-        if not eligible or self.worker_config.graph_policy == "off" or not _cuda_batch(batch):
-            return None
-        if batch.attention.attention_mode is AttentionMode.PAGED_VARLEN and (
-            not self.worker_config.prefill_cuda_graph
-            or any(
-                selection is not TokenSelection.LAST_LOGITS for selection in batch.token_selections
-            )
-        ):
-            return None
-        if (
-            batch.attention.attention_mode is AttentionMode.PACKED
-            and not self.worker_config.prefill_cuda_graph
-        ):
-            return None
-        if (
-            batch.attention.attention_mode is AttentionMode.PACKED
-            and self.kv_cache.cache.is_quantized
-        ):
-            return None
-        try:
-            _graph_provider(
-                self.attention,
-                batch.attention.attention_mode,
-                head_dim=cast(TextMixin, self.model).text_backbone.cache_config.head_dim,
-                block_size=self.worker_config.block_size,
-                device=batch.request_pool_indices.device,
-            )
-        except _GraphMiss:
-            return None
-
-        decode = _decode_shape(
-            batch,
-            self.decode_shapes[entry],
-            self.worker_config.block_size,
-            self.decode_context_blocks,
-        )
-        prefill = (
-            None
-            if decode is not None
-            else _prefill_shape(
-                batch,
-                tuple(shape.token_bucket for shape in self.prefill_shapes[entry])
-                if cast(TextMixin, self.model).text_backbone.attention_mode
-                is not AttentionMode.PACKED
-                else (),
-                self.worker_config.block_size,
-                self.prefill_row_sizes,
-                self.decode_context_blocks,
-            )
-        )
-        if decode is not None:
-            execution = _pad_decode_batch(batch, *decode, self.worker_config.block_size)
-            state_key = _decode_signature(batch, *decode)
-            signature = state_key
-            padded_rows = decode[0]
-            startup_resident = True
-        elif prefill is not None:
-            execution = _pad_prefill_batch(batch, *prefill, self.worker_config.block_size)
-            state_key = _prefill_signature(batch, *prefill, self.worker_config.block_size)
-            signature = state_key
-            padded_rows = prefill[0].row_bucket
-            startup_resident = True
-        else:
-            execution = _normalize_exact_batch(
-                batch,
-                context_blocks=cast(InputBuffers, entry.input_buffers).max_blocks_per_row,
-                block_size=self.worker_config.block_size,
-            )
-            signature = _exact_signature(execution)
-            state_key = ("exact", signature)
-            padded_rows = rows
-            startup_resident = False
-
-        return state_key, execution, padded_rows, startup_resident
-
-    @torch.inference_mode()
-    def capture_batch(
-        self,
-        entry: ModelEntry,
-        batch: InputBatch,
-        forward: Callable[[InputBatch], ExecutionOutput],
-    ) -> None:
-        """Capture one physical shape while restoring its mutable numerical inputs."""
-
-        if self._startup_complete:
-            raise GraphExecutionError("entry capture is outside startup preparation")
-        selected = self.select_graph_shape(entry, batch, eligible=True)
-        if selected is None:
-            self.eager_batch(entry, batch, forward)
-            return
-        state_key, execution, _, bucketed = selected
-        assert self.graph_streams[entry] is not None
-        if state_key in self.batch_graphs[entry]:
-            return
-        if self.graph_memory_budgets[entry.device] == 0:
-            raise GraphExecutionError("configured CUDA graph residency has no memory budget")
-        static = _graph_batch(execution, next(_GRAPH_BINDINGS), own_inputs=not bucketed)
-        releases: tuple[Callable[[], None], ...] = ()
-        stream = None if entry.cuda_stream is None else entry.cuda_stream.stream
-        context = nullcontext() if stream is None else torch.cuda.stream(stream)
-        with context, stream_collective_scope(entry.collectives):
-            restore = self._capture_restore(static)
-            try:
-                releases = self._prepare_graph_attention(entry, static, execution, capture=True)
-
-                def compute() -> tuple[ExecutionOutput, SamplerOutput | None]:
-                    output = forward(static)
-                    return output, _greedy_decode(static, output, self.decode_predicates)
-
-                graph = CudaGraph[tuple[ExecutionOutput, SamplerOutput | None]](
-                    device=entry.device,
-                    stream=self.graph_streams[entry],
-                    pool=self.graph_pools[entry],
-                    device_pools=self.graph_device_pools[entry],
-                    expected_context=(
-                        None if entry.cuda_stream is None else entry.cuda_stream.context
-                    ),
-                )
-                graph.capture(compute, keepalive=(static,), restore=restore)
-                graph.releases = releases
-                releases = ()
-                self.batch_graphs[entry][state_key] = BatchGraph(
-                    graph,
-                    static,
-                    () if bucketed else tuple(_batch_tensors(static)),
-                    tuple(_attention_inputs(static)),
-                )
-            except BaseException as error:
-                if stream is not None:
-                    stream.synchronize()
-                else:
-                    torch.cuda.current_stream(entry.device).synchronize()
-                self._discard_batch_graph(entry, state_key)
-                for release in reversed(releases):
-                    release()
-                error.add_note(f"entry capture device={entry.device} shape={state_key!r}")
-                raise
-            finally:
-                restore()
-                torch.cuda.current_stream(entry.device).synchronize()
-
-    def _capture_restore(self, batch: InputBatch) -> Callable[[], None]:
-        """Retain the bounded KV write set and graph-greedy mutable input."""
-
-        tensors: list[tuple[torch.Tensor, torch.Tensor]] = []
-        finish = batch.decode_force_finish
-        if finish is not None:
-            tensors.append((finish, finish.clone()))
-        pages = torch.unique(batch.attention.out_cache_loc // self.worker_config.block_size)
-        pages = pages[pages != 0].long()
-        cache = self.kv_cache
-        saved = (cache.cache.k.index_select(1, pages), cache.cache.v.index_select(1, pages))
-
-        def restore() -> None:
-            for tensor, snapshot in tensors:
-                tensor.copy_(snapshot)
-            cache.cache.k.index_copy_(1, pages, saved[0])
-            cache.cache.v.index_copy_(1, pages, saved[1])
-
-        return restore
-
-    def run_batch(
-        self,
-        entry: ModelEntry,
-        batch: InputBatch,
-        forward: Callable[[InputBatch], ExecutionOutput],
-        *,
-        eligible: bool,
-        borrow_output: bool = False,
-    ) -> ExecutionOutput:
-        """Stage metadata and replay a resident key, or use the established eager path."""
-
-        rows = batch.row_count
-        selected = self.select_graph_shape(entry, batch, eligible=eligible)
-        if selected is None:
-            return replace(
-                self.eager_batch(entry, batch, forward),
-                stats=ForwardStats(cuda_graph_runtime_mode_counts={"eager": 1}),
-            )
-        state_key, execution, padded_rows, bucketed = selected
-        captured = False
-        if state_key not in self.batch_graphs[entry]:
-            if not bucketed:
-                return replace(
-                    self.eager_batch(entry, execution, forward),
-                    stats=ForwardStats(cuda_graph_runtime_mode_counts={"eager": 1}),
-                )
-            if self._startup_complete:
-                raise GraphExecutionError("configured CUDA graph bucket is not resident")
-            # Direct execution may precede explicit startup. Materialize the
-            # configured bucket on its binding, preserving the same full policy.
-            self.capture_batch(entry, batch, forward)
-            captured = True
-        assert self.graph_streams[entry] is not None
-        graph = self.batch_graphs[entry].get(state_key)
-        if graph is None:
-            raise GraphExecutionError("entry graph has no input owner")
-        output, greedy = self._replay_batch(entry, graph, execution, rows)
-        output = (
-            _trim_output(output, rows)
-            if borrow_output
-            else self._publish_batch_output(entry, output, rows)
-        )
-        return replace(
-            output,
-            stats=ForwardStats(
-                cuda_graph_runtime_mode_counts={"graph_capture" if captured else "graph_replay": 1},
-                cuda_graph_captures=int(captured),
-                cuda_graph_replays=int(not captured),
-                cuda_graph_unpadded_tokens=rows,
-                cuda_graph_padded_tokens=padded_rows - rows,
-            ),
-            greedy=greedy,
-        )
-
-    def _discard_batch_graph(self, entry: ModelEntry, key: Hashable) -> None:
-        graph = self.batch_graphs[entry].pop(key, None)
-        if graph is not None:
-            graph.graph.close()
-        if not self.batch_graphs[entry] and entry in self.graph_pools:
-            # CUDA retires a pool with its last graph; retained output allocations
-            # must not be reused under the retired pool identity.
-            self.graph_pools[entry] = torch.cuda.graph_pool_handle()
-            self.graph_device_pools[entry] = capture_pools(self._capture_devices(entry.device))
-
-    def eager_batch(
-        self,
-        entry: ModelEntry,
-        batch: InputBatch,
-        forward: Callable[[InputBatch], ExecutionOutput],
-    ) -> ExecutionOutput:
-        """Execute a numerical batch on the lane's eager path."""
-
-        stream = None if entry.cuda_stream is None else entry.cuda_stream.stream
-        context = nullcontext() if stream is None else torch.cuda.stream(stream)
-        with context, stream_collective_scope(entry.collectives):
-            return forward(batch)
-
-    def _replay_batch(
-        self,
-        entry: ModelEntry,
-        graph: BatchGraph,
-        execution: InputBatch,
-        rows: int,
-    ) -> tuple[ExecutionOutput, SamplerOutput | None]:
-        stream = None if entry.cuda_stream is None else entry.cuda_stream.stream
-        context = nullcontext() if stream is None else torch.cuda.stream(stream)
-        with context, stream_collective_scope(entry.collectives):
-            if graph.input_leaves:
-                _copy_tensors(graph.input_leaves, tuple(_batch_tensors(execution)), "forward")
-            else:
-                _copy_tensors(
-                    graph.attention_leaves, tuple(_attention_inputs(execution)), "attention"
-                )
-            self._prepare_graph_attention(entry, graph.inputs, execution, capture=False)
-            assert self.graph_streams[entry] is not None
-            output, greedy = graph.graph.replay()
-            # Trimming packs completion columns with a device copy. It must
-            # follow replay on its producer stream, before the output fence.
-            return output, _trim_greedy(greedy, rows)
-
-    def _publish_batch_output(
-        self, entry: ModelEntry, output: ExecutionOutput, rows: int
-    ) -> ExecutionOutput:
-        """Publish live rows before another graph reuses capture storage."""
-
-        stream = None if entry.cuda_stream is None else entry.cuda_stream.stream
-        consumer = None if stream is None else torch.cuda.current_stream(stream.device)
-        context = nullcontext() if stream is None else torch.cuda.stream(stream)
-        with context, stream_collective_scope(entry.collectives):
-            published = _trim_output(output, rows).clone()
-        if consumer is not None and consumer != stream:
-            for value in published.values:
-                value.record_stream(consumer)
-        return published
-
-    def _prepare_graph_attention(
-        self,
-        entry: ModelEntry,
-        static_batch: InputBatch,
-        live_batch: InputBatch,
-        *,
-        capture: bool,
-    ) -> tuple[Callable[[], None], ...]:
-        """Bind static attention wrappers to live page metadata for capture or replay."""
-
-        # Dense and entry attention carry no persistent backend plan. Paged
-        # modes first copy live table views into the static graph batch.
-        static = static_batch.attention
-        live = live_batch.attention
-        if static.attention_mode is not live.attention_mode:
-            raise _GraphMiss("attention form changed for a graph bucket")
-        if static.attention_mode in {AttentionMode.DENSE, AttentionMode.PACKED}:
-            return ()
-        if static.attention_mode not in {AttentionMode.PAGED_DECODE, AttentionMode.PAGED_VARLEN}:
-            return ()
-        prepared = _live_attention(static, live)
-        layer = self.kv_cache.cache.layer(0)
-        key_cache, _value_cache = layer.k, layer.v
-        backend = _graph_provider(
-            self.attention,
-            static.attention_mode,
-            head_dim=cast(TextMixin, self.model).text_backbone.cache_config.head_dim,
-            block_size=self.worker_config.block_size,
-            device=key_cache.device,
-        )
-        q_dtype = key_cache.dtype
-        kv_dtype = key_cache.dtype
-        releases: list[Callable[[], None]] = []
-
-        if capture:
-            release_name = (
-                "release_paged_decode_graph_binding"
-                if static.attention_mode is AttentionMode.PAGED_DECODE
-                else "release_paged_prefill_graph_wrapper"
-            )
-            release = getattr(backend, release_name, None)
-            if callable(release):
-                releases.append(_release_call(release, static_batch.binding))
-        try:
-            # Decode wrappers are keyed by graph binding and can be replanned for
-            # each live table while retaining fixed tensor addresses.
-            if static.attention_mode is AttentionMode.PAGED_DECODE:
-                prepare = getattr(backend, "prepare_paged_decode_cuda_graph", None)
-                if callable(prepare):
-                    prepare(
-                        static_batch.binding,
-                        prepared,
-                        batch_size=int(cast(torch.Tensor, static.block_table).shape[0]),
-                        max_indices=max(1, int(cast(torch.Tensor, static.block_table).numel())),
-                        num_q_heads=next(
-                            module.num_heads
-                            for module in cast(TextMixin, self.model).text_backbone.modules()
-                            if isinstance(module, RadixAttention)
-                        ),
-                        num_kv_heads=int(
-                            cast(TextMixin, self.model).text_backbone.cache_config.num_kv_heads
-                        ),
-                        head_dim=int(
-                            cast(TextMixin, self.model).text_backbone.cache_config.head_dim
-                        ),
-                        page_size=self.worker_config.block_size,
-                        q_dtype=q_dtype,
-                        kv_dtype=kv_dtype,
-                    )
-                return tuple(releases)
-
-            # Prefill capture owns a graph-bound wrapper until graph eviction;
-            # replay updates only its caller-owned metadata buffers.
-            if static.attention_mode is not AttentionMode.PAGED_VARLEN:
-                return ()
-            bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
-            prepare = getattr(backend, "prepare_paged_prefill_cuda_graph", None)
-            if callable(bind) and callable(prepare):
-                if capture:
-                    bind(
-                        static_batch.binding,
-                        static,
-                        device=cast(torch.Tensor, static.block_table).device,
-                    )
-                prepare(
-                    static_batch.binding,
-                    prepared,
-                    num_q_heads=next(
-                        module.num_heads
-                        for module in cast(TextMixin, self.model).text_backbone.modules()
-                        if isinstance(module, RadixAttention)
-                    ),
-                    num_kv_heads=int(
-                        cast(TextMixin, self.model).text_backbone.cache_config.num_kv_heads
-                    ),
-                    head_dim=int(cast(TextMixin, self.model).text_backbone.cache_config.head_dim),
-                    page_size=self.worker_config.block_size,
-                    q_dtype=q_dtype,
-                    kv_dtype=kv_dtype,
-                    causal=static.causal,
-                )
-            return tuple(releases)
-        except BaseException as error:
-            for release in reversed(releases):
-                try:
-                    release()
-                except BaseException as cleanup:
-                    error.add_note(f"attention binding cleanup failed: {cleanup!r}")
-            raise
 
     def forward(
         self,
@@ -2190,7 +1112,7 @@ class ModelRunner:
         grouped: dict[tuple[object, ...], list[int]] = defaultdict(list)
         bindings: dict[int, ModelEntry] = {}
         for index, (task, operation) in enumerate(tasks):
-            entry = self._forward_entries.get((operation.entry, operation.kind))
+            entry = self._forward_entries.get((operation.entry, task.forward_mode))
             if entry is None:
                 yield (
                     (index,),
@@ -2279,7 +1201,7 @@ class ModelRunner:
             )
             for operation in operations
         )
-        entry = self._forward_entries.get((operations[0].entry, operations[0].kind))
+        entry = self._forward_entries.get((operations[0].entry, forward_mode))
         if entry is None:
             raise InputError(
                 f"model runner has no {operations[0].kind.value!r} binding for {operations[0].entry!r}",
@@ -2304,9 +1226,6 @@ class ModelRunner:
                     cache=cache,
                     tables=tables,
                     states=states,
-                    packed=cast(TextMixin, self.model).text_backbone.attention_mode
-                    is AttentionMode.PACKED,
-                    binding=_binding_identity(operations),
                 )
                 request_pool_indices = batch.request_pool_indices
         except Exception as error:
@@ -2420,7 +1339,7 @@ def _execution_failure(
     if isinstance(error, WorkerError):
         return error
     classified = classify(error)
-    if isinstance(error, GraphExecutionError) or classified.code in {
+    if isinstance(error, CUDAGraphError) or classified.code in {
         WorkerErrorCode.RESOURCE_ERROR,
         WorkerErrorCode.FATAL_WORKER_FAILURE,
     }:
@@ -2438,19 +1357,3 @@ def _execution_failure(
         route=forward_mode.value,
         operations=operations,
     )
-
-
-__all__ = ["ModelRunner"]
-
-
-def _binding_identity(operations: tuple[ScheduledRequest, ...]) -> int:
-    """Return a shared attention binding when every forward row agrees."""
-
-    hasher = hashlib.blake2b(digest_size=8)
-    for operation in operations:
-        hasher.update(int(operation.request_key.request_id).to_bytes(8, "little"))
-        hasher.update(int(operation.request_key.request_epoch).to_bytes(8, "little"))
-        hasher.update(operation.request_key.engine_id.to_bytes(8, "little"))
-        hasher.update(operation.op_id.batch_id.to_bytes(8, "little"))
-        hasher.update(operation.op_id.request_index.to_bytes(4, "little"))
-    return int.from_bytes(hasher.digest(), "little")

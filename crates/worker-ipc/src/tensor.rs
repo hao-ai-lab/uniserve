@@ -179,15 +179,12 @@ pub enum TransferTransport {
         /// Shared-memory object name.
         name: String,
     },
-    /// CUDA IPC publication with shared lifetime and readiness handles.
+    /// CUDA publication whose granted reader receives a physical-allocation descriptor.
     CudaIpc {
         /// Publishing worker endpoint.
         endpoint: String,
         /// Stable publication identity.
         publication_id: String,
-        /// Opaque CUDA allocation handle.
-        #[serde(with = "serde_bytes")]
-        storage_handle: Vec<u8>,
         /// Exported allocation size in bytes.
         storage_size_bytes: u64,
         /// Byte offsets of ordered first-axis spans within one allocation.
@@ -583,7 +580,6 @@ fn transfer_encoded_size(tensors: &[TensorTransfer]) -> usize {
                 TransferTransport::CudaIpc {
                     endpoint,
                     publication_id,
-                    storage_handle,
                     ready_event_handle,
                     tensor_stride,
                     span_lengths,
@@ -592,7 +588,6 @@ fn transfer_encoded_size(tensors: &[TensorTransfer]) -> usize {
                 } => endpoint
                     .len()
                     .saturating_add(publication_id.len())
-                    .saturating_add(storage_handle.len())
                     .saturating_add(ready_event_handle.len())
                     .saturating_add(8usize.saturating_mul(tensor_stride.len()))
                     .saturating_add(8usize.saturating_mul(storage_offsets_bytes.len()))
@@ -753,7 +748,6 @@ impl Locator {
             TransferTransport::CudaIpc {
                 endpoint,
                 publication_id,
-                storage_handle,
                 storage_size_bytes,
                 storage_offsets_bytes,
                 span_lengths,
@@ -765,7 +759,6 @@ impl Locator {
                 ensure_valid!(
                     !endpoint.is_empty()
                         && publication_id.len() == 32
-                        && storage_handle.len() == 64
                         && *storage_size_bytes > 0
                         && !storage_offsets_bytes.is_empty()
                         && span_counts.len() == span_lengths.len()
@@ -790,9 +783,7 @@ impl Locator {
                         && tensor_stride.iter().all(|stride| *stride >= 0),
                     "CUDA IPC transfer handle is incomplete"
                 );
-                let opaque_bytes = storage_handle
-                    .len()
-                    .saturating_add(ready_event_handle.len());
+                let opaque_bytes = ready_event_handle.len();
 
                 ensure_valid!(
                     opaque_bytes <= MAX_TRANSFER_HANDLE_BYTES,

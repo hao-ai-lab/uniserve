@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from uniserve.model.video import VideoMixin
-from uniserve.tensors import ImageRange
+from uniserve.media import image as media_image
+from uniserve.model import VideoPostprocessor
 from uniserve_worker.execution import operations as operations
 from uniserve_worker.execution.batch_state import BatchState
 from uniserve_worker.execution.commit import _discard_group
@@ -50,7 +50,6 @@ from uniserve_worker.runtime.latent_pool import LatentImport
 from uniserve_worker.runtime.tensor_store import FeatureMetadata, ImageMetadata, TensorRead
 
 if TYPE_CHECKING:
-    from uniserve.model.model import Model
     from uniserve_worker.bootstrap.worker_info import WorkerInfo
     from uniserve_worker.config import WorkerConfig
     from uniserve_worker.execution.model_runner import ModelRunner
@@ -144,7 +143,7 @@ def prepare_batch(
                     allocation.page_ids,
                     group=allocation.group_id,
                     start=0,
-                    length=len(allocation.page_ids) * cache.cache.page_size,
+                    length=len(allocation.page_ids) * cache.info.block_size,
                 )
             )
         for row, write_kv in enumerate(batch.write_kv):
@@ -249,7 +248,7 @@ def prepare_inputs(
                     raise invalid_descriptor("device-product image geometry must be non-negative")
                 if (value.height == 0) != (value.width == 0):
                     raise invalid_descriptor("device-product image geometry is incomplete")
-                if value.value_range not in {"", *(member.value for member in ImageRange)}:
+                if value.value_range not in {"", "signed_unit", "unit"}:
                     raise invalid_descriptor("device-product value range is invalid")
                 if value.height == 0 and value.value_range:
                     raise invalid_descriptor("non-image device product carries an image range")
@@ -322,7 +321,9 @@ def prepare_inputs(
                             width=value.width,
                             value_range=None
                             if not value.value_range
-                            else ImageRange(value.value_range),
+                            else (
+                                (-1.0, 1.0) if value.value_range == "signed_unit" else (0.0, 1.0)
+                            ),
                         )
                     ),
                 )
@@ -577,7 +578,6 @@ def _open_group(
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     media_buffers: MediaBuffers | None,
-    execution_model: Model,
     output_pool: OutputPool,
     request_tables: BlockTables | None,
     request_pool: RequestPool,
@@ -606,137 +606,153 @@ def _open_group(
             if operations.operation_identity(operation) not in predicated
         )
     )
-    # Restrict input payloads to identities declared by this completion group.
-    started = time.perf_counter_ns()
-    declared_inputs = {
-        reference.buffer_id for operation in scheduled for reference in operation.tensor_inputs()
-    }
-    declared_inputs.update(
-        operation.kv_input for operation in scheduled if operation.kv_input is not None
-    )
-    declared_inputs.update(
-        operation.predicate.buffer_id for operation in scheduled if operation.predicate is not None
-    )
-    input_products = tuple(
-        payload for payload in batch.input_products if payload.product.buffer_id in declared_inputs
-    )
-    completion: OutputBuffer | None = None
-    try:
-        # Candidate drafts and completion slots form a speculative ownership unit:
-        # either all later completion group resources bind successfully or both are discarded.
-        request_pool_indices = tuple(
-            int(request_pool.get(operation.request_key.request_id).request_pool_idx)
+    if active_operations:
+        stream = model_runner.operation_stream(active_operations[0])
+        if stream is not None:
+            # Request slots are initialized on the control stream. Independent
+            # numerical entries publish their own producer/consumer fences.
+            stream.wait_stream(torch.cuda.current_stream(stream.device))
+            state.group_streams[completion_group] = stream
+
+    with state.group_scope(completion_group):
+        # Restrict input payloads to identities declared by this completion group.
+        started = time.perf_counter_ns()
+        declared_inputs = {
+            reference.buffer_id
             for operation in scheduled
+            for reference in operation.tensor_inputs()
+        }
+        declared_inputs.update(
+            operation.kv_input for operation in scheduled if operation.kv_input is not None
         )
-        completion = output_pool.acquire(
-            len(scheduled),
-            token_capacity=_completion_words(scheduled),
-            devices=tuple(
-                dict.fromkeys(
-                    device
-                    for operation in scheduled
-                    for device in model_runner.operation_devices(operation)
-                )
-            ),
+        declared_inputs.update(
+            operation.predicate.buffer_id
+            for operation in scheduled
+            if operation.predicate is not None
         )
-        candidates = request_pool.create_outputs(scheduled, request_pool_indices, completion)
-    except BaseException:
-        if completion is not None:
-            completion.abandon()
-        raise
-    assert completion is not None
-    for request in candidates:
-        if operations.operation_identity(request.operation) in predicated:
-            request.status = OpStatus.PREDICATED
-    state.bind_outputs(completion_group, candidates, completion, started)
-    try:
-        # Bind physical state in dependency order before decoding transferred inputs.
-        _reserve_cpu_tasks(
-            active_operations,
-            completion_group,
-            cpu_tasks=cpu_tasks,
-            worker_info=worker_info,
-            media_buffers=media_buffers,
-            execution_model=execution_model,
-            config=config,
-            state=state,
+        input_products = tuple(
+            payload
+            for payload in batch.input_products
+            if payload.product.buffer_id in declared_inputs
         )
-        if active_operations:
-            identities = {operations.operation_identity(op) for op in active_operations}
-            has_forward = any(
-                operations.operation_identity(batch.operations[index]) in identities
-                for index in batch.forward_operation_indices
+        completion: OutputBuffer | None = None
+        try:
+            # Candidate drafts and completion slots form a speculative ownership unit:
+            # either all later completion group resources bind successfully or both are discarded.
+            request_pool_indices = tuple(
+                int(request_pool.get(operation.request_key.request_id).request_pool_idx)
+                for operation in scheduled
             )
-            if kv_cache is None or request_tables is None:
-                if has_forward:
-                    raise unsupported_setup("KV-free execution received cache forward rows")
-            else:
-                _bind_cache_tables(
-                    active_operations,
-                    completion_group,
-                    kv_cache=kv_cache,
-                    request_tables=request_tables,
-                    state=state,
-                )
-            _bind_latent_inputs(
+            completion = output_pool.acquire(
+                len(scheduled),
+                token_capacity=_completion_words(scheduled),
+                devices=tuple(
+                    dict.fromkeys(
+                        device
+                        for operation in scheduled
+                        for device in model_runner.operation_devices(operation)
+                    )
+                ),
+            )
+            candidates = request_pool.create_outputs(scheduled, request_pool_indices, completion)
+        except BaseException:
+            if completion is not None:
+                completion.abandon()
+            raise
+        assert completion is not None
+        for request in candidates:
+            if operations.operation_identity(request.operation) in predicated:
+                request.status = OpStatus.PREDICATED
+        state.bind_outputs(completion_group, candidates, completion, started)
+        try:
+            # Bind physical state in dependency order before decoding transferred inputs.
+            _reserve_cpu_tasks(
                 active_operations,
                 completion_group,
+                cpu_tasks=cpu_tasks,
+                worker_info=worker_info,
+                media_buffers=media_buffers,
+                postprocessor=model_runner.video_postprocessor,
+                config=config,
+                state=state,
+            )
+            if active_operations:
+                identities = {operations.operation_identity(op) for op in active_operations}
+                has_forward = any(
+                    operations.operation_identity(batch.operations[index]) in identities
+                    for index in batch.forward_operation_indices
+                )
+                if kv_cache is None or request_tables is None:
+                    if has_forward:
+                        raise unsupported_setup("KV-free execution received cache forward rows")
+                else:
+                    _bind_cache_tables(
+                        active_operations,
+                        completion_group,
+                        kv_cache=kv_cache,
+                        request_tables=request_tables,
+                        state=state,
+                    )
+                _bind_latent_inputs(
+                    active_operations,
+                    completion_group,
+                    latent_pool=latent_pool,
+                    model_runner=model_runner,
+                    state=state,
+                )
+            _reserve_outputs(
+                scheduled,
+                completion_group,
+                tensor_store=tensor_store,
+                model_runner=model_runner,
+                state=state,
+            )
+
+            # Only live operations consume inputs; predicated outputs are published
+            # directly into their aligned completion rows.
+            active_inputs = {
+                reference
+                for operation in active_operations
+                for reference in operation.tensor_inputs()
+            }
+            active_inputs.update(
+                operation.predicate
+                for operation in active_operations
+                if operation.predicate is not None
+            )
+            _stage_input_products(
+                tuple(payload for payload in input_products if payload.product in active_inputs),
+                completion_group,
+                kv_cache=kv_cache,
+                tensor_store=tensor_store,
                 latent_pool=latent_pool,
                 model_runner=model_runner,
                 state=state,
             )
-        _reserve_outputs(
-            scheduled,
-            completion_group,
-            tensor_store=tensor_store,
-            execution_model=execution_model,
-            model_runner=model_runner,
-            state=state,
-        )
-
-        # Only live operations consume inputs; predicated outputs are published
-        # directly into their aligned completion rows.
-        active_inputs = {
-            reference for operation in active_operations for reference in operation.tensor_inputs()
-        }
-        active_inputs.update(
-            operation.predicate
-            for operation in active_operations
-            if operation.predicate is not None
-        )
-        _stage_input_products(
-            tuple(payload for payload in input_products if payload.product in active_inputs),
-            completion_group,
-            kv_cache=kv_cache,
-            tensor_store=tensor_store,
-            latent_pool=latent_pool,
-            model_runner=model_runner,
-            state=state,
-        )
-        _consume_predicates(
-            active_operations,
-            completion_group,
-            tensor_store=tensor_store,
-            model_runner=model_runner,
-            state=state,
-        )
-        _publish_predicated_outputs(
-            scheduled, completion_group, tensor_store=tensor_store, state=state
-        )
-        state.group_registered[completion_group] = True
-        record_component(state.group_component_us[completion_group], "open_lane", started)
-        return completion_group
-    except BaseException:
-        _discard_group(
-            completion_group,
-            kv_cache=kv_cache,
-            tensor_store=tensor_store,
-            latent_pool=latent_pool,
-            media_mux=media_mux,
-            transfer_backends=transfer_backends,
-            state=state,
-        )
-        raise
+            _consume_predicates(
+                active_operations,
+                completion_group,
+                tensor_store=tensor_store,
+                model_runner=model_runner,
+                state=state,
+            )
+            _publish_predicated_outputs(
+                scheduled, completion_group, tensor_store=tensor_store, state=state
+            )
+            state.group_registered[completion_group] = True
+            record_component(state.group_component_us[completion_group], "open_lane", started)
+            return completion_group
+        except BaseException:
+            _discard_group(
+                completion_group,
+                kv_cache=kv_cache,
+                tensor_store=tensor_store,
+                latent_pool=latent_pool,
+                media_mux=media_mux,
+                transfer_backends=transfer_backends,
+                state=state,
+            )
+            raise
 
 
 def _completion_words(scheduled: tuple[ScheduledRequest, ...]) -> int:
@@ -757,12 +773,11 @@ def _reserve_cpu_tasks(
     cpu_tasks: CpuPool,
     worker_info: WorkerInfo,
     media_buffers: MediaBuffers | None,
-    execution_model: Model,
+    postprocessor: VideoPostprocessor | None,
     config: WorkerConfig,
 ) -> None:
     """Reserve bounded CPU slots for active operations that schedule host-side work."""
 
-    video_model = isinstance(execution_model, VideoMixin)
     for operation in scheduled:
         if operation.kind not in {
             PipelineStage.IMAGE_DECODING,
@@ -771,7 +786,7 @@ def _reserve_cpu_tasks(
             PipelineStage.MUXING,
         }:
             continue
-        if video_model and config.rank != worker_info.output_rank(operation.entry):
+        if postprocessor is not None and config.rank != worker_info.output_rank(operation.entry):
             continue
         pending = state.pending_output(completion_group, operation.request_key.request_id)
         if pending.completion_tasks:
@@ -792,7 +807,7 @@ def validate_batch(
     batch: ScheduleBatch,
     *,
     worker_info: WorkerInfo,
-    execution_model: Model,
+    model_runner: ModelRunner,
     config: WorkerConfig,
 ) -> None:
     """Validate run identity, completion group resources, routing, and operation support before staging."""
@@ -825,7 +840,7 @@ def validate_batch(
         )
     ):
         raise invalid_descriptor("execution batch exceeds request-slot capacity")
-    validate_video_batch(batch, execution_model=execution_model)
+    validate_video_batch(batch, postprocessor=model_runner.video_postprocessor)
 
 
 def _reserve_outputs(
@@ -834,7 +849,6 @@ def _reserve_outputs(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    execution_model: Model,
     model_runner: ModelRunner,
 ) -> None:
     """Bind each declared device value to its concrete bounded owner."""
@@ -877,8 +891,8 @@ def _reserve_outputs(
                 if layout is None:
                     continue
                 shapes[output] = layout.shape
-                if layout.region is not None:
-                    regions[output] = layout.region
+                if layout.local_slice != tuple(slice(0, extent) for extent in layout.shape):
+                    regions[output] = layout.local_slice
                 persistent_bindings.append((output, device))
             if operation.image_output is not None:
                 persistent_bindings.append((operation.image_output, device))
@@ -1072,8 +1086,14 @@ def _bind_latent_inputs(
         image = request.request.image
         if image is None:
             raise invalid_descriptor("latent params has no admitted image geometry")
-        flow = model_runner.generation()
-        expected_units = int(flow.image_tokens(int(params.height), int(params.width)))
+        flow = model_runner.images
+        if flow is None:
+            raise invalid_descriptor("image trajectory has no numerical input factory")
+        expected_units = int(
+            flow.denoiser.latent_shape(
+                "image", media_image.Config(int(params.height), int(params.width))
+            )[0]
+        )
         if (
             int(params.height) != int(image.height)
             or int(params.width) != int(image.width)
@@ -1163,7 +1183,7 @@ def _bind_cache_tables(
         if table.request_pool_idx not in slots:
             continue
         pages = cache.validate_pages(table.page_ids, group=table.group_id)
-        if int(table.allocated_tokens) > len(pages) * cache.cache.page_size:
+        if int(table.allocated_tokens) > len(pages) * cache.info.block_size:
             raise invalid_descriptor("block-table allocation exceeds physical capacity")
         tables.append(
             (

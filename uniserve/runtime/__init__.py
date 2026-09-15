@@ -1,1 +1,43 @@
 """Storage and executable ownership for direct numerical calls."""
+
+from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .cuda import CUDAError
+    from .cuda_graph import CUDAGraph, CUDAGraphError
+    from .execution import ExecutionContext
+    from .prefix_cache import PrefixCache
+    from .process_groups import ProcessGroups, initialize_process_groups
+    from .tensor_buffers import TensorBuffers
+
+__all__ = [
+    "TensorBuffers",
+    "PrefixCache",
+    "ProcessGroups",
+    "initialize_process_groups",
+    "ExecutionContext",
+    "CUDAGraph",
+    "CUDAGraphError",
+    "CUDAError",
+]
+
+
+def __getattr__(name):
+    # Numerical modules can import borrowed bindings without recursively
+    # constructing the storage/resource owner dependency graph.
+    modules = {
+        "TensorBuffers": "tensor_buffers",
+        "PrefixCache": "prefix_cache",
+        "ProcessGroups": "process_groups",
+        "initialize_process_groups": "process_groups",
+        "ExecutionContext": "execution",
+        "CUDAGraph": "cuda_graph",
+        "CUDAGraphError": "cuda_graph",
+        "CUDAError": "cuda",
+    }
+    if name not in modules:
+        raise AttributeError(name)
+    value = getattr(import_module(f"{__name__}.{modules[name]}"), name)
+    globals()[name] = value
+    return value

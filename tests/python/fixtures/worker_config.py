@@ -15,7 +15,7 @@ def stub_worker_config(
     max_batch_operations: int = DEFAULT_MAX_BATCH_OPS,
     max_batch_tokens: int,
 ) -> WorkerConfig:
-    """Build the single-device worker_config geometry required by ``StubModel``."""
+    """Build CPU execution capacity for the deterministic simulator."""
 
     return WorkerConfig(
         device="cpu",
@@ -23,7 +23,7 @@ def stub_worker_config(
         world_size=1,
         block_size=int(block_size),
         kv_token_capacity=int(block_size) * DEFAULT_NUM_BLOCKS_FALLBACK,
-        attention_backend="torch_sdpa",
+        attention_backend="torch",
         model_dtype="bfloat16",
         kv_cache_dtype=None,
         kv_memory_fraction=1.0,

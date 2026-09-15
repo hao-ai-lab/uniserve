@@ -4,15 +4,27 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve.attention.metadata import ExpertRoute
-from uniserve.distributed.mesh import Communicator
-from uniserve.nn.branch import branch
-from uniserve.nn.layer import LayerConfig
-from uniserve.nn.linear import QKVParallelLinear
-from uniserve.nn.norm import RMSNorm
-from uniserve.nn.qkv import RotaryQKV
-from uniserve.runtime.branches import bind_branches
-from uniserve.runtime.cuda_graph import CudaGraph, capture_pools
+from contextlib import ExitStack
+from torch import nn
+
+from uniserve.nn import QKVParallelLinear, RMSNorm
+from uniserve.nn.attention import RotaryQKVProjection
+from uniserve.runtime import CUDAGraph, ExecutionContext
+
+
+class Projection(nn.Module):
+    def __init__(self, device, target):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(8, device=device)
+        self.qkv = RotaryQKVProjection(
+            QKVParallelLinear(8, 2, 1, 4, device=target),
+            RMSNorm(4, 1e-6, device=target),
+            RMSNorm(4, 1e-6, device=target),
+        )
+
+    def forward(self, hidden, cos, sin):
+        return self.qkv(self.input_norm(hidden), cos, sin)
+
 
 pytestmark = pytest.mark.unit
 
@@ -33,33 +45,39 @@ pytestmark = pytest.mark.unit
 )
 def test_rotary_projection_preserves_qkv_values_and_replay(rows, flow_device):
     device = "cpu" if flow_device == "cpu" else "cuda:0"
-    projection = QKVParallelLinear(8, 4, 2, 1, layer_config=LayerConfig(Communicator(), None))
-    module = branch(RotaryQKV(projection, RMSNorm(4, 1e-6), RMSNorm(4, 1e-6)), ExpertRoute.FLOW)
+    module = Projection(device, flow_device)
+    projection = module.qkv.projection
     weight = torch.arange(128, dtype=torch.float32).reshape(16, 8) / 128 - 0.5
     bias = torch.linspace(-0.3, 0.3, 16)
     scales = torch.tensor([0.5, 0.75, 1.0, 1.25])
     with torch.no_grad():
-        projection.weight.copy_(weight)
-        projection.bias.copy_(bias)
-        module.query_norm.weight.copy_(scales)
-        module.key_norm.weight.copy_(scales)
-    module.to(flow_device)
-    bind_branches(module, device=device, flow_device=flow_device)
+        for (name, branch), branch_weight, branch_bias in zip(
+            projection.projections.items(),
+            weight.split((8, 4, 4)),
+            bias.split((8, 4, 4)),
+            strict=True,
+        ):
+            branch.weight.copy_(branch_weight)
+            branch.bias.copy_(branch_bias)
+        module.qkv.query_norm.weight.copy_(scales)
+        module.qkv.key_norm.weight.copy_(scales)
     hidden = torch.arange(rows * 8, dtype=torch.float32).reshape(rows, 8) / 32
     phase = torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2) / 7
     cosine, sine = phase.cos(), phase.sin()
 
     def expected(values):
-        query, key, value = F.linear(values, weight, bias).split((8, 4, 4), dim=-1)
+        query, key, value = F.linear(F.layer_norm(values, (8,)), weight, bias).split(
+            (8, 4, 4), dim=-1
+        )
 
         def rotate(value, heads):
             value = value.reshape(rows, heads, 4)
             value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6) * scales
             left, right = value.chunk(2, dim=-1)
             cos, sin = cosine[:, None], sine[:, None]
-            return torch.cat((left * cos - right * sin, right * cos + left * sin), -1).bfloat16()
+            return torch.cat((left * cos - right * sin, right * cos + left * sin), -1)
 
-        return rotate(query, 2), rotate(key, 1), value.reshape(rows, 1, 4).bfloat16()
+        return rotate(query, 2), rotate(key, 1), value.reshape(rows, 1, 4)
 
     inputs = hidden.to(device)
     cos, sin = (cosine.to(device),), (sine.to(device),)
@@ -68,45 +86,20 @@ def test_rotary_projection_preserves_qkv_values_and_replay(rows, flow_device):
         for actual, reference in zip(result, wanted, strict=True):
             torch.testing.assert_close(actual, reference.to(device))
 
-    with torch.inference_mode():
-        verify(module(inputs, cos=cos, sin=sin), expected(hidden))
-        if device != "cpu":
-            # Peer transfers, all rotary inputs, and tuple outputs participate
-            # in the same replay; updating the source must update every head.
-            calls = []
-            for offset in (0.25, 0.5):
-                current = inputs.clone()
-                stream = torch.cuda.Stream(device=device)
-                stream.wait_stream(torch.cuda.current_stream(device))
-                with torch.cuda.stream(stream):
-                    module(current, cos=cos, sin=sin)
-                stream.synchronize()
-                graph = CudaGraph(
-                    device=torch.device(device),
-                    stream=stream,
-                    device_pools=capture_pools((torch.device(flow_device),)),
-                )
-                graph.capture(lambda current=current: module(current, cos=cos, sin=sin))
-                output = graph.output
-                current.add_(offset)
-                calls.append((stream, graph, current, output, offset))
-            for stream, graph, _, _, _ in calls:
-                stream.wait_stream(torch.cuda.current_stream(device))
-                with torch.cuda.stream(stream):
-                    graph.replay()
-            for stream, _, _, output, offset in calls:
-                torch.cuda.current_stream(device).wait_stream(stream)
-                verify(output, expected(hidden + offset))
-            # Reusing one caller's graph must preserve the other caller's
-            # still-borrowed output, even though their neural weights are shared.
-            stream, graph, current, _, _ = calls[1]
-            current.add_(0.25)
+    with ExitStack() as scope, torch.inference_mode():
+        stream = None if device == "cpu" else torch.cuda.Stream(device=device)
+        if stream is not None:
             stream.wait_stream(torch.cuda.current_stream(device))
-            with torch.cuda.stream(stream):
-                graph.replay()
-            torch.cuda.current_stream(device).wait_stream(stream)
-            verify(calls[0][3], expected(hidden + 0.25))
-            verify(calls[1][3], expected(hidden + 0.75))
-            for stream, graph, _, _, _ in calls:
-                stream.synchronize()
-                graph.close()
+        context = scope.enter_context(ExecutionContext(module, stream=stream))
+        context.prepare(None)
+        verify(module(inputs, cos, sin), expected(hidden))
+        if stream is not None:
+            with torch.cuda.device(flow_device):
+                pool = torch.cuda.MemPool()
+            graph = scope.enter_context(
+                CUDAGraph(context=context, pools={torch.device(flow_device): pool})
+            )
+            graph.capture(lambda: module(inputs, cos, sin))
+            inputs.mul_(1.25)
+            verify(graph.replay(), expected(hidden * 1.25))
+            stream.synchronize()

@@ -1,42 +1,41 @@
-from __future__ import annotations
+"""H3's trained four-evaluation endpoints retain their materialization order."""
 
 import pytest
 import torch
 
-from uniserve.nn.diffusion.integrator import clean_sample_euler_step_
-from uniserve.nn.diffusion.schedule import shifted_sigmas
-from uniserve_models.minimax_h3.config import FASTH3_LADDER, FASTH3_TIME_SCALE
+from uniserve_models.minimax_h3.config import DiffusionConfig, TransformerConfig
+from uniserve_models.minimax_h3.diffusion import Denoiser
 from uniserve_models.minimax_h3.packing import audio_latent_frames
 
 pytestmark = pytest.mark.unit
 
 
-@pytest.mark.parametrize(
-    ("shift", "expected"),
-    (
-        (12.0, (1.0, 36.0 / 37.0, 12.0 / 13.0, 0.8, 0.0)),
-        (3.0, (1.0, 0.9, 0.75, 0.5, 0.0)),
-    ),
-)
-def test_fasth3_checkpoint_schedule(shift: float, expected: tuple[float, ...]) -> None:
-    assert shifted_sigmas(FASTH3_LADDER, shift, scale=FASTH3_TIME_SCALE) == pytest.approx(expected)
+def test_fixed_modality_endpoints():
+    with torch.device("meta"):
+        model = Denoiser(TransformerConfig(), DiffusionConfig())
+    schedules = model.make_schedules(4, shift=None, device="cpu")
+    assert tuple(schedules) == ("video", "audio")
+    for name, expected in (
+        ("video", (1.0, 36.0 / 37.0, 12.0 / 13.0, 0.8, 0.0)),
+        ("audio", (1.0, 0.9, 0.75, 0.5, 0.0)),
+    ):
+        sigma = torch.tensor(expected, dtype=torch.float32)
+        torch.testing.assert_close(schedules[name].sigmas, sigma, rtol=0, atol=0)
+        torch.testing.assert_close(schedules[name].timesteps, 1.0 - sigma, rtol=0, atol=0)
+        assert schedules[name].coordinates == pytest.approx(
+            tuple(1.0 - value for value in expected)
+        )
+        assert schedules[name].num_steps == 4
 
 
-@pytest.mark.parametrize(("video_frames", "expected"), ((124, 207), (362, 604)))
-def test_fasth3_audio_duration_geometry(video_frames: int, expected: int) -> None:
+@pytest.mark.parametrize("steps,shift", [(1, None), (2, None), (3, None), (5, None), (4, 1.0)])
+def test_rejects_untrained_schedule(steps, shift):
+    with torch.device("meta"):
+        model = Denoiser(TransformerConfig(), DiffusionConfig())
+    with pytest.raises(ValueError, match="four evaluations"):
+        model.make_schedules(steps, shift=shift, device="cpu")
+
+
+@pytest.mark.parametrize("video_frames,expected", [(124, 207), (362, 604)])
+def test_audio_duration(video_frames, expected):
     assert audio_latent_frames(video_frames) == expected
-
-
-def test_fasth3_solver_follows_clean_time_interval() -> None:
-    sample = torch.tensor([2.0, -1.0], dtype=torch.float32)
-    velocity = torch.tensor([0.5, 2.0], dtype=torch.float32)
-
-    clean_sample_euler_step_(
-        sample,
-        velocity,
-        timestep=torch.tensor(0.25),
-        sigma=torch.tensor(0.75),
-        sigma_next=torch.tensor(0.5),
-    )
-
-    assert sample.tolist() == pytest.approx([2.125, -0.5])

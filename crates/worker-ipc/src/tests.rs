@@ -505,7 +505,6 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
         TransferTransport::CudaIpc {
             endpoint: "uniserve-cuda-physical-incarnation".into(),
             publication_id: "0123456789abcdef0123456789abcdef".into(),
-            storage_handle: vec![7; 64],
             storage_size_bytes: 4096,
             storage_offsets_bytes: vec![128, 64],
             span_lengths: vec![2],
@@ -1356,6 +1355,8 @@ fn request_fixtures() -> Vec<WorkerRequest> {
 
 fn full_caps() -> WorkerInfo {
     WorkerInfo {
+        encoder_cache_entries: 64,
+        encoder_entry_bytes: 128 << 20,
         pipeline_components: video_components(),
         num_inference_steps: 4,
         supported_ops: Computation::ALL.to_vec(),

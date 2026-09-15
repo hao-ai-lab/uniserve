@@ -8,8 +8,9 @@ from uniserve.runtime import paged_kv_math
 
 @pytest.mark.parametrize("encoded", (False, True))
 @pytest.mark.parametrize("index_dtype", (torch.int32, torch.int64))
+@pytest.mark.parametrize("column_stride", (1, 2))
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_paged_kv_write_replays_dynamic_rows_in_cuda_graph(encoded, index_dtype):
+def test_paged_kv_write_replays_dynamic_rows_in_cuda_graph(encoded, index_dtype, column_stride):
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(71)
     pages, page_size, heads, head_dim = 5, 4, 8, 128
@@ -37,28 +38,33 @@ def test_paged_kv_write_replays_dynamic_rows_in_cuda_graph(encoded, index_dtype)
     row_width = heads * head_dim
     k_storage = torch.randn(
         rows,
-        row_width + 32,
+        row_width * column_stride + 32,
         dtype=torch.bfloat16,
         device=device,
         generator=generator,
     )
     v_storage = torch.randn(
         rows,
-        row_width + 48,
+        row_width * column_stride + 48,
         dtype=torch.bfloat16,
         device=device,
         generator=generator,
     )
-    k_current = k_storage[:, 16 : 16 + row_width].view(rows, heads, head_dim)
-    v_current = v_storage[:, 24 : 24 + row_width].view(rows, heads, head_dim)
+    k_current = k_storage[:, 16 : 16 + row_width * column_stride : column_stride].view(
+        rows, heads, head_dim
+    )
+    v_current = v_storage[:, 24 : 24 + row_width * column_stride : column_stride].view(
+        rows, heads, head_dim
+    )
     assert not k_current.is_contiguous()
     assert not v_current.is_contiguous()
     page_ids = torch.tensor([-1, 2, 4], dtype=index_dtype, device=device)
     offsets = torch.tensor([0, 3, 0], dtype=index_dtype, device=device)
 
-    # Encoded slots reserve zero as a non-writing sentinel. Page/offset
-    # addressing instead masks negative page IDs; both forms share K/V geometry.
-    locations = torch.tensor([0, 11, 16], dtype=index_dtype, device=device) if encoded else page_ids
+    # Both encoded and block/offset addresses exclude only the -1 sentinel.
+    locations = (
+        torch.tensor([-1, 11, 16], dtype=index_dtype, device=device) if encoded else page_ids
+    )
     address_offsets = None if encoded else offsets
 
     with torch.inference_mode():
@@ -138,9 +144,11 @@ def test_encoded_kv_locations_preserve_unwritten_rows(device, cast):
     source_dtype = torch.float32 if cast else torch.bfloat16
     source_keys = torch.arange(30, dtype=source_dtype, device=device).reshape(5, 2, 3) / 7
     source_values = -source_keys
-    locations = torch.tensor([0, -2, 4, 7, 11], device=device)
+    locations = torch.tensor([0, -1, 4, 7, 11], device=device)
     expected_keys = keys.clone()
     expected_values = values.clone()
+    expected_keys[0, 0] = source_keys[0]
+    expected_values[0, 0] = source_values[0]
     for row, (page, offset) in enumerate(((1, 0), (1, 3), (2, 3)), start=2):
         expected_keys[page, offset] = source_keys[row]
         expected_values[page, offset] = source_values[row]

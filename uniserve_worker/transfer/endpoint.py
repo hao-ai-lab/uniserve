@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import array
 import hashlib
 import json
+import os
 import selectors
 import socket
 import threading
@@ -39,30 +41,44 @@ def publication_key(locator: Locator) -> bytes:
     raise invalid_descriptor("process publication requires a shared transport")
 
 
-def open_reader(locator: Locator) -> socket.socket:
+def open_reader(locator: Locator) -> tuple[socket.socket, int | None]:
     """Acquire source ownership before opening any shared allocation or readiness signal."""
 
     handle = locator.transport
     if not isinstance(handle, (CudaIpcTransfer, PosixShmTransfer)):
         raise invalid_descriptor("process read requires a shared transport")
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    descriptors = array.array("i")
     try:
         connection.connect("\0" + handle.endpoint)
         connection.sendall(publication_key(locator) + locator_digest(locator))
-        response = connection.recv(1)
+        response, ancillary, flags, _address = connection.recvmsg(
+            1, socket.CMSG_SPACE(descriptors.itemsize), socket.MSG_CMSG_CLOEXEC
+        )
+        for level, kind, payload in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                descriptors.frombytes(payload[: len(payload) - len(payload) % descriptors.itemsize])
         if not response:
             raise resource_error("publication endpoint was lost before readiness")
         if response == b"F":
             raise resource_error("publication producer failed before readiness")
         if response != b"G":
             raise invalid_descriptor("publication is retired, invalid, or has no reader capacity")
+        if flags & socket.MSG_CTRUNC or len(descriptors) != int(
+            isinstance(handle, CudaIpcTransfer)
+        ):
+            raise invalid_descriptor("publication grant has an invalid allocation descriptor")
     except OSError as error:
+        for descriptor in descriptors:
+            os.close(descriptor)
         connection.close()
         raise resource_error("publication endpoint was lost before readiness") from error
     except BaseException:
+        for descriptor in descriptors:
+            os.close(descriptor)
         connection.close()
         raise
-    return connection
+    return connection, descriptors[0] if descriptors else None
 
 
 def finish_reader(connection: socket.socket) -> None:
@@ -106,6 +122,7 @@ class PublicationEndpoint(Generic[Source]):
         publication_capacity: int,
         reclaim: Callable[[Source, Future[None]], None],
         drain: Callable[[Source], None],
+        descriptor: Callable[[Source], int] | None = None,
     ) -> None:
         if min(reader_capacity, publication_capacity) < 1:
             raise ValueError("publication and reader capacities must be positive")
@@ -114,6 +131,7 @@ class PublicationEndpoint(Generic[Source]):
         self._publication_capacity = publication_capacity
         self._reclaim = reclaim
         self._drain = drain
+        self._descriptor = descriptor
         self._publications: dict[bytes, _Publication[Source]] = {}
         self._lock = threading.Lock()
         self._closing = False
@@ -298,7 +316,14 @@ class PublicationEndpoint(Generic[Source]):
                 else:
                     response = b"G"
             try:
-                connection.send(response)
+                if response == b"G" and self._descriptor is not None:
+                    descriptor = self._descriptor(publication.source)
+                    connection.sendmsg(
+                        (response,),
+                        ((socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", (descriptor,))),),
+                    )
+                else:
+                    connection.send(response)
             except OSError:
                 remove(connection)
             else:

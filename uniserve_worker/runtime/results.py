@@ -1,4 +1,4 @@
-"""Translate numerical output requirements into bounded protocol products."""
+"""Translate numerical output layouts into bounded protocol products."""
 
 from __future__ import annotations
 
@@ -6,9 +6,11 @@ from collections.abc import Mapping
 from types import MappingProxyType
 
 import torch
+from torch import nn
 
-from uniserve.model.model import Model
+from uniserve.model import AudioDecoder, Denoiser, VideoDecoder
 
+from ..config import WorkerConfig
 from ..execution.resources import output_layouts
 from ..protocol.batch import DeviceDim, DType, OutputInfo, ShapeBound, StaticDim
 
@@ -22,59 +24,53 @@ _DTYPES = {
     torch.float32: DType.F32,
 }
 
-# The media protocol names persistent products by their downstream use. The
-# numerical capabilities name modalities, independently of publication/storage.
-_PRODUCT_NAMES = {
-    "forward_diffusion": {"video": "video_latents", "audio": "audio_latents"},
-    "decode:video": {"video": "video_segments"},
-    "decode:audio": {"audio": "audio_samples"},
-}
+
+def product_name(module: nn.Module, name: str) -> str:
+    """Name a numerical modality by its downstream protocol use."""
+
+    if isinstance(module, Denoiser):
+        return {"video": "video_latents", "audio": "audio_latents"}.get(name, name)
+    if isinstance(module, VideoDecoder) and name == "video":
+        return "video_segments"
+    if isinstance(module, AudioDecoder) and name == "audio":
+        return "audio_samples"
+    return name
 
 
-def resolve_outputs(model: Model) -> Mapping[str, tuple[OutputInfo, ...]]:
-    """Resolve complete logical result bounds before placement and allocation.
+def resolve_outputs(model: nn.Module, config: WorkerConfig) -> Mapping[str, tuple[OutputInfo, ...]]:
+    """Resolve global product bounds from the worker's admitted numerical sizes.
 
-    Models declare maximum numerical input shapes and the resulting tensor
-    requirements. Only this boundary selects wire dtypes, dynamic extent
-    descriptors, and persistent product names. Local output regions do not
-    reduce a product's global capacity: remote readers can assemble its shards.
-    Unsupported wire representations fail before any product is allocated.
+    Local shards retain their global allocation bound so remote consumers can
+    assemble them. Wire dtypes and persistent product names belong here; model
+    output layouts retain only their numerical representation and placement.
     """
 
-    from uniserve_models.catalog import entry_paths
+    from ..bootstrap.components import describe_components
 
     result = {}
-    calls = model.component_calls(model.config)
-    for entry, path in entry_paths(type(model), model.config).items():
+    for entry, calls in describe_components(model).items():
         outputs = []
-        try:
-            component = model.get_submodule(path)
-        except AttributeError:
-            continue
-        numerical = [
-            (call.method, name, layout)
-            for call in calls
-            if call.component == path
-            for name, layout in output_layouts(model, call.method, component).items()
-        ]
-        for call, name, layout in numerical:
-            dtype = _DTYPES.get(layout.dtype)
-            if dtype is None:
-                raise ValueError(f"result {entry}.{name} has no protocol dtype")
-            if len(layout.variable_axes) > 1:
-                raise ValueError(f"result {entry}.{name} exceeds the protocol's dynamic axes")
-            outputs.append(
-                OutputInfo(
-                    _PRODUCT_NAMES.get(call, {}).get(name, name),
-                    dtype,
-                    ShapeBound(
-                        tuple(
-                            DeviceDim(extent) if axis in layout.variable_axes else StaticDim(extent)
-                            for axis, extent in enumerate(layout.shape)
-                        )
-                    ),
+        for call in calls:
+            for name, layout in output_layouts(model, config, call).items():
+                dtype = _DTYPES.get(layout.dtype)
+                if dtype is None:
+                    raise ValueError(f"result {entry}.{name} has no protocol dtype")
+                if len(layout.variable_axes) > 1:
+                    raise ValueError(f"result {entry}.{name} exceeds the protocol dynamic axes")
+                outputs.append(
+                    OutputInfo(
+                        product_name(call.module, name),
+                        dtype,
+                        ShapeBound(
+                            tuple(
+                                DeviceDim(extent)
+                                if axis in layout.variable_axes
+                                else StaticDim(extent)
+                                for axis, extent in enumerate(layout.shape)
+                            )
+                        ),
+                    )
                 )
-            )
         if outputs:
             result[entry] = tuple(outputs)
     return MappingProxyType(result)

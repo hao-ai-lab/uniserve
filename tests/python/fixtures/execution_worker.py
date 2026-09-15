@@ -8,19 +8,16 @@ from dataclasses import replace
 import torch
 
 from tests.python.fixtures.worker_config import stub_worker_config
-from uniserve.attention import FlashInferTuningConfig, resolve_attention_selection
 from uniserve.distributed.mesh import Communicator
-from uniserve.model.image_diffusion import LatentLayout
-from uniserve.model.model import Model
 from uniserve_models.processing import stub_processor
-from uniserve_models.stub import StubModel
+from uniserve_models.stub import Model
 from uniserve_worker.config import ComponentConfig, WorkerConfig
 from uniserve_worker.execution.model_entry import ModelEntry
 from uniserve_worker.worker import Worker
 
 
 def execution_worker(
-    model: Model | None = None,
+    model: torch.nn.Module | None = None,
     *,
     block_size: int = 16,
     device: str = "cpu",
@@ -34,7 +31,7 @@ def execution_worker(
     components: tuple[tuple[str, ComponentConfig], ...] = (),
     bindings: Mapping[str, ModelEntry] | None = None,
 ) -> Worker:
-    ready = StubModel() if model is None else model
+    ready = Model().to(device) if model is None else model
     worker_config = replace(
         stub_worker_config(block_size, max_batch_tokens=max_batch_tokens),
         device=device,
@@ -55,6 +52,10 @@ def execution_worker(
         if execution is None
         else execution
     )
+    if model is None and policy.generation_device is not None:
+        # The fixture is the resource owner for its constructed modules.
+        ready.latent_encoder.to(policy.generation_device)
+        ready.image_decoder.to(policy.generation_device)
     worker_config = replace(
         policy,
         device=worker_config.device,
@@ -68,15 +69,11 @@ def execution_worker(
     )
     worker = Worker(
         ready,
-        image_processor=stub_processor() if isinstance(ready, StubModel) else None,
+        image_processor=stub_processor() if isinstance(ready, Model) else None,
         bindings=bindings,
         sampling_group=Communicator(device=torch.device(device)),
         worker_config=worker_config,
-        attention=resolve_attention_selection(
-            "torch_sdpa",
-            tuning=FlashInferTuningConfig(),
-            block_size=block_size,
-        ),
+        attention="torch",
         tokenizer=None,
         allowed_work_variants=None,
         transfer_backends=transfer_backends,
@@ -88,19 +85,15 @@ def execution_worker(
     )
     from .depth_one import configure_physical_pool
 
-    flow = worker.model.generation
+    flow = worker.runner.images
     configure_physical_pool(
-        cache_pages=worker.kv_cache.cache.num_pages,
+        cache_pages=0 if worker.info.kv_cache is None else worker.info.kv_cache.num_blocks,
         request_pool_size=worker.info.request_slots,
-        block_size=worker.kv_cache.cache.page_size,
-        commit_marker_tokens=(
-            int(flow.marker_tokens)
-            if flow is not None and flow.latent_layout is LatentLayout.PATCH_TOKENS
-            else 0
-        ),
-        max_cfg_branches=1 if flow is None else flow.max_cfg_branches,
+        block_size=block_size if worker.info.kv_cache is None else worker.info.kv_cache.block_size,
+        commit_marker_tokens=0 if flow is None else flow.framing,
+        max_cfg_branches=1 if flow is None else 3,
         latent_page_units=worker.info.latent_page_units,
-        latent_downsample=1 if flow is None else flow.latent_downsample,
+        latent_downsample=1 if flow is None else flow.denoiser.downsample,
     )
     return worker
 

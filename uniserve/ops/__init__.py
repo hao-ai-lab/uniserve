@@ -8,8 +8,6 @@ from __future__ import annotations
 from uniserve.ops.core import Dispatcher, Operator
 from uniserve.ops.facade import (
     add_rms_norm,
-    attention,
-    can_run_attention,
     qk_norm,
     qk_norm_rope,
     rms_norm,
@@ -24,18 +22,13 @@ from uniserve.ops.modulation import (
 )
 from uniserve.ops.requests import (
     AddRmsNormReq,
-    AttentionReq,
-    DenseAttention,
     MultiAxisQKNormReq,
     MultiAxisQKNormRopeReq,
     PackedRopeReq,
-    PagedDecodeAttention,
     QKNormReq,
     QKNormRopeReq,
     RmsNormReq,
     SiluAndMulReq,
-    VarlenAttention,
-    VisibleEndAttention,
 )
 from uniserve.ops.rope import apply_rotary_emb, apply_rotary_pos_emb, rotate_half
 from uniserve.ops.silu import (
@@ -54,25 +47,18 @@ __all__ = [
     "value_first_swiglu_absmax",
     "value_first_swiglu_fp8",
     "AddRmsNormReq",
-    "AttentionReq",
-    "DenseAttention",
     "Dispatcher",
     "MultiAxisQKNormReq",
     "MultiAxisQKNormRopeReq",
     "Operator",
     "PackedRopeReq",
-    "PagedDecodeAttention",
     "QKNormReq",
     "QKNormRopeReq",
     "RmsNormReq",
     "SiluAndMulReq",
-    "VarlenAttention",
-    "VisibleEndAttention",
     "add_rms_norm",
     "apply_rotary_emb",
     "apply_rotary_pos_emb",
-    "attention",
-    "can_run_attention",
     "qk_norm",
     "qk_norm_rope",
     "rms_norm",

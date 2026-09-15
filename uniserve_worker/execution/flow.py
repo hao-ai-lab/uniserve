@@ -7,13 +7,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.model.batch import DiffusionBatch
-from uniserve.model.diffusion import DiffusionMixin
-from uniserve.model.media import ImageSize
-from uniserve.model.tensors import TokenSelection
-from uniserve.nn.diffusion.cfg import Branch, CfgPlan, RenormKind
-from uniserve.nn.diffusion.config import DiffusionConfig
-from uniserve.nn.rng import flow_noise_seed, normal_noise
+from uniserve.diffusion import Branch, Guidance, Renorm
+from uniserve.media import image as media_image
+from uniserve_worker.execution.tensors import TokenSelection
+from uniserve.nn.rng import flow_noise_seed
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.protocol.batch import (
     DrawLayout,
@@ -30,7 +27,7 @@ from uniserve_worker.runtime.request import RequestState
 
 from . import operations
 from .batch_state import BatchState
-from .diffusion_state import DiffusionState, resolve_prefix
+from .diffusion_state import ImageState, resolve_prefix
 from .output import PendingOutput
 from .rows import ForwardRow
 
@@ -48,19 +45,28 @@ if TYPE_CHECKING:
     from .model_runner import ModelRunner
 
 
-def diffusion_config(image: ImageParams) -> DiffusionConfig:
-    """Normalize admitted wire options at the numerical execution boundary."""
+def image_state(factory, size, image: ImageParams) -> ImageState:
+    """Bind admitted sampling choices to the denoiser's mathematical recipes."""
 
-    return DiffusionConfig(
-        steps=image.steps,
-        timestep_shift=image.timestep_shift if image.timestep_shift > 0 else None,
-        cfg_text_scale=image.cfg_text_scale,
-        cfg_img_scale=image.cfg_img_scale,
-        cfg_interval=image.cfg_interval,
-        cfg_renorm=RenormKind(image.cfg_renorm_type),
-        cfg_renorm_min=image.cfg_renorm_min,
-        seed=image.seed or 0,
+    schedule = factory.denoiser.make_schedules(
+        image.steps,
+        shift=image.timestep_shift if image.timestep_shift > 0 else None,
+        device="cpu",
+    )["image"]
+    guidance = factory.denoiser.make_guidance(
+        text_scale=image.cfg_text_scale,
+        image_scale=image.cfg_img_scale,
+        interval=image.cfg_interval,
+        renorm=Renorm(image.cfg_renorm_type),
+        renorm_min=image.cfg_renorm_min,
     )
+    return ImageState(size, schedule, guidance)
+
+
+def require_inputs(runner):
+    if runner.images is None:
+        raise invalid_descriptor("image computation requires its denoiser input factory")
+    return runner.images
 
 
 def prepare_latent(
@@ -78,7 +84,7 @@ def prepare_latent(
 ) -> PendingOutput:
     """Seed and publish the initial latent trajectory for one diffusion request."""
 
-    model_runner.generation()
+    require_inputs(model_runner)
     request_id = operation.request_key.request_id
 
     # Media preparation joins one visible conditioning publication to one new
@@ -131,12 +137,10 @@ def prepare_latent(
     pool = latent_pool
     staging.value.zero_()
     initial = staging.value[: int(params.latent_units)]
-    diffusion = model_runner.diffusion
-    if diffusion is None:
-        raise invalid_descriptor("image initialization requires a diffusion execution owner")
-    numerical_config = diffusion_config(image)
-    trajectory = diffusion.initialize(
-        ImageSize(int(params.height), int(params.width)), numerical_config
+    trajectory = image_state(
+        require_inputs(model_runner),
+        media_image.Config(int(params.height), int(params.width)),
+        image,
     )
     row.request.diffusion = trajectory
     initial_latent(
@@ -144,7 +148,7 @@ def prepare_latent(
         int(params.height),
         int(params.width),
         initial,
-        seed=numerical_config.seed,
+        seed=image.seed or 0,
         model_runner=model_runner,
     )
     pool.initialize(
@@ -192,10 +196,10 @@ def initialize(
     latent_pool: LatentPool,
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
-) -> DiffusionState:
+) -> ImageState:
     """Bind reusable request geometry and refill the current operation from its exact latent version."""
 
-    model_runner.generation()
+    require_inputs(model_runner)
     request_id = operation.request_key.request_id
     conditioning = operation.kv_input
     latent_input = operation.latent_input
@@ -247,13 +251,10 @@ def initialize(
         height=int(params.height),
         width=int(params.width),
     )
-    diffusion = model_runner.diffusion
-    if diffusion is None:
-        raise invalid_descriptor("flow operation has no diffusion execution owner")
-    size = ImageSize(int(params.height), int(params.width))
+    size = media_image.Config(int(params.height), int(params.width))
     trajectory = row.request.diffusion
-    if trajectory is None or trajectory.size != size:
-        trajectory = diffusion.initialize(size, diffusion_config(image))
+    if not isinstance(trajectory, ImageState) or trajectory.size != size:
+        trajectory = image_state(require_inputs(model_runner), size, image)
         row.request.diffusion = trajectory
     # Prefix initialization follows this submission's descriptors, including
     # retries after a failed operation; retained metadata is not accepted state.
@@ -265,7 +266,7 @@ def initialize(
 def prepare_step(
     operation: ScheduledRequest,
     completion_group: int,
-    trajectory: DiffusionState,
+    trajectory: ImageState,
     step_index: int,
     *,
     state: BatchState,
@@ -273,42 +274,40 @@ def prepare_step(
     model_runner: ModelRunner,
     latent_pool: LatentPool,
     tokenizer: PreTrainedTokenizerBase | None,
-) -> tuple[CfgPlan, torch.Tensor, torch.Tensor, tuple[tuple[Branch, ForwardRow], ...]]:
+) -> tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor, tuple[tuple[Branch, ForwardRow], ...]]:
     """Gather current latent pages and construct one guided diffusion-step batch."""
 
     request = state.pending_output(completion_group, operation.request_key.request_id)
     image = request.request.image
     if image is None:
         raise invalid_descriptor("flow step requires admitted image parameters")
-    generation = model_runner.generation()
+    factory = require_inputs(model_runner)
     row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
         raise invalid_descriptor("trajectory operation has no staged latent inputs")
-    schedule, config = trajectory.schedule, trajectory.config
-    if schedule is None or config is None:
-        raise invalid_descriptor("image trajectory requires numerical configuration and schedule")
-    if not 0 <= step_index < config.steps:
+    schedule = trajectory.schedule
+    if not 0 <= step_index < schedule.num_steps:
         raise IndexError(step_index)
-    times = schedule.timesteps[0]
+    times = schedule.timesteps
     t, t_next = latent_pool.stage_timestep(
         row.request.request_pool_idx, float(times[step_index]), float(times[step_index + 1])
     )
-    guide = generation.guidance(config, step_index)
+    branches = trajectory.guidance.branches(schedule, step_index)
     prefix_rows = []
     prefix_branches = []
     entries = trajectory.entries
     descriptors = state.group_forward_indices[completion_group].get(
         operations.operation_identity(operation), ()
     )
-    if len(descriptors) < len(guide.branches):
+    if len(descriptors) < len(branches):
         raise invalid_descriptor("media denoise has incomplete forward-row metadata")
-    denoise_descriptors = descriptors[-len(guide.branches) :]
-    for branch_index, branch in enumerate(guide.branches):
+    denoise_descriptors = descriptors[-len(branches) :]
+    for branch_index, branch in enumerate(branches):
         if branch in entries:
             continue
-        source = generation.branch_source(branch)
+        source = factory.branch_source(branch)
         if source not in trajectory.prefixes:
             trajectory.prefixes[source] = resolve_prefix(
                 model_runner.flow_prompt,
@@ -333,7 +332,7 @@ def prepare_step(
                 state.batch.request_pool_indices[candidate] == slot
                 and (state.batch.seq_lens[candidate] - state.batch.query_lens[candidate]) == 0
                 and state.batch.query_lens[candidate] == len(prefix)
-                for candidate in descriptors[: -len(guide.branches)]
+                for candidate in descriptors[: -len(branches)]
             )
             entry = (
                 slot,
@@ -355,13 +354,13 @@ def prepare_step(
         if initialize_prefix and prefix:
             prefix_rows.append(prefix_row(prefix, entry))
             prefix_branches.append(branch)
-    return guide, t, t_next, tuple(zip(prefix_branches, prefix_rows, strict=True))
+    return branches, t, t_next, tuple(zip(prefix_branches, prefix_rows, strict=True))
 
 
 def finish(
     operation: ScheduledRequest,
     completion_group: int,
-    trajectory: DiffusionState,
+    trajectory: ImageState,
     *,
     state: BatchState,
     worker_info: WorkerInfo,
@@ -490,24 +489,12 @@ def initial_latent(
 ) -> None:
     """Create deterministic bounded latent noise or reuse the request’s staged image latent."""
 
-    model = model_runner.model
-    if not isinstance(model, DiffusionMixin):
-        raise invalid_descriptor("latent preparation requires the diffusion capability")
     rng = operation.rng
     assert rng is not None and rng.draw_layout is DrawLayout.FLOW_NOISE
-    shape = ImageSize(height, width)
-    raw = target.reshape(model.noise_shape("image", shape)).unsqueeze(0)
-    noise = {"image": raw}
-    normal_noise(
-        (flow_noise_seed(seed, int(rng.semantic_index_base)),),
-        tuple(noise.values()),
-    )
-    model.prepare_latents(
-        DiffusionBatch(latents={"image": (target,)}, sizes=(shape,)),
-        noise=noise,
-        state={"image": target.unsqueeze(0)},
-        constants={},
-        scratch={},
+    require_inputs(model_runner).initialize(
+        media_image.Config(height, width),
+        seed=flow_noise_seed(seed, int(rng.semantic_index_base)),
+        out=target,
     )
 
 
@@ -528,9 +515,6 @@ def prefix_row(
         group_id=entry[1],
         write_kv=True,
         causal=True,
-        attention_indexes=torch.stack(
-            (positions, torch.zeros_like(positions), torch.zeros_like(positions))
-        ),
     )
 
 
@@ -540,3 +524,198 @@ def require_image(request: RequestState) -> ImageParams:
     if request.image is None:
         raise invalid_descriptor("flow execution requires admitted image parameters")
     return request.image
+
+
+def flow_rows(factory, trajectory, current, branches, timestep, *, conditioning_position, device):
+    """Borrow one learned sample copy for every active guidance branch."""
+
+    from .device_transfer import tensor_to_device
+    from ..protocol.batch import PipelineStage
+
+    current = tensor_to_device(current, device)
+    timestep = tensor_to_device(timestep, device)
+    size, rows = trajectory.size, []
+    for branch in branches:
+        entry = trajectory.entries[branch]
+        temporal = conditioning_position if branch is Branch.CONDITIONED else entry[2]
+        if temporal not in trajectory.positions:
+            trajectory.positions[temporal] = factory.positions(size, temporal, device=device)
+        rows.append(
+            ForwardRow(
+                forward_mode=PipelineStage.DENOISING,
+                positions=trajectory.positions[temporal],
+                timestep=timestep.reshape(1),
+                latent=current,
+                image_tokens=factory.sequence_length(size),
+                image_height=size.height,
+                image_width=size.width,
+                request_pool_idx=entry[0],
+                seq_len=entry[2],
+                group_id=entry[1],
+                write_kv=False,
+                causal=False,
+            )
+        )
+    return tuple(rows)
+
+
+def integrate(factory, trajectory, current, outputs, index, timestep, next_timestep):
+    """Apply guidance and the model's public solver to the operation's sample."""
+
+    from .device_transfer import tensor_to_device
+
+    schedule, guidance = trajectory.schedule, trajectory.guidance
+    branches = guidance.branches(schedule, index)
+    velocity = guidance.combine(
+        {
+            branch: tensor_to_device(output, current.device)
+            for branch, output in zip(branches, outputs, strict=True)
+        },
+        schedule,
+        index,
+    )
+    factory.denoiser.solver.step_(
+        velocity,
+        current,
+        timestep,
+        next_timestep,
+        sigma=schedule.sigmas[index],
+        next_sigma=schedule.sigmas[index + 1],
+    )
+
+
+@torch.inference_mode()
+def prepare_flow(runner, entry, latent_pool, tokenizer):
+    """Warm and capture configured image shapes with actual conditioning prefixes."""
+
+    import math
+    from contextlib import nullcontext
+    from functools import partial
+
+    from uniserve.math import ceil_div
+    from ..protocol.batch import PipelineStage
+    from .attention import from_blocks
+    from .graph_inputs import DiffusionShape
+    from .model_runner import capture_image_parameters
+    from .runners.prefill import stage_text
+
+    factory, cache = require_inputs(runner), runner.kv_cache
+    capture = runner.worker_config.graph_policy != "off" and runner.worker_config.prefill_cuda_graph
+    capacity = min(factory.max_tokens, latent_pool.capacity_units)
+    side = max(1, math.isqrt(capacity)) * factory.denoiser.downsample
+    shapes = (
+        runner.flow_captures
+        if capture and runner.flow_captures
+        else tuple(
+            next(
+                (
+                    shape
+                    for shape in reversed(runner.flow_captures)
+                    if shape.cfg_branches == branches
+                ),
+                DiffusionShape(1, side, side, branches),
+            )
+            for branches in runner.flow_cfg_branches
+        )
+    )
+    forward = partial(runner.batch_forward, entry)
+    prefix_entry = runner._forward_entries[(entry.name, ForwardMode.PREFILL)]
+    stream = entry.context.stream
+    if stream is not None:
+        stream.wait_stream(torch.cuda.current_stream(entry.device))
+    with entry.context.activate():
+        for shape in sorted(
+            shapes,
+            key=lambda item: item.rows * item.height * item.width * item.cfg_branches,
+            reverse=True,
+        ):
+            size = media_image.Config(shape.height, shape.width)
+            image = capture_image_parameters(
+                shape.cfg_branches, steps=2, height=shape.height, width=shape.width
+            )
+            trajectory = image_state(factory, size, image)
+            branches = trajectory.guidance.branches(trajectory.schedule, 0)
+            if len(branches) != shape.cfg_branches:
+                raise ValueError("capture guidance does not realize its configured branch count")
+            prefixes = (
+                tuple(
+                    resolve_prefix(
+                        runner.flow_prompt,
+                        factory.branch_source(branch),
+                        image_prompt="",
+                        negative_prompt="",
+                        negative_token_ids=(),
+                        tokenizer=tokenizer,
+                    )[0]
+                    for branch in branches
+                )
+                * shape.rows
+            )
+            page_counts = tuple(ceil_div(len(prefix), cache.info.block_size) for prefix in prefixes)
+            with (
+                cache.startup_pages(sum(page_counts)) as scratch,
+                latent_pool.startup_values(
+                    shape.rows, factory.denoiser.latent_shape("image", size)[0]
+                ) as latents,
+            ):
+                for value in latents:
+                    value.zero_()
+                pages, cursor = [], 0
+                for count in page_counts:
+                    pages.append(tuple(scratch[cursor : cursor + count]))
+                    cursor += count
+                selected = tuple(index for index, prefix in enumerate(prefixes) if prefix)
+                if selected:
+                    batch = stage_text(
+                        prefix_entry.input_buffers,
+                        cache,
+                        tuple(prefixes[index] for index in selected),
+                        tuple(pages[index] for index in selected),
+                        selection=TokenSelection.HIDDEN,
+                        slots=tuple(1 + index // shape.cfg_branches for index in selected),
+                    )
+                    prefix_stream = prefix_entry.context.stream
+                    current_stream = (
+                        torch.cuda.current_stream(entry.device)
+                        if entry.device.type == "cuda"
+                        else None
+                    )
+                    if prefix_stream is not None:
+                        prefix_stream.wait_stream(current_stream)
+                    runner.eager_batch(
+                        prefix_entry, batch, partial(runner.batch_forward, prefix_entry)
+                    )
+                    if prefix_stream is not None:
+                        current_stream.wait_stream(prefix_stream)
+                attention = from_blocks(
+                    pages=tuple(pages),
+                    query_lengths=(factory.sequence_length(size),) * len(prefixes),
+                    prefix_lengths=tuple(map(len, prefixes)),
+                    block_size=cache.info.block_size,
+                    causal=(False,) * len(prefixes),
+                    write=(False,) * len(prefixes),
+                )
+                rows = tuple(
+                    ForwardRow(
+                        forward_mode=PipelineStage.DENOISING,
+                        positions=factory.positions(size, len(prefix), device=entry.device),
+                        timestep=trajectory.schedule.timesteps[:1].to(entry.device),
+                        latent=latents[index // shape.cfg_branches].to(entry.device),
+                        image_tokens=factory.sequence_length(size),
+                        image_height=size.height,
+                        image_width=size.width,
+                        request_pool_idx=1 + index // shape.cfg_branches,
+                        seq_len=len(prefix),
+                        causal=False,
+                    )
+                    for index, prefix in enumerate(prefixes)
+                )
+                batch = entry.input_buffers.stage(
+                    rows, forward_mode=PipelineStage.DENOISING, attention=attention
+                )
+                if capture:
+                    runner.capture_batch(entry, batch, forward)
+                else:
+                    runner.eager_batch(entry, batch, forward)
+    if stream is not None:
+        torch.cuda.current_stream(entry.device).wait_stream(stream)

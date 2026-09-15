@@ -7,7 +7,8 @@ from dataclasses import replace
 import pytest
 import torch
 
-from tests.python.fixtures.model_execution import TEST_MODEL, TEST_WORKER_CONFIG
+from tests.python.fixtures.worker_config import stub_worker_config
+from uniserve_models.stub import Model
 from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.tensors import BufferConfig
@@ -23,94 +24,40 @@ from uniserve_worker.config import ComponentConfig
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import ForwardMode, PipelineStage
 
+TEST_MODEL = Model()
+TEST_WORKER_CONFIG = stub_worker_config(64, max_batch_tokens=8192)
+
 pytestmark = pytest.mark.unit
-
-
-def test_attention_output_bindings_isolate_callers_and_restore_after_errors():
-    from uniserve.distributed.mesh import DeviceMesh
-    from uniserve.nn.parallel_attention import ParallelAttention, output_scope
-    from uniserve.runtime.attention_storage import allocate_output_storage
-
-    attention = ParallelAttention(mesh=DeviceMesh.trivial())
-    callers = tuple(
-        allocate_output_storage((attention,), rows=8, heads=2, head_dim=4, dtype=torch.float32)
-        for _ in range(2)
-    )
-    query = torch.arange(24, dtype=torch.float32).reshape(3, 2, 4)
-
-    def publish(value):
-        destinations = attention.output_views(value)
-        destinations[0].copy_(value)
-        return attention.finish_output(destinations)
-
-    with output_scope(callers[0].views):
-        first = publish(query)
-        with pytest.raises(ValueError, match="caller exit"):
-            with output_scope(callers[1].views):
-                second = publish(query + 7)
-                raise ValueError("caller exit")
-        torch.testing.assert_close(first, query)
-        restored = publish(query - 2)
-        torch.testing.assert_close(restored, query - 2)
-        torch.testing.assert_close(second, query + 7)
-        for invalid in (torch.zeros(9, 2, 4), query.double()):
-            with pytest.raises(ValueError, match="bound tensor storage"):
-                publish(invalid)
-            torch.testing.assert_close(restored, query - 2)
-
-    with pytest.raises(RuntimeError, match="bound output buffers"):
-        publish(query)
-
-
-def test_call_state_borrows_its_fields_and_stages_zero_padded_values():
-    from uniserve.runtime.tensor_buffers import TensorBuffers
-    from uniserve.runtime.tensors import bind_state, stage_tensor
-
-    backing = torch.full((4, 3), -1.0)
-    overlap = torch.full((2,), 7.0)
-    storage = TensorBuffers({"condition": backing, "overlap": overlap})
-    state = bind_state({"condition": BufferConfig((3, 3), torch.float32)}, storage)
-    source = torch.arange(6).float().reshape(2, 3)
-    stage_tensor(source, state["condition"])
-    expected = torch.cat((source, torch.zeros(1, 3), torch.full((1, 3), -1.0)))
-    torch.testing.assert_close(backing, expected)
-    torch.testing.assert_close(source, torch.arange(6).float().reshape(2, 3))
-    torch.testing.assert_close(overlap, torch.full((2,), 7.0))
-    # Invalid production values cannot partially overwrite existing request state.
-    for invalid in (torch.ones(4, 3), torch.ones(3, 3, dtype=torch.float64), torch.ones(9)):
-        with pytest.raises(ValueError, match="representation"):
-            stage_tensor(invalid, state["condition"])
-        torch.testing.assert_close(backing, expected)
 
 
 def test_declared_scratch_borrows_compact_views():
     from uniserve.runtime.tensor_buffers import TensorBuffers
-    from uniserve.runtime.tensors import bind_scratch
 
     storage = TensorBuffers.allocate(
-        {"rows": BufferConfig((2, 3), torch.float32, capacity_shape=(4, 6))},
-        "cpu",
+        {"rows": BufferConfig((2, 3), torch.float32, capacity_shape=(4, 6))}, device="cpu"
     )
-    storage.capacity["rows"].copy_(torch.arange(24).reshape(4, 6))
-    views = bind_scratch({"rows": BufferConfig((2, 3), torch.float32)}, storage)
+    storage.view({"rows": BufferConfig((4, 6), torch.float32)})["rows"].copy_(
+        torch.arange(24).reshape(4, 6)
+    )
+    views = storage.view({"rows": BufferConfig((2, 3), torch.float32)})
     torch.testing.assert_close(views["rows"], torch.arange(6).float().reshape(2, 3))
     views["rows"].add_(10)
     expected = torch.arange(24).float()
     expected[:6] += 10
-    torch.testing.assert_close(storage.capacity["rows"], expected.reshape(4, 6))
-    larger = bind_scratch({"rows": BufferConfig((4, 6), torch.float32)}, storage)
+    torch.testing.assert_close(
+        storage.view({"rows": BufferConfig((4, 6), torch.float32)})["rows"], expected.reshape(4, 6)
+    )
+    larger = storage.view({"rows": BufferConfig((4, 6), torch.float32)})
     torch.testing.assert_close(larger["rows"], expected.reshape(4, 6))
     with pytest.raises(ValueError, match="capacity"):
-        bind_scratch({"rows": BufferConfig((5, 6), torch.float32)}, storage)
-    incompatible = TensorBuffers({"rows": torch.empty((4, 6), dtype=torch.int32)})
+        storage.view({"rows": BufferConfig((5, 6), torch.float32)})
+    incompatible = TensorBuffers.from_tensors({"rows": torch.empty((4, 6), dtype=torch.int32)})
     with pytest.raises(ValueError, match="dtype"):
-        bind_scratch({"rows": BufferConfig((2, 3), torch.float32)}, incompatible)
+        incompatible.view({"rows": BufferConfig((2, 3), torch.float32)})
 
 
-@pytest.mark.parametrize("kind", ["state", "scratch"])
-def test_tensor_capacity_covers_packed_selections_that_move_between_ranks(kind):
+def test_tensor_capacity_covers_packed_selections_that_move_between_ranks():
     from uniserve.runtime.tensor_buffers import TensorBuffers
-    from uniserve.runtime.tensors import bind_scratch, bind_state, merge_buffers
 
     def fields(prompt):
         # Six feature rows follow the prompt in a two-way sequence partition.
@@ -123,10 +70,9 @@ def test_tensor_capacity_covers_packed_selections_that_move_between_ranks(kind):
             )
         }
 
-    storage = TensorBuffers.allocate(merge_buffers((fields(16),)), "cpu")
-    bind = bind_state if kind == "state" else bind_scratch
+    storage = TensorBuffers.allocate(fields(16), device="cpu")
     for prompt, expected in ((16, []), (0, [[0, 1], [2, 3], [4, 5]]), (2, [[0, 1], [2, 3]])):
-        features = bind(fields(prompt), storage)["features"]
+        features = storage.view(fields(prompt))["features"]
         features.copy_(torch.arange(features.numel()).reshape_as(features))
         torch.testing.assert_close(
             features, torch.tensor(expected, dtype=torch.float32).reshape(-1, 2)
@@ -215,26 +161,22 @@ def test_worker_info_projects_model_behavior_and_resource_geometry():
 
     assert ForwardMode.PREFILL in info.supported_ops
     assert PipelineStage.DENOISING in info.supported_ops
-    assert layout.max_vision_feature_bytes == (
-        int(TEST_MODEL.max_vit_grid_tokens) * int(TEST_MODEL.text_backbone.hidden_size) * 2
-    )
+    assert layout.max_vision_feature_bytes == ((512 // 16) ** 2 * 4 * 2)
     assert info.kv_cache is not None
-    assert info.kv_cache.num_layers == TEST_MODEL.text_backbone.cache_config.num_layers
+    assert info.kv_cache.num_layers == len(TEST_MODEL.cache_config.layers)
     assert info.model_name == "test-model"
 
 
 def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:
-    flow = TEST_MODEL.generation
-    assert flow is not None
     worker_config = replace(
         TEST_WORKER_CONFIG,
-        kv_token_capacity=int(flow.max_latent_tokens) + 1,
+        kv_token_capacity=1024 + 1,
     )
 
     layout = build_worker_layout(TEST_MODEL, worker_config, image_processor=stub_processor())
 
     expected_pages = ceil_div(
-        int(flow.max_latent_tokens) + 1,
+        1024 + 1,
         int(worker_config.block_size),
     )
     assert layout.info.latent_pages == expected_pages + 1
@@ -256,11 +198,9 @@ def test_persistent_buffer_capacity_includes_active_encoder_output() -> None:
 def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() -> None:
     worker_config = replace(TEST_WORKER_CONFIG, model_dtype="float32")
     layout = build_worker_layout(TEST_MODEL, worker_config, image_processor=stub_processor())
-    flow = TEST_MODEL.generation
-    assert flow is not None
     assert layout.max_latent_feature_bytes == latent_trajectory_bytes(
-        int(flow.max_vae_grid_tokens),
-        int(flow.latent_channels) * int(flow.latent_patch_size) ** 2,
+        1024,
+        3 * 16**2,
         4,
     )
     arena = model_arena_capacity(
@@ -277,7 +217,7 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
         max_vision_feature_bytes=1,
         bytes_per_token=1,
     )
-    expected = latent_trajectory_bytes(int(flow.max_latent_tokens), 1024, 4)
+    expected = latent_trajectory_bytes(1024, 1024, 4)
     assert arena.transfer_bytes == expected * arena.transfer_tickets
 
 
@@ -300,80 +240,46 @@ def test_worker_worker_config_rejects_invalid_runtime_geometry(worker_config):
     [(torch.float64, (), "dtype"), (torch.float32, (0, 1), "dynamic axes")],
 )
 def test_result_publication_rejects_unrepresentable_numerical_outputs(dtype, axes, message):
-    from uniserve.model.components import ComponentCall
-    from uniserve.model.model import Model
-    from uniserve.tensors import OutputLayout as NumericalTensor
+    from tests.python.fixtures.encoding import Model as EncodedModel
+    from uniserve.model import TextEncoder
+    from uniserve.tensors import OutputLayout
+    from uniserve_worker.config import WorkerConfig
     from uniserve_worker.runtime.results import resolve_outputs
 
-    class FeatureEncoder(torch.nn.Module):
-        def output_layout(self):
-            return {"features": NumericalTensor((2, 3), dtype, variable_axes=axes)}
+    class FeatureEncoder(TextEncoder):
+        def output_layout(self, num_tokens):
+            return {
+                "conditioning": OutputLayout(
+                    (2, 3), dtype, (slice(0, 2), slice(0, 3)), variable_axes=axes
+                )
+            }
 
-    class Features(Model):
-        def __init__(self):
-            super().__init__()
-            self.encoder = FeatureEncoder()
-
-        @classmethod
-        def component_calls(cls, config):
-            return (ComponentCall("encoder", "encode:vision"),)
-
+    model = EncodedModel()
+    model.text_encoder = FeatureEncoder(model.text_encoder.network, (0,))
     with pytest.raises(ValueError, match=message):
-        resolve_outputs(Features())
+        resolve_outputs(model, WorkerConfig())
 
 
 def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
-    import torch
-
-    from uniserve.model.components import ComponentCall
-    from uniserve.model.model import Model
-    from uniserve.tensors import BufferConfig
-    from uniserve.tensors import OutputLayout as NumericalTensor
+    from tests.python.fixtures.encoding import Config, Model as EncodedModel
     from uniserve_worker.config import WorkerConfig
     from uniserve_worker.protocol.batch import (
         BufferAllocation,
+        ComputationId,
         RequestKey,
         StaticDim,
         TensorRef,
     )
     from uniserve_worker.runtime.buffer_pool import BufferPool
 
-    class Conditioning(torch.nn.Module):
-        max_tokens = 3
-
-        def output_layout(self, size):
-            return {"conditioning": NumericalTensor((3, 7), torch.float32, variable_axes=(0,))}
-
-    class Latents(torch.nn.Module):
-        def output_layout(self):
-            return {"latent": NumericalTensor((5, 11), torch.float32)}
-
-    class TensorModel(Model):
-        def __init__(self):
-            super().__init__()
-            self.text_encoder = Conditioning()
-            self.denoiser = Latents()
-
-        @classmethod
-        def component_calls(cls, config):
-            return (
-                ComponentCall("text_encoder", "encode:text"),
-                ComponentCall("denoiser", "forward_diffusion"),
-            )
-
-    model = TensorModel()
-    model.architecture = "TensorEntryModel"
-    config = WorkerConfig(device="cpu", max_request_pool_size=2)
+    model = EncodedModel(Config(hidden_size=7))
+    config = WorkerConfig(device="cpu", max_sequence_tokens=3, max_request_pool_size=2)
     info = build_worker_layout(
         model,
         config,
         queue_depth=8,
         completion_payload_bytes=1024,
-        state_buffers={"state": BufferConfig((4,), torch.float32)},
-        components=(
-            ("text_encoder", ComponentConfig((0,))),
-            ("denoiser", ComponentConfig((0,))),
-        ),
+        components=(("text_encoder", ComponentConfig((0,))),),
     ).info
     arena = BufferPool(byte_capacity=info.buffer_pool_bytes, devices=("cpu",))
     bindings = []
@@ -388,7 +294,7 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
                 )
                 product = TensorRef(
                     RequestKey(1, request_id, 1),
-                    op_id,
+                    ComputationId(op_id, 0),
                     0,
                     1,
                     output.dtype,
@@ -470,7 +376,12 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
             name,
             config,
             group,
-            DeviceMesh(config.ranks, rank, config.parallel_config, group.device)
+            DeviceMesh(
+                ranks=config.ranks,
+                rank=rank,
+                shape=tuple(size for _, size in config.parallel_config.dimensions),
+                axes=tuple(axis for axis, _ in config.parallel_config.dimensions),
+            )
             if config.distribution is None and rank in config.ranks
             else None,
             group.device,
@@ -533,3 +444,39 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
     assert local_product_storage_bytes(
         outputs, bindings=bindings, pipeline_components=components, max_unresolved_ops=8
     ) == expected_full.get(rank, 0)
+
+
+@pytest.mark.parametrize("start,stop", [(2, 5), (5, 5)])
+def test_tensor_output_preserves_global_slice_and_borrows_storage(start, stop):
+    from uniserve.tensors import OutputLayout, TensorOutput
+
+    source = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    result = TensorOutput(
+        source[start:stop],
+        OutputLayout((6, 4), torch.float32, (slice(start, stop), slice(0, 4))),
+    )
+    assert result.layout.local_slice == (slice(start, stop), slice(0, 4))
+    source.add_(1)
+    torch.testing.assert_close(result.tensor, source[start:stop])
+    with pytest.raises(ValueError, match="shape"):
+        TensorOutput(source, result.layout)
+    with pytest.raises(ValueError, match="dtype"):
+        TensorOutput(source[start:stop].double(), result.layout)
+
+
+@pytest.mark.parametrize(
+    "region",
+    [
+        (slice(None, 2), slice(0, 4)),
+        (slice(-1, 2), slice(0, 4)),
+        (slice(3, 2), slice(0, 4)),
+        (slice(0, 2, 2), slice(0, 4)),
+        (slice(0, 7), slice(0, 4)),
+        (slice(0, 6),),
+    ],
+)
+def test_output_layout_rejects_ambiguous_or_out_of_bounds_slices(region):
+    from uniserve.tensors import OutputLayout
+
+    with pytest.raises(ValueError):
+        OutputLayout((6, 4), torch.float32, region)

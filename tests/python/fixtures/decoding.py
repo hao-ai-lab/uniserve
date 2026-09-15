@@ -1,54 +1,81 @@
-"""Small numerical video reconstruction through the public decoder contracts."""
+"""Numerical temporal projection through the public video decoder contract."""
+
+from dataclasses import dataclass
+from types import MappingProxyType
 
 import torch
+from torch import nn
 
-from uniserve.model.batch import TensorOutput
-from uniserve.model.components import ComponentCall
-from uniserve.model.model import Model
-from uniserve.nn.vae.decoder import LatentDecoder
+from uniserve.media import image
+from uniserve.model import EntryPoint, VideoDecoder
+from uniserve.nn.vae import LatentDecoder
 from uniserve.tensors import OutputLayout
 
 
-class ChannelDecoder(LatentDecoder):
-    """Apply channel statistics and a learned temporal projection to one RGB pixel."""
+@dataclass(frozen=True)
+class Config:
+    window: int = 4
+    height: int = 1
+    width: int = 1
 
-    latent_shape = (1, 3, 4)
 
-    def __init__(self):
+class TemporalProjection(nn.Module):
+    def __init__(self, window):
         super().__init__()
-        self.vae = torch.nn.Linear(4, 4, bias=False)
+        self.projection = nn.Linear(window, window, bias=False)
         with torch.no_grad():
-            self.vae.weight.copy_(torch.diag(torch.tensor([1.0, 2.0, 3.0, 4.0])))
-        self.register_buffer("latents_mean", torch.tensor([0.1, 0.2, 0.3]).view(1, 3, 1))
-        self.register_buffer("latents_std", torch.tensor([0.5, 1.5, 2.5]).view(1, 3, 1))
+            self.projection.weight.copy_(torch.diag(torch.arange(1.0, window + 1)))
 
-    def _reconstruct(self, latents):
-        return self.vae(latents).unsqueeze(-1).unsqueeze(-1)
+    def forward(self, values):
+        return self.projection(values.movedim(2, -1)).movedim(-1, 2)
 
 
-class VideoDecoder(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.native = ChannelDecoder()
+class Decoder(VideoDecoder):
+    def __init__(self, config):
+        super().__init__(
+            LatentDecoder(
+                TemporalProjection(config.window),
+                latent_shape=(1, 3, config.window, config.height, config.width),
+                mean=torch.tensor([0.1, 0.2, 0.3]).view(1, 3, 1, 1, 1),
+                std=torch.tensor([0.5, 1.5, 2.5]).view(1, 3, 1, 1, 1),
+            ),
+            frame_size=image.Config(config.height, config.width),
+        )
+        self.window = config.window
 
-    def decode(self, latents, size, windows, *, constants, scratch):
-        values = tuple(self.native(value.T.unsqueeze(0).float()) for value in latents)
-        return TensorOutput(
-            {"video": values},
-            {"video": tuple(OutputLayout(tuple(value.shape), value.dtype) for value in values)},
+    def frame_slices(self, num_frames):
+        if num_frames < 1 or num_frames % self.window:
+            raise ValueError("the temporal projection requires complete windows")
+        return tuple(
+            slice(start, start + self.window) for start in range(0, num_frames, self.window)
         )
 
+    def output_layout(self, num_frames):
+        shape = (
+            len(self.frame_slices(num_frames)),
+            1,
+            3,
+            self.window,
+            self.frame_size.height,
+            self.frame_size.width,
+        )
+        return {"video": OutputLayout(shape, torch.float32, tuple(slice(0, n) for n in shape))}
 
-class DecodedModel(Model):
-    """Decode four RGB latent rows without text or diffusion capability."""
+    def unpack_latents(self, latent, frames, num_frames, *, constants, workspace):
+        return latent.T.reshape(1, 3, num_frames, self.frame_size.height, self.frame_size.width)[
+            :, :, frames
+        ]
 
-    decoder_kinds = frozenset({"video"})
 
-    def __init__(self):
+class DecodedModel(nn.Module):
+    def __init__(self, config=Config()):
         super().__init__()
-        self.reconstruction = VideoDecoder()
-        self.audio_decoder = None
+        self.config = config
+        self.reconstruction = Decoder(config)
 
-    @classmethod
-    def component_calls(cls, config):
-        return (ComponentCall("reconstruction", "decode:video"),)
+
+def entry_points(config):
+    return MappingProxyType({"reconstruction": (EntryPoint("decode"),)})
+
+
+entry_paths = MappingProxyType({"reconstruction": "reconstruction.decode"})

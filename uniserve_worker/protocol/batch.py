@@ -124,7 +124,6 @@ class CudaIpcTransfer:
 
     endpoint: str
     publication_id: str
-    storage_handle: bytes
     storage_size_bytes: int
     storage_offsets_bytes: tuple[int, ...]
     span_lengths: tuple[int, ...]
@@ -138,7 +137,6 @@ class CudaIpcTransfer:
         if (
             not self.endpoint
             or len(self.publication_id) != 32
-            or len(self.storage_handle) != 64
             or self.storage_size_bytes < 1
             or not self.storage_offsets_bytes
             or len(self.span_counts) != len(self.span_lengths)
@@ -224,7 +222,6 @@ class Locator:
             transport = CudaIpcTransfer(
                 endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
                 publication_id=_str(data.get("publication_id"), f"{where}.publication_id"),
-                storage_handle=_bytes(data.get("storage_handle"), f"{where}.storage_handle"),
                 storage_size_bytes=_uint(
                     data.get("storage_size_bytes"), f"{where}.storage_size_bytes"
                 ),
@@ -275,7 +272,6 @@ class Locator:
                 transport="cuda_ipc",
                 endpoint=transport.endpoint,
                 publication_id=transport.publication_id,
-                storage_handle=transport.storage_handle,
                 storage_size_bytes=transport.storage_size_bytes,
                 storage_offsets_bytes=list(transport.storage_offsets_bytes),
                 span_lengths=list(transport.span_lengths),
@@ -528,7 +524,6 @@ def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
             size += (
                 len(transport.endpoint.encode())
                 + len(transport.publication_id.encode())
-                + len(transport.storage_handle)
                 + len(transport.ready_event_handle)
                 + 8 * len(transport.tensor_stride)
                 + 8 * len(transport.storage_offsets_bytes)

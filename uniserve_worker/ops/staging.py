@@ -32,18 +32,21 @@ if triton is not None:
         positions,
         block_tables,
         cache_lengths,
-        kv_lengths,
         query_lengths,
-        decode_page_ids,
-        decode_page_offsets,
+        query_offsets,
+        prefix_offsets,
+        write_indices,
         rows,
         page_table_group_stride: tl.constexpr,
         page_table_row_stride: tl.constexpr,
         page_table_column_stride: tl.constexpr,
         request_token_stride: tl.constexpr,
         request_position_stride: tl.constexpr,
+        position_axis_stride: tl.constexpr,
+        position_axes: tl.constexpr,
         block_table_row_stride: tl.constexpr,
         max_rows: tl.constexpr,
+        row_block: tl.constexpr,
         table_width,
         group_id,
         page_size: tl.constexpr,
@@ -53,78 +56,78 @@ if triton is not None:
 
         # Request counts and table extents change during serving. Keep them as
         # runtime values so an arrival does not load another kernel variant.
-        # The flattened launch covers both the two-dimensional block table and
-        # the one-dimensional scalar buffers. Each program handles whichever
-        # domains contain its offsets.
-        offsets = tl.program_id(0) * block + tl.arange(0, block)
+        # The scalar CTA reads the same request state as table-copy CTAs. Its
+        # scan has no dependency on their stores and needs no global barrier.
+        if tl.program_id(0) == 0:
+            offsets = tl.arange(0, row_block)
+            scalar_mask = offsets < max_rows
+            live_rows = scalar_mask & (offsets < rows)
+            slots = tl.load(request_pool_indices + offsets, mask=live_rows, other=0)
+            cache = tl.load(request_cache_lengths + slots, mask=live_rows, other=0)
+            tokens = tl.load(
+                request_tokens + slots * request_token_stride, mask=live_rows, other=1
+            )
+            token_positions = tl.load(
+                request_positions + slots * request_position_stride, mask=live_rows, other=0
+            )
 
-        # Map active output rows through the request pool into the selected KV
-        # group. Stores span the full graph capacity, zeroing inactive rows.
-        table_elements = max_rows * table_width
-        table_mask = offsets < table_elements
-        table_rows = offsets // table_width
-        columns = offsets - table_rows * table_width
-        live_table = table_mask & (table_rows < rows)
-        table_slots = tl.load(
-            request_pool_indices + table_rows,
-            mask=live_table,
-            other=0,
-        )
-        table_values = tl.load(
-            request_page_tables
-            + group_id * page_table_group_stride
-            + table_slots * page_table_row_stride
-            + columns * page_table_column_stride,
-            mask=live_table,
-            other=0,
-        )
-        tl.store(
-            block_tables + table_rows * block_table_row_stride + columns,
-            table_values,
-            mask=table_mask,
-        )
+            # Cache length identifies the append page and its token offset.
+            # Inactive rows and unavailable pages keep the public -1 sentinel.
+            page_slots = cache // page_size
+            write_pages = tl.load(
+                request_page_tables
+                + group_id * page_table_group_stride
+                + slots * page_table_row_stride
+                + page_slots * page_table_column_stride,
+                mask=live_rows & (page_slots < table_width),
+                other=-1,
+            )
+            writes = tl.where(
+                write_pages >= 0, write_pages.to(tl.int64) * page_size + cache % page_size, -1
+            )
+            tl.store(request_pool_indices + offsets, 0, mask=scalar_mask & ~live_rows)
+            tl.store(input_ids + offsets, tokens, mask=scalar_mask)
+            for axis in tl.static_range(position_axes):
+                tl.store(
+                    positions + axis * position_axis_stride + offsets,
+                    token_positions if axis == 0 else 0,
+                    mask=scalar_mask,
+                )
+            tl.store(cache_lengths + offsets, cache, mask=scalar_mask)
+            tl.store(query_lengths + offsets, 1, mask=scalar_mask)
+            tl.store(write_indices + offsets, writes, mask=scalar_mask)
+            tl.store(query_offsets, 0)
+            tl.store(prefix_offsets, 0)
+            tl.store(query_offsets + offsets + 1, offsets + 1, mask=scalar_mask)
+            tl.store(prefix_offsets + offsets + 1, tl.cumsum(cache), mask=scalar_mask)
+        else:
+            table_offsets = (tl.program_id(0) - 1) * block + tl.arange(0, block)
 
-        # Gather the next token and its sequence state for every live row. The
-        # masked load defaults also initialize unused scalar capacity to stable
-        # graph inputs during the same launch.
-        scalar_mask = offsets < max_rows
-        live_rows = scalar_mask & (offsets < rows)
-        slots = tl.load(request_pool_indices + offsets, mask=live_rows, other=0)
-        cache = tl.load(
-            request_cache_lengths + slots,
-            mask=live_rows,
-            other=0,
-        )
-        tokens = tl.load(
-            request_tokens + slots * request_token_stride,
-            mask=live_rows,
-            other=1,
-        )
-        token_positions = tl.load(
-            request_positions + slots * request_position_stride,
-            mask=live_rows,
-            other=0,
-        )
-
-        # The current cache length is the append position: its quotient selects
-        # a physical page and its remainder selects the offset within that page.
-        page_slots = cache // page_size
-        write_pages = tl.load(
-            request_page_tables
-            + group_id * page_table_group_stride
-            + slots * page_table_row_stride
-            + page_slots * page_table_column_stride,
-            mask=live_rows & (page_slots < table_width),
-            other=0,
-        )
-        tl.store(request_pool_indices + offsets, slots, mask=scalar_mask)
-        tl.store(input_ids + offsets, tokens, mask=scalar_mask)
-        tl.store(positions + offsets, token_positions, mask=scalar_mask)
-        tl.store(cache_lengths + offsets, cache, mask=scalar_mask)
-        tl.store(kv_lengths + offsets, cache + 1, mask=scalar_mask)
-        tl.store(query_lengths + offsets, 1, mask=scalar_mask)
-        tl.store(decode_page_ids + offsets, write_pages, mask=scalar_mask)
-        tl.store(decode_page_offsets + offsets, cache % page_size, mask=scalar_mask)
+            # Map active output rows through the request pool into the selected KV
+            # group. Stores span the full graph capacity, zeroing inactive rows.
+            table_elements = max_rows * table_width
+            table_mask = table_offsets < table_elements
+            table_rows = table_offsets // table_width
+            columns = table_offsets - table_rows * table_width
+            live_table = table_mask & (table_rows < rows)
+            table_slots = tl.load(
+                request_pool_indices + table_rows,
+                mask=live_table,
+                other=0,
+            )
+            table_values = tl.load(
+                request_page_tables
+                + group_id * page_table_group_stride
+                + table_slots * page_table_row_stride
+                + columns * page_table_column_stride,
+                mask=live_table,
+                other=0,
+            )
+            tl.store(
+                block_tables + table_rows * block_table_row_stride + columns,
+                table_values,
+                mask=table_mask,
+            )
 
 
 def gather_request_decode_inputs(
@@ -138,10 +141,10 @@ def gather_request_decode_inputs(
     positions: torch.Tensor,
     block_tables: torch.Tensor,
     cache_lengths: torch.Tensor,
-    kv_lengths: torch.Tensor,
     query_lengths: torch.Tensor,
-    decode_page_ids: torch.Tensor,
-    decode_page_offsets: torch.Tensor,
+    query_offsets: torch.Tensor,
+    prefix_offsets: torch.Tensor,
+    write_indices: torch.Tensor,
     rows: int,
     group_id: int,
     page_size: int,
@@ -150,7 +153,7 @@ def gather_request_decode_inputs(
 
     ``request_pool_indices[:rows]`` identifies scheduler-owned request slots.
     The function materializes their selected KV-group page tables, next-token
-    ids and positions, cache/query lengths, and physical append locations.
+    ids and position axes, cache/query lengths and offsets, and append indices.
     Output rows beyond ``rows`` are initialized for safe fixed-shape graph
     replay. Every tensor must reside on the same CUDA device.
     """
@@ -167,10 +170,10 @@ def gather_request_decode_inputs(
         positions,
         block_tables,
         cache_lengths,
-        kv_lengths,
         query_lengths,
-        decode_page_ids,
-        decode_page_offsets,
+        query_offsets,
+        prefix_offsets,
+        write_indices,
     )
     device = request_pool_indices.device
     if device.type != "cuda" or any(value.device != device for value in tensors):
@@ -197,24 +200,25 @@ def gather_request_decode_inputs(
         or int(group_id) >= int(request_page_tables.shape[0])
         or int(page_size) < 1
     ):
-        raise ValueError("request-indexed decode geometry is invalid")
+        raise ValueError("request-indexed decode table capacity or group is invalid")
+    if positions.ndim != 2 or positions.shape[0] not in (1, 3) or positions.stride(1) != 1:
+        raise ValueError("decode positions require one or three contiguous token axes")
     scalar_outputs = (
         input_ids,
-        positions,
+        positions[0],
         cache_lengths,
-        kv_lengths,
         query_lengths,
-        decode_page_ids,
-        decode_page_offsets,
+        write_indices,
     )
     if any(int(value.numel()) < max_rows for value in scalar_outputs):
         raise ValueError("request-indexed decode scalar buffers are undersized")
+    if min(query_offsets.numel(), prefix_offsets.numel()) < max_rows + 1:
+        raise ValueError("request-indexed decode offset buffers are undersized")
 
-    # Size the grid for the larger flattened output domain so the one launch
-    # always covers both block-table cells and per-row scalars.
+    # One CTA produces all scalar columns; the remaining CTAs copy table cells.
     block = 256
     _gather_request_decode_inputs_kernel[
-        (triton.cdiv(max(max_rows, int(block_tables.numel())), block),)
+        (1 + triton.cdiv(int(block_tables.numel()), block),)
     ](
         *tensors,
         rows=row_count,
@@ -223,8 +227,11 @@ def gather_request_decode_inputs(
         page_table_column_stride=int(request_page_tables.stride(2)),
         request_token_stride=int(request_tokens.stride(0)),
         request_position_stride=int(request_positions.stride(0)),
+        position_axis_stride=int(positions.stride(0)),
+        position_axes=int(positions.shape[0]),
         block_table_row_stride=int(block_tables.stride(0)),
         max_rows=max_rows,
+        row_block=triton.next_power_of_2(max_rows),
         table_width=width,
         group_id=int(group_id),
         page_size=int(page_size),

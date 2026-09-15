@@ -4,9 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve.attention import resolve_attention_selection
-from uniserve.attention.tuning import FlashInferTuningConfig
-from uniserve.nn.attention import RadixAttention
+from uniserve.nn.attention import Attention, DenseInput
+from uniserve.runtime import CUDAGraph, ExecutionContext
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -22,11 +21,12 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
     ]
     + [
         (provider, rank, torch.bfloat16, False, layout)
-        for provider, rank in (("flashinfer", 3), ("fa4_cute", 4))
+        for provider, rank in (("flashinfer", 3), ("flash_attn_4", 4))
         for layout in ("contiguous", "interleaved")
     ]
     + [
-        (provider, 4, torch.bfloat16, False, "strided_columns") for provider in ("auto", "fa4_cute")
+        (provider, 4, torch.bfloat16, False, "strided_columns")
+        for provider in ("auto", "flash_attn_4")
     ],
 )
 @torch.inference_mode()
@@ -58,17 +58,14 @@ def test_dense_attention_preserves_heads_masks_and_graph_inputs(
         k = torch.randn((batch, kv_heads, rows, width), device=device, dtype=dtype)
         v = torch.randn_like(k)
     mask = torch.ones(rows, rows, device=device, dtype=torch.bool).tril() if masked else None
-    selection = resolve_attention_selection(
-        provider, tuning=FlashInferTuningConfig(), block_size=16
-    )
-    attention = RadixAttention(query_heads, kv_heads, width)
-    attention.bind_dense(selection)
+    attention = Attention(query_heads, kv_heads, width)
+    inputs = DenseInput(causal=not masked, mask=mask)
 
     def execute():
         def layout(value):
             return value.squeeze(0).transpose(0, 1) if rank == 3 else value
 
-        output = attention(layout(q), layout(k), layout(v), None, causal=not masked, attn_mask=mask)
+        output = attention(layout(q), layout(k), layout(v), inputs)
         return output.transpose(0, 1).unsqueeze(0) if rank == 3 else output
 
     def reference():
@@ -84,16 +81,17 @@ def test_dense_attention_preserves_heads_masks_and_graph_inputs(
     # The existing paged/segmented attention conformance uses 2e-2 for half
     # precision and 2e-5 for FP32 against an independently normalized reference.
     tolerance = 2e-5 if dtype == torch.float32 else 2e-2
-    actual = execute()
-    torch.testing.assert_close(actual, reference(), rtol=tolerance, atol=tolerance)
-    torch.cuda.synchronize(device)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with ExecutionContext(attention, attention=provider, stream=stream) as context:
+        context.prepare(None)
         actual = execute()
-    q.mul_(0.5)
-    v.add_(0.25)
-    if mask is not None:
-        mask[:, ::3] = False
-    graph.replay()
-    torch.testing.assert_close(actual, reference(), rtol=tolerance, atol=tolerance)
-    graph.reset()
+        torch.testing.assert_close(actual, reference(), rtol=tolerance, atol=tolerance)
+        with CUDAGraph(context=context) as graph:
+            graph.capture(execute)
+            q.mul_(0.5)
+            v.add_(0.25)
+            if mask is not None:
+                mask[:, ::3] = False
+            actual = graph.replay()
+            torch.testing.assert_close(actual, reference(), rtol=tolerance, atol=tolerance)

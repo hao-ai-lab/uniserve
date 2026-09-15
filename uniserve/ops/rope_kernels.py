@@ -15,6 +15,7 @@ from uniserve.runtime.triton import triton_available
 try:  # pragma: no cover - depends on the installed accelerator stack.
     import triton
     import triton.language as tl
+    from triton.language.extra.cuda import libdevice
 except Exception:  # pragma: no cover
     triton = None
     tl = None
@@ -24,6 +25,39 @@ _TRITON_ROPE_BLOCK = 256
 
 
 if triton is not None:
+
+    @triton.jit(do_not_specialize=["total"])
+    def _rotary_factors_kernel(
+        positions,
+        frequencies,
+        cosine,
+        sine,
+        total: tl.int64,
+        width: tl.constexpr,
+        shape: tl.constexpr,
+        strides: tl.constexpr,
+        frequency_stride: tl.constexpr,
+        scale: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * block + tl.arange(0, block)
+        rows = offsets // width
+        position_offsets = tl.full((block,), 0, tl.int64)
+        # The leading extent only bounds the launch. Remaining dimensions
+        # describe the strided row layout; a new token count needs no kernel.
+        for axis in tl.static_range(len(shape) - 1, -1, -1):
+            position_offsets += (rows % shape[axis]) * strides[axis + 1]
+            rows //= shape[axis]
+        position_offsets += rows * strides[0] if len(strides) else 0
+        position = tl.load(positions + position_offsets, offsets < total, other=0).to(tl.float32)
+        frequency = tl.load(frequencies + (offsets % width) * frequency_stride).to(tl.float32)
+        # Match the public FP32 phase domain, including range reduction for
+        # large or negative positions. Approximate sin/cos instructions do not
+        # provide that domain; libdevice uses the CUDA numerical functions.
+        phase = position * frequency
+        factor = tl.full((), scale, tl.float32)
+        tl.store(cosine + offsets, libdevice.cos(phase) * factor, offsets < total)
+        tl.store(sine + offsets, libdevice.sin(phase) * factor, offsets < total)
 
     @triton.jit
     def _packed_rope_kernel(
@@ -65,7 +99,7 @@ if triton is not None:
         sine,
         output,
         first_row,
-        row_count: tl.constexpr,
+        row_count,
         heads: tl.constexpr,
         stride_token: tl.constexpr,
         stride_head: tl.constexpr,
@@ -117,7 +151,7 @@ if triton is not None:
         )
         tl.store(output + rows[:, None] * dim + columns[None, :], rotated, mask=mask)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["q_rows", "k_rows"])
     def _qk_rms_norm_rope_kernel(
         q_ptr,
         k_ptr,
@@ -127,8 +161,8 @@ if triton is not None:
         sin_ptr,
         q_out_ptr,
         k_out_ptr,
-        q_rows: tl.constexpr,
-        k_rows: tl.constexpr,
+        q_rows: tl.int32,
+        k_rows: tl.int32,
         q_heads: tl.constexpr,
         k_heads: tl.constexpr,
         q_stride_0: tl.constexpr,
@@ -144,7 +178,7 @@ if triton is not None:
         block: tl.constexpr,
         rows_per_program: tl.constexpr,
     ):
-        """Process Q/K tiles in disjoint CTA ranges with one normalization per row."""
+        """Process Q/K tiles with live row bounds and one normalization per row."""
 
         pid = tl.program_id(0)
         query_programs = tl.cdiv(q_rows, rows_per_program)
@@ -208,6 +242,7 @@ if triton is not None:
         block_rows: tl.constexpr,
         head_dim: tl.constexpr,
         rotary_dim: tl.constexpr,
+        compact: tl.constexpr,
     ):
         """Normalize Q/K in place and rotate an even prefix of each head."""
 
@@ -264,13 +299,14 @@ if triton is not None:
         partner_key = partner_key * key_rstd[:, None] * partner_key_weight
 
         rotary_mask = columns[None, :] < rotary_dim
+        factor_columns = columns % half_rotary if compact else columns
         cosine_values = tl.load(
-            cosine + row_offsets[:, None] * rotary_stride_row + columns[None, :],
+            cosine + row_offsets[:, None] * rotary_stride_row + factor_columns[None, :],
             mask=valid & rotary_mask,
             other=1.0,
         ).to(tl.float32)
         sine_values = tl.load(
-            sine + row_offsets[:, None] * rotary_stride_row + columns[None, :],
+            sine + row_offsets[:, None] * rotary_stride_row + factor_columns[None, :],
             mask=valid & rotary_mask,
             other=0.0,
         ).to(tl.float32)
@@ -538,8 +574,6 @@ if triton is not None:
         sin2_ptr,
         q_out_ptr,
         k_out_ptr,
-        q_rows: tl.constexpr,
-        k_rows: tl.constexpr,
         q_heads: tl.constexpr,
         k_heads: tl.constexpr,
         q_stride_0: tl.constexpr,
@@ -564,6 +598,7 @@ if triton is not None:
         # Program ids select either a complete query or key row; the branch is
         # uniform within a program and independent of tensor values.
         pid = tl.program_id(0)
+        q_rows = tl.num_programs(0) // (q_heads + k_heads) * q_heads
         if pid < q_rows:
             token = pid // q_heads
             head = pid - token * q_heads
@@ -623,6 +658,45 @@ if triton is not None:
             )
 
 
+def try_triton_rotary_factors(positions, frequencies, scale, *, dtype):
+    """Generate compact factors on supported CUDA tensors, or decline eligibility."""
+
+    floating = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+    if (
+        triton is None
+        or not triton_available(positions.device)
+        or frequencies.device != positions.device
+        or positions.layout != torch.strided
+        or frequencies.layout != torch.strided
+        or positions.dtype not in floating | {torch.int32, torch.int64}
+        or frequencies.dtype not in floating
+        or dtype not in floating
+    ):
+        return None
+    shape = (*positions.shape, frequencies.numel())
+    cosine = torch.empty(shape, device=positions.device, dtype=dtype)
+    sine = torch.empty_like(cosine)
+    total = cosine.numel()
+    if total:
+        # Triton launches on the thread's current device, whereas this public
+        # numerical operation follows its input tensors, as PyTorch does.
+        with torch.cuda.device(positions.device):
+            _rotary_factors_kernel[(triton.cdiv(total, 256),)](
+                positions,
+                frequencies,
+                cosine,
+                sine,
+                total,
+                frequencies.numel(),
+                tuple(positions.shape[1:]),
+                tuple(positions.stride()),
+                frequencies.stride(0),
+                scale,
+                256,
+            )
+    return cosine, sine
+
+
 def can_run_triton_qk_rms_norm_rope_inplace(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -630,6 +704,8 @@ def can_run_triton_qk_rms_norm_rope_inplace(
     key_weight: torch.Tensor,
     cosine: torch.Tensor,
     sine: torch.Tensor,
+    *,
+    compact: bool = False,
 ) -> bool:
     """Check the packed row/head geometry for in-place partial QK rotation."""
 
@@ -665,8 +741,8 @@ def can_run_triton_qk_rms_norm_rope_inplace(
         or not sine.is_contiguous()
         or int(cosine.shape[0]) != int(query.shape[0])
         or int(cosine.shape[1]) <= 0
-        or int(cosine.shape[1]) % 2 != 0
-        or int(cosine.shape[1]) > int(query.shape[2])
+        or (not compact and int(cosine.shape[1]) % 2 != 0)
+        or int(cosine.shape[1]) * (2 if compact else 1) > int(query.shape[2])
     )
 
 
@@ -682,6 +758,7 @@ def triton_qk_rms_norm_rope_inplace(
     cosine: torch.Tensor,
     sine: torch.Tensor,
     eps: float,
+    compact: bool = False,
 ) -> None:
     """Normalize Q/K and rotate their leading feature prefix in place.
 
@@ -690,11 +767,11 @@ def triton_qk_rms_norm_rope_inplace(
     """
 
     if not can_run_triton_qk_rms_norm_rope_inplace(
-        query, key, query_weight, key_weight, cosine, sine
+        query, key, query_weight, key_weight, cosine, sine, compact=compact
     ):
         raise RuntimeError("in-place partial QK RMSNorm and RoPE requires eligible Triton tensors")
     rows, heads, head_dim = (int(size) for size in query.shape)
-    rotary_dim = int(cosine.shape[-1])
+    rotary_dim = int(cosine.shape[-1]) * (2 if compact else 1)
 
     # Each program covers eight rows for one head, normalizing the full head
     # before applying factors only to the declared rotary prefix.
@@ -717,6 +794,7 @@ def triton_qk_rms_norm_rope_inplace(
         block_rows,
         head_dim,
         rotary_dim,
+        compact,
         num_warps=8,
         num_stages=1,
     )
@@ -731,10 +809,11 @@ def _triton_qk_rms_norm_rope_inplace_fake(
     cosine: torch.Tensor,
     sine: torch.Tensor,
     eps: float,
+    compact: bool = False,
 ) -> None:
     """Declare the mutating custom operator's fake-tensor contract."""
 
-    del query, key, query_weight, key_weight, cosine, sine, eps
+    del query, key, query_weight, key_weight, cosine, sine, eps, compact
 
 
 def try_triton_qk_rms_norm_rope(
@@ -946,8 +1025,6 @@ def try_triton_qk_multi_axis_rms_norm_rope(
         sin[2],
         q_out,
         k_out,
-        q_rows,
-        k_rows,
         q_heads,
         k_heads,
         int(q.stride(0)),

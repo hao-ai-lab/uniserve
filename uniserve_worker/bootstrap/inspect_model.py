@@ -11,51 +11,40 @@ import subprocess
 import sys
 from pathlib import Path
 
-from uniserve.loading.config import LoadConfig
-from uniserve.loading.source import resolve_model_root
-from uniserve_models.catalog import resolve_catalog_entry
-from uniserve_models.source import read_model_config
+from uniserve.loading import Config as IOConfig
+from uniserve_models import loading as models
 
 
 def inspect_model(model: str, *, download: bool = False, revision: str | None = None) -> dict:
-    """Resolve catalog metadata and validate the H3 variant without GPU weights."""
-
-    from uniserve_models.metadata import h3_metadata
-    from uniserve_models.minimax_h3.config import (
-        FASTH3_MODEL_ID,
-        FASTH3_REVISION,
-        PRECISION_PRESETS,
-    )
+    """Inspect the same normalized checkpoint contract used for public loading."""
+    from uniserve_models.minimax_h3 import Config as H3Config
+    from uniserve_models.minimax_h3.config import FASTH3_MODEL_ID, FASTH3_REVISION
 
     if model == FASTH3_MODEL_ID and revision is None:
         revision = FASTH3_REVISION
-    root, repository = resolve_model_root(model, LoadConfig(revision=revision))
-    config = read_model_config(root)
-    entry = resolve_catalog_entry(config["architectures"])
+    source = models.read_config(
+        model, io=IOConfig(revision=revision), modules=None if download else frozenset()
+    )
     descriptions = {
-        "MiniMaxH3Transformer3DModel": "minimax-h3",
-        "Qwen3ForCausalLM": "qwen3",
-        "BagelForConditionalGeneration": "bagel",
-        "NEOChatModel": "sensenova",
+        "uniserve_models.minimax_h3": "minimax-h3",
+        "uniserve_models.qwen3": "qwen3",
+        "uniserve_models.bagel": "bagel",
+        "uniserve_models.sensenova_u1": "sensenova",
     }
-    if repository and entry.architecture == "MiniMaxH3Transformer3DModel":
-        from huggingface_hub import snapshot_download
-
-        logging.info("download: resolving checkpoint %s@%s", repository, revision or root.name)
-        root = Path(
-            snapshot_download(
-                repository,
-                revision=revision or root.name,
-                allow_patterns=list(entry.sidecars),
-            )
-        )
+    local = Path(model).expanduser()
+    repository = None if local.exists() else model
     contract = None
-    if entry.architecture == "MiniMaxH3Transformer3DModel":
-        model_config = h3_metadata(root)
-        diffusion = model_config.diffusion
-        video = model_config.video_decoder
+    root = local.parent if local.is_file() else local
+    if isinstance(source.model, H3Config):
+        if repository is not None:
+            if source.tokenizer is None:
+                raise ValueError("H3 inspection requires its resolved tokenizer directory")
+            root = source.tokenizer.parent
+        architecture = source.model
+        diffusion, output = architecture.diffusion, architecture.output
         manifest = json.loads((root / "fastvideo_inference.json").read_text())
-        # This JSON is the inspection command's external result, not model configuration.
+        # Inspection reports provenance; numerical architecture configs retain
+        # only fields consumed by the network and its mathematical recipes.
         contract = {
             "family": "minimax-h3",
             "variant": "fasth3",
@@ -67,19 +56,15 @@ def inspect_model(model: str, *, download: bool = False, revision: str | None = 
             "inference_grid": [*(step / diffusion.time_scale for step in diffusion.ladder), 0.0],
             "sigma_shifts": [diffusion.video_shift, diffusion.audio_shift],
             "denoise_steps": len(diffusion.ladder),
-            "width": video.width,
-            "height": video.height,
-            "fps": video.fps,
-            "audio_rate": model_config.audio_decoder.sampling_rate,
-            "precision_presets": list(PRECISION_PRESETS),
+            "width": output.frame_size.width,
+            "height": output.frame_size.height,
+            "fps": output.frame_rate,
+            "audio_rate": output.sample_rate,
+            "precision_presets": list(source.precisions),
+            "revision": root.name if root.parent.name == "snapshots" else None,
         }
-        # Only a hub snapshot directory establishes revision provenance. A
-        # local checkpoint retains its manifest's declared content identity.
-        contract["revision"] = root.name if root.parent.name == "snapshots" else None
-        if repository and download:
-            root = Path(snapshot_download(repository, revision=root.name))
     return {
-        "description": descriptions[entry.architecture],
+        "description": descriptions[source.model_class.__module__],
         "model_path": str(root) if contract is not None else model,
         "repository": repository,
         "contract": contract,
@@ -92,8 +77,8 @@ def doctor(model: dict, ranks: int) -> dict:
 
     import torch
 
-    from uniserve.attention.video_sparse_provider import resolve_sparse_provider
-    from uniserve_models.minimax_h3.config import PRECISION_PRESETS
+    from uniserve.runtime.backends.attention import vsa
+    from uniserve_models.minimax_h3 import precisions
 
     from ..media.mux import require_media_codecs
 
@@ -115,13 +100,13 @@ def doctor(model: dict, ranks: int) -> dict:
         )
     devices = []
     for rank in range(ranks):
-        provider = resolve_sparse_provider(torch.device("cuda", rank))
+        provider = vsa.resolve("auto", device=torch.device("cuda", rank))
         free, total = torch.cuda.mem_get_info(rank)
         devices.append(
             {
                 "rank": rank,
                 "name": torch.cuda.get_device_name(rank),
-                "sparse_attention": provider.name,
+                "sparse_attention": type(provider).__module__.rsplit(".", 1)[-1],
                 "free_bytes": free,
                 "total_bytes": total,
             }
@@ -162,7 +147,19 @@ def doctor(model: dict, ranks: int) -> dict:
         "devices": devices,
         "codecs": ["libx264", "aac"],
         "native_sparse_attention": "available",
-        "precision": PRECISION_PRESETS["balanced"],
+        "precision": {
+            "dtype": str(precisions["balanced"].dtype),
+            "dtypes": {path: str(dtype) for path, dtype in precisions["balanced"].dtypes.items()},
+            "quantization": {
+                path: None
+                if value is None
+                else {
+                    "weight": value.weight.format,
+                    "activation": value.activation.format,
+                }
+                for path, value in precisions["balanced"].quantization.items()
+            },
+        },
         "capacity_estimate": {
             "checkpoint_component_bytes": component_bytes,
             "unquantized_weight_bytes_per_rank": weight_ceiling,

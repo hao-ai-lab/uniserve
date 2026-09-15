@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import torch
-
-from uniserve.attention.metadata import AttentionMetadata
 
 
 @dataclass(frozen=True)
@@ -106,77 +103,3 @@ class PackedRopeReq:
     x: torch.Tensor
     cos: torch.Tensor
     sin: torch.Tensor
-
-
-@dataclass(frozen=True)
-class DenseAttention:
-    """Carries dense Q/K/V tensors, scaling, causality, and optional attention mask."""
-
-    q: torch.Tensor
-    k: torch.Tensor
-    v: torch.Tensor
-    causal: bool
-    scale: float
-    attn_mask: torch.Tensor | None = None
-    ctx: AttentionMetadata | None = None
-
-
-@dataclass(frozen=True)
-class PagedDecodeAttention:
-    """Carries decode queries, paged KV storage, page tables, lengths, and optional current K/V writes."""
-
-    q: torch.Tensor
-    k: torch.Tensor
-    v: torch.Tensor
-    block_table: torch.Tensor
-    cache_seqlens: torch.Tensor
-    causal: bool
-    scale: float
-    current_k: torch.Tensor | None = None
-    current_v: torch.Tensor | None = None
-    kv_cache: Any | None = None
-    ctx: AttentionMetadata | None = None
-
-
-@dataclass(frozen=True)
-class VarlenAttention:
-    """Carries packed variable-length Q/K/V tensors and cumulative sequence offsets."""
-
-    q: torch.Tensor
-    k: torch.Tensor
-    v: torch.Tensor
-    cu_seqlens_q: torch.Tensor
-    cu_seqlens_k: torch.Tensor
-    max_seqlen_q: int
-    max_seqlen_k: int
-    causal: bool
-    scale: float
-    block_table: torch.Tensor | None = None
-    kv_cache: Any | None = None
-    ctx: AttentionMetadata | None = None
-
-
-@dataclass(frozen=True)
-class VisibleEndAttention:
-    """Carries dense Q/K/V tensors with a per-row visible KV boundary."""
-
-    q: torch.Tensor
-    k: torch.Tensor
-    v: torch.Tensor
-    visible_end: torch.Tensor
-    scale: float
-    cu_seqlens_q: torch.Tensor | None = None
-    cu_seqlens_k: torch.Tensor | None = None
-    page_table: torch.Tensor | None = None
-    seqused_k: torch.Tensor | None = None
-    max_seqlen_q: int | None = None
-    max_seqlen_k: int | None = None
-    use_prefix_bounds: bool = False
-    fully_visible: bool = False
-    prefix_k: torch.Tensor | None = None
-    prefix_v: torch.Tensor | None = None
-    prefix_lens: torch.Tensor | None = None
-    ctx: AttentionMetadata | None = None
-
-
-AttentionReq = DenseAttention | PagedDecodeAttention | VarlenAttention | VisibleEndAttention

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -113,6 +114,37 @@ class PeerAllocation {
     return descriptor;
   }
 
+  torch::Tensor map_local() const {
+    const c10::cuda::CUDAGuard guard(device_);
+    auto mapping = std::make_shared<PeerMapping>();
+    mapping->device = device_;
+    mapping->total_bytes = bytes_;
+    mapping->segment_bytes = bytes_;
+    check_cuda(cuMemAddressReserve(&mapping->address, bytes_, 0, 0, 0),
+                "reserve shared tensor address range");
+    check_cuda(cuMemMap(mapping->address, bytes_, 0, handle_, 0),
+                "map shared tensor allocation");
+    mapping->mapped_segments = 1;
+    CUmemGenericAllocationHandle retained;
+    check_cuda(cuMemRetainAllocationHandle(
+                   &retained, reinterpret_cast<void*>(mapping->address)),
+               "retain shared tensor allocation");
+    mapping->handles.push_back(retained);
+    CUmemAccessDesc access{};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = device_;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    check_cuda(cuMemSetAccess(mapping->address, bytes_, &access, 1),
+                "enable shared tensor access");
+    // Keep the originating allocation handle rather than importing its FD:
+    // CUDA imported handles cannot themselves be exported to another reader.
+    return at::for_blob(reinterpret_cast<void*>(mapping->address), shape_)
+        .deleter([mapping](void*) {})
+        .options(options_)
+        .target_device(c10::Device(c10::kCUDA, device_))
+        .make_tensor();
+  }
+
   torch::Tensor map_peers(const std::vector<int>& descriptors) const {
     const c10::cuda::CUDAGuard guard(device_);
     TORCH_CHECK(!descriptors.empty() &&
@@ -164,74 +196,71 @@ class PeerAllocation {
   CUmemGenericAllocationHandle handle_ = 0;
 };
 
-std::tuple<pybind11::bytes, size_t, size_t> export_ipc(torch::Tensor tensor) {
+std::optional<std::tuple<int, size_t, size_t>> export_fd(torch::Tensor tensor) {
   TORCH_CHECK(tensor.is_cuda() && tensor.numel() > 0,
-              "CUDA IPC export requires a nonempty CUDA tensor");
+              "shared allocation export requires a nonempty CUDA tensor");
   const c10::cuda::CUDAGuard guard(tensor.get_device());
-  ensure_current_context(tensor.get_device());
-  const auto pointer = reinterpret_cast<CUdeviceptr>(tensor.data_ptr());
-  CUdeviceptr base = 0;
-  size_t size = 0;
-  check_cuda(cuMemGetAddressRange(&base, &size, pointer), "query IPC allocation bounds");
-  CUipcMemHandle handle{};
-  check_cuda(cuIpcGetMemHandle(&handle, base), "export CUDA IPC allocation");
-  return {pybind11::bytes(reinterpret_cast<const char*>(&handle), sizeof(handle)),
-          size, pointer - base};
+  const auto base = tensor.storage().data_ptr().get();
+  CUmemGenericAllocationHandle handle;
+  const auto status = cuMemRetainAllocationHandle(&handle, base);
+  // Ordinary caching-allocator storage needs an exportable materialization.
+  // Driver failures other than an unsupported allocation remain observable.
+  if (status == CUDA_ERROR_INVALID_VALUE) {
+    return std::nullopt;
+  }
+  check_cuda(status, "retain shared allocation");
+  try {
+    CUmemAllocationProp properties{};
+    check_cuda(cuMemGetAllocationPropertiesFromHandle(&properties, handle),
+                "query shared allocation properties");
+    if (!(properties.requestedHandleTypes & CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)) {
+      cuMemRelease(handle);
+      return std::nullopt;
+    }
+    int descriptor = -1;
+    check_cuda(cuMemExportToShareableHandle(
+                   &descriptor, handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0),
+               "export shared allocation");
+    cuMemRelease(handle);
+    const auto offset = static_cast<const char*>(tensor.data_ptr()) -
+        static_cast<const char*>(base);
+    return std::make_tuple(descriptor, tensor.storage().nbytes(), offset);
+  } catch (...) {
+    cuMemRelease(handle);
+    throw;
+  }
 }
 
-struct IpcMapping {
-  CUdeviceptr address = 0;
-  int device = 0;
-
-  ~IpcMapping() {
-    // The public transfer lease holds this tensor through the last device
-    // read. Closing the mapping precedes acknowledgement to the producer.
-    if (address) {
-      const c10::cuda::CUDAGuard guard(device);
-      ensure_current_context(device);
-      cuIpcCloseMemHandle(address);
-    }
-  }
-};
-
-torch::Tensor import_ipc(torch::Tensor prototype, const pybind11::bytes& opaque,
-                         size_t allocation_bytes, size_t byte_offset,
-                         const std::vector<int64_t>& shape,
-                         const std::vector<int64_t>& strides) {
-  TORCH_CHECK(prototype.is_cuda() && !shape.empty() && shape.size() == strides.size(),
-              "CUDA IPC import requires matching tensor shape and strides");
-  const std::string bytes = opaque;
-  TORCH_CHECK(bytes.size() == sizeof(CUipcMemHandle), "invalid CUDA IPC allocation handle");
-  size_t extent = 1;
-  for (size_t index = 0; index < shape.size(); ++index) {
-    TORCH_CHECK(shape[index] > 0 && strides[index] >= 0,
-                "CUDA IPC tensor extents and strides are invalid");
-    const auto rows = static_cast<size_t>(shape[index] - 1);
-    const auto stride = static_cast<size_t>(strides[index]);
-    TORCH_CHECK(!rows || stride <= (std::numeric_limits<size_t>::max() - extent) / rows,
-                "CUDA IPC tensor span overflows size_t");
-    extent += rows * stride;
-  }
-  TORCH_CHECK(byte_offset % prototype.element_size() == 0 && byte_offset < allocation_bytes &&
-                  extent <= (allocation_bytes - byte_offset) / prototype.element_size(),
-              "CUDA IPC tensor exceeds its exported allocation");
+torch::Tensor import_fd(torch::Tensor prototype, int descriptor,
+                        size_t allocation_bytes) {
+  TORCH_CHECK(prototype.is_cuda() && allocation_bytes > 0 &&
+                  allocation_bytes % prototype.element_size() == 0,
+              "shared allocation import requires a representable CUDA extent");
   const auto device = prototype.get_device();
   const c10::cuda::CUDAGuard guard(device);
-  ensure_current_context(device);
-  auto mapping = std::make_shared<IpcMapping>();
+  auto mapping = std::make_shared<PeerMapping>();
   mapping->device = device;
-  CUipcMemHandle handle{};
-  std::memcpy(&handle, bytes.data(), sizeof(handle));
-  check_cuda(cuIpcOpenMemHandle(&mapping->address, handle, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS),
-              "import CUDA IPC allocation");
-  CUdeviceptr allocation_base = 0;
-  size_t mapped_bytes = 0;
-  check_cuda(cuMemGetAddressRange(&allocation_base, &mapped_bytes, mapping->address),
-              "query imported CUDA allocation bounds");
-  TORCH_CHECK(allocation_base == mapping->address && allocation_bytes == mapped_bytes,
-              "CUDA IPC allocation size disagrees with the exported handle");
-  return at::for_blob(reinterpret_cast<void*>(mapping->address + byte_offset), shape)
-      .strides(strides)
+  mapping->total_bytes = allocation_bytes;
+  mapping->segment_bytes = allocation_bytes;
+  CUmemGenericAllocationHandle handle;
+  check_cuda(cuMemImportFromShareableHandle(
+                 &handle, reinterpret_cast<void*>(static_cast<uintptr_t>(descriptor)),
+                 CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
+             "import shared allocation");
+  mapping->handles.push_back(handle);
+  check_cuda(cuMemAddressReserve(&mapping->address, allocation_bytes, 0, 0, 0),
+              "reserve shared allocation address range");
+  check_cuda(cuMemMap(mapping->address, allocation_bytes, 0, handle, 0),
+              "map shared allocation");
+  mapping->mapped_segments = 1;
+  CUmemAccessDesc access{};
+  access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  access.location.id = device;
+  access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  check_cuda(cuMemSetAccess(mapping->address, allocation_bytes, &access, 1),
+              "enable shared allocation access");
+  return at::for_blob(reinterpret_cast<void*>(mapping->address),
+                     {static_cast<int64_t>(allocation_bytes / prototype.element_size())})
       .deleter([mapping](void*) {})
       .options(prototype.options())
       .target_device(c10::Device(c10::kCUDA, device))
@@ -356,12 +385,13 @@ void copy_host_device(torch::Tensor destination, torch::Tensor source, uint64_t 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, binding) {
   binding.def("allocation_granularity", &allocation_granularity);
-  binding.def("export_ipc", &export_ipc);
-  binding.def("import_ipc", &import_ipc);
+  binding.def("export_fd", &export_fd);
+  binding.def("import_fd", &import_fd);
   binding.def("copy_host_device", &copy_host_device);
   binding.def("record_host_usage", &record_host_usage);
   pybind11::class_<PeerAllocation>(binding, "PeerAllocation")
       .def(pybind11::init<torch::Tensor, std::vector<int64_t>>())
       .def("export_fd", &PeerAllocation::export_fd)
+      .def("map_local", &PeerAllocation::map_local)
       .def("map_peers", &PeerAllocation::map_peers);
 }

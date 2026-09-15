@@ -6,28 +6,27 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from uniserve import ops
+from . import functional
 
 __all__ = [
-    "SiluAndMul",
-    "GeluAndMul",
+    "SiLUAndMul",
+    "GELUAndMul",
     "get_act_fn",
 ]
 
 
-class SiluAndMul(nn.Module):
-    """Applies SiLU gating to explicit inputs or equal halves of one packed tensor."""
+class SiLUAndMul(nn.Module):
+    """Apply SiLU gating to equal channel halves of a packed tensor."""
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
-        """Apply SiLU to the first operand and multiply by the second or packed half."""
+    def forward(self, x: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
+        """Apply SiLU to the gate half and multiply by the value half."""
 
-        return ops.silu_and_mul(x, y)
+        return functional.silu_and_mul(x, out=out)
 
 
-class GeluAndMul(nn.Module):
-    """Applies GELU gating to explicit inputs or equal halves of one packed tensor."""
+class GELUAndMul(nn.Module):
+    """Apply GELU gating to equal channel halves of a packed tensor."""
 
     def __init__(self, approximate: str = "none") -> None:
         """Select the PyTorch GELU approximation used by the gate."""
@@ -35,12 +34,10 @@ class GeluAndMul(nn.Module):
         super().__init__()
         self.approximate = approximate
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
-        """Apply GELU to the first operand and multiply by the second or packed half."""
+    def forward(self, x: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
+        """Apply GELU to the gate half and multiply by the value half."""
 
-        if y is None:
-            x, y = x.chunk(2, dim=-1)
-        return F.gelu(x, approximate=self.approximate) * y
+        return functional.gelu_and_mul(x, approximate=self.approximate, out=out)
 
 
 _ACT_FN_REGISTRY: dict[str, Callable[[], nn.Module]] = {
@@ -51,10 +48,10 @@ _ACT_FN_REGISTRY: dict[str, Callable[[], nn.Module]] = {
     "gelu_fast": lambda: nn.GELU(approximate="tanh"),
     "gelu_approx": lambda: nn.GELU(approximate="tanh"),
     "relu": nn.ReLU,
-    "silu_and_mul": SiluAndMul,
-    "swiglu": SiluAndMul,
-    "gelu_and_mul": GeluAndMul,
-    "geglu": GeluAndMul,
+    "silu_and_mul": SiLUAndMul,
+    "swiglu": SiLUAndMul,
+    "gelu_and_mul": GELUAndMul,
+    "geglu": GELUAndMul,
 }
 
 

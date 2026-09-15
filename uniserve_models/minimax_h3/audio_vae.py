@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from collections import OrderedDict
 
 import torch
 from torch import nn
 
 from uniserve.nn.vae.decoder import LatentDecoder
 
-__all__ = ["AudioDecoderConfig", "MiniMaxH3AudioVAE"]
+__all__ = ["Config", "Model"]
 
 
 @dataclass(frozen=True, slots=True)
-class AudioDecoderConfig:
+class Config:
     """Native audio network and channel normalization."""
 
     encoder_dim: int = 64
@@ -28,7 +28,6 @@ class AudioDecoderConfig:
     num_attention_heads: int = 8
     resblock_kernel_sizes: tuple[int, ...] = (3, 7, 11)
     resblock_dilation_sizes: tuple[tuple[int, ...], ...] = ((1, 3, 5), (1, 3, 5), (1, 3, 5))
-    sampling_rate: int = 32000
     latents_mean: tuple[float, ...] = (
         -0.020211687488382354,
         0.3876466479950502,
@@ -118,7 +117,6 @@ class AudioDecoderConfig:
             "latent_channels",
             "decoder_dim",
             "num_attention_heads",
-            "sampling_rate",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -158,55 +156,77 @@ class AudioDecoderConfig:
             raise ValueError("H3 audio latent width must be divisible by attention heads")
 
 
-class MiniMaxH3AudioVAE(LatentDecoder):
-    """Decodes H3 audio latents into bounded stereo PCM waveforms."""
+class Model(LatentDecoder):
+    """Invert audio latent statistics and reconstruct interleaved stereo PCM."""
 
-    latent_shape = (2, 32, None)
-    vae: Any
-    latents_mean: torch.Tensor
-    latents_std: torch.Tensor
+    def __init__(self, config: Config):
+        from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (
+            MiniMaxH3AudioBigVGANDecoder,
+        )
 
-    def __init__(self, vae: nn.Module, config: AudioDecoderConfig) -> None:
-        """Compose an audio decoder with its configured latent normalization statistics."""
-
-        super().__init__()
+        decoder = nn.Sequential(
+            OrderedDict(
+                (
+                    ("input", nn.Conv1d(config.latent_channels, config.latent_dim, 1)),
+                    (
+                        "network",
+                        MiniMaxH3AudioBigVGANDecoder(
+                            in_channels=config.latent_dim,
+                            upsample_initial_channel=config.decoder_dim,
+                            upsample_rates=config.decoder_rates,
+                            upsample_kernel_sizes=config.decoder_kernel_sizes,
+                            resblock_kernel_sizes=config.resblock_kernel_sizes,
+                            resblock_dilation_sizes=config.resblock_dilation_sizes,
+                        ),
+                    ),
+                )
+            )
+        )
+        # The checkpoint supplies the exact anti-alias filters as numerical
+        # weights. Register them as non-trainable Parameters so the ordinary
+        # assignment path loads their values alongside the convolutions.
+        for module in decoder.modules():
+            for name, value in tuple(module.named_buffers(recurse=False)):
+                if name not in module._non_persistent_buffers_set:
+                    delattr(module, name)
+                    module.register_parameter(name, nn.Parameter(value, requires_grad=False))
+        super().__init__(
+            decoder,
+            latent_shape=(2, config.latent_channels, None),
+            mean=torch.tensor(config.latents_mean, dtype=torch.float32, device="cpu").view(
+                1, config.latent_channels, 1
+            ),
+            std=torch.tensor(config.latents_std, dtype=torch.float32, device="cpu").view(
+                1, config.latent_channels, 1
+            ),
+        )
         self.config = config
-        self.latent_shape = (2, config.latent_channels, None)
-        self.vae = vae.float()
-        if not hasattr(vae, "decode"):
-            raise TypeError("MiniMax H3 audio VAE does not expose decode")
-        mean, std = config.latents_mean, config.latents_std
-        # Keep constant values when parameter storage is deferred. The public
-        # loader stages graph buffers after materializing the learned modules.
-        statistics_device = "cpu" if self.device.type == "meta" else self.device
-        self.register_buffer(
-            "latents_mean",
-            torch.tensor(mean, dtype=torch.float32, device=statistics_device).view(
-                1, config.latent_channels, 1
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "latents_std",
-            torch.tensor(std, dtype=torch.float32, device=statistics_device).view(
-                1, config.latent_channels, 1
-            ),
-            persistent=False,
-        )
 
-    def _reconstruct(self, latents: torch.Tensor) -> torch.Tensor:
-        """Convert native decoder output to interleaved signed-16 stereo."""
-
-        decoded = self.vae.decode(latents).sample.float()
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        decoded = super().forward(latents).float()
         if decoded.ndim != 3 or decoded.shape[:2] != (2, 1):
-            raise RuntimeError("MiniMax H3 audio decoder returned invalid stereo geometry")
-        # PyAV accepts interleaved signed-16 stereo as [samples, channels].
+            raise RuntimeError("audio decoder must produce two mono channel timelines")
         return (
             decoded[:, 0]
             .transpose(0, 1)
-            .clamp_(-1.0, 1.0)
-            .mul_(32767.0)
-            .round_()
+            .clamp(-1.0, 1.0)
+            .mul(32767.0)
+            .round()
             .to(torch.int16)
             .contiguous()
         )
+
+
+def assignments(model: Model, reader):
+    """Map native decoder fields without retaining the checkpoint encoder."""
+    from uniserve.loading import weights
+
+    available = frozenset(reader.names())
+    values = []
+    for name, parameter in model.named_parameters():
+        source = name.replace("decoder.input.", "dec_in_proj.").replace(
+            "decoder.network.", "decoder."
+        )
+        if source in available:
+            values.append(weights.Assignment(parameter, reader.get(source)))
+    return tuple(values)

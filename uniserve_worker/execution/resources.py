@@ -1,105 +1,78 @@
-"""Worker selection of numerical components and their allocation bounds."""
+"""Query numerical result layouts and reserve caller-owned media input storage."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from typing import Any, cast
+from collections.abc import Mapping
 
-from uniserve.model.media import VideoSize
-from uniserve.model.model import Model
-from uniserve.model.text import TextSize
-from uniserve.model.video import VideoMixin
-from uniserve.runtime.tensors import merge_buffers
+from torch import nn
+
+from uniserve.model import AudioDecoder, Denoiser, TextEncoder, VideoDecoder, VideoPostprocessor
 from uniserve.tensors import BufferConfig, OutputLayout
 
-from .model_entry import ModelEntry
+from ..config import WorkerConfig
+from .model_entry import Call, ModelEntry
 
 
 def media_state_buffers(
-    model: Model, bindings: Mapping[str, ModelEntry]
+    model: nn.Module, bindings: Mapping[str, ModelEntry], config: WorkerConfig
 ) -> dict[str, BufferConfig]:
-    """Allocate cross-step tensors only for participating stateful computations."""
+    """Reserve resident samples and transfer staging only on participating ranks."""
 
-    if not isinstance(model, VideoMixin):
+    from ..bootstrap.inputs import media_inputs
+
+    factory = media_inputs(model, config)
+    if factory is None:
         return {}
-    size = VideoSize(
-        model.output_capacity.frame_count, cast(int, getattr(model.text_encoder, "max_tokens"))
-    )
-    fields = []
+    result = {}
     for binding in bindings.values():
-        for method in binding.methods:
-            if method in {"forward_diffusion", "postprocess_video"}:
-                component = cast(Any, model.get_submodule(binding.component))
-                fields.append(component.state_buffers(size))
-    return merge_buffers(fields)
-
-
-def media_workspace_buffers(
-    model: Model, bindings: Mapping[str, ModelEntry]
-) -> dict[str, BufferConfig]:
-    """Bound temporary views for the locally serialized media computations."""
-
-    if not isinstance(model, VideoMixin):
-        return {}
-    video = model.output_capacity
-    size = VideoSize(video.frame_count, cast(int, getattr(model.text_encoder, "max_tokens")))
-    fields = []
-    for binding in bindings.values():
-        for method in binding.methods:
-            if method in {"forward_diffusion", "decode:video", "postprocess_video"}:
-                component = cast(Any, model.get_submodule(binding.component))
-                fields.append(component.workspace_buffers(size))
-            elif method == "decode:audio":
-                decoder = cast(Any, model.get_submodule(binding.component))
-                samples = round(video.frame_count * video.audio_rate / video.frame_rate)
-                fields.append(decoder.workspace_buffers(decoder.latent_frames(samples)))
-    return merge_buffers(fields)
+        for call in binding.calls:
+            if isinstance(call.module, Denoiser) and call.entry.method == "forward":
+                fields = factory.capacity_buffers()
+            elif isinstance(call.module, VideoPostprocessor):
+                fields = call.module.state_buffers(factory.maximum.num_frames)
+            else:
+                continue
+            for name, field in fields.items():
+                if name in result and result[name] != field:
+                    raise ValueError(f"media request fields disagree about {name!r}")
+                result[name] = field
+    return result
 
 
 def output_layouts(
-    model: Model,
-    call: str,
-    component: Any,
+    model: nn.Module,
+    config: WorkerConfig,
+    call: Call,
     *,
     frames: int | None = None,
     prompt_tokens: int | None = None,
-    units: int | None = None,
 ) -> Mapping[str, OutputLayout]:
-    """Query global tensor results at the producing numerical component.
+    """Describe complete persistent tensor products for one capability call."""
 
-    Media encoding publishes artifacts, while ordinary token/image operations
-    use their existing scalar and feature result paths. This query covers the
-    persistent tensors transferred between component computations.
-    """
+    from ..bootstrap.inputs import capability, media_inputs
 
-    if call in {"encode:conditioning", "postprocess_video"}:
-        return {}
-    query = getattr(component, "output_layout", None)
-    if not callable(query):
-        return {}
-    query = cast(Callable[..., Mapping[str, OutputLayout]], query)
-    if call == "encode:text":
-        tokens = (
-            cast(int, getattr(component, "max_tokens")) if prompt_tokens is None else prompt_tokens
+    component = call.module
+    if isinstance(component, TextEncoder) and call.entry.method == "encode":
+        return component.output_layout(
+            config.max_sequence_tokens if prompt_tokens is None else prompt_tokens
         )
-        return query(TextSize(tokens))
-    if call == "decode:video" and not isinstance(model, VideoMixin):
-        return query(units=units)
-    if call not in {"forward_diffusion", "decode:video", "decode:audio"} or not isinstance(
-        model, VideoMixin
-    ):
-        return query()
-    video = model.video_info(model.output_capacity.frame_count if frames is None else frames)
-    size = VideoSize(
-        video.frame_count,
-        cast(int, getattr(model.text_encoder, "max_tokens"))
-        if prompt_tokens is None
-        else prompt_tokens,
+    if not isinstance(component, (Denoiser, VideoDecoder, AudioDecoder)):
+        return {}
+    if isinstance(component, VideoDecoder) and frames is not None:
+        return component.output_layout(frames)
+    factory = media_inputs(model, config)
+    if factory is None:
+        # Image execution returns its features and decoded raster through the
+        # token/image protocol rather than persistent inter-component products.
+        return {}
+    size = factory.size(
+        factory.maximum.num_frames if frames is None else frames,
+        config.max_sequence_tokens if prompt_tokens is None else prompt_tokens,
     )
-    if call == "forward_diffusion":
-        return query(size)
-    if call == "decode:video":
-        count = len(model.decode_windows(video)) if units is None else units
-        return query(size, units=count)
-    samples = round(video.frame_count * video.audio_rate / video.frame_rate)
-    return query(samples)
+    if isinstance(component, Denoiser):
+        return component.output_layout(size)
+    if isinstance(component, VideoDecoder):
+        return component.output_layout(size.num_frames)
+    clock = capability(model, VideoPostprocessor)
+    samples = round(size.num_frames * component.sample_rate / clock.frame_rate)
+    return component.output_layout(samples)

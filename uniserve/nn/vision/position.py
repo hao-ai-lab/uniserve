@@ -75,23 +75,14 @@ def get_flattened_position_ids_extrapolate(
 
 
 class PositionEmbedding(nn.Module):
-    """Adds learned or sinusoidal two-dimensional positions to packed image patches."""
+    """Learned position rows indexed on a fixed two-dimensional grid."""
 
-    def __init__(self, max_num_patch_per_side: int, hidden_size: int, *, init_sincos: bool = True):
-        """Allocate a square position table and optionally initialize deterministic sinusoids."""
-
+    def __init__(self, grid_size: tuple[int, int], hidden_size: int):
         super().__init__()
-        self.max_num_patch_per_side = int(max_num_patch_per_side)
-        self.hidden_size = int(hidden_size)
-        self.pos_embed = nn.Parameter(
-            torch.zeros(self.max_num_patch_per_side**2, self.hidden_size),
-            requires_grad=False,
-        )
-        if init_sincos:
-            pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side)
-            self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float())
+        if len(grid_size) != 2 or any(type(size) is not int or size < 1 for size in grid_size):
+            raise ValueError("position grid requires two positive integer dimensions")
+        self.grid_size = grid_size
+        self.weight = nn.Parameter(torch.empty(grid_size[0] * grid_size[1], hidden_size))
 
-    def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
-        """Gather learned vision position rows for the supplied integer indexes."""
-
-        return self.pos_embed[position_ids]
+    def forward(self, positions: torch.Tensor) -> torch.Tensor:
+        return self.weight[positions]

@@ -185,6 +185,10 @@ pub struct WorkerInfo {
     pub latent_pages: u32,
     /// Persistent buffer-pool capacity in bytes.
     pub buffer_pool_bytes: u64,
+    /// Maximum simultaneously retained encoder feature products.
+    pub encoder_cache_entries: u32,
+    /// Maximum bytes in one encoder feature product, independent of pool size.
+    pub encoder_entry_bytes: u64,
     /// Maximum unresolved operations per request lineage.
     pub max_unresolved_ops: u32,
 }
@@ -392,6 +396,8 @@ impl Default for WorkerInfo {
             latent_page_units: 0,
             latent_pages: 0,
             buffer_pool_bytes: 0,
+            encoder_cache_entries: 0,
+            encoder_entry_bytes: 0,
             max_unresolved_ops: 1,
         }
     }

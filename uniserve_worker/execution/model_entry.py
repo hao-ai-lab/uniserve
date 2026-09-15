@@ -1,15 +1,15 @@
-"""Resolved numerical module bindings and their resident input geometry."""
+"""Resolved numerical module bindings and their resident input storage."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
 
-from uniserve.distributed.collectives import NcclCommunicator
 from uniserve.distributed.mesh import Communicator, DeviceMesh
+from uniserve.model import EntryPoint
 from uniserve_worker.config import ComponentConfig
 
 from ..protocol.batch import Computation, OutputInfo
@@ -18,16 +18,9 @@ from .cuda_stream import CudaStream
 if TYPE_CHECKING:
     from .batch import ExecutionOutput
     from .input_buffers import InputBuffers
-from uniserve.runtime.cuda_graph import CudaGraph
+from uniserve.runtime import ExecutionContext
 
 TensorOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
-TensorSignature: TypeAlias = tuple[tuple[tuple[int, ...], torch.dtype, tuple[int, ...]], ...]
-
-
-def tensor_signature(inputs: tuple[torch.Tensor, ...]) -> TensorSignature:
-    """Include layout as well as shape in a tensor-only computation's identity."""
-
-    return tuple((tuple(value.shape), value.dtype, tuple(value.stride())) for value in inputs)
 
 
 def capture_required(missing: bool, groups: tuple[Communicator, ...], device: torch.device) -> bool:
@@ -37,8 +30,22 @@ def capture_required(missing: bool, groups: tuple[Communicator, ...], device: to
         return missing
     decision = torch.tensor(int(missing), dtype=torch.int32, device=device)
     for group in groups:
-        group.all_reduce_max(decision)
+        group.all_reduce(decision, op="max")
     return bool(decision.item())
+
+
+@dataclass(frozen=True, slots=True)
+class Call:
+    """A borrowed capability method and its numerical participation groups."""
+
+    path: str
+    module: torch.nn.Module
+    entry: EntryPoint
+    groups: tuple[Communicator, ...] = ()
+
+    @property
+    def forward(self) -> Callable[..., Any]:
+        return getattr(self.module, self.entry.method)
 
 
 @dataclass(slots=True, eq=False)
@@ -60,18 +67,10 @@ class ModelEntry:
     outputs: tuple[OutputInfo, ...] = ()
     computations: tuple[Computation, ...] = ()
     component: str = ""
-    methods: dict[str, tuple[Callable[..., Any], tuple[Communicator, ...]]] = field(
-        default_factory=dict
-    )
+    calls: tuple[Call, ...] = ()
+    context: ExecutionContext | None = None
     input_buffers: InputBuffers | None = None
     cuda_stream: CudaStream | None = None
-    # Native device streams use process groups and shared reduction workspaces;
-    # Green Context streams require a complete, explicit communicator mapping.
-    collectives: dict[str, NcclCommunicator] | None = None
-    fixed_inputs: tuple[torch.Tensor, ...] | None = None
-    signature: TensorSignature | None = None
-    graph: CudaGraph[TensorOutput] | None = None
-    capture_inputs: tuple[torch.Tensor, ...] | None = None
 
     def __post_init__(self) -> None:
         if any(rank not in self.process_group.ranks for rank in self.config.ranks):
@@ -81,19 +80,24 @@ class ModelEntry:
                 raise ValueError(f"entry {self.name} requires its local mesh")
             if self.mesh is not None and (
                 self.mesh.ranks != self.config.ranks
-                or self.mesh.parallel_config != self.config.parallel_config
+                or tuple(zip(self.mesh.axes, self.mesh.shape))
+                != self.config.parallel_config.dimensions
             ):
                 raise ValueError(f"entry {self.name} mesh disagrees with configuration")
         if self.mesh is not None:
             if not self.groups:
                 self.groups = tuple(
-                    {group.name: group for group in self.mesh.groups.values()}.values()
+                    {
+                        group.ranks: group
+                        for axes in self.mesh._groups
+                        for group in (self.mesh.get_group(axes),)
+                    }.values()
                 )
 
     @property
     def owns(self) -> bool:
         """Whether this process executes the configured entry."""
-        return self.process_group.rank in self.config.ranks
+        return self.process_group.global_rank in self.config.ranks
 
     @property
     def input_ranks(self) -> tuple[int, ...]:
@@ -111,13 +115,16 @@ class ModelEntry:
         if config.distribution is not None:
             return config.ranks
         geometry = DeviceMesh(
-            config.ranks, config.ranks[0], config.parallel_config, self.process_group.device
+            ranks=config.ranks,
+            rank=config.ranks[0],
+            shape=tuple(size for _, size in config.parallel_config.dimensions),
+            axes=tuple(axis for axis, _ in config.parallel_config.dimensions),
         )
-        axes = tuple(name for name, _ in geometry.dimensions)
+        axes = geometry.axes
         return tuple(
             rank
             for rank in config.ranks
-            if geometry.get_coordinate(rank)[axes.index("tp")] == 0
-            and geometry.get_coordinate(rank)[axes.index("pp")]
+            if geometry.coordinate(rank)[axes.index("tp")] == 0
+            and geometry.coordinate(rank)[axes.index("pp")]
             == config.parallel_config.pipeline_parallel_size - 1
         )

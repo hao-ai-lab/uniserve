@@ -28,8 +28,10 @@ from tests.python.fixtures.depth_one import (
     visual_state_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve.model.batch import TextBatch, TextOutput
-from uniserve_models.stub import StubModel, _next_token
+from uniserve.model import Logits
+from tests.python.fixtures.simulation import expected_successor
+from uniserve_models.stub import Model
+from uniserve_models.stub import entry_points as entry_points, entry_paths as entry_paths
 from uniserve_worker.config import LaneConfig, WorkerConfig
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import (
@@ -65,18 +67,18 @@ pytestmark = pytest.mark.integration
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-class _MisalignedOutputModel(StubModel):
+class _MisalignedOutputModel(Model):
     def __init__(self) -> None:
         super().__init__()
         self.misaligned = False
         self.failure_delay_cycles = 0
 
-    def compute_logits(self, hidden: torch.Tensor, batch: TextBatch) -> TextOutput:
-        output = super().compute_logits(hidden, batch)
+    def compute_logits(self, hidden: torch.Tensor, *, token_indices: torch.Tensor) -> Logits:
+        output = super().compute_logits(hidden, token_indices=token_indices)
         if self.misaligned:
             if self.failure_delay_cycles:
                 torch.cuda._sleep(self.failure_delay_cycles)
-            return TextOutput(output.values[:-1])
+            return Logits(output.values[:-1], output.vocab)
         return output
 
 
@@ -214,7 +216,7 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
         ),
     )
 
-    assert extended.completions[0].committed_tokens == (_next_token(4),)
+    assert extended.completions[0].committed_tokens == (expected_successor(4),)
     assert extended.completions[0].kv_visible_len == 2
     assert extended.completions[0].position == 2
 
@@ -239,7 +241,7 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
         ),
     )
 
-    assert decoded.completions[0].committed_tokens == (_next_token(first_token),)
+    assert decoded.completions[0].committed_tokens == (expected_successor(first_token),)
     assert decoded.completions[0].kv_visible_len == 3
     assert decoded.completions[0].position == 3
 
@@ -666,7 +668,7 @@ def test_computation_identity_preserves_homogeneous_decode():
             op_id=ComputationId(60, index),
             predecessor=observation.op_id,
             mode=ForwardMode.DECODE,
-            tokens=(_next_token(last_tokens[index]),),
+            tokens=(expected_successor(last_tokens[index]),),
         )
         decode_ops.append(operation)
 
@@ -683,13 +685,13 @@ def test_computation_identity_preserves_homogeneous_decode():
     )
 
     assert tuple(record.committed_tokens for record in decoded.completions) == tuple(
-        (_next_token(_next_token(token)),) for token in last_tokens
+        (expected_successor(expected_successor(token)),) for token in last_tokens
     )
 
 
 @pytest.mark.gpu
 def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> None:
-    model = _MisalignedOutputModel()
+    model = _MisalignedOutputModel().to("cuda:0")
     worker = execution_worker(
         model,
         device="cuda:0",
@@ -724,7 +726,7 @@ def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> No
             op_id=ComputationId(32, 0),
             predecessor=observation.op_id,
             mode=ForwardMode.DECODE,
-            tokens=(_next_token(13),),
+            tokens=(expected_successor(13),),
         )
         model.misaligned = True
         model.failure_delay_cycles = 1_000_000_000
@@ -777,7 +779,7 @@ def test_output_validation_failure_discards_all_candidate_state():
         op_id=ComputationId(32, 0),
         predecessor=observation.op_id,
         mode=ForwardMode.DECODE,
-        tokens=(_next_token(13),),
+        tokens=(expected_successor(13),),
     )
     retry_batch = execution_run(run_id=13, admissions=(), operations=(retry,), input_products=())
     model.misaligned = True
@@ -793,7 +795,7 @@ def test_output_validation_failure_discards_all_candidate_state():
         op_id=ComputationId(33, 0),
         predecessor=observation.op_id,
         mode=ForwardMode.DECODE,
-        tokens=(_next_token(13),),
+        tokens=(expected_successor(13),),
     )
     result = finalized_report(
         worker,
@@ -804,7 +806,7 @@ def test_output_validation_failure_discards_all_candidate_state():
             )
         ),
     )
-    assert result.completions[0].committed_tokens == (_next_token(_next_token(13)),)
+    assert result.completions[0].committed_tokens == (expected_successor(expected_successor(13)),)
     assert result.completions[0].kv_visible_len == 3
 
 
@@ -1101,9 +1103,19 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
 
 @pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
 def test_non_power_of_two_context_capacity_accepts_prefill_and_decode(device: str) -> None:
-    model = StubModel()
-    model.text_backbone.max_tokens = 20
-    worker = execution_worker(model, block_size=4, device=device)
+    model = Model().to(device)
+    worker = execution_worker(
+        model,
+        block_size=4,
+        device=device,
+        execution=WorkerConfig(
+            max_sequence_tokens=20,
+            graph_policy="off",
+            prefill_cuda_graph=False,
+            flow_graph_batch_sizes=(1,),
+            flow_graph_shapes=((16, 16),),
+        ),
+    )
     admission = ar_params(1, block_ids=(0, 1, 2, 3, 4))
     predecessor = root_parent(admission)
     commands = ()
@@ -1203,9 +1215,9 @@ def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
     assert crossed  # the chain actually crossed a page boundary
     assert block_count == 2
     # Committed tokens follow the stub oracle unbroken across the boundary.
-    chain = [_next_token(4)]
+    chain = [expected_successor(4)]
     for _ in range(4):
-        chain.append(_next_token(chain[-1]))
+        chain.append(expected_successor(chain[-1]))
     assert accepted == chain
 
 
@@ -2226,7 +2238,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         sample_continuation=True,
         max_tokens=2,
     )
-    next_token = _next_token(1007)
+    next_token = expected_successor(1007)
     transition_product = TensorRef(
         request_key=admission.request_key,
         producer_op_id=state.op_id,
@@ -2584,11 +2596,15 @@ def test_full_binding_returns_current_decode_tokens(warmup):
             ),
         )
         assert result.completions[0].status is OpStatus.OK
-        assert result.completions[0].committed_tokens == (_next_token(_next_token(4)),)
+        assert result.completions[0].committed_tokens == (
+            expected_successor(expected_successor(4)),
+        )
 
 
 @pytest.mark.gpu
 def test_failed_capture_preserves_error_through_worker_scope_and_reconstruction(monkeypatch):
+    from uniserve.runtime.cuda_graph import CUDAGraphError
+
     policy = WorkerConfig(
         graph_policy="full",
         prefill_cuda_graph=True,
@@ -2607,10 +2623,10 @@ def test_failed_capture_preserves_error_through_worker_scope_and_reconstruction(
 
     with monkeypatch.context() as patch:
         patch.setattr(torch.cuda.CUDAGraph, "capture_end", failed_capture)
-        with pytest.raises(RuntimeError) as raised:
+        with pytest.raises(CUDAGraphError, match="CUDA capture completion failed") as raised:
             with execution_worker(device="cuda:0", execution=policy) as worker:
                 worker.warmup()
-        assert raised.value is failure
+        assert raised.value.__cause__ is failure
     with execution_worker(device="cuda:0", execution=policy) as worker:
         worker.warmup()
         admission = ar_params(1, block_ids=(0,))
@@ -2628,4 +2644,6 @@ def test_failed_capture_preserves_error_through_worker_scope_and_reconstruction(
             ),
         )
         assert result.completions[0].status is OpStatus.OK
-        assert result.completions[0].committed_tokens == (_next_token(_next_token(4)),)
+        assert result.completions[0].committed_tokens == (
+            expected_successor(expected_successor(4)),
+        )

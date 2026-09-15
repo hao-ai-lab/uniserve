@@ -15,7 +15,7 @@ from tests.python.fixtures.depth_one import (
     umm_params,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_models.stub import _next_token
+from tests.python.fixtures.simulation import expected_successor
 from uniserve_worker.protocol.batch import (
     ComputationId,
     DType,
@@ -83,7 +83,7 @@ def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> Non
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    with_transition = _with_transition_predicate(base, _next_token(4))
+    with_transition = _with_transition_predicate(base, expected_successor(4))
     token = replace(
         with_transition.token_output,
         output_index=1,
@@ -130,7 +130,7 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
     admission = NewRequest(
         base.request_key,
         request_pool_idx=base.request_pool_idx,
-        ar=replace(base.ar, finish_token_ids=(_next_token(4),)),
+        ar=replace(base.ar, finish_token_ids=(expected_successor(4),)),
     )
     predecessor = token_operation(
         admission.request_key,
@@ -281,7 +281,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         op_id=ComputationId(3, 0),
         predecessor=initial_observation.op_id,
         mode=ForwardMode.DECODE,
-        tokens=(_next_token(4),),
+        tokens=(expected_successor(4),),
     )
     predecessor = _with_transition_predicate(predecessor, 4_242)
     parent_report = worker.submit(

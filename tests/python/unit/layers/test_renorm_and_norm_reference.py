@@ -6,10 +6,21 @@ import pytest
 import torch
 
 from uniserve import ops
-from uniserve.nn.diffusion.cfg import CfgParams, RenormKind, combine_cfg
+from uniserve.diffusion import AdditiveGuidance, Branch, Renorm, make_schedule
+from uniserve.nn import functional
 from uniserve.nn.norm import RMSNorm
 
 pytestmark = pytest.mark.unit
+
+
+def _combine(base, conditioned, scale, renorm, minimum=0.0):
+    guidance = AdditiveGuidance(scale, 1.0, (0.0, 1.0), renorm, minimum)
+    schedule = make_schedule(
+        1, shift=1.0, direction="descending", shift_domain="time", device=base.device
+    )
+    return guidance.combine(
+        {Branch.TEXT_UNCONDITIONAL: base, Branch.CONDITIONED: conditioned}, schedule, 0
+    )
 
 
 # --- shared references ------------------------------------------------------
@@ -52,13 +63,9 @@ def test_renorm_none_returns_unmodified_guided_velocity():
     torch.manual_seed(0)
     base = torch.randn(2, 3, 8)
     cond = torch.randn(2, 3, 8)
-    branches = torch.stack([base, cond], dim=0)
     scale = 2.5
 
-    out = combine_cfg(
-        branches,
-        CfgParams(branch_count=2, scales=(scale,), renorm=RenormKind.NONE),
-    )
+    out = _combine(base, cond, scale, Renorm.NONE)
 
     torch.testing.assert_close(out, _guided_two_branch(base, cond, scale))
 
@@ -70,19 +77,13 @@ def test_renorm_rescale_blends_channel_matched_with_raw_guided():
     torch.manual_seed(1)
     base = torch.randn(2, 4, 16)
     cond = torch.randn(2, 4, 16)
-    branches = torch.stack([base, cond], dim=0)
     scale = 3.0
     guided = _guided_two_branch(base, cond, scale)
     eps = torch.finfo(guided.dtype).eps
-    matched = _match_norm_reference(
-        guided, branches[-1], dims=(guided.ndim - 1,), minimum=0.0, eps=eps
-    )
+    matched = _match_norm_reference(guided, cond, dims=(guided.ndim - 1,), minimum=0.0, eps=eps)
     expected = 0.7 * matched + 0.3 * guided
 
-    out = combine_cfg(
-        branches,
-        CfgParams(branch_count=2, scales=(scale,), renorm=RenormKind.RESCALE),
-    )
+    out = _combine(base, cond, scale, Renorm.RESCALE)
 
     torch.testing.assert_close(out, expected)
 
@@ -94,15 +95,11 @@ def test_renorm_cfg_zero_star_subtracts_per_sample_mean():
     torch.manual_seed(2)
     base = torch.randn(2, 5, 8)
     cond = torch.randn(2, 5, 8)
-    branches = torch.stack([base, cond], dim=0)
     scale = 4.0
     guided = _guided_two_branch(base, cond, scale)
     expected = guided - guided.mean(dim=(1, 2), keepdim=True)
 
-    out = combine_cfg(
-        branches,
-        CfgParams(branch_count=2, scales=(scale,), renorm=RenormKind.CFG_ZERO_STAR),
-    )
+    out = _combine(base, cond, scale, Renorm.CFG_ZERO_STAR)
 
     torch.testing.assert_close(out, expected)
 
@@ -118,18 +115,11 @@ def test_renorm_min_clamps_reference_norm_up_disabling_downscale():
     torch.manual_seed(4)
     base = torch.randn(2, 4, 16) * 0.1
     cond = torch.randn(2, 4, 16) * 5.0
-    branches = torch.stack([base, cond], dim=0)
     scale = 4.0
     guided = _guided_two_branch(base, cond, scale)
 
-    out_default = combine_cfg(
-        branches,
-        CfgParams(branch_count=2, scales=(scale,), renorm=RenormKind.CHANNEL, renorm_min=0.0),
-    )
-    out_clamped = combine_cfg(
-        branches,
-        CfgParams(branch_count=2, scales=(scale,), renorm=RenormKind.CHANNEL, renorm_min=1e6),
-    )
+    out_default = _combine(base, cond, scale, Renorm.CHANNEL, 0.0)
+    out_clamped = _combine(base, cond, scale, Renorm.CHANNEL, 1e6)
 
     # The default match downscales (strictly different from raw guided)...
     assert not torch.allclose(out_default, guided)
@@ -140,17 +130,9 @@ def test_renorm_min_clamps_reference_norm_up_disabling_downscale():
 # --- unknown renorm kind ----------------------------------------------------
 
 
-def test_unknown_renorm_kind_raises_value_error():
-    torch.manual_seed(5)
-    branches = torch.stack([torch.randn(1, 4, 8), torch.randn(1, 4, 8)], dim=0)
-
-    class _UnregisteredKind:
-        pass
-
-    params = CfgParams(branch_count=2, scales=(2.0,), renorm=_UnregisteredKind())
-
-    with pytest.raises(ValueError, match="unknown renorm kind"):
-        combine_cfg(branches, params)
+def test_guidance_rejects_an_unrecognized_renormalization():
+    with pytest.raises(TypeError, match="renormalization must use Renorm"):
+        AdditiveGuidance(2.0, 1.0, (0.0, 1.0), "channel", 0.0)
 
 
 # --- RMSNorm vs fp32 reciprocal-rms reference -------------------------------
@@ -201,7 +183,7 @@ def test_rmsnorm_preserves_normalization_and_residual_values(device, dtype):
             values.float(), (128,), weight=module.weight.float(), eps=1e-5
         ).to(dtype)
         torch.testing.assert_close(module(values), expected, rtol=2e-2, atol=2e-2)
-        normalized, combined = module.forward_with_residual(values, residual)
+        normalized, combined = functional.add_rms_norm(values, residual, module.weight, module.eps)
         expected_sum = values + residual
         expected_normalized = torch.nn.functional.rms_norm(
             expected_sum.float(), (128,), weight=module.weight.float(), eps=1e-5

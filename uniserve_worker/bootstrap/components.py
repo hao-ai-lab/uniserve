@@ -1,177 +1,253 @@
-"""Physical placement validation against declared numerical component calls."""
+"""Bind public numerical capabilities to the worker's logical IPC entries."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any
+from dataclasses import replace
+from importlib import import_module
 
-from uniserve.model.components import ComponentCall
-from uniserve.model.decoder import DecoderMixin
-from uniserve.model.encoder import EncoderMixin
-from uniserve.model.text import TextMixin
+from torch import nn
+
+from uniserve.distributed import DeviceMesh
+
+from uniserve.model import (
+    AudioDecoder,
+    CausalLM,
+    Denoiser,
+    Encoder,
+    EntryPoint,
+    ImageDecoder,
+    PatchEncoder,
+    TextEncoder,
+    VideoDecoder,
+    VideoPostprocessor,
+)
+from uniserve.nn.vae import PatchAutoencoder
 from uniserve_worker.config import ComponentConfig
 
+from ..execution.model_entry import Call, ModelEntry
 from ..foundation.errors import unsupported_setup
 from ..protocol.batch import Computation, ForwardMode, PipelineStage, TransferMode
 
-if TYPE_CHECKING:
-    from uniserve.model.model import Model
 
+def call_operations(calls: Iterable[Call]) -> frozenset[Computation]:
+    """Resolve computation from capability type and the declared numerical method."""
 
-_CALL_OPERATIONS: Mapping[str, tuple[Computation, ...]] = {
-    "forward": (ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY),
-    "encode:text": (PipelineStage.TEXT_ENCODING,),
-    "encode:vision": (PipelineStage.VISION_ENCODING,),
-    "encode:latent": (PipelineStage.LATENT_ENCODING,),
-    "encode:conditioning": (PipelineStage.LATENT_PREPARATION,),
-    "forward_diffusion": (PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING),
-    "decode:image": (PipelineStage.IMAGE_DECODING,),
-    "decode:video": (PipelineStage.VIDEO_DECODING,),
-    "decode:audio": (PipelineStage.AUDIO_DECODING,),
-    "postprocess_video": (),
-}
-
-
-def call_operations(methods: Iterable[str]) -> frozenset[Computation]:
-    """Translate numerical entry names into worker operations during binding."""
-
-    return frozenset(operation for method in methods for operation in _CALL_OPERATIONS[method])
-
-
-def supported_operations(model: Model) -> frozenset[Computation]:
-    operations: set[Computation] = {TransferMode.TENSOR}
-    operations.update(call_operations(call.method for call in model.component_calls(model.config)))
-    if isinstance(model, TextMixin):
-        operations.update((TransferMode.KV_PUBLISH, TransferMode.KV_INSTALL))
-    operations.update(media_components(model))
+    operations: set[Computation] = set()
+    for call in calls:
+        module, method = call.module, call.entry.method
+        if isinstance(module, CausalLM) and method == "forward":
+            operations.update((ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY))
+        elif isinstance(module, Denoiser) and method == "forward":
+            operations.update((PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING))
+        elif isinstance(module, VideoPostprocessor) and method == "forward":
+            operations.update(
+                (PipelineStage.VIDEO_ENCODING, PipelineStage.AUDIO_ENCODING, PipelineStage.MUXING)
+            )
+        elif method == "encode":
+            if isinstance(module, TextEncoder):
+                operations.add(PipelineStage.TEXT_ENCODING)
+            elif isinstance(module, PatchEncoder):
+                operations.add(PipelineStage.VISION_ENCODING)
+            elif isinstance(module, PatchAutoencoder):
+                operations.add(PipelineStage.LATENT_ENCODING)
+            elif isinstance(module, Encoder):
+                operations.add(PipelineStage.LATENT_PREPARATION)
+        elif method == "decode":
+            if isinstance(module, ImageDecoder):
+                operations.add(PipelineStage.IMAGE_DECODING)
+            elif isinstance(module, VideoDecoder):
+                operations.add(PipelineStage.VIDEO_DECODING)
+            elif isinstance(module, AudioDecoder):
+                operations.add(PipelineStage.AUDIO_DECODING)
     return frozenset(operations)
 
 
-def media_components(model: Model) -> dict[PipelineStage, str]:
-    """Attach media execution to the catalog's existing logical entry names."""
+def describe_components(
+    model: nn.Module,
+    *,
+    entries: Mapping[str, tuple[EntryPoint, ...]] | None = None,
+    paths: Mapping[str, str] | None = None,
+) -> dict[str, tuple[Call, ...]]:
+    """Bind exported methods to their explicitly declared component owner.
 
-    from uniserve_models.catalog import entry_paths
+    EntryPoint methods are relative to the component path, including nested
+    methods such as ``conditioner.encode``. IPC names select one exported
+    method and thereby name its whole component. Numerical sharing does not
+    imply placement ownership.
+    """
 
-    calls = model.component_calls(model.config)
-    if not any(call.method == "postprocess_video" for call in calls):
+    if entries is None or paths is None:
+        package = import_module(type(model).__module__)
+        entries = package.entry_points(model.config) if entries is None else entries
+        paths = package.entry_paths if paths is None else paths
+    owners: dict[tuple[str, str], str] = {}
+    calls: dict[str, list[Call]] = {path: [] for path in entries}
+    for component, points in entries.items():
+        for point in points:
+            nested, _, method = point.method.rpartition(".")
+            path = ".".join(part for part in (component, nested) if part)
+            key = (path, method)
+            if key in owners:
+                raise unsupported_setup(f"model repeats numerical method {key}")
+            owners[key] = component
+            try:
+                module = model.get_submodule(path)
+            except AttributeError as error:
+                raise unsupported_setup(f"entry module {path!r} does not exist") from error
+            if module is None:
+                # The full declaration remains available on ranks where a
+                # first/last-stage submodule has no resident numerical state.
+                parent_path = path
+                while parent_path:
+                    parent_path = parent_path.rpartition(".")[0]
+                    parent = model.get_submodule(parent_path)
+                    mesh = getattr(parent, "mesh", None)
+                    if isinstance(mesh, DeviceMesh):
+                        pipeline = mesh.get_group("pp" if "pp" in mesh.axes else ())
+                        if (point.stage == "first" and pipeline.rank != 0) or (
+                            point.stage == "last" and pipeline.rank != pipeline.size - 1
+                        ):
+                            break
+                        raise unsupported_setup(f"participating component {path!r} was removed")
+                else:
+                    raise unsupported_setup(f"component {path!r} has no numerical module")
+                continue
+            if not callable(getattr(module, method, None)):
+                raise unsupported_setup(f"component {path!r} has no callable {method!r}")
+            call = Call(path, module, replace(point, method=method))
+            if not call_operations((call,)) and not (
+                isinstance(module, CausalLM) and method in {"embed_input_ids", "compute_logits"}
+            ):
+                raise unsupported_setup(f"worker cannot execute capability {path}.{method}")
+            calls[component].append(call)
+
+    anchors = {}
+    for name, path in paths.items():
+        owner, _, method = path.rpartition(".")
+        key = (owner, method)
+        if key not in owners:
+            raise unsupported_setup(f"IPC entry {name!r} references undeclared method {path!r}")
+        component = owners[key]
+        if component in anchors:
+            raise unsupported_setup(f"component {component!r} belongs to multiple IPC entries")
+        anchors[component] = name
+    missing = entries.keys() - anchors.keys()
+    if missing:
+        raise unsupported_setup(f"components {sorted(missing)} require an explicit IPC entry")
+    return {name: tuple(calls[component]) for component, name in anchors.items()}
+
+
+def supported_operations(model: nn.Module) -> frozenset[Computation]:
+    calls = tuple(call for calls in describe_components(model).values() for call in calls)
+    operations = {TransferMode.TENSOR, *call_operations(calls)}
+    if any(isinstance(call.module, CausalLM) for call in calls):
+        operations.update((TransferMode.KV_PUBLISH, TransferMode.KV_INSTALL))
+    return frozenset(operations)
+
+
+def media_components(model: nn.Module) -> dict[PipelineStage, str]:
+    """Resolve the media pipeline's component routing from its capabilities."""
+
+    components = describe_components(model)
+    if not any(
+        isinstance(call.module, VideoPostprocessor)
+        for calls in components.values()
+        for call in calls
+    ):
         return {}
-    entries = {path: name for name, path in entry_paths(type(model), model.config).items()}
-    required = {
-        "encode:text",
-        "encode:conditioning",
-        "forward_diffusion",
-        "decode:video",
-        "decode:audio",
-        "postprocess_video",
+    stages = {
+        PipelineStage.TEXT_ENCODING,
+        PipelineStage.LATENT_PREPARATION,
+        PipelineStage.DENOISING,
+        PipelineStage.VIDEO_DECODING,
+        PipelineStage.AUDIO_DECODING,
+        PipelineStage.VIDEO_ENCODING,
+        PipelineStage.AUDIO_ENCODING,
+        PipelineStage.MUXING,
     }
-    roles = {}
-    for call in calls:
-        if call.method not in required:
-            continue
-        if call.method in roles:
-            raise unsupported_setup(f"video pipeline repeats {call.method} computation")
-        roles[call.method] = entries[call.component]
-    if roles.keys() != required:
-        raise unsupported_setup(
-            f"video pipeline is missing numerical calls {sorted(required - roles.keys())}"
-        )
-    if roles["encode:conditioning"] != roles["forward_diffusion"]:
-        raise unsupported_setup("latent preparation requires the denoiser's conditioning component")
-    output = roles["postprocess_video"]
-    return {
-        PipelineStage.TEXT_ENCODING: roles["encode:text"],
-        PipelineStage.LATENT_PREPARATION: roles["forward_diffusion"],
-        PipelineStage.DENOISING: roles["forward_diffusion"],
-        PipelineStage.VIDEO_DECODING: roles["decode:video"],
-        PipelineStage.AUDIO_DECODING: roles["decode:audio"],
-        PipelineStage.VIDEO_ENCODING: output,
-        PipelineStage.AUDIO_ENCODING: output,
-        PipelineStage.MUXING: output,
-    }
+    routes = {}
+    for name, calls in components.items():
+        for stage in call_operations(calls) & stages:
+            if stage in routes:
+                raise unsupported_setup(f"media pipeline repeats {stage.value} computation")
+            routes[stage] = name
+    if stages - routes.keys():
+        raise unsupported_setup("media pipeline lacks required numerical capabilities")
+    if routes[PipelineStage.LATENT_PREPARATION] != routes[PipelineStage.DENOISING]:
+        raise unsupported_setup("latent preparation must participate in the denoiser entry")
+    return routes
 
 
 def validate_components(
-    model_class: type[Model],
-    config: Any,
+    model: nn.Module,
     components: Mapping[str, ComponentConfig],
     *,
+    entries: Mapping[str, tuple[EntryPoint, ...]] | None = None,
     paths: Mapping[str, str] | None = None,
-) -> dict[str, tuple[ComponentCall, ...]]:
-    """Validate placement against complete method/stage participation records.
+) -> dict[str, tuple[Call, ...]]:
+    """Validate physical placement before loading weights or creating groups."""
 
-    Actual module methods are resolved after construction, before loading or
-    execution. An outer model's mixins do not determine a child capability.
-    """
-
-    from uniserve_models.catalog import entry_paths
-
-    paths = entry_paths(model_class, config) if paths is None else paths
-    calls = model_class.component_calls(config)
-    declared = {}
-    for call in calls:
-        key = (call.component, call.method)
-        if key in declared:
-            raise unsupported_setup(f"model repeats numerical method {key}")
-        if call.method not in _CALL_OPERATIONS:
-            raise unsupported_setup(f"worker does not execute numerical method {call.method!r}")
-        declared[key] = call
-    unknown = components.keys() - paths.keys()
+    declared = describe_components(model, entries=entries, paths=paths)
+    unknown = components.keys() - declared.keys()
     if unknown:
         raise unsupported_setup(f"unknown computation entries {sorted(unknown)}")
-    by_entry = {
-        name: tuple(call for call in calls if call.component == path)
-        for name, path in paths.items()
-    }
     for name, component in components.items():
-        methods = {call.method for call in by_entry[name]}
-        if not methods:
+        calls = declared[name]
+        if not calls:
             raise unsupported_setup(f"entry {name!r} has no numerical methods")
-        if "decode:video" in methods:
+        if any(isinstance(call.module, VideoDecoder) for call in calls):
             if component.distribution != "temporal_units" or component.units_per_rank != 1:
                 raise unsupported_setup(
-                    "video decoder execution requires temporal_units with one native unit per rank"
+                    "video decoding requires temporal_units with one native unit per rank"
                 )
         elif component.distribution is not None:
             raise unsupported_setup(f"entry {name!r} requires model-parallel membership")
-    return by_entry
+    return declared
 
 
-def bind_components(model: Model, bindings, *, paths: Mapping[str, str] | None = None) -> None:
-    """Bind actual callables and groups once, resolving stage participation here."""
+def bind_components(
+    model: nn.Module,
+    bindings: Mapping[str, ModelEntry],
+    *,
+    entries: Mapping[str, tuple[EntryPoint, ...]] | None = None,
+    paths: Mapping[str, str] | None = None,
+) -> None:
+    """Borrow methods and communicator views for each local participating stage."""
 
-    from functools import partial
-
-    from uniserve_models.catalog import entry_paths
-
-    paths = entry_paths(type(model), model.config) if paths is None else paths
-    calls = model.component_calls(model.config)
+    declared = validate_components(
+        model,
+        {name: binding.config for name, binding in bindings.items()},
+        entries=entries,
+        paths=paths,
+    )
     for name, binding in bindings.items():
-        if name not in paths:
-            continue
-        binding.component = paths[name]
-        binding.methods.clear()
+        binding.calls = ()
         if not binding.owns or binding.mesh is None:
             continue
-        owner = model.get_submodule(binding.component)
-        stage, stages = binding.mesh.coord("pp"), binding.mesh.size("pp")
-        for call in calls:
-            if call.component != binding.component:
+        mesh = binding.mesh
+        pipeline = mesh.get_group("pp")
+        calls = []
+        for call in declared[name]:
+            stage = call.entry.stage
+            if stage == "first" and pipeline.rank != 0:
                 continue
-            if call.stage == "first" and stage != 0 or call.stage == "last" and stage != stages - 1:
+            if stage == "last" and pipeline.rank != pipeline.size - 1:
                 continue
-            method, _, kind = call.method.partition(":")
-            forward = getattr(owner, method, None)
-            if not callable(forward):
-                raise unsupported_setup(f"component {call.component!r} has no callable {method!r}")
-            if method == "encode":
-                if not isinstance(owner, EncoderMixin) or kind not in owner.encoder_kinds:
-                    raise unsupported_setup(f"component {call.component!r} does not encode {kind}")
-                forward = partial(forward, kind)
-            elif method == "decode" and kind == "image":
-                if not isinstance(owner, DecoderMixin) or kind not in owner.decoder_kinds:
-                    raise unsupported_setup(f"component {call.component!r} does not decode {kind}")
-                forward = partial(forward, kind)
-            groups = tuple(
-                binding.mesh.get_group(axis) for axis in call.groups if binding.mesh.size(axis) > 1
-            )
-            binding.methods[call.method] = (forward, groups)
+            groups = {}
+            for role in call.entry.groups:
+                axes = (
+                    tuple(
+                        axis
+                        for axis in mesh.axes
+                        if axis.startswith("cp") or (role == "sp" and axis == "ulysses")
+                    )
+                    if role in {"cp", "sp"}
+                    else (role,)
+                )
+                group = mesh.get_group(axes)
+                if group.size > 1:
+                    groups[group.ranks] = group
+            calls.append(replace(call, groups=tuple(groups.values())))
+        binding.calls = tuple(calls)
+        binding.computations = tuple(call_operations(calls))

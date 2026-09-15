@@ -1,4 +1,4 @@
-"""Derive row-aligned forward tensors from scheduler tables."""
+"""Construct explicit attention inputs from scheduler-assigned page tables."""
 
 from __future__ import annotations
 
@@ -6,13 +6,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.attention.inputs import physical_columns
-from uniserve.attention.metadata import AttentionMetadata, AttentionMode
-from uniserve.attention.selection import AttentionSelection
 from uniserve.math import bucketed_length
-from uniserve.runtime.kv_cache import KVCacheConfig
+from uniserve.nn.attention import BlockTable, PagedInput, SegmentedInput, SequenceLengths
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.protocol.batch import ForwardMode
 
 from .rows import ForwardRow
 
@@ -58,82 +54,49 @@ def cache_pages(
     return pages, width
 
 
-def columns(
-    tasks: tuple[ForwardRow, ...],
-    *,
-    tables: BlockTables | None,
-    cache: CacheManager | None,
-    packed: bool,
-) -> AttentionMetadata:
-    """Build packed attention mode, sequence, cache, position, and route tensors for forward rows."""
+def from_blocks(*, pages, query_lengths, prefix_lengths, block_size, causal, write):
+    """Build ordinary paged appends or a read-only prefix/current attention call."""
 
-    pages, width = cache_pages(tasks, tables=tables, cache=cache)
-    assert cache is not None
-    query_lens = tuple(task.query_tokens for task in tasks)
-    prefix_lens = tuple(task.seq_len for task in tasks)
-    causal_rows = tuple(task.causal for task in tasks)
-    pure_decode = all(
-        task.forward_mode is ForwardMode.DECODE
-        and task.token_ids is not None
-        and task.query_tokens == 1
-        for task in tasks
-    )
-    try:
-        return physical_columns(
-            pages=pages,
-            prefix_lens=prefix_lens,
-            query_lens=query_lens,
-            causal_rows=causal_rows,
-            write_rows=tuple(task.write_kv for task in tasks),
-            positions=tuple(
-                task.attention_indexes
-                if task.attention_indexes is not None
-                else _three_axis_positions(task.positions, task.query_tokens)
-                for task in tasks
-            ),
-            token_rows=tuple(task.token_ids is not None for task in tasks),
-            text_local_indices=tuple(task.text_local_indices for task in tasks),
-            width=width,
-            block_size=cache.cache.page_size,
-            packed=packed,
-            decode=pure_decode,
+    if any(write):
+        result = PagedInput.from_blocks(
+            blocks=tuple(tuple(row) for row in pages),
+            query_lengths=query_lengths,
+            prefix_lengths=prefix_lengths,
+            block_size=block_size,
+            causal=causal,
+            device="cpu",
         )
-    except ValueError as error:
-        raise invalid_descriptor(str(error)) from error
+        if not all(write):
+            offset = 0
+            for length, enabled in zip(query_lengths, write, strict=True):
+                if not enabled:
+                    result.write_indices[offset : offset + length].fill_(-1)
+                offset += length
+        return result
+    queries = SequenceLengths.from_lengths(query_lengths, device="cpu")
+    prefixes = SequenceLengths.from_lengths(prefix_lengths, device="cpu")
+    table = torch.zeros((len(pages), max(1, max(map(len, pages)))), dtype=torch.int32)
+    for index, row in enumerate(pages):
+        table[index, : len(row)] = torch.tensor(row, dtype=torch.int32)
+    if any(causal):
+        raise ValueError("read-only prefix/current calls require noncausal current sequences")
+    return SegmentedInput(
+        queries,
+        prefixes,
+        BlockTable(table, block_size),
+        None,
+        queries.values[:, None].expand(-1, queries.maximum),
+        True,
+    )
 
 
-def _three_axis_positions(positions: torch.Tensor | None, query: int) -> torch.Tensor:
-    """Validate and normalize optional positions to three axes by query row."""
-
-    if positions is None:
-        return torch.zeros((3, query), dtype=torch.long)
-    if positions.ndim == 1 and int(positions.numel()) == query:
-        return torch.stack((positions, torch.zeros_like(positions), torch.zeros_like(positions)))
-    if positions.ndim == 2 and tuple(positions.shape) == (3, query):
-        return positions
-    raise invalid_descriptor("row positions cannot be lowered to three-axis attention indexes")
-
-
-__all__ = ["columns"]
-
-
-def supports_flow_attention(
-    selection: AttentionSelection,
-    geometry: KVCacheConfig,
-    pool: CacheManager,
-    device: torch.device,
-) -> bool:
-    """Return whether the selected backend can execute the model's flow-attention geometry."""
-
-    if pool.cache.is_quantized:
-        return False
-    head_dim = int(geometry.head_dim)
-    for provider in selection.providers:
-        if provider.can_bind(
-            AttentionMode.PACKED,
-            head_dim=head_dim,
-            block_size=pool.cache.page_size,
-            device=device,
-        ):
-            return True
-    return False
+def columns(tasks, *, tables, cache):
+    pages, _width = cache_pages(tasks, tables=tables, cache=cache)
+    return from_blocks(
+        pages=pages,
+        query_lengths=tuple(task.query_tokens for task in tasks),
+        prefix_lengths=tuple(task.seq_len for task in tasks),
+        block_size=cache.info.block_size,
+        causal=tuple(task.causal for task in tasks),
+        write=tuple(task.write_kv for task in tasks),
+    )

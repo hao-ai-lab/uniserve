@@ -1,74 +1,77 @@
-"""Iterative layer pipelines preserve row ownership and independent request state."""
-
-from pathlib import Path
+"""Pipeline decoder calls preserve nonlinear recurrence and independent inputs."""
 
 import pytest
 import torch
 import torch.multiprocessing as mp
+from torch import nn
 
-from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
-from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
-from uniserve.nn.parallel_pipeline import LayerPipeline
+from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.model import TransformerDecoder
+from uniserve.nn.attention import AttentionParallelConfig, SequenceLengths, Ulysses, VarlenInput
+from uniserve.runtime import initialize_process_groups
 
 pytestmark = pytest.mark.integration
 
 
-def _run_pipeline(rank: int, rendezvous: str, stages: int) -> None:
-    environment = initialize_process_groups(
-        rank=rank,
-        local_rank=rank,
-        world_size=4,
-        device=torch.device("cpu"),
-        backend="gloo",
-        init_method=rendezvous,
-    )
-    mesh = initialize_model_parallel(
-        environment,
-        {
-            "denoiser": (
-                (3, 2, 1, 0),
-                ParallelConfig(
-                    pipeline_parallel_size=stages,
-                    sequence_parallel=SequenceParallel("ulysses", (4 // stages,)),
-                ),
-            )
-        },
-    )["denoiser"]
-    pipeline = LayerPipeline(mesh.get_group("pp"), 7)
-    torch.manual_seed(191)
-    # Seven unequal nonlinear layers expose missing/repeated layer ranges.
-    weights = torch.randn(7, 8, 8, dtype=torch.float64) / 8
-    initial = torch.randn(2, 16, 8, dtype=torch.float64)
-    local_rows = 16 // mesh.size("sp")
-    offset = mesh.coord("sp") * local_rows
-    states = initial[:, offset : offset + local_rows].clone()
-    hidden = torch.empty_like(states[0])
-    for step in range(4):
-        # Two interleaved requests share stage scratch and keep separate latents.
-        for request in range(2):
-            if pipeline.first:
-                hidden.copy_(states[request])
-            pipeline.receive_activation(hidden)
-            for layer in pipeline.layers:
-                hidden = torch.tanh(hidden @ weights[layer] + layer / 16)
-            pipeline.send_activation(hidden)
-            if pipeline.last:
-                states[request].add_(hidden, alpha=(step + 1) / 64)
-            pipeline.feedback((states[request],))
+class NonlinearLayer(nn.Module):
+    def __init__(self, weight, offset):
+        super().__init__()
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.offset = offset
 
-    reference = initial.clone()
-    for step in range(4):
-        value = reference.clone()
-        for layer in range(7):
-            value = torch.tanh(value @ weights[layer] + layer / 16)
-        reference.add_(value, alpha=(step + 1) / 64)
-    if pipeline.first or pipeline.last:
-        torch.testing.assert_close(
-            states, reference[:, offset : offset + local_rows], rtol=0, atol=0
+    def forward(self, hidden, residual, positions, attention):
+        hidden = hidden if residual is None else hidden + residual
+        value = torch.tanh(hidden @ self.weight + self.offset)
+        return value, torch.zeros_like(value)
+
+
+@torch.inference_mode()
+def _run(rank, rendezvous, stages):
+    with initialize_process_groups(
+        rank=rank, local_rank=rank, world_size=4, device="cpu", init_method=rendezvous
+    ) as owner:
+        mesh = owner.bind(
+            DeviceMesh(
+                ranks=(3, 2, 1, 0), shape=(stages, 4 // stages), axes=("pp", "tokens"), rank=rank
+            ),
+            device="cpu",
         )
-    environment.close()
+        generator = torch.Generator().manual_seed(191)
+        weights = torch.randn(7, 8, 8, dtype=torch.float64, generator=generator) / 8
+        initial = torch.randn(2, 16, 8, dtype=torch.float64, generator=generator)
+        model = TransformerDecoder(
+            nn.Embedding(32, 8, dtype=torch.float64),
+            nn.ModuleDict(
+                {
+                    str(index): NonlinearLayer(weight, index / 16)
+                    for index, weight in enumerate(weights)
+                }
+            ),
+            nn.Identity(),
+        )
+        parallelize_(model, mesh, attention=AttentionParallelConfig(heads=Ulysses("tokens")))
+        pipeline = mesh.get_group("pp")
+        lengths = SequenceLengths.from_lengths((16,), device="cpu")
+        attention = VarlenInput(lengths, lengths, (False,))
+        positions = torch.arange(16)
+        states = initial.clone()
+        for step in range(4):
+            for request in range(2):
+                value = model(states[request] if pipeline.rank == 0 else None, positions, attention)
+                if pipeline.rank + 1 == pipeline.size:
+                    states[request].add_(value, alpha=(step + 1) / 64)
+                # Solver feedback is ordinary numerical communication; each
+                # trajectory retains its own state outside the shared module.
+                pipeline.broadcast(states[request], src=pipeline.size - 1, out=states[request])
+        reference = initial.clone()
+        for step in range(4):
+            value = reference.clone()
+            for index, weight in enumerate(weights):
+                value = torch.tanh(value @ weight + index / 16)
+            reference.add_(value, alpha=(step + 1) / 64)
+        torch.testing.assert_close(states, reference, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("stages", [2, 4])
-def test_layer_pipeline_recurrence_preserves_interleaved_requests(tmp_path: Path, stages: int):
-    mp.spawn(_run_pipeline, ((tmp_path / "rendezvous").as_uri(), stages), nprocs=4, join=True)
+@pytest.mark.parametrize("stages", (2, 4))
+def test_pipeline_recurrence_preserves_independent_trajectories(tmp_path, stages):
+    mp.spawn(_run, args=((tmp_path / "pipeline").as_uri(), stages), nprocs=4, join=True)

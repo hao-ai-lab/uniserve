@@ -1,89 +1,119 @@
-"""Checkpoint loading distinguishes nonresident weights from invalid records."""
+"""Public loading accepts nonresident source records and rejects unknown names."""
 
 import pytest
 import torch
+from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+from safetensors.torch import save_file
 
-from tests.python.fixtures.model_execution import model_arguments
-from uniserve.distributed.mesh import Communicator
-from uniserve.loading.handles import TensorWeightHandle
-from uniserve.model.limits import ModelLimits
-from uniserve.nn.decoder.mot import MoTConfig
-from uniserve.nn.layer import LayerConfig
-from uniserve_models.bagel import BagelConfig, BagelForConditionalGeneration
-from uniserve_models.minimax_h3.config import H3Config
+from tests.python.integration.model_loading.test_bagel import _checkpoint as bagel_checkpoint
+from uniserve import loading
+from uniserve.distributed import DeviceMesh
+from uniserve.loading import checkpoint, weights
+from uniserve_models import bagel
+from uniserve_models.minimax_h3 import DiffusionConfig, Transformer, TransformerConfig
+from uniserve_models.minimax_h3.config import TRANSFORMER_FIELDS
+from uniserve_models.minimax_h3.weights import transformer_component
+
+pytestmark = pytest.mark.unit
 
 
-@pytest.mark.parametrize(
-    ("rank", "nonresident"),
-    [
-        (0, "language_model.model.layers.2.input_layernorm.weight"),
-        (1, "language_model.model.embed_tokens.weight"),
-    ],
-)
-def test_bagel_loading_reports_unknown_records_on_each_pipeline_stage(rank, nonresident):
-    with torch.device("meta"):
-        model = BagelForConditionalGeneration(
-            BagelConfig(text=MoTConfig(num_hidden_layers=3)),
-            **model_arguments(
-                LayerConfig(Communicator(), None, pipeline=Communicator(ranks=(0, 1), rank=rank))
-            ),
-        )
-    unknown = ("language_model.model.layers.2.unknown.weight", "unknown.weight")
-
-    report = model.load_weights(
-        tuple(TensorWeightHandle(name, torch.zeros(1)) for name in (nonresident, *unknown))
-    )
-
-    assert report.skipped == [nonresident]
-    assert report.unexpected == list(unknown)
+def _pipeline(rank):
+    return DeviceMesh(ranks=(0, 1), rank=rank, shape=(2, 1), axes=("pp", "tp"))
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_h3_checkpoint_reports_reject_unknown_records_on_each_pipeline_stage(rank):
-    from tests.python.fixtures.model_execution import h3_arguments
-    from uniserve.distributed.mesh import DeviceMesh
-    from uniserve.distributed.parallel import ParallelConfig
-    from uniserve_models.catalog import MINIMAX_H3_ENTRY
-    from uniserve_models.minimax_h3.model import MiniMaxH3Model
+def test_bagel_loading_rejects_unknown_records_on_each_pipeline_stage(tmp_path, rank):
+    _, state, config = bagel_checkpoint(tmp_path)
 
-    parallel = ParallelConfig(pipeline_parallel_size=2)
-    denoiser = DeviceMesh(
-        (0, 1),
-        rank,
-        parallel,
-        groups={"pp": Communicator(ranks=(0, 1), rank=rank, name="pp")},
-    )
-    local = DeviceMesh((rank,), rank, ParallelConfig(), groups={})
-    arguments = h3_arguments(
-        parallel={"denoiser": parallel},
-        meshes={"denoiser": denoiser, "text_encoder": local, "video_decoder": local},
-        limits=ModelLimits(text_tokens=64, video_frames=22),
-        precisions=MINIMAX_H3_ENTRY.component_precisions({"mode": "quality"}),
-    )
-    with torch.device("meta"):
-        model = MiniMaxH3Model(H3Config(), **arguments)
-    unknown = {
-        "denoiser": (
-            "time_embedder.unknown.weight",
-            "transformer_blocks.50.attn.to_q.weight",
-            "transformer_blocks.0.adaln_proj.unknown.weight",
-            "token_refiner.unknown.weight",
-        ),
-        "text_encoder": (
-            "model.visual.blocks.27.attn.qkv.weight",
-            "model.language_model.layers.64.self_attn.q_proj.weight",
-            "model.visual.unknown.weight",
-        ),
-        "video_decoder": (
-            "encoder.unknown.weight",
-            "quant_conv.unknown",
-            "decoder.unknown.weight",
-        ),
-    }
-    for component in model.checkpoint_components():
-        assert component.map_weights is not None
-        names = unknown[component.source]
-        report = component.map_weights(
-            tuple(TensorWeightHandle(name, torch.zeros(1)) for name in names)
+    def load():
+        return loading.load_model(
+            bagel.Model,
+            config,
+            checkpoint=(
+                checkpoint.Config("primary", filenames=("ema.safetensors",)).resolve(
+                    tmp_path, io=loading.Config()
+                ),
+            ),
+            mapping=bagel.checkpoint_mappings,
+            device="cpu",
+            modules=frozenset(("text", "denoiser")),
+            meshes={"text": _pipeline(rank), "denoiser": _pipeline(rank)},
         )
-        assert report.unexpected == list(names)
+
+    loaded = load()
+    skipped = {name for report in loaded.reports for name in report.skipped}
+    nonresident = (
+        "language_model.model.layers.1.input_layernorm.weight"
+        if rank == 0
+        else "language_model.model.embed_tokens.weight"
+    )
+    assert nonresident in skipped
+    state.update(
+        {
+            "language_model.model.layers.1.unknown.weight": torch.zeros(1),
+            "unknown.weight": torch.zeros(1),
+        }
+    )
+    save_file(state, tmp_path / "ema.safetensors")
+    with pytest.raises(
+        RuntimeError,
+        match="unexpected=.*language_model.model.layers.1.unknown.weight.*unknown.weight",
+    ):
+        load()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_h3_loading_rejects_unknown_records_on_each_pipeline_stage(tmp_path, rank):
+    config = TransformerConfig(
+        hidden_size=32,
+        num_attention_heads=2,
+        num_hidden_layers=2,
+        num_refiner_layers=1,
+        intermediate_size=64,
+        text_dim=24,
+        frequency_dim=16,
+        time_hidden_dim=32,
+        time_dim=16,
+        rope_frequency_dim=4,
+    )
+    native = MiniMaxH3Transformer3DModel(
+        **{source: getattr(config, target) for source, target in TRANSFORMER_FIELDS.items()},
+        patch_size=(1, 2, 2),
+        final_norm_eps=config.norm_eps,
+    )
+    source = native.state_dict()
+    for index in range(config.num_hidden_layers):
+        source[f"transformer_blocks.{index}.attn.to_gate_compress.weight"] = torch.zeros(
+            config.num_attention_heads * config.head_dim, config.hidden_size
+        )
+    save_file(source, tmp_path / "model.safetensors")
+
+    def load():
+        return loading.load_model(
+            Transformer,
+            config,
+            checkpoint=(checkpoint.Config("denoiser").resolve(tmp_path, io=loading.Config()),),
+            mapping=lambda model: (transformer_component(model, DiffusionConfig()),),
+            device="cpu",
+            meshes={"": _pipeline(rank)},
+            weights=weights.Config(),
+        )
+
+    loaded = load()
+    skipped = {name for report in loaded.reports for name in report.skipped}
+    assert f"transformer_blocks.{1 - rank}.attn.to_q.weight" in skipped
+    unknown = (
+        "time_embedder.unknown.weight",
+        "transformer_blocks.50.attn.to_q.weight",
+        "transformer_blocks.0.adaln_proj.unknown.weight",
+        "token_refiner.unknown.weight",
+    )
+    source.update(dict.fromkeys(unknown, torch.zeros(1)))
+    # safetensors requires independently owned values for distinct records.
+    save_file(
+        {name: value.clone() for name, value in source.items()}, tmp_path / "model.safetensors"
+    )
+    with pytest.raises(RuntimeError) as raised:
+        load()
+    assert "unexpected=" in str(raised.value)
+    assert all(name in str(raised.value) for name in unknown)

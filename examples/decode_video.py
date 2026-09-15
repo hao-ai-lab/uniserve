@@ -7,35 +7,21 @@ from pathlib import Path
 
 import torch
 
-from uniserve.attention import FlashInferTuningConfig, resolve_attention_selection
-from uniserve.distributed.parallel import ParallelConfig
-from uniserve.distributed.process_groups import (
-    ProcessGroups,
-    initialize_model_parallel,
-    initialize_process_groups,
-)
-from uniserve.loading import load_model
-from uniserve.model.limits import ModelLimits
-from uniserve.model.media import VideoSize
-from uniserve.nn.attention import bind_dense_attention_modules
-from uniserve.nn.layer import LayerConfig
-from uniserve.runtime.tensor_buffers import TensorBuffers
-from uniserve.runtime.tensors import bind_scratch, bind_state, merge_buffers, prepare_constants
-from uniserve_models import resolve_model
-from uniserve_models.minimax_h3 import MiniMaxH3Model
+from uniserve.model import VideoDecoder, VideoPostprocessor
+from uniserve.runtime import ExecutionContext, TensorBuffers
+from uniserve_models.loading import load_model, read_config
 
 
 @torch.inference_mode()
 def decode_video(
     checkpoint: str, latents: torch.Tensor, *, frames: int, device: str = "cuda:0"
 ) -> torch.Tensor:
-    """Return CPU uint8 [frames, 768, 1344, 3] RGB pixels from H3 video rows.
+    """Return CPU uint8 [frames, 768, 1344, 3] pixels from complete H3 video rows.
 
-    Input is the complete, final FP32 video modality in H3 packed row order,
-    shape [((frames - 5) // 17 * 5 + 2) * 24 * 42, 96]. It can reside on CPU
-    or CUDA. All sequence shards must be joined in logical order beforehand.
-    The checkpoint must be the supported full FastH3 VSA checkpoint. Legal
-    frame counts are at least 22 and have the form 17 * n + 5.
+    Input is the final FP32 video modality in tile-major canonical order, with
+    shape [((frames - 5) // 17 * 5 + 2) * 24 * 42, 96]. Sequence shards must
+    already be joined in logical order. Frames have the form 17 * n + 5, n >= 1.
+    Only the video decoder and postprocessor checkpoint modules are loaded.
     """
 
     if frames < 22 or frames % 17 != 5:
@@ -43,99 +29,46 @@ def decode_video(
     expected = (((frames - 5) // 17 * 5 + 2) * 24 * 42, 96)
     if latents.dtype != torch.float32 or tuple(latents.shape) != expected:
         raise ValueError(f"H3 video latents must be float32 with shape {expected}")
-    with initialize_process_groups(rank=0, local_rank=0, world_size=1, device=device) as groups:
-        # All numerical views and native graph outputs leave scope before the
-        # process-group owner closes. Only the independent CPU pixels escape.
-        return _decode(groups, checkpoint, latents, frames)
-
-
-def _decode(
-    groups: ProcessGroups, checkpoint: str, latents: torch.Tensor, frames: int
-) -> torch.Tensor:
-    device = groups.local_device
-    parallel = {"video_decoder": ParallelConfig(), "video_output": ParallelConfig()}
-    meshes = initialize_model_parallel(
-        groups, {name: ((0,), value) for name, value in parallel.items()}
-    )
-    source = resolve_model(
-        checkpoint, components=frozenset(parallel), quantization={"mode": "quality"}
-    )
-    layers = source.configure_layers(
-        {name: LayerConfig(mesh.get_group("tp"), None) for name, mesh in meshes.items()}
-    )
-    loaded = load_model(
-        source.model_class,
-        source.config,
-        sources=source.weights,
-        device=device,
-        dtype=torch.bfloat16,
-        parallel=parallel,
-        meshes=meshes,
-        layers=layers,
-        limits=ModelLimits(text_tokens=64, video_frames=frames),
-    )
-    model = loaded.model
-    if not isinstance(model, MiniMaxH3Model):
-        raise TypeError("this example decodes the FastH3 video layout")
-    bind_dense_attention_modules(
-        model, resolve_attention_selection("auto", tuning=FlashInferTuningConfig(), block_size=256)
-    )
-    shape = VideoSize(frames)
-    backing = TensorBuffers.allocate(model.video_output.state_buffers(shape), device)
-    scratch = TensorBuffers.allocate(
-        merge_buffers(
-            (
-                model.video_decoder.workspace_buffers(shape),
-                model.video_output.workspace_buffers(shape),
-            )
-        ),
-        device,
-    )
-    try:
-        decoder_constants = prepare_constants(
-            model.video_decoder, VideoSize(shape.frames), device=device
-        )
-        decoder_scratch = bind_scratch(
-            model.video_decoder.workspace_buffers(VideoSize(shape.frames)), scratch
-        )
-        pixel_constants = prepare_constants(
-            model.video_output, VideoSize(shape.frames), device=device
-        )
-        pixel_state = bind_state(model.video_output.state_buffers(VideoSize(shape.frames)), backing)
-        pixel_scratch = bind_scratch(
-            model.video_output.workspace_buffers(VideoSize(shape.frames)), scratch
-        )
+    config = read_config(checkpoint, modules=frozenset({"video_decoder", "video_postprocessor"}))
+    model = load_model(config, device=device, precision="quality").model
+    decoder, postprocessor = model.video_decoder, model.video_postprocessor
+    if not isinstance(decoder, VideoDecoder) or not isinstance(postprocessor, VideoPostprocessor):
+        raise TypeError("video reconstruction requires decoder and postprocessor capabilities")
+    requirements = postprocessor.state_buffers(frames)
+    with (
+        ExecutionContext(decoder) as decoding,
+        ExecutionContext(postprocessor) as pixels,
+        TensorBuffers.allocate(requirements, device=device) as backing,
+    ):
+        decoding.prepare(frames)
+        pixels.prepare(frames)
+        state = backing.view(requirements)
         source = latents.to(device)
-        pixels = []
-        for window in model.decode_windows(model.video_info(frames)):
-            decoded = model.video_decoder.decode(
-                (source,),
-                shape,
-                (window,),
-                constants=decoder_constants,
-                scratch=decoder_scratch,
-            ).values["video"][0]
-            if decoded is None:
-                raise RuntimeError("local video decoder did not produce a tensor")
-            # The numerical decoder already applies its native temporal crop.
-            # Remove only the leading result-unit dimension for postprocessing.
-            segment = decoded[0]
-            output = model.postprocess_video(
-                (segment,),
-                (window,),
-                state=pixel_state,
-                constants=pixel_constants,
-                scratch=pixel_scratch,
-            ).values["video"][0]
-            if output is None:
-                raise RuntimeError("local video postprocessing did not produce pixels")
-            # The next call reuses RGB scratch. A blocking CPU copy completes
-            # its reader and preserves this window independently of that reuse.
-            pixels.append(output.cpu())
-        return torch.cat(pixels)
-    finally:
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+        outputs = []
+        for interval in decoder.frame_slices(frames):
+            with decoding.activate():
+                decoded = decoder.decode(
+                    (source,),
+                    frames=(interval,),
+                    num_frames=(frames,),
+                    constants=decoding.constants,
+                    workspace=decoding.workspace,
+                )
+            if decoded[0] is None:
+                raise RuntimeError("local video reconstruction returned no tensor")
+            with pixels.activate():
+                output = postprocessor(
+                    decoded,
+                    frames=(interval,),
+                    num_frames=(frames,),
+                    state=state,
+                    constants=pixels.constants,
+                    workspace=pixels.workspace,
+                )[0]
+            # Each invocation borrows RGB workspace. Complete an independent
+            # CPU copy before the next window can reuse that backing.
+            outputs.append(output.tensor.to("cpu", copy=True))
+        return torch.cat(outputs)
 
 
 def main() -> None:

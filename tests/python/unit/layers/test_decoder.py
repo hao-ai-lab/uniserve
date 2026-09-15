@@ -6,18 +6,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve.attention.selection import AttentionSelection
-from uniserve.attention.torch_sdpa import TorchSDPAAttentionBackend
-from uniserve.distributed.mesh import Communicator
-from uniserve.nn.attention import bind_dense_attention_modules
-from uniserve.nn.decoder.qwen import Qwen3Config, Qwen3Model
-from uniserve.nn.layer import LayerConfig
+from uniserve.nn.attention import SequenceLengths, VarlenInput
+from uniserve_models.qwen3 import Config, Transformer
+
 
 pytestmark = pytest.mark.unit
 
 
-def _decoder(*, normalize_output: bool) -> Qwen3Model:
-    config = Qwen3Config(
+def _decoder(*, normalize_output: bool) -> Transformer:
+    config = Config(
         vocab_size=32,
         hidden_size=16,
         intermediate_size=32,
@@ -35,14 +32,9 @@ def _decoder(*, normalize_output: bool) -> Qwen3Model:
         num_experts_per_tok=1,
         moe_intermediate_size=32,
     )
-    model = Qwen3Model(
-        config,
-        layer_config=LayerConfig(Communicator(), None),
-        normalize_output=normalize_output,
-    )
-    bind_dense_attention_modules(
-        model, AttentionSelection("torch_sdpa", (TorchSDPAAttentionBackend(),))
-    )
+    model = Transformer(config)
+    if not normalize_output:
+        model.norm = torch.nn.Identity()
     generator = torch.Generator().manual_seed(193)
     with torch.no_grad():
         for parameter in model.parameters():
@@ -53,15 +45,23 @@ def _decoder(*, normalize_output: bool) -> Qwen3Model:
     return model
 
 
+def _forward(model, embeddings, positions):
+    batch, length, width = embeddings.shape
+    lengths = SequenceLengths.from_lengths((length,) * batch, device=embeddings.device)
+    attention = VarlenInput(lengths, lengths, (True,) * batch)
+    result = model(embeddings.reshape(-1, width), positions.expand(batch, -1).flatten(), attention)
+    return result.view(batch, length, width)
+
+
 @pytest.mark.parametrize("normalize_output", [False, True])
 def test_full_sequence_decoder_preserves_causal_prefix_and_batch_independence(normalize_output):
     model = _decoder(normalize_output=normalize_output)
     tokens = torch.tensor([[1, 3, 5, 7, 9, 11], [1, 3, 5, 2, 4, 6]])
     positions = torch.arange(tokens.shape[1]).expand_as(tokens)
     with torch.inference_mode():
-        together = model(model.embed_tokens(tokens), positions=positions)
-        first = model(model.embed_tokens(tokens[:1]), positions=positions[:1])
-        prefix = model(model.embed_tokens(tokens[:1, :3]), positions=positions[:1, :3])
+        together = _forward(model, model.embed_input_ids(tokens), positions)
+        first = _forward(model, model.embed_input_ids(tokens[:1]), positions[:1])
+        prefix = _forward(model, model.embed_input_ids(tokens[:1, :3]), positions[:1, :3])
 
     torch.testing.assert_close(together[0], first[0])
     torch.testing.assert_close(together[0, :3], together[1, :3])
@@ -78,7 +78,7 @@ def test_full_sequence_decoder_returns_requested_residual_stream(normalize_outpu
                 parameter.zero_()
     inputs = torch.arange(1, 49, dtype=torch.float32).reshape(1, 3, 16) / 16
     with torch.inference_mode():
-        actual = model(inputs, positions=torch.arange(3))
+        actual = _forward(model, inputs, torch.arange(3))
     expected = F.rms_norm(inputs, (16,), eps=1e-6) if normalize_output else inputs
     torch.testing.assert_close(actual, expected)
 
@@ -86,17 +86,17 @@ def test_full_sequence_decoder_returns_requested_residual_stream(normalize_outpu
 @pytest.mark.parametrize("factor", [None, 2.0])
 @pytest.mark.parametrize("dim", [16, 32])
 def test_axis_rotary_preserves_full_frequency_range(dim, factor):
-    from uniserve.nn.rope import RopeScaling, get_rope
+    from uniserve.nn.rope import LinearScaling, RotaryEmbedding
 
     theta = 10000.0
-    rotary = get_rope(
+    rotary = RotaryEmbedding(
         dim,
         theta=theta,
         keep_freq_range=True,
-        scaling=None if factor is None else RopeScaling("linear", factor=factor),
+        scaling=None if factor is None else LinearScaling(factor=factor),
     )
     positions = torch.tensor([0, 3, 17, 256])
-    cosine, sine = rotary.cos_sin_1d(positions)
+    cosine, sine = rotary(positions, dtype=torch.float32, sequence_length=257)
     # Keeping alternate frequencies of a doubled-width rotary embedding gives
     # each spatial/temporal axis the full frequency range of its source head.
     frequencies = theta ** (-torch.arange(0, dim, 2, dtype=torch.float32) / dim)

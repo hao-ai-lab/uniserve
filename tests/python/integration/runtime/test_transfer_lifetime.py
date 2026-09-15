@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from tests.python.fixtures.shm_publication import serve_pending_publication
-from uniserve.tensors import TensorRegion
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import (
     BufferAllocation,
@@ -350,18 +349,23 @@ def test_local_read_keeps_its_producer_fence_after_publication_retirement() -> N
 def _serve_unacknowledged_cuda_read(channel, invalid_handle: bool = False) -> None:
     """Serve a real device allocation and reject retirement after the copy finishes."""
 
+    import os
     import socket
     import uuid
 
-    from uniserve_kernel.peer_memory import export_ipc
+    from uniserve_kernel.peer_memory import empty, export_fd
 
     from uniserve_worker.protocol.batch import CudaIpcTransfer
 
     torch.cuda.set_device(0)
-    source = torch.arange(1024, dtype=torch.float32, device="cuda:0")
+    source = empty((1024,), dtype=torch.float32, device=torch.device("cuda:0"))
+    source.copy_(torch.arange(1024, dtype=torch.float32, device="cuda:0"))
     event = torch.cuda.Event(interprocess=True)
     event.record()
-    handle, capacity, offset = export_ipc(source)
+    descriptor, capacity, offset = export_fd(source)
+    if invalid_handle:
+        os.close(descriptor)
+        descriptor = os.open(os.devnull, os.O_RDONLY)
     endpoint = f"uniserve-test-read-{uuid.uuid4().hex}"
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
         listener.bind("\0" + endpoint)
@@ -371,7 +375,6 @@ def _serve_unacknowledged_cuda_read(channel, invalid_handle: bool = False) -> No
             transport=CudaIpcTransfer(
                 endpoint=endpoint,
                 publication_id=uuid.uuid4().hex,
-                storage_handle=bytes(len(handle)) if invalid_handle else handle,
                 storage_size_bytes=capacity,
                 storage_offsets_bytes=(offset,),
                 span_lengths=(source.shape[0],),
@@ -389,13 +392,19 @@ def _serve_unacknowledged_cuda_read(channel, invalid_handle: bool = False) -> No
         connection, _address = listener.accept()
         with connection:
             assert len(connection.recv(128)) == 64
-            connection.sendall(b"G")
+            import array
+
+            connection.sendmsg(
+                (b"G",),
+                ((socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", (descriptor,))),),
+            )
             assert connection.recv(1) == b"A"
             channel.send("released")
             assert channel.recv() == "reject"
             connection.sendall(b"E")
         # Keep the allocation alive until the receiver has observed retirement.
         assert channel.recv() == "close"
+    os.close(descriptor)
     channel.close()
 
 
@@ -462,7 +471,7 @@ def test_cuda_ipc_reports_import_failure_before_acknowledgement() -> None:
         ready = threading.Event()
         ticket.add_done_callback(ready.set)
         assert ready.wait(30), "import failure waited for the source acknowledgement"
-        with pytest.raises(RuntimeError, match="IPC"):
+        with pytest.raises(RuntimeError, match="allocation"):
             ticket.result()
         assert parent.poll(30), "failed import did not release its source grant"
         assert parent.recv() == "released"
@@ -471,7 +480,7 @@ def test_cuda_ipc_reports_import_failure_before_acknowledgement() -> None:
         retirement_rejected = True
         transport.close()
         assert ticket.retired()
-        with pytest.raises(RuntimeError, match="IPC"):
+        with pytest.raises(RuntimeError, match="allocation"):
             ticket.result()
     finally:
         if process.is_alive() and not retirement_rejected:
@@ -735,8 +744,16 @@ def test_cancelled_shard_reads_retain_destination_and_capacity_until_physical_re
     else:
         target = store.producer_write_views((binding,))[0]
     shard_shape = (shape[0] // 2, *shape[1:])
-    first_region = TensorRegion((0,) * len(shape), shard_shape)
-    second_region = TensorRegion((shard_shape[0], *(0 for _ in shape[1:])), shard_shape)
+    first_region = tuple(
+        slice(start, start + extent)
+        for start, extent in zip((0,) * len(shape), shard_shape, strict=True)
+    )
+    second_region = tuple(
+        slice(start, start + extent)
+        for start, extent in zip(
+            (shard_shape[0], *(0 for _ in shape[1:])), shard_shape, strict=True
+        )
+    )
     healthy = None
     process.start()
     child.close()

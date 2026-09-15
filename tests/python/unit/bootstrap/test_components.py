@@ -1,50 +1,49 @@
-"""Component startup preserves callable and participation constraints."""
+"""Invalid capability and placement declarations fail at worker startup."""
 
 import pytest
 import torch
 
-from uniserve.distributed.mesh import Communicator, DeviceMesh
-from uniserve.distributed.parallel import ParallelConfig
-from uniserve.model.components import ComponentCall
-from uniserve.model.model import Model
-from uniserve_worker.bootstrap.components import bind_components, validate_components
+from uniserve.model import Encoder, EntryPoint
+from uniserve_worker.bootstrap.components import validate_components
 from uniserve_worker.config import ComponentConfig
-from uniserve_worker.execution.model_entry import ModelEntry
 from uniserve_worker.foundation.errors import WorkerError
 
 pytestmark = pytest.mark.unit
 
 
 def test_binding_rejects_a_missing_numerical_method():
-    class DeclaredModel(Model):
-        def __init__(self):
-            super().__init__()
-            self.encoder = torch.nn.Identity()
-
-        @classmethod
-        def component_calls(cls, config):
-            return (ComponentCall("encoder", "encode:text"),)
-
-    group = Communicator(device=torch.device("cpu"))
-    binding = ModelEntry(
-        "encoder",
-        ComponentConfig((0,)),
-        group,
-        DeviceMesh((0,), 0, ParallelConfig(), group.device),
-        group.device,
-    )
+    model = torch.nn.Module()
+    model.encoder = torch.nn.Identity()
     with pytest.raises(WorkerError, match="no callable 'encode'"):
-        bind_components(DeclaredModel(), {"encoder": binding})
+        validate_components(
+            model,
+            {"encoder": ComponentConfig((0,))},
+            entries={"encoder": (EntryPoint("encode"),)},
+            paths={"encoder": "encoder.encode"},
+        )
 
 
 def test_source_validation_rejects_conflicting_stage_declarations():
-    class DeclaredModel(Model):
-        @classmethod
-        def component_calls(cls, config):
-            return (
-                ComponentCall("", "forward"),
-                ComponentCall("", "forward", stage="last"),
-            )
-
+    model = Encoder(torch.nn.Identity())
     with pytest.raises(WorkerError, match="repeats numerical method"):
-        validate_components(DeclaredModel, {}, {})
+        validate_components(
+            model,
+            {"encoder": ComponentConfig((0,))},
+            entries={"": (EntryPoint("encode"), EntryPoint("encode", stage="last"))},
+            paths={"encoder": "encode"},
+        )
+
+
+def test_component_requires_explicit_placement():
+    network = torch.nn.Linear(4, 4)
+    model = torch.nn.Module()
+    model.first = Encoder(network)
+    model.second = Encoder(network)
+    model.conditioner = Encoder(network)
+    with pytest.raises(WorkerError, match="require an explicit IPC entry"):
+        validate_components(
+            model,
+            {"first": ComponentConfig((0,)), "second": ComponentConfig((0,))},
+            entries={path: (EntryPoint("encode"),) for path in ("first", "second", "conditioner")},
+            paths={"first": "first.encode", "second": "second.encode"},
+        )

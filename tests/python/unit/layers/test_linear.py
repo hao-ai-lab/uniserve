@@ -1,247 +1,200 @@
-"""Prepared projection values preserve logical scale domains and bias semantics."""
+"""Projection values follow logical branches, statistics, and output storage."""
 
 import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve.distributed.mesh import Communicator
-from uniserve.nn.layer import LayerConfig
-from uniserve.nn.linear import LinearBase, MergedColumnParallelLinear
+from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.nn.linear import (
+    ColumnParallelLinear,
+    Linear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from uniserve.nn.mlp import GatedMLP
-from uniserve.nn.quant.base import PreparedLinearInput
-from uniserve.nn.quant.fp8 import DynamicW8A8Fp8LinearMethod
+from uniserve.quantization import Quantizer
 
 pytestmark = pytest.mark.unit
 
 
-@pytest.mark.parametrize("tensorwise", [False, True])
-def test_prepared_fp8_values_preserve_shape_scale_and_deferred_bias(tensorwise):
-    # Powers of two and small integers are exactly representable in E4M3.
-    # Weight extrema of 448 give each logical output domain a unit scale.
+@pytest.mark.parametrize("dtype,large", ((torch.float16, 2048), (torch.bfloat16, 256)))
+@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu)))
+@torch.inference_mode()
+def test_unsharded_row_projection_preserves_dense_affine_rounding(dtype, large, device):
+    from uniserve.model import TextSize
+    from uniserve.runtime import ExecutionContext
+
+    layer = RowParallelLinear(2, 1, device=device, dtype=dtype)
+    layer.weight.copy_(torch.tensor([[large, 1]], device=device, dtype=dtype))
+    layer.bias.fill_(-large)
+    source = torch.tensor([[1, 1], [1, -1]], device=device, dtype=dtype)
+    # Rounding the product before adding bias loses the unit contribution.
+    # A single shard is the ordinary dense affine map, with one final store.
+    expected = torch.tensor([[1], [-1]], device=device, dtype=dtype)
+    with ExecutionContext(layer) as context:
+        context.prepare(TextSize(2, 1))
+        torch.testing.assert_close(layer(source), expected, rtol=0, atol=0)
+        out = torch.empty(2, 2, device=device, dtype=dtype)[:, :1]
+        assert layer(source, out=out) is out
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "quantizer",
+    (Quantizer("fp8"), pytest.param(Quantizer("nvfp4"), marks=pytest.mark.gpu)),
+)
+@torch.inference_mode()
+def test_encoded_projection_chunks_preserve_the_source_scale_domain(quantizer):
+    device = "cpu" if quantizer.format == "fp8" else "cuda"
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    source = torch.arange(160, dtype=torch.float32, device=device).reshape(5, 32).sin().to(dtype)
+    # Deliberately retain a source domain wider than this local value range.
+    # Concatenating through dequantization and fresh statistics changes it.
+    encoded = quantizer.quantize(source, amax=torch.tensor(3.718, device=device))
+    layer = ColumnParallelLinear(32, 32, bias=False, device=device, dtype=dtype)
+    if device == "cuda":
+        layer.weight = nn.Parameter(quantizer.quantize(layer.weight), requires_grad=False)
+    layer.input_quantizer = quantizer
+    expected = layer(encoded)
+
+    def chunks():
+        for start, stop in ((0, 2), (2, 5)):
+            fields = {
+                name: value[start:stop] if name in {"values", "block_scale"} else value.clone()
+                for name, value in encoded.buffers().items()
+            }
+            yield (
+                slice(start, stop),
+                quantizer.from_tensors(fields, shape=(stop - start, 32), dtype=dtype),
+            )
+
+    result = torch.empty_like(expected)
+    for interval, value in layer.forward_chunks(chunks(), token_slice=slice(0, 5), num_tokens=5):
+        result[interval].copy_(value)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("axis", [None, 0])
+def test_encoded_input_preserves_scales_shape_and_bias(axis):
+    quantizer = Quantizer("fp8", axis=axis)
+    layer = Linear(2, 2)
     weights = torch.tensor([[448.0, 2.0], [-4.0, 448.0]])
-    bias = torch.tensor([2.0, -4.0])
-    linear = LinearBase(
-        2,
-        2,
-        layer_config=LayerConfig(Communicator(), None),
-        quant_method=DynamicW8A8Fp8LinearMethod(tensorwise=tensorwise),
+    layer.weight = nn.Parameter(quantizer.quantize(weights), requires_grad=False)
+    layer.bias.copy_(torch.tensor([2.0, -4.0]))
+    layer.input_quantizer = quantizer
+    source = torch.tensor([[[1.0, 2.0], [-2.0, 4.0]]])
+    encoded = quantizer.quantize(source.reshape(2, 2))
+    expected = F.linear(encoded.dequantize(), layer.weight.dequantize(), layer.bias).reshape(
+        1, 2, 2
     )
-    linear.weight = nn.Parameter(weights.clone(), requires_grad=False)
-    linear.bias = nn.Parameter(bias.clone(), requires_grad=False)
-    linear.finalize_weights()
-    values = torch.tensor([[[1.0, 2.0], [-2.0, 4.0]]]).to(torch.float8_e4m3fn)
-    scale = torch.tensor([[0.5]]) if tensorwise else torch.tensor([[0.5], [2.0]])
-    prepared = (
-        PreparedLinearInput(values, tensor_scale=scale)
-        if tensorwise
-        else PreparedLinearInput(values, row_scales=scale)
-    )
-    expected = ((values.float().reshape(2, 2) * scale) @ weights.T).reshape(1, 2, 2)
-    actual = linear.forward_prepared(prepared, output_dtype=torch.float32, include_bias=False)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    torch.testing.assert_close(
-        linear.forward_prepared(prepared, output_dtype=torch.float32),
-        expected + bias,
-        rtol=0,
-        atol=0,
-    )
-    misplaced = (
-        PreparedLinearInput(values, row_scales=scale)
-        if tensorwise
-        else PreparedLinearInput(values, tensor_scale=scale)
-    )
-    with pytest.raises(ValueError, match="activation scale"):
-        linear.forward_prepared(misplaced)
-
-
-def test_prepared_gated_mlp_preserves_row_scales_and_leading_dimensions():
-    model = GatedMLP(
-        2,
-        2,
-        layer_config=LayerConfig(Communicator(), None),
-        quant_method=DynamicW8A8Fp8LinearMethod(),
-    )
-    weights = torch.eye(2) * 448
-    with torch.no_grad():
-        model.gate_up_proj.weight.copy_(weights.repeat(2, 1))
-        model.down_proj.weight.copy_(weights)
-    model.gate_up_proj.finalize_weights()
-    model.down_proj.finalize_weights()
-    values = torch.tensor([[[1, 2], [2, 1]]]).to(torch.float8_e4m3fn)
-    scales = torch.tensor([[0.5], [2.0]])
-    actual = model.forward_prepared(PreparedLinearInput(values, row_scales=scales))
-    # The smallest gate is 224, where SiLU rounds exactly to its input.
-    # All weights, activations, and FP8 scale ratios are representable here.
-    dense = (values.float().reshape(2, 2) * scales).reshape(1, 2, 2)
-    expected = ((dense * 448).square() * 448).bfloat16()
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    with pytest.raises(ValueError, match="activation scale"):
-        model.forward_prepared(PreparedLinearInput(values))
-
-
-@pytest.mark.parametrize("tensorwise", [False, True])
-def test_reusable_activation_preparation_preserves_logical_values(tensorwise):
-    linear = LinearBase(
-        2,
-        2,
-        layer_config=LayerConfig(Communicator(), None),
-        quant_method=DynamicW8A8Fp8LinearMethod(tensorwise=tensorwise),
-        bias=False,
-    )
-    with torch.no_grad():
-        linear.weight.copy_(torch.eye(2) * 448)
-    linear.finalize_weights()
-    inputs = torch.tensor([[[224.0, 448.0], [-112.0, 224.0]]])
-    for maximum in (None, inputs.abs().amax()):
-        prepared = linear.prepare_input(inputs, absmax=maximum)
-        actual = linear.forward_prepared(prepared, output_dtype=torch.float32)
-        torch.testing.assert_close(actual, inputs * 448, rtol=0, atol=0)
-
-
-def test_deferred_gated_mlp_preserves_dense_projection_bias():
-    model = GatedMLP(
-        4, 8, layer_config=LayerConfig(Communicator(), None), order="value_gate", bias=True
-    )
-    generator = torch.Generator().manual_seed(179)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.copy_(torch.randn(parameter.shape, generator=generator))
-    inputs = torch.randn((2, 3, 4), generator=generator)
-    packed = F.linear(inputs, model.gate_up_proj.weight, model.gate_up_proj.bias)
-    value, gate = packed.chunk(2, dim=-1)
-    expected = F.linear(value * F.silu(gate), model.down_proj.weight, model.down_proj.bias)
-    actual, bias = model.forward_deferred(inputs, input_absmax=inputs.abs().amax())
-    if bias is not None:
-        actual = actual + bias
-    torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.parametrize("component", ["mot", "vision"])
-def test_multimodal_layers_keep_excluded_checkpoint_projections_dense(component):
-    from uniserve.nn.decoder.mot import MoTConfig, MoTModel
-    from uniserve.nn.quant.base import process_quantized_modules
-    from uniserve.nn.quant.config import QuantizationConfig
-    from uniserve.nn.vision.encoder import VisionEncoder, VisionEncoderConfig
-
-    if component == "mot":
-        prefix = "language_model.model"
-        ignored = tuple(
-            f"{prefix}.layers.0.self_attn.{name}_moe_gen"
-            for name in ("q_proj", "k_proj", "v_proj", "o_proj")
-        ) + (f"{prefix}.layers.0.mlp_moe_gen",)
-        model = MoTModel(
-            MoTConfig(
-                hidden_size=8,
-                intermediate_size=16,
-                num_hidden_layers=1,
-                num_attention_heads=2,
-                num_key_value_heads=1,
-                vocab_size=32,
-                rms_norm_eps=1e-6,
-                rope_theta=10000,
-                head_dim=4,
-            ),
-            layer_config=LayerConfig(
-                Communicator(), QuantizationConfig(method="fp8", ignored_layers=ignored), prefix
-            ),
-        )
-        dense_names = (
-            "layers.0.flow_qkv.projection.weight",
-            "layers.0.o_proj_moe_gen.weight",
-            "layers.0.mlp_moe_gen.gate_up_proj.weight",
-            "layers.0.mlp_moe_gen.down_proj.weight",
-        )
-        quantized_names = ("layers.0.text_qkv.projection.weight", "layers.0.mlp.down_proj.weight")
-    else:
-        prefix = "vit_model.vision_model.encoder"
-        ignored = (f"{prefix}.layers.0.self_attn.v_proj", f"{prefix}.layers.0.mlp.fc1")
-        model = VisionEncoder(
-            VisionEncoderConfig(8, 2, 16, 1),
-            layer_config=LayerConfig(
-                Communicator(), QuantizationConfig(method="fp8", ignored_layers=ignored), prefix
-            ),
-        )
-        dense_names = ("layers.0.self_attn.v_proj.weight", "layers.0.mlp.0.weight")
-        quantized_names = ("layers.0.self_attn.q_proj.weight", "layers.0.mlp.2.weight")
-    model = model.bfloat16()
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.fill_(0.5)
-        process_quantized_modules(model.modules())
-    state = model.state_dict()
-    for name in dense_names:
-        torch.testing.assert_close(
-            state[name], torch.full(state[name].shape, 0.5, dtype=torch.bfloat16), rtol=0, atol=0
-        )
-    for name in quantized_names:
-        assert state[name].dtype == torch.float8_e4m3fn
+    out = torch.empty(1, 2, 2).transpose(-1, -2)
+    assert layer(source, output_dtype=torch.float32, out=out) is out
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    torch.testing.assert_close(layer(encoded), expected.reshape(2, 2), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("quantized", [False, True])
-@pytest.mark.parametrize("rows", [1, 3])
-def test_packed_projection_branches_preserve_logical_weights_and_bias(quantized, rows):
-    projection = MergedColumnParallelLinear(
-        2,
-        (2, 1, 1),
-        layer_config=LayerConfig(Communicator(), None),
-        quant_method=DynamicW8A8Fp8LinearMethod() if quantized else None,
-        bias=True,
+@pytest.mark.parametrize("rows", [0, 1, 3])
+def test_named_branches_preserve_independent_weights_and_bias(quantized, rows):
+    layer = MergedColumnParallelLinear(2, {"q": 2, "k": 1, "v": 1})
+    weights = (
+        torch.tensor([[448.0, 0.0], [0.0, 448.0]]),
+        torch.tensor([[224.0, 224.0]]),
+        torch.tensor([[112.0, -112.0]]),
     )
-    weights = torch.tensor([[448.0, 0.0], [0.0, 448.0], [448.0, 448.0], [448.0, -448.0]])
-    bias = torch.tensor([1.0, 2.0, 3.0, 4.0])
-    with torch.no_grad():
-        projection.weight.copy_(weights)
-        projection.bias.copy_(bias)
-    projection.finalize_weights()
-    inputs = torch.tensor([[224.0, 448.0]]).expand(rows, 2)
-    expected = F.linear(inputs, weights, bias)
-    actual = torch.cat(projection.forward_branches(inputs), dim=-1)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    source = torch.tensor([[224.0, 448.0]]).expand(rows, 2)
+    for index, (branch, weight) in enumerate(zip(layer.projections.values(), weights, strict=True)):
+        branch.weight = nn.Parameter(
+            Quantizer("fp8").quantize(weight) if quantized else weight, requires_grad=False
+        )
+        branch.bias.fill_(index + 1)
+        branch.input_quantizer = Quantizer("fp8", axis=0) if quantized else None
+    result = layer(source)
+    for index, (name, weight) in enumerate(zip(layer.projections, weights, strict=True)):
+        torch.testing.assert_close(
+            result[name], F.linear(source, weight) + index + 1, rtol=0, atol=0
+        )
 
 
 @pytest.mark.parametrize("heads,kv_heads", [(4, 2), (4, 1), (8, 8)])
-def test_query_owners_load_their_corresponding_grouped_key_value_heads(heads, kv_heads):
-    from uniserve.loading.handles import TensorWeightHandle
-    from uniserve.loading.weight_loaders import attach_parameter_loaders, load_parameter_weight
-    from uniserve.nn.linear import QKVParallelLinear
-
+def test_query_shards_select_their_grouped_kv_heads(heads, kv_heads):
     head_dim, width = 4, 8
     weights = tuple(
-        torch.arange(count * head_dim * width, dtype=torch.float32).view(count * head_dim, width)
+        torch.arange(count * head_dim * width, dtype=torch.float32).view(-1, width)
         for count in (heads, kv_heads, kv_heads)
-    )
-    biases = tuple(
-        torch.arange(count * head_dim, dtype=torch.float32) for count in (heads, kv_heads, kv_heads)
     )
     values = torch.eye(width)[:3]
     ranks = (3, 1, 0, 2)
     for owner, physical in enumerate(ranks):
-        linear = QKVParallelLinear(
-            width,
-            head_dim,
-            heads,
-            kv_heads,
-            layer_config=LayerConfig(Communicator(ranks=ranks, rank=physical), None),
-            bias=True,
-        )
-        attach_parameter_loaders(linear, device="cpu", dtype=torch.float32)
-        for branch, weight, bias in zip(("q", "k", "v"), weights, biases, strict=True):
-            load_parameter_weight(linear.weight, TensorWeightHandle("weight", weight), branch)
-            load_parameter_weight(linear.bias, TensorWeightHandle("bias", bias), branch)
-        query_heads = range(owner * heads // 4, (owner + 1) * heads // 4)
-        key_heads = sorted({head // (heads // kv_heads) for head in query_heads})
-        expected = []
-        for selected, weight, bias in zip(
-            (list(query_heads), key_heads, key_heads), weights, biases, strict=True
+        layer = QKVParallelLinear(width, heads, kv_heads, head_dim, bias=False)
+        for branch, weight in zip(layer.projections.values(), weights, strict=True):
+            branch.weight.copy_(weight)
+        parallelize_(layer, DeviceMesh(ranks=ranks, shape=(4,), axes=("tp",), rank=physical))
+        queries = range(owner * heads // 4, (owner + 1) * heads // 4)
+        keys = sorted({head // (heads // kv_heads) for head in queries})
+        actual = layer(values)
+        for name, selected, weight in zip(
+            ("q", "k", "v"), (queries, keys, keys), weights, strict=True
         ):
             columns = [head * head_dim + dim for head in selected for dim in range(head_dim)]
-            expected.append(F.linear(values, weight, bias)[:, columns])
-        torch.testing.assert_close(linear(values), torch.cat(expected, dim=-1), rtol=0, atol=0)
+            torch.testing.assert_close(
+                actual[name], F.linear(values, weight)[:, columns], rtol=0, atol=0
+            )
+
+
+def test_shared_parameters_survive_parallel_binding():
+    modules = nn.ModuleList([Linear(4, 4), Linear(4, 4)])
+    modules[1].weight = modules[0].weight
+    parallelize_(modules, DeviceMesh(ranks=(0,), shape=(), axes=(), rank=0))
+    assert modules[0].weight is modules[1].weight
+    modules[0].weight.fill_(3)
+    torch.testing.assert_close(
+        modules[0](torch.ones(1, 4)) - modules[0].bias,
+        modules[1](torch.ones(1, 4)) - modules[1].bias,
+    )
 
 
 @pytest.mark.parametrize("shape", [(0, 7), (0, 0), ()])
-def test_empty_projection_keeps_the_declared_input_width(shape):
-    linear = LinearBase(8, 4, layer_config=LayerConfig(Communicator(), None))
-    with pytest.raises(ValueError, match="feature width"):
-        linear(torch.empty(shape))
+def test_invalid_contraction_width_is_rejected_for_empty_inputs(shape):
+    layer = Linear(8, 4)
+    with pytest.raises(ValueError, match="dimension"):
+        layer(torch.empty(shape))
+
+
+def test_merged_projection_rejects_bias_outside_its_branch_channels():
+    from uniserve.nn.functional import merged_linear
+
+    with pytest.raises(ValueError, match="bias.*channels"):
+        merged_linear(
+            torch.ones(3, 4),
+            {"first": torch.ones(2, 4), "second": torch.ones(3, 4)},
+            {"first": torch.ones(1), "second": None},
+        )
+
+
+def test_gated_mlp_uses_named_gate_and_up_branches():
+    model = GatedMLP(4, 8, bias=True)
+    source = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4) / 16
+    gate = model.gate_up.projections["gate"]
+    up = model.gate_up.projections["up"]
+    expected = F.linear(
+        F.silu(F.linear(source, gate.weight, gate.bias)) * F.linear(source, up.weight, up.bias),
+        model.down.weight,
+        model.down.bias,
+    )
+    torch.testing.assert_close(model(source), expected)
+
+
+def test_row_chunks_keep_one_tensor_scale_across_intervals():
+    layer = RowParallelLinear(2, 2)
+    layer.input_quantizer = Quantizer("fp8")
+    layer.weight = nn.Parameter(Quantizer("fp8").quantize(torch.eye(2)), requires_grad=False)
+    source = torch.tensor([[1.1, 2.3], [100.0, 200.0], [3.2, 4.7]])
+    actual = list(
+        layer.forward_chunks(iter(((slice(0, 1), source[:1]), (slice(1, 3), source[1:]))))
+    )
+    torch.testing.assert_close(
+        torch.cat([value for _, value in actual]), layer(source), rtol=0, atol=0
+    )

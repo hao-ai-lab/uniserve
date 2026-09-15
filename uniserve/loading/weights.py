@@ -1,0 +1,561 @@
+"""Numerical weight representation, explicit assignments and load results."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
+
+import torch
+from torch import nn
+
+from uniserve._slices import intersection, subtract, within
+from uniserve._slices import shape as region_shape
+from uniserve.nn.linear import (
+    Linear,
+    MergedColumnParallelLinear,
+    VocabParallelEmbedding,
+    VocabParallelHead,
+    _coalesce,
+)
+from uniserve.quantization import QuantizationConfig, QuantizedTensor, Quantizer
+
+from . import checkpoint
+
+
+@dataclass(frozen=True, slots=True)
+class Config:
+    """Choose parameter dtype and quantization by longest module-path prefix."""
+
+    dtype: torch.dtype = torch.bfloat16
+    dtypes: Mapping[str, torch.dtype] = field(default_factory=dict)
+    quantization: Mapping[str, QuantizationConfig | None] = field(default_factory=dict)
+
+    def __post_init__(self):
+        object.__setattr__(self, "dtypes", MappingProxyType(dict(self.dtypes)))
+        object.__setattr__(self, "quantization", MappingProxyType(dict(self.quantization)))
+        if not self.dtype.is_floating_point or any(
+            not dtype.is_floating_point for dtype in self.dtypes.values()
+        ):
+            raise ValueError("weight compute dtypes must be floating point")
+        if any(
+            value is not None and not isinstance(value, QuantizationConfig)
+            for value in self.quantization.values()
+        ):
+            raise TypeError("weight quantization requires QuantizationConfig values or None")
+
+
+@dataclass(frozen=True, slots=True)
+class Assignment:
+    """Copy one logical source rectangle into one Parameter rectangle.
+
+    Source slices select mathematical checkpoint branches. The loader applies
+    a target layer's channel partition when a complete logical matrix is given.
+    Target slices address resident storage. preserve_dtype keeps source dtype.
+    """
+
+    target: nn.Parameter
+    source: checkpoint.Weight
+    source_slice: tuple[slice, ...] | None = None
+    target_slice: tuple[slice, ...] | None = None
+    preserve_dtype: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleMapping:
+    """Map one checkpoint source onto a resident numerical module.
+
+    required/optional name module parameters. nonresident names intentionally
+    unused checkpoint tensors, including entries belonging to absent PP layers.
+    post_load may compute derived constants while the source reader is open.
+    """
+
+    module: nn.Module
+    source: str
+    map_weights: Callable[[checkpoint.Reader], tuple[Assignment, ...]]
+    required: frozenset[str]
+    optional: frozenset[str] = frozenset()
+    nonresident: frozenset[str] = frozenset()
+    post_load: Callable[[checkpoint.Reader], None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Report:
+    loaded: frozenset[str]
+    skipped: tuple[str, ...]
+    missing: tuple[str, ...]
+    unexpected: tuple[str, ...]
+    incomplete: Mapping[str, tuple[str, ...]]
+
+    def __post_init__(self):
+        object.__setattr__(self, "incomplete", MappingProxyType(dict(self.incomplete)))
+
+
+def _choice(path, mapping, default):
+    candidates = (
+        (len(prefix), value)
+        for prefix, value in mapping.items()
+        if not prefix or path == prefix or path.startswith(prefix + ".")
+    )
+    return max(candidates, key=lambda pair: pair[0], default=(-1, default))[1]
+
+
+def _full(shape):
+    return tuple(slice(0, size) for size in shape)
+
+
+def _source_names(weight):
+    if isinstance(weight, checkpoint.FP8Weight):
+        return _source_names(weight.values) | _source_names(weight.scale)
+    return {weight.name}
+
+
+def _source_identity(weight):
+    if isinstance(weight, checkpoint.FP8Weight):
+        return (
+            type(weight),
+            _source_identity(weight.values),
+            _source_identity(weight.scale),
+            weight.axis,
+            weight.dtype,
+        )
+    return id(weight)
+
+
+def _fp8_fragments(shape, fragments, *, device, dtype):
+    """Assemble source encodings without deriving new scales from local values."""
+
+    if not shape:
+        raise ValueError("a scalar FP8 parameter cannot have multiple disjoint assignments")
+    values = torch.zeros(shape, dtype=torch.float8_e4m3fn, device=device)
+    scales = torch.ones((shape[0], *((1,) * (len(shape) - 1))), dtype=torch.float32, device=device)
+    initialized = torch.zeros(shape[0], dtype=torch.bool, device=device)
+    per_row = any(fragment.quantizer.axis == 0 for _, fragment in fragments)
+    for target, fragment in fragments:
+        fields = fragment.buffers()
+        rows = target[0]
+        incoming = (
+            fields["scale"].to(device).expand(rows.stop - rows.start, *((1,) * (len(shape) - 1)))
+        )
+        selected = initialized[rows]
+        if selected.any() and not torch.equal(scales[rows][selected], incoming[selected]):
+            raise ValueError("FP8 source fragments disagree within the same scale domain")
+        values[target].copy_(fields["values"].to(device))
+        scales[rows].copy_(incoming)
+        initialized[rows] = True
+    if not per_row and shape[0] and torch.equal(scales, scales[:1].expand_as(scales)):
+        quantizer = Quantizer("fp8")
+        scales = scales[0].reshape(())
+    else:
+        quantizer = Quantizer("fp8", axis=0)
+    return quantizer.from_tensors(
+        {"values": values, "scale": scales}, shape=tuple(shape), dtype=dtype
+    )
+
+
+class _Loader:
+    """Own readers and materialization while preserving shared parameter identity."""
+
+    def __init__(
+        self,
+        model,
+        sources,
+        mappings,
+        *,
+        device,
+        weights,
+        io,
+        devices,
+        excluded=(),
+        selected=None,
+        known_paths=None,
+    ):
+        self.model = model
+        self.sources = sources
+        self.mappings = mappings
+        self.excluded = excluded
+        self.selected = selected
+        self._known_paths = known_paths
+        self.device = torch.device(device)
+        self.weights = weights
+        self.io = io
+        self.devices = (
+            {}
+            if devices is None
+            else {path: torch.device(value) for path, value in devices.items()}
+        )
+        self._stack = ExitStack()
+        self._readers = {}
+        self._aliases = defaultdict(list)
+        self._owners = {}
+        self._settings = {}
+        self._assignments = defaultdict(list)
+        self._regions = {}
+        self._mapping_assignments = []
+        self._used = defaultdict(set)
+        self._loaded = set()
+        self._padding = {}
+        self._index_model()
+
+    def _index_model(self):
+        # Precision/device declarations address the complete architecture.
+        # Pipeline binding may remove those paths before materialization, but
+        # misspelled paths must still fail against the original module tree.
+        paths = self._known_paths
+        if paths is None:
+            paths = {path for path, _ in self.model.named_modules(remove_duplicate=False)}
+        for mapping in (self.weights.dtypes, self.weights.quantization, self.devices):
+            unknown = set(mapping).difference(paths)
+            if unknown:
+                raise ValueError(f"weight settings name unknown module paths: {sorted(unknown)}")
+        for path, module in self.model.named_modules(remove_duplicate=False):
+            dtype = _choice(path, self.weights.dtypes, self.weights.dtype)
+            quantization = _choice(path, self.weights.quantization, None)
+            explicit = any(
+                not prefix or path == prefix or path.startswith(prefix + ".")
+                for prefix in self.weights.quantization
+            )
+            device = _choice(path, self.devices, self.device)
+            if isinstance(module, Linear):
+                module.input_quantizer = None if quantization is None else quantization.activation
+            for name, parameter in module.named_parameters(recurse=False, remove_duplicate=False):
+                key = id(parameter)
+                quantizer = (
+                    quantization.weight
+                    if isinstance(module, Linear) and name == "weight" and quantization is not None
+                    else None
+                )
+                settings = (
+                    device,
+                    dtype if parameter.dtype.is_floating_point else parameter.dtype,
+                    quantizer,
+                    explicit,
+                )
+                previous = self._settings.setdefault(key, settings)
+                if previous != settings:
+                    raise ValueError(
+                        "shared parameter aliases have conflicting device, dtype or quantization choices"
+                    )
+                self._aliases[key].append((module, name))
+                self._owners.setdefault(key, (module, name))
+                if isinstance(module, (VocabParallelEmbedding, VocabParallelHead)):
+                    start = max(
+                        0,
+                        min(parameter.shape[0], module.vocab.size - module.vocab.local_slice.start),
+                    )
+                    self._padding[key] = (
+                        slice(start, parameter.shape[0]),
+                        *(slice(0, width) for width in parameter.shape[1:]),
+                    )
+
+    def _compile(self, assignment):
+        key = id(assignment.target)
+        if key not in self._owners:
+            raise ValueError("checkpoint assignment target is not a registered model Parameter")
+        source = (
+            _full(assignment.source.shape)
+            if assignment.source_slice is None
+            else assignment.source_slice
+        )
+        target = (
+            _full(assignment.target.shape)
+            if assignment.target_slice is None
+            else assignment.target_slice
+        )
+        if not within(source, assignment.source.shape) or not within(
+            target, tuple(assignment.target.shape)
+        ):
+            raise ValueError("checkpoint assignment rectangle exceeds its tensor")
+        owner, name = self._owners[key]
+        if isinstance(owner, (VocabParallelEmbedding, VocabParallelHead)):
+            if source[0].stop - source[0].start == owner.vocab.size and target == _full(
+                assignment.target.shape
+            ):
+                start = min(owner.vocab.size, owner.vocab.local_slice.start)
+                stop = min(owner.vocab.size, owner.vocab.local_slice.stop)
+                source = (slice(source[0].start + start, source[0].start + stop), *source[1:])
+                target = (slice(0, stop - start), *target[1:])
+        elif isinstance(owner, Linear) and name in {"weight", "bias"}:
+            logical = (
+                (owner.out_features, owner.in_features)
+                if name == "weight"
+                else (owner.out_features,)
+            )
+            local = owner._weight_slice if name == "weight" else owner._weight_slice[:1]
+            if region_shape(source) == logical and target == _full(assignment.target.shape):
+                source = tuple(
+                    slice(base.start + part.start, base.start + part.stop)
+                    for base, part in zip(source, local, strict=True)
+                )
+        if region_shape(source) != region_shape(target):
+            raise ValueError(
+                f"checkpoint assignment shape mismatch: {region_shape(source)} to {region_shape(target)}"
+            )
+        self._regions[id(assignment)] = source, target
+        for previous in self._assignments[key]:
+            if (
+                _source_identity(previous.source) == _source_identity(assignment.source)
+                and self._regions[id(previous)] == (source, target)
+                and previous.preserve_dtype == assignment.preserve_dtype
+            ):
+                return
+            if intersection(self._regions[id(previous)][1], target) is not None:
+                raise ValueError(
+                    "overlapping checkpoint assignments must identify the same source rectangle"
+                )
+        self._assignments[key].append(assignment)
+
+    def _reports(self):
+        used = self._used
+        reports = []
+        for module_mapping, assignments in zip(
+            self.mappings, self._mapping_assignments, strict=True
+        ):
+            parameters = dict(module_mapping.module.named_parameters(remove_duplicate=False))
+            unknown = module_mapping.required.difference(parameters)
+            if unknown:
+                raise ValueError(
+                    f"mapping required names are not model parameters: {sorted(unknown)}"
+                )
+            ids = {id(assignment.target) for assignment in assignments}
+            loaded = frozenset(
+                name for name, parameter in parameters.items() if id(parameter) in ids
+            )
+            incomplete = {}
+            for name in loaded:
+                parameter = parameters[name]
+                uncovered = (_full(parameter.shape),)
+                if id(parameter) in self._padding:
+                    uncovered = subtract(uncovered[0], self._padding[id(parameter)])
+                for assignment in self._assignments[id(parameter)]:
+                    _, target = self._regions[id(assignment)]
+                    uncovered = tuple(
+                        piece for region in uncovered for piece in subtract(region, target)
+                    )
+                if uncovered and parameter.numel():
+                    incomplete[name] = tuple(str(region) for region in uncovered)
+            reader = self._readers[module_mapping.source]
+            reports.append(
+                Report(
+                    loaded,
+                    tuple(sorted(set(reader.names()) & module_mapping.nonresident)),
+                    tuple(
+                        sorted(
+                            module_mapping.required.difference(module_mapping.optional).difference(
+                                loaded
+                            )
+                        )
+                    ),
+                    tuple(sorted(set(reader.names()).difference(used[module_mapping.source]))),
+                    incomplete,
+                )
+            )
+        return tuple(reports)
+
+    def load(self) -> tuple[Report, ...]:
+        if self.io.mode == "dummy" and not any(
+            module_mapping.post_load is not None for module_mapping in self.mappings
+        ):
+            return self._dummy()
+        if len({source.name for source in self.sources}) != len(self.sources):
+            raise ValueError("checkpoint source names must be unique")
+        by_name = {source.name: source for source in self.sources}
+        for module_mapping in self.mappings:
+            if module_mapping.source not in self._readers:
+                self._readers[module_mapping.source] = self._stack.enter_context(
+                    by_name[module_mapping.source].open(io=self.io)
+                )
+            reader = self._readers[module_mapping.source]
+            assignments = module_mapping.map_weights(reader)
+            for assignment in assignments:
+                self._compile(assignment)
+                self._used[module_mapping.source].update(_source_names(assignment.source))
+            self._used[module_mapping.source].update(module_mapping.nonresident)
+            self._mapping_assignments.append(assignments)
+        # A selected capability can share a file with other declared mappings.
+        # Account for their known source fields without materializing them or
+        # opening additional files. Unknown tensors still fail completeness.
+        for module_mapping in self.excluded:
+            reader = self._readers.get(module_mapping.source)
+            if reader is not None:
+                for assignment in module_mapping.map_weights(reader):
+                    self._used[module_mapping.source].update(_source_names(assignment.source))
+                self._used[module_mapping.source].update(module_mapping.nonresident)
+        reports = self._reports()
+        for report in reports:
+            if report.missing or report.incomplete:
+                raise RuntimeError(
+                    f"checkpoint load mismatch: missing={report.missing}, unexpected={report.unexpected}, incomplete={dict(report.incomplete)}"
+                )
+        for key, assignments in self._assignments.items():
+            self._materialize(key, assignments)
+        for module_mapping in self.mappings:
+            if module_mapping.post_load is not None:
+                module_mapping.post_load(self._readers[module_mapping.source])
+        # Auxiliary source values used to derive constants need not be mapped
+        # onto Parameters. Account for actual reads while the reader is open;
+        # merely enumerating source metadata does not consume a tensor.
+        for source, reader in self._readers.items():
+            self._used[source].update(reader._consumed)
+        reports = tuple(
+            replace(
+                report,
+                unexpected=tuple(
+                    sorted(
+                        set(self._readers[module_mapping.source].names()).difference(
+                            self._used[module_mapping.source]
+                        )
+                    )
+                ),
+            )
+            for module_mapping, report in zip(self.mappings, reports, strict=True)
+        )
+        for report in reports:
+            if report.unexpected:
+                raise RuntimeError(f"checkpoint load mismatch: unexpected={report.unexpected}")
+        self._buffers()
+        self._fuse()
+        return reports
+
+    def _fuse(self):
+        assigned = set()
+        for module in self.model.modules():
+            if isinstance(module, MergedColumnParallelLinear):
+                _coalesce(module.projections, assigned=assigned)
+
+    def _materialize(self, key, assignments):
+        device, dtype, quantizer, explicit = self._settings[key]
+        parameter = assignments[0].target
+        preserved = {
+            assignment.source.dtype for assignment in assignments if assignment.preserve_dtype
+        }
+        if len(preserved) > 1 or (
+            preserved and not all(assignment.preserve_dtype for assignment in assignments)
+        ):
+            raise ValueError("one Parameter cannot have conflicting source-dtype requirements")
+        if preserved:
+            dtype = preserved.pop()
+        complete = len(assignments) == 1 and self._regions[id(assignments[0])][1] == _full(
+            parameter.shape
+        )
+        if complete:
+            assignment = assignments[0]
+            source, _ = self._regions[id(assignment)]
+            value = assignment.source.read(source).to(device=device, dtype=dtype)
+        else:
+            fragments = []
+            for assignment in assignments:
+                source, target = self._regions[id(assignment)]
+                fragments.append((target, assignment.source.read(source)))
+            if all(
+                isinstance(fragment, QuantizedTensor) and fragment.quantizer.format == "fp8"
+                for _, fragment in fragments
+            ):
+                value = _fp8_fragments(parameter.shape, fragments, device=device, dtype=dtype)
+            else:
+                value = torch.empty(tuple(parameter.shape), device=device, dtype=dtype)
+                for target, fragment in fragments:
+                    if isinstance(fragment, QuantizedTensor):
+                        fragment = fragment.dequantize(dtype=dtype)
+                    value[target].copy_(fragment.to(device=device, dtype=dtype))
+        if key in self._padding and not isinstance(value, QuantizedTensor):
+            value[self._padding[key]].zero_()
+        if (
+            quantizer is not None
+            and isinstance(value, QuantizedTensor)
+            and quantizer.format == value.quantizer.format == "fp8"
+        ):
+            # A serialized FP8 scale describes the checkpoint's complete
+            # statistical domain. Selecting FP8 execution does not derive a
+            # smaller per-row or rank-local scale from that already encoded value.
+            pass
+        elif quantizer is not None:
+            owner, _ = self._owners[key]
+            value = quantizer.quantize(value, distribution=owner.weight_distribution)
+        elif isinstance(value, QuantizedTensor) and explicit:
+            value = value.dequantize(dtype=dtype)
+        resident = nn.Parameter(value, requires_grad=parameter.requires_grad)
+        for owner, name in self._aliases[key]:
+            owner._parameters[name] = resident
+        self._loaded.add(key)
+
+    def _buffers(self):
+        active = (
+            self.selected
+            if self.selected is not None
+            else {
+                id(module)
+                for module_mapping in self.mappings
+                for module in module_mapping.module.modules()
+            }
+        )
+        moved = {}
+        buffers = [
+            (path, module, name, buffer)
+            for path, module in self.model.named_modules(remove_duplicate=False)
+            for name, buffer in module.named_buffers(recurse=False)
+        ]
+        for path, module, name, buffer in buffers:
+            if id(module) not in active:
+                continue
+            device = _choice(path, self.devices, self.device)
+            if buffer.is_meta:
+                raise RuntimeError(
+                    f"derived buffer {path}.{name} was not materialized by its numerical owner"
+                )
+            key = id(buffer)
+            if key in moved and moved[key].device != device:
+                raise ValueError("shared buffer aliases have conflicting devices")
+            if key not in moved:
+                moved[key] = buffer.to(device=device)
+            module._buffers[name] = moved[key]
+
+    def _dummy(self):
+        import hashlib
+
+        reports = []
+        parameters = [
+            tuple(
+                (name, parameter)
+                for name, parameter in module_mapping.module.named_parameters(
+                    remove_duplicate=False
+                )
+                if name in module_mapping.required or name in module_mapping.optional
+            )
+            for module_mapping in self.mappings
+        ]
+        for module_mapping, parameter_items in zip(self.mappings, parameters, strict=True):
+            loaded = set()
+            for name, parameter in parameter_items:
+                key = id(parameter)
+                if key not in self._loaded:
+                    device, dtype, quantizer, _ = self._settings[key]
+                    seed = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "little")
+                    generator = torch.Generator(device="cpu").manual_seed(seed)
+                    value = torch.empty(tuple(parameter.shape), dtype=dtype, device="cpu")
+                    if dtype.is_floating_point:
+                        value.normal_(0, 0.02, generator=generator)
+                    else:
+                        value.zero_()
+                    value = value.to(device)
+                    if key in self._padding:
+                        value[self._padding[key]].zero_()
+                    if quantizer is not None:
+                        owner, _ = self._owners[key]
+                        value = quantizer.quantize(value, distribution=owner.weight_distribution)
+                    resident = nn.Parameter(value, requires_grad=parameter.requires_grad)
+                    for owner, field in self._aliases[key]:
+                        owner._parameters[field] = resident
+                    self._loaded.add(key)
+                loaded.add(name)
+            reports.append(Report(frozenset(loaded), (), (), (), {}))
+        self._buffers()
+        self._fuse()
+        return tuple(reports)
+
+    def close(self) -> None:
+        self._stack.close()
+        self._readers.clear()
+        self._assignments.clear()

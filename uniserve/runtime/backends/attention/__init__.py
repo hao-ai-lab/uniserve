@@ -1,0 +1,190 @@
+"""Prepared attention operators borrowing numerical inputs and cache state."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from importlib import import_module
+
+import torch as torch_lib
+
+from uniserve.cache import mha
+from uniserve.model.inputs import TextSize
+from uniserve.nn.attention.inputs import AttentionInput, DenseInput, PagedInput, SegmentedInput
+from uniserve.tensors import BufferConfig
+
+
+class Operator:
+    """One layer invocation's backend state and borrowed numerical resources."""
+
+    def __init__(self, *, num_heads, num_kv_heads, head_dim, dtype, size, cache, workspace):
+        if min(num_heads, num_kv_heads, head_dim) < 1 or num_heads % num_kv_heads:
+            raise ValueError("attention requires compatible positive query and KV heads")
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.size = size
+        self.cache = cache
+        self.workspace = workspace
+        self._closed = False
+        if cache is not None and cache.key.shape[2:] != (num_kv_heads, head_dim):
+            raise ValueError("prefix state does not match the prepared KV head dimensions")
+
+    def bind(self, batch: AttentionInput) -> None:
+        """Prepare changed numerical metadata without relying on object identity."""
+
+        self._check_batch(batch)
+        if self.requires_host_lengths(batch) and any(
+            lengths is not None and lengths.host is None
+            for lengths in (getattr(batch, name, None) for name in ("queries", "keys", "prefixes"))
+        ):
+            raise ValueError("this attention preparation requires exact host sequence lengths")
+
+    def requires_host_lengths(self, batch: AttentionInput) -> bool:
+        """Whether preparation needs exact CPU sequence lengths.
+
+        Infrastructure supplies missing mirrors before bind/capture. Providers
+        whose kernels consume device offsets directly override this query.
+        """
+
+        return not isinstance(batch, DenseInput)
+
+    def _check_batch(self, batch):
+        if self._closed:
+            raise RuntimeError("attention operator is closed")
+        if not isinstance(batch, DenseInput) and (
+            (
+                batch.queries.num_tokens is not None
+                and batch.queries.num_tokens > self.size.num_tokens
+            )
+            or batch.queries.batch_size > self.size.batch_size
+        ):
+            raise ValueError("attention input exceeds prepared token or sequence capacity")
+        if isinstance(batch, (PagedInput, SegmentedInput)) and self.cache is not None:
+            if batch.block_table.block_size != self.cache.block_size:
+                raise ValueError("attention block table and cache block sizes differ")
+
+    def update_cache(
+        self, k: torch_lib.Tensor, v: torch_lib.Tensor, *, indices: torch_lib.Tensor
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("attention operator is closed")
+        if self.cache is None:
+            raise RuntimeError("attention cache update requires bound prefix state")
+        self.cache.update(k, v, indices=indices)
+
+    def _validate(self, q, k, v, batch, out):
+        # Host-driven provider preparation belongs to bind(), before capture.
+        # The numerical call only validates capacity and borrowed tensor views.
+        self._check_batch(batch)
+        head_axis = 1
+        if (
+            q.ndim not in {3, 4}
+            or q.shape[head_axis] != self.num_heads
+            or q.shape[-1] != self.head_dim
+        ):
+            raise ValueError("query tensor does not match prepared attention dimensions")
+        if (
+            q.dtype != self.dtype
+            or out.shape != q.shape
+            or out.dtype != q.dtype
+            or out.device != q.device
+        ):
+            raise ValueError("attention output and query representation must match")
+        if q.ndim == 3 and q.shape[0] > self.size.num_tokens:
+            raise ValueError("attention queries exceed prepared token capacity")
+        if isinstance(batch, DenseInput):
+            tokens = q.shape[0] if q.ndim == 3 else q.shape[0] * q.shape[2]
+            batches = 1 if q.ndim == 3 else q.shape[0]
+            if tokens > self.size.num_tokens or batches > self.size.batch_size:
+                raise ValueError("dense attention exceeds the prepared token or batch capacity")
+        if k.shape != v.shape or k.device != q.device or v.device != q.device:
+            raise ValueError("key and value tensors must have matching dimensions and devices")
+        kv_axis = 1 if k.ndim == 3 or isinstance(batch, DenseInput) else 2
+        if (
+            k.ndim not in {3, 4}
+            or k.shape[kv_axis] != self.num_kv_heads
+            or k.shape[-1] != self.head_dim
+            or k.dtype != self.dtype
+            or v.dtype != self.dtype
+        ):
+            raise ValueError("key and value tensors do not match prepared head dimensions or dtype")
+
+    def __call__(
+        self,
+        q: torch_lib.Tensor,
+        k: torch_lib.Tensor,
+        v: torch_lib.Tensor,
+        batch: AttentionInput,
+        *,
+        scale: float,
+        out: torch_lib.Tensor,
+    ) -> torch_lib.Tensor:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        self._closed = True
+        self.cache = None
+        self.workspace = {}
+
+
+class Backend:
+    """Factory for independent layer operators and their workspace declarations."""
+
+    operator_class: type[Operator]
+
+    def workspace_buffers(
+        self,
+        *,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch_lib.dtype,
+        size: TextSize,
+        cache: mha.State | None,
+    ) -> Mapping[str, BufferConfig]:
+        return {}
+
+    def prepare(
+        self,
+        *,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch_lib.dtype,
+        size: TextSize,
+        cache: mha.State | None,
+        workspace: Mapping[str, torch_lib.Tensor],
+    ) -> Operator:
+        return self.operator_class(
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            size=size,
+            cache=cache,
+            workspace=workspace,
+        )
+
+
+def resolve(backend: str | Backend, *, device: torch_lib.device, flashinfer=None) -> Backend:
+    """Resolve a provider, preserving an optional configured FlashInfer factory.
+
+    Automatic selection also uses its workspace grant for TensorRT-LLM, whose
+    native kernels consume the same scratch allocation.
+    """
+
+    if isinstance(backend, Backend):
+        return backend
+    if backend == "auto":
+        from ._auto import Backend as _Auto
+
+        return _Auto(device, flashinfer=flashinfer)
+    if backend not in {"torch", "flash_attn", "flash_attn_4", "flashinfer", "trtllm", "sgl_kernel"}:
+        raise ValueError(f"unknown attention backend {backend!r}")
+    if backend == "flashinfer" and flashinfer is not None:
+        return flashinfer
+    factory = import_module(f"{__name__}.{backend}").Backend
+    if backend == "trtllm" and flashinfer is not None:
+        return factory(workspace_size=flashinfer.config.workspace_size)
+    return factory()

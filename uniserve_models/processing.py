@@ -4,13 +4,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
+
+import torch
 
 if TYPE_CHECKING:
-    from uniserve_models.bagel import BagelConfig
-    from uniserve_models.sensenova.config import NeoChatConfig
+    from uniserve_models.bagel import Config as BagelConfig
+    from uniserve_models.sensenova_u1 import Config as U1Config
 
-from uniserve.model.tensors import PositionLayout
+
+class BranchSource(StrEnum):
+    """Choose conditioning content for one guidance branch."""
+
+    CONDITIONING = "conditioning"
+    NEGATIVE_OR_START = "negative_or_start"
+    START = "start"
+
+
+class PositionLayout(StrEnum):
+    """Choose temporal or temporal/spatial coordinates for inserted features."""
+
+    TEMPORAL = "temporal"
+    TEMPORAL_SPATIAL = "temporal_spatial"
 
 
 class FeatureLayout(StrEnum):
@@ -40,7 +56,7 @@ class PatchTransform:
     downsample_ratio: float
     min_pixels: int
     max_pixels: int
-    normalization: str = "imagenet"
+    normalization: Literal["imagenet", "signed_unit"] = "imagenet"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +74,7 @@ class TowerTransform:
     """Combines resize and normalization policy for one image tower."""
 
     resize: StrideResize
-    normalization: str = "signed_unit"
+    normalization: Literal["imagenet", "signed_unit"] = "signed_unit"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +83,7 @@ class ImageProcessor:
 
     vit: PatchTransform | TowerTransform | None = None
     vae: TowerTransform | None = None
-    staging_dtype: str | None = None
+    staging_dtype: torch.dtype | None = None
     feature_injection: FeatureInjection | None = None
 
     def __post_init__(self) -> None:
@@ -79,6 +95,9 @@ class ImageProcessor:
 
 __all__ = [
     "FlowPrompt",
+    "BranchSource",
+    "PositionLayout",
+    "load_tokenizer",
     "bagel_processor",
     "sensenova_processor",
     "stub_processor",
@@ -165,7 +184,7 @@ def bagel_processor(config: BagelConfig) -> ImageProcessor:
     )
 
 
-def sensenova_processor(config: NeoChatConfig) -> ImageProcessor:
+def sensenova_processor(config: U1Config) -> ImageProcessor:
     """Build the checkpoint architecture's caller-owned image transforms."""
 
     return ImageProcessor(
@@ -175,7 +194,7 @@ def sensenova_processor(config: NeoChatConfig) -> ImageProcessor:
             min_pixels=512 * 512,
             max_pixels=2048 * 2048,
         ),
-        staging_dtype="bfloat16",
+        staging_dtype=torch.bfloat16,
         feature_injection=FeatureInjection(
             layout=FeatureLayout.DIRECT,
             positions=PositionLayout.TEMPORAL_SPATIAL,
@@ -199,7 +218,7 @@ def stub_processor() -> ImageProcessor:
         vae=TowerTransform(
             StrideResize(max_size=512, min_size=16, stride=16, max_pixels=512 * 512)
         ),
-        staging_dtype="bfloat16",
+        staging_dtype=torch.bfloat16,
         feature_injection=FeatureInjection(
             layout=FeatureLayout.DIRECT,
             positions=PositionLayout.TEMPORAL_SPATIAL,
@@ -260,3 +279,13 @@ def resolve_input_tokens(
         end_token_id=updates.get("end_token_id", injection.end_token_id),
     )
     return replace(processor, feature_injection=resolved_injection)
+
+
+def load_tokenizer(path: Path):
+    """Load a caller-owned tokenizer from a resolved local checkpoint directory."""
+
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(
+        path, use_fast=False, trust_remote_code=False, local_files_only=True
+    )

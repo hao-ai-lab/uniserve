@@ -5,11 +5,14 @@ from dataclasses import replace
 import pytest
 import torch
 
-from tests.python.fixtures.model_execution import TEST_WORKER_CONFIG
-from uniserve.runtime.kv_cache import KVCacheConfig
-from uniserve_models.stub import StubModel
+from tests.python.fixtures.worker_config import stub_worker_config
+
+from uniserve_models.stub import Model
+from uniserve_models.processing import stub_processor
 from uniserve_worker.bootstrap.capacity import derive_runtime_kv_capacity
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
+
+TEST_WORKER_CONFIG = stub_worker_config(64, max_batch_tokens=8192)
 
 pytestmark = pytest.mark.unit
 
@@ -28,18 +31,8 @@ def fixed_device_total(monkeypatch):
     )
 
 
-def _model() -> StubModel:
-    model = StubModel()
-    model.text_backbone.cache_config = KVCacheConfig(
-        num_layers=32,
-        num_kv_heads=8,
-        total_kv_heads=8,
-        kv_head_offset=0,
-        head_dim=8,
-        dtype=torch.bfloat16,
-        total_layers=32,
-    )
-    return model
+def _model() -> Model:
+    return Model()
 
 
 def _worker_config(*, token_capacity: int | None):
@@ -96,7 +89,6 @@ def test_automatic_cuda_kv_capacity_requires_a_host_grant():
 
 def test_automatic_capacity_charges_request_and_input_storage() -> None:
     model = _model()
-    model.generation = None
     config = replace(
         _worker_config(token_capacity=None),
         pool_memory_bytes=32 * 1024**3,
@@ -123,8 +115,9 @@ def test_explicit_pages_cannot_displace_resident_encoder_storage() -> None:
         max_batch_operations=4,
         max_batch_tokens=64,
     )
-    build_worker_info(model, config)
-    # The feature arena is resident independently of how many KV pages are requested.
-    model.max_vit_grid_tokens = 1024**3
+    processor = stub_processor()
+    build_worker_info(model, config, image_processor=processor)
+    # The processor's admitted image area owns the complete resident feature bound.
+    processor = replace(processor, vit=replace(processor.vit, max_pixels=1024**3 * 16**2))
     with pytest.raises(ValueError, match="grant"):
-        build_worker_info(model, config)
+        build_worker_info(model, config, image_processor=processor)

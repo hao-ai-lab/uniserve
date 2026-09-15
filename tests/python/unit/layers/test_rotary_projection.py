@@ -1,0 +1,255 @@
+"""Public rotary and QKV calls preserve frequency and normalization domains."""
+
+import pytest
+import torch
+from torch.nn import functional as F
+
+from uniserve.nn import RMSNorm, RotaryEmbedding
+from uniserve.nn.attention import AxialQKVProjection, QKVProjection, RotaryQKVProjection
+from uniserve.nn.functional import apply_rotary, qk_norm_rope
+from uniserve.nn.linear import QKVParallelLinear
+from uniserve.nn.rope import DynamicScaling, LinearScaling, LongRoPEScaling
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_partial_qk_rotation_normalizes_the_complete_head_in_place(device):
+    generator = torch.Generator().manual_seed(182)
+    projected = torch.randn(67, 3, 4, 128, generator=generator).to(device, torch.bfloat16)
+    query, key, _, _ = projected.unbind(2)
+    weights = tuple(torch.randn(128, generator=generator).to(device) for _ in range(2))
+    phase = torch.randn(67, 48, generator=generator).to(device)
+    cosine, sine = phase.cos(), phase.sin()
+    expected = []
+    for value, weight in zip((query, key), weights, strict=True):
+        normalized = value.double()
+        normalized = normalized * torch.rsqrt(normalized.square().mean(-1, keepdim=True) + 1e-5)
+        normalized = normalized * weight.double()
+        expected.append(
+            torch.cat(
+                (
+                    _rotate(normalized[..., :96], cosine.double(), sine.double(), "split"),
+                    normalized[..., 96:],
+                ),
+                dim=-1,
+            ).to(value.dtype)
+        )
+    with torch.inference_mode():
+        actual = qk_norm_rope(
+            query,
+            key,
+            *weights,
+            (cosine,),
+            (sine,),
+            eps=1e-5,
+            axis_dims=(128,),
+            out=(query, key),
+        )
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, reference, rtol=2e-2, atol=2e-2)
+
+
+def _rotate(value, cos, sin, rotation):
+    if rotation == "split":
+        left, right = value.chunk(2, dim=-1)
+        turned = torch.cat((-right, left), dim=-1)
+        cosine, sine = torch.cat((cos, cos), dim=-1), torch.cat((sin, sin), dim=-1)
+    else:
+        turned = torch.stack((-value[..., 1::2], value[..., ::2]), dim=-1).flatten(-2)
+        cosine, sine = cos.repeat_interleave(2, dim=-1), sin.repeat_interleave(2, dim=-1)
+    return value * cosine.unsqueeze(-2) + turned * sine.unsqueeze(-2)
+
+
+@pytest.mark.parametrize("rotation", ["split", "interleaved"])
+def test_partial_rotary_preserves_trailing_features_and_output(rotation):
+    value = torch.arange(3 * 2 * 10).reshape(3, 2, 10).float() / 7
+    positions = torch.tensor([0, 2, 5])
+    rotary = RotaryEmbedding(8, theta=100)
+    cosine, sine = rotary(positions, dtype=torch.float32, sequence_length=6)
+    frequencies = 100 ** (-torch.arange(0, 8, 2).float() / 8)
+    torch.testing.assert_close(cosine, torch.cos(positions[:, None] * frequencies), rtol=0, atol=0)
+    expected = torch.cat((_rotate(value[..., :8], cosine, sine, rotation), value[..., 8:]), dim=-1)
+    out = torch.empty(3, 2, 20)[..., ::2]
+    assert apply_rotary(value, cosine, sine, rotation=rotation, out=out) is out
+    torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_dynamic_rotary_calls_do_not_change_another_sequence_frequency_domain(device):
+    positions = torch.tensor([0, 2, 4], device=device)
+    rotary = RotaryEmbedding(
+        8, theta=100, scaling=DynamicScaling(2), max_position_embeddings=8, device=device
+    )
+    for length in (8, 32, 16, 8):
+        base = 100 * (2 * max(length, 8) / 8 - 1) ** (8 / 6)
+        phase = positions[:, None] * base ** (-torch.arange(0, 8, 2, device=device).float() / 8)
+        actual = rotary(positions, dtype=torch.float32, sequence_length=length)
+        torch.testing.assert_close(actual[0], phase.cos())
+        torch.testing.assert_close(actual[1], phase.sin())
+
+
+@pytest.mark.parametrize(
+    ("position_dtype", "output_dtype", "shape"),
+    [
+        (torch.int64, torch.float32, (2, 3)),
+        (torch.int32, torch.bfloat16, (6,)),
+        (torch.float64, torch.float16, (2, 3)),
+        (torch.float32, torch.float64, ()),
+        (torch.float16, torch.float32, (6,)),
+        (torch.bfloat16, torch.float32, (0, 3)),
+    ],
+)
+def test_rotary_factors_preserve_position_views_and_fp32_phase(position_dtype, output_dtype, shape):
+    # Position coordinates need not be contiguous, positive or integral. Large
+    # phases also exercise the full trigonometric range reduction domain.
+    values = torch.tensor([-1000003, -3.25, 0, 2.5, 7, 100003], device="cuda")
+    if position_dtype == torch.float16:
+        values = values.clamp(-60000, 60000)
+    storage = torch.empty(12, dtype=position_dtype, device="cuda")
+    storage[::2] = values
+    positions = storage[::2]
+    if not shape:
+        positions = positions[0]
+    elif shape[0] == 0:
+        positions = positions[:0].reshape(shape)
+    else:
+        positions = positions.reshape(shape)
+        if len(shape) == 2:
+            positions = positions.transpose(0, 1)
+    rotary = RotaryEmbedding(12, theta=100, attention_scale=1.25, keep_freq_range=True).cuda()
+    # Frequencies are constructed on CPU and transferred with the module;
+    # recomputing pow on CUDA can change their last bit before phase formation.
+    frequency = (1 / (100 ** (torch.arange(0, 24, 2).float() / 24)))[::2].cuda()
+    phase = positions.float().unsqueeze(-1) * frequency
+    expected = ((phase.cos() * 1.25).to(output_dtype), (phase.sin() * 1.25).to(output_dtype))
+    actual = rotary(positions, dtype=output_dtype, sequence_length=1000004)
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, reference, rtol=0, atol=0)
+
+
+def test_rotary_factors_read_changed_positions_on_graph_replay():
+    rotary = RotaryEmbedding(128, theta=1000000).cuda()
+    positions = torch.arange(40, device="cuda", dtype=torch.int64)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        rotary(positions, dtype=torch.bfloat16, sequence_length=4096)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = rotary(positions, dtype=torch.bfloat16, sequence_length=4096)
+    frequencies = (1 / (1000000 ** (torch.arange(0, 128, 2).float() / 128))).cuda()
+    for offset in (31, 1024):
+        positions.add_(offset)
+        graph.replay()
+        phase = positions.float()[:, None] * frequencies
+        for value, reference in zip(actual, (phase.cos(), phase.sin()), strict=True):
+            torch.testing.assert_close(value, reference.to(torch.bfloat16), rtol=0, atol=0)
+
+
+def test_longrope_switches_by_explicit_length_and_constants_have_the_same_values():
+    scaling = LongRoPEScaling(2, 8, 1.25, (1, 2, 3, 4), (2, 4, 6, 8))
+    rotary = RotaryEmbedding(8, theta=100, scaling=scaling, max_position_embeddings=16)
+    positions = torch.tensor([0, 2, 4])
+    base = 100 ** (-torch.arange(0, 8, 2).float() / 8)
+    for length, factors in (
+        (8, scaling.short_factor),
+        (16, scaling.long_factor),
+        (8, scaling.short_factor),
+    ):
+        phase = positions[:, None] * base / torch.tensor(factors)
+        cosine, sine = rotary(positions, dtype=torch.float32, sequence_length=length)
+        torch.testing.assert_close(cosine, phase.cos() * 1.25)
+        torch.testing.assert_close(sine, phase.sin() * 1.25)
+    storage = {
+        name: torch.empty(item.shape, dtype=item.dtype)
+        for name, item in rotary.constant_buffers(16).items()
+    }
+    rotary.prepare_constants(16, out=storage)
+    expected = rotary(torch.arange(16), dtype=torch.float32, sequence_length=16)
+    torch.testing.assert_close(storage["cos"], expected[0])
+    torch.testing.assert_close(storage["sin"], expected[1])
+
+
+@pytest.mark.parametrize("kind", ["unrotated", "rotary", "axial"])
+def test_qkv_composition_preserves_heads_and_full_normalization(kind):
+    projection = QKVParallelLinear(8, 4, 2, 8, dtype=torch.float32)
+    hidden = torch.arange(24).reshape(3, 8).float() / 17
+    query_norm, key_norm = RMSNorm(8, 1e-5), RMSNorm(8, 1e-5)
+    positions = torch.tensor([1, 3, 6])
+    if kind == "unrotated":
+        network, dims, rotations, cos, sin = QKVProjection(projection), (), (), (), ()
+    else:
+        dims = (8,) if kind == "rotary" else (4, 4)
+        rotations = ("split",) if kind == "rotary" else ("interleaved", "split")
+        network = (
+            RotaryQKVProjection(projection, query_norm, key_norm)
+            if kind == "rotary"
+            else AxialQKVProjection(
+                projection, query_norm, key_norm, axis_dims=dims, rotations=rotations
+            )
+        )
+        pairs = tuple(
+            RotaryEmbedding(width, scaling=LinearScaling(2))(
+                positions, dtype=torch.float32, sequence_length=7
+            )
+            for width in dims
+        )
+        cos, sin = tuple(pair[0] for pair in pairs), tuple(pair[1] for pair in pairs)
+    expected = []
+    for name in ("q", "k", "v"):
+        layer = projection.projections[name]
+        value = F.linear(hidden, layer.weight, layer.bias).reshape(3, -1, 8)
+        if name != "v" and kind != "unrotated":
+            value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-5)
+            value = torch.cat(
+                tuple(
+                    _rotate(part, cosine, sine, rotation)
+                    for part, cosine, sine, rotation in zip(
+                        value.split(dims, dim=-1), cos, sin, rotations, strict=True
+                    )
+                ),
+                dim=-1,
+            )
+        expected.append(value)
+    for actual, reference in zip(network(hidden, cos, sin), expected, strict=True):
+        torch.testing.assert_close(actual, reference)
+
+
+def test_axial_projection_preserves_independent_normalization_domains():
+    projection = QKVParallelLinear(8, 2, 1, 8, dtype=torch.float32)
+    hidden = torch.arange(16).reshape(2, 8).float() / 17
+    query_norm = torch.nn.ModuleList((RMSNorm(4, 1e-5), RMSNorm(4, 1e-5)))
+    key_norm = torch.nn.ModuleList((RMSNorm(4, 1e-5), RMSNorm(4, 1e-5)))
+    network = AxialQKVProjection(
+        projection, query_norm, key_norm, axis_dims=(4, 2, 2), rotations=("split",) * 3
+    )
+    pairs = tuple(
+        RotaryEmbedding(width)(torch.tensor([1, 2]), dtype=torch.float32, sequence_length=3)
+        for width in (4, 2, 2)
+    )
+    cosine, sine = tuple(pair[0] for pair in pairs), tuple(pair[1] for pair in pairs)
+    expected = []
+    for name in ("q", "k", "v"):
+        layer = projection.projections[name]
+        value = F.linear(hidden, layer.weight, layer.bias).reshape(2, -1, 8)
+        if name != "v":
+            # The two spatial axes share one four-channel RMS denominator;
+            # neither the temporal half nor the individual spatial axis does.
+            domains = value.reshape(2, -1, 2, 4)
+            normalized = (
+                domains * torch.rsqrt(domains.square().mean(-1, keepdim=True) + 1e-5)
+            ).reshape_as(value)
+            value = torch.cat(
+                tuple(
+                    _rotate(part, cos, sin, "split")
+                    for part, cos, sin in zip(
+                        normalized.split((4, 2, 2), dim=-1), cosine, sine, strict=True
+                    )
+                ),
+                dim=-1,
+            )
+        expected.append(value)
+    for actual, target in zip(network(hidden, cosine, sine), expected, strict=True):
+        torch.testing.assert_close(actual, target)

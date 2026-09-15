@@ -7,8 +7,13 @@ from typing import Any
 import torch
 
 
-class CudaError(RuntimeError):
+class CUDAError(RuntimeError):
     """A CUDA resource or operation could not satisfy its required contract."""
+
+    def __init__(self, message: str, *, code: int | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 def driver() -> Any:
@@ -17,7 +22,7 @@ def driver() -> Any:
     try:
         from cuda.bindings import driver  # pyright: ignore[reportAttributeAccessIssue]
     except ImportError as error:  # pragma: no cover - CUDA configurations install cuda-python.
-        raise CudaError("CUDA driver operations require cuda-python") from error
+        raise CUDAError("CUDA driver operations require cuda-python") from error
     return driver
 
 
@@ -29,7 +34,9 @@ def cuda_status(result: tuple[Any, ...], operation: str) -> None:
         return
     name_result = cu.cuGetErrorName(result[0])
     name = str(name_result[1]) if name_result[0] == cu.CUresult.CUDA_SUCCESS else str(result[0])
-    raise CudaError(f"{operation} failed: {name}")
+    message_result = cu.cuGetErrorString(result[0])
+    message = str(message_result[1]) if message_result[0] == cu.CUresult.CUDA_SUCCESS else name
+    raise CUDAError(f"{operation} failed: {name}: {message}", code=int(result[0]))
 
 
 def cuda_value(result: tuple[Any, ...], operation: str) -> Any:
@@ -39,11 +46,11 @@ def cuda_value(result: tuple[Any, ...], operation: str) -> Any:
     return result[1]
 
 
-def verify_graph_context(graph: torch.cuda.CUDAGraph, expected_context: int | None) -> int:
-    """Prove every kernel node in a captured graph belongs to the supplied CUDA context."""
+def verify_graph_context(graph: torch.cuda.CUDAGraph, contexts: frozenset[int]) -> int:
+    """Verify kernels belong to the execution context's actual device bindings."""
 
-    if expected_context is None:
-        return 0
+    if not contexts:
+        raise ValueError("CUDA graph verification requires its bound contexts")
     cu = driver()
     raw_graph = graph.raw_cuda_graph()
     nodes_result = cu.cuGraphGetNodes(cu.CUgraph(raw_graph), 1 << 20)
@@ -56,18 +63,18 @@ def verify_graph_context(graph: torch.cuda.CUDAGraph, expected_context: int | No
         if node_type != cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
             continue
         params = cuda_value(cu.cuGraphKernelNodeGetParams(node), "query kernel node context")
-        if int(params.ctx) != int(expected_context):
+        if int(params.ctx) not in contexts:
             name_result = (
                 cu.cuFuncGetName(params.func)
                 if int(params.func)
                 else cu.cuKernelGetName(params.kern)
             )
             name = name_result[1] if name_result[0] == cu.CUresult.CUDA_SUCCESS else "unknown"
-            raise CudaError(
+            raise CUDAError(
                 f"captured compute node {name!r} escaped its owning context: "
-                f"actual={int(params.ctx):#x}, expected={int(expected_context):#x}"
+                f"actual={int(params.ctx):#x}, expected={sorted(hex(value) for value in contexts)}"
             )
         kernels += 1
-    if kernels == 0:
-        raise CudaError("captured CUDA graph contains no compute node")
+    # Empty token partitions and copy-only computations are valid graphs.
+    # Their lack of kernels does not violate device-context containment.
     return kernels

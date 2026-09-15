@@ -1,5 +1,18 @@
-"""Shared VAE/autoencoder layers."""
+"""Shared latent codecs and spatial numerical layers."""
 
-from uniserve.nn.vae.autoencoder import FLUX_VAE_CONFIG, AutoEncoder, AutoEncoderConfig
+from .decoder import LatentDecoder
+from .spatial import SpatialDecoder
+from .layers import AttentionBlock, DiagonalGaussian, Downsample, ResidualBlock, Upsample
+from .patch import PatchAutoencoder, RGBDecoder
 
-__all__ = ["FLUX_VAE_CONFIG", "AutoEncoder", "AutoEncoderConfig"]
+__all__ = [
+    "LatentDecoder",
+    "SpatialDecoder",
+    "AttentionBlock",
+    "DiagonalGaussian",
+    "Downsample",
+    "ResidualBlock",
+    "Upsample",
+    "PatchAutoencoder",
+    "RGBDecoder",
+]

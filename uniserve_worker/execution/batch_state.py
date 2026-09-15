@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from threading import Lock
@@ -72,6 +73,7 @@ class BatchState:
     completed_groups: set[int] = field(default_factory=set)
     accepted_groups: set[int] = field(default_factory=set)
     group_buffers: dict[int, OutputBuffer] = field(default_factory=dict)
+    group_streams: dict[int, torch.cuda.Stream] = field(default_factory=dict)
     group_started_ns: dict[int, int] = field(default_factory=dict)
     group_forward_stats: dict[int, list[ForwardStats]] = field(default_factory=dict)
     group_component_us: dict[int, dict[str, int]] = field(default_factory=dict)
@@ -117,6 +119,12 @@ class BatchState:
         """Borrow original operation values belonging to one completion group."""
 
         return tuple(self.batch.operations[index] for index in self.output_groups[group])
+
+    def group_scope(self, group: int):
+        """Keep numerical access and its retirement fences on the selected stream."""
+
+        stream = self.group_streams.get(group)
+        return nullcontext() if stream is None else torch.cuda.stream(stream)
 
     def bind_outputs(
         self, group: int, outputs: tuple[PendingOutput, ...], buffer: OutputBuffer, started_ns: int

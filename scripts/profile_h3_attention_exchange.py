@@ -1,16 +1,15 @@
 from __future__ import annotations
 
+from uniserve.distributed import DeviceMesh
 import json
 import os
 
 import torch
 import torch.distributed as dist
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from uniserve.runtime import TensorBuffers, initialize_process_groups
+from uniserve.tensors import BufferConfig
 
-from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
+from uniserve_worker.parallel import ParallelConfig, SequenceParallel
 from uniserve.ops.video_sparse import compose_to_head_shards, unpack_add_compression
 
 
@@ -70,28 +69,37 @@ def main() -> None:
     candidate_output = torch.empty_like(reference)
     sync_input = torch.full((1,), rank, device=device, dtype=torch.int32)
     sync_output = torch.empty((world,), device=device, dtype=torch.int32)
-    environment = init_distributed_environment(
+    environment = initialize_process_groups(
         rank=rank, local_rank=rank, world_size=world, device=str(device)
     )
-    mesh = initialize_model_parallel(
-        environment,
-        {
-            "denoiser": (
-                tuple(range(world)),
-                ParallelConfig(sequence_parallel=SequenceParallel("ulysses", (world,))),
-            ),
-        },
-    )["denoiser"]
-    workspace = environment.symmetric_memory(
-        mesh.get_group("sp"),
-        (local_rows, global_heads, width),
-        dtype=torch.bfloat16,
-        name="profile_video_attention_heads",
-        layout=(),
-    )
+    bound_meshes = {}
+    for mesh_name, (mesh_ranks, mesh_parallel) in sorted(
+        (
+            {
+                "denoiser": (
+                    tuple(range(world)),
+                    ParallelConfig(sequence_parallel=SequenceParallel("ulysses", (world,))),
+                )
+            }
+        ).items()
+    ):
+        topology = DeviceMesh(
+            ranks=mesh_ranks,
+            shape=tuple(size for _, size in mesh_parallel.dimensions),
+            axes=tuple(axis for axis, _ in mesh_parallel.dimensions),
+            rank=environment.rank,
+        )
+        bound_mesh = environment.bind(topology, device=environment.device)
+        if environment.rank in mesh_ranks:
+            bound_meshes[mesh_name] = bound_mesh
+    mesh = bound_meshes["denoiser"]
+    group = mesh.get_group("ulysses")
+    schema = {"output": BufferConfig((local_rows, global_heads, width), torch.bfloat16)}
+    workspace = TensorBuffers.allocate(schema, device=device, symmetric={"output": group})
+    local = workspace.view(schema)["output"]
 
     def collective_fence() -> None:
-        workspace.fence(sync_input, sync_output)
+        group.all_gather(sync_input, out=sync_output)
 
     def baseline_once(layer_gate: torch.Tensor) -> None:
         unpack_add_compression(attended, layer_gate, compressed, local_output)
@@ -104,11 +112,11 @@ def main() -> None:
             attended,
             layer_gate,
             compressed,
-            workspace.peers,
+            workspace.peers("output"),
             rank,
         )
         collective_fence()
-        candidate_output.copy_(workspace.local)
+        candidate_output.copy_(local)
         collective_fence()
 
     def baseline() -> None:

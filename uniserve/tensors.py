@@ -1,89 +1,38 @@
-"""Numerical tensor regions shared by computation and storage callers."""
+"""Numerical buffer requirements and borrowed tensor outputs."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
-from math import prod
+from math import isfinite, prod
 
 import torch
 
+from uniserve import _slices
 
-@dataclass(frozen=True, slots=True)
-class TensorRegion:
-    """A nonempty rectangular region, measured in logical tensor elements."""
 
-    offset: tuple[int, ...]
-    shape: tuple[int, ...]
+def _join_channels(values, *, copy: bool = True):
+    """Borrow adjacent channel views, or concatenate unrelated output storage."""
 
-    def __post_init__(self) -> None:
+    first = values[0]
+    position = first.storage_offset()
+    storage = first.untyped_storage().data_ptr()
+    for value in values:
         if (
-            not self.shape
-            or len(self.offset) != len(self.shape)
-            or any(start < 0 for start in self.offset)
-            or any(extent < 1 for extent in self.shape)
+            value.shape[:-1] != first.shape[:-1]
+            or value.stride()[:-1] != first.stride()[:-1]
+            or value.stride(-1) != 1
+            or value.dtype != first.dtype
+            or value.device != first.device
+            or value.untyped_storage().data_ptr() != storage
+            or value.storage_offset() != position
         ):
-            raise ValueError("tensor region has invalid bounds")
-
-    def within(self, shape: tuple[int, ...]) -> bool:
-        return len(shape) == len(self.shape) and all(
-            start + extent <= bound
-            for start, extent, bound in zip(self.offset, self.shape, shape, strict=True)
+            break
+        position += value.shape[-1]
+    else:
+        return first.as_strided(
+            (*first.shape[:-1], sum(value.shape[-1] for value in values)), first.stride()
         )
-
-    def intersection(self, other: TensorRegion) -> TensorRegion | None:
-        if len(self.shape) != len(other.shape):
-            raise ValueError("tensor regions have different dimensions")
-        start = tuple(max(a, b) for a, b in zip(self.offset, other.offset, strict=True))
-        end = tuple(
-            min(a + n, b + m)
-            for a, n, b, m in zip(self.offset, self.shape, other.offset, other.shape, strict=True)
-        )
-        if any(a >= b for a, b in zip(start, end, strict=True)):
-            return None
-        return TensorRegion(start, tuple(b - a for a, b in zip(start, end, strict=True)))
-
-    def subtract(self, covered: TensorRegion) -> tuple[TensorRegion, ...]:
-        """Partition the remainder without duplicating overlapping replica reads."""
-
-        intersection = self.intersection(covered)
-        if intersection is None:
-            return (self,)
-        start = list(self.offset)
-        end = [a + n for a, n in zip(self.offset, self.shape, strict=True)]
-        remaining = []
-        for axis, (low, extent) in enumerate(
-            zip(intersection.offset, intersection.shape, strict=True)
-        ):
-            high = low + extent
-            if start[axis] < low:
-                piece_end = end.copy()
-                piece_end[axis] = low
-                remaining.append(
-                    TensorRegion(
-                        tuple(start), tuple(b - a for a, b in zip(start, piece_end, strict=True))
-                    )
-                )
-                start[axis] = low
-            if high < end[axis]:
-                piece_start = start.copy()
-                piece_start[axis] = high
-                remaining.append(
-                    TensorRegion(
-                        tuple(piece_start),
-                        tuple(b - a for a, b in zip(piece_start, end, strict=True)),
-                    )
-                )
-                end[axis] = high
-        return tuple(remaining)
-
-    def relative_to(self, origin: tuple[int, ...]) -> TensorRegion:
-        return TensorRegion(
-            tuple(a - b for a, b in zip(self.offset, origin, strict=True)), self.shape
-        )
-
-    def slices(self) -> tuple[slice, ...]:
-        return tuple(slice(a, a + n) for a, n in zip(self.offset, self.shape, strict=True))
+    return torch.cat(values, dim=-1) if copy else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,27 +73,20 @@ class BufferConfig:
         )
 
 
-class ImageRange(StrEnum):
-    """Whether image samples use signed-unit or unit numerical values."""
-
-    SIGNED_UNIT = "signed_unit"
-    UNIT = "unit"
-
-
 @dataclass(frozen=True, slots=True)
 class OutputLayout:
-    """Global output representation and this rank's optional rectangular region.
+    """Global output representation and this rank's rectangular slice.
 
     Variable axes describe bounded output extents for a numerical input size.
-    A local region never reduces the global capacity needed to assemble shards.
+    A local slice never reduces the global capacity needed to assemble shards.
     Returned tensors own or borrow their actual storage independently of this value.
     """
 
     shape: tuple[int, ...]
     dtype: torch.dtype
-    region: TensorRegion | None = None
+    local_slice: tuple[slice, ...]
     variable_axes: tuple[int, ...] = ()
-    value_range: ImageRange | None = None
+    value_range: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.shape, tuple) or any(
@@ -162,5 +104,25 @@ class OutputLayout:
             )
         ):
             raise ValueError("variable output axes must be distinct axes of the global shape")
-        if self.region is not None and not self.region.within(self.shape):
-            raise ValueError("output region must lie within its global shape")
+        if not _slices.within(self.local_slice, self.shape):
+            raise ValueError("output slice must lie within its global shape")
+        if self.value_range is not None and (
+            len(self.value_range) != 2
+            or not all(isfinite(value) for value in self.value_range)
+            or self.value_range[0] >= self.value_range[1]
+        ):
+            raise ValueError("output value range must be a finite increasing interval")
+
+
+@dataclass(frozen=True, slots=True)
+class TensorOutput:
+    """Borrow a numerical tensor and its position within the complete result."""
+
+    tensor: torch.Tensor
+    layout: OutputLayout
+
+    def __post_init__(self) -> None:
+        if tuple(self.tensor.shape) != _slices.shape(self.layout.local_slice):
+            raise ValueError("output tensor shape must match its local slice")
+        if self.tensor.dtype != self.layout.dtype:
+            raise ValueError("output tensor dtype must match its layout")

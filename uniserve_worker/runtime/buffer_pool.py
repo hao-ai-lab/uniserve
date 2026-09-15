@@ -60,10 +60,17 @@ class BufferPool:
         if not normalized:
             normalized.append(torch.device("cpu"))
         self.devices = tuple(normalized)
-        self._arenas = {
-            str(device): torch.empty((self.byte_capacity,), dtype=torch.uint8, device=device)
-            for device in self.devices
-        }
+        self._arenas = {}
+        for device in self.devices:
+            if device.type == "cuda":
+                from uniserve_kernel.peer_memory import empty
+
+                # Publications borrow these persistent allocations directly.
+                # Their physical mappings retire independently of model streams.
+                arena = empty((self.byte_capacity,), dtype=torch.uint8, device=device)
+            else:
+                arena = torch.empty((self.byte_capacity,), dtype=torch.uint8, device=device)
+            self._arenas[str(device)] = arena
         self._active: dict[tuple[str, BufferId], BufferBinding] = {}
         self._next_binding_id = 1
         self._lock = RLock()
@@ -162,7 +169,7 @@ class BufferPool:
             self._active.pop(key)
 
     def close(self) -> None:
-        """Drop all logical bindings and release every persistent device arena."""
+        """Release arenas after the caller retires their device uses and reader grants."""
 
         with self._lock:
             self._active.clear()

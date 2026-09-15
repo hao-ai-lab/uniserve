@@ -1,0 +1,114 @@
+"""Logical token partitions and head exchange over borrowed communicators."""
+
+from dataclasses import dataclass
+
+import torch
+
+from .mesh import Communicator
+
+
+@dataclass(frozen=True)
+class _TokenShard:
+    num_tokens: int
+    group: Communicator
+
+    def __post_init__(self):
+        if self.num_tokens < 0:
+            raise ValueError("the complete token count cannot be negative")
+
+    @property
+    def capacity(self):
+        return (self.num_tokens + self.group.size - 1) // self.group.size
+
+    @property
+    def token_slice(self):
+        start = min(self.num_tokens, self.capacity * self.group.rank)
+        return slice(start, min(self.num_tokens, start + self.capacity))
+
+    @property
+    def count(self):
+        interval = self.token_slice
+        return interval.stop - interval.start
+
+    def local(self, value, *, dim=0):
+        if value.shape[dim] != self.num_tokens:
+            raise ValueError("the input does not cover the complete token domain")
+        return value.narrow(dim, self.token_slice.start, self.count)
+
+    def pad(self, value):
+        if value.shape[0] != self.count:
+            raise ValueError("the input does not match its local token interval")
+        if self.count == self.capacity:
+            return value.contiguous()
+        result = value.new_zeros((self.capacity, *value.shape[1:]))
+        result[: self.count].copy_(value)
+        return result
+
+    def gather(self, value):
+        if self.group.size == 1 or self.num_tokens == 0:
+            return value
+        return self.group.all_gather(self.pad(value), dim=0)[: self.num_tokens]
+
+
+class _HeadExchange:
+    """Exchange token ownership for heads, including adjacent GQA replicas."""
+
+    def __init__(self, group):
+        self.group = group
+
+    def head_slice(self, heads):
+        if heads < self.group.size:
+            if self.group.size % heads:
+                raise ValueError("replicated KV heads must divide Ulysses membership")
+            start = self.group.rank // (self.group.size // heads)
+            return slice(start, start + 1)
+        if heads % self.group.size:
+            raise ValueError("attention heads must divide Ulysses membership")
+        count = heads // self.group.size
+        return slice(self.group.rank * count, (self.group.rank + 1) * count)
+
+    def heads(self, value, *, storage=None, role):
+        if value.ndim != 3 or value.shape[1] < 1:
+            raise ValueError("head exchange requires [tokens, heads, features]")
+        if self.group.size == 1:
+            return value
+        if value.shape[0] == 0:
+            return value[:, self.head_slice(value.shape[1])]
+        tokens, heads, features = value.shape
+        interval = self.head_slice(heads)
+        if heads < self.group.size:
+            value = value.repeat_interleave(self.group.size // heads, dim=1)
+        width = interval.stop - interval.start
+        source = value.view(tokens, self.group.size, width, features).transpose(0, 1)
+        if storage is None:
+            outgoing, incoming = source.contiguous(), None
+        else:
+            outgoing = storage.view(f"{role}_send", tuple(source.shape), value)
+            incoming = storage.view(f"{role}_receive", tuple(source.shape), value)
+            outgoing.copy_(source)
+        splits = (1,) * self.group.size
+        result = self.group.all_to_all(
+            outgoing, input_splits=splits, output_splits=splits, out=incoming
+        )
+        return result.reshape(tokens * self.group.size, width, features)
+
+    def tokens(self, value, *, storage=None):
+        if value.ndim != 3 or value.shape[0] % self.group.size:
+            raise ValueError("attention output tokens must divide Ulysses membership")
+        if self.group.size == 1:
+            return value
+        if value.shape[0] == 0:
+            return value.new_empty((0, value.shape[1] * self.group.size, value.shape[2]))
+        tokens = value.shape[0] // self.group.size
+        heads, features = value.shape[1:]
+        outgoing = value.reshape(self.group.size, tokens, heads, features).contiguous()
+        incoming = (
+            None
+            if storage is None
+            else storage.view("output_receive", tuple(outgoing.shape), value)
+        )
+        splits = (1,) * self.group.size
+        result = self.group.all_to_all(
+            outgoing, input_splits=splits, output_splits=splits, out=incoming
+        )
+        return result.transpose(0, 1).reshape(tokens, heads * self.group.size, features)

@@ -355,6 +355,8 @@ impl SimEngine {
             latent_page_units: 64,
             latent_pages: 1_025,
             buffer_pool_bytes: 257_u64 * (256 << 20),
+            encoder_cache_entries: 256,
+            encoder_entry_bytes: 256 << 20,
             max_batch_ops: 1024,
             max_unresolved_ops: 2,
             model_name: "sim".to_owned(),

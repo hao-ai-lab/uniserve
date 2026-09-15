@@ -30,7 +30,7 @@ def test_encoded_pixels_match_channel_normalization(normalization, patches, devi
         if patches
         else TowerTransform(StrideResize(32, 24, 1, 24 * 32), normalization)
     )
-    processor = ImageProcessor(vit=transform, staging_dtype=dtype)
+    processor = ImageProcessor(vit=transform, staging_dtype=getattr(torch, dtype))
 
     result = prepare_image(
         processor,

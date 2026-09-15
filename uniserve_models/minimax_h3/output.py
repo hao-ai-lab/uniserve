@@ -1,113 +1,93 @@
-"""H3 temporal windows and RGB reconstruction over borrowed tensor views."""
+"""H3 output raster and sampling clocks."""
 
-from __future__ import annotations
+from collections.abc import Mapping
+from dataclasses import dataclass
 
 import torch
-from torch import nn
 
-from uniserve.model.media import DecodeWindow, VideoInfo, VideoSize
-from uniserve.model.tensors import TensorViews
-from uniserve.model.video import VideoMixin
+from uniserve.media import image
+from uniserve.model import VideoPostprocessor as BaseVideoPostprocessor
 from uniserve.tensors import BufferConfig, OutputLayout
-from uniserve_models.minimax_h3.layout import validate_frames
 
 
-class VideoOutput(VideoMixin, nn.Module):
-    """Combine fixed video timing with the shared window blending computation."""
+@dataclass(frozen=True, slots=True)
+class Config:
+    frame_size: image.Config = image.Config(768, 1344)
+    frame_rate: int = 24
+    sample_rate: int = 32000
 
-    def __init__(
-        self, *, width: int, height: int, frame_rate: int, audio_rate: int, frame_limit: int
-    ) -> None:
-        super().__init__()
-        self.width = width
-        self.height = height
-        self.frame_rate = frame_rate
-        self.audio_rate = audio_rate
-        self.frame_limit = frame_limit
-        self.output_capacity = self.video_info(frame_limit)
-        self.decode_frame_capacity = frame_limit
+    def __post_init__(self):
+        if any(
+            type(value) is not int or value < 1 for value in (self.frame_rate, self.sample_rate)
+        ):
+            raise ValueError("media sampling clocks must be positive integers")
 
-    def video_info(self, frames: int) -> VideoInfo:
-        validate_frames(frames)
-        if frames > self.frame_limit:
-            raise ValueError("H3 output exceeds configured frame capacity")
-        return VideoInfo(
-            frame_count=frames,
-            width=self.width,
-            height=self.height,
-            frame_rate=self.frame_rate,
-            audio_rate=self.audio_rate,
-        )
 
-    def decode_windows(self, video: VideoInfo) -> tuple[DecodeWindow, ...]:
-        """Partition output into 17-frame bodies and the final five-frame overlap."""
+def frame_slices(num_frames: int) -> tuple[slice, ...]:
+    """Partition a complete H3 timeline into 17-frame bodies and its final overlap."""
+    if type(num_frames) is not int or num_frames < 22 or num_frames % 17 != 5:
+        raise ValueError("H3 frame count must have the form 17 * n + 5 with n positive")
+    count = (num_frames - 5) // 17
+    return tuple(
+        slice(index * 17, (index + 1) * 17 + (5 if index + 1 == count else 0))
+        for index in range(count)
+    )
 
-        if video != self.video_info(video.frame_count):
-            raise ValueError("H3 decode windows require the configured raster and frame rates")
-        return decode_windows(video.frame_count)
 
-    def output_layout(self, size: VideoSize) -> dict[str, OutputLayout]:
-        video = self.video_info(size.frames)
+class VideoPostprocessor(BaseVideoPostprocessor):
+    """Remove H3's three-frame decoder padding and cross-fade five-frame overlaps."""
+
+    def __init__(self, *, frame_size: image.Config, frame_rate: int):
+        weights = torch.arange(5, device="cpu", dtype=torch.float16) / 5
+        super().__init__(weights, frame_size=frame_size, frame_rate=frame_rate)
+
+    def reconstruction_slices(self, frames: slice, num_frames: int) -> tuple[slice, slice]:
+        if frames not in frame_slices(num_frames):
+            raise ValueError("H3 RGB reconstruction requires a complete legal frame slice")
+        return slice(0, 17), slice(20, 25)
+
+    def output_layout(self, num_frames: int) -> Mapping[str, OutputLayout]:
+        frame_slices(num_frames)
+        height, width = self.frame_size.height, self.frame_size.width
         return {
             "video": OutputLayout(
-                (video.frame_count, video.height, video.width, 3),
+                (num_frames, height, width, 3),
                 torch.uint8,
+                (slice(0, num_frames), slice(0, height), slice(0, width), slice(0, 3)),
                 variable_axes=(0,),
+                value_range=(0, 255),
             )
         }
 
-    def state_buffers(self, size: VideoSize) -> dict[str, BufferConfig]:
-        video = self.video_info(size.frames)
-        return {"video_overlap": BufferConfig((1, 3, 5, video.height, video.width), torch.float16)}
-
-    def workspace_buffers(self, size: VideoSize) -> dict[str, BufferConfig]:
-        video = self.video_info(size.frames)
+    def state_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
+        frame_slices(num_frames)
         return {
-            "rgb_frames": BufferConfig(
-                (video.frame_count, video.height, video.width, 3), torch.uint8
+            "video_overlap": BufferConfig(
+                (1, 3, 5, self.frame_size.height, self.frame_size.width), torch.float16
             )
         }
 
-    def constant_buffers(self, size: VideoSize) -> dict[str, BufferConfig]:
-        self.video_info(size.frames)
+    def workspace_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
+        layout = self.output_layout(num_frames)["video"]
+        return {"rgb_frames": BufferConfig(layout.shape, layout.dtype)}
+
+    def constant_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
+        frame_slices(num_frames)
         return {
             name: BufferConfig((1, 3, 1, 1, 1), torch.float32)
             for name in ("pixel_mean", "pixel_std")
         }
 
-    @torch.inference_mode()
-    def prepare_constants(self, size: VideoSize, *, out: TensorViews) -> None:
-        buffers = self.constant_buffers(size)
+    def prepare_constants(self, num_frames: int, *, out: Mapping[str, torch.Tensor]) -> None:
+        buffers = self.constant_buffers(num_frames)
         if out.keys() != buffers.keys():
             raise ValueError("RGB constants must contain mean and standard deviation")
-        for name, config in buffers.items():
-            if tuple(out[name].shape) != config.shape or out[name].dtype != config.dtype:
-                raise ValueError(f"RGB constant {name!r} has incompatible shape or dtype")
         for name, values in (
             ("pixel_mean", (0.485, 0.456, 0.406)),
             ("pixel_std", (0.229, 0.224, 0.225)),
         ):
+            if out[name].shape != buffers[name].shape or out[name].dtype != buffers[name].dtype:
+                raise ValueError(f"RGB constant {name!r} has incompatible shape or dtype")
             out[name].copy_(
-                torch.tensor(values, dtype=torch.float32, device="cpu").view(1, 3, 1, 1, 1)
+                torch.tensor(values, device="cpu", dtype=torch.float32).view(1, 3, 1, 1, 1)
             )
-
-
-def decode_windows(frames: int) -> tuple[DecodeWindow, ...]:
-    """Map an H3 duration to its native windows and exact RGB frame intervals."""
-
-    validate_frames(frames)
-    units = (frames - 5) // 17
-    return tuple(
-        DecodeWindow(
-            latent_start=unit * 5,
-            latent_stop=unit * 5 + 7,
-            frame_start=unit * 17,
-            frame_stop=(unit + 1) * 17 + (5 if unit + 1 == units else 0),
-            body_frames=17,
-            overlap_frames=5,
-            padding_frames=3,
-            crop=(3, 0),
-            final=unit + 1 == units,
-        )
-        for unit in range(units)
-    )

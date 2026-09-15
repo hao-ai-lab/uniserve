@@ -296,7 +296,9 @@ def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
 
     # PyTorch is the external numerical backend. Construction and binding must
     # succeed even when entering numerical warmup cannot succeed.
-    monkeypatch.setattr(torch, "inference_mode", unavailable)
+    # Decorated numerical entry points already retain context instances;
+    # failing their entry exercises the backend boundary those instances use.
+    monkeypatch.setattr(torch.inference_mode, "__enter__", unavailable)
     worker = Worker.from_config(config)
     if cleanup_failure:
         shutdown = concurrent.futures.ThreadPoolExecutor.shutdown
@@ -361,7 +363,7 @@ def test_successful_manual_warmup_is_retained_by_run(monkeypatch) -> None:
 
         # Administrative serving needs no further numerical startup once the
         # execution-only caller has successfully warmed up the worker.
-        monkeypatch.setattr(torch, "inference_mode", unavailable)
+        monkeypatch.setattr(torch.inference_mode, "__enter__", unavailable)
         endpoint = QueuedWorkerIpc(({"kind": "info", "call_id": 1}, {"kind": "close"}))
         worker.bind(endpoint).run()
         assert endpoint.responses[0]["kind"] == "info"
@@ -382,7 +384,7 @@ def test_startup_failure_keeps_resources_until_scope_exit(monkeypatch) -> None:
     def unavailable(*args, **kwargs):
         raise ValueError("startup unavailable")
 
-    monkeypatch.setattr(torch, "inference_mode", unavailable)
+    monkeypatch.setattr(torch.inference_mode, "__enter__", unavailable)
     with worker:
         with pytest.raises(ValueError):
             worker.warmup()
@@ -429,9 +431,9 @@ def test_scope_retains_model_after_run_and_releases_it_on_exit() -> None:
     import gc
     import weakref
 
-    from uniserve_models.stub import StubModel
+    from uniserve_models.stub import Model
 
-    model = StubModel()
+    model = Model()
     reference = weakref.ref(model)
     worker = execution_worker(model).bind(QueuedWorkerIpc(({"kind": "close"},)))
     del model

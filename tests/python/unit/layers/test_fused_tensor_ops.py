@@ -114,12 +114,18 @@ def test_swiglu_and_magnitude_preserve_gated_values(device) -> None:
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize(("head_dim", "rotary_dim"), ((64, 48), (96, 64)))
-def test_qkv_bias_fusion_preserves_outputs(device, head_dim, rotary_dim, dtype) -> None:
+@pytest.mark.parametrize("layout", ("contiguous", "merged", "transposed"))
+def test_qkv_bias_fusion_preserves_outputs(device, head_dim, rotary_dim, dtype, layout) -> None:
     torch.manual_seed(53)
     shape = (2, 17, 32, head_dim)
     query = torch.randn(shape, dtype=dtype, device=device)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
+    if layout != "contiguous":
+        packed = torch.cat((query, key, value), dim=-2)
+        if layout == "transposed":
+            packed = packed.transpose(0, 1).contiguous().transpose(0, 1)
+        query, key, value = packed.chunk(3, dim=-2)
     query_bias = torch.randn((32 * head_dim,), dtype=dtype, device=device)
     key_bias = torch.randn((32 * head_dim,), dtype=dtype, device=device)
     value_bias = torch.randn((32 * head_dim,), dtype=dtype, device=device)
@@ -145,15 +151,14 @@ def test_qkv_bias_fusion_preserves_outputs(device, head_dim, rotary_dim, dtype) 
         expected.append(normalized)
     expected_query, expected_key = expected
     expected_value = value + value_bias.view(32, head_dim)
-    actual_value = value.clone()
     actual_query, actual_key = qk_rms_norm_partial_rope_(
-        query.clone(),
-        key.clone(),
+        query,
+        key,
         cosine,
         sine,
         query_bias=query_bias,
         key_bias=key_bias,
-        value=actual_value,
+        value=value,
         value_bias=value_bias,
     )
     tolerance = 2e-2 if dtype is torch.bfloat16 else 2e-3
@@ -161,7 +166,7 @@ def test_qkv_bias_fusion_preserves_outputs(device, head_dim, rotary_dim, dtype) 
         actual_query.double(), expected_query, rtol=tolerance, atol=tolerance
     )
     torch.testing.assert_close(actual_key.double(), expected_key, rtol=tolerance, atol=tolerance)
-    assert torch.equal(actual_value, expected_value)
+    assert torch.equal(value, expected_value)
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))

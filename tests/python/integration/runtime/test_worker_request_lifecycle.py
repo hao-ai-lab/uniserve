@@ -20,7 +20,7 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
-from uniserve_models.stub import _next_token
+from tests.python.fixtures.simulation import expected_successor
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import (
     ComputationId,
@@ -203,7 +203,7 @@ def test_retained_encoder_product_outlives_its_producer_request(
             consumed = finalized_report(consumer, consumer.submit(batch))
         assert consumed.completions[0].status is OpStatus.OK
         assert consumed.completions[0].kv_visible_len == 2
-        assert consumed.completions[0].committed_tokens == (_next_token(1007),)
+        assert consumed.completions[0].committed_tokens == (expected_successor(1007),)
 
         read = producer.tensor_store.consume(product, consumer_op_id=ComputationId(2, 0))
         freed = producer.submit(execution_run(run_id=4, commands=(Free(product.buffer_id),)))

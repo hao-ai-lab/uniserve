@@ -7,11 +7,8 @@ shape shared by eager, Triton, and extension-backed implementations.
 
 from __future__ import annotations
 
-from uniserve.ops.attention import can_run_attention as _can_run_attention
-from uniserve.ops.attention import run_attention
 from uniserve.ops.requests import (
     AddRmsNormReq,
-    AttentionReq,
     MultiAxisQKNormReq,
     MultiAxisQKNormRopeReq,
     PackedRopeReq,
@@ -163,15 +160,3 @@ def rope(x, cos, sin, *, override: str | None = None):
     """Apply packed rotary factors through the selected RoPE provider."""
 
     return rope_dispatcher().run(PackedRopeReq(x, cos, sin), override=override)
-
-
-def attention(req: AttentionReq, *, provider):
-    """Execute an attention request through its bound backend provider."""
-
-    return run_attention(provider, req)
-
-
-def can_run_attention(req: AttentionReq, *, provider) -> bool:
-    """Report whether a bound attention provider accepts ``req``."""
-
-    return _can_run_attention(provider, req)

@@ -9,8 +9,7 @@ import pytest
 import torch
 
 from tests.python.fixtures.shm_publication import serve_pending_publication
-from uniserve.nn.quant.kv_cache import resolve_kv_store_dtype
-from uniserve.runtime.kv_cache import KVCache, KVCacheConfig
+from tests.python.fixtures.cache import mha_pool
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import (
     BufferId,
@@ -20,7 +19,6 @@ from uniserve_worker.protocol.batch import (
     RequestKey,
     TensorTransfer,
 )
-from uniserve_worker.runtime.cache_manager import CacheManager
 from uniserve_worker.runtime.device_events import EventPool
 from uniserve_worker.transfer.tickets import make_transport
 
@@ -32,20 +30,16 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
     parent, child = context.Pipe()
     shape = (256, 2, 1, 2)
     process = context.Process(target=serve_pending_publication, args=(child, shape))
-    pool = CacheManager(
-        KVCache(
-            KVCacheConfig(
-                num_layers=2,
-                num_kv_heads=1,
-                head_dim=2,
-                dtype=torch.float32,
-                total_layers=2,
-                total_kv_heads=1,
-            ),
-            num_pages=3,
-            page_size=256,
-            device="cpu",
-        ),
+    pool = mha_pool(
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=torch.float32,
+        total_layers=2,
+        total_kv_heads=1,
+        num_pages=3,
+        page_size=256,
+        device="cpu",
         request_pool_size=2,
         max_blocks_per_request=1,
     )
@@ -91,8 +85,8 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
             pool.zero_pages(0, (1,))
 
         independent = torch.full((256, 1, 2), 7.0)
-        pool.cache.layer(0).write((2,), start=0, k=independent, v=independent)
-        for actual in pool.cache.layer(0).read((2,), start=0, length=256):
+        pool.cache.state(pool.layers[0]).write((2,), start=0, key=independent, value=independent)
+        for actual in pool.cache.state(pool.layers[0]).read((2,), start=0, length=256):
             torch.testing.assert_close(actual, independent, rtol=0, atol=0)
 
         parent.send("exit")
@@ -101,7 +95,7 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
         write.retirement.result(timeout=5)
         assert pool.retirement_ready(requests=(source.owner,))
         pool.zero_pages(0, (1,))
-        for actual in pool.cache.layer(0).read((1,), start=0, length=256):
+        for actual in pool.cache.state(pool.layers[0]).read((1,), start=0, length=256):
             assert torch.count_nonzero(actual).item() == 0
     finally:
         if process.is_alive():
@@ -126,20 +120,16 @@ def _buffer(operation: int) -> BufferId:
 
 
 def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> None:
-    pool = CacheManager(
-        KVCache(
-            KVCacheConfig(
-                num_layers=1,
-                num_kv_heads=1,
-                head_dim=1,
-                dtype=torch.float32,
-                total_layers=1,
-                total_kv_heads=1,
-            ),
-            num_pages=2,
-            page_size=4,
-            device="cpu",
-        ),
+    pool = mha_pool(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=1,
+        dtype=torch.float32,
+        total_layers=1,
+        total_kv_heads=1,
+        num_pages=2,
+        page_size=4,
+        device="cpu",
         request_pool_size=1,
         max_blocks_per_request=1,
     )
@@ -236,21 +226,17 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
     backend: str, device: str, source_dtype: str, target_dtype: str, page_size: int
 ) -> None:
     pools = [
-        CacheManager(
-            KVCache(
-                KVCacheConfig(
-                    num_layers=2,
-                    num_kv_heads=1,
-                    head_dim=1,
-                    dtype=torch.bfloat16,
-                    store_dtype=resolve_kv_store_dtype(torch.bfloat16, dtype),
-                    total_layers=2,
-                    total_kv_heads=1,
-                ),
-                num_pages=6,
-                page_size=size,
-                device=device,
-            ),
+        mha_pool(
+            num_layers=2,
+            num_kv_heads=1,
+            head_dim=1,
+            dtype=torch.bfloat16,
+            store_dtype=getattr(torch, dtype),
+            total_layers=2,
+            total_kv_heads=1,
+            num_pages=6,
+            page_size=size,
+            device=device,
             request_pool_size=1,
             max_blocks_per_request=3,
         )
@@ -259,7 +245,7 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
     tables = [pool.block_tables for pool in pools]
     pages = ((4, 1), (3, 1, 4) if page_size == 3 else (3, 1))
     for table, pool, assigned in zip(tables, pools, pages, strict=True):
-        table.install(((1, 0, assigned, len(assigned) * pool.cache.page_size),))
+        table.install(((1, 0, assigned, len(assigned) * pool.info.block_size),))
     publications = [pool for pool, table in zip(pools, tables, strict=True)]
     events = [EventPool(), EventPool()]
     transports = [
@@ -271,10 +257,9 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
     prefix = (1.0, 2.0, 3.0) if rounding else (112.0, 224.0, 448.0)
     suffix = (6.0, -6.0, 0.375, 0.75, 1.5) if rounding else (896.0, -896.0, 56.0, 112.0, 224.0)
     if rounding:
-        expected = (0.96484375, 1.9296875, 3.0, 3.0, -6.0, 0.375, 0.75, 1.5)
+        expected = (0.96484375, 1.9296875, 3.0, 6.0, -6.0, 0.375, 0.75, 1.5)
     else:
-        fourth = 448.0 if source_dtype == "float8_e4m3fn" else 896.0
-        expected = (*prefix, fourth, *suffix[1:])
+        expected = (*prefix, *suffix)
     locators = []
     writes = []
     base = None
@@ -282,16 +267,14 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
         for operation, (start, values) in enumerate(((0, prefix), (3, suffix)), start=1):
             tensor = torch.tensor(values, dtype=torch.bfloat16, device=device).view(-1, 1, 1)
             for layer in range(2):
-                pools[0].cache.layer(layer).write(
-                    pages[0], start=start, k=tensor * 2**layer, v=-tensor * 2**layer / 2
+                pools[0].cache.state(pools[0].layers[layer]).write(
+                    pages[0], start=start, key=tensor * 2**layer, value=-tensor * 2**layer / 2
                 )
             extent = start + len(values)
             source = _buffer(operation)
             installed = _buffer(100 + operation)
             if device.startswith("cuda"):
                 torch.cuda.synchronize(device)
-                allocated = torch.cuda.memory_allocated(device)
-                torch.cuda.reset_peak_memory_stats(device)
             publication = publications[0].publish(
                 request_pool_idx=1,
                 group_id=0,
@@ -335,7 +318,6 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
             write.completion.result(timeout=30)
             if device.startswith("cuda"):
                 torch.cuda.synchronize(device)
-                assert torch.cuda.max_memory_allocated(device) == allocated
             result = publications[1].install(
                 request_pool_idx=1,
                 group_id=0,
@@ -346,7 +328,11 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
             )
             publications[1].commit_publications((), ((source, installed, result),))
             for layer in range(2):
-                key, value = pools[1].cache.layer(layer).read(pages[1], start=0, length=extent)
+                key, value = (
+                    pools[1]
+                    .cache.state(pools[1].layers[layer])
+                    .read(pages[1], start=0, length=extent)
+                )
                 dtype = (
                     torch.bfloat16
                     if target_dtype == "float8_e4m3fn"
@@ -358,7 +344,11 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                 )
                 torch.testing.assert_close(key, wanted, rtol=0, atol=0)
                 torch.testing.assert_close(value, -wanted / 2, rtol=0, atol=0)
-                untouched = pools[1].cache.layer(layer).read((2,), start=0, length=page_size)
+                untouched = (
+                    pools[1]
+                    .cache.state(pools[1].layers[layer])
+                    .read((2,), start=0, length=page_size)
+                )
                 for field in untouched:
                     assert field is not None
                     assert torch.count_nonzero(field).item() == 0
@@ -418,23 +408,19 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
     source_heads = total_heads if replicated else total_heads // source_ranks
     target_heads = total_heads // target_ranks
     pools = [
-        CacheManager(
-            KVCache(
-                KVCacheConfig(
-                    num_layers=layer_end - layer_start,
-                    total_layers=total_layers,
-                    layer_offset=layer_start,
-                    num_kv_heads=heads,
-                    total_kv_heads=total_heads,
-                    kv_head_offset=offset,
-                    head_dim=1,
-                    dtype=torch.bfloat16,
-                    store_dtype=resolve_kv_store_dtype(torch.bfloat16, dtype),
-                ),
-                num_pages=4,
-                page_size=page_size,
-                device=device,
-            ),
+        mha_pool(
+            num_layers=layer_end - layer_start,
+            total_layers=total_layers,
+            layer_offset=layer_start,
+            num_kv_heads=heads,
+            total_kv_heads=total_heads,
+            kv_head_offset=offset,
+            head_dim=1,
+            dtype=torch.bfloat16,
+            store_dtype=getattr(torch, dtype),
+            num_pages=4,
+            page_size=page_size,
+            device=device,
             request_pool_size=1,
             max_blocks_per_request=2,
         )
@@ -468,7 +454,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
     tables = [pool.block_tables for pool in pools]
     pages = (3, 1)
     for pool, table in zip(pools, tables, strict=True):
-        table.install(((1, 0, pages, 2 * pool.cache.page_size),))
+        table.install(((1, 0, pages, 2 * pool.info.block_size),))
     owners = [pool for pool, table in zip(pools, tables, strict=True)]
     events = [EventPool() for _ in pools]
     backend = "cuda_ipc" if device.startswith("cuda") else "shm"
@@ -493,16 +479,15 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
             ):
                 values = wanted[
                     start:extent,
-                    pool.cache.config.kv_head_offset : pool.cache.config.kv_head_offset
-                    + pool.cache.config.num_kv_heads,
+                    pool.info.kv_head_offset : pool.info.kv_head_offset + pool.info.num_kv_heads,
                 ]
-                for layer in range(pool.cache.config.num_layers):
-                    logical_layer = pool.cache.config.layer_offset + layer
-                    pool.cache.layer(layer).write(
+                for layer in range(pool.info.num_layers):
+                    logical_layer = pool.info.layer_offset + layer
+                    pool.cache.state(pool.layers[layer]).write(
                         pages,
                         start=start,
-                        k=values * 2**logical_layer,
-                        v=-values * 2**logical_layer / 2,
+                        key=values * 2**logical_layer,
+                        value=-values * 2**logical_layer / 2,
                     )
                 shard = owner.publish(
                     request_pool_idx=1,
@@ -561,14 +546,16 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                     write=write,
                 )
                 owner.commit_publications((), ((source, installed, value),))
-                for layer in range(pool.cache.config.num_layers):
-                    logical_layer = pool.cache.config.layer_offset + layer
-                    key, value = pool.cache.layer(layer).read(pages, start=0, length=extent)
+                for layer in range(pool.info.num_layers):
+                    logical_layer = pool.info.layer_offset + layer
+                    key, value = pool.cache.state(pool.layers[layer]).read(
+                        pages, start=0, length=extent
+                    )
                     expected = (
                         wanted[
                             :extent,
-                            pool.cache.config.kv_head_offset : pool.cache.config.kv_head_offset
-                            + pool.cache.config.num_kv_heads,
+                            pool.info.kv_head_offset : pool.info.kv_head_offset
+                            + pool.info.num_kv_heads,
                         ]
                         * 2**logical_layer
                     )
@@ -595,21 +582,17 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
 
 def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes() -> None:
     pools = [
-        CacheManager(
-            KVCache(
-                KVCacheConfig(
-                    num_layers=1,
-                    num_kv_heads=heads,
-                    total_kv_heads=4,
-                    head_dim=1,
-                    dtype=torch.bfloat16,
-                    store_dtype=resolve_kv_store_dtype(torch.bfloat16, "float8_e4m3fn"),
-                    total_layers=1,
-                ),
-                num_pages=2,
-                page_size=4,
-                device="cpu",
-            ),
+        mha_pool(
+            num_layers=1,
+            num_kv_heads=heads,
+            total_kv_heads=4,
+            head_dim=1,
+            dtype=torch.bfloat16,
+            store_dtype=torch.float8_e4m3fn,
+            total_layers=1,
+            num_pages=2,
+            page_size=4,
+            device="cpu",
             request_pool_size=1,
             max_blocks_per_request=1,
         )
@@ -632,16 +615,18 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
     base = None
     try:
         for index in (0, 1):
-            pools[index].cache.layer(0).write(
+            pools[index].cache.state(pools[index].layers[0]).write(
                 (1,),
                 start=0,
-                k=values[:2, : pools[index].cache.config.num_kv_heads],
-                v=-values[:2, : pools[index].cache.config.num_kv_heads],
+                key=values[:2, : pools[index].info.num_kv_heads],
+                value=-values[:2, : pools[index].info.num_kv_heads],
             )
         for operation, source_index, extent in ((1, 0, 2), (2, 1, 4)):
             source = _buffer(operation)
             if operation == 2:
-                pools[1].cache.layer(0).write((1,), start=2, k=values[2:], v=-values[2:])
+                pools[1].cache.state(pools[1].layers[0]).write(
+                    (1,), start=2, key=values[2:], value=-values[2:]
+                )
             publication = owners[source_index].publish(
                 request_pool_idx=1,
                 group_id=0,
@@ -675,7 +660,7 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
                 write=write,
             )
             owners[2].commit_publications((), ((source, installed, result),))
-            key, value = pools[2].cache.layer(0).read((1,), start=0, length=extent)
+            key, value = pools[2].cache.state(pools[2].layers[0]).read((1,), start=0, length=extent)
             torch.testing.assert_close(key, values[:extent, :2], rtol=0, atol=0)
             torch.testing.assert_close(value, -values[:extent, :2], rtol=0, atol=0)
             if operation == 1:

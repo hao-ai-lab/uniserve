@@ -1,14 +1,15 @@
 """Runtime-owned peer tensors preserve ordered values and captured reuse."""
 
+from uniserve.distributed import DeviceMesh
 from pathlib import Path
 
 import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve.distributed.parallel import ParallelConfig, SequenceParallel
-from uniserve.distributed.peer_memory import allocate_peer_workspace
-from uniserve.distributed.process_groups import initialize_model_parallel, initialize_process_groups
+from uniserve_worker.parallel import ParallelConfig, SequenceParallel
+from uniserve.runtime._peer_memory import allocate_peer_workspace
+from uniserve.runtime.process_groups import initialize_process_groups
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -24,16 +25,19 @@ def _run_peer_tensor(rank: int, rendezvous: str, world_size: int) -> None:
         init_method=rendezvous,
     )
     ranks = tuple(reversed(range(world_size)))
-    mesh = initialize_model_parallel(
-        environment,
-        {
-            "model": (
-                ranks,
-                ParallelConfig(sequence_parallel=SequenceParallel("ring", (world_size,))),
-            )
-        },
-    )["model"]
-    group = mesh.get_group("cp")
+    bound_meshes = {}
+    for mesh_name, (mesh_ranks, mesh_parallel) in sorted(({'model': (ranks, ParallelConfig(sequence_parallel=SequenceParallel('ring', (world_size,))))}).items()):
+        topology = DeviceMesh(
+            ranks=mesh_ranks,
+            shape=tuple(size for _, size in mesh_parallel.dimensions),
+            axes=tuple(axis for axis, _ in mesh_parallel.dimensions),
+            rank=environment.rank,
+        )
+        bound_mesh = environment.bind(topology, device=environment.device)
+        if environment.rank in mesh_ranks:
+            bound_meshes[mesh_name] = bound_mesh
+    mesh = bound_meshes['model']
+    group = mesh.get_group(tuple(axis for axis in mesh.axes if axis.startswith("cp")))
     workspace = allocate_peer_workspace(group, (123, 7, 128), dtype=torch.bfloat16, row_multiple=64)
     assert workspace.local.shape[0] >= 123 and workspace.local.shape[0] % 64 == 0
     sync_input = torch.zeros(1, dtype=torch.int32, device=device)
