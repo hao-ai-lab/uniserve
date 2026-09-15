@@ -1,9 +1,9 @@
 """Execution-owned delivery at numerical modules placed on another device."""
 
+from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass, replace
-from collections.abc import Mapping
 
 import torch
 

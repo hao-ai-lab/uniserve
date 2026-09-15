@@ -1,4 +1,4 @@
-"""CUDA streams, optional SM partitions, and their actual dependency events."""
+"""CUDA streams and optional SM partitions."""
 
 from __future__ import annotations
 
@@ -11,14 +11,11 @@ import torch
 from uniserve.runtime.cuda import CUDAError, cuda_status, cuda_value, driver
 from uniserve.runtime.resources import close_resources
 
-from ..config import LaneConfig
-from ..protocol.batch import Computation
 
-
-class CudaStream:
+class CUDAStream:
     """Own one CUDA execution stream and optional Green Context resources.
 
-    CPU execution has no CudaStream. Ordinary bindings retain a PyTorch stream;
+    CPU execution has no CUDAStream. Ordinary bindings retain a PyTorch stream;
     partitioned bindings own a native stream and may borrow their parent's
     Green Context. A parent outlives every fork that uses its SM allocation.
     Ingress/output event slots are reused in submission order on the worker.
@@ -30,12 +27,11 @@ class CudaStream:
         device: torch.device,
         stream: torch.cuda.Stream,
         sm_count: int,
-        config: LaneConfig | None = None,
         green: Any = None,
         context: Any = None,
         raw_stream: Any = None,
         event_slots: int = 2,
-        parent: CudaStream | None = None,
+        parent: CUDAStream | None = None,
     ) -> None:
         if device.type != "cuda":
             raise ValueError("CUDA stream requires a CUDA device")
@@ -44,7 +40,6 @@ class CudaStream:
         self.device = device
         self.stream = stream
         self.sm_count = int(sm_count)
-        self.config = config
         self.green = green
         self.context = context
         self.raw_stream = raw_stream
@@ -53,10 +48,6 @@ class CudaStream:
         self._event_cursor = 0
         self._ingress_events = tuple(torch.cuda.Event(blocking=False) for _ in range(event_slots))
         self._output_events = tuple(torch.cuda.Event(blocking=False) for _ in range(event_slots))
-
-    @property
-    def name(self) -> str | None:
-        return None if self.config is None else self.config.lane_id
 
     @property
     def full_device(self) -> bool:
@@ -101,7 +92,7 @@ class CudaStream:
     def synchronize(self) -> None:
         self.stream.synchronize()
 
-    def fork(self) -> CudaStream:
+    def fork(self) -> CUDAStream:
         """Own another ordered stream within this same device resource grant.
 
         The parent must outlive its forks, including their captured graphs.
@@ -121,11 +112,10 @@ class CudaStream:
             )
             stream = torch.cuda.ExternalStream(int(raw), device=self.device)
         try:
-            return CudaStream(
+            return CUDAStream(
                 device=self.device,
                 stream=stream,
                 sm_count=self.sm_count,
-                config=self.config,
                 green=self.green,
                 context=self.context,
                 raw_stream=raw,
@@ -167,27 +157,27 @@ def _destroy_context(context: Any) -> None:
     cuda_status(driver().cuGreenCtxDestroy(context), "destroy Green Context")
 
 
-def create_partitioned_streams(
-    lanes: tuple[LaneConfig, ...],
+def partition_streams(
     device: torch.device,
+    sm_counts: tuple[int, ...],
     *,
-    event_slots: int = 2,
-) -> tuple[CudaStream, ...]:
+    event_slots: int | tuple[int, ...] = 2,
+) -> tuple[CUDAStream, ...]:
     """Realize exact, disjoint Green Context resources from one split tree."""
 
-    if not lanes:
+    if not sm_counts:
         return ()
     if device.type != "cuda":
         raise CUDAError("execution lanes require a CUDA device")
-    if len({lane.lane_id for lane in lanes}) != len(lanes):
-        raise CUDAError("lane ids must be unique")
-    bound_computations: set[Computation] = set()
-    for lane in lanes:
-        overlap = bound_computations.intersection(lane.computations)
-        if overlap:
-            names = ", ".join(sorted(value.value for value in overlap))
-            raise CUDAError(f"computations have multiple execution lane bindings: {names}")
-        bound_computations.update(lane.computations)
+    if any(type(count) is not int or count < 1 for count in sm_counts):
+        raise CUDAError("stream SM counts must be positive integers")
+
+    if isinstance(event_slots, int):
+        slot_counts = (event_slots,) * len(sm_counts)
+    else:
+        slot_counts = event_slots
+    if len(slot_counts) != len(sm_counts) or any(count < 1 for count in slot_counts):
+        raise CUDAError("each CUDA stream requires a positive event-slot count")
 
     torch.cuda.init()
     index = device.index if device.index is not None else torch.cuda.current_device()
@@ -198,7 +188,7 @@ def create_partitioned_streams(
         cu.cuDeviceGetDevResource(cuda_device, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM),
         "query device SM resource",
     )
-    requested = sum(int(lane.sm_budget) for lane in lanes)
+    requested = sum(sm_counts)
     available = int(full.sm.smCount)
     if requested > available:
         raise CUDAError(
@@ -207,18 +197,20 @@ def create_partitioned_streams(
 
     acquisition = ExitStack()
     partitions = ExitStack()
-    realized: list[CudaStream] = []
+    realized: list[CUDAStream] = []
     try:
         aggregate, _unassigned = _split_one(cu, full, requested)
         aggregate_green = _green_from_resources(cu, cuda_device, (aggregate,))
         partitions.callback(_destroy_context, aggregate_green)
         current_resource = _green_resource(cu, aggregate_green)
-        for ordinal, lane in enumerate(lanes):
-            if ordinal + 1 == len(lanes):
+        for ordinal, (requested_count, slots) in enumerate(
+            zip(sm_counts, slot_counts, strict=True)
+        ):
+            if ordinal + 1 == len(sm_counts):
                 lane_resource = current_resource
                 remainder = None
             else:
-                lane_resource, remainder = _split_one(cu, current_resource, int(lane.sm_budget))
+                lane_resource, remainder = _split_one(cu, current_resource, requested_count)
             lane_green = _green_from_resources(cu, cuda_device, (lane_resource,))
             acquisition.callback(_destroy_context, lane_green)
             context = cuda_value(cu.cuCtxFromGreenCtx(lane_green), "resolve lane context")
@@ -231,23 +223,20 @@ def create_partitioned_streams(
             acquisition.callback(_destroy_stream, raw_stream)
             resolved = _green_resource(cu, lane_green)
             sm_count = int(resolved.sm.smCount)
-            if sm_count != int(lane.sm_budget):
-                raise CUDAError(
-                    f"lane {lane.lane_id!r} resolved {sm_count} SMs, expected {lane.sm_budget}"
-                )
+            if sm_count != requested_count:
+                raise CUDAError(f"CUDA stream received {sm_count} SMs, expected {requested_count}")
             associated = cuda_value(cu.cuStreamGetGreenCtx(raw_stream), "query lane origin stream")
             if int(associated) != int(lane_green):
                 raise CUDAError("lane origin stream has the wrong Green Context")
             realized.append(
-                CudaStream(
-                    config=lane,
+                CUDAStream(
                     device=device,
                     sm_count=sm_count,
                     green=lane_green,
                     context=context,
                     raw_stream=raw_stream,
                     stream=torch.cuda.ExternalStream(int(raw_stream), device=device),
-                    event_slots=int(lane.max_inflight or (event_slots - 1)) + 1,
+                    event_slots=slots,
                 )
             )
             if remainder is not None:
@@ -263,7 +252,7 @@ def create_partitioned_streams(
         except BaseException as cleanup_error:
             error.add_note(f"Resource cleanup also failed: {cleanup_error!r}")
         raise
-    # Each returned context now owns its stream and exact SM partition.
+    # Each returned context owns its stream and exact SM partition.
     acquisition.pop_all()
     return tuple(realized)
 
@@ -309,7 +298,6 @@ def _green_resource(cu: Any, green: Any) -> Any:
 
 
 __all__ = [
-    "CudaStream",
-    "LaneConfig",
-    "create_partitioned_streams",
+    "CUDAStream",
+    "partition_streams",
 ]

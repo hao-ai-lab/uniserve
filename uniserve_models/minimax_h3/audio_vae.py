@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import torch
 from torch import nn

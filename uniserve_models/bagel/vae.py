@@ -1,7 +1,7 @@
 """BAGEL's FLUX image autoencoder architecture and checkpoint mapping."""
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import nn

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from uniserve.distributed import DeviceMesh
 import json
 import os
 
 import torch
 import torch.distributed as dist
+
+from uniserve.distributed import DeviceMesh
+from uniserve.ops.video_sparse import compose_to_head_shards, unpack_add_compression
 from uniserve.runtime import TensorBuffers, initialize_process_groups
 from uniserve.tensors import BufferConfig
-
-from uniserve_worker.parallel import ParallelConfig, SequenceParallel
-from uniserve.ops.video_sparse import compose_to_head_shards, unpack_add_compression
+from uniserve_worker.bootstrap.config import ParallelConfig, SequenceConfig
 
 
 def main() -> None:
@@ -78,7 +78,7 @@ def main() -> None:
             {
                 "denoiser": (
                     tuple(range(world)),
-                    ParallelConfig(sequence_parallel=SequenceParallel("ulysses", (world,))),
+                    ParallelConfig(sequence_parallel=SequenceConfig("ulysses", (world,))),
                 )
             }
         ).items()

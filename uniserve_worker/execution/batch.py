@@ -9,9 +9,10 @@ from typing import TYPE_CHECKING, Generic, TypeVar
 import torch
 
 from uniserve.model.logits import Logits, VocabShard
-from uniserve_worker.execution.tensors import TokenSelection, packed_tensor_views
-from uniserve.tensors import OutputLayout
-from uniserve_worker.protocol.batch import ForwardMode, ForwardStats, PipelineStage
+from uniserve.tensors import OutputLayout, adjacent_view
+from uniserve_worker.execution.sampling import TokenSelection
+from uniserve_worker.protocol.operation import ForwardMode, PipelineStage
+from uniserve_worker.protocol.output import ForwardStats
 
 if TYPE_CHECKING:
     from .sampling import SamplerOutput
@@ -76,7 +77,7 @@ class ExecutionOutput:
         if not self.layouts:
             object.__setattr__(self, "layouts", (None,) * len(self.values))
         if len(self.layouts) != len(self.values):
-            raise ValueError("output geometry must align with execution rows")
+            raise ValueError("output layouts must align with execution rows")
 
     def materialize(self) -> ExecutionOutput:
         """Gather global vocabulary rows, preserving their caller-visible shapes."""
@@ -106,11 +107,11 @@ class ExecutionOutput:
             sources = tuple(self.values[index] for index in indexes)
             # Adjacent request rows already share backing; gather them together
             # without adding another allocation or collective per request.
-            packed = packed_tensor_views(sources)
+            view = adjacent_view(sources)
             rows = (
                 torch.cat(sources, dim=0)
-                if packed is None
-                else packed.reshape(-1, vocab.local_slice.stop - vocab.local_slice.start)
+                if view is None
+                else view.reshape(-1, vocab.local_slice.stop - vocab.local_slice.start)
             )
             gathered = Logits(rows, vocab).gather()
             for index, value in zip(
@@ -122,7 +123,7 @@ class ExecutionOutput:
     def clone(self) -> ExecutionOutput:
         """Own detached copies that survive reuse of the producer's storage.
 
-        Outputs on one device with one dtype share a packed allocation. Shapes
+        Outputs on one device with one dtype share a contiguous allocation. Shapes
         and logical tensor values are preserved independently of source strides;
         storage remains live for as long as any returned tensor is retained.
         """
@@ -141,8 +142,8 @@ class ExecutionOutput:
                 copied[index] = self.values[index].detach().clone()
                 continue
             sources = [self.values[index] for index in indexes]
-            packed = torch.cat(tuple(value.detach().reshape(-1) for value in sources))
-            views = packed.split(tuple(value.numel() for value in sources))
+            storage = torch.cat(tuple(value.detach().reshape(-1) for value in sources))
+            views = storage.split(tuple(value.numel() for value in sources))
             for index, view in zip(indexes, views, strict=True):
                 copied[index] = view.reshape(self.values[index].shape)
         greedy = self.greedy

@@ -1,9 +1,8 @@
 """Diffusion schedules, guidance, noise and numerical integration."""
 
-from .noise import NoiseScale, normal_noise
 from .guidance import AdditiveGuidance, Branch, Guidance, NestedGuidance, Renorm
+from .noise import NoiseScale, normal_noise
 from .schedule import Schedule, make_schedule
-from .step import DenoisingStep
 from .solver import (
     CleanSampleEulerSolver,
     EulerSolver,
@@ -11,6 +10,7 @@ from .solver import (
     clean_sample_to_velocity,
     euler_step,
 )
+from .step import DenoisingStep
 
 __all__ = [
     "AdditiveGuidance",

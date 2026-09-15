@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+from uniserve.execution import VideoProcessor, VideoRunner
 from uniserve.model import VideoDecoder, VideoPostprocessor
 from uniserve.runtime import ExecutionContext, TensorBuffers
 from uniserve_models.loading import load_model, read_config
@@ -42,29 +43,21 @@ def decode_video(
     ):
         decoding.prepare(frames)
         pixels.prepare(frames)
+        decoder_runner = VideoRunner(decoder, context=decoding)
+        pixel_runner = VideoProcessor(postprocessor, context=pixels)
         state = backing.view(requirements)
         source = latents.to(device)
         outputs = []
         for interval in decoder.frame_slices(frames):
-            with decoding.activate():
-                decoded = decoder.decode(
-                    (source,),
-                    frames=(interval,),
-                    num_frames=(frames,),
-                    constants=decoding.constants,
-                    workspace=decoding.workspace,
-                )
+            decoded = decoder_runner.decode((source,), frames=(interval,), num_frames=(frames,))
             if decoded[0] is None:
                 raise RuntimeError("local video reconstruction returned no tensor")
-            with pixels.activate():
-                output = postprocessor(
-                    decoded,
-                    frames=(interval,),
-                    num_frames=(frames,),
-                    state=state,
-                    constants=pixels.constants,
-                    workspace=pixels.workspace,
-                )[0]
+            output = pixel_runner.forward(
+                decoded,
+                frames=(interval,),
+                num_frames=(frames,),
+                state=state,
+            )[0]
             # Each invocation borrows RGB workspace. Complete an independent
             # CPU copy before the next window can reuse that backing.
             outputs.append(output.tensor.to("cpu", copy=True))

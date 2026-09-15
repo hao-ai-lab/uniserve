@@ -492,7 +492,7 @@ def _pool_qkv_means_fake(
     query_tile_offset: int = 0,
     key_tile_offset: int = 0,
 ) -> None:
-    """Declare the pooled custom operator's fake-tensor mutation contract."""
+    """Declare fake-tensor mutation for the pooled custom operator."""
 
     del query, key, value, valid_sizes, pooled_query, pooled_key, pooled_value
     del query_tile_offset, key_tile_offset
@@ -538,7 +538,7 @@ def _threshold_topk_indices_custom(scores: torch.Tensor, output: torch.Tensor) -
 
 @_threshold_topk_indices_custom.register_fake
 def _threshold_topk_indices_fake(scores: torch.Tensor, output: torch.Tensor) -> None:
-    """Declare the threshold custom operator's fake-tensor mutation contract."""
+    """Declare fake-tensor mutation for the threshold custom operator."""
 
     del scores, output
 

@@ -12,33 +12,36 @@ from tests.python.fixtures.depth_one import finalized_report
 from tests.python.fixtures.encoding import Model as EncodedModel
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve.distributed import Communicator, DeviceMesh
+from uniserve_worker.bootstrap.config import ComponentConfig, ParallelConfig
 from uniserve_worker.bootstrap.worker_info import WorkerInfo
-from uniserve_worker.config import ComponentConfig, LaneConfig, WorkerConfig
+from uniserve_worker.config import LaneConfig, WorkerConfig
 from uniserve_worker.execution.model_entry import ModelEntry
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.foundation.errors import InputError
-from uniserve_worker.parallel import ParallelConfig
 from uniserve_worker.protocol.batch import (
-    Bounds,
     BufferAllocation,
-    ComputationId,
     DecodeRange,
-    DeviceDim,
-    DiffusionSamplingParams,
-    DType,
+    DiffusionParams,
     NewRequest,
-    OpStatus,
-    OutputInfo,
-    PipelineStage,
-    RequestKey,
     ScheduleBatch,
-    ScheduledRequest,
-    ShapeBound,
     Start,
-    StaticDim,
     TensorPublication,
-    TensorRef,
+)
+from uniserve_worker.protocol.identity import ComputationId, RequestKey
+from uniserve_worker.protocol.operation import (
+    Bounds,
+    OpStatus,
+    PipelineStage,
+    ScheduledRequest,
     TransferMode,
+)
+from uniserve_worker.protocol.tensor import (
+    DeviceDim,
+    DType,
+    OutputInfo,
+    ShapeBound,
+    StaticDim,
+    TensorRef,
 )
 from uniserve_worker.transfer.layout import fetch_tensor
 
@@ -245,7 +248,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
                 NewRequest(
                     key,
                     request_pool_idx=1,
-                    diffusion=DiffusionSamplingParams(22, 3, 4, 1000),
+                    diffusion=DiffusionParams(22, 3, 4, 1000),
                     prompt_token_ids=prompt,
                 )
             ),
@@ -411,7 +414,7 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
         admission = NewRequest(
             key,
             request_pool_idx=1,
-            diffusion=DiffusionSamplingParams(22, 3, 4, 1000),
+            diffusion=DiffusionParams(22, 3, 4, 1000),
             prompt_token_ids=(3, 8, 1),
         )
         run = ScheduleBatch(

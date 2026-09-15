@@ -19,7 +19,8 @@ from uniserve.runtime.device import fill_cpu_ints
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
 from ..foundation.errors import invalid_descriptor, resource_error
-from ..protocol.batch import BufferId, RequestKey, TensorRef
+from ..protocol.identity import BufferId, RequestKey
+from ..protocol.tensor import TensorRef
 from ..transfer.exports import ExportLocations, release_exports
 from ..transfer.tickets import TransferTicket
 
@@ -78,7 +79,7 @@ class LatentPool:
             min(int(request_pool_size), int(page_units), int(latent_width)) < 1
             or int(num_pages) < 2
         ):
-            raise ValueError("latent-pool geometry must contain slots, pages, and elements")
+            raise ValueError("latent-pool shape must contain slots, pages, and elements")
         if not dtype.is_floating_point:
             raise ValueError("latent-pool storage must use a floating dtype")
         self.request_pool_size = int(request_pool_size)
@@ -771,7 +772,7 @@ class LatentPool:
             or len(set(pages)) != len(pages)
             or any(page < 1 or page >= self.num_pages for page in pages)
         ):
-            raise invalid_descriptor("latent page table is outside physical pool geometry")
+            raise invalid_descriptor("latent page table is outside physical pool bounds")
         return pages
 
     def _require_page_owners(
@@ -808,7 +809,7 @@ class LatentPool:
         height: int,
         width: int,
     ) -> None:
-        """Validate slot ownership, generation, step, units, and raster geometry."""
+        """Validate slot ownership, generation, step, units, and raster dimensions."""
 
         current = (
             int(self._steps[slot].item()),

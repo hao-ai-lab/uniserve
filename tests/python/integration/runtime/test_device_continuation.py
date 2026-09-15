@@ -15,14 +15,14 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
+from uniserve.sampling import SamplingParams
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.protocol.batch import (
-    ComputationId,
+from uniserve_worker.protocol.identity import ComputationId
+from uniserve_worker.protocol.operation import (
     DrawLayout,
     ForwardMode,
     OpStatus,
     Rng,
-    SamplingParams,
     SamplingState,
 )
 
@@ -44,8 +44,8 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(graph
     second = ar_params(35, block_ids=(1,))
     terminal = expected_successor(expected_successor(4))
     if finish_policy == "admission":
-        assert first.ar is not None
-        first = replace(first, ar=replace(first.ar, finish_token_ids=(terminal,)))
+        assert first.generation is not None
+        first = replace(first, generation=replace(first.generation, finish_token_ids=(terminal,)))
 
     with execution_worker(device="cuda:0", pipeline_depth=3, execution=policy) as worker:
         parents = tuple(

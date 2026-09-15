@@ -1,4 +1,4 @@
-"""ScheduledRequest identities and scalar geometry derived from logical execution state."""
+"""ScheduledRequest identities and scalar bounds derived from logical execution state."""
 
 from __future__ import annotations
 
@@ -6,11 +6,8 @@ from dataclasses import replace
 
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.protocol.batch import (
-    FinishFlags,
-    OpStatus,
-    ScheduledRequest,
-)
+from uniserve_worker.protocol.operation import OpStatus, ScheduledRequest
+from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.runtime.block_tables import BlockTables
 from uniserve_worker.runtime.request import RequestProgress
 

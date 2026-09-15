@@ -52,7 +52,7 @@ def video_segment_rgb(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Join one NCTHW segment and return RGB24 frames and its successor overlap.
 
-    The caller supplies checkpoint normalization and temporal-window geometry.
+    The caller supplies checkpoint normalization and temporal-window dimensions.
     Multiplication, addition, clamping and integer rounding preserve that order;
     overlap blending retains the decoded tensor's arithmetic precision.
     """

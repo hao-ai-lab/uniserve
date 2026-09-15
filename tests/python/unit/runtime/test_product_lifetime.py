@@ -8,28 +8,29 @@ import pytest
 import torch
 
 from tests.python.fixtures.cache import mha_pool
+from uniserve.runtime import EventPool
 from uniserve_worker.execution.output import OutputBuffer, OutputPool
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import (
-    Bounds,
     BufferAllocation,
-    BufferId,
-    ComputationId,
-    DType,
-    ImageParams,
     LatentParams,
     NewRequest,
+)
+from uniserve_worker.protocol.identity import BufferId, ComputationId, RequestKey
+from uniserve_worker.protocol.operation import (
+    Bounds,
+    ImageParams,
     PipelineStage,
-    RequestKey,
     ScheduledRequest,
+)
+from uniserve_worker.protocol.tensor import (
+    DType,
     ShapeBound,
     StaticDim,
     TensorRef,
-    UmmRequestParams,
 )
 from uniserve_worker.runtime.buffer_pool import BufferPool
 from uniserve_worker.runtime.cpu import CpuPool
-from uniserve_worker.runtime.device_events import EventPool
 from uniserve_worker.runtime.latent_pool import LatentPool
 from uniserve_worker.runtime.request import RequestPool
 from uniserve_worker.runtime.tensor_store import FeatureMetadata, TensorStore
@@ -564,7 +565,7 @@ def latent_output():
             NewRequest(
                 key,
                 request_pool_idx=slot,
-                umm=UmmRequestParams(ImageParams(height=height, width=width)),
+                image=ImageParams(height=height, width=width),
             )
         )
         buffer = OutputBuffer(1, token_capacity=1, event_pool=events)

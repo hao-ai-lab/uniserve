@@ -3,10 +3,10 @@
 from uniserve.model import LatentInput
 from uniserve_models.stub import DenoiserInput
 
-from .image import ImageInputs
+from .image import ImageBuilder
 
 
-class Inputs(ImageInputs):
+class StubBuilder(ImageBuilder):
     framing = 2
     max_tokens = 1024
 

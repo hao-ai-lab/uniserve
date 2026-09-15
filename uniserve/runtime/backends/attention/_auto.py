@@ -72,7 +72,7 @@ class _Automatic(_Operator):
         if self._closed:
             raise RuntimeError("attention operator is closed")
         # The selected operator owns the same dimensions and capacity and
-        # validates them once together with its native preparation contract.
+        # validates them once together with its native preparation requirements.
         self._operator(batch).bind(batch)
 
     def requires_host_lengths(self, batch):

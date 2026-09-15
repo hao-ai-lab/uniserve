@@ -14,32 +14,27 @@ from typing import Final
 
 import torch
 
+from uniserve.runtime import EventPool
 from uniserve.runtime.device import canonical_device
 from uniserve.runtime.resources import close_resources
-from uniserve_worker.protocol.batch import Computation, ComputationId
+from uniserve_worker.protocol.identity import BufferId, ComputationId, RequestKey
+from uniserve_worker.protocol.operation import Computation
 
 from ..foundation.errors import WorkerError, WorkerErrorCode, resource_error
 from ..media.buffers import MediaLease
 from ..media.storage import publish_media_bytes
 from ..profiling import timing_events_enabled
-from ..protocol.batch import (
-    BufferId,
-    ErrorCode,
+from ..protocol.batch import LatentParams, TensorPublication
+from ..protocol.operation import ErrorCode, OpStatus, ScheduledRequest
+from ..protocol.output import (
     FinishFlags,
-    KvTransfer,
-    LatentParams,
-    Locator,
     MediaOutput,
-    OpStatus,
     PosixShmArtifact,
-    RequestKey,
     RequestOutput,
-    ScheduledRequest,
-    TensorPublication,
     TimingCounters,
 )
+from ..protocol.transfer import KvTransfer, Locator
 from ..runtime.cpu import CpuTask
-from ..runtime.device_events import EventPool
 from ..runtime.latent_pool import LatentStaging
 from ..runtime.request import RequestProgress, RequestState
 from ..runtime.tensor_store import TensorRead, TensorRecord
@@ -186,7 +181,7 @@ class OutputBuffer:
         count = int(rows)
         capacity = int(token_capacity)
         if count < 1 or capacity < count:
-            raise resource_error("output lease geometry is invalid")
+            raise resource_error("output lease shape is invalid")
         normalized: list[torch.device] = []
         for value in devices:
             device = canonical_device(value)

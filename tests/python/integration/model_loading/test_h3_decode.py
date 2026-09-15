@@ -15,8 +15,9 @@ from uniserve_models.minimax_h3.packing import (
     build_packing,
     video_latent_frames,
 )
+from uniserve_worker.bootstrap.config import ComponentConfig
 from uniserve_worker.bootstrap.distributed import initialize_entries
-from uniserve_worker.config import ComponentConfig, WorkerConfig
+from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.model_runner import ModelRunner
 
 pytestmark = [

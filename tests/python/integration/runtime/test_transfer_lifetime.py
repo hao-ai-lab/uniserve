@@ -10,20 +10,18 @@ import pytest
 import torch
 
 from tests.python.fixtures.shm_publication import serve_pending_publication
+from uniserve.runtime import EventPool
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.protocol.batch import (
-    BufferAllocation,
-    ComputationId,
+from uniserve_worker.protocol.batch import BufferAllocation
+from uniserve_worker.protocol.identity import ComputationId, RequestKey
+from uniserve_worker.protocol.tensor import (
     DType,
-    Locator,
-    RequestKey,
     ShapeBound,
     StaticDim,
     TensorRef,
-    WorkerEndpoint,
 )
+from uniserve_worker.protocol.transfer import Locator, WorkerEndpoint
 from uniserve_worker.runtime.buffer_pool import BufferPool
-from uniserve_worker.runtime.device_events import EventPool
 from uniserve_worker.runtime.latent_pool import LatentPool
 from uniserve_worker.runtime.tensor_store import TensorStore
 from uniserve_worker.transfer.layout import region_view
@@ -355,7 +353,7 @@ def _serve_unacknowledged_cuda_read(channel, invalid_handle: bool = False) -> No
 
     from uniserve_kernel.peer_memory import empty, export_fd
 
-    from uniserve_worker.protocol.batch import CudaIpcTransfer
+    from uniserve_worker.protocol.transfer import CudaIpcTransfer
 
     torch.cuda.set_device(0)
     source = empty((1024,), dtype=torch.float32, device=torch.device("cuda:0"))

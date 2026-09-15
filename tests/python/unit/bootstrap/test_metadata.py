@@ -71,7 +71,11 @@ def test_h3_worker_advertises_bounded_media_products():
     from uniserve_models.minimax_h3 import Config, Model
     from uniserve_worker.bootstrap.components import media_components, supported_operations
     from uniserve_worker.config import WorkerConfig
-    from uniserve_worker.protocol.batch import VIDEO_STAGES, PipelineStage, TransferMode
+    from uniserve_worker.protocol.operation import (
+        VIDEO_STAGES,
+        PipelineStage,
+        TransferMode,
+    )
     from uniserve_worker.runtime.results import resolve_outputs
 
     with torch.device("meta"):

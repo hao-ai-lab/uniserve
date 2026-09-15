@@ -24,17 +24,17 @@ from itertools import groupby, repeat
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from uniserve import _slices
+from uniserve.runtime import EventPool
 
 from ..foundation.errors import invalid_descriptor, resource_error, unsupported_setup
 from ..foundation.shared_memory import allocate_shared_memory
-from ..protocol.batch import (
+from ..protocol.transfer import (
     CudaIpcTransfer,
     LocalTransfer,
     Locator,
     PosixShmTransfer,
     WorkerEndpoint,
 )
-from ..runtime.device_events import EventPool
 from .endpoint import PublicationEndpoint, finish_reader, open_reader
 from .layout import region_view, validate_destination
 
@@ -131,7 +131,7 @@ def _publication_views(
     shape = (sum(int(span.shape[0]) for span in spans), *first.shape[1:])
     value = (0,) * len(shape) if offset is None else offset
     if len(value) != len(shape) or any(not isinstance(start, int) or start < 0 for start in value):
-        raise invalid_descriptor("publication offset does not match its tensor geometry")
+        raise invalid_descriptor("publication offset does not match its tensor shape")
     source = tuple(span.detach() for span in spans)
     return (source if isinstance(tensor, tuple) else source[0]), shape, value
 
@@ -547,7 +547,7 @@ class _BoundedTransferPool:
             try:
                 ticket._require_active()
                 # Inference mode is thread-local. Destinations reserved by an
-                # inference caller retain that contract on transport threads.
+                # inference caller retain that behavior on transport threads.
                 with torch.inference_mode():
                     operation(ticket, *args)
             except BaseException as error:
@@ -1313,7 +1313,7 @@ class CudaIpcTransport(Transport):
         try:
             exported = export_fd(first)
             if exported is None:
-                # Arbitrary CUDA tensors retain the same publication contract.
+                # Arbitrary CUDA tensors retain the same publication behavior.
                 # Materialize only their logical spans, never their enclosing
                 # allocator segment. Shared worker arenas export directly.
                 shared = empty(shape, dtype=first.dtype, device=first.device)

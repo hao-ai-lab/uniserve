@@ -8,21 +8,20 @@ import pytest
 import torch
 
 from tests.python.fixtures.worker_config import stub_worker_config
-from uniserve_models.stub import Model
 from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.tensors import BufferConfig
-from uniserve_models.processing import stub_processor
+from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.capacity import (
     latent_trajectory_bytes,
     model_arena_capacity,
     request_tensor_window,
     tensor_slot_capacity,
 )
+from uniserve_worker.bootstrap.config import ComponentConfig
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
-from uniserve_worker.config import ComponentConfig
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.protocol.batch import ForwardMode, PipelineStage
+from uniserve_worker.protocol.operation import ForwardMode, PipelineStage
 
 TEST_MODEL = Model()
 TEST_WORKER_CONFIG = stub_worker_config(64, max_batch_tokens=8192)
@@ -154,7 +153,7 @@ def test_worker_info_projects_model_behavior_and_resource_geometry():
     layout = build_worker_layout(
         TEST_MODEL,
         TEST_WORKER_CONFIG,
-        image_processor=stub_processor(),
+        image_processor=image_processor(),
         model_name="test-model",
     )
     info = layout.info
@@ -173,7 +172,7 @@ def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:
         kv_token_capacity=1024 + 1,
     )
 
-    layout = build_worker_layout(TEST_MODEL, worker_config, image_processor=stub_processor())
+    layout = build_worker_layout(TEST_MODEL, worker_config, image_processor=image_processor())
 
     expected_pages = ceil_div(
         1024 + 1,
@@ -184,7 +183,7 @@ def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:
 
 
 def test_persistent_buffer_capacity_includes_active_encoder_output() -> None:
-    layout = build_worker_layout(TEST_MODEL, TEST_WORKER_CONFIG, image_processor=stub_processor())
+    layout = build_worker_layout(TEST_MODEL, TEST_WORKER_CONFIG, image_processor=image_processor())
     feature_bytes = max(
         layout.max_latent_feature_bytes,
         layout.max_vision_feature_bytes,
@@ -197,7 +196,7 @@ def test_persistent_buffer_capacity_includes_active_encoder_output() -> None:
 
 def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() -> None:
     worker_config = replace(TEST_WORKER_CONFIG, model_dtype="float32")
-    layout = build_worker_layout(TEST_MODEL, worker_config, image_processor=stub_processor())
+    layout = build_worker_layout(TEST_MODEL, worker_config, image_processor=image_processor())
     assert layout.max_latent_feature_bytes == latent_trajectory_bytes(
         1024,
         3 * 16**2,
@@ -261,15 +260,12 @@ def test_result_publication_rejects_unrepresentable_numerical_outputs(dtype, axe
 
 
 def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
-    from tests.python.fixtures.encoding import Config, Model as EncodedModel
+    from tests.python.fixtures.encoding import Config
+    from tests.python.fixtures.encoding import Model as EncodedModel
     from uniserve_worker.config import WorkerConfig
-    from uniserve_worker.protocol.batch import (
-        BufferAllocation,
-        ComputationId,
-        RequestKey,
-        StaticDim,
-        TensorRef,
-    )
+    from uniserve_worker.protocol.batch import BufferAllocation
+    from uniserve_worker.protocol.identity import ComputationId, RequestKey
+    from uniserve_worker.protocol.tensor import StaticDim, TensorRef
     from uniserve_worker.runtime.buffer_pool import BufferPool
 
     model = EncodedModel(Config(hidden_size=7))
@@ -353,13 +349,13 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
 ):
     from uniserve.distributed.mesh import DeviceMesh
     from uniserve_worker.bootstrap.capacity import local_product_storage_bytes
-    from uniserve_worker.config import ComponentConfig
+    from uniserve_worker.bootstrap.config import ComponentConfig
     from uniserve_worker.execution.model_entry import ModelEntry
-    from uniserve_worker.protocol.batch import (
+    from uniserve_worker.protocol.operation import PipelineStage
+    from uniserve_worker.protocol.tensor import (
         DeviceDim,
         DType,
         OutputInfo,
-        PipelineStage,
         ShapeBound,
         StaticDim,
     )

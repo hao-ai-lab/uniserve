@@ -1,8 +1,6 @@
-"""Euler integration with explicit prediction and sample mutation contracts."""
+"""Euler integration with explicit prediction and sample mutation behavior."""
 
 from typing import Literal, TypeAlias
-
-import torch
 
 
 def _output(value, out):

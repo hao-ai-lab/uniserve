@@ -1,7 +1,7 @@
 """Analytical diffusion coordinates and their FP32 numerical endpoints."""
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Literal
 
 import torch

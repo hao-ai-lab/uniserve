@@ -12,25 +12,18 @@ from typing import Final, cast
 import torch
 
 from uniserve import _slices
+from uniserve.runtime import EventPool
 from uniserve.runtime.device import canonical_device
-from uniserve_worker.protocol.batch import ComputationId
+from uniserve_worker.protocol.identity import BufferId, ComputationId, RequestKey
 
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
-from ..protocol.batch import (
-    BufferAllocation,
-    BufferId,
-    DType,
-    RequestKey,
-    StaticDim,
-    TensorRef,
-    TensorTransfer,
-    WorkerEndpoint,
-)
+from ..protocol.batch import BufferAllocation
+from ..protocol.tensor import DType, StaticDim, TensorRef
+from ..protocol.transfer import TensorTransfer, WorkerEndpoint
 from ..transfer.exports import ExportLocations, release_exports
 from ..transfer.layout import fetch_tensor
 from ..transfer.tickets import TransferTicket, Transport
 from .buffer_pool import BufferBinding, BufferPool
-from .device_events import EventPool
 
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
 _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
@@ -74,7 +67,7 @@ def device_product_capacity_bytes(
     devices = int(device_count)
     value_bytes = int(max_value_bytes)
     if min(slots, devices, value_bytes) < 1:
-        raise ValueError("device-product geometry must be positive")
+        raise ValueError("device-product dimensions must be positive")
     scalar_bytes = slots * devices * sum(dict(_DTYPE_STORAGE.values()).values())
     return scalar_bytes + slots * devices * value_bytes
 
@@ -131,7 +124,7 @@ def _event_ready(event: torch.cuda.Event | None) -> bool:
 
 @dataclass(slots=True)
 class RelaySlot:
-    """Tracks ownership, generation, storage geometry, and relay binding for one device-product slot."""
+    """Track ownership, generation, storage shape, and relay binding for one product slot."""
 
     index: int
     device_name: str
@@ -145,31 +138,31 @@ class RelaySlot:
 
 @dataclass(frozen=True, slots=True)
 class ImageMetadata:
-    """Spatial geometry and numerical value range of an immutable image tensor."""
+    """Spatial dimensions and numerical value range of an immutable image tensor."""
 
     height: int = 0
     width: int = 0
     value_range: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
-        """Require complete, nonnegative image geometry."""
+        """Require complete, nonnegative image dimensions."""
 
         if self.height < 0 or self.width < 0:
-            raise ValueError("device-product image geometry must be non-negative")
+            raise ValueError("device-product image dimensions must be non-negative")
         if (self.height == 0) != (self.width == 0):
-            raise ValueError("device-product image geometry must be complete")
+            raise ValueError("device-product image dimensions must be complete")
 
 
 @dataclass(frozen=True, slots=True)
 class FeatureMetadata:
-    """Spatial geometry of an immutable floating-point encoder feature."""
+    """Spatial dimensions of an immutable floating-point encoder feature."""
 
     height: int
     width: int
 
     def __post_init__(self) -> None:
         if min(self.height, self.width) < 1:
-            raise ValueError("encoder feature geometry must be positive")
+            raise ValueError("encoder feature dimensions must be positive")
 
 
 @dataclass(slots=True)
@@ -253,7 +246,7 @@ class TensorStore:
         """Initialize bounded product registries, relay arenas, and event ownership."""
 
         # Validate independent slot-byte capacity and the coupled request-relay
-        # geometry before creating any registries.
+        # dimensions before creating any registries.
         self.capacity = int(capacity)
         self.entry_capacity = int(entry_capacity)
         self.max_entry_bytes = int(max_entry_bytes)
@@ -269,11 +262,11 @@ class TensorStore:
         self.relay_depth = int(relay_depth)
         self.buffer_pool = buffer_pool
         if (self.request_capacity == 0) != (self.relay_depth == 0):
-            raise ValueError("request-relay geometry must be complete")
+            raise ValueError("request-relay dimensions must be complete")
         if self.request_capacity < 0 or self.relay_depth < 0:
-            raise ValueError("request-relay geometry must not be negative")
+            raise ValueError("request-relay dimensions must not be negative")
 
-        # Storage pools are partitioned by device and tensor geometry; relay
+        # Storage pools are partitioned by device and tensor shape; relay
         # arenas reserve stable request/lane addresses for graph capture.
         self._allocated_bytes = 0
         self._relay_arenas: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
@@ -541,7 +534,7 @@ class TensorStore:
             slot < 1 or slot > self.request_capacity or math.prod(_device_shape(reference)) != 1
             for reference, _device, slot, _dtype, _field in requested
         ):
-            raise invalid_descriptor("request-relay output has invalid slot or scalar geometry")
+            raise invalid_descriptor("request-relay output has an invalid slot or scalar shape")
         keys = tuple(
             _reference_key(reference) for reference, _device, _slot, _dtype, _field in requested
         )
@@ -659,7 +652,7 @@ class TensorStore:
         field: int,
         operation: tuple[str, int, RequestKey, ComputationId],
     ) -> RelaySlot:
-        """Resolve or create one stable scalar relay slot inside its geometry-specific arena."""
+        """Resolve or create one stable scalar relay slot inside its shape-specific arena."""
 
         device_name = str(device)
         lane_key = (device_name, request_slot, lane)
@@ -1509,7 +1502,7 @@ class TensorStore:
                 assert storage is not None
                 if write.region is None:
                     if write.actual_shape != tensor.shape:
-                        raise invalid_descriptor("product import changes resident tensor geometry")
+                        raise invalid_descriptor("product import changes resident tensor shape")
                     destination = (
                         storage
                         if tuple(storage.shape) == tensor.shape

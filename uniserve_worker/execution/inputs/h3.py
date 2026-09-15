@@ -13,7 +13,7 @@ from uniserve.tensors import BufferConfig
 from uniserve_models.minimax_h3 import Denoiser, DenoiserInput, DenoiserSize
 
 
-class Inputs:
+class MediaBuilder:
     """Own input bounds while borrowing the denoiser's numerical capability.
 
     Native CPU noise, pinned transfer sources and retained conditioning belong

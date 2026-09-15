@@ -25,23 +25,22 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from uniserve_worker.protocol.batch import (
-    BatchOutput,
     BlockTable,
-    Bounds,
-    BufferId,
     CachePageAllocation,
-    ComputationId,
     Finish,
-    ForwardMode,
     Free,
-    KvTransfer,
-    Locator,
     NewRequest,
+)
+from uniserve_worker.protocol.identity import BufferId, ComputationId
+from uniserve_worker.protocol.operation import (
+    Bounds,
+    ForwardMode,
     OpStatus,
-    PosixShmTransfer,
     ScheduledRequest,
     TransferMode,
 )
+from uniserve_worker.protocol.output import BatchOutput
+from uniserve_worker.protocol.transfer import KvTransfer, Locator, PosixShmTransfer
 
 
 def _read_request(locator: Locator) -> bytes:
@@ -216,11 +215,11 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     assert report.completions[0].status is OpStatus.OK
                     assert report.completions[0].kv_visible_len == 2
                     serving.result(timeout=5)
-                    for layer in range(worker.kv_cache.cache.config.num_layers):
-                        expected = producer.kv_cache.cache.layer(layer).read(
+                    for layer in worker.kv_cache.layers:
+                        expected = producer.kv_cache.cache.state(layer).read(
                             (1,), start=0, length=2
                         )
-                        actual = worker.kv_cache.cache.layer(layer).read((1,), start=0, length=2)
+                        actual = worker.kv_cache.cache.state(layer).read((1,), start=0, length=2)
                         for left, right in zip(actual, expected, strict=True):
                             torch.testing.assert_close(left, right, rtol=0, atol=0)
                 finally:

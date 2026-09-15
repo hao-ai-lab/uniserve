@@ -22,13 +22,7 @@ from uniserve.model import EntryPoint
 from uniserve.nn.attention import AttentionParallelConfig
 from uniserve.quantization import QuantizationConfig, Quantizer
 
-from .processing import (
-    SENSENOVA_PROMPT,
-    FlowPrompt,
-    ImageProcessor,
-    bagel_processor,
-    sensenova_processor,
-)
+from .processing import FlowPrompt, ImageProcessor
 
 ConfigT = TypeVar("ConfigT")
 ModelT = TypeVar("ModelT", bound=nn.Module)
@@ -315,18 +309,17 @@ def read_config(
         and not name.startswith(("optimizer/", "original/"))
     }
     _fetch(root, sidecars, repository, revision, io)
-    if (
-        architecture == "BagelForConditionalGeneration"
-        and repository is not None
-        and io.mode != "dummy"
-    ):
-        _fetch(
-            root,
-            _source_files(package.checkpoint_sources[0], root, inventory, io),
-            repository,
-            revision,
-            io,
-        )
+    if repository is not None and io.mode != "dummy":
+        # Some architectures derive dimensions from checkpoint tensor headers.
+        # The package declares those sources before module selection is known.
+        for declaration in package.config_sources:
+            _fetch(
+                root,
+                _source_files(declaration, root, inventory, io),
+                repository,
+                revision,
+                io,
+            )
     model_config = package.read_config(root, io)
     with torch.device("meta"):
         model = package.Model(model_config)
@@ -354,13 +347,7 @@ def read_config(
         if repository is not None and io.mode != "dummy":
             _fetch(root, _source_files(declaration, root, inventory, io), repository, revision, io)
         sources.append(declaration.resolve(root, io=io))
-    processor = (
-        bagel_processor(model_config)
-        if architecture == "BagelForConditionalGeneration"
-        else sensenova_processor(model_config)
-        if architecture == "NEOChatModel"
-        else None
-    )
+    processor = None if package.image_processor is None else package.image_processor(model_config)
     processor = _tokens(processor, root)
     tokenizer_root = root / "tokenizer" if (root / "tokenizer").is_dir() else root
     tokenizer = (
@@ -412,7 +399,7 @@ def read_config(
         io,
         tokenizer,
         processor,
-        SENSENOVA_PROMPT if architecture == "NEOChatModel" else None,
+        package.flow_prompt,
         modules,
     )
 

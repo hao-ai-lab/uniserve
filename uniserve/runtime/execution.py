@@ -301,7 +301,7 @@ class _AttentionBinding:
 
 
 class _VsaBinding:
-    """Own one VSA call site's plans, mutable query maps and packed input backing."""
+    """Own one VSA call site's plans, mutable query maps, and packed input backing."""
 
     def __init__(self, backend, allocate, scratch, shared_buffers, exchange):
         self.backend, self.allocate, self.scratch = backend, allocate, scratch

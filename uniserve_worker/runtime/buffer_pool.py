@@ -11,7 +11,9 @@ import torch
 from uniserve.runtime.device import canonical_device
 
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor
-from ..protocol.batch import BufferAllocation, BufferId, TensorRef
+from ..protocol.batch import BufferAllocation
+from ..protocol.identity import BufferId
+from ..protocol.tensor import TensorRef
 
 
 def _invariant(message: str) -> WorkerError:

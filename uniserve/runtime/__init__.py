@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .cuda import CUDAError
     from .cuda_graph import CUDAGraph, CUDAGraphError
+    from .events import EventPool, EventPoolError
     from .execution import ExecutionContext
     from .prefix_cache import PrefixCache
     from .process_groups import ProcessGroups, initialize_process_groups
+    from .stream import CUDAStream, partition_streams
     from .tensor_buffers import TensorBuffers
 
 __all__ = [
@@ -17,9 +19,13 @@ __all__ = [
     "ProcessGroups",
     "initialize_process_groups",
     "ExecutionContext",
+    "EventPool",
+    "EventPoolError",
     "CUDAGraph",
     "CUDAGraphError",
     "CUDAError",
+    "CUDAStream",
+    "partition_streams",
 ]
 
 
@@ -32,9 +38,13 @@ def __getattr__(name):
         "ProcessGroups": "process_groups",
         "initialize_process_groups": "process_groups",
         "ExecutionContext": "execution",
+        "EventPool": "events",
+        "EventPoolError": "events",
         "CUDAGraph": "cuda_graph",
         "CUDAGraphError": "cuda_graph",
         "CUDAError": "cuda",
+        "CUDAStream": "stream",
+        "partition_streams": "stream",
     }
     if name not in modules:
         raise AttributeError(name)

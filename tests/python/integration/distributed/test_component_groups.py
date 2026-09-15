@@ -5,9 +5,8 @@ import torch
 import torch.multiprocessing as mp
 
 from uniserve.runtime import initialize_process_groups
-from uniserve_worker.parallel import ParallelConfig, SequenceParallel
+from uniserve_worker.bootstrap.config import ComponentConfig, ParallelConfig, SequenceConfig
 from uniserve_worker.bootstrap.distributed import initialize_entries
-from uniserve_worker.config import ComponentConfig
 
 pytestmark = pytest.mark.integration
 
@@ -28,7 +27,7 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
         {
             "denoiser": ComponentConfig(
                 (0, 1, 2, 3),
-                ParallelConfig(2, sequence_parallel=SequenceParallel("ulysses", (2,))),
+                ParallelConfig(2, sequence_parallel=SequenceConfig("ulysses", (2,))),
             ),
             "encoder": ComponentConfig((3, 1), ParallelConfig(2)),
             "output": ComponentConfig((2,)),

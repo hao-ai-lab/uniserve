@@ -11,13 +11,12 @@ from uniserve.model import EmbeddingReplacement, TextInput
 from uniserve.nn.attention import BlockTable, PagedInput, SegmentedInput, SequenceLengths
 from uniserve.runtime import CUDAGraph, ExecutionContext, PrefixCache
 from uniserve.runtime.cuda_graph import CUDAGraphError
-from uniserve_worker.protocol.batch import ForwardMode
+from uniserve.sampling import greedy
+from uniserve.tensors import adjacent_view
+from uniserve_worker.protocol.operation import ForwardMode
 
 from .batch import ExecutionOutput, InputBatch
-from .sampling import SamplerOutput
-from .tensors import TokenSelection, packed_tensor_views
-
-TOKEN_CONTINUATION_BIT = 1 << 31
+from .sampling import TOKEN_CONTINUATION_BIT, SamplerOutput, TokenSelection
 
 
 class GraphMiss(RuntimeError):
@@ -470,12 +469,12 @@ class BatchGraph:
             values = output.values
             if self._hidden_output:
                 # Capture fixes tensor addresses, not the live sequence cuts.
-                # Uniform hidden results share one packed, pipeline-published
+                # Uniform hidden results share one contiguous, pipeline-published
                 # tensor; split its views again using this invocation's lengths.
-                packed = packed_tensor_views(values)
-                if packed is None:
-                    raise GraphMiss("hidden graph results must share packed output storage")
-                values = packed.reshape(-1, values[0].shape[-1]).split(attention.queries.host)
+                view = adjacent_view(values)
+                if view is None:
+                    raise GraphMiss("hidden graph results must share contiguous output storage")
+                values = view.reshape(-1, values[0].shape[-1]).split(attention.queries.host)
             result = replace(
                 output,
                 values=values[:count],
@@ -516,16 +515,14 @@ def greedy_decode(
     ):
         return None
     rows = tuple(value.reshape(-1) for value in output.values)
-    logits = packed_tensor_views(rows)
+    logits = adjacent_view(rows)
     if logits is None:
         raise GraphMiss("decode logits are not one contiguous graph output")
     logits = logits.reshape(batch.row_count, -1)
-    from uniserve_worker.execution.sampling import greedy_vocabulary
-
     partitions = output.vocabularies
     if any(partition != partitions[0] for partition in partitions):
         return None
-    max_values, tokens = greedy_vocabulary(logits, partitions[0])
+    max_values, tokens = greedy(logits, partitions[0])
     valid = torch.isfinite(max_values)
     active = predicate_state.index_select(0, batch.request_pool_indices.reshape(-1))
     finish = force_finish.reshape(-1) & valid & active
@@ -561,7 +558,7 @@ def trim_greedy(
         return None
     total = int(output.tokens.numel())
     if rows < 0 or rows > total or int(output.completion.numel()) != 4 * total:
-        raise CUDAGraphError("CUDA graph greedy output has invalid row geometry")
+        raise CUDAGraphError("CUDA graph greedy output has invalid row count")
     if rows == total:
         return output
     completion = torch.cat(

@@ -6,9 +6,9 @@ from collections.abc import Mapping
 
 from uniserve.distributed.mesh import DeviceMesh
 from uniserve.runtime.process_groups import ProcessGroups
-from uniserve_worker.config import ComponentConfig
 
 from ..execution.model_entry import ModelEntry
+from .config import ComponentConfig
 
 
 def initialize_entries(

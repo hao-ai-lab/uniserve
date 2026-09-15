@@ -8,7 +8,7 @@ import torch
 
 
 class CUDAError(RuntimeError):
-    """A CUDA resource or operation could not satisfy its required contract."""
+    """A CUDA resource or operation could not satisfy its requirements."""
 
     def __init__(self, message: str, *, code: int | None = None):
         super().__init__(message)

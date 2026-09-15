@@ -58,7 +58,7 @@ def silu_and_mul(x, y=None, *, override: str | None = None):
         import torch
 
         # Providers consume one tensor whose final dimension is laid out as
-        # ``[gate, value]``; concatenate explicit operands into that contract.
+        # ``[gate, value]``; concatenate explicit operands into that representation.
         x = torch.cat((x, y), dim=-1)
 
     return silu_and_mul_dispatcher().run(SiluAndMulReq(x), override=override)

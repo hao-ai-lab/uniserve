@@ -9,7 +9,6 @@ from importlib import import_module
 from torch import nn
 
 from uniserve.distributed import DeviceMesh
-
 from uniserve.model import (
     AudioDecoder,
     CausalLM,
@@ -23,11 +22,16 @@ from uniserve.model import (
     VideoPostprocessor,
 )
 from uniserve.nn.vae import PatchAutoencoder
-from uniserve_worker.config import ComponentConfig
 
 from ..execution.model_entry import Call, ModelEntry
 from ..foundation.errors import unsupported_setup
-from ..protocol.batch import Computation, ForwardMode, PipelineStage, TransferMode
+from ..protocol.operation import (
+    Computation,
+    ForwardMode,
+    PipelineStage,
+    TransferMode,
+)
+from .config import ComponentConfig
 
 
 def call_operations(calls: Iterable[Call]) -> frozenset[Computation]:

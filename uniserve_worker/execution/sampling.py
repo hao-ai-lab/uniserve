@@ -4,19 +4,30 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Literal, TypeAlias
 
 import torch
 
-from uniserve.model.logits import VocabShard
+from uniserve.sampling import SamplingParams
 
-from ..protocol.batch import SamplingParams
+SAMPLING_COMPLETION_FIELDS = 4
+TOKEN_CONTINUATION_BIT = 1 << 31
+TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 
-# Packed integer bit patterns and the row geometry needed to decode logprobs.
+# Packed integer bit patterns and row dimensions are enough to decode logprobs.
 # The tensor stays on the producing device; the output owner performs any D2H copy.
 LogprobValues: TypeAlias = tuple[
     torch.Tensor, tuple[int, ...], tuple[int, ...], tuple[tuple[int, ...], ...], int, int
 ]
+
+
+class TokenSelection(StrEnum):
+    """Select final-token logits, all-token logits, or hidden states."""
+
+    LAST_LOGITS = "last_logits"
+    ALL_LOGITS = "all_logits"
+    HIDDEN = "hidden"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +61,7 @@ class SamplingMetadata:
 
 @dataclass(frozen=True, slots=True)
 class SamplerOutput:
-    """Numerical selections with shared packed completion and optional logprob columns.
+    """Numerical selections with shared completion storage and optional logprob columns.
 
     Row selections retain this complete batch so device and host publication
     can consume its columns without splitting and reconstructing tensor views.
@@ -180,35 +191,3 @@ def sample_columns(
             parts.append(values if start == 0 and end == values.numel() else values[start:end])
         columns.append(parts[0] if len(parts) == 1 else torch.cat(parts, dim=0))
     return tuple(columns)
-
-
-def greedy_vocabulary(
-    logits: torch.Tensor, vocab: VocabShard | None = None
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select global maxima with the dense torch.max tie and NaN rules.
-
-    Only one score/token pair is exchanged per row. Scores retain their exact
-    floating representation and token IDs use int64, including padded shards
-    with no real tokens. Communicator order is logical vocabulary order.
-    """
-
-    if vocab is None:
-        return torch.max(logits, dim=-1)
-    if logits.ndim != 2 or logits.shape[-1] != vocab.local_slice.stop - vocab.local_slice.start:
-        raise ValueError("greedy logits must be rows of the declared vocabulary shard")
-    begin = vocab.local_slice.start
-    valid = max(0, min(logits.shape[-1], vocab.size - begin))
-    if valid:
-        values, tokens = torch.max(logits[:, :valid], dim=-1)
-        tokens = tokens + begin
-    else:
-        values = logits.new_full((logits.shape[0],), float("-inf"))
-        tokens = torch.full_like(values, vocab.size, dtype=torch.int64)
-    if vocab.group.size == 1:
-        return values, tokens
-    candidates = torch.stack((values.to(torch.float64).view(torch.int64), tokens), dim=-1)
-    gathered = vocab.group.all_gather(candidates, dim=0).reshape(vocab.group.size, -1, 2)
-    scores = gathered[..., 0].contiguous().view(torch.float64)
-    maxima, owners = scores.max(dim=0)
-    selected = gathered[..., 1].gather(0, owners.unsqueeze(0)).squeeze(0)
-    return maxima.to(logits.dtype), selected

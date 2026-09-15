@@ -7,22 +7,22 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.diffusion import Branch, Guidance, Renorm
+from uniserve.diffusion import Branch, Renorm
 from uniserve.media import image as media_image
-from uniserve_worker.execution.tensors import TokenSelection
 from uniserve.nn.rng import flow_noise_seed
+from uniserve_worker.execution.sampling import TokenSelection
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.protocol.batch import (
+from uniserve_worker.protocol.batch import TensorPublication
+from uniserve_worker.protocol.operation import (
     DrawLayout,
-    FinishFlags,
     ForwardMode,
     ImageParams,
-    KvTransfer,
     OpStatus,
     ScheduledRequest,
-    TensorPublication,
-    TensorRef,
 )
+from uniserve_worker.protocol.output import FinishFlags
+from uniserve_worker.protocol.tensor import TensorRef
+from uniserve_worker.protocol.transfer import KvTransfer
 from uniserve_worker.runtime.request import RequestState
 
 from . import operations
@@ -45,15 +45,25 @@ if TYPE_CHECKING:
     from .model_runner import ModelRunner
 
 
-def image_state(factory, size, image: ImageParams) -> ImageState:
+def _to_device(value: torch.Tensor, device: torch.device | None) -> torch.Tensor:
+    """Borrow a local tensor or copy it to the device on the caller's stream."""
+
+    if device is None or value.device == device:
+        return value
+    # Host consumers need a completed D2H result; device consumers retain the
+    # stream dependency and can overlap the copy with independent work.
+    return value.to(device, non_blocking=device.type != "cpu")
+
+
+def image_state(builder, size, image: ImageParams) -> ImageState:
     """Bind admitted sampling choices to the denoiser's mathematical recipes."""
 
-    schedule = factory.denoiser.make_schedules(
+    schedule = builder.denoiser.make_schedules(
         image.steps,
         shift=image.timestep_shift if image.timestep_shift > 0 else None,
         device="cpu",
     )["image"]
-    guidance = factory.denoiser.make_guidance(
+    guidance = builder.denoiser.make_guidance(
         text_scale=image.cfg_text_scale,
         image_scale=image.cfg_img_scale,
         interval=image.cfg_interval,
@@ -64,9 +74,9 @@ def image_state(factory, size, image: ImageParams) -> ImageState:
 
 
 def require_inputs(runner):
-    if runner.images is None:
-        raise invalid_descriptor("image computation requires its denoiser input factory")
-    return runner.images
+    if runner.image_builder is None:
+        raise invalid_descriptor("image computation requires its denoiser input builder")
+    return runner.image_builder
 
 
 def prepare_latent(
@@ -197,7 +207,7 @@ def initialize(
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
 ) -> ImageState:
-    """Bind reusable request geometry and refill the current operation from its exact latent version."""
+    """Bind reusable request state and refill the operation from its exact latent version."""
 
     require_inputs(model_runner)
     request_id = operation.request_key.request_id
@@ -281,7 +291,7 @@ def prepare_step(
     image = request.request.image
     if image is None:
         raise invalid_descriptor("flow step requires admitted image parameters")
-    factory = require_inputs(model_runner)
+    builder = require_inputs(model_runner)
     row = state.pending_output(completion_group, operation.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
@@ -307,7 +317,7 @@ def prepare_step(
     for branch_index, branch in enumerate(branches):
         if branch in entries:
             continue
-        source = factory.branch_source(branch)
+        source = builder.branch_source(branch)
         if source not in trajectory.prefixes:
             trajectory.prefixes[source] = resolve_prefix(
                 model_runner.flow_prompt,
@@ -379,7 +389,7 @@ def finish(
         raise invalid_descriptor("trajectory operation has no staged latent inputs")
     latent_input, latent_output = operation.latent_input, operation.latent_output
     if latent_input is None or latent_output is None or request.request.image is None:
-        raise invalid_descriptor("flow completion lost its trajectory contract")
+        raise invalid_descriptor("flow completion lost its trajectory state")
     start_step = int(params.start_step)
     final_step = start_step + int(params.step_count)
     latent_pool.write_inactive(
@@ -526,27 +536,26 @@ def require_image(request: RequestState) -> ImageParams:
     return request.image
 
 
-def flow_rows(factory, trajectory, current, branches, timestep, *, conditioning_position, device):
+def flow_rows(builder, trajectory, current, branches, timestep, *, conditioning_position, device):
     """Borrow one learned sample copy for every active guidance branch."""
 
-    from .device_transfer import tensor_to_device
-    from ..protocol.batch import PipelineStage
+    from ..protocol.operation import PipelineStage
 
-    current = tensor_to_device(current, device)
-    timestep = tensor_to_device(timestep, device)
+    current = _to_device(current, device)
+    timestep = _to_device(timestep, device)
     size, rows = trajectory.size, []
     for branch in branches:
         entry = trajectory.entries[branch]
         temporal = conditioning_position if branch is Branch.CONDITIONED else entry[2]
         if temporal not in trajectory.positions:
-            trajectory.positions[temporal] = factory.positions(size, temporal, device=device)
+            trajectory.positions[temporal] = builder.positions(size, temporal, device=device)
         rows.append(
             ForwardRow(
                 forward_mode=PipelineStage.DENOISING,
                 positions=trajectory.positions[temporal],
                 timestep=timestep.reshape(1),
                 latent=current,
-                image_tokens=factory.sequence_length(size),
+                image_tokens=builder.sequence_length(size),
                 image_height=size.height,
                 image_width=size.width,
                 request_pool_idx=entry[0],
@@ -559,22 +568,20 @@ def flow_rows(factory, trajectory, current, branches, timestep, *, conditioning_
     return tuple(rows)
 
 
-def integrate(factory, trajectory, current, outputs, index, timestep, next_timestep):
+def integrate(builder, trajectory, current, outputs, index, timestep, next_timestep):
     """Apply guidance and the model's public solver to the operation's sample."""
-
-    from .device_transfer import tensor_to_device
 
     schedule, guidance = trajectory.schedule, trajectory.guidance
     branches = guidance.branches(schedule, index)
     velocity = guidance.combine(
         {
-            branch: tensor_to_device(output, current.device)
+            branch: _to_device(output, current.device)
             for branch, output in zip(branches, outputs, strict=True)
         },
         schedule,
         index,
     )
-    factory.denoiser.solver.step_(
+    builder.denoiser.solver.step_(
         velocity,
         current,
         timestep,
@@ -589,20 +596,20 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
     """Warm and capture configured image shapes with actual conditioning prefixes."""
 
     import math
-    from contextlib import nullcontext
     from functools import partial
 
     from uniserve.math import ceil_div
-    from ..protocol.batch import PipelineStage
+
+    from ..protocol.operation import PipelineStage
     from .attention import from_blocks
     from .graph_inputs import DiffusionShape
     from .model_runner import capture_image_parameters
-    from .runners.prefill import stage_text
+    from .startup import stage_text
 
-    factory, cache = require_inputs(runner), runner.kv_cache
+    builder, cache = require_inputs(runner), runner.kv_cache
     capture = runner.worker_config.graph_policy != "off" and runner.worker_config.prefill_cuda_graph
-    capacity = min(factory.max_tokens, latent_pool.capacity_units)
-    side = max(1, math.isqrt(capacity)) * factory.denoiser.downsample
+    capacity = min(builder.max_tokens, latent_pool.capacity_units)
+    side = max(1, math.isqrt(capacity)) * builder.denoiser.downsample
     shapes = (
         runner.flow_captures
         if capture and runner.flow_captures
@@ -633,7 +640,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
             image = capture_image_parameters(
                 shape.cfg_branches, steps=2, height=shape.height, width=shape.width
             )
-            trajectory = image_state(factory, size, image)
+            trajectory = image_state(builder, size, image)
             branches = trajectory.guidance.branches(trajectory.schedule, 0)
             if len(branches) != shape.cfg_branches:
                 raise ValueError("capture guidance does not realize its configured branch count")
@@ -641,7 +648,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                 tuple(
                     resolve_prefix(
                         runner.flow_prompt,
-                        factory.branch_source(branch),
+                        builder.branch_source(branch),
                         image_prompt="",
                         negative_prompt="",
                         negative_token_ids=(),
@@ -655,7 +662,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
             with (
                 cache.startup_pages(sum(page_counts)) as scratch,
                 latent_pool.startup_values(
-                    shape.rows, factory.denoiser.latent_shape("image", size)[0]
+                    shape.rows, builder.denoiser.latent_shape("image", size)[0]
                 ) as latents,
             ):
                 for value in latents:
@@ -689,7 +696,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                         current_stream.wait_stream(prefix_stream)
                 attention = from_blocks(
                     pages=tuple(pages),
-                    query_lengths=(factory.sequence_length(size),) * len(prefixes),
+                    query_lengths=(builder.sequence_length(size),) * len(prefixes),
                     prefix_lengths=tuple(map(len, prefixes)),
                     block_size=cache.info.block_size,
                     causal=(False,) * len(prefixes),
@@ -698,10 +705,10 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                 rows = tuple(
                     ForwardRow(
                         forward_mode=PipelineStage.DENOISING,
-                        positions=factory.positions(size, len(prefix), device=entry.device),
+                        positions=builder.positions(size, len(prefix), device=entry.device),
                         timestep=trajectory.schedule.timesteps[:1].to(entry.device),
                         latent=latents[index // shape.cfg_branches].to(entry.device),
-                        image_tokens=factory.sequence_length(size),
+                        image_tokens=builder.sequence_length(size),
                         image_height=size.height,
                         image_width=size.width,
                         request_pool_idx=1 + index // shape.cfg_branches,

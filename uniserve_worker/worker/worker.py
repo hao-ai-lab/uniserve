@@ -8,29 +8,27 @@ from bisect import insort
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import replace
 from functools import partial
 from queue import SimpleQueue
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Self
 
 import torch
-
-from uniserve.distributed.mesh import Communicator
-from uniserve.runtime.process_groups import ProcessGroups, initialize_process_groups
-from uniserve.math import ceil_div
 from torch import nn
 
+from uniserve.distributed.mesh import Communicator
+from uniserve.math import ceil_div
 from uniserve.model import CausalLM, VideoPostprocessor
 from uniserve.profiling import profile_range
-from uniserve.runtime.device import canonical_device, device_memory_budget
-from uniserve.runtime import PrefixCache
 from uniserve.quantization import Quantizer
+from uniserve.runtime import EventPool, PrefixCache
+from uniserve.runtime.device import canonical_device, device_memory_budget
+from uniserve.runtime.process_groups import ProcessGroups, initialize_process_groups
 from uniserve.runtime.resources import close_resources
 from uniserve_models.processing import FlowPrompt, ImageProcessor
-from uniserve_worker.config import ComponentConfig
 from uniserve_worker.profiling import WorkerProfiler, record_failure, worker_range_name
-from uniserve_worker.protocol.batch import Computation, ComputationId, PipelineStage
+from uniserve_worker.protocol.identity import BufferId, ComputationId, RequestKey
+from uniserve_worker.protocol.operation import Computation
 
 from ..bootstrap.capacity import (
     check_startup_memory,
@@ -39,8 +37,8 @@ from ..bootstrap.capacity import (
     resolve_request_capacity,
 )
 from ..bootstrap.distributed import initialize_entries
+from ..bootstrap.inputs import capability, image_builder
 from ..bootstrap.model_loader import load_worker_model, prepare_worker_model
-from ..bootstrap.inputs import capability, image_inputs
 from ..bootstrap.worker_info import RequestKind, ResponseKind, WorkerInfo
 from ..bootstrap.worker_info_builder import build_worker_layout
 from ..config import (
@@ -59,21 +57,14 @@ from ..foundation.errors import (
     invalid_descriptor,
     unsupported_setup,
 )
-from ..protocol.batch import (
-    BatchOutput,
-    BufferId,
-    Finish,
-    Free,
-    RequestKey,
-    ScheduleBatch,
-    WorkerEndpoint,
-)
+from ..protocol.batch import Finish, Free, ScheduleBatch
+from ..protocol.output import BatchOutput
+from ..protocol.transfer import WorkerEndpoint
 from ..runtime.block_tables import BlockTables
 from ..runtime.buffer_pool import BufferPool
 from ..runtime.cache_manager import CacheManager
 from ..runtime.cpu import CpuPool
 from ..runtime.decode_state import DecodeState
-from ..runtime.device_events import EventPool
 from ..runtime.latent_pool import LatentPool
 from ..runtime.request import RequestPool
 from ..runtime.tensor_store import TensorStore
@@ -84,8 +75,8 @@ from .messages import PendingResponse, ServiceRequest
 from .warmup import warmup_requests
 
 if TYPE_CHECKING:
-    from ..bootstrap.config import WorkerProcessArgs
-    from ..bootstrap.ipc import WorkerIpcEndpoint
+    from ..bootstrap.config import ComponentConfig, WorkerProcessArgs
+    from ..bootstrap.launch import WorkerIpcEndpoint
 
 logger = logging.getLogger(__name__)
 
@@ -357,7 +348,7 @@ class Worker:
             self.block_tables = None
             max_blocks_per_row = 0
 
-            # KV pages and request-to-token tables share group geometry; bind them to
+            # KV pages and request-to-token tables share group dimensions; bind them to
             # the model only after attention compatibility has been established.
             if cache is not None:
                 assert text is not None
@@ -429,7 +420,7 @@ class Worker:
                 self.decode_state = None
 
             # Generation state has its own page pool and may live on another device.
-            flow = image_inputs(model)
+            flow = image_builder(model)
             latent_dtype = getattr(torch, str(layout.latent_dtype).removeprefix("torch."), None)
             if flow is not None and not isinstance(latent_dtype, torch.dtype):
                 raise unsupported_setup(f"unsupported latent dtype {layout.latent_dtype!r}")

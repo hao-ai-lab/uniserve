@@ -10,7 +10,7 @@ from PIL import Image
 
 from uniserve_models.processing import ImageProcessor, PatchTransform, StrideResize, TowerTransform
 from uniserve_worker.execution.image_input import prepare_image
-from uniserve_worker.protocol.batch import PipelineStage
+from uniserve_worker.protocol.operation import PipelineStage
 
 
 @pytest.mark.parametrize("normalization", ("signed_unit", "imagenet"))

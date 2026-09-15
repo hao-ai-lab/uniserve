@@ -6,7 +6,7 @@ import socket
 import uuid
 from multiprocessing import shared_memory
 
-from uniserve_worker.protocol.batch import Locator, PosixShmTransfer, WorkerEndpoint
+from uniserve_worker.protocol.transfer import Locator, PosixShmTransfer, WorkerEndpoint
 
 
 def serve_pending_publication(channel, shape=(1024,)) -> None:

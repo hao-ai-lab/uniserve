@@ -12,9 +12,8 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from uniserve.runtime.backends.attention.flashinfer import Config as FlashInferConfig
-from uniserve_worker.parallel import ParallelConfig
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.protocol.batch import (
+from uniserve_worker.protocol.operation import (
     COMPUTATIONS,
     Computation,
     ForwardMode,
@@ -523,71 +522,3 @@ def _parse_optional_bool(value: object | None) -> bool | None:
     if text == "false":
         return False
     raise ValueError(f"expected optional bool token, got {value!r}")
-
-
-@dataclass(frozen=True, slots=True)
-class ComponentConfig:
-    """Ordered process membership and logical parallelism for one model component."""
-
-    ranks: tuple[int, ...]
-    parallel_config: ParallelConfig = ParallelConfig()
-    distribution: str | None = None
-    units_per_rank: int = 1
-
-    def __post_init__(self) -> None:
-        if not self.ranks or len(set(self.ranks)) != len(self.ranks):
-            raise ValueError("component ranks must be unique and non-empty")
-        if any(type(rank) is not int or rank < 0 for rank in self.ranks):
-            raise ValueError("component ranks must be nonnegative integers")
-        if self.distribution not in (None, "temporal_units"):
-            raise ValueError(f"unsupported component distribution {self.distribution!r}")
-        if type(self.units_per_rank) is not int or self.units_per_rank < 1:
-            raise ValueError("units_per_rank must be a positive integer")
-        if self.distribution is None and len(self.ranks) != self.parallel_config.world_size:
-            raise ValueError("component membership must equal TP × sequence × pipeline degrees")
-        if self.distribution is not None and self.parallel_config.world_size != 1:
-            raise ValueError("temporal unit distribution requires a local decoder parallel_config")
-
-    @classmethod
-    def from_dict(cls, value: dict[str, object]) -> ComponentConfig:
-        unknown = value.keys() - {"ranks", "parallel_config", "distribution", "units_per_rank"}
-        if unknown:
-            raise ValueError(f"unknown component fields: {sorted(unknown)}")
-        ranks = value.get("ranks")
-        parallel = value.get("parallel_config", {})
-        if not isinstance(ranks, (list, tuple)) or not isinstance(parallel, dict):
-            raise ValueError("component requires ranks and a parallel_config object")
-        distribution = value.get("distribution")
-        units = value.get("units_per_rank", 1)
-        if distribution is not None and not isinstance(distribution, str):
-            raise ValueError("component distribution must be a string")
-        if type(units) is not int:
-            raise ValueError("units_per_rank must be a positive integer")
-        return cls(tuple(ranks), ParallelConfig.from_dict(parallel), distribution, units)
-
-    def to_dict(self) -> dict[str, object]:
-        value: dict[str, object] = {
-            "ranks": list(self.ranks),
-            "parallel_config": self.parallel_config.to_dict(),
-        }
-        if self.distribution is not None:
-            value.update(distribution=self.distribution, units_per_rank=self.units_per_rank)
-        return value
-
-
-def parse_entries(
-    value: dict[str, object], world_size: int
-) -> tuple[tuple[str, ComponentConfig], ...]:
-    """Validate the authoritative expanded component assignments from the host."""
-
-    components = []
-    if not value:
-        raise ValueError("entry configuration must not be empty")
-    for name, component in sorted(value.items()):
-        if not name or not isinstance(component, dict):
-            raise ValueError("entry configuration requires named component objects")
-        resolved = ComponentConfig.from_dict(component)
-        if any(rank >= world_size for rank in resolved.ranks):
-            raise ValueError(f"component {name!r} contains ranks outside the process world")
-        components.append((name, resolved))
-    return tuple(components)

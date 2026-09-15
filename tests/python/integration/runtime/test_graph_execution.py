@@ -5,11 +5,11 @@ from contextlib import nullcontext
 import pytest
 import torch
 
-from tests.python.fixtures.encoding import Model
 from tests.python.fixtures.diffusion import LinearDenoiser, Size
+from tests.python.fixtures.encoding import Model
 from uniserve.model import DenoiserInput, LatentInput
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.diffusion_runner import DiffusionRunner
+from uniserve_worker.execution.denoising_runner import DenoisingRunner
 from uniserve_worker.execution.model_runner import ModelRunner
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
@@ -52,7 +52,7 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(graphs, 
     model.projection.to(branch_device)
     schedules = model.make_schedules(2, shift=1.0, device=device)
     capture_stream = torch.cuda.Stream(device=device) if graphs else None
-    runner = DiffusionRunner(
+    runner = DenoisingRunner(
         model,
         device=device,
         capture_stream=capture_stream,

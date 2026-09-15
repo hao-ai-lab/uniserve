@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.execution.top_k_sampling import sample_top_k
+from uniserve.sampling import sample_top_k
 
 pytestmark = pytest.mark.unit
 

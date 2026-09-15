@@ -72,7 +72,7 @@ def allocate_peer_tensor(
 
     POSIX descriptors are transferred through Unix-domain sockets using the
     standard SCM_RIGHTS protocol. The existing process group exchanges socket
-    addresses and validates matching geometry and a shared host before any
+    addresses and validates matching shapes and a shared host before any
     descriptor transfer. All setup finishes before CUDA graph capture.
     """
 
@@ -95,7 +95,7 @@ def allocate_peer_tensor(
                     peer is None or (peer[0], peer[2], peer[3]) != (identity[0], shape, str(dtype))
                     for peer in identities
                 ):
-                    raise ValueError("peer tensors require matching geometry on one host")
+                    raise ValueError("peer tensors require matching shapes on one host")
                 backend_ranks = sorted(group.ranks)
                 ordered = [identities[backend_ranks.index(rank)] for rank in group.ranks]
                 destination = ordered[(group.rank + 1) % group.size]

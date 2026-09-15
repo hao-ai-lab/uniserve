@@ -2,8 +2,6 @@
 
 from dataclasses import dataclass
 
-import torch
-
 from .mesh import Communicator
 
 

@@ -1,43 +1,39 @@
-"""Deterministic numerical modules for the CPU serving simulator."""
+"""Deterministic text, vision and image module composition."""
 
-from dataclasses import dataclass
+from __future__ import annotations
+
 from types import MappingProxyType
 
 import torch
 from torch import nn
 
-from uniserve.diffusion import AdditiveGuidance, EulerSolver, NoiseScale, make_schedule
 from uniserve.distributed import Communicator
-from uniserve.media import image
 from uniserve.model import (
     CausalLM,
-    DenoiserInput as NumericalDenoiserInput,
     EntryPoint,
     ImageDecoder,
-    ImageDenoiser,
     PatchEncoder,
     TransformerDecoder,
     VocabShard,
 )
-from uniserve.nn.attention import Attention, AttentionInput, PagedInput, SegmentedInput
+from uniserve.nn.attention import Attention, PagedInput, SegmentedInput
 from uniserve.nn.functional import patchify
 from uniserve.nn.vae.layers import DiagonalGaussian
 from uniserve.nn.vae.patch import PatchAutoencoder, RGBDecoder
-from uniserve.tensors import OutputLayout, TensorOutput
+
+from .config import Config
+from .denoiser import Denoiser
 
 STUB_EOS_TOKEN_ID = 151645
+
+
 STUB_IMG_START_TOKEN_ID = 151670
+
+
 _VOCAB_SIZE = STUB_IMG_START_TOKEN_ID + 1
+
+
 _HIDDEN_SIZE = 4
-
-
-@dataclass(frozen=True, slots=True)
-class Config:
-    patch_size: int = 16
-
-    def __post_init__(self):
-        if type(self.patch_size) is not int or self.patch_size < 1:
-            raise ValueError("simulation patches must have a positive pixel width")
 
 
 class _Embedding(nn.Module):
@@ -123,66 +119,6 @@ class _Moments(_Scale):
     def forward(self, pixels):
         means = super().forward(pixels)
         return torch.cat((means, torch.zeros_like(means)), dim=1)
-
-
-@dataclass(frozen=True)
-class DenoiserInput(NumericalDenoiserInput[image.Config]):
-    attention: AttentionInput
-
-
-class Denoiser(ImageDenoiser):
-    def __init__(self, config: Config, backbone: TransformerDecoder):
-        super().__init__(
-            patch_size=config.patch_size,
-            latent_channels=3,
-            downsample=config.patch_size,
-            noise_scale=NoiseScale(1.0, "constant", 1.0, 1.0),
-            prediction_dtype=torch.bfloat16,
-            solver=EulerSolver(),
-        )
-        self.backbone = backbone
-
-    def make_schedules(self, steps, *, shift, device):
-        return {
-            "image": make_schedule(
-                steps,
-                shift=1.0 if shift is None else shift,
-                direction="ascending",
-                shift_domain="time",
-                device=device,
-            )
-        }
-
-    def make_guidance(self, *, text_scale, image_scale, interval, renorm, renorm_min):
-        return AdditiveGuidance(text_scale, image_scale, interval, renorm, renorm_min)
-
-    def forward(self, inputs: DenoiserInput, *, state, constants, workspace):
-        if set(inputs.latents) != {"image"}:
-            raise ValueError("simulation predicts the image latent modality")
-        # Latent-feature prefill and image prediction share the scalar cache
-        # layer. Read-only attention inputs leave the prefix untouched.
-        count = inputs.attention.queries.num_tokens
-        reference = inputs.latents["image"][0].tensor
-        values = reference.new_zeros((count, 1, 1))
-        if (
-            isinstance(inputs.attention, (PagedInput, SegmentedInput))
-            and inputs.attention.write_indices is not None
-        ):
-            self.backbone.layers["0"].attention.update_cache(
-                values, values, indices=inputs.attention.write_indices
-            )
-        outputs = []
-        for latent, size in zip(inputs.latents["image"], inputs.sizes, strict=True):
-            shape = self.latent_shape("image", size)
-            if tuple(latent.tensor.shape) != shape:
-                raise ValueError("simulation latents must match their canonical image patches")
-            outputs.append(
-                TensorOutput(
-                    torch.zeros_like(latent.tensor, dtype=self.prediction_dtype),
-                    OutputLayout(shape, self.prediction_dtype, tuple(slice(0, n) for n in shape)),
-                )
-            )
-        return {"image": tuple(outputs)}
 
 
 class Model(CausalLM):

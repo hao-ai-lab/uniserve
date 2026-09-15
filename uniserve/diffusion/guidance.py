@@ -1,8 +1,8 @@
 """Caller-held classifier-free guidance over analytical schedule coordinates."""
 
+import math
 from dataclasses import dataclass
 from enum import Enum
-import math
 from typing import ClassVar
 
 import torch

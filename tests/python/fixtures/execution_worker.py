@@ -9,9 +9,9 @@ import torch
 
 from tests.python.fixtures.worker_config import stub_worker_config
 from uniserve.distributed.mesh import Communicator
-from uniserve_models.processing import stub_processor
-from uniserve_models.stub import Model
-from uniserve_worker.config import ComponentConfig, WorkerConfig
+from uniserve_models.stub import Model, image_processor
+from uniserve_worker.bootstrap.config import ComponentConfig
+from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.model_entry import ModelEntry
 from uniserve_worker.worker import Worker
 
@@ -69,7 +69,7 @@ def execution_worker(
     )
     worker = Worker(
         ready,
-        image_processor=stub_processor() if isinstance(ready, Model) else None,
+        image_processor=image_processor() if isinstance(ready, Model) else None,
         bindings=bindings,
         sampling_group=Communicator(device=torch.device(device)),
         worker_config=worker_config,
@@ -85,7 +85,7 @@ def execution_worker(
     )
     from .depth_one import configure_physical_pool
 
-    flow = worker.runner.images
+    flow = worker.runner.image_builder
     configure_physical_pool(
         cache_pages=0 if worker.info.kv_cache is None else worker.info.kv_cache.num_blocks,
         request_pool_size=worker.info.request_slots,

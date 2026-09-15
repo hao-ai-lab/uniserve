@@ -166,12 +166,12 @@ def _validate_attention(
     block_counts: torch.Tensor,
     valid_sizes: torch.Tensor,
 ) -> None:
-    """Validate the public sparse-attention tensor and metadata contract."""
+    """Validate the public sparse-attention tensors and metadata."""
 
     if query.ndim != 3 or query.shape[1] < 1 or query.shape[2] != _HEAD_DIM:
         raise ValueError("Triton sparse attention requires [sequence, heads, 128] Q/K/V")
     if key.shape != value.shape or key.shape[1:] != query.shape[1:]:
-        raise ValueError("Triton sparse attention requires matching K/V and Q/K head geometry")
+        raise ValueError("Triton sparse attention requires matching K/V and Q/K head dimensions")
     if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
         raise ValueError("Triton sparse attention requires BF16 Q/K/V")
     if not query.is_cuda or any(tensor.device != query.device for tensor in (key, value, output)):

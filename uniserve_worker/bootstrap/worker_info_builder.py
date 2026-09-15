@@ -1,4 +1,4 @@
-"""Build WorkerInfo from a loaded model and worker geometry."""
+"""Build WorkerInfo from a loaded model and worker resource settings."""
 
 from __future__ import annotations
 
@@ -8,29 +8,29 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 
 import torch
+from torch import nn
 
 from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
-from torch import nn
-
-from uniserve.model import CausalLM, PatchEncoder, VideoPostprocessor
 from uniserve.media import image
+from uniserve.model import CausalLM, PatchEncoder, VideoPostprocessor
 from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
 from uniserve_models.processing import ImageProcessor
-from uniserve_worker.config import ComponentConfig, WorkerConfig
-from uniserve_worker.protocol.batch import COMPUTATIONS, Computation
+from uniserve_worker.config import WorkerConfig
+from uniserve_worker.protocol.operation import COMPUTATIONS, Computation
 
 from ..config import graph_memory_budget_bytes, graph_padding_block_count
 from ..execution.input_buffers import InputBufferConfig
 from ..execution.model_entry import ModelEntry
 from ..execution.resources import media_state_buffers
 from ..foundation.errors import unsupported_setup
-from ..protocol.batch import WorkerEndpoint
+from ..protocol.transfer import WorkerEndpoint
 from ..runtime.block_tables import BlockTables
 from ..runtime.cache_imports import cache_transfer_workspace_bytes
 from ..runtime.decode_state import DecodeState
 from ..runtime.results import resolve_outputs
+from .cache import cache_info, resize_cache
 from .capacity import (
     ArenaCapacity,
     active_latent_capacity_tokens,
@@ -46,8 +46,8 @@ from .capacity import (
     vision_tokens,
 )
 from .components import media_components, supported_operations
-from .inputs import capability, image_inputs, media_inputs
-from .cache import cache_info, resize_cache
+from .config import ComponentConfig
+from .inputs import capability, image_builder, media_builder
 from .worker_info import EntryInfo, WorkerInfo
 
 __all__ = ["WorkerLayout", "build_worker_info", "build_worker_layout", "configuration_identity"]
@@ -55,7 +55,7 @@ __all__ = ["WorkerLayout", "build_worker_info", "build_worker_layout", "configur
 
 @dataclass(frozen=True, slots=True)
 class WorkerLayout:
-    """Worker-local model geometry paired with the public capacity report."""
+    """Worker-local model dimensions paired with the public capacity report."""
 
     info: WorkerInfo
     arena: ArenaCapacity
@@ -86,7 +86,7 @@ def configuration_identity(
 ) -> str:
     """Identify resolved params, numerical storage, operators, and shape bounds.
 
-    This describes resolved execution geometry and numerical policy, not a hash
+    This describes resolved execution dimensions and numerical policy, not a hash
     of weight contents. Graph and arena objects retain their own lifetimes and
     cannot be reused by a differently initialized worker.
     """
@@ -178,9 +178,9 @@ def build_worker_layout(
     bindings: Mapping[str, ModelEntry] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> WorkerLayout:
-    """Resolve resource geometry and the exact capacity report used by the worker.
+    """Resolve resource dimensions and the exact capacity report used by the worker.
 
-    Model geometry determines storage reservations. Admission additionally obeys
+    Model dimensions determine storage reservations. Admission additionally obeys
     the configured operation set and every lane's bounds; these restrictions do
     not shrink the storage needed by warmup and graph capture.
     """
@@ -281,7 +281,7 @@ def _token_worker_layout(
     owns_kv = text is not None
     cache = None if text is None else cache_info(text, worker_config, num_blocks=1)
     bytes_per_token = 0 if cache is None else cache.bytes_per_token
-    flow = image_inputs(model)
+    flow = image_builder(model)
     requested_latent_units = (
         active_latent_capacity_tokens(
             flow.max_tokens,
@@ -496,7 +496,7 @@ def _request_tensor_worker_layout(
         buffer_pool_bytes=slots * product_storage_bytes(resolve_outputs(model, worker_config)),
         max_unresolved_ops=unresolved_window,
         pipeline_components=dict(media_components(model)),
-        num_inference_steps=media_inputs(model, worker_config).num_steps,
+        num_inference_steps=media_builder(model, worker_config).num_steps,
     )
     return WorkerLayout(
         info=info,

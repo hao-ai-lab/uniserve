@@ -6,9 +6,9 @@ from uuid import uuid4
 import pytest
 
 from uniserve_worker.bootstrap.cli import parse_worker_args
-from uniserve_worker.bootstrap.ipc import WorkerIpcEndpoint
-from uniserve_worker.bootstrap.launch import run_worker
-from uniserve_worker.protocol.batch import ComputationId, ForwardMode
+from uniserve_worker.bootstrap.launch import WorkerIpcEndpoint, run_worker
+from uniserve_worker.protocol.identity import ComputationId
+from uniserve_worker.protocol.operation import ForwardMode
 
 pytestmark = pytest.mark.integration
 
@@ -72,7 +72,7 @@ def test_endpoint_scope_closes_and_preserves_body_error(failing_scope):
 def test_model_loading_failure_releases_the_launch_endpoint(tmp_path):
     service = f"worker-{uuid4().hex}"
     config = _model_config(service, tmp_path)
-    with pytest.raises(FileNotFoundError, match="config.json"):
+    with pytest.raises(FileNotFoundError, match="modular_model_index.json"):
         run_worker(config)
     with WorkerIpcEndpoint(service, max_payload=65536) as endpoint:
         assert endpoint.try_recv() is None
@@ -139,7 +139,7 @@ def test_worker_preserves_a_caller_owned_process_group(tmp_path, failure):
     dist.init_process_group("gloo", init_method=f"file://{tmp_path}/world", rank=0, world_size=1)
     try:
         if failure == "model_loading":
-            with pytest.raises(FileNotFoundError, match="config.json"):
+            with pytest.raises(FileNotFoundError, match="modular_model_index.json"):
                 Worker.from_config(_model_config("borrowed-world", tmp_path))
         elif failure == "process_world":
             with pytest.raises(WorkerError, match="rank/world_size") as raised:
@@ -179,9 +179,9 @@ def _owned_world(rank, directory):
             config = replace(
                 config,
                 use_stub_model=False,
-                model=ModelLaunchConfig(directory, {}, 16, 1.0),
+                model=ModelLaunchConfig(directory, {}),
             )
-            with pytest.raises(FileNotFoundError, match="config.json"):
+            with pytest.raises(FileNotFoundError, match="modular_model_index.json"):
                 Worker.from_config(config)
         elif failure == "execution_setup":
             config = replace(config, data_plane=replace(config.data_plane, publication_backends=()))
@@ -218,7 +218,7 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
     )
     from tests.python.fixtures.execution_worker import execution_worker
     from uniserve_worker.config import LaneConfig, WorkerConfig
-    from uniserve_worker.protocol.batch import COMPUTATIONS, OpStatus
+    from uniserve_worker.protocol.operation import COMPUTATIONS, OpStatus
 
     policy = WorkerConfig(
         prefill_cuda_graph=False,

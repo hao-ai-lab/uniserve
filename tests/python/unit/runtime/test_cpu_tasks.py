@@ -6,10 +6,10 @@ from threading import Event
 import pytest
 import torch
 
+from uniserve.runtime import EventPool
 from uniserve_worker.execution.output import OutputPool
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.runtime.cpu import CpuPool
-from uniserve_worker.runtime.device_events import EventPool
 
 
 def test_submitted_task_retains_capacity_until_actual_completion() -> None:

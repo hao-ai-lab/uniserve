@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping
-from dataclasses import fields, replace
+from dataclasses import fields, is_dataclass, replace
 from typing import Generic, TypeVar
 
 import torch
@@ -14,12 +14,41 @@ from uniserve.distributed import Communicator
 from uniserve.model import Denoiser, DenoiserInput
 from uniserve.runtime import CUDAGraph, ExecutionContext, PrefixCache
 
-from .denoising import numerical_signature
 from .graph_inputs import clone_inputs, copy_inputs, input_signature
 from .model_entry import capture_required
 
 InputT = TypeVar("InputT", bound=DenoiserInput)
 SizeT = TypeVar("SizeT")
+
+
+def _numerical_signature(value: object) -> Hashable:
+    """Identify static values and tensor backing independently of tensor contents.
+
+    Immutable numerical records may be rebuilt between calls. Their values and
+    borrowed tensor addresses determine graph reuse; mutable device contents do
+    not, so this function never reads tensors back to the host.
+    """
+
+    if isinstance(value, torch.Tensor):
+        return (
+            value.device,
+            value.dtype,
+            tuple(value.shape),
+            tuple(value.stride()),
+            value.data_ptr(),
+        )
+    if isinstance(value, Mapping):
+        return tuple((key, _numerical_signature(item)) for key, item in value.items())
+    if isinstance(value, (tuple, list)):
+        return tuple(_numerical_signature(item) for item in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return type(value), tuple(
+            (field.name, _numerical_signature(getattr(value, field.name)))
+            for field in fields(value)
+        )
+    if isinstance(value, Hashable):
+        return value
+    raise TypeError(f"unsupported numerical graph value: {type(value).__name__}")
 
 
 def restore_samples(inputs: DenoiserInput):
@@ -37,7 +66,7 @@ def restore_samples(inputs: DenoiserInput):
     return restore
 
 
-class DiffusionRunner(Generic[InputT, SizeT]):
+class DenoisingRunner(Generic[InputT, SizeT]):
     """Execute one denoiser capability over caller-supplied typed inputs.
 
     Prepared contexts own plans, constants, communication resources and scratch.
@@ -152,7 +181,7 @@ class DiffusionRunner(Generic[InputT, SizeT]):
         # rebuilt per trajectory, so their values are copied into graph-owned
         # storage on every invocation instead of making addresses part of reuse.
         signature = (
-            numerical_signature(
+            _numerical_signature(
                 (
                     tuple(
                         (field.name, getattr(inputs, field.name))

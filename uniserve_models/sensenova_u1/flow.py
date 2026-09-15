@@ -1,7 +1,7 @@
 """SenseNova's adaptive flow head and convolutional image reconstruction."""
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import nn

@@ -154,7 +154,7 @@ def _compile(
     lse: torch.Tensor | None,
     allow_empty_blocks: bool,
 ) -> Callable[..., None]:
-    """Compile and cache the block-sparse CuTe kernel for one concrete tensor geometry."""
+    """Compile and cache the block-sparse CuTe kernel for one concrete tensor shape."""
 
     if _cute is None or _kernel_type is None:
         raise RuntimeError("CuTe sparse video attention is unavailable") from _IMPORT_ERROR
@@ -204,7 +204,7 @@ def _validate(
     """Validate tensor ranks, dtypes, shapes, devices, and block-index bounds."""
 
     if key.shape != value.shape or key.shape[1:] != query.shape[1:]:
-        raise ValueError("CuTe sparse attention requires matching K/V and Q/K head geometry")
+        raise ValueError("CuTe sparse attention requires matching K/V and Q/K head dimensions")
     if query.ndim != 3 or query.shape[1] < 1 or query.shape[2] != 128:
         raise ValueError("CuTe sparse attention requires [sequence, heads, 128] Q/K/V")
     if any(t.dtype != torch.bfloat16 for t in (query, key, value)) or not query.is_cuda:

@@ -12,13 +12,8 @@ from uniserve_worker.bootstrap.capacity import input_buffer_config
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.execution.rows import ForwardRow
-from uniserve_worker.protocol.batch import (
-    Bounds,
-    ComputationId,
-    PipelineStage,
-    RequestKey,
-    ScheduledRequest,
-)
+from uniserve_worker.protocol.identity import ComputationId, RequestKey
+from uniserve_worker.protocol.operation import Bounds, PipelineStage, ScheduledRequest
 from uniserve_worker.runtime.cache_manager import CacheManager
 from uniserve_worker.runtime.latent_pool import LatentPool
 

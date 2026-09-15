@@ -10,7 +10,6 @@ from uniserve.quantization import QuantizationConfig, Quantizer
 from .config import TransformerConfig
 from .video_vae import Config as VideoConfig
 
-
 # This table is the single definition of each named numerical choice. Both
 # complete presets and component overrides expand through weight_config.
 _formats = {

@@ -29,7 +29,7 @@ from uniserve.model import (
     VideoPostprocessor,
 )
 from uniserve.nn.vae import PatchAutoencoder
-from uniserve.runtime import CUDAGraph, ExecutionContext
+from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext, partition_streams
 from uniserve.runtime.backends.attention import resolve as attention_backend
 from uniserve.runtime.backends.attention.flashinfer import Backend as FlashInfer
 from uniserve.runtime.cuda_graph import CUDAGraphError
@@ -37,7 +37,7 @@ from uniserve.runtime.device import canonical_device, fill_cpu_ints
 from uniserve.runtime.resources import close_resources
 from uniserve.tensors import OutputLayout, TensorOutput
 from uniserve_models.processing import ImageProcessor
-from uniserve_worker.config import ComponentConfig, WorkerConfig
+from uniserve_worker.config import WorkerConfig
 from uniserve_worker.foundation.errors import (
     ComputeError,
     InputError,
@@ -47,23 +47,23 @@ from uniserve_worker.foundation.errors import (
     classify,
     invalid_descriptor,
 )
-from uniserve_worker.protocol.batch import (
-    ComputationId,
+from uniserve_worker.protocol.identity import ComputationId
+from uniserve_worker.protocol.operation import (
     ForwardMode,
-    ForwardStats,
     ImageParams,
     PipelineStage,
     ScheduledRequest,
 )
+from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.runtime.results import resolve_outputs
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
 from ..bootstrap.components import bind_components, call_operations, describe_components
-from ..bootstrap.inputs import capability, image_inputs, media_inputs
+from ..bootstrap.config import ComponentConfig
+from ..bootstrap.inputs import capability, image_builder, media_builder
 from ..profiling import record_component
 from .batch import ExecutionOutput, InputBatch
-from .cuda_stream import CudaStream, create_partitioned_streams
-from .diffusion_runner import DiffusionRunner
+from .denoising_runner import DenoisingRunner
 from .graph_inputs import (
     BatchGraph,
     PrefillShape,
@@ -81,7 +81,7 @@ from .input_buffers import InputBuffers
 from .model_entry import ModelEntry, capture_required
 from .resources import media_state_buffers, output_layouts
 from .rows import ForwardRow
-from .tensors import TokenSelection
+from .sampling import TokenSelection
 from .text import TextCall
 
 if TYPE_CHECKING:
@@ -137,8 +137,8 @@ class ModelRunner:
             flashinfer=FlashInfer(worker_config.flashinfer),
         )
         self.processor, self.flow_prompt = image_processor, flow_prompt
-        self.images = image_inputs(model)
-        self.media = media_inputs(model, worker_config)
+        self.image_builder = image_builder(model)
+        self.media_builder = media_builder(model, worker_config)
         self.text = capability(model, CausalLM)
         # Capability discovery belongs to initialization. Request execution uses
         # these borrowed modules without walking the loaded parameter tree.
@@ -174,7 +174,7 @@ class ModelRunner:
         self._module_graphs = {}
         self._module_streams = {}
         self._text_calls = {}
-        self._streams = []
+        self._lane_streams = []
         self._capture_stream = None
         self._preparation_stream = None
         self._text_staging = self._text_tokens = None
@@ -187,7 +187,7 @@ class ModelRunner:
         self.decode_context_blocks = 0
         self.decode_predicates = None
         self.kv_cache = None
-        self.diffusion = None
+        self.denoising = None
         self.uses_lanes = False
         self._startup_complete = self._closed = False
         try:
@@ -210,8 +210,8 @@ class ModelRunner:
                         continue
                     key = (name, call.path, call.entry.method)
                     self._module_entries[key] = (binding, call)
-                    if self.media is not None and isinstance(call.module, Denoiser):
-                        self.diffusion = DiffusionRunner(
+                    if self.media_builder is not None and isinstance(call.module, Denoiser):
+                        self.denoising = DenoisingRunner(
                             call.module,
                             device=binding.device,
                             capture_stream=self.capture_stream(),
@@ -304,9 +304,9 @@ class ModelRunner:
             computations = call_operations((call,))
             parents = tuple(
                 stream
-                for stream in self._streams
+                for lane, stream in self._lane_streams
                 if stream.device == binding.device
-                and (stream.config is None or computations.intersection(stream.config.computations))
+                and (lane is None or computations.intersection(lane.computations))
             )
             if len(parents) > 1:
                 raise InputError("one numerical entry requires an unambiguous execution partition")
@@ -315,7 +315,7 @@ class ModelRunner:
             elif self.worker_config.lanes:
                 raise InputError("numerical entry has no initialized execution partition")
             else:
-                owner = CudaStream(
+                owner = CUDAStream(
                     device=binding.device,
                     stream=torch.cuda.Stream(device=binding.device),
                     sm_count=torch.cuda.get_device_properties(binding.device).multi_processor_count,
@@ -359,25 +359,34 @@ class ModelRunner:
     def _initialize_streams(self, *, event_slots):
         """Realize execution grants for both staged and standalone capabilities."""
 
-        if self._streams:
+        if self._lane_streams:
             return
         config, device = self.worker_config, canonical_device(self.worker_config.device)
         self.uses_lanes = bool(config.lanes)
         if config.lanes:
             if self._capture_devices(device):
                 raise ValueError("Green Context lanes require one physical device")
-            self._streams.extend(
-                create_partitioned_streams(config.lanes, device, event_slots=event_slots)
+            slots = tuple(int(lane.max_inflight or (event_slots - 1)) + 1 for lane in config.lanes)
+            streams = partition_streams(
+                device,
+                tuple(lane.sm_budget for lane in config.lanes),
+                event_slots=slots,
             )
+            self._lane_streams.extend(zip(config.lanes, streams, strict=True))
         else:
             for target in (device, *self._capture_devices(device)):
                 if target.type == "cuda":
-                    self._streams.append(
-                        CudaStream(
-                            device=target,
-                            stream=torch.cuda.Stream(device=target),
-                            sm_count=torch.cuda.get_device_properties(target).multi_processor_count,
-                            event_slots=event_slots,
+                    self._lane_streams.append(
+                        (
+                            None,
+                            CUDAStream(
+                                device=target,
+                                stream=torch.cuda.Stream(device=target),
+                                sm_count=torch.cuda.get_device_properties(
+                                    target
+                                ).multi_processor_count,
+                                event_slots=event_slots,
+                            ),
                         )
                     )
 
@@ -502,10 +511,10 @@ class ModelRunner:
         return ExecutionOutput(tuple(values), layouts=tuple(layouts))
 
     def run_denoising(self, inputs, schedules, *, state, slot, input_key):
-        if self.diffusion is None:
+        if self.denoising is None:
             raise InputError("rank does not own denoising computation")
         started = time.perf_counter_ns()
-        values, path = self.diffusion.step(
+        values, path = self.denoising.step(
             inputs, schedules, state=state, slot=slot, input_key=input_key
         )
         return replace(self._result(values), stats=_observations("denoiser", started, path))
@@ -585,7 +594,7 @@ class ModelRunner:
         prefill_sizes = tuple(
             value for value in config.prefill_graph_token_sizes if 0 < value <= prefill_capacity
         )
-        if self.images is not None:
+        if self.image_builder is not None:
             from uniserve.media import image
 
             self.flow_cfg_branches = (1, 2, 3)
@@ -597,10 +606,10 @@ class ModelRunner:
                 max_tokens=input_config.max_tokens,
                 per_image_capacity=latent_capacity_units,
                 latent_capacity=latent_pool.capacity_units,
-                physical_tokens=lambda height, width: self.images.sequence_length(
+                physical_tokens=lambda height, width: self.image_builder.sequence_length(
                     image.Config(height, width)
                 ),
-                image_tokens=lambda height, width: self.images.denoiser.latent_shape(
+                image_tokens=lambda height, width: self.image_builder.denoiser.latent_shape(
                     "image", image.Config(height, width)
                 )[0],
             )
@@ -612,7 +621,7 @@ class ModelRunner:
             PipelineStage.LATENT_ENCODING,
             PipelineStage.IMAGE_DECODING,
         }
-        if self.images is not None:
+        if self.image_builder is not None:
             staged.add(PipelineStage.DENOISING)
         for (name, path, method), (placement, call) in self._module_entries.items():
             operations = call_operations((call,)) & staged
@@ -623,16 +632,13 @@ class ModelRunner:
                 if operations & {PipelineStage.LATENT_ENCODING, PipelineStage.IMAGE_DECODING}
                 else placement.device
             )
-            streams = [stream for stream in self._streams if stream.device == target]
-            for stream in streams or (None,):
-                kinds = (
-                    operations
-                    if stream is None or stream.config is None
-                    else operations.intersection(stream.config.computations)
-                )
+            streams = [
+                (lane, stream) for lane, stream in self._lane_streams if stream.device == target
+            ]
+            for lane, stream in streams or ((None, None),):
+                kinds = operations if lane is None else operations.intersection(lane.computations)
                 if not kinds:
                     continue
-                lane = None if stream is None else stream.config
                 rows = (
                     max_rows
                     if lane is None
@@ -656,7 +662,7 @@ class ModelRunner:
                         self.prefill_row_sizes,
                         max_rows=rows,
                         max_tokens=tokens,
-                        visual=self.images is not None,
+                        visual=self.image_builder is not None,
                     )
                     if ForwardMode.PREFILL in kinds
                     else ()
@@ -690,7 +696,7 @@ class ModelRunner:
                         entry.input_buffers = InputBuffers(
                             config=fields,
                             device=target,
-                            images=self.images,
+                            image_builder=self.image_builder,
                             max_inflight=max_inflight,
                         )
                         entry.context = ExecutionContext(
@@ -723,7 +729,7 @@ class ModelRunner:
                     except BaseException as cleanup:
                         error.add_note(f"input resource cleanup failed: {cleanup!r}")
                     raise
-                self.entries[(name, path, None if stream is None else stream.name)] = entry
+                self.entries[(name, path, None if lane is None else lane.lane_id)] = entry
                 self.batch_graphs[entry] = {}
                 self.decode_shapes[entry], self.prefill_shapes[entry] = decode, prefill
                 if config.graph_policy != "off" and target.type == "cuda":
@@ -927,7 +933,7 @@ class ModelRunner:
     def operation_devices(self, operation):
         binding = self.bindings.get(operation.entry)
         source = canonical_device(self.worker_config.device) if binding is None else binding.device
-        if self.images is not None and operation.kind in {
+        if self.image_builder is not None and operation.kind in {
             PipelineStage.LATENT_PREPARATION,
             PipelineStage.DENOISING,
             PipelineStage.IMAGE_DECODING,
@@ -939,7 +945,7 @@ class ModelRunner:
         return source, source if entry is None else entry.device, source
 
     def warmup(self, storage):
-        if self.media is not None:
+        if self.media_builder is not None:
             from .video import warmup_decoders, warmup_denoising, warmup_postprocess
 
             warmup_denoising(self, storage)
@@ -949,8 +955,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture(self, *, tokenizer, latents):
-        from .runners.decode import prepare_decode
-        from .runners.prefill import prepare_prefill
+        from .startup import prepare_decode, prepare_prefill
 
         for phase in ("prefill", "decode", "flow"):
             for entry in self.batch_graphs:
@@ -978,13 +983,13 @@ class ModelRunner:
             }
             if private_pool_bytes(device, pools) > budget:
                 raise CUDAGraphError("captured graph residency exceeds its device budget")
-        for stream in self._streams:
+        for _, stream in self._lane_streams:
             stream.verify()
         self._startup_complete = True
 
     def synchronize(self):
         streams = [self._capture_stream, self._preparation_stream]
-        streams.extend(stream.stream for stream in self._streams)
+        streams.extend(stream.stream for _, stream in self._lane_streams)
         streams.extend(stream.stream for stream in self._module_streams.values())
         devices = {
             canonical_device(self.worker_config.device),
@@ -1007,8 +1012,8 @@ class ModelRunner:
             graph.graph.close for graphs in self.batch_graphs.values() for graph in graphs.values()
         ]
         actions.extend(graph.close for graph, _ in self._module_graphs.values())
-        if self.diffusion is not None:
-            actions.append(self.diffusion.close)
+        if self.denoising is not None:
+            actions.append(self.denoising.close)
         try:
             close_resources(*actions)
         finally:
@@ -1027,7 +1032,7 @@ class ModelRunner:
         if self._text_staging is not None:
             actions.append(self._text_staging.close)
         actions.extend(stream.close for stream in reversed(tuple(self._module_streams.values())))
-        actions.extend(stream.close for stream in reversed(self._streams))
+        actions.extend(stream.close for _, stream in reversed(self._lane_streams))
         try:
             close_resources(*actions)
         finally:
@@ -1037,7 +1042,7 @@ class ModelRunner:
             self._module_contexts.clear()
             self._module_pools.clear()
             self._module_streams.clear()
-            self._streams.clear()
+            self._lane_streams.clear()
             self._text_tokens = self._text_staging = None
 
     def stage_text_tokens(self, tokens: tuple[int, ...]) -> torch.Tensor:
@@ -1087,7 +1092,7 @@ class ModelRunner:
             torch.cuda.current_stream(self.worker_config.device).wait_stream(stream)
 
     def image_processor(self) -> ImageProcessor:
-        """Require the caller's image preprocessing contract for the active operation."""
+        """Require image preprocessing settings for the active operation."""
 
         value = self.processor
         if not isinstance(value, ImageProcessor):
@@ -1309,7 +1314,7 @@ def _validate_outputs(
                 task.image_height,
                 task.image_width,
             ):
-                raise ValueError("decoded tensor does not match declared image geometry")
+                raise ValueError("decoded tensor does not match the requested image shape")
 
 
 def _input_failure(

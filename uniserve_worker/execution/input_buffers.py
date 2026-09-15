@@ -11,16 +11,15 @@ from uniserve.model import EmbeddingReplacement, TextInput, VisionInput
 from uniserve.nn.attention import BlockTable, PagedInput, SegmentedInput, SequenceLengths
 from uniserve.runtime.device import fill_cpu_bools, fill_cpu_ints
 from uniserve.runtime.tensor_buffers import TensorBuffers
-from uniserve.tensors import BufferConfig
+from uniserve.tensors import BufferConfig, adjacent_view
 from uniserve_worker.ops.staging import gather_request_decode_inputs
-from uniserve_worker.protocol.batch import ForwardMode, PipelineStage
+from uniserve_worker.protocol.operation import ForwardMode, PipelineStage
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
 from .attention import cache_pages, columns
 from .batch import InputBatch
-from .inputs.image import DecodeInput, ImageInputs
+from .inputs.image import DecodeInput, ImageBuilder
 from .rows import ForwardRow
-from .tensors import packed_tensor_views
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,9 +73,11 @@ class InputBuffers:
         config: InputBufferConfig,
         device,
         max_inflight=1,
-        images: ImageInputs | None = None,
+        image_builder: ImageBuilder | None = None,
     ):
-        self.config, self.device, self.images = config, torch.device(device), images
+        self.config = config
+        self.device = torch.device(device)
+        self.image_builder = image_builder
         self.max_rows, self.max_tokens = config.max_rows, config.max_tokens
         self.max_text_tokens, self.max_blocks_per_row = (
             config.max_text_tokens,
@@ -224,7 +225,7 @@ class InputBuffers:
         # Multimodal prefills share one capture representation whether the
         # current prompt inserts features or consists entirely of token IDs.
         use_embeddings = has_embeddings or (
-            self.images is not None
+            self.image_builder is not None
             and any(row.forward_mode is not ForwardMode.DECODE for row in rows)
         )
         if use_embeddings:
@@ -234,17 +235,17 @@ class InputBuffers:
         # Adjacent continuation rows already share backing. Preserve that
         # layout; concatenate only disjoint columns on a common source device.
         values = tuple(row.token_ids.reshape(-1) for row in rows)
-        packed = None
+        input_ids = None
         if len({value.device for value in values}) == 1:
-            packed = packed_tensor_views(values)
-            packed = torch.cat(values) if packed is None else packed
-            self.input_ids[:total].copy_(packed, non_blocking=True)
+            input_ids = adjacent_view(values)
+            input_ids = torch.cat(values) if input_ids is None else input_ids
+            self.input_ids[:total].copy_(input_ids, non_blocking=True)
         # Multimodal text uses one three-axis representation for prefill and
         # decode. Spatial coordinates of ordinary text stay zero; numerical
         # layers can consume the prepared axes directly on every replay.
-        offset, axes = 0, 3 if self.images is not None else 1
+        offset, axes = 0, 3 if self.image_builder is not None else 1
         for row, length in zip(rows, lengths, strict=True):
-            if packed is None:
+            if input_ids is None:
                 self.input_ids[offset : offset + length].copy_(
                     row.token_ids.reshape(-1), non_blocking=True
                 )
@@ -271,10 +272,10 @@ class InputBuffers:
         )
 
     def _images(self, rows, attention):
-        if self.images is None:
-            raise ValueError("image denoising requires its bound input factory")
+        if self.image_builder is None:
+            raise ValueError("image denoising requires its bound input builder")
         sizes = tuple(image.Config(row.image_height, row.image_width) for row in rows)
-        lengths = tuple(self.images.sequence_length(size) for size in sizes)
+        lengths = tuple(self.image_builder.sequence_length(size) for size in sizes)
         if sum(lengths) > self.max_tokens:
             raise ValueError("image sequences exceed input-buffer capacity")
         positions, offset = [], 0
@@ -285,7 +286,7 @@ class InputBuffers:
             positions.append(self.positions[:, offset : offset + length])
             self.timesteps[index].copy_(row.timestep.reshape(()))
             offset += length
-        return self.images.bind(
+        return self.image_builder.bind(
             samples=tuple(self._device_view(row.latent) for row in rows),
             sizes=sizes,
             timesteps=tuple(self.timesteps[index : index + 1] for index in range(len(rows))),
@@ -341,7 +342,7 @@ class InputBuffers:
             request_tokens=states.future_input_tokens[:, 0],
             request_positions=states.logical_lengths,
             input_ids=self.input_ids,
-            positions=self.positions if self.images is not None else self.positions[:1],
+            positions=self.positions if self.image_builder is not None else self.positions[:1],
             block_tables=self.block_tables[:, :width],
             cache_lengths=self.cache_lengths,
             query_lengths=self.query_lengths,
@@ -370,7 +371,7 @@ class InputBuffers:
             writes,
             tuple(row.causal for row in rows),
         )
-        if self.images is not None:
+        if self.image_builder is not None:
             positions = self.positions[:, :count]
         else:
             positions = self.positions[0, :count]

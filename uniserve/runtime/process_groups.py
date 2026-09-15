@@ -7,8 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
 from itertools import combinations
-from types import MappingProxyType
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Any, Self
 
 import torch

@@ -33,7 +33,7 @@ class DecodeState:
         """Allocate request-indexed continuation tensors and prewarm update kernels."""
 
         if request_pool_size < 1 or vocab_size < 1 or continuation_width < 1:
-            raise ValueError("runtime-state geometry must be positive")
+            raise ValueError("runtime-state dimensions must be positive")
         self.request_pool_size = int(request_pool_size)
         self.vocab_size = int(vocab_size)
         self.continuation_width = int(continuation_width)
@@ -114,7 +114,7 @@ class DecodeState:
         """Describe continuation storage; verified lengths belong to the page-table owner."""
 
         if min(request_pool_size, vocab_size, continuation_width) < 1:
-            raise ValueError("runtime-state geometry must be positive")
+            raise ValueError("runtime-state dimensions must be positive")
         if not logits_dtype.is_floating_point:
             raise ValueError("runtime prompt-logit dtype must be floating point")
         rows = request_pool_size + 1

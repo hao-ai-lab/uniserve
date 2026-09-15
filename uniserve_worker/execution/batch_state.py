@@ -19,20 +19,16 @@ from uniserve_worker.execution.rows import (
 )
 from uniserve_worker.foundation.errors import WorkerError, invalid_descriptor
 from uniserve_worker.protocol.batch import (
-    BatchOutput,
-    BufferId,
     Finish,
-    ForwardStats,
     Free,
-    KvTransfer,
-    OpStatus,
     RegistrationAck,
-    RequestKey,
-    RequestOutput,
     ScheduleBatch,
-    ScheduledRequest,
     TensorPublication,
 )
+from uniserve_worker.protocol.identity import BufferId, RequestKey
+from uniserve_worker.protocol.operation import OpStatus, ScheduledRequest
+from uniserve_worker.protocol.output import BatchOutput, ForwardStats, RequestOutput
+from uniserve_worker.protocol.transfer import KvTransfer
 from uniserve_worker.runtime.cache_imports import CacheImport
 from uniserve_worker.runtime.cache_manager import CacheManager
 from uniserve_worker.runtime.latent_pool import LatentImport, LatentPool

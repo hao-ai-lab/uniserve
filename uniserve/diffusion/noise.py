@@ -1,7 +1,7 @@
 """Native normal draws and resolution-dependent numerical noise scaling."""
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Literal
 
 import torch

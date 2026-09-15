@@ -9,17 +9,20 @@ from typing import cast
 import torch
 
 from uniserve.distributed.mesh import Communicator
-from uniserve_worker.execution.tensors import packed_tensor_views
 from uniserve.runtime.triton import triton_available
+from uniserve.sampling import SamplingParams, sample_top_k
+from uniserve.tensors import adjacent_view
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.protocol.batch import SamplingParams
 
-from .sampling import LogprobValues, SamplerOutput, SamplerRow, SamplingMetadata
-from .top_k_sampling import sample_top_k
-
-SAMPLING_COMPLETION_FIELDS = 4
-TOKEN_CONTINUATION_BIT = 1 << 31
-TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
+from .sampling import (
+    SAMPLING_COMPLETION_FIELDS,
+    TOKEN_CONTINUATION_BIT,
+    TOKEN_VALUE_MASK,
+    LogprobValues,
+    SamplerOutput,
+    SamplerRow,
+    SamplingMetadata,
+)
 
 
 def device_greedy_parameters(parameters: SamplingParams) -> bool:
@@ -138,7 +141,7 @@ def sample_device_greedy_group(
 ) -> tuple[SamplerRow, ...]:
     """Resolve predicates, greedy tokens, finish state, and completion values for a group."""
 
-    logits = packed_tensor_views(tuple(task.logits for task in tasks))
+    logits = adjacent_view(tuple(task.logits for task in tasks))
     if logits is None:
         logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
     else:
@@ -186,7 +189,7 @@ def sample_device_greedy_group(
 
 
 def _fused_top_k(task: SamplingMetadata, vocab: int) -> int:
-    """Return a fused top-k width when the task satisfies the kernel's sampling contract."""
+    """Return a fused top-k width when the task is supported by the compiled kernel."""
 
     if task.logits.device.type != "cuda":
         return 0
@@ -228,7 +231,7 @@ def _sample_fused_top_k_group(
     """Sample a homogeneous fused-top-k group and return its numerical selections."""
 
     # The compiled kernel consumes one contiguous column for each sampling
-    # input, so compatible task rows are packed before a single launch.
+    # input, so compatible task rows are concatenated before a single launch.
     logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
     draws = torch.cat(tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0)
     parameters = torch.cat(
@@ -527,10 +530,10 @@ def _sample_predicates(
 
     if tasks and all(task.predicate is not None and task.tagged_predicate for task in tasks):
         predicates = tuple(cast(torch.Tensor, task.predicate).reshape(-1)[:1] for task in tasks)
-        packed = packed_tensor_views(predicates)
-        if packed is None:
-            packed = torch.cat(predicates, dim=0)
-        return packed.reshape(-1).ge(TOKEN_CONTINUATION_BIT)
+        view = adjacent_view(predicates)
+        if view is None:
+            view = torch.cat(predicates, dim=0)
+        return view.reshape(-1).ge(TOKEN_CONTINUATION_BIT)
     values = tuple(
         (
             torch.ones((1,), dtype=torch.bool, device=device)
@@ -586,7 +589,7 @@ def _sampled_transition_values(
     selected_eligibility = select_device_values(eligibility, indexes)
 
     # Captured graphs may supply fixed destination storage. Its one-bit row
-    # contract must exactly match the selected product subset.
+    # shape must exactly match the selected product subset.
     target: torch.Tensor | None = None
     if destination is not None:
         target = destination.reshape(-1)
@@ -661,8 +664,8 @@ def select_device_values(values: torch.Tensor, indexes: tuple[int, ...]) -> torc
     views = tuple(flat[index : index + 1] for index in indexes)
     if len(views) == 1:
         return views[0]
-    packed = packed_tensor_views(views)
-    return torch.cat(views, dim=0) if packed is None else packed.reshape(-1)
+    view = adjacent_view(views)
+    return torch.cat(views, dim=0) if view is None else view.reshape(-1)
 
 
 def _shape_sampling_logits_batch(
@@ -1011,7 +1014,7 @@ def logprob_details(
 
         return values.to(dtype=torch.float32).contiguous().view(torch.int32).to(torch.long)
 
-    packed = torch.cat(
+    encoded = torch.cat(
         (
             selected_tokens.reshape(-1).to(torch.long),
             float_bits(selected_values.reshape(-1)),
@@ -1023,7 +1026,7 @@ def logprob_details(
             candidate_ranks.reshape(-1).to(torch.long),
         )
     )
-    return packed, requested_rows, counts, requested_ids, max_count, max_requested
+    return encoded, requested_rows, counts, requested_ids, max_count, max_requested
 
 
 def broadcast_selection(group: Communicator | None, value: torch.Tensor) -> torch.Tensor:

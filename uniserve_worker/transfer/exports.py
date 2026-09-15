@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from concurrent.futures import Future
 
-from ..protocol.batch import BufferId, Locator, RequestKey
+from ..protocol.identity import BufferId, RequestKey
+from ..protocol.transfer import Locator
 from .tickets import Transport
 
 ExportLocations = tuple[tuple[Transport, Locator], ...]

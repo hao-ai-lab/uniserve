@@ -8,7 +8,7 @@ from uniserve.model import CausalLM, TextInput, VocabShard
 from uniserve.nn.attention import DenseInput
 
 from .batch import ExecutionOutput
-from .tensors import TokenSelection
+from .sampling import TokenSelection
 
 
 class TextCall:

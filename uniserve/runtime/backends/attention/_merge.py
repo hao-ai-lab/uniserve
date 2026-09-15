@@ -103,7 +103,7 @@ def _triton_merge_eligible(
     second_output: torch.Tensor,
     second_lse: torch.Tensor,
 ) -> bool:
-    """Return whether two attention states satisfy the fused merge kernel contract."""
+    """Return whether two attention states satisfy the fused merge kernel requirements."""
 
     tensors = (first_output, first_lse, second_output, second_lse)
     return bool(

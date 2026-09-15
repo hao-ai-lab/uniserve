@@ -7,9 +7,9 @@ from pathlib import Path
 from tests.python.fixtures.depth_one import finalized_report
 from uniserve_worker.bootstrap.cli import create_worker_cli_parser
 from uniserve_worker.bootstrap.config import WorkerProcessArgs
-from uniserve_worker.bootstrap.ipc import WorkerIpcEndpoint
+from uniserve_worker.bootstrap.launch import WorkerIpcEndpoint
 from uniserve_worker.media.storage import publish_media_bytes
-from uniserve_worker.protocol.batch import MediaOutput, PosixShmArtifact
+from uniserve_worker.protocol.output import MediaOutput, PosixShmArtifact
 from uniserve_worker.worker import Worker
 
 

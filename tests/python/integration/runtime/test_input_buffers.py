@@ -4,10 +4,10 @@ import pytest
 import torch
 
 from uniserve.nn.attention import PagedInput
-from uniserve_worker.execution.tensors import TokenSelection
 from uniserve_worker.execution.input_buffers import InputBufferConfig, InputBuffers
 from uniserve_worker.execution.rows import ForwardRow
-from uniserve_worker.protocol.batch import ForwardMode
+from uniserve_worker.execution.sampling import TokenSelection
+from uniserve_worker.protocol.operation import ForwardMode
 from uniserve_worker.runtime.decode_state import DecodeState
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]

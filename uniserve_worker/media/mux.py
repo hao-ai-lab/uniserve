@@ -15,7 +15,9 @@ import numpy as np
 from uniserve.media.video import Config
 
 from ..foundation.errors import invalid_descriptor
-from ..protocol.batch import ComputationId, MediaOutput, MediaTrack, PosixShmArtifact, RequestKey
+from ..protocol.batch import MediaTrack
+from ..protocol.identity import ComputationId, RequestKey
+from ..protocol.output import MediaOutput, PosixShmArtifact
 from .storage import publish_media_bytes
 
 if TYPE_CHECKING:
@@ -48,7 +50,7 @@ def require_media_codecs(video_codec: str, audio_codec: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class AvMuxConfig:
-    """Codec, frame, audio, and decode-unit geometry for one media container."""
+    """Codec, frame, audio, and decode-unit settings for one media container."""
 
     width: int
     height: int
@@ -61,7 +63,7 @@ class AvMuxConfig:
     audio_frame_samples: int = 1024
 
     def __post_init__(self) -> None:
-        """Validate positive media geometry and complete decode-unit coverage."""
+        """Validate positive media dimensions and complete decode-unit coverage."""
 
         if (
             min(
@@ -73,7 +75,7 @@ class AvMuxConfig:
             )
             < 1
         ):
-            raise ValueError("media mux geometry and rates must be positive")
+            raise ValueError("media mux dimensions and rates must be positive")
         if not self.video_unit_frames or sum(self.video_unit_frames) != self.frame_count:
             raise ValueError("media mux decode units must cover the output frame count")
 
@@ -150,7 +152,7 @@ class AvMuxSession:
                 or rgb24.shape[1:] != (config.height, config.width, 3)
                 or int(rgb24.shape[0]) != expected_frames
             ):
-                raise RuntimeError("video capture has invalid RGB24 geometry")
+                raise RuntimeError("video capture has invalid RGB24 dimensions")
 
             # Initialize shared streams only after the input has passed validation.
             self._open()
@@ -180,7 +182,7 @@ class AvMuxSession:
             if self._closed or self._audio_written:
                 raise RuntimeError("audio was muxed more than once")
             if pcm.ndim != 2 or pcm.shape[1] != 2:
-                raise RuntimeError("audio capture has invalid stereo geometry")
+                raise RuntimeError("audio capture has invalid stereo dimensions")
             self._open()
             container, stream = self._container, self._audio
             if container is None or stream is None:
@@ -296,7 +298,7 @@ class MediaMux:
         audio_rate: int,
         video_unit_frames: tuple[int, ...],
     ) -> None:
-        """Create the request-owned mux session for a validated output geometry."""
+        """Create the request-owned mux session for validated output dimensions."""
 
         if request_key in self._sessions:
             return

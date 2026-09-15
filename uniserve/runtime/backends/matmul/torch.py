@@ -27,7 +27,7 @@ class _TorchOperator(_Operator):
                 else weight.float()
             )
             # The reference projection rounds its GEMM result before adding
-            # bias, matching the encoded accelerator projection contract.
+            # bias, matching the encoded accelerator projection format.
             out.copy_(F.linear(x, weight).to(out.dtype))
             if bias is not None:
                 out.add_(bias.to(out.dtype))

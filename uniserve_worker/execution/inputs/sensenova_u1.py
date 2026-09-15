@@ -6,10 +6,10 @@ from uniserve.model import LatentInput
 from uniserve.nn.functional import unpatchify
 from uniserve_models.sensenova_u1 import DenoiserInput, ImageConditioning
 
-from .image import ImageInputs
+from .image import ImageBuilder
 
 
-class Inputs(ImageInputs):
+class U1Builder(ImageBuilder):
     @property
     def max_tokens(self):
         return self.denoiser.config.max_image_seq_len

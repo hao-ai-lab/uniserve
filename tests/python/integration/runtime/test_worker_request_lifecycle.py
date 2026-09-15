@@ -19,18 +19,15 @@ from tests.python.fixtures.depth_one import (
     visual_state_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from tests.python.fixtures.simulation import expected_successor
+from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.protocol.batch import (
-    ComputationId,
+from uniserve_worker.protocol.batch import Finish, Free, NewRequest
+from uniserve_worker.protocol.identity import ComputationId, RequestKey
+from uniserve_worker.protocol.operation import (
     ErrorCode,
-    Finish,
     ForwardMode,
-    Free,
-    NewRequest,
     OpStatus,
-    RequestKey,
     TransferMode,
 )
 
@@ -44,7 +41,7 @@ pytestmark = pytest.mark.integration
 def test_independent_product_work_preserves_request_progress(device, warm_start) -> None:
     from dataclasses import replace
 
-    from uniserve_worker.protocol.batch import Bounds, ScheduledRequest
+    from uniserve_worker.protocol.operation import Bounds, ScheduledRequest
 
     worker = execution_worker(device=device)
     admission = ar_params(79, block_ids=(0,))
@@ -168,7 +165,7 @@ def test_retained_encoder_product_outlives_its_producer_request(
         replacement = NewRequest(
             template.request_key,
             request_pool_idx=admission.request_pool_idx,
-            ar=template.ar,
+            generation=template.generation,
         )
         bind_request_allocation(
             replacement.request_key,
@@ -345,7 +342,7 @@ def test_cancelled_admission_cannot_publish_over_a_reused_request_slot() -> None
         replacement = NewRequest(
             template.request_key,
             request_pool_idx=admission.request_pool_idx,
-            ar=template.ar,
+            generation=template.generation,
         )
         bind_request_allocation(
             replacement.request_key, request_pool_idx=replacement.request_pool_idx, page_ids=(1,)
@@ -481,7 +478,7 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
             request_epoch=retired.request_key.request_epoch + 1,
         ),
         request_pool_idx=retired.request_pool_idx,
-        ar=replacement_template.ar,
+        generation=replacement_template.generation,
     )
     bind_request_allocation(
         replacement.request_key,

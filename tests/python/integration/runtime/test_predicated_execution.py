@@ -16,20 +16,16 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
-from uniserve_worker.protocol.batch import (
-    ComputationId,
-    DType,
-    Finish,
+from uniserve_worker.protocol.batch import Finish, Free, NewRequest
+from uniserve_worker.protocol.identity import ComputationId
+from uniserve_worker.protocol.operation import (
     ForwardMode,
-    Free,
     ImageParams,
-    NewRequest,
     OpStatus,
     SamplingState,
     ScheduledRequest,
-    ShapeBound,
-    TensorRef,
 )
+from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
 
 
 def _with_transition_predicate(
@@ -130,7 +126,7 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
     admission = NewRequest(
         base.request_key,
         request_pool_idx=base.request_pool_idx,
-        ar=replace(base.ar, finish_token_ids=(expected_successor(4),)),
+        generation=replace(base.generation, finish_token_ids=(expected_successor(4),)),
     )
     predecessor = token_operation(
         admission.request_key,
@@ -245,8 +241,8 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     admission = NewRequest(
         understanding.request_key,
         request_pool_idx=understanding.request_pool_idx,
-        ar=understanding.ar,
-        umm=generation.umm,
+        generation=understanding.generation,
+        image=generation.image,
     )
     initial = token_operation(
         admission.request_key,

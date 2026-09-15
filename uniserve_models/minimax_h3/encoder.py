@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 from torch import nn
 
@@ -13,7 +13,7 @@ from uniserve_models import qwen3
 
 @dataclass(frozen=True, slots=True)
 class TextEncoderConfig:
-    """Defines the H3 text encoder's vocabulary and tensor geometry.
+    """Define the H3 text encoder's vocabulary and tensor dimensions.
 
     The configuration fixes hidden width, attention num_attention_heads, layer count, and rotary
     settings.

@@ -7,9 +7,9 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve_worker.parallel import ParallelConfig, SequenceParallel
 from uniserve.runtime._peer_memory import allocate_peer_workspace
 from uniserve.runtime.process_groups import initialize_process_groups
+from uniserve_worker.bootstrap.config import ParallelConfig, SequenceConfig
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -26,7 +26,7 @@ def _run_peer_tensor(rank: int, rendezvous: str, world_size: int) -> None:
     )
     ranks = tuple(reversed(range(world_size)))
     bound_meshes = {}
-    for mesh_name, (mesh_ranks, mesh_parallel) in sorted(({'model': (ranks, ParallelConfig(sequence_parallel=SequenceParallel('ring', (world_size,))))}).items()):
+    for mesh_name, (mesh_ranks, mesh_parallel) in sorted(({'model': (ranks, ParallelConfig(sequence_parallel=SequenceConfig('ring', (world_size,))))}).items()):
         topology = DeviceMesh(
             ranks=mesh_ranks,
             shape=tuple(size for _, size in mesh_parallel.dimensions),

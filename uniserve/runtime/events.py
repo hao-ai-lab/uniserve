@@ -11,17 +11,15 @@ import torch
 
 from uniserve.runtime.device import canonical_device
 
-from ..foundation.errors import WorkerError, WorkerErrorCode
+
+class EventPoolError(RuntimeError):
+    """Report invalid event ownership or stream ordering."""
 
 
-def _invariant(message: str) -> WorkerError:
-    """Construct a classified invariant error for event-pool misuse."""
+def _invariant(message: str) -> EventPoolError:
+    """Construct an error for invalid event-pool ownership or ordering."""
 
-    return WorkerError(
-        code=WorkerErrorCode.INVARIANT_VIOLATION,
-        message=message,
-        fatal=True,
-    )
+    return EventPoolError(message)
 
 
 @dataclass(slots=True)
@@ -293,4 +291,4 @@ class EventPool:
         return state
 
 
-__all__ = ["EventPool"]
+__all__ = ["EventPool", "EventPoolError"]

@@ -2,12 +2,52 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from math import isfinite, prod
 
 import torch
 
 from uniserve import _slices
+
+
+def adjacent_view(values: Sequence[torch.Tensor]) -> torch.Tensor | None:
+    """Return one flat view when tensors cover adjacent regions of one storage.
+
+    The input order is significant. No allocation is performed, and ``None``
+    indicates that concatenation is required.
+    """
+
+    if not values:
+        return None
+
+    flat = tuple(value.reshape(-1) for value in values)
+    first = flat[0]
+    if (
+        not first.is_contiguous()
+        or any(not value.is_contiguous() for value in flat)
+        or any(value.dtype != first.dtype or value.device != first.device for value in flat)
+    ):
+        return None
+
+    storage = first.untyped_storage().data_ptr()
+    offset = int(first.storage_offset())
+    expected = offset
+    for value in flat:
+        if value.untyped_storage().data_ptr() != storage or int(value.storage_offset()) != expected:
+            return None
+        expected += int(value.numel())
+    return first.as_strided((expected - offset,), (1,), storage_offset=offset)
+
+
+def concatenate_views(values: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Borrow adjacent flattened views, or concatenate disjoint tensors."""
+
+    tensors = tuple(value.reshape(-1) for value in values)
+    if not tensors:
+        raise ValueError("at least one tensor is required")
+    view = adjacent_view(tensors)
+    return torch.cat(tensors, dim=0) if view is None else view
 
 
 def _join_channels(values, *, copy: bool = True):

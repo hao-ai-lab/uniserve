@@ -3,12 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-import torch
 
 from tests.python.fixtures.worker_config import stub_worker_config
-
-from uniserve_models.stub import Model
-from uniserve_models.processing import stub_processor
+from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.capacity import derive_runtime_kv_capacity
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
 
@@ -115,7 +112,7 @@ def test_explicit_pages_cannot_displace_resident_encoder_storage() -> None:
         max_batch_operations=4,
         max_batch_tokens=64,
     )
-    processor = stub_processor()
+    processor = image_processor()
     build_worker_info(model, config, image_processor=processor)
     # The processor's admitted image area owns the complete resident feature bound.
     processor = replace(processor, vit=replace(processor.vit, max_pixels=1024**3 * 16**2))

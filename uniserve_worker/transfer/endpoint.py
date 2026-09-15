@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Generic, TypeVar
 
 from ..foundation.errors import invalid_descriptor, resource_error
-from ..protocol.batch import CudaIpcTransfer, Locator, PosixShmTransfer
+from ..protocol.transfer import CudaIpcTransfer, Locator, PosixShmTransfer
 
 Source = TypeVar("Source")
 

@@ -1,4 +1,4 @@
-"""Token-to-raster transforms with explicit spatiotemporal patch geometry."""
+"""Token-to-raster transforms with explicit spatiotemporal patch dimensions."""
 
 from __future__ import annotations
 

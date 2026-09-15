@@ -8,10 +8,10 @@ import torch
 from torch import nn
 from torch.distributed.tensor import Replicate, Shard
 
+from uniserve.nn.attention._parallel import ParallelAttention
 from uniserve.nn.attention.config import AttentionParallelConfig
 from uniserve.nn.attention.layer import Attention
 from uniserve.nn.attention.vsa import Attention as VsaAttention
-from uniserve.nn.attention._parallel import ParallelAttention
 from uniserve.nn.linear import (
     ColumnParallelLinear,
     Linear,
@@ -25,9 +25,9 @@ from uniserve.nn.linear import (
 )
 from uniserve.quantization import QuantizedTensor
 
+from ._tokens import _HeadExchange
 from .distribution import Distribution
 from .mesh import DeviceMesh
-from ._tokens import _HeadExchange
 
 
 def _replicated_heads(mesh: DeviceMesh, heads: int) -> Distribution:

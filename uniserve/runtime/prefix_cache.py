@@ -46,11 +46,11 @@ class PrefixCache:
             count = num_blocks[name] if isinstance(num_blocks, Mapping) else num_blocks
             size = block_size[name] if isinstance(block_size, Mapping) else block_size
             quantizer = None if quantization is None else quantization.get(name)
-            specs = layout.buffers(
+            requirements = layout.buffers(
                 num_blocks=count, block_size=size, dtype=dtype, quantizer=quantizer
             )
-            allocation = TensorBuffers.allocate(specs, device=self.device)
-            tensors = allocation.view(specs)
+            allocation = TensorBuffers.allocate(requirements, device=self.device)
+            tensors = allocation.view(requirements)
             for tensor in tensors.values():
                 tensor.zero_()
             state = layout.bind(tensors, block_size=size, dtype=dtype, quantizer=quantizer)

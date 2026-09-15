@@ -65,8 +65,8 @@ class PeerReduction:
 
     BF16/FP16 contributions accumulate in FP32 before the output rounding. The
     native kernel stages each contribution in peer storage before overwriting
-    its input, preserving Communicator's in-place output contract. The native
-    launch geometry requires the physical device's complete SM domain.
+    its input, preserving Communicator's in-place output behavior. The native
+    launch requires the physical device's complete SM domain.
     """
 
     def __init__(self, group: Communicator) -> None:

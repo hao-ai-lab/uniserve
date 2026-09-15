@@ -9,11 +9,7 @@ from typing import TYPE_CHECKING
 from uniserve import _slices
 
 from ..foundation.errors import invalid_descriptor
-from ..protocol.batch import (
-    Locator,
-    TensorTransfer,
-    WorkerEndpoint,
-)
+from ..protocol.transfer import Locator, TensorTransfer, WorkerEndpoint
 
 if TYPE_CHECKING:
     import torch

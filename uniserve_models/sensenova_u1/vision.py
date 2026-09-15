@@ -1,7 +1,7 @@
 """SenseNova's NEO patch projection, axial RoPE and dense spatial reduction."""
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import nn

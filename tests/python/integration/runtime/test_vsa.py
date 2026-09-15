@@ -2,8 +2,8 @@
 
 import pytest
 import torch
-from tests.python.fixtures.vsa import reference_attention
 
+from tests.python.fixtures.vsa import reference_attention
 from uniserve.nn.attention import vsa
 from uniserve.runtime import CUDAGraph, ExecutionContext
 

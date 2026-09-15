@@ -11,11 +11,8 @@ from uniserve.distributed import DeviceMesh, parallelize_
 from uniserve.model import TextSize
 from uniserve.nn import ColumnParallelLinear
 from uniserve.nn.attention import AttentionParallelConfig, Ulysses
-from uniserve.runtime import CUDAGraph, ExecutionContext
+from uniserve.runtime import CUDAGraph, ExecutionContext, partition_streams
 from uniserve.runtime.process_groups import initialize_process_groups
-from uniserve_worker.config import LaneConfig
-from uniserve_worker.execution.cuda_stream import create_partitioned_streams
-from uniserve_worker.protocol.batch import COMPUTATIONS, ForwardMode
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -86,21 +83,7 @@ def _run_collectives(rank: int, rendezvous: str):
         )
         group = mesh.get_group("tokens")
         module = _Collectives(mesh)
-        greens = create_partitioned_streams(
-            (
-                LaneConfig("decode", 64, (ForwardMode.DECODE, ForwardMode.VERIFY)),
-                LaneConfig(
-                    "compute",
-                    88,
-                    tuple(
-                        kind
-                        for kind in COMPUTATIONS
-                        if kind not in {ForwardMode.DECODE, ForwardMode.VERIFY}
-                    ),
-                ),
-            ),
-            device,
-        )
+        greens = partition_streams(device, (64, 88))
         try:
             for green in greens:
                 with ExecutionContext(module, stream=green.stream) as context:

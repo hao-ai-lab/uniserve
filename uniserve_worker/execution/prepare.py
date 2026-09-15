@@ -21,6 +21,7 @@ from uniserve_worker.execution.batch_state import BatchState
 from uniserve_worker.execution.commit import _discard_group
 from uniserve_worker.execution.output import OutputBuffer, PendingOutput
 from uniserve_worker.execution.rows import OperationIdentity
+from uniserve_worker.execution.sampling import SAMPLING_COMPLETION_FIELDS
 from uniserve_worker.execution.video import require_media_output_ring
 from uniserve_worker.execution.video import validate_batch as validate_video_batch
 from uniserve_worker.foundation.errors import (
@@ -30,21 +31,22 @@ from uniserve_worker.foundation.errors import (
 )
 from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.batch import (
-    BufferId,
-    ComputationId,
-    DeviceProductTransferValue,
-    DType,
-    EncoderTransferValue,
     LatentParams,
-    LatentTransferValue,
+    ScheduleBatch,
+    TensorPublication,
+)
+from uniserve_worker.protocol.identity import BufferId, ComputationId
+from uniserve_worker.protocol.operation import (
     OpStatus,
     PipelineStage,
-    ScheduleBatch,
     ScheduledRequest,
-    ShapeBound,
-    TensorPublication,
-    TensorRef,
     TransferMode,
+)
+from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
+from uniserve_worker.protocol.transfer import (
+    DeviceProductTransferValue,
+    EncoderTransferValue,
+    LatentTransferValue,
 )
 from uniserve_worker.runtime.latent_pool import LatentImport
 from uniserve_worker.runtime.tensor_store import FeatureMetadata, ImageMetadata, TensorRead
@@ -66,10 +68,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-SAMPLING_COMPLETION_FIELDS = 4
-TOKEN_CONTINUATION_BIT = 1 << 31
-TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 
 
 def prepare_batch(
@@ -245,9 +243,9 @@ def prepare_inputs(
             elif isinstance(value, DeviceProductTransferValue):
                 main = value.tensor
                 if min(value.height, value.width) < 0:
-                    raise invalid_descriptor("device-product image geometry must be non-negative")
+                    raise invalid_descriptor("device-product image dimensions must be non-negative")
                 if (value.height == 0) != (value.width == 0):
-                    raise invalid_descriptor("device-product image geometry is incomplete")
+                    raise invalid_descriptor("device-product image dimensions are incomplete")
                 if value.value_range not in {"", "signed_unit", "unit"}:
                     raise invalid_descriptor("device-product value range is invalid")
                 if value.height == 0 and value.value_range:
@@ -1072,7 +1070,7 @@ def _bind_latent_inputs(
                     "pool-free latent params disagrees with resident generation state"
                 )
         return
-    # Pooled models bind each operation to validated image geometry and page ownership.
+    # Pooled models bind each operation to validated image dimensions and page ownership.
     rows: list[tuple[OperationIdentity, LatentParams, int]] = []
     for params in parameters:
         identity = (params.request_key, params.op_id)
@@ -1085,10 +1083,10 @@ def _bind_latent_inputs(
         slot = int(request.request.request_pool_idx)
         image = request.request.image
         if image is None:
-            raise invalid_descriptor("latent params has no admitted image geometry")
-        flow = model_runner.images
+            raise invalid_descriptor("latent params has no admitted image dimensions")
+        flow = model_runner.image_builder
         if flow is None:
-            raise invalid_descriptor("image trajectory has no numerical input factory")
+            raise invalid_descriptor("image trajectory has no numerical input builder")
         expected_units = int(
             flow.denoiser.latent_shape(
                 "image", media_image.Config(int(params.height), int(params.width))
@@ -1099,7 +1097,7 @@ def _bind_latent_inputs(
             or int(params.width) != int(image.width)
             or int(params.latent_units) != expected_units
         ):
-            raise invalid_descriptor("latent params disagrees with admitted model geometry")
+            raise invalid_descriptor("latent params disagrees with admitted model dimensions")
         transferred = next(
             (
                 publication.value
@@ -1291,7 +1289,7 @@ def _stage_input_products(
     for entry in input_products:
         product = entry.product
         # Transfer metadata determines which runtime owns the imported value;
-        # each branch validates identity and geometry before publication.
+        # each branch validates identity and shape before publication.
         if not state.input_ready(product.buffer_id):
             raise invalid_descriptor("cross-stage input has no query-ready prepared transfer")
         value = entry.value

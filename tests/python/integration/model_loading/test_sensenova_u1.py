@@ -229,9 +229,9 @@ def test_images_and_velocity_follow_independent_equations(tmp_path, worker_input
     scale = torch.tensor(2.0)
     size = image.Config(8, 8)
     if worker_inputs:
-        from uniserve_worker.bootstrap.inputs import image_inputs
+        from uniserve_worker.bootstrap.inputs import image_builder
 
-        factory = image_inputs(model)
+        factory = image_builder(model)
         factory.initialize(size, seed=71, out=sample)
         pixels = torch.randn(
             (1, 3, 8, 8), generator=torch.Generator().manual_seed(71), dtype=torch.bfloat16

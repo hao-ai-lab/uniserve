@@ -1,6 +1,6 @@
 """Packed RoPE and fused QK normalization-plus-RoPE kernels.
 
-The launchers enforce tensor geometry before entering Triton, accumulate
+The launchers enforce tensor shapes before entering Triton, accumulate
 normalization and rotation in FP32, and combine query and key head rows into shared
 launch domains. Specialized kernels cover partial in-place rotation and the
 two multi-axis head/tail layouts selected by :mod:`uniserve.ops.qk_plan`.
@@ -438,7 +438,7 @@ if triton is not None:
             block_b,
         )
 
-        # Key rows reuse the same row helper with their own geometry and weights.
+        # Key rows reuse the same row helper with their own dimensions and weights.
         k_pid = pid - q_rows
         k_active = (k_pid >= 0) & (k_pid < k_rows)
         k_token = k_pid // k_heads
@@ -707,7 +707,7 @@ def can_run_triton_qk_rms_norm_rope_inplace(
     *,
     compact: bool = False,
 ) -> bool:
-    """Check the packed row/head geometry for in-place partial QK rotation."""
+    """Check packed row/head dimensions for in-place partial QK rotation."""
 
     # In-place execution requires co-located rank-three Q/K tensors, full-width
     # normalization weights, and contiguous duplicated factors for an even
@@ -811,7 +811,7 @@ def _triton_qk_rms_norm_rope_inplace_fake(
     eps: float,
     compact: bool = False,
 ) -> None:
-    """Declare the mutating custom operator's fake-tensor contract."""
+    """Declare fake-tensor mutation for the custom operator."""
 
     del query, key, query_weight, key_weight, cosine, sine, eps, compact
 
@@ -829,7 +829,7 @@ def try_triton_qk_rms_norm_rope(
     """Try one-launch QK RMSNorm plus full-width NeoX rotation.
 
     Returns contiguous output tensors, or ``None`` when device, layout, or
-    feature geometry falls outside the Triton kernel contract.
+    feature shape falls outside the Triton kernel requirements.
     """
 
     if not can_run_triton_qk_rms_norm_rope(q, k, q_weight, k_weight, cos, sin, q_eps, k_eps):
@@ -982,7 +982,7 @@ def try_triton_qk_multi_axis_rms_norm_rope(
     rotary table. Both tail axes share one RMS weight while retaining separate
     rotary tables. Masked reduction tiles cover arbitrary even axis widths
     within the fused head-size bound. Returns ``None`` when the tensors fall
-    outside this contract.
+    outside these requirements.
     """
 
     if not can_run_triton_qk_multi_axis_rms_norm_rope(
@@ -1060,7 +1060,7 @@ def can_run_triton_qk_multi_axis_rms_norm_rope(
     *,
     axis_dims: tuple[int, ...],
 ) -> bool:
-    """Return whether tensors satisfy the specialized three-axis kernel contract."""
+    """Return whether tensors satisfy the specialized three-axis kernel requirements."""
 
     # The kernel is specialized for a leading axis plus two equal-width axes
     # that share one tail normalization weight.
@@ -1081,7 +1081,7 @@ def can_run_triton_qk_multi_axis_rms_norm_rope(
         return False
     tail_dim = 2 * axis_dim
 
-    # Match the bounded head geometry of the other fused QK kernels.
+    # Match the bounded head dimensions of the other fused QK kernels.
     if dim0 + tail_dim > 1024:
         return False
     if q.ndim != 3 or k.ndim != 3 or q.dtype != k.dtype:
@@ -1215,7 +1215,7 @@ def _qk_rms_norm_rope_is_eligible(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> bool:
-    """Check device and shape contracts shared by the full-width kernel."""
+    """Check device and shape requirements shared by the full-width kernel."""
 
     if triton is None or torch.is_grad_enabled():
         return False
@@ -1256,7 +1256,7 @@ def _qk_rms_norm_rope_shapes_match(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> bool:
-    """Check contiguous packed-QK and half-width rotary table geometry."""
+    """Check contiguous packed-QK and half-width rotary table dimensions."""
 
     # The kernel flattens token/head rows directly, so only the feature axis may
     # be strided through its explicit stride and must remain unit-contiguous.
@@ -1363,7 +1363,7 @@ class _EagerPackedRope:
     """Portable tensor implementation of packed RoPE."""
 
     def is_eligible(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> bool:
-        """Return ``True`` because tensor operations provide the general contract."""
+        """Return ``True`` because tensor operations handle the general case."""
 
         return True
 

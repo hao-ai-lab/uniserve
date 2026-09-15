@@ -11,44 +11,44 @@ import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from uniserve.sampling import SamplingParams
 from uniserve_worker.execution.batch_state import BatchState
 
 if TYPE_CHECKING:
     from uniserve_worker.worker import Worker
 
 from uniserve_worker.protocol.batch import (
-    ArRequestParams,
     BatchCommand,
-    BatchOutput,
     BlockTable,
-    Bounds,
     BufferAllocation,
-    BufferId,
     CachePageAllocation,
-    ComputationId,
-    DeviceDim,
-    DrawLayout,
-    DType,
-    ForwardMode,
-    ImageParams,
-    KvTransfer,
+    GenerationParams,
     LatentParams,
     NewRequest,
-    OpStatus,
-    PipelineStage,
-    RequestKey,
-    RequestOutput,
-    Rng,
-    SamplingParams,
     ScheduleBatch,
-    ScheduledRequest,
-    ShapeBound,
     Start,
     TensorPublication,
-    TensorRef,
-    TransferMode,
-    UmmRequestParams,
 )
+from uniserve_worker.protocol.identity import BufferId, ComputationId, RequestKey
+from uniserve_worker.protocol.operation import (
+    Bounds,
+    DrawLayout,
+    ForwardMode,
+    ImageParams,
+    OpStatus,
+    PipelineStage,
+    Rng,
+    ScheduledRequest,
+    TransferMode,
+)
+from uniserve_worker.protocol.output import BatchOutput, RequestOutput
+from uniserve_worker.protocol.tensor import (
+    DeviceDim,
+    DType,
+    ShapeBound,
+    TensorRef,
+)
+from uniserve_worker.protocol.transfer import KvTransfer
 
 AUTHORITY = 0
 _BLOCK_TABLES: dict[RequestKey, list[int]] = {}
@@ -220,8 +220,8 @@ def execution_run(
     """Build scheduler columns and physical allocations for observable worker behavior."""
 
     for admission in admissions:
-        if admission.umm is not None:
-            _IMAGE_PARAMS[admission.request_key] = admission.umm.image
+        if admission.image is not None:
+            _IMAGE_PARAMS[admission.request_key] = admission.image
         _REQUEST_POOL_INDICES[admission.request_key] = int(admission.request_pool_idx)
     for operation in operations:
         for product in (*operation.buffer_inputs(), *operation.buffer_outputs()):
@@ -298,10 +298,10 @@ def execution_run(
                 alt_slot = _alternative_slot(operation.request_key)
                 negative = next(
                     (
-                        admission.ar.negative_token_ids
+                        admission.generation.negative_token_ids
                         for admission in admissions
                         if admission.request_key == operation.request_key
-                        and admission.ar is not None
+                        and admission.generation is not None
                     ),
                     (),
                 )
@@ -390,7 +390,7 @@ def ar_params(
     return NewRequest(
         rk,
         request_pool_idx=request_id + 1,
-        ar=ArRequestParams(
+        generation=GenerationParams(
             sampling=(
                 sampling
                 if sampling is not None
@@ -409,7 +409,7 @@ def umm_params(request_id: int, image: ImageParams, *, request_epoch: int = 1) -
     return NewRequest(
         rk,
         request_pool_idx=request_id + 1,
-        umm=UmmRequestParams(image=image),
+        image=image,
     )
 
 

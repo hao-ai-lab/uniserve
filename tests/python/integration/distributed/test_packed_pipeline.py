@@ -22,7 +22,7 @@ from uniserve.nn.attention import (
 )
 from uniserve.runtime import ExecutionContext, PrefixCache, initialize_process_groups
 from uniserve_models import bagel, sensenova_u1
-from uniserve_worker.bootstrap.inputs import image_inputs
+from uniserve_worker.bootstrap.inputs import image_builder
 
 pytestmark = pytest.mark.integration
 
@@ -119,7 +119,7 @@ def _run(rank, rendezvous, root, architecture, config, shape, axes):
         # Diffusion remains a separate homogeneous numerical call, including
         # BAGEL's text-expert markers within its mathematical image layout.
         size = image.Config(8, 8)
-        factory = image_inputs(reference)
+        factory = image_builder(reference)
         sample = torch.empty(reference.denoiser.latent_shape("image", size), dtype=torch.bfloat16)
         factory.initialize(size, seed=71, out=sample)
         positions = factory.positions(size, 9, device="cpu")

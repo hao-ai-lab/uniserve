@@ -135,7 +135,7 @@ class TritonPackedRope(Operator):
         super().__init__("triton", "rope")
 
     def can_run(self, req: PackedRopeReq) -> bool:
-        """Accept packed tensors matching the Triton launch contract."""
+        """Accept packed tensors matching the Triton launch requirements."""
 
         return _triton_packed.is_eligible(req.x, req.cos, req.sin)
 
@@ -219,7 +219,7 @@ def _flatten_heads(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], bool
         raise RuntimeError("triton multi-axis qk_norm_rope requires 3D or 4D q/k tensors")
 
     # BHSD becomes contiguous BSHD before batch and sequence are flattened, so
-    # each token/head vector matches the rank-three Triton kernel contract.
+    # each token/head vector matches the rank-three Triton kernel requirements.
     flat = (
         x.permute(0, 2, 1, 3).contiguous().reshape(x.shape[0] * x.shape[2], x.shape[1], x.shape[3])
     )
@@ -441,12 +441,12 @@ class TritonQKNormRope(Operator):
         super().__init__("triton", "qk_norm_rope")
 
     def can_run(self, req: QKNormRopeRequest) -> bool:
-        """Check single- or multi-axis geometry against the fused kernel family."""
+        """Check single- or multi-axis dimensions against the fused kernel family."""
 
         if isinstance(req, MultiAxisQKNormRopeReq):
             return self._can_run_multi_axis(req)
 
-        # The in-place partial-rotation kernel has a distinct shape contract;
+        # The in-place partial-rotation kernel has distinct shape requirements;
         # both paths require factor tables that are already position-indexed.
         if req.in_place:
             return (
@@ -589,7 +589,7 @@ class TritonQKNormRope(Operator):
 
         # A single-axis group can fuse normalization and rotation. Shared
         # groups normalize together, then rotate each constituent axis through
-        # the packed kernel, so both group and per-axis contracts must hold.
+        # the packed kernel, so both group and per-axis requirements must hold.
         for group in plan.groups:
             if group.single_axis:
                 cos = plan.cos_tables[group.start]
@@ -740,7 +740,7 @@ class EagerQKNormRope(Operator):
                 or rotary_dim % 2
                 or rotary_dim > req.q.shape[-1]
             ):
-                raise ValueError("in-place partial qk_norm_rope geometry is invalid")
+                raise ValueError("in-place partial qk_norm_rope shape is invalid")
 
             def partial_rope(value: torch.Tensor) -> torch.Tensor:
                 """Rotate the declared prefix of one normalized Q/K tensor."""
@@ -871,7 +871,7 @@ def qk_rms_norm_partial_rope_(
         if bias is not None and (bias.numel() != heads * head_dim or bias.device != query.device):
             raise ValueError("projection bias must match the complete head width and device")
     if value is not None and (value.shape != query.shape or value.device != query.device):
-        raise ValueError("value projection must match Q/K geometry and device")
+        raise ValueError("value projection must match Q/K shape and device")
     # Merged projections lend disjoint Q/K/V views with gaps between token
     # rows. The kernel supports these strides when leading token dimensions
     # flatten affinely and each head and row owns nonoverlapping coordinates.

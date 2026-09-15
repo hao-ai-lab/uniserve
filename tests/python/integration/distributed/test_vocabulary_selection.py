@@ -10,8 +10,8 @@ from torch import nn
 from uniserve.distributed import DeviceMesh
 from uniserve.model import TextSize, VocabShard
 from uniserve.runtime import CUDAGraph, ExecutionContext, initialize_process_groups
+from uniserve.sampling import greedy
 from uniserve_worker.execution.batch import ExecutionOutput
-from uniserve_worker.execution.sampling import greedy_vocabulary
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -69,11 +69,11 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
                             context.prepare(TextSize(num_tokens=6, batch_size=6))
                             stream.wait_stream(current)
                             with context.activate():
-                                greedy_vocabulary(local, vocab)
+                                greedy(local, vocab)
                             current.wait_stream(stream)
                             current.synchronize()
                             with CUDAGraph(context=context) as graph:
-                                graph.capture(lambda: greedy_vocabulary(local, vocab))
+                                graph.capture(lambda: greedy(local, vocab))
                                 for iteration in range(2):
                                     if iteration:
                                         full[1, 9] = 4

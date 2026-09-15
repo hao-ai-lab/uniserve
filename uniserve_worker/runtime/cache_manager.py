@@ -11,19 +11,13 @@ from threading import RLock
 
 import torch
 
-from uniserve.runtime import PrefixCache
 from uniserve.quantization import QuantizedTensor
+from uniserve.runtime import PrefixCache
 from uniserve_worker.bootstrap.worker_info import KVCacheInfo
 
 from ..foundation.errors import invalid_descriptor, resource_error
-from ..protocol.batch import (
-    BufferId,
-    ComputationId,
-    KvTransfer,
-    Locator,
-    RequestKey,
-    TensorTransfer,
-)
+from ..protocol.identity import BufferId, ComputationId, RequestKey
+from ..protocol.transfer import KvTransfer, Locator, TensorTransfer
 from ..transfer.exports import ExportLocations, release_exports
 from ..transfer.tickets import Transport, publish_tensor
 from .block_tables import BlockTables, page_spans
@@ -702,7 +696,7 @@ class CacheManager:
                 self.info.head_dim,
             )
             if publication.tensors[0].shape != expected:
-                raise invalid_descriptor("KV transfer geometry does not match destination layers")
+                raise invalid_descriptor("KV transfer shape does not match destination layers")
 
     def prepare_install(
         self,

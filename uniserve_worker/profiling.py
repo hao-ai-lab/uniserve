@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .protocol.batch import ForwardStats
+    from .protocol.output import ForwardStats
 
 
 import inspect
@@ -311,7 +311,7 @@ def _forward_stats(
 ) -> ForwardStats:
     """Aggregate the original counters and local component times at completion."""
 
-    from .protocol.batch import ForwardStats
+    from .protocol.output import ForwardStats
 
     stats = ForwardStats.combine(values)
     components = dict(stats.component_us)

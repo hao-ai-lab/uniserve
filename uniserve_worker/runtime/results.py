@@ -12,7 +12,13 @@ from uniserve.model import AudioDecoder, Denoiser, VideoDecoder
 
 from ..config import WorkerConfig
 from ..execution.resources import output_layouts
-from ..protocol.batch import DeviceDim, DType, OutputInfo, ShapeBound, StaticDim
+from ..protocol.tensor import (
+    DeviceDim,
+    DType,
+    OutputInfo,
+    ShapeBound,
+    StaticDim,
+)
 
 _DTYPES = {
     torch.uint8: DType.U8,

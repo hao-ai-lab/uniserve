@@ -6,8 +6,8 @@ import select
 import pytest
 import torch
 
+from uniserve.runtime import EventPool
 from uniserve_worker._uniserve_ipc import StreamSignal
-from uniserve_worker.runtime.device_events import EventPool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

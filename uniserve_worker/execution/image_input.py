@@ -17,15 +17,15 @@ from torchvision.transforms import functional as vision
 
 from uniserve_models.processing import ImageProcessor, PatchTransform, StrideResize
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.protocol.batch import PipelineStage
+from uniserve_worker.protocol.operation import PipelineStage
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 @dataclass(frozen=True, slots=True)
-class ImageInputs:
-    """Holds normalized image pixels, patch-grid coordinates, and original media dimensions."""
+class PreparedImage:
+    """Normalized pixels, patch coordinates, and original image dimensions."""
 
     pixels: torch.Tensor
     grid: torch.Tensor | None
@@ -40,7 +40,7 @@ def prepare_image(
     encoded: str,
     *,
     device: torch.device,
-) -> ImageInputs:
+) -> PreparedImage:
     """Decode, resize, normalize, and stage one encoded image for the selected model tower."""
 
     image = _decode_rgb(encoded)
@@ -62,7 +62,7 @@ def prepare_image(
             .reshape(grid_height * grid_width, channels * patch * patch)
         )
         grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
-        return ImageInputs(
+        return PreparedImage(
             _stage(pixels, processor, device),
             grid.to(device=device, non_blocking=True),
             (grid_height, grid_width),
@@ -76,7 +76,7 @@ def prepare_image(
     height, width = canvas.height, canvas.width
     tower_image = _resize_stride(canvas, transform.resize)
     pixels = _normalize(tower_image, transform.normalization)
-    return ImageInputs(_stage(pixels, processor, device), None, None, height, width)
+    return PreparedImage(_stage(pixels, processor, device), None, None, height, width)
 
 
 def prepare_tensor_image(
@@ -86,7 +86,7 @@ def prepare_tensor_image(
     *,
     device: torch.device,
     signed_unit: bool,
-) -> ImageInputs:
+) -> PreparedImage:
     """Apply the declared image transform to an already decoded RGB tensor."""
 
     value = image.detach().to(dtype=torch.float32)
@@ -122,7 +122,7 @@ def prepare_tensor_image(
             .reshape(grid_height * grid_width, channels * patch * patch)
         )
         grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
-        return ImageInputs(
+        return PreparedImage(
             _stage(pixels, processor, device),
             grid.to(device=device, non_blocking=True),
             (grid_height, grid_width),
@@ -157,7 +157,7 @@ def prepare_tensor_image(
         )
     value = _resize_tensor(value, target_height, target_width)
     normalized = _normalize_tensor(value, transform.normalization)
-    return ImageInputs(
+    return PreparedImage(
         _stage(normalized, processor, device),
         None,
         None,
@@ -202,7 +202,7 @@ def patch_grid_shape(
     source_height: int,
     source_width: int,
 ) -> tuple[int, int]:
-    """Return the host-known patch grid for one declared image geometry."""
+    """Return the host-known patch grid for the declared image dimensions."""
 
     height, width = _patch_image_shape(processor, source_height, source_width)
     patch = int(processor.patch_size)
@@ -237,7 +237,7 @@ def _bounded_grid_shape(
     """Fit an aspect-preserving patch grid within minimum and maximum token bounds."""
 
     if min(height, width, factor) < 1:
-        raise invalid_descriptor("image geometry must be positive")
+        raise invalid_descriptor("image dimensions must be positive")
     if max(height, width) / min(height, width) > 200:
         raise invalid_descriptor("image aspect ratio must be at most 200")
     result_height = max(factor, round(height / factor) * factor)
@@ -338,7 +338,7 @@ def _stage(value: torch.Tensor, processor: ImageProcessor, device: torch.device)
 
 
 __all__ = [
-    "ImageInputs",
+    "PreparedImage",
     "patch_grid_shape",
     "prepare_image",
     "prepare_tensor_image",

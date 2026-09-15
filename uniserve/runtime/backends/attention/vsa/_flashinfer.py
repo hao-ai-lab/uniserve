@@ -7,8 +7,8 @@ from typing import Any
 
 import torch
 
-from uniserve.nn.attention.vsa.inputs import Pattern
 from uniserve.distributed._chunks import _ChunkProducer
+from uniserve.nn.attention.vsa.inputs import Pattern
 from uniserve.ops.video_sparse_rows import compose_attention, pack_sparse_input_rows
 from uniserve.runtime.triton import triton_available
 
@@ -39,7 +39,7 @@ _INDEX_BLOCK = 256
 
 @dataclass(frozen=True, slots=True)
 class _SparsePlan:
-    """Own one geometry-specific FlashInfer plan and its mutable device index buffer."""
+    """Own one shape-specific FlashInfer plan and its mutable device index buffer."""
 
     wrapper: Any
     indices: torch.Tensor
@@ -422,7 +422,7 @@ def prepare_rows(
         or packed.device != query.device
         or not packed.is_contiguous()
     ):
-        raise ValueError("prepared sparse inputs must match the complete query geometry")
+        raise ValueError("prepared sparse inputs must match the complete query shape")
     packed_key = packed[1].transpose(0, 1) if native_rows else packed[1]
     packed_value = packed[2].transpose(0, 1) if native_rows else packed[2]
     prefix_rows = pattern.dense_prefix_tiles * _TILE

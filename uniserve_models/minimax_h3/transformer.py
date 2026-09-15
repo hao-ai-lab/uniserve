@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from itertools import chain
 
 import torch
@@ -148,7 +148,7 @@ class Transformer(nn.Module):
 
     Latent input heads belong to the first pipeline stage. The final stage
     normalizes and projects each modality independently. The caller supplies
-    packed activations and owns every state, constant and workspace tensor.
+    contiguous activations and owns every state, constant, and workspace tensor.
     """
 
     def __init__(self, config: TransformerConfig):

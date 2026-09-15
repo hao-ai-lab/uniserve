@@ -27,7 +27,7 @@ class AttentionBuffers:
     Each owner has a page-aligned row capacity, which can exceed its active
     logical rows. Gather storage instead holds a compact replicated key domain.
     The attention owner retains mapped tensor storage through its final peer read.
-    ``valid_sizes`` stores valid-row counts for the geometry's explicit block
+    ``valid_sizes`` stores valid-row counts for the layout's explicit block
     size; numerical backends populate it when masking aligned owner capacity.
     """
 
@@ -255,7 +255,7 @@ class ParallelAttention(torch.nn.Module):
         return buffers
 
     def output_views(self, query: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Return compact sequence-owner views for this call's query geometry."""
+        """Return compact sequence-owner views for this call's query dimensions."""
 
         group = self.ulysses_group
         if query.ndim != 3 or query.shape[0] % group.size:

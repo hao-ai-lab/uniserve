@@ -1,6 +1,7 @@
 """CuTe block-64 attention on Blackwell."""
 
-from . import Backend as BaseBackend, Operator as BaseOperator
+from . import Backend as BaseBackend
+from . import Operator as BaseOperator
 from . import _cute
 
 
@@ -18,6 +19,7 @@ class _Operator(BaseOperator):
 
     def rows(self, q, k, v, batch, *, gate, compressed, out, owners, chunk_tokens, packed, scale):
         from functools import partial
+
         from ._rows import _Rows
 
         self.bind(batch)

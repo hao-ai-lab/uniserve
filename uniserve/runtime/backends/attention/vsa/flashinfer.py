@@ -5,7 +5,8 @@ import torch
 from uniserve.ops.video_sparse_rows import pack_sparse_input_rows
 from uniserve.tensors import BufferConfig
 
-from . import Backend as BaseBackend, Operator as BaseOperator
+from . import Backend as BaseBackend
+from . import Operator as BaseOperator
 from . import _flashinfer
 
 

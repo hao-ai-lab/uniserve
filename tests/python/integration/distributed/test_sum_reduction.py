@@ -8,9 +8,9 @@ import torch
 import torch.multiprocessing as mp
 
 from uniserve.runtime._collectives import allocate_peer_reductions
-from uniserve_worker.parallel import ParallelConfig
 from uniserve.runtime.process_groups import initialize_process_groups
 from uniserve.runtime._communication import collective_scope
+from uniserve_worker.bootstrap.config import ParallelConfig
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

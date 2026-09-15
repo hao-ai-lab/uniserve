@@ -13,8 +13,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from uniserve.runtime import EventPoolError
+
 if TYPE_CHECKING:
-    from uniserve_worker.protocol.batch import ComputationId
+    from uniserve_worker.protocol.identity import ComputationId
 
 __all__ = [
     "WorkerErrorCode",
@@ -281,6 +283,10 @@ def resource_error(message: str, **kw: Any) -> ResourceError:
 _CLASSIFY_RULES: list[tuple[Any, WorkerErrorCode]] = [
     (lambda exc, lowered: _looks_like_fatal_cuda(lowered), WorkerErrorCode.FATAL_WORKER_FAILURE),
     (lambda exc, lowered: _looks_like_oom(exc, lowered), WorkerErrorCode.RESOURCE_ERROR),
+    (
+        lambda exc, lowered: isinstance(exc, EventPoolError),
+        WorkerErrorCode.INVARIANT_VIOLATION,
+    ),
     (
         lambda exc, lowered: isinstance(exc, NotImplementedError),
         WorkerErrorCode.UNSUPPORTED_OPERATION,

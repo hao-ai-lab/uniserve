@@ -115,11 +115,11 @@ class Config(StateConfig):
         )
         if set(tensors) != set(expected):
             raise ValueError("K/V backing fields do not match the state layout")
-        for name, spec in expected.items():
+        for name, requirement in expected.items():
             tensor = tensors[name]
             if (
-                tuple(tensor.shape) != spec.shape
-                or tensor.dtype != spec.dtype
+                tuple(tensor.shape) != requirement.shape
+                or tensor.dtype != requirement.dtype
                 or not tensor.is_contiguous()
             ):
                 raise ValueError(f"K/V backing {name!r} disagrees with its layout")

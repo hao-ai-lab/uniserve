@@ -193,7 +193,7 @@ class _TorchOperator(_Operator):
         if q.ndim != 3 or (
             batch.queries.num_tokens is not None and q.shape[0] != batch.queries.num_tokens
         ):
-            raise ValueError("packed attention queries must match their declared token lengths")
+            raise ValueError("packed attention rows must match their declared token lengths")
         if isinstance(batch, SegmentedInput) and self.cache is None:
             raise RuntimeError("segmented attention requires bound prefix state")
         if q.is_cuda and torch.cuda.is_current_stream_capturing():

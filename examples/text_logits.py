@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+from uniserve.execution import TextRunner
 from uniserve.model import CausalLM, TextInput, TextSize
 from uniserve.nn.attention import PagedInput
 from uniserve.runtime import ExecutionContext, PrefixCache
@@ -62,10 +63,10 @@ def text_logits(
         ) as cache,
         ExecutionContext(model, cache=cache, attention="torch") as execution,
     ):
-        execution.prepare(TextSize(count, 1))
-        execution.bind_attention(attention)
-        hidden = model(inputs)
-        logits = model.compute_logits(hidden, token_indices=positions)
+        runner = TextRunner(model, context=execution)
+        runner.warmup(TextSize(count, 1))
+        hidden = runner.forward(inputs)
+        logits = runner.compute_logits(hidden, token_indices=positions)
         if logits is None:
             raise RuntimeError("local vocabulary projection returned no logits")
         return input_ids, logits.gather().to("cpu", copy=True)

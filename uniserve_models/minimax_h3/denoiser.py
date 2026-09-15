@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import math
+from collections.abc import Mapping
 
 import torch
 
@@ -48,7 +48,7 @@ def schedules(config: DiffusionConfig, *, device: torch.device | str) -> Mapping
 class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
     """Predict video/audio velocities from explicit latent and text tensors.
 
-    Native random draws and their packed sample destinations use CPU FP32;
+    Native random draws and their contiguous sample destinations use CPU FP32;
     callers transfer prepared samples into device views before evaluation.
     Text features are the output of ``conditioner.encode``. Packed padding is
     numerical attention input and never represents a second computation batch.

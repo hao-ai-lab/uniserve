@@ -1,4 +1,4 @@
-"""SGL's FlashAttention kernels over the public numerical input contract."""
+"""SGL's FlashAttention kernels over the public numerical inputs."""
 
 import torch
 

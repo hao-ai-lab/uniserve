@@ -143,7 +143,7 @@ class NeoVitEncoder(nn.Module):
         *,
         grid_shapes: tuple[tuple[int, int], ...] | None,
     ) -> torch.Tensor:
-        # Host-known per-image (h, w) grids drive the conv geometry, so the
+        # Host-known per-image (h, w) grids drive convolution dimensions, so the
         # downsample never reads the device ``grid_hw`` tensor back to the host;
         # ``grid_hw`` remains the device source of truth for 2D RoPE positions.
         """Merge fixed patch neighborhoods and project them to language width."""

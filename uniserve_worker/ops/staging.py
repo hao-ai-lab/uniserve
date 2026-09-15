@@ -64,9 +64,7 @@ if triton is not None:
             live_rows = scalar_mask & (offsets < rows)
             slots = tl.load(request_pool_indices + offsets, mask=live_rows, other=0)
             cache = tl.load(request_cache_lengths + slots, mask=live_rows, other=0)
-            tokens = tl.load(
-                request_tokens + slots * request_token_stride, mask=live_rows, other=1
-            )
+            tokens = tl.load(request_tokens + slots * request_token_stride, mask=live_rows, other=1)
             token_positions = tl.load(
                 request_positions + slots * request_position_stride, mask=live_rows, other=0
             )
@@ -158,7 +156,7 @@ def gather_request_decode_inputs(
     replay. Every tensor must reside on the same CUDA device.
     """
 
-    # A single-device contract lets the fused kernel dereference every input
+    # A single-device requirement lets the fused kernel dereference every input
     # directly and prevents partially staged graph inputs.
     tensors = (
         request_pool_indices,
@@ -217,9 +215,7 @@ def gather_request_decode_inputs(
 
     # One CTA produces all scalar columns; the remaining CTAs copy table cells.
     block = 256
-    _gather_request_decode_inputs_kernel[
-        (1 + triton.cdiv(int(block_tables.numel()), block),)
-    ](
+    _gather_request_decode_inputs_kernel[(1 + triton.cdiv(int(block_tables.numel()), block),)](
         *tensors,
         rows=row_count,
         page_table_group_stride=int(request_page_tables.stride(0)),

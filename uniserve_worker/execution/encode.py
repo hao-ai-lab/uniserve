@@ -10,30 +10,33 @@ from typing import TYPE_CHECKING
 import torch
 
 from uniserve.media import image
-from uniserve_models.processing import PositionLayout
-from uniserve_worker.execution.tensors import TokenSelection
-from uniserve_models.processing import FeatureInjection, FeatureLayout, PatchTransform
+from uniserve_models.processing import (
+    FeatureInjection,
+    FeatureLayout,
+    PatchTransform,
+    PositionLayout,
+)
 from uniserve_worker.execution.output import PendingOutput
+from uniserve_worker.execution.sampling import TokenSelection
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.media.codec import quantize_image_hwc, uint8_image_to_png_base64_bytes
-from uniserve_worker.protocol.batch import (
-    EncoderTransferValue,
-    FinishFlags,
+from uniserve_worker.protocol.batch import TensorPublication
+from uniserve_worker.protocol.operation import (
     ForwardMode,
     OpStatus,
     PipelineStage,
     ScheduledRequest,
-    TensorPublication,
-    TensorRef,
-    TensorTransfer,
 )
+from uniserve_worker.protocol.output import FinishFlags
+from uniserve_worker.protocol.tensor import TensorRef
+from uniserve_worker.protocol.transfer import EncoderTransferValue, TensorTransfer
 from uniserve_worker.runtime.cpu import CpuTask
 from uniserve_worker.runtime.tensor_store import FeatureMetadata, ImageMetadata, TensorRecord
 from uniserve_worker.transfer.tickets import publish_tensor
 
 from . import operations, transfer
 from .batch_state import BatchState
-from .image_input import ImageInputs, patch_grid_shape, prepare_image, prepare_tensor_image
+from .image_input import PreparedImage, patch_grid_shape, prepare_image, prepare_tensor_image
 from .rows import ForwardRow
 
 if TYPE_CHECKING:
@@ -98,7 +101,7 @@ def prepare_features(
     state: BatchState,
     tensor_store: TensorStore,
     model_runner: ModelRunner,
-) -> ImageInputs:
+) -> PreparedImage:
     """Stage image tensors and build the model batch for one encoder operation."""
 
     image_processor = model_runner.image_processor()
@@ -138,7 +141,7 @@ def prepare_features(
 def publish_features(
     operation: ScheduledRequest,
     completion_group: int,
-    prepared: ImageInputs,
+    prepared: PreparedImage,
     output: torch.Tensor,
     *,
     state: BatchState,
@@ -360,14 +363,14 @@ def encode_source(
             or metadata.width < 1
             or metadata.value_range is None
         ):
-            raise invalid_descriptor("resident image product has incomplete geometry")
+            raise invalid_descriptor("resident image product has incomplete dimensions")
         return read.tensor, metadata
     raise invalid_descriptor("encode operation has no source image product")
 
 
 def encode_row(
     mode: PipelineStage,
-    prepared: ImageInputs,
+    prepared: PreparedImage,
 ) -> ForwardRow:
     """Build a vision- or latent-encoder row from prepared image tensors."""
 
@@ -516,17 +519,17 @@ def latent_state_row(
 ) -> ForwardRow:
     """Publish encoded image latents and construct the request runtime for diffusion conditioning."""
 
-    factory = model_runner.images
-    if factory is None or factory.framing != 2:
+    builder = model_runner.image_builder
+    if builder is None or builder.framing != 2:
         raise invalid_descriptor("latent feature publication requires framed image conditioning")
     size = image.Config(height, width)
-    image_tokens = factory.denoiser.latent_shape("image", size)[0]
+    image_tokens = builder.denoiser.latent_shape("image", size)[0]
     if latent.reshape(-1, latent.shape[-1]).shape[0] != image_tokens:
         raise invalid_descriptor("state latent does not match the declared image dimensions")
-    query = factory.sequence_length(size)
-    positions = factory.positions(size, conditioning_position + 1, device=latent.device)
+    query = builder.sequence_length(size)
+    positions = builder.positions(size, conditioning_position + 1, device=latent.device)
     positions[0, 0] = conditioning_position
-    positions[0, -1] = conditioning_position + factory.rope_advance
+    positions[0, -1] = conditioning_position + builder.rope_advance
     cache = operations.cache_coordinates(
         state.pending_output(completion_group, operation.request_key.request_id),
         tables=request_tables,

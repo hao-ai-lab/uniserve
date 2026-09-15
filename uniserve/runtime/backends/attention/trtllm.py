@@ -63,7 +63,7 @@ class _TRTLLM(_Operator):
         if q.ndim != 3 or (
             batch.queries.num_tokens is not None and q.shape[0] != batch.queries.num_tokens
         ):
-            raise ValueError("packed attention queries must match their declared lengths")
+            raise ValueError("packed attention rows must match their declared query lengths")
         key, value = (k, v) if self.cache is None else (self.cache.key, self.cache.value)
         if key.ndim != 4:
             raise ValueError("TensorRT-LLM MHA requires physical paged K/V backing")

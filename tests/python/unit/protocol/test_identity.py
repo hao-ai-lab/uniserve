@@ -3,14 +3,8 @@
 import pickle
 from dataclasses import replace
 
-from uniserve_worker.protocol.batch import (
-    BufferId,
-    ComputationId,
-    DType,
-    RequestKey,
-    ShapeBound,
-    TensorRef,
-)
+from uniserve_worker.protocol.identity import BufferId, ComputationId, RequestKey
+from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
 
 
 def test_buffer_lookup_preserves_identity_across_reconstruction_and_versions():

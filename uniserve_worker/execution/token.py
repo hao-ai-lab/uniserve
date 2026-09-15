@@ -7,21 +7,22 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from uniserve_worker.execution.tensors import TokenSelection, packed_tensor_views
 from uniserve.nn.rng import DRAW_LAYOUT_TARGET, sampling_key, sampling_uniform
+from uniserve.sampling import SamplingParams
+from uniserve.tensors import adjacent_view
 from uniserve_worker.execution.output import (
     PendingOutput,
 )
+from uniserve_worker.execution.sampling import TokenSelection
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.protocol.batch import (
+from uniserve_worker.protocol.operation import (
     DrawLayout,
-    FinishFlags,
     ForwardMode,
     OpStatus,
-    SamplingParams,
     SamplingState,
     ScheduledRequest,
 )
+from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.runtime.tensor_store import (
     FeatureMetadata,
     TensorRecord,
@@ -39,11 +40,11 @@ from .sampling import SamplerOutput, SamplerRow, SamplingMetadata, sample_column
 
 if TYPE_CHECKING:
     from uniserve.distributed.mesh import Communicator
-    from .inputs.image import ImageInputs
 
     from ..runtime.block_tables import BlockTables
     from ..runtime.decode_state import DecodeState
     from ..runtime.tensor_store import TensorStore
+    from .inputs.image import ImageBuilder
     from .model_runner import ModelRunner
 
 
@@ -148,7 +149,7 @@ def prepare_sampling(
     state: BatchState,
     request_pool_index: torch.Tensor,
     tensor_store: TensorStore,
-    image_inputs: ImageInputs | None,
+    image_builder: ImageBuilder | None,
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> SamplingMetadata | PendingOutput:
@@ -164,7 +165,7 @@ def prepare_sampling(
             task,
             output,
             request_pool_index=request_pool_index,
-            image_inputs=image_inputs,
+            image_builder=image_builder,
             request_tables=request_tables,
             decode_state=decode_state,
             state=state,
@@ -240,7 +241,7 @@ def publish_sample(
     sampled: SamplerRow,
     *,
     state: BatchState,
-    image_inputs: ImageInputs | None,
+    image_builder: ImageBuilder | None,
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> PendingOutput:
@@ -257,7 +258,7 @@ def publish_sample(
             operations.require_progress(request),
             rng_counter=operations.require_progress(request).rng_counter + (1),
         )
-        flow = image_inputs
+        flow = image_builder
         logical_position = start + (
             max(1, 1 if flow is None else int(flow.rope_advance))
             if operation.completion_output is not None
@@ -274,7 +275,7 @@ def publish_sample(
         return _finish_visual(
             operation,
             completion_group,
-            image_inputs=image_inputs,
+            image_builder=image_builder,
             request_tables=request_tables,
             state=state,
         )
@@ -415,7 +416,7 @@ def _prepare_visual_sampling(
     *,
     state: BatchState,
     request_pool_index: torch.Tensor,
-    image_inputs: ImageInputs | None,
+    image_builder: ImageBuilder | None,
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> SamplingMetadata | PendingOutput:
@@ -429,7 +430,7 @@ def _prepare_visual_sampling(
     )
     if operation.token_output is not None:
         assert value is not None
-        generation = image_inputs
+        generation = image_builder
         sample = build_sampling_metadata(
             operation,
             value[-1],
@@ -447,7 +448,7 @@ def _prepare_visual_sampling(
     return _finish_visual(
         operation,
         completion_group,
-        image_inputs=image_inputs,
+        image_builder=image_builder,
         request_tables=request_tables,
         state=state,
     )
@@ -458,7 +459,7 @@ def _finish_visual(
     completion_group: int,
     *,
     state: BatchState,
-    image_inputs: ImageInputs | None,
+    image_builder: ImageBuilder | None,
     request_tables: BlockTables | None,
 ) -> PendingOutput:
     """Finalize visual feature publication and advance the encode operation state."""
@@ -466,7 +467,7 @@ def _finish_visual(
     request = state.pending_output(completion_group, operation.request_key.request_id)
     position = int(operations.require_progress(request).logical_position)
     if operation.completion_output is not None:
-        flow = image_inputs
+        flow = image_builder
         request.projected_progress = replace(
             operations.require_progress(request),
             logical_position=position + max(1, 1 if flow is None else int(flow.rope_advance)),
@@ -848,12 +849,12 @@ def publish_token_products(
             if any(value is None for value in values):
                 raise RuntimeError("sampling result lost a declared transition output")
             tensors = tuple(cast(torch.Tensor, value) for value in values)
-            packed = packed_tensor_views(tensors)
-            if packed is None:
-                packed = torch.cat(tensors, dim=0)
+            values = adjacent_view(tensors)
+            if values is None:
+                values = torch.cat(tensors, dim=0)
         else:
-            (packed,) = sample_columns(selected, ("tagged_tokens",))
-        tensor_store.publish_writes(tuple(writes), packed.reshape(-1))
+            (values,) = sample_columns(selected, ("tagged_tokens",))
+        tensor_store.publish_writes(tuple(writes), values.reshape(-1))
 
 
 def build_sampling_metadata(
@@ -1010,7 +1011,9 @@ def _request_penalty_base(
     if states is None:
         raise RuntimeError("token sampling has no request runtime-state owner")
     if states.vocab_size != int(vocab) or states.device != device:
-        raise unsupported_setup("sampling geometry disagrees with request runtime state")
+        raise unsupported_setup(
+            "sampling vocabulary or device disagrees with request runtime state"
+        )
     return states.penalty_counts[int(request.request.request_pool_idx)]
 
 

@@ -1,4 +1,4 @@
-"""Capture-eligible exact top-k sampling."""
+"""Capture-safe exact top-k sampling."""
 
 from __future__ import annotations
 

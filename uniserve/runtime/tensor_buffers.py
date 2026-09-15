@@ -10,8 +10,7 @@ from typing import Self
 import torch
 
 from uniserve.distributed.mesh import Communicator
-from uniserve.runtime._peer_memory import SymmetricMemory
-from uniserve.runtime._peer_memory import allocate_symmetric_memory
+from uniserve.runtime._peer_memory import SymmetricMemory, allocate_symmetric_memory
 from uniserve.tensors import BufferConfig
 
 

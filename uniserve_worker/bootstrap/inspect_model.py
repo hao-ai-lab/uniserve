@@ -16,7 +16,7 @@ from uniserve_models import loading as models
 
 
 def inspect_model(model: str, *, download: bool = False, revision: str | None = None) -> dict:
-    """Inspect the same normalized checkpoint contract used for public loading."""
+    """Inspect the same normalized checkpoint metadata used for public loading."""
     from uniserve_models.minimax_h3 import Config as H3Config
     from uniserve_models.minimax_h3.config import FASTH3_MODEL_ID, FASTH3_REVISION
 
@@ -33,7 +33,7 @@ def inspect_model(model: str, *, download: bool = False, revision: str | None = 
     }
     local = Path(model).expanduser()
     repository = None if local.exists() else model
-    contract = None
+    checkpoint_info = None
     root = local.parent if local.is_file() else local
     if isinstance(source.model, H3Config):
         if repository is not None:
@@ -43,9 +43,9 @@ def inspect_model(model: str, *, download: bool = False, revision: str | None = 
         architecture = source.model
         diffusion, output = architecture.diffusion, architecture.output
         manifest = json.loads((root / "fastvideo_inference.json").read_text())
-        # Inspection reports provenance; numerical architecture configs retain
+        # Inspection reports checkpoint identity; numerical architecture configs retain
         # only fields consumed by the network and its mathematical recipes.
-        contract = {
+        checkpoint_info = {
             "family": "minimax-h3",
             "variant": "fasth3",
             "model_id": manifest["model_id"],
@@ -64,10 +64,11 @@ def inspect_model(model: str, *, download: bool = False, revision: str | None = 
             "revision": root.name if root.parent.name == "snapshots" else None,
         }
     return {
-        "description": descriptions[source.model_class.__module__],
-        "model_path": str(root) if contract is not None else model,
+        "description": descriptions[source.model_class.__module__.rsplit(".", 1)[0]],
+        "model_path": str(root) if checkpoint_info is not None else model,
         "repository": repository,
-        "contract": contract,
+        # ``contract`` is the established Rust/Python inspection message field.
+        "contract": checkpoint_info,
         "python": sys.executable,
     }
 

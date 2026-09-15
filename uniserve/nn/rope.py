@@ -219,7 +219,9 @@ class RotaryEmbedding(nn.Module):
         if not dtype.is_floating_point or (
             positions.dtype not in {torch.int32, torch.int64} and not positions.is_floating_point()
         ):
-            raise ValueError("rotary factors require numerical positions and a floating output dtype")
+            raise ValueError(
+                "rotary factors require numerical positions and a floating output dtype"
+            )
         dynamic = isinstance(self.scaling, (DynamicScaling, LongRoPEScaling))
         if dynamic:
             frequencies, scale = self._frequencies(

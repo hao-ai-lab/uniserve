@@ -4,10 +4,10 @@ from uniserve.model import LatentInput
 from uniserve_models.bagel import DenoiserInput
 from uniserve_models.processing import BranchSource
 
-from .image import ImageInputs
+from .image import ImageBuilder
 
 
-class Inputs(ImageInputs):
+class BagelBuilder(ImageBuilder):
     framing = 2
     image_unconditional = BranchSource.CONDITIONING
 

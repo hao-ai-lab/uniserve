@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import pytest
 
+from uniserve.runtime import EventPoolError
 from uniserve_worker.foundation.errors import WorkerError, WorkerErrorCode, classify
-from uniserve_worker.protocol.batch import ComputationId
+from uniserve_worker.protocol.identity import ComputationId
 
 pytestmark = pytest.mark.unit
 
@@ -71,6 +72,14 @@ def test_generic_runtime_error_classifies_as_compute_error():
     assert err.code == "ComputeError"
     assert err.retryable is False
     assert err.fatal is False
+
+
+def test_event_pool_error_classifies_as_fatal_invariant_violation():
+    err = classify(EventPoolError("device event reference accounting is invalid"))
+
+    assert err.code == WorkerErrorCode.INVARIANT_VIOLATION
+    assert err.retryable is False
+    assert err.fatal is True
 
 
 @pytest.mark.parametrize(

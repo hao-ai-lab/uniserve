@@ -14,18 +14,18 @@ from uniserve.model import TextSize
 from uniserve.runtime import ExecutionContext, PrefixCache
 from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.capacity import input_buffer_config
-from uniserve_worker.config import ComponentConfig, WorkerConfig
+from uniserve_worker.bootstrap.config import ComponentConfig
+from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.attention import from_blocks
 from uniserve_worker.execution.flow import flow_rows, image_state, integrate, prefix_row
 from uniserve_worker.execution.model_entry import ModelEntry
 from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.protocol.batch import (
+from uniserve_worker.protocol.identity import ComputationId, RequestKey
+from uniserve_worker.protocol.operation import (
     Bounds,
-    ComputationId,
     ForwardMode,
     ImageParams,
     PipelineStage,
-    RequestKey,
     ScheduledRequest,
 )
 from uniserve_worker.runtime.cache_manager import CacheManager
@@ -98,7 +98,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
     )
     runner = ModelRunner(model, config, bindings=bindings)
     size = image.Config(16, 16)
-    factory = runner.images
+    factory = runner.image_builder
     shape = factory.denoiser.latent_shape("image", size)
     cache = PrefixCache(model.text.cache_config, num_blocks=8, block_size=16, device="cuda:0")
     manager = CacheManager(
@@ -258,7 +258,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
     from uniserve.nn.attention import SequenceLengths, VarlenInput
     from uniserve_worker.bootstrap.components import supported_operations
     from uniserve_worker.execution.rows import ForwardRow
-    from uniserve_worker.execution.tensors import TokenSelection
+    from uniserve_worker.execution.sampling import TokenSelection
     from uniserve_worker.worker import Worker
 
     if name == "bagel":
@@ -462,7 +462,8 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             )
             from uniserve.model import VisionInput
             from uniserve_worker.execution.image_input import prepare_image
-            from uniserve_worker.protocol.batch import DeviceDim, OpStatus, ShapeBound
+            from uniserve_worker.protocol.operation import OpStatus
+            from uniserve_worker.protocol.tensor import DeviceDim, ShapeBound
 
             configure_physical_pool(
                 cache_pages=worker.info.kv_cache.num_blocks,
@@ -471,7 +472,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 commit_marker_tokens=0,
                 max_cfg_branches=3,
                 latent_page_units=worker.info.latent_page_units,
-                latent_downsample=worker.runner.images.denoiser.downsample,
+                latent_downsample=worker.runner.image_builder.denoiser.downsample,
             )
             encoded = io.BytesIO()
             Image.new("RGB", (16, 16), (64, 96, 128)).save(encoded, format="PNG")

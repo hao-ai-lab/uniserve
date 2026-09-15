@@ -5,13 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import torch
-
-if TYPE_CHECKING:
-    from uniserve_models.bagel import Config as BagelConfig
-    from uniserve_models.sensenova_u1 import Config as U1Config
 
 
 class BranchSource(StrEnum):
@@ -98,11 +94,7 @@ __all__ = [
     "BranchSource",
     "PositionLayout",
     "load_tokenizer",
-    "bagel_processor",
-    "sensenova_processor",
-    "stub_processor",
     "resolve_input_tokens",
-    "SENSENOVA_PROMPT",
     "FeatureInjection",
     "FeatureLayout",
     "ImageProcessor",
@@ -146,105 +138,6 @@ class FlowPrompt:
             int(value)
             for value in tokenizer.encode(framed, add_special_tokens=self.add_special_tokens)
         )
-
-
-_BAGEL_VIT_MIN_SIZE = 224
-_BAGEL_VAE_MIN_SIZE = 512
-_BAGEL_VAE_MAX_SIZE = 1024
-_BAGEL_VAE_STRIDE = 16
-_BAGEL_MAX_IMAGE_PIXELS = 14 * 14 * 9 * 1024
-
-
-def bagel_processor(config: BagelConfig) -> ImageProcessor:
-    """Build the checkpoint architecture's caller-owned image transforms."""
-
-    return ImageProcessor(
-        vit=TowerTransform(
-            resize=StrideResize(
-                max_size=int(config.vision.image_size),
-                min_size=_BAGEL_VIT_MIN_SIZE,
-                stride=int(config.vision.patch_size),
-                max_pixels=_BAGEL_MAX_IMAGE_PIXELS,
-            ),
-        ),
-        vae=TowerTransform(
-            resize=StrideResize(
-                max_size=_BAGEL_VAE_MAX_SIZE,
-                min_size=_BAGEL_VAE_MIN_SIZE,
-                stride=_BAGEL_VAE_STRIDE,
-                max_pixels=_BAGEL_MAX_IMAGE_PIXELS,
-            ),
-        ),
-        feature_injection=FeatureInjection(
-            layout=FeatureLayout.FRAMED,
-            positions=PositionLayout.TEMPORAL,
-            start_token_id=int(config.start_of_image_id),
-            end_token_id=int(config.end_of_image_id),
-        ),
-    )
-
-
-def sensenova_processor(config: U1Config) -> ImageProcessor:
-    """Build the checkpoint architecture's caller-owned image transforms."""
-
-    return ImageProcessor(
-        vit=PatchTransform(
-            patch_size=int(config.vision.patch_size),
-            downsample_ratio=float(config.vision.downsample_ratio),
-            min_pixels=512 * 512,
-            max_pixels=2048 * 2048,
-        ),
-        staging_dtype=torch.bfloat16,
-        feature_injection=FeatureInjection(
-            layout=FeatureLayout.DIRECT,
-            positions=PositionLayout.TEMPORAL_SPATIAL,
-            start_token="<img>",
-            end_token="</img>",
-        ),
-    )
-
-
-def stub_processor() -> ImageProcessor:
-    """Build the checkpoint architecture's caller-owned image transforms."""
-
-    return ImageProcessor(
-        vit=PatchTransform(
-            patch_size=16,
-            downsample_ratio=1.0,
-            min_pixels=16 * 16,
-            max_pixels=512 * 512,
-            normalization="signed_unit",
-        ),
-        vae=TowerTransform(
-            StrideResize(max_size=512, min_size=16, stride=16, max_pixels=512 * 512)
-        ),
-        staging_dtype=torch.bfloat16,
-        feature_injection=FeatureInjection(
-            layout=FeatureLayout.DIRECT,
-            positions=PositionLayout.TEMPORAL_SPATIAL,
-            end_token_id=1007,
-        ),
-    )
-
-
-_FLOW_SYSTEM_MESSAGE = (
-    "You are an image generation and editing assistant that accurately understands and executes user intent.\n\n"
-    "You support two modes:\n\n1. Think Mode:\nIf the task requires reasoning, you MUST start with a <think></think> block. Put all reasoning inside the block using plain text. DO NOT include any image tags. Keep it reasonable and directly useful for producing the final image.\n\n"
-    "2. Non-Think Mode:\nIf no reasoning is needed, directly produce the final image.\n\nTask Types:\n\nA. Text-to-Image Generation:\n- Generate a high-quality image based on the user's description.\n- Ensure visual clarity, semantic consistency, and completeness.\n- DO NOT introduce elements that contradict or override the user's intent.\n\n"
-    "B. Image Editing:\n- Use the provided image(s) as input or reference for modification or transformation.\n- The result can be an edited image or a new image based on the reference(s).\n- Preserve all unspecified attributes unless explicitly changed.\n\n"
-    "General Rules:\n- For any visible text in the image, follow the language specified for the rendered text in the user's description, not the language of the prompt. If no language is specified, use the user's input language."
-)
-
-SENSENOVA_PROMPT = FlowPrompt(
-    user_prefix="<|im_start|>user\n",
-    user_suffix="<|im_end|>\n",
-    assistant_suffix="<|im_start|>assistant\n",
-    conditioned_append="<think>\n\n</think>\n\n<img>",
-    unconditional_append="<img>",
-    system_prefix="<|im_start|>system\n",
-    system_message=_FLOW_SYSTEM_MESSAGE,
-    system_suffix="<|im_end|>\n",
-)
 
 
 def resolve_input_tokens(

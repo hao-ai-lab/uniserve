@@ -14,16 +14,15 @@ from uniserve import _slices
 from uniserve_worker.execution import operations as operations
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.protocol.batch import (
+from uniserve_worker.protocol.batch import TensorPublication
+from uniserve_worker.protocol.operation import ScheduledRequest, TransferMode
+from uniserve_worker.protocol.tensor import TensorRef
+from uniserve_worker.protocol.transfer import (
     DeviceProductTransferValue,
     EncoderTransferValue,
     LatentTransferValue,
     Locator,
-    ScheduledRequest,
-    TensorPublication,
-    TensorRef,
     TensorTransfer,
-    TransferMode,
     TransferValue,
 )
 from uniserve_worker.runtime.latent_pool import LatentExport
@@ -321,7 +320,7 @@ def publish_product(
     source_kind = ""
     if encoder_write is not None:
         if not isinstance(source_metadata, FeatureMetadata):
-            raise invalid_descriptor("encoder transfer requires feature geometry")
+            raise invalid_descriptor("encoder transfer requires feature dimensions")
         source_operation = request.operation
         if source_operation.vision_input is not None:
             source_kind = "vision_feature"
@@ -330,7 +329,7 @@ def publish_product(
         else:
             raise invalid_descriptor("encoder transfer has no feature source")
     elif isinstance(source_metadata, FeatureMetadata):
-        raise invalid_descriptor("device tensor transfer cannot carry feature geometry")
+        raise invalid_descriptor("device tensor transfer cannot carry feature dimensions")
     elif height == 0 and value_range:
         raise invalid_descriptor("non-image tensor carries an image range")
     region = None if device_write is None else device_write.region
@@ -428,7 +427,7 @@ def fetch_product(
 
 
 def tensor_matches_product(tensor: TensorTransfer, product: TensorRef) -> bool:
-    """Verify that a transfer locator’s byte size, dtype, and shape match a product contract."""
+    """Verify that a transfer locator's byte size, dtype, and shape match its product."""
 
     return _representation_matches_product(tensor.shape, tensor.dtype, tensor.nbytes, product)
 

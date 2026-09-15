@@ -15,12 +15,12 @@ import torch
 
 from uniserve.quantization import QuantizedTensor
 
-from .block_tables import page_spans
-
 from ..foundation.errors import invalid_descriptor, resource_error
-from ..protocol.batch import BufferId, KvTransfer, RequestKey, TensorTransfer
+from ..protocol.identity import BufferId, RequestKey
+from ..protocol.transfer import KvTransfer, TensorTransfer
 from ..transfer.layout import fetch_tensor
 from ..transfer.tickets import TransferTicket, Transport
+from .block_tables import page_spans
 from .cpu import CpuPool
 
 if TYPE_CHECKING:
@@ -388,8 +388,8 @@ class CacheImports:
             # Limit physical reads to one layer, independent of model depth.
             tickets = []
             state = self.pool.cache.state(name)
-            for index, field in enumerate(("key", "value")):
-                tensor = state.tensors[field]
+            for index, tensor_name in enumerate(("key", "value")):
+                tensor = state.tensors[tensor_name]
                 values = (
                     tensor.buffers()["values"] if isinstance(tensor, QuantizedTensor) else tensor
                 )

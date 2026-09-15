@@ -28,38 +28,44 @@ from tests.python.fixtures.depth_one import (
     visual_state_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve.model import Logits
 from tests.python.fixtures.simulation import expected_successor
+from uniserve.model import Logits
 from uniserve_models.stub import Model
-from uniserve_models.stub import entry_points as entry_points, entry_paths as entry_paths
+from uniserve_models.stub import entry_paths as entry_paths
+from uniserve_models.stub import entry_points as entry_points
 from uniserve_worker.config import LaneConfig, WorkerConfig
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import (
-    COMPUTATIONS,
-    ArRequestParams,
     BlockTable,
+    Free,
+    GenerationParams,
+    NewRequest,
+    TensorPublication,
+)
+from uniserve_worker.protocol.identity import ComputationId
+from uniserve_worker.protocol.operation import (
+    COMPUTATIONS,
     Bounds,
-    ComputationId,
-    DeviceProductTransferValue,
-    DType,
-    EncoderTransferValue,
     ErrorCode,
     ForwardMode,
-    Free,
     ImageParams,
-    NewRequest,
     OpStatus,
     PipelineStage,
-    RequestOutput,
     SamplingState,
     ScheduledRequest,
+    TransferMode,
+)
+from uniserve_worker.protocol.output import RequestOutput
+from uniserve_worker.protocol.tensor import (
+    DType,
     ShapeBound,
     StaticDim,
-    TensorPublication,
     TensorRef,
+)
+from uniserve_worker.protocol.transfer import (
+    DeviceProductTransferValue,
+    EncoderTransferValue,
     TensorTransfer,
-    TransferMode,
-    UmmRequestParams,
 )
 
 pytestmark = pytest.mark.integration
@@ -1631,8 +1637,8 @@ def test_tensor_entry_input_preserves_values_through_output_release(
 ) -> None:
     from threading import Event
 
-    from uniserve_worker.protocol.batch import WorkerEndpoint
-    from uniserve_worker.runtime.device_events import EventPool
+    from uniserve.runtime import EventPool
+    from uniserve_worker.protocol.transfer import WorkerEndpoint
     from uniserve_worker.transfer.tickets import make_transport
 
     events = EventPool()
@@ -1737,8 +1743,8 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> Non
     admission = NewRequest(
         generation.request_key,
         request_pool_idx=generation.request_pool_idx,
-        ar=ArRequestParams(),
-        umm=generation.umm,
+        generation=GenerationParams(),
+        image=generation.image,
     )
     bind_request_allocation(
         admission.request_key,
@@ -2131,10 +2137,8 @@ def test_generated_feedback_commits_absolute_visual_token_state():
     admission = NewRequest(
         understanding.request_key,
         request_pool_idx=understanding.request_pool_idx,
-        ar=understanding.ar,
-        umm=UmmRequestParams(
-            ImageParams(steps=2, height=16, width=16, seed=29, retain_images=True)
-        ),
+        generation=understanding.generation,
+        image=ImageParams(steps=2, height=16, width=16, seed=29, retain_images=True),
     )
     extend = token_operation(
         admission.request_key,
@@ -2485,7 +2489,7 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
-    from uniserve_worker.protocol.batch import BatchOutput
+    from uniserve_worker.protocol.output import BatchOutput
 
     with execution_worker(transfer_backends=("shm",), pipeline_depth=2) as worker:
         worker.warmup()

@@ -8,12 +8,18 @@ from .config import WorkerProcessArgs
 
 logger = logging.getLogger(__name__)
 
+try:
+    from .._uniserve_ipc import Server as WorkerIpcEndpoint
+except ImportError as exc:  # pragma: no cover - depends on the installed native extension.
+    raise ImportError(
+        "_uniserve_ipc is not installed; reinstall the package (pip install -e .) to build it."
+    ) from exc
+
 
 def run_worker(config: WorkerProcessArgs) -> None:
     """Own the IPC endpoint around model construction and the worker's blocking run."""
 
     from ..worker import Worker
-    from .ipc import WorkerIpcEndpoint
 
     with (
         WorkerIpcEndpoint(
@@ -36,4 +42,4 @@ def run_worker(config: WorkerProcessArgs) -> None:
         worker.run()
 
 
-__all__ = ["run_worker"]
+__all__ = ["WorkerIpcEndpoint", "run_worker"]

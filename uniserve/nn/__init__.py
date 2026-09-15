@@ -115,6 +115,8 @@ if TYPE_CHECKING:  # Expose concrete definitions to type checkers without import
         MergedColumnParallelLinear,
         QKVParallelLinear,
         RowParallelLinear,
+        VocabParallelEmbedding,
+        VocabParallelHead,
     )
     from uniserve.nn.moe import FusedMoE, TopK
     from uniserve.nn.norm import RMSNorm
@@ -124,8 +126,4 @@ if TYPE_CHECKING:  # Expose concrete definitions to type checkers without import
     from uniserve.nn.vision import (
         MLPConnector,
         PatchEmbed,
-    )
-    from uniserve.nn.linear import (
-        VocabParallelHead,
-        VocabParallelEmbedding,
     )

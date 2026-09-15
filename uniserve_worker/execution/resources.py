@@ -18,18 +18,18 @@ def media_state_buffers(
 ) -> dict[str, BufferConfig]:
     """Reserve resident samples and transfer staging only on participating ranks."""
 
-    from ..bootstrap.inputs import media_inputs
+    from ..bootstrap.inputs import media_builder
 
-    factory = media_inputs(model, config)
-    if factory is None:
+    builder = media_builder(model, config)
+    if builder is None:
         return {}
     result = {}
     for binding in bindings.values():
         for call in binding.calls:
             if isinstance(call.module, Denoiser) and call.entry.method == "forward":
-                fields = factory.capacity_buffers()
+                fields = builder.capacity_buffers()
             elif isinstance(call.module, VideoPostprocessor):
-                fields = call.module.state_buffers(factory.maximum.num_frames)
+                fields = call.module.state_buffers(builder.maximum.num_frames)
             else:
                 continue
             for name, field in fields.items():
@@ -49,7 +49,7 @@ def output_layouts(
 ) -> Mapping[str, OutputLayout]:
     """Describe complete persistent tensor products for one capability call."""
 
-    from ..bootstrap.inputs import capability, media_inputs
+    from ..bootstrap.inputs import capability, media_builder
 
     component = call.module
     if isinstance(component, TextEncoder) and call.entry.method == "encode":
@@ -60,13 +60,13 @@ def output_layouts(
         return {}
     if isinstance(component, VideoDecoder) and frames is not None:
         return component.output_layout(frames)
-    factory = media_inputs(model, config)
-    if factory is None:
+    builder = media_builder(model, config)
+    if builder is None:
         # Image execution returns its features and decoded raster through the
         # token/image protocol rather than persistent inter-component products.
         return {}
-    size = factory.size(
-        factory.maximum.num_frames if frames is None else frames,
+    size = builder.size(
+        builder.maximum.num_frames if frames is None else frames,
         config.max_sequence_tokens if prompt_tokens is None else prompt_tokens,
     )
     if isinstance(component, Denoiser):

@@ -13,8 +13,8 @@ from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.graph_inputs import BatchGraph, pad_text
 from uniserve_worker.execution.input_buffers import InputBufferConfig, InputBuffers
-from uniserve_worker.execution.runners.prefill import stage_text
-from uniserve_worker.execution.tensors import TokenSelection
+from uniserve_worker.execution.sampling import TokenSelection
+from uniserve_worker.execution.startup import stage_text
 from uniserve_worker.execution.text import TextCall
 from uniserve_worker.runtime.cache_manager import CacheManager
 
@@ -269,14 +269,9 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
     from uniserve_worker.bootstrap.capacity import input_buffer_config
     from uniserve_worker.execution.model_runner import ModelRunner
     from uniserve_worker.execution.rows import ForwardRow
-    from uniserve_worker.execution.tensors import TokenSelection
-    from uniserve_worker.protocol.batch import (
-        Bounds,
-        ComputationId,
-        ForwardMode,
-        RequestKey,
-        ScheduledRequest,
-    )
+    from uniserve_worker.execution.sampling import TokenSelection
+    from uniserve_worker.protocol.identity import ComputationId, RequestKey
+    from uniserve_worker.protocol.operation import Bounds, ForwardMode, ScheduledRequest
 
     reference = _save_checkpoint(tmp_path)
     model = models.load_model(

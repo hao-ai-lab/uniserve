@@ -12,7 +12,7 @@ from uniserve.model import ImageDenoiser
 from uniserve_models.processing import BranchSource
 
 
-class ImageInputs:
+class ImageBuilder:
     """Borrow image mathematics while constructing inputs for admitted requests.
 
     Coordinates include any framing tokens; sample storage contains only

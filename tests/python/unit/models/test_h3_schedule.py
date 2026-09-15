@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from uniserve_models.minimax_h3.config import DiffusionConfig, TransformerConfig
-from uniserve_models.minimax_h3.diffusion import Denoiser
+from uniserve_models.minimax_h3.denoiser import Denoiser
 from uniserve_models.minimax_h3.packing import audio_latent_frames
 
 pytestmark = pytest.mark.unit

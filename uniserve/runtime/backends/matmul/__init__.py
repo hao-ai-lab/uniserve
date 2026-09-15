@@ -1,4 +1,4 @@
-"""Preparation and execution contracts for local matrix multiplication."""
+"""Preparation and execution interfaces for local matrix multiplication."""
 
 from __future__ import annotations
 

@@ -3,7 +3,7 @@
 The provider families cover ordinary RMSNorm, residual-add RMSNorm, and paired
 query/key normalization. Triton kernels accumulate variance in fp32, extension
 providers serve aligned low-precision inputs, and eager implementations define
-the portable numerical contract.
+the portable numerical behavior.
 """
 
 from __future__ import annotations
@@ -162,7 +162,7 @@ if triton is not None:
 
 
 def _norm_inputs_eligible(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Check the shared CUDA, layout, gradient, and width provider contract."""
+    """Check the shared CUDA, layout, gradient, and width requirements."""
 
     return not (
         not hidden_states.is_cuda
@@ -206,7 +206,7 @@ def _reshape_norm_rows(tensor: torch.Tensor, hidden_size: int) -> torch.Tensor:
 
 
 def eager_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Apply the portable RMSNorm numerical contract along the final dimension."""
+    """Apply portable RMS normalization along the final dimension."""
 
     in_dtype = hidden_states.dtype
 
@@ -468,7 +468,7 @@ class TritonAddRmsNorm(Operator):
         rows = req.hidden_states.numel() // hidden_size
 
         # Separate outputs preserve the residual stream while avoiding mutation
-        # when the request does not select the SGL in-place contract.
+        # when the request does not select SGL's in-place form.
         normed = torch.empty_like(req.hidden_states)
         combined = torch.empty_like(req.hidden_states)
         block, num_warps = _norm_launch_config(hidden_size)

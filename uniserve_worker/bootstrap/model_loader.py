@@ -17,14 +17,15 @@ from uniserve.nn.attention import AttentionParallelConfig, ContextParallelConfig
 from uniserve.nn.vae.patch import PatchAutoencoder
 from uniserve.quantization import QuantizationConfig, Quantizer
 from uniserve_models import loading as models
-from uniserve_models.processing import FlowPrompt, ImageProcessor, load_tokenizer, stub_processor
+from uniserve_models.processing import FlowPrompt, ImageProcessor, load_tokenizer
+from uniserve_models.stub import image_processor
 
-from ..config import ComponentConfig, WorkerConfig
+from ..config import WorkerConfig
 from ..execution.model_entry import ModelEntry
 from ..foundation.errors import unsupported_setup
 from ..runtime.results import resolve_outputs
 from .components import bind_components, describe_components, validate_components
-from .config import WorkerProcessArgs
+from .config import ComponentConfig, WorkerProcessArgs
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ def _weight_config(source, options, execution) -> weights.Config:
     components = options.get("components", {})
     if not isinstance(components, Mapping):
         raise TypeError("precision components must be an object")
-    package = import_module(source.model_class.__module__)
+    package = import_module(source.model_class.__module__.rsplit(".", 1)[0])
     if components:
         factory = getattr(package, "weight_config", None)
         if factory is None:
@@ -151,7 +152,7 @@ def load_worker_model(
         return WorkerModel(
             model,
             replace(config.execution, attention_backend="torch", encoder_cache_entries=1024),
-            image_processor=stub_processor(),
+            image_processor=image_processor(),
         )
     if config.model is None or source is None:
         raise RuntimeError("validated model worker is missing model configuration")

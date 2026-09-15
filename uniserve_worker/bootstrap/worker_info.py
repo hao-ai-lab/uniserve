@@ -7,8 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from uniserve_worker.config import ComponentConfig
-from uniserve_worker.protocol.batch import (
+from uniserve_worker.protocol.operation import (
     VIDEO_STAGES,
     Computation,
     ForwardMode,
@@ -17,7 +16,9 @@ from uniserve_worker.protocol.batch import (
 )
 
 from ..foundation.errors import invalid_descriptor, unsupported_setup
-from ..protocol.batch import OutputInfo, WorkerEndpoint
+from ..protocol.tensor import OutputInfo
+from ..protocol.transfer import WorkerEndpoint
+from .config import ComponentConfig
 
 
 class RequestKind(StrEnum):
@@ -47,7 +48,7 @@ class KvGroupKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class KvGroup:
-    """Describes the page count and optional window geometry of one KV cache group."""
+    """Describe the page count and optional window of one KV cache group."""
 
     num_blocks: int
     kind: KvGroupKind
@@ -68,7 +69,7 @@ class KvGroup:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode full-context or sliding-window geometry for the scheduler wire format."""
+        """Encode full-context or sliding-window settings for the scheduler wire format."""
 
         kind: dict[str, object] = {"kind": self.kind.value}
         if self.kind is KvGroupKind.SLIDING_WINDOW:
@@ -81,7 +82,7 @@ class KvGroup:
 
 @dataclass(frozen=True, slots=True)
 class KVCacheInfo:
-    """Publishes KV block size, dtype, token capacity, and group geometry to the scheduler."""
+    """Publish KV block size, dtype, token capacity, and group layout to the scheduler."""
 
     block_size: int
     num_blocks: int
@@ -112,11 +113,11 @@ class KVCacheInfo:
             or not self.groups
             or not self.dtype
         ):
-            raise invalid_descriptor("worker info declares incomplete KV geometry")
+            raise invalid_descriptor("worker info declares incomplete KV dimensions")
         if self.kv_head_offset < 0 or self.kv_head_offset + self.num_kv_heads > self.total_kv_heads:
-            raise invalid_descriptor("worker KV head interval exceeds its logical geometry")
+            raise invalid_descriptor("worker KV head interval exceeds its logical bounds")
         if self.layer_offset < 0 or self.layer_offset + self.num_layers > self.total_layers:
-            raise invalid_descriptor("worker KV layer interval exceeds its logical geometry")
+            raise invalid_descriptor("worker KV layer interval exceeds its logical bounds")
         if any(group.num_blocks < 1 for group in self.groups):
             raise invalid_descriptor("worker info KV groups must be physical page partitions")
         if sum(group.num_blocks for group in self.groups) != self.num_blocks:
@@ -124,7 +125,7 @@ class KVCacheInfo:
 
     @classmethod
     def from_mapping(cls, value: object, where: str) -> KVCacheInfo:
-        """Decode and validate complete physical KV geometry from the wire mapping."""
+        """Decode and validate complete physical KV dimensions from the wire mapping."""
 
         data = _map(value, where)
         return cls(
@@ -146,7 +147,7 @@ class KVCacheInfo:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode physical KV geometry and page groups for scheduler discovery."""
+        """Encode physical KV dimensions and page groups for scheduler discovery."""
 
         return {
             "block_size": self.block_size,
@@ -231,7 +232,7 @@ class WorkerInfo:
 
         Cooperative numerical outputs may reside on different stages. Host
         products belong to the entry's first member, matching the rank-report
-        join contract. An unconfigured local worker has one possible owner.
+        join requirements. An unconfigured local worker has one possible owner.
         """
 
         for component in self.components:
@@ -254,7 +255,7 @@ class WorkerInfo:
         return self.kv_cache is not None
 
     def __post_init__(self) -> None:
-        """Validate advertised worker topology, capacities, variants, and cache-group geometry."""
+        """Validate advertised worker topology, capacities, variants, and cache-group layout."""
 
         if (
             not self.device

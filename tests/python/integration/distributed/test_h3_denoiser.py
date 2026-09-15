@@ -257,7 +257,7 @@ def test_partitioned_denoising_and_feedback(tmp_path):
 
 @torch.inference_mode()
 def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
-    from uniserve_worker.execution.diffusion_runner import DiffusionRunner
+    from uniserve_worker.execution.denoising_runner import DenoisingRunner
     from uniserve_worker.execution.inputs.h3 import Inputs
 
     source = _checkpoint(tmp_path)
@@ -283,7 +283,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         factory = Inputs(model, max_frames=22, max_text_tokens=65)
         size = factory.size(22, 63)
         matrices = {name: value.to(device) for name, value in source.items()}
-        runner = DiffusionRunner(
+        runner = DenoisingRunner(
             model,
             device=device,
             capture_stream=torch.cuda.Stream(device=device),

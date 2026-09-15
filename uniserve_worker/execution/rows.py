@@ -7,13 +7,9 @@ from typing import TypeAlias
 
 import torch
 
-from uniserve_worker.execution.tensors import TokenSelection
-from uniserve_worker.protocol.batch import (
-    ComputationId,
-    ForwardMode,
-    PipelineStage,
-    RequestKey,
-)
+from uniserve_worker.execution.sampling import TokenSelection
+from uniserve_worker.protocol.identity import ComputationId, RequestKey
+from uniserve_worker.protocol.operation import ForwardMode, PipelineStage
 
 OperationIdentity: TypeAlias = tuple[RequestKey, ComputationId]
 

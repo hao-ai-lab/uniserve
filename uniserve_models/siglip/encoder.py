@@ -1,12 +1,10 @@
 """SigLIP-NaViT image transformer composition and patch coordinates."""
 
-import math
-from dataclasses import dataclass
+from __future__ import annotations
 
 import torch
 from torch import nn
 
-from uniserve.loading import checkpoint, weights
 from uniserve.model import TransformerEncoder
 from uniserve.nn.attention import Attention as ScaledAttention
 from uniserve.nn.attention import SequenceLengths, VarlenInput
@@ -14,49 +12,7 @@ from uniserve.nn.functional import patchify
 from uniserve.nn.linear import ColumnParallelLinear, Linear, QKVParallelLinear, RowParallelLinear
 from uniserve.nn.vision.patching import build_abs_positions_from_grid_hw
 
-
-@dataclass(frozen=True)
-class TransformerConfig:
-    hidden_size: int
-    num_attention_heads: int
-    intermediate_size: int
-    num_hidden_layers: int
-    layer_norm_eps: float
-
-    def __post_init__(self):
-        if (
-            any(
-                type(value) is not int or value < 1
-                for value in (
-                    self.hidden_size,
-                    self.num_attention_heads,
-                    self.intermediate_size,
-                    self.num_hidden_layers,
-                )
-            )
-            or self.hidden_size % self.num_attention_heads
-        ):
-            raise ValueError("SigLIP widths, layers and heads must be positive and compatible")
-        if not math.isfinite(self.layer_norm_eps) or self.layer_norm_eps <= 0:
-            raise ValueError("SigLIP layer norm epsilon must be finite and positive")
-
-
-@dataclass(frozen=True)
-class Config:
-    patch_size: int
-    image_size: int
-    num_channels: int
-    encoder: TransformerConfig
-
-    def __post_init__(self):
-        if (
-            any(
-                type(value) is not int or value < 1
-                for value in (self.patch_size, self.image_size, self.num_channels)
-            )
-            or self.image_size % self.patch_size
-        ):
-            raise ValueError("SigLIP image and patch dimensions must be positive and aligned")
+from .config import Config, TransformerConfig
 
 
 class Attention(nn.Module):
@@ -143,28 +99,3 @@ class Encoder(nn.Module):
         offsets = torch.cat((values.new_zeros(1), values.cumsum(0, dtype=torch.int32)))
         lengths = SequenceLengths(host=counts, values=values, offsets=offsets)
         return self.encoder(features, VarlenInput(lengths, lengths, (False,) * len(counts)))
-
-
-def assignments(
-    model: Encoder, reader: checkpoint.Reader, *, prefix: str = ""
-) -> tuple[weights.Assignment, ...]:
-    """Map SigLIP's checkpoint tower, whose patch matrix is already HWC-packed."""
-    result = []
-    available = frozenset(reader.names())
-    for name, parameter in model.named_parameters():
-        if name.startswith(("patch_embedding.", "position_embedding.")):
-            source = "embeddings." + name
-        elif name.startswith("encoder.norm."):
-            source = "post_layernorm." + name.removeprefix("encoder.norm.")
-        else:
-            source = name.replace(".input_norm.", ".layer_norm1.")
-            source = source.replace(".output_norm.", ".layer_norm2.")
-            source = source.replace(".attention.output.", ".self_attn.out_proj.")
-            for branch in ("q", "k", "v"):
-                source = source.replace(
-                    f".attention.qkv.projections.{branch}.", f".self_attn.{branch}_proj."
-                )
-            source = source.replace(".mlp.0.", ".mlp.fc1.").replace(".mlp.2.", ".mlp.fc2.")
-        if prefix + source in available:
-            result.append(weights.Assignment(parameter, reader.get(prefix + source)))
-    return tuple(result)

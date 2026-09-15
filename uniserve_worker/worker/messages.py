@@ -9,7 +9,8 @@ from typing import Any
 from ..bootstrap.worker_info import RequestKind, ResponseKind
 from ..execution.batch_state import BatchState
 from ..foundation.errors import WorkerError, invalid_descriptor
-from ..protocol.batch import BatchOutput, ScheduleBatch
+from ..protocol.batch import ScheduleBatch
+from ..protocol.output import BatchOutput
 
 
 def response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:

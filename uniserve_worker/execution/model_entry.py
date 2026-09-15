@@ -10,10 +10,11 @@ import torch
 
 from uniserve.distributed.mesh import Communicator, DeviceMesh
 from uniserve.model import EntryPoint
-from uniserve_worker.config import ComponentConfig
+from uniserve.runtime import CUDAStream
 
-from ..protocol.batch import Computation, OutputInfo
-from .cuda_stream import CudaStream
+from ..bootstrap.config import ComponentConfig
+from ..protocol.operation import Computation
+from ..protocol.tensor import OutputInfo
 
 if TYPE_CHECKING:
     from .batch import ExecutionOutput
@@ -70,7 +71,7 @@ class ModelEntry:
     calls: tuple[Call, ...] = ()
     context: ExecutionContext | None = None
     input_buffers: InputBuffers | None = None
-    cuda_stream: CudaStream | None = None
+    cuda_stream: CUDAStream | None = None
 
     def __post_init__(self) -> None:
         if any(rank not in self.process_group.ranks for rank in self.config.ranks):
@@ -114,17 +115,17 @@ class ModelEntry:
         config = self.config
         if config.distribution is not None:
             return config.ranks
-        geometry = DeviceMesh(
+        mesh = DeviceMesh(
             ranks=config.ranks,
             rank=config.ranks[0],
             shape=tuple(size for _, size in config.parallel_config.dimensions),
             axes=tuple(axis for axis, _ in config.parallel_config.dimensions),
         )
-        axes = geometry.axes
+        axes = mesh.axes
         return tuple(
             rank
             for rank in config.ranks
-            if geometry.coordinate(rank)[axes.index("tp")] == 0
-            and geometry.coordinate(rank)[axes.index("pp")]
+            if mesh.coordinate(rank)[axes.index("tp")] == 0
+            and mesh.coordinate(rank)[axes.index("pp")]
             == config.parallel_config.pipeline_parallel_size - 1
         )

@@ -64,7 +64,7 @@ The service preserves configured payload bounds, pipeline depth, backpressure an
 
 ## Computation bindings
 
-ModelRunner resolves configured devices and domains into ModelEntry bindings. Each CudaStream retains its physical stream and dependency events. A partitioned stream owns a Green Context or borrows its parent's actual SM allocation; child streams close before that parent. ModelRunner owns InputBuffers and batch/module CUDAGraph resources; DiffusionRunner owns request-slot denoising graphs. Calls on one numerical entry serialize access to its workspace and graphs. Independent entries receive separate computation streams and mutable resources while sharing read-only parameters.
+ModelRunner resolves configured devices and domains into ModelEntry bindings. Each CUDAStream retains its physical stream and dependency events. A partitioned stream owns a Green Context or borrows its parent's actual SM allocation; child streams close before that parent. ModelRunner owns InputBuffers and batch/module CUDAGraph resources; DenoisingRunner owns request-slot denoising graphs. Calls on one numerical entry serialize access to its workspace and graphs. Independent entries receive separate computation streams and mutable resources while sharing read-only parameters.
 
 Green Context bindings enqueue computation and communication within their assigned SM partition, including graph capture. Streamed communication uses a transport stream in the same context, with producer and consumer dependencies. Default full-device execution retains its process-group and peer-reduction providers. ModelEntry owns its bound communicator and borrows shared numerical resources from ModelRunner.
 

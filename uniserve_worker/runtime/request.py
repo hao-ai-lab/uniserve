@@ -9,22 +9,19 @@ from typing import TYPE_CHECKING
 import torch
 
 from uniserve.runtime.tensor_buffers import TensorBuffers
+from uniserve.sampling import SamplingParams
 from uniserve.tensors import BufferConfig
 
 from ..foundation.errors import invalid_descriptor
 from ..protocol.batch import (
     BatchCommand,
-    ComputationId,
     Finish,
-    ImageParams,
     NewRequest,
-    OpStatus,
-    RequestKey,
-    SamplingParams,
-    ScheduledRequest,
     Start,
-    TensorRef,
 )
+from ..protocol.identity import ComputationId, RequestKey
+from ..protocol.operation import ImageParams, OpStatus, ScheduledRequest
+from ..protocol.tensor import TensorRef
 
 if TYPE_CHECKING:
     from ..execution.diffusion_state import ImageState, VideoState
@@ -320,15 +317,19 @@ class RequestPool:
             return None
         if occupant is not None:
             raise invalid_descriptor(f"request-pool index {slot} is occupied")
-        prefix = 0 if admission.ar is None else int(admission.ar.initial_position)
+        prefix = 0 if admission.generation is None else int(admission.generation.initial_position)
         self._rows[slot] = RequestState(
             request_key=admission.request_key,
             request_pool_idx=slot,
             admission=admission,
-            sampling=None if admission.ar is None else admission.ar.sampling,
-            image=None if admission.umm is None else admission.umm.image,
-            negative_token_ids=() if admission.ar is None else admission.ar.negative_token_ids,
-            finish_token_ids=() if admission.ar is None else admission.ar.finish_token_ids,
+            sampling=None if admission.generation is None else admission.generation.sampling,
+            image=admission.image,
+            negative_token_ids=()
+            if admission.generation is None
+            else admission.generation.negative_token_ids,
+            finish_token_ids=()
+            if admission.generation is None
+            else admission.generation.finish_token_ids,
             accepted_progress=RequestProgress(
                 logical_position=prefix, kv_visible_len=prefix, kv_computed_len=prefix
             ),

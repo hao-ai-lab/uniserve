@@ -39,9 +39,12 @@ def _checkpoint(root, tied=False, theta=1_000_000.0):
 
 @pytest.mark.parametrize("tied,theta", [(False, 10_000.0), (True, 1_000_000.0)])
 def test_checkpoint_prefill_decode_and_selected_logits(tmp_path, tied, theta):
+    from uniserve_worker.bootstrap.inspect_model import inspect_model
+
     reference = _checkpoint(tmp_path, tied, theta)
     io = loading.Config()
     config = models.read_config(tmp_path, io=io)
+    assert inspect_model(str(tmp_path))["description"] == "qwen3"
     result = models.load_model(config, device="cpu", weights=weights.Config(dtype=torch.float32))
     model = result.model
     if tied:
@@ -143,7 +146,7 @@ def _partitioned(rank, rendezvous, root, shape, axes):
             attention={"": parallel},
         ).model
         from uniserve.nn.attention import SequenceLengths, VarlenInput
-        from uniserve_worker.execution.tensors import TokenSelection
+        from uniserve_worker.execution.sampling import TokenSelection
         from uniserve_worker.execution.text import TextCall
 
         call = TextCall(model)

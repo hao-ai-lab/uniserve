@@ -125,7 +125,7 @@ def build_packing(
     if audio_frames < 1:
         raise ValueError("H3 audio latent frame count must be positive")
     if video_frames % patch_t or latent_height % patch_h or latent_width % patch_w:
-        raise ValueError("fixed latent geometry is not divisible by the transformer patch")
+        raise ValueError("fixed latent dimensions are not divisible by the transformer patch")
 
     # Text and audio occupy dense 64-row tiles before the sparse video region.
     rows_per_frame = latent_height // patch_h * (latent_width // patch_w)

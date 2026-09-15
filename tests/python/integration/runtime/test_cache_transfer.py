@@ -8,18 +8,12 @@ from dataclasses import replace
 import pytest
 import torch
 
-from tests.python.fixtures.shm_publication import serve_pending_publication
 from tests.python.fixtures.cache import mha_pool
+from tests.python.fixtures.shm_publication import serve_pending_publication
+from uniserve.runtime import EventPool
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.protocol.batch import (
-    BufferId,
-    ComputationId,
-    KvTransfer,
-    Locator,
-    RequestKey,
-    TensorTransfer,
-)
-from uniserve_worker.runtime.device_events import EventPool
+from uniserve_worker.protocol.identity import BufferId, ComputationId, RequestKey
+from uniserve_worker.protocol.transfer import KvTransfer, Locator, TensorTransfer
 from uniserve_worker.transfer.tickets import make_transport
 
 pytestmark = pytest.mark.integration

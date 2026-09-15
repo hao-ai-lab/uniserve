@@ -501,7 +501,7 @@ class Communicator:
         """Exchange tensor bytes with group-local peers in one batched P2P launch.
 
         Callers keep send storage live until stream completion and supply
-        contiguous receive storage with the peer's agreed tensor contract.
+        contiguous receive storage with the peer's agreed tensor shape.
         """
 
         output = out

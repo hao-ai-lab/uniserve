@@ -7,13 +7,12 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
-
-from uniserve.distributed.mesh import Communicator
-from uniserve.math import ceil_div
 from torch import nn
 
-from uniserve.model import CausalLM, PatchEncoder, VideoPostprocessor
 from uniserve.diffusion import Branch
+from uniserve.distributed.mesh import Communicator
+from uniserve.math import ceil_div
+from uniserve.model import CausalLM, PatchEncoder, VideoPostprocessor
 from uniserve.runtime.device import canonical_device, device_memory_budget
 from uniserve.tensors import BufferConfig
 from uniserve_models.processing import FeatureLayout, ImageProcessor, PatchTransform
@@ -23,12 +22,13 @@ from ..execution.input_buffers import InputBufferConfig
 from ..execution.model_entry import ModelEntry
 from ..execution.resources import media_state_buffers
 from ..foundation.errors import unsupported_setup
-from ..protocol.batch import DeviceDim, OutputInfo, PipelineStage
+from ..protocol.operation import PipelineStage
+from ..protocol.tensor import DeviceDim, OutputInfo
 from ..runtime.cache_manager import CacheManager
 from ..runtime.results import resolve_outputs
 from ..runtime.tensor_store import TensorStore, device_product_capacity_bytes
 from .components import media_components
-from .inputs import capability, image_inputs
+from .inputs import capability, image_builder
 
 _DEVICE_PRODUCTS_PER_OPERATION = 6
 _DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
@@ -64,7 +64,7 @@ def input_buffer_config(
         if config.lanes
         else config.max_batch_tokens
     )
-    flow = image_inputs(model)
+    flow = image_builder(model)
     branches = 1 if flow is None else len(Branch)
     injection = None if processor is None else processor.feature_injection
     image_span = (
@@ -198,7 +198,7 @@ def local_product_storage_bytes(
     disjoint regions may subsequently be imported into that allocation. A
     temporal-unit stage only retains its unresolved groups of leading-axis
     units. Non-streaming results retain their declared capacity until their
-    consumers finish. Alignment follows BufferPool' allocation contract.
+    consumers finish. Alignment follows BufferPool's allocation rules.
     """
 
     if max_unresolved_ops < 1:
@@ -281,7 +281,7 @@ def latent_trajectory_bytes(
     width = int(latent_width)
     element_bytes = int(dtype_bytes)
     if units < 0 or width < 1 or element_bytes < 1:
-        raise ValueError("latent trajectory geometry is invalid")
+        raise ValueError("latent trajectory dimensions are invalid")
     return units * width * element_bytes
 
 
@@ -301,7 +301,7 @@ def latent_pool_capacity_bytes(
     width = int(latent_width)
     element_bytes = int(dtype_bytes)
     if min(slots, units, width, element_bytes) < 1 or pages < 2:
-        raise ValueError("latent pool geometry is invalid")
+        raise ValueError("latent pool dimensions are invalid")
     usable_pages = pages - 1
     storage = 2 * pages * units * width * element_bytes
     step_buffer = usable_pages * units * width * element_bytes
@@ -382,7 +382,7 @@ def model_arena_capacity(
     bindings: Mapping[str, ModelEntry] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> ArenaCapacity:
-    """Derive device-product, transfer, latent, and CPU arena bounds from worker_config geometry."""
+    """Derive device-product, transfer, latent, and CPU arena bounds from worker settings."""
 
     depth = int(pipeline_depth)
     payload_bytes = int(completion_payload_bytes)
@@ -406,7 +406,7 @@ def model_arena_capacity(
         )
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
     block_size = int(worker_config.block_size)
-    flow = image_inputs(model)
+    flow = image_builder(model)
     latent_pool_bytes = 0
     latent_transfer_bytes = 0
     if flow is not None:
@@ -519,13 +519,13 @@ def derive_runtime_kv_capacity(
     """Size one physical KV pool from explicit tokens or a host-owned byte grant.
 
     Fixed-capacity callers supply their page count. Automatic CUDA sizing requires
-    a granted budget; CPU geometry uses its declared default page policy.
+    a granted budget; CPU capacity uses its declared default page policy.
     """
 
     block = int(block_size)
     token_bytes = int(bytes_per_token)
     if block < 1 or token_bytes < 1 or floor < 1 or resident_copies < 1 or co_resident_blocks < 0:
-        raise ValueError("KV capacity geometry must be positive")
+        raise ValueError("KV capacity dimensions must be positive")
     if available_bytes is not None and available_bytes < 0:
         raise ValueError("KV memory grant must not be negative")
     if kv_token_capacity is not None:

@@ -126,9 +126,9 @@ def test_image_markers_use_text_expert_and_flow_preserves_residual(tmp_path):
     _, state, config = _checkpoint(tmp_path)
     model = _load(tmp_path, config)
     size = image.Config(8, 8)
-    from uniserve_worker.bootstrap.inputs import image_inputs
+    from uniserve_worker.bootstrap.inputs import image_builder
 
-    factory = image_inputs(model)
+    factory = image_builder(model)
     sample = torch.empty((4, 8), dtype=torch.bfloat16)
     factory.initialize(size, seed=71, out=sample)
     expected_noise = torch.randn(

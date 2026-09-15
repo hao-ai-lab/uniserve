@@ -54,7 +54,7 @@ class _FlashOperator(_Operator):
         if q.ndim != 3 or (
             batch.queries.num_tokens is not None and q.shape[0] != batch.queries.num_tokens
         ):
-            raise ValueError("packed attention must match the declared query lengths")
+            raise ValueError("packed attention rows must match the declared query lengths")
         for query_slice, key_slice, run in causal_runs(batch):
             query = q[query_slice]
             if query.numel() == 0:

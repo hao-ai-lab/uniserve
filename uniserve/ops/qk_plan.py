@@ -65,7 +65,7 @@ class QKNormRopePlan:
 
         _validate_multi_axis_rope(req)
 
-        # Canonical integer dimensions feed both slicing and kernel geometry;
+        # Canonical integer dimensions feed both slicing and kernel launch sizes;
         # group discovery then determines which axes share an RMS reduction.
         axis_dims = tuple(int(dim) for dim in req.axis_dims)
         groups = _groups(axis_dims, req.q_weights, req.k_weights)

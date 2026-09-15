@@ -15,7 +15,7 @@ class Modulation(nn.Module):
     """Own timestep-only products without retaining their projection weights.
 
     A fixed solver ladder permits preparation once at load time. Projection
-    inputs retain the caller's batch geometry and dtype conversion; individual
+    inputs retain the caller's batch dimensions and dtype conversion; individual
     weights may be materialized and released by a checkpoint iterator. Requests
     borrow products from this immutable model resource.
     """
@@ -31,9 +31,7 @@ class Modulation(nn.Module):
             products.shape[0] != output_products.shape[0]
             or products.shape[2] != output_products.shape[1]
         ):
-            raise ValueError(
-                "layer and output modulation products must share the timestep ladder"
-            )
+            raise ValueError("layer and output modulation products must share the timestep ladder")
         if min(products.shape) < 1 or (
             output_products is not None and min(output_products.shape) < 1
         ):
@@ -85,9 +83,7 @@ class Modulation(nn.Module):
                 or projected.dtype != blocks.dtype
                 or projected.device != blocks.device
             ):
-                raise ValueError(
-                    "modulation layer projections must share output geometry and format"
-                )
+                raise ValueError("modulation layer projections must share output shape and format")
             blocks[:, index].copy_(projected)
             count += 1
             del weight, bias, projected

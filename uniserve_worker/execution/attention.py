@@ -46,7 +46,7 @@ def cache_pages(
             cache.require_writable(row_pages, group=group_id, start=prefix, length=query)
     # The last shape bucket can end at a non-power-of-two context capacity.
     # Both resident and staged tables own that exact bound; shape padding
-    # must not invent columns beyond their scheduler-visible page geometry.
+    # must not invent columns beyond their scheduler-visible page bounds.
     width = min(
         bucketed_length(max(1, max(map(len, pages)))),
         tables.max_blocks_per_request,

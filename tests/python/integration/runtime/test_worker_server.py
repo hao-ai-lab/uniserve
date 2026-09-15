@@ -14,15 +14,9 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
-from uniserve_worker.protocol.batch import (
-    ComputationId,
-    Finish,
-    ForwardMode,
-    NewRequest,
-    RequestKey,
-    ScheduleBatch,
-    ScheduledRequest,
-)
+from uniserve_worker.protocol.batch import Finish, NewRequest, ScheduleBatch
+from uniserve_worker.protocol.identity import ComputationId, RequestKey
+from uniserve_worker.protocol.operation import ForwardMode, ScheduledRequest
 
 pytestmark = pytest.mark.integration
 

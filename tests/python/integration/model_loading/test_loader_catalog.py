@@ -1,9 +1,9 @@
 """Model discovery and checkpoint closure through the public loading boundary."""
 
-from dataclasses import replace
 import json
-from pathlib import Path
 import shutil
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -153,6 +153,58 @@ def test_image_processing_metadata_has_resolved_token_identities(tmp_path, has_m
     assert config.image_processor.vit.downsample_ratio == 0.5
     assert config.flow_prompt is not None
     assert load_tokenizer(config.tokenizer).convert_tokens_to_ids("<img>") == 1
+
+
+def test_remote_image_architecture_resolves_checkpoint_dimensions_and_transforms(
+    tmp_path, monkeypatch
+):
+    remote = tmp_path / "remote"
+    snapshot = tmp_path / "snapshots" / ("b" * 40)
+    remote.mkdir()
+    metadata = {
+        "architectures": ["BagelForConditionalGeneration"],
+        "llm_config": {
+            "hidden_size": 32,
+            "intermediate_size": 48,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "vocab_size": 37,
+        },
+        "vit_config": {
+            "hidden_size": 32,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 2,
+            "patch_size": 2,
+            "image_size": 8,
+        },
+        "vae_config": {"ch": 32, "ch_mult": [1, 1], "downsample": 2, "z_channels": 2},
+        "start_of_image_id": 35,
+        "end_of_image_id": 36,
+    }
+    (remote / "config.json").write_text(json.dumps(metadata))
+    save_file({"latent_pos_embed.pos_embed": torch.zeros(9, 32)}, remote / "ema.safetensors")
+
+    def download(*, repo_id, filename, revision, cache_dir):
+        target = snapshot / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(remote / filename, target)
+        return str(target)
+
+    def files(self, *, repo_id, revision):
+        return [path.name for path in remote.iterdir()]
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
+    monkeypatch.setattr("huggingface_hub.HfApi.list_repo_files", files)
+    # Architecture inspection still needs the learned position-table extent,
+    # even when no numerical module is selected for loading.
+    config = models.read_config("owner/bagel", modules=frozenset())
+    assert config.model.max_latent_size == 3
+    assert config.image_processor.vit.resize.stride == 2
+    assert config.image_processor.vit.resize.max_size == 8
+    assert config.image_processor.feature_injection.start_token_id == 35
+    assert config.image_processor.feature_injection.end_token_id == 36
+    assert config.flow_prompt is None
 
 
 def test_unknown_modular_pipeline_fails_at_discovery(tmp_path):

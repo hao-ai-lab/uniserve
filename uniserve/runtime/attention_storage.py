@@ -36,7 +36,7 @@ def allocate_output_storage(
 ) -> OutputStorage:
     """Allocate peer outputs shared only by one caller's serialized layers.
 
-    Geometry describes query rows and heads after Ulysses exchange. Each peer
+    The dimensions describe query rows and heads after Ulysses exchange. Each peer
     receives its sequence rows with every head in that logical group. Runtime
     owns registration, synchronization values, and allocation retirement.
     """

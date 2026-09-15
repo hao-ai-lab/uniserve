@@ -8,7 +8,7 @@ from uniserve.distributed import DeviceMesh, parallelize_
 from uniserve.nn.attention import AttentionParallelConfig, Ulysses
 from uniserve.runtime import TensorBuffers
 from uniserve_models.minimax_h3.config import DiffusionConfig, TransformerConfig
-from uniserve_models.minimax_h3.diffusion import Denoiser
+from uniserve_models.minimax_h3.denoiser import Denoiser
 from uniserve_models.minimax_h3.inputs import DenoiserSize
 
 pytestmark = pytest.mark.unit

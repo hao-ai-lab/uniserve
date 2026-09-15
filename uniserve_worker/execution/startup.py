@@ -1,29 +1,27 @@
-"""Numerical token inputs for bounded packed startup preparation."""
+"""Prepare bounded text inputs and CUDA graphs during worker startup."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
-
-from ..model_entry import ModelEntry
-
-if TYPE_CHECKING:
-    from ..graph_inputs import PrefillShape
-    from ..model_runner import ModelRunner
-
-from collections.abc import Callable, Sequence
 
 import torch
 
 from uniserve.math import ceil_div
-from uniserve_worker.execution.tensors import TokenSelection
-from uniserve_worker.protocol.batch import ForwardMode
+from uniserve_worker.execution.sampling import TokenSelection
+from uniserve_worker.protocol.operation import ForwardMode
 
-from ...runtime.cache_manager import CacheManager
-from ..attention import from_blocks
-from ..batch import ExecutionOutput, InputBatch
-from ..input_buffers import InputBuffers
-from ..rows import ForwardRow
+from ..runtime.cache_manager import CacheManager
+from .attention import from_blocks
+from .batch import ExecutionOutput, InputBatch
+from .input_buffers import InputBuffers
+from .model_entry import ModelEntry
+from .rows import ForwardRow
+
+if TYPE_CHECKING:
+    from .graph_inputs import PrefillShape
+    from .model_runner import ModelRunner
 
 
 def stage_text(
@@ -108,9 +106,46 @@ def prepare_prefill(
             batch = stage_text(
                 buffers,
                 runner.kv_cache,
-                tuple((0,) * n for n in lengths),
+                tuple((0,) * count for count in lengths),
                 pages,
                 causal=shape.causal,
                 selection=shape.selection,
             )
             runner.capture_batch(entry, batch, forward)
+
+
+def prepare_decode(
+    runner: ModelRunner,
+    entry: ModelEntry,
+    buffers: InputBuffers,
+    forward: Callable[[InputBatch], ExecutionOutput],
+) -> None:
+    """Prepare valid one-token prefixes, then capture each decode batch bucket."""
+
+    row_counts = (
+        tuple(reversed(runner.decode_shapes[entry]))
+        if runner.worker_config.graph_policy != "off"
+        else (1,)
+    )
+    for rows in row_counts:
+        with runner.kv_cache.startup_pages(rows) as scratch:
+            pages = tuple((page,) for page in scratch)
+            prompt = stage_text(buffers, runner.kv_cache, ((0,),) * rows, pages)
+            runner.eager_batch(entry, prompt, forward)
+            batch = stage_text(
+                buffers,
+                runner.kv_cache,
+                ((0,),) * rows,
+                pages,
+                prefixes=(1,) * rows,
+                decode=True,
+            )
+            predicates = runner.decode_predicates
+            saved = None if predicates is None else predicates.clone()
+            try:
+                if predicates is not None:
+                    predicates[1 : rows + 1] = True
+                runner.capture_batch(entry, batch, forward)
+            finally:
+                if saved is not None and predicates is not None:
+                    predicates.copy_(saved)

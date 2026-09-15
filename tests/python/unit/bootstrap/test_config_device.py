@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from uniserve_worker.bootstrap.cli import parse_worker_args
-from uniserve_worker.protocol.batch import ForwardMode, PipelineStage
+from uniserve_worker.protocol.operation import ForwardMode, PipelineStage
 
 pytestmark = pytest.mark.unit
 

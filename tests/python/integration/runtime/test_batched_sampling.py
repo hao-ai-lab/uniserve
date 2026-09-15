@@ -24,21 +24,20 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
+from uniserve.sampling import SamplingParams
 from uniserve_models.stub import STUB_IMG_START_TOKEN_ID
-from uniserve_worker.protocol.batch import (
-    ArRequestParams,
-    BatchOutput,
-    ComputationId,
+from uniserve_worker.protocol.batch import GenerationParams, NewRequest
+from uniserve_worker.protocol.identity import ComputationId
+from uniserve_worker.protocol.operation import (
     DrawLayout,
     ErrorCode,
     ForwardMode,
-    NewRequest,
     OpStatus,
     Rng,
-    SamplingParams,
     SamplingState,
     ScheduledRequest,
 )
+from uniserve_worker.protocol.output import BatchOutput
 
 pytestmark = pytest.mark.integration
 
@@ -151,7 +150,9 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
         )
 
         for completion, prompt_end in zip(result.completions, prompt_ends, strict=True):
-            assert completion.committed_tokens == (expected_successor(expected_successor(prompt_end)),)
+            assert completion.committed_tokens == (
+                expected_successor(expected_successor(prompt_end)),
+            )
             assert (completion.position, completion.kv_visible_len, completion.kv_computed_len) == (
                 3,
                 3,
@@ -164,11 +165,11 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> Non
     first = ar_params(24, block_ids=(3,))
     second_base = ar_params(25, block_ids=(4,))
     expected = expected_successor(4)
-    assert second_base.ar is not None
+    assert second_base.generation is not None
     second = NewRequest(
         second_base.request_key,
         request_pool_idx=second_base.request_pool_idx,
-        ar=replace(second_base.ar, finish_token_ids=(expected,)),
+        generation=replace(second_base.generation, finish_token_ids=(expected,)),
     )
     first_op = token_operation(
         first.request_key,
@@ -314,7 +315,9 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(dev
     following = finalized_report(worker, worker.submit(successor_batch))
 
     completion = result.completions[0]
-    assert completion.committed_tokens == (expected_successor(prime.completions[0].committed_tokens[0]),)
+    assert completion.committed_tokens == (
+        expected_successor(prime.completions[0].committed_tokens[0]),
+    )
     assert completion.kv_computed_len == 5
     assert completion.kv_visible_len == 3
 
@@ -331,7 +334,7 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> Non
     admission = NewRequest(
         base.request_key,
         request_pool_idx=base.request_pool_idx,
-        ar=replace(cast(ArRequestParams, base.ar), finish_token_ids=(1001,)),
+        generation=replace(cast(GenerationParams, base.generation), finish_token_ids=(1001,)),
     )
     extend = token_operation(
         admission.request_key,

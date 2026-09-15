@@ -46,7 +46,7 @@ def _triton_act_row_chunks(rows: int, n_cols: int) -> Iterator[tuple[int, int]]:
     rows = int(rows)
     n_cols = int(n_cols)
     if rows < 0 or n_cols <= 0:
-        raise ValueError("activation row geometry must be non-negative with positive columns")
+        raise ValueError("activation rows must be non-negative with positive columns")
 
     # Each input row contains two ``n_cols`` halves, so the launch range is
     # bounded by twice the output width.
@@ -106,7 +106,7 @@ if triton is not None:
 
 
 def _act_inputs_eligible(x: torch.Tensor) -> bool:
-    """Check the device, layout, gradient, and packed-width kernel contract."""
+    """Check the device, layout, gradient, and packed-width kernel requirements."""
 
     return not (
         not x.is_cuda or torch.is_grad_enabled() or not x.is_contiguous() or x.shape[-1] % 2 != 0
@@ -357,7 +357,7 @@ def _validate_value_first(
     value_gate: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> int:
-    """Validate the packed halves and bias geometry."""
+    """Validate the packed halves and bias shape."""
 
     if value_gate.ndim < 1 or value_gate.shape[-1] < 2 or value_gate.shape[-1] % 2:
         raise ValueError("SwiGLU requires two equal, nonempty packed halves")

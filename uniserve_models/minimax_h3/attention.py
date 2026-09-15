@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
 import math
+from collections.abc import Iterator, Mapping
 
 import torch
 from torch import nn

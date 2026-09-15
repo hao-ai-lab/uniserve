@@ -11,38 +11,30 @@ import torch
 
 from uniserve.math import ceil_div
 from uniserve.media.image import Config as ImageConfig
-from ..execution.flow import image_state
-from uniserve_worker.protocol.batch import (
-    ComputationId,
-    ForwardMode,
-    PipelineStage,
-    TransferMode,
-)
+from uniserve_worker.protocol.identity import BufferId, ComputationId, RequestKey
+from uniserve_worker.protocol.operation import ForwardMode, PipelineStage, TransferMode
 
 from ..execution.diffusion_state import resolve_prefix
+from ..execution.flow import image_state
 from ..execution.graph_inputs import DiffusionShape
 from ..execution.model_runner import capture_image_parameters
 from ..foundation.errors import invalid_descriptor
 from ..protocol.batch import (
     BatchCommand,
-    BatchOutput,
     BlockTable,
     BufferAllocation,
-    BufferId,
     CachePageAllocation,
     Finish,
     Free,
     LatentParams,
     NewRequest,
-    OpStatus,
-    RequestKey,
-    RequestOutput,
     ScheduleBatch,
-    ScheduledRequest,
     Start,
     TensorPublication,
-    TensorRef,
 )
+from ..protocol.operation import OpStatus, ScheduledRequest
+from ..protocol.output import BatchOutput, RequestOutput
+from ..protocol.tensor import TensorRef
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -260,9 +252,9 @@ def _warmup_batch(
 def _warmup_token_output(
     request_key: RequestKey, op_id: ComputationId, generation: int
 ) -> TensorRef:
-    """Declare a packed int64 token relay for warmup sampling."""
+    """Declare an encoded int64 token relay for warmup sampling."""
 
-    from ..protocol.batch import DType, ShapeBound
+    from ..protocol.tensor import DType, ShapeBound
 
     return TensorRef(
         request_key=request_key,
@@ -381,8 +373,8 @@ def _build_warmup_batch(
         if (
             request is None
             and admission is not None
-            and admission.ar is not None
-            and admission.ar.initial_position != 0
+            and admission.generation is not None
+            and admission.generation.initial_position != 0
         ):
             raise invalid_descriptor("warmup KV admission requires an empty prefix")
         visible = 0
@@ -543,7 +535,7 @@ def _warmup_flow_tables(
 
     request = requests.worker.requests.get(operation.request_key.request_id)
     image = request.image
-    generation = requests.worker.runner.images
+    generation = requests.worker.runner.image_builder
     if image is None or generation is None:
         raise invalid_descriptor("generation warmup has no admitted image runtime")
     trajectory = image_state(generation, ImageConfig(height, width), image)
@@ -650,7 +642,7 @@ def warmup_requests(worker: Worker) -> None:
         if ForwardMode.PREFILL in worker.info.supported_ops:
             _warmup_tokens(requests)
             logger.info("completed token runtime warmup")
-        if worker.runner.images is not None:
+        if worker.runner.image_builder is not None:
             _warmup_flow(requests)
             logger.info("completed flow runtime warmup")
 
@@ -669,14 +661,10 @@ def _warmup_image_size(requests: _WarmupRequests) -> tuple[int, int]:
 def _warmup_tokens(requests: _WarmupRequests) -> None:
     """Exercise extend-to-decode token handoff and release its synthetic request."""
 
-    from ..protocol.batch import (
-        ArRequestParams,
-        Bounds,
-        NewRequest,
-        RequestKey,
-        SamplingParams,
-        ScheduledRequest,
-    )
+    from uniserve.sampling import SamplingParams
+
+    from ..protocol.batch import GenerationParams, NewRequest
+    from ..protocol.operation import Bounds, ScheduledRequest
 
     variants = requests.worker.info.supported_ops
     if ForwardMode.PREFILL not in variants:
@@ -693,7 +681,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
         sid: NewRequest(
             keys[sid],
             request_pool_idx=sid,
-            ar=ArRequestParams(
+            generation=GenerationParams(
                 sampling=SamplingParams(temperature=0.0, ignore_eos=True),
                 initial_position=0,
             ),
@@ -797,22 +785,22 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
 def _warmup_flow(requests: _WarmupRequests) -> None:
     """Drive one denoise quantum through the real flow forward path."""
 
-    from ..protocol.batch import (
+    from ..protocol.batch import NewRequest
+    from ..protocol.operation import (
         Bounds,
-        DeviceDim,
         DrawLayout,
-        DType,
-        NewRequest,
-        RequestKey,
         Rng,
         ScheduledRequest,
+    )
+    from ..protocol.tensor import (
+        DeviceDim,
+        DType,
         ShapeBound,
         StaticDim,
         TensorRef,
-        UmmRequestParams,
     )
 
-    generation = requests.worker.runner.images
+    generation = requests.worker.runner.image_builder
     if (
         not {
             PipelineStage.LATENT_PREPARATION,
@@ -853,13 +841,11 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
             NewRequest(
                 key,
                 request_pool_idx=index,
-                umm=UmmRequestParams(
-                    image=capture_image_parameters(
-                        cfg_branches,
-                        steps=2,
-                        height=height,
-                        width=width,
-                    )
+                image=capture_image_parameters(
+                    cfg_branches,
+                    steps=2,
+                    height=height,
+                    width=width,
                 ),
             )
             for index, key in enumerate(keys, start=1)

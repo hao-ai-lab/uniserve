@@ -9,19 +9,15 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from uniserve.tensors import concatenate_views
 from uniserve_worker.execution.output import (
     PendingOutput,
 )
-from uniserve_worker.execution.tensors import concatenate_views
 from uniserve_worker.execution.transfer import _release_locators
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.profiling import _forward_stats, record_component
-from uniserve_worker.protocol.batch import (
-    OpStatus,
-    PipelineStage,
-    ScheduledRequest,
-    TensorPublication,
-)
+from uniserve_worker.protocol.batch import TensorPublication
+from uniserve_worker.protocol.operation import OpStatus, PipelineStage, ScheduledRequest
 from uniserve_worker.transfer.exports import validate_exports
 
 from .batch_state import BatchState
@@ -41,10 +37,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-SAMPLING_COMPLETION_FIELDS = 4
-TOKEN_CONTINUATION_BIT = 1 << 31
-TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 
 
 def _commit_group(

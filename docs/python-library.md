@@ -14,6 +14,23 @@ model = loaded.model
 
 Models compose ordinary `torch.nn.Module` layers. Capabilities such as `CausalLM`, `TextEncoder`, `ImageDenoiser`, `ImageDecoder` and `VideoDecoder` provide shared numerical behavior. Text uses `forward`, `embed_input_ids` and `compute_logits`; encoders use `encode`; media decoders use `decode`; denoisers use `prepare_latents` and `forward`. Independent token decoding and diffusion use separate homogeneous calls. Concurrent callers share immutable model parameters and own independent execution contexts.
 
+## Model packages
+
+Each architecture has a package under `uniserve_models`: `qwen3`, `bagel`, `sensenova_u1` and `minimax_h3`. `siglip` supplies the reusable visual tower, and `stub` supplies deterministic simulator computation. Import public objects from the package, for example `from uniserve_models.bagel import Config, Model`; package initializers declare exports rather than implement networks.
+
+| Module | Responsibility |
+| --- | --- |
+| `config.py` | Immutable architecture composition and checkpoint metadata normalization |
+| `model.py` | Top-level module composition and numerical entry-point declarations |
+| `transformer.py`, `encoder.py`, `denoiser.py` | The corresponding numerical submodule implementations |
+| `inputs.py` | Model-specific borrowed numerical inputs |
+| `weights.py` | Checkpoint sources, tensor assignments and precision presets; H3's component precision policies live in `precision.py` |
+| `processing.py` | Architecture-specific image transforms and prompt framing |
+
+Packages contain the modules their computations need. SigLIP exposes an encoder rather than a serving model, and the simulator has no checkpoint loader. Image/audio/video codecs and other architecture-specific submodules retain their domain names. A submodule's own configuration stays with that submodule when it is independently composed.
+
+Shared discovery and materialization remain in `uniserve_models.loading`; shared preprocessing value types and tokenizer utilities remain in `uniserve_models.processing`. Loadable packages declare `config_sources` for checkpoint headers needed during architecture inspection, and provide their own image-processor factory and flow prompt. These are loading-time assets used by callers, not resources retained by numerical modules.
+
 ## Text logits and prefix storage
 
 The [text logits example](../examples/text_logits.py) loads a Qwen3, BAGEL or SenseNova U1 text capability, allocates prefix storage and evaluates raw-text next-token logits through the public numerical interfaces.
@@ -39,6 +56,19 @@ The saved dictionary contains CPU `input_ids` shaped `[tokens]` and `logits` sha
 ## Execution contexts and CUDA graphs
 
 `ExecutionContext` owns prepared backend state, communication scratch and numerical workspace. Enter the context before calling its module, prepare the required size, and bind attention inputs before graph capture. `bind_attention` refreshes planning metadata; captured calls read numerical tensor contents from their fixed addresses.
+
+The capability runners in `uniserve.execution` provide the ordinary direct-call boundary over an existing context. `TextRunner` binds attention before `forward` and keeps vocabulary projection separate; `EncoderRunner`, `LatentRunner`, `DenoisingRunner`, `ImageRunner`, `VideoRunner`, `VideoProcessor`, and `AudioRunner` expose the corresponding numerical methods. Runners borrow the model and context, connect the context stream back to the caller's current stream, and never own request state or scheduling policy.
+
+```python
+from uniserve.execution import TextRunner
+from uniserve.runtime import ExecutionContext
+
+with ExecutionContext(model, cache=cache) as execution:
+    runner = TextRunner(model, context=execution)
+    runner.warmup(size)
+    hidden = runner.forward(inputs)
+    logits = runner.compute_logits(hidden, token_indices=token_indices)
+```
 
 ```python
 from uniserve.runtime import CUDAGraph, ExecutionContext

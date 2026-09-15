@@ -11,7 +11,6 @@ from typing import Any, Mapping
 from . import audio_vae, output, video_vae
 from .encoder import TextEncoderConfig
 
-
 FASTH3_LADDER = (1000, 750, 500, 250)
 FASTH3_SHIFTS = (12.0, 3.0)
 FASTH3_TIME_SCALE = 1000.0
@@ -53,7 +52,7 @@ def _validate_manifest(manifest: Mapping[str, object]) -> None:
 
 @dataclass(frozen=True, slots=True)
 class TransformerConfig:
-    """Defines H3 multimodal width, layer, attention, expert, modulation, and sparse-video geometry."""
+    """Define H3 widths, layers, attention, experts, modulation, and sparse-video layout."""
 
     hidden_size: int = 5376
     num_attention_heads: int = 56
@@ -306,3 +305,7 @@ def read_config(root: Path, io) -> Config:
     if metadata["audio_vae"].get("sampling_rate") != 32000:
         raise ValueError("FastH3 audio output requires a 32000 Hz sampling clock")
     return _normalize(metadata)
+
+
+# Checkpoint headers needed to resolve architecture before module selection.
+config_sources = ()

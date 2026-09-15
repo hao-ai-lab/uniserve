@@ -9,15 +9,22 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve.loading import weights
+from uniserve.loading import checkpoint, weights
 from uniserve.nn import Modulation
-from uniserve_models import qwen3
+from uniserve_models.qwen3.weights import parameter_sources
 
 from . import audio_vae, video_vae
 from .conditioning import assignments as conditioning_assignments
 from .config import TEXT_FIELDS, TRANSFORMER_FIELDS, TransformerConfig
-from .diffusion import schedules
+from .denoiser import schedules
 from .modulation import TimestepEmbedding
+
+checkpoint_sources = (
+    checkpoint.Config("denoiser", "transformer", module_path="denoiser"),
+    checkpoint.Config("text_encoder", "text_encoder", module_path="text_encoder"),
+    checkpoint.Config("video_decoder", "vae", module_path="video_decoder"),
+    checkpoint.Config("audio_decoder", "audio_vae", module_path="audio_decoder"),
+)
 
 
 @cache
@@ -219,7 +226,7 @@ def _text_component(model):
         "network." + target.removeprefix("backbone."): source.replace(
             "model.", "model.language_model.", 1
         )
-        for target, source in qwen3._parameter_sources(model.network.config).items()
+        for target, source in parameter_sources(model.network.config).items()
         if target.startswith("backbone.")
     }
     parameters = dict(model.named_parameters())

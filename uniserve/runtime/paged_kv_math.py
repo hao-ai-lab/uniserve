@@ -122,7 +122,7 @@ def _triton_paged_kv_write_eligible(
     k_src: torch.Tensor,
     v_src: torch.Tensor,
 ) -> bool:
-    """Return whether paged KV inputs satisfy the fused Triton scatter contract."""
+    """Return whether paged KV inputs satisfy the fused Triton scatter requirements."""
 
     addresses = (locations,) if offsets is None else (locations, offsets)
     tensors = (k_cache, v_cache, *addresses, k_src, v_src)

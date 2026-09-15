@@ -13,7 +13,7 @@ from uniserve.tensors import BufferConfig
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
 from ..foundation.errors import invalid_descriptor
-from ..protocol.batch import RequestKey
+from ..protocol.identity import RequestKey
 
 __all__ = ["BlockTables"]
 
@@ -54,7 +54,7 @@ class BlockTables:
             )
             < 1
         ):
-            raise invalid_descriptor("request-to-token pool geometry is invalid")
+            raise invalid_descriptor("request-to-token pool dimensions are invalid")
 
         self._table_capacity = self.request_pool_size * self.group_count
         buffer_configs = self.buffers(
@@ -109,7 +109,7 @@ class BlockTables:
         """Describe page tables and the full request/group installation workspace."""
 
         if min(group_count, request_pool_size, max_blocks_per_request) < 1:
-            raise invalid_descriptor("request-to-token pool geometry is invalid")
+            raise invalid_descriptor("request-to-token pool dimensions are invalid")
         rows, tables = request_pool_size + 1, request_pool_size * group_count
         return {
             "page_tables": BufferConfig((group_count, rows, max_blocks_per_request), torch.int32),
