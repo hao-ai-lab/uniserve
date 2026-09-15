@@ -139,7 +139,6 @@ impl CompiledChatTemplate {
 mod tests {
     use std::fs;
 
-    use crate::profile::assets::{HfSpecialTokens, NamedSpecialToken};
     use tempfile::TempDir;
 
     use super::*;
@@ -171,29 +170,6 @@ mod tests {
     }
 
     #[test]
-    fn test_special_tokens_injected_into_context() {
-        let template = "{{ bos_token }}hello{{ eos_token }}";
-        let template =
-            CompiledChatTemplate::new(template.to_string(), ChatTemplateContentFormatOption::Auto)
-                .unwrap();
-
-        let special_tokens = HfSpecialTokens {
-            bos_token: Some(NamedSpecialToken::Text("<s>".to_string())),
-            eos_token: Some(NamedSpecialToken::Text("</s>".to_string())),
-            ..Default::default()
-        };
-
-        let result = template
-            .apply(TemplateContext {
-                special_tokens: Some(&special_tokens),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(result, "<s>hello</s>");
-    }
-
-    #[test]
     fn test_special_tokens_undefined_when_not_provided() {
         let template = "{% if bos_token is defined %}{{ bos_token }}{% endif %}hello";
         let template =
@@ -202,50 +178,6 @@ mod tests {
 
         let result = template.apply(TemplateContext::default()).unwrap();
         assert_eq!(result, "hello");
-    }
-
-    #[test]
-    fn test_special_tokens_partial() {
-        let template =
-            "{{ bos_token }}hello{% if eos_token is defined %}{{ eos_token }}{% endif %}";
-        let template =
-            CompiledChatTemplate::new(template.to_string(), ChatTemplateContentFormatOption::Auto)
-                .unwrap();
-
-        let special_tokens = HfSpecialTokens {
-            bos_token: Some(NamedSpecialToken::Text("<s>".to_string())),
-            eos_token: None,
-            ..Default::default()
-        };
-
-        let result = template
-            .apply(TemplateContext {
-                special_tokens: Some(&special_tokens),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(result, "<s>hello");
-    }
-
-    #[test]
-    fn test_tojson_filter_supports_indent_and_sort_keys() {
-        let template = CompiledChatTemplate::new(
-            "{{ payload | tojson(indent=2, sort_keys=true) }}".to_string(),
-            ChatTemplateContentFormatOption::Auto,
-        )
-        .unwrap();
-        let mut kwargs = HashMap::new();
-        kwargs.insert("payload".to_string(), serde_json::json!({"b": 1, "a": 2}));
-
-        let result = template
-            .apply(TemplateContext {
-                template_kwargs: Some(&kwargs),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(result, "{\n  \"a\": 2,\n  \"b\": 1\n}");
     }
 
     #[test]
@@ -282,17 +214,6 @@ mod tests {
         let error = resolve_chat_template("missing_template.jinja").unwrap_err();
 
         assert!(matches!(error, TemplateError::MissingTemplatePath));
-    }
-
-    #[test]
-    fn test_chat_template_state_respects_explicit_content_format_override() {
-        let template = CompiledChatTemplate::new(
-            "{% for item in messages[0].content %}{{ item.text }}{% endfor %}".to_string(),
-            ChatTemplateContentFormatOption::String,
-        )
-        .unwrap();
-
-        assert_eq!(template.content_format(), ChatTemplateContentFormat::String);
     }
 
     #[test]

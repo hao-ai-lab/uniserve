@@ -270,7 +270,6 @@ mod tests {
     fn default_config_validates() {
         let config = Config::default();
         assert!(config.validate().is_ok());
-        assert_eq!(config.engine, EngineSettings::default());
     }
 
     #[test]

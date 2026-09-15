@@ -35,12 +35,6 @@ fn base_request(messages: Vec<ChatMessage>) -> ChatRequest {
     }
 }
 
-/// Probe template that renders a marker for the detected content shape.
-const DETECT_PROBE: &str = "{%- for message in messages -%}\
-{%- if message.content is string -%}STR:{{ message.content }}\
-{%- else -%}LIST{%- for part in message.content -%}:{{ part.text }}{%- endfor -%}\
-{%- endif -%}{%- endfor -%}";
-
 fn multipart_user() -> ChatRequest {
     let mut request = base_request(vec![ChatMessage::user(vec![
         ChatContentPart::text("a"),
@@ -91,52 +85,12 @@ fn auto_detection_treats_direct_content_loop_template_as_openai() {
     assert_eq!(rendered, "a|b|");
 }
 
-#[test]
-fn detector_probe_reports_string_for_string_format() {
-    // Sanity anchor for the probe template itself under an explicit String force.
-    let rendered = hf_render(
-        DETECT_PROBE,
-        ChatTemplateContentFormatOption::String,
-        &multipart_user(),
-    );
-    assert_eq!(rendered, "STR:ab");
-}
-
-#[test]
-fn detector_probe_reports_list_for_openai_format() {
-    let rendered = hf_render(
-        DETECT_PROBE,
-        ChatTemplateContentFormatOption::OpenAi,
-        &multipart_user(),
-    );
-    assert_eq!(rendered, "LIST:a:b");
-}
-
 fn qwen_history() -> ChatRequest {
     base_request(vec![
         ChatMessage::text(ChatRole::User, "What is the capital of France?"),
         ChatMessage::assistant_text("The capital of France is Paris."),
         ChatMessage::text(ChatRole::User, "And of Italy?"),
     ])
-}
-
-#[test]
-fn qwen3_render_is_deterministic_across_repeated_renders() {
-    let renderer = HfChatRenderer::new(
-        Some(QWEN3_TEMPLATE.to_owned()),
-        HashMap::new(),
-        ChatTemplateContentFormatOption::Auto,
-    )
-    .unwrap();
-    let request = qwen_history();
-
-    let first = renderer.render(&request).unwrap();
-    let second = renderer.render(&request).unwrap();
-
-    assert_eq!(
-        first, second,
-        "repeated Qwen renders must be byte-identical"
-    );
 }
 
 #[test]

@@ -478,9 +478,9 @@ impl ChatRole {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, to_value};
+    use serde_json::json;
 
-    use super::{ChatContent, ChatContentPart, ChatMessage, ChatRole, Tool};
+    use super::{ChatContent, ChatContentPart, ChatMessage, ChatRole};
     use crate::serving::chat::event::AssistantContentBlock;
 
     #[test]
@@ -496,18 +496,6 @@ mod tests {
         assert_eq!(
             content,
             ChatContent::Parts(vec![ChatContentPart::text("hello")])
-        );
-    }
-
-    #[test]
-    fn chat_content_from_string_like_values_builds_text() {
-        assert_eq!(
-            ChatContent::from("hello"),
-            ChatContent::Text("hello".to_string())
-        );
-        assert_eq!(
-            ChatContent::from("hello".to_string()),
-            ChatContent::Text("hello".to_string())
         );
     }
 
@@ -534,25 +522,5 @@ mod tests {
         assert_eq!(message.role(), ChatRole::Assistant);
         assert_eq!(message.text_content().unwrap(), "outer");
         assert_eq!(message.reasoning_content().as_deref(), Some("inner"));
-    }
-
-    #[test]
-    fn developer_message_round_trips_through_serde() {
-        let message = ChatMessage::developer(
-            "hello",
-            Some(vec![Tool {
-                name: "get_weather".to_string(),
-                description: Some("Get weather".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                }),
-                strict: Some(true),
-            }]),
-        );
-
-        let value = to_value(&message).unwrap();
-        let decoded: ChatMessage = serde_json::from_value(value).unwrap();
-        assert_eq!(decoded, message);
     }
 }

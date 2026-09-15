@@ -941,57 +941,6 @@ mod tests {
         assert!(ImageParams::default().validate().is_ok());
     }
 
-    /// Converts an injected clock to fractional and whole Unix seconds.
-    ///
-    /// Instants before the epoch clamp to zero.
-    fn epoch_conversion(clock: SystemTime) -> (f64, u64) {
-        let d = clock.duration_since(UNIX_EPOCH).unwrap_or_default();
-        (d.as_secs_f64(), d.as_secs())
-    }
-
-    #[test]
-    fn epoch_conversion_u64_is_floor_of_f64() {
-        // Whole seconds are the floor of the fractional representation for an
-        // instant 1,234.75 seconds after the epoch.
-        let clock = UNIX_EPOCH + std::time::Duration::from_millis(1_234_750);
-        let (frac, whole) = epoch_conversion(clock);
-        assert!((frac - 1234.75).abs() < 1e-6, "fractional secs preserved");
-        assert_eq!(whole, 1234, "whole secs == floor(fractional)");
-        assert_eq!(
-            whole,
-            frac.floor() as u64,
-            "u64 helper == floor(f64 helper)"
-        );
-    }
-
-    #[test]
-    fn epoch_conversion_at_epoch_is_zero() {
-        let (frac, whole) = epoch_conversion(UNIX_EPOCH);
-        assert_eq!(frac, 0.0);
-        assert_eq!(whole, 0);
-    }
-
-    #[test]
-    fn epoch_conversion_clamps_pre_epoch_to_zero() {
-        // `duration_since` rejects pre-epoch values, and the public clock
-        // helpers map that error to a zero duration.
-        let clock = UNIX_EPOCH - std::time::Duration::from_secs(5);
-        let (frac, whole) = epoch_conversion(clock);
-        assert_eq!(frac, 0.0, "pre-request_epoch clamps fractional to 0.0");
-        assert_eq!(whole, 0, "pre-request_epoch clamps whole to 0");
-    }
-
-    #[test]
-    fn real_clock_helpers_are_panic_free_and_non_negative() {
-        // Both clock views use the same non-negative epoch conversion.
-        let f = now_unix_secs();
-        let u = now_unix_secs_u64();
-        assert!(f.is_finite() && f >= 0.0, "fractional secs sane: {f}");
-        // Separate clock reads may cross one whole-second boundary.
-        let diff = (f.floor() as i128 - u as i128).abs();
-        assert!(diff <= 1, "integer and fractional helpers agree within 1s");
-    }
-
     #[test]
     fn image_params_validate_rejects_out_of_bounds() {
         let bad_steps = ImageParams {

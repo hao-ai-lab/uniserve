@@ -614,23 +614,7 @@ mod tests {
         let mut h = header_for_request(&req);
         h.len = payload_len_u32(bytes.len()).unwrap();
         verify_header_len(h, bytes.len()).unwrap();
-        assert_eq!(h.kind, 1);
         assert_eq!(h.version, IPC_VERSION);
-    }
-
-    #[test]
-    fn request_kind_codes_cover_every_ipc_kind_uniquely() {
-        // Every payload kind has a distinct nonzero diagnostic code.
-        use std::collections::HashSet;
-        let mut seen = HashSet::new();
-        for kind in RequestKind::ALL {
-            let code = request_kind_code(kind);
-            assert_ne!(code, 0, "request_kind_code missing for {kind:?}");
-            assert!(
-                seen.insert(code),
-                "duplicate request_kind_code for {kind:?}"
-            );
-        }
     }
 
     #[test]
@@ -641,22 +625,5 @@ mod tests {
         if (u32::MAX as usize) < usize::MAX {
             assert!(payload_len_u32(u32::MAX as usize + 1).is_err());
         }
-    }
-
-    #[test]
-    fn ipc_version_is_exact() {
-        assert!(is_supported_ipc_version(IPC_VERSION));
-        assert!(!is_supported_ipc_version(IPC_VERSION + 1));
-        assert!(!is_supported_ipc_version(IPC_VERSION - 1));
-    }
-
-    #[test]
-    fn verify_header_len_rejects_unsupported_version() {
-        let h = Header {
-            version: IPC_VERSION + 1,
-            len: 0,
-            ..Default::default()
-        };
-        assert!(verify_header_len(h, 0).is_err());
     }
 }

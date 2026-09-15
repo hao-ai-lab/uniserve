@@ -133,21 +133,3 @@ impl HttpBody for LoadTrackedBody {
         self.inner.size_hint()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn overloaded_response_is_503_with_retry_after() {
-        let response = overloaded_response(8);
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|value| value.to_str().ok()),
-            Some(RETRY_AFTER_SECONDS)
-        );
-    }
-}

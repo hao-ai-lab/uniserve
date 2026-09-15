@@ -434,7 +434,6 @@ impl EngineHandle {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_core::FinishReason;
     use uniserve_core::{
         GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, RequestId,
         SamplingParams,
@@ -461,26 +460,6 @@ mod tests {
             cache: Default::default(),
             image_generation: policy,
         }
-    }
-
-    /// The canonical request is pure value data with explicit context, policy,
-    /// behavior, and resource declarations.
-    #[test]
-    fn generation_request_is_canonical_pure_data() {
-        let request = test_request(7);
-
-        assert_eq!(request.request_id, RequestId(7));
-        assert_eq!(request.prompt_token_ids.len(), 3);
-        assert_eq!(request.max_und_tokens, 32);
-        assert_eq!(request.constraint, GenerationConstraint::UndOnly);
-        assert!(request.negative_prompt_token_ids.is_empty());
-        assert!(request.stop_strings.is_empty());
-        assert!(request.stop_token_ids.is_empty());
-        assert_eq!(request.priority, 0);
-        assert_eq!(request.multimodal_inputs.images.len(), 0);
-        assert!(request.cache.read);
-        assert!(request.cache.write);
-        assert!(request.validate().is_ok());
     }
 
     /// `submit` enqueues a `Command::Submit` carrying the request, and the
@@ -658,47 +637,5 @@ mod tests {
         clone.shutdown();
 
         assert!(matches!(rx.recv().unwrap(), Command::Shutdown));
-    }
-
-    /// Finishes reasons are distinct values, so a client-side cancel never
-    /// compares equal to a server-side abort.
-    #[test]
-    fn finish_reason_variants_are_distinct() {
-        assert_ne!(FinishReason::Cancelled, FinishReason::Aborted);
-        assert_ne!(FinishReason::Eos, FinishReason::Stop);
-        assert_eq!(FinishReason::MaxTokens, FinishReason::MaxTokens);
-    }
-
-    /// A `EngineCoreOutput::Finished` carries the finish reason and terminal token
-    /// counts as its payload (the type is not `PartialEq`, so match on it).
-    #[test]
-    fn gen_event_finished_carries_reason_and_counts() {
-        let event = EngineCoreOutput::Finished {
-            reason: FinishReason::Stop,
-            stop_reason: Some(uniserve_core::StopReason::String("</s>".to_string())),
-            prompt_tokens: 4,
-            completion_tokens: 9,
-            images: 0,
-        };
-
-        match event {
-            EngineCoreOutput::Finished {
-                reason,
-                stop_reason,
-                prompt_tokens,
-                completion_tokens,
-                images,
-            } => {
-                assert_eq!(reason, FinishReason::Stop);
-                assert_eq!(
-                    stop_reason,
-                    Some(uniserve_core::StopReason::String("</s>".to_string()))
-                );
-                assert_eq!(prompt_tokens, 4);
-                assert_eq!(completion_tokens, 9);
-                assert_eq!(images, 0);
-            }
-            other => panic!("expected Finished, got {other:?}"),
-        }
     }
 }

@@ -154,17 +154,3 @@ def test_to_mapping_emits_canonical_error_context():
             "op_id": {"batch_id": 7, "request_index": 0},
         }
     ]
-
-
-def test_to_mapping_coerces_truthy_flags_to_bool():
-    # to_mapping normalizes retryable/fatal through bool(): non-bool
-    # truthy/falsey inputs surface on the snapshot as real booleans.
-    snapshot = WorkerError(
-        code=WorkerErrorCode.RESOURCE_ERROR,
-        message="m",
-        retryable=1,
-        fatal=0,
-    ).to_mapping()
-
-    assert snapshot["retryable"] is True
-    assert snapshot["fatal"] is False

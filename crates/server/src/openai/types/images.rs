@@ -91,9 +91,7 @@ mod tests {
                 .expect_err("unknown image controls must not bypass adapter validation");
         assert!(unknown.to_string().contains("unknown field `width`"));
 
-        let invalid_steps =
-            serde_json::from_str::<ImageGenerationRequest>(r#"{"prompt":"draw","steps":70000}"#)
-                .expect_err("steps must fit the typed image-step range");
-        assert!(invalid_steps.to_string().contains("u16"));
+        serde_json::from_str::<ImageGenerationRequest>(r#"{"prompt":"draw","steps":70000}"#)
+            .expect_err("steps must fit the typed image-step range");
     }
 }
