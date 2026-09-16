@@ -64,8 +64,6 @@ def test_ordered_bindings_generate_outputs(
         str(require_uniserve_binary()),
         "serve",
         checkpoint,
-        "--model-description",
-        description,
         "--served-model-name",
         description,
         "--host",

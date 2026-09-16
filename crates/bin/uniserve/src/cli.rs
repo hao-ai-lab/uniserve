@@ -19,7 +19,7 @@ use uniserve_engine::{
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
-    ModelDescription, SchedulingPolicy,
+    SchedulingPolicy,
 };
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
@@ -54,21 +54,6 @@ pub(crate) enum Command {
     /// Run the UniServe OpenAI server: the Rust engine and scheduler run
     /// in-process, driving a forward-only worker.
     Serve(Box<ServeArgs>),
-    /// Inspect checkpoint access and the installed GPU serving prerequisites.
-    Doctor(DoctorArgs),
-}
-
-/// Read-only serving prerequisite inspection.
-#[derive(Debug, Args)]
-pub(crate) struct DoctorArgs {
-    #[arg(long)]
-    pub model: String,
-    #[arg(long, default_value_t = 1)]
-    pub worker_ranks: usize,
-    #[arg(long, default_value_os_t = default_worker_python())]
-    pub worker_python: std::path::PathBuf,
-    #[arg(long)]
-    pub revision: Option<String>,
 }
 
 /// Scheduler ordering policy accepted by the command line.
@@ -113,7 +98,7 @@ pub(crate) struct ServeArgs {
 impl ServeArgs {
     /// Builds the UniServe-native server config, binding the HTTP listener
     /// directly.
-    pub(crate) fn to_uniserve_config(&self) -> Config {
+    pub(crate) fn to_uniserve_config(&self, is_media: bool) -> Config {
         let listener_mode = match &self.uds {
             Some(path) => HttpListenerMode::BindUnix { path: path.clone() },
             None => HttpListenerMode::BindTcp {
@@ -121,7 +106,7 @@ impl ServeArgs {
                 port: self.port,
             },
         };
-        self.runtime.clone().into_config(listener_mode)
+        self.runtime.clone().into_config(listener_mode, is_media)
     }
 }
 
@@ -133,15 +118,6 @@ pub(crate) struct SharedRuntimeArgs {
     /// public model ID.
     #[arg(value_name = "MODEL")]
     pub model: String,
-
-    /// Closed model description that owns configured preprocessing and output behavior.
-    #[arg(long)]
-    pub model_description: Option<ModelDescription>,
-    #[arg(skip)]
-    pub model_contract: Option<Value>,
-    /// Immutable H3 checkpoint revision; the known FastH3 release is pinned by default.
-    #[arg(long)]
-    pub revision: Option<String>,
 
     /// Override the maximum model context length. When unset, the model's real
     /// context length (`max_position_embeddings`) is used.
@@ -274,8 +250,10 @@ impl SharedRuntimeArgs {
     }
 
     /// Builds the UniServe Rust-engine settings from these CLI arguments.
-    pub(crate) fn engine_settings(&self) -> EngineSettings {
-        let is_media = self.model_description == Some(ModelDescription::MiniMaxH3);
+    ///
+    /// `is_media` comes from the checkpoint itself; video deployments size their
+    /// pipeline, batch and IPC slots differently from token deployments.
+    pub(crate) fn engine_settings(&self, is_media: bool) -> EngineSettings {
         let mut worker_process = self.worker_process.to_args();
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
@@ -332,18 +310,14 @@ impl SharedRuntimeArgs {
     }
 
     /// Builds the OpenAI-server config for the in-process UniServe engine.
-    fn into_config(self, listener_mode: HttpListenerMode) -> Config {
-        let engine = self.engine_settings();
+    fn into_config(self, listener_mode: HttpListenerMode, is_media: bool) -> Config {
+        let engine = self.engine_settings(is_media);
         let model = self.resolved_model();
         let api_key = self.configured_api_key();
         let request_timeout = self.request_timeout.map(Duration::from_secs);
         Config {
             engine,
             model,
-            model_description: self
-                .model_description
-                .expect("model description resolved before configuration"),
-            model_contract: self.model_contract,
             served_model_name: self.served_model_name,
             listener_mode,
             chat_template: self.chat_template,
@@ -528,8 +502,6 @@ mod tests {
             "uniserve",
             "serve",
             "model",
-            "--model-description",
-            "qwen3",
             "--page-size",
             "0",
         ]);
@@ -542,8 +514,6 @@ mod tests {
             "uniserve",
             "serve",
             "model",
-            "--model-description",
-            "qwen3",
             "--load-threads",
             "0",
         ]);
@@ -556,8 +526,6 @@ mod tests {
             "uniserve",
             "serve",
             "model",
-            "--model-description",
-            "qwen3",
             "--device",
             "cpu",
             "--worker-ranks",
@@ -615,15 +583,11 @@ mod tests {
             "uniserve",
             "serve",
             "model",
-            "--model-description",
-            "minimax-h3",
             "--quantization-config",
             r#"{"mode":"performance","components":{"transformer.attention":"fp8","transformer.mlp":"nvfp4","text_encoder":"bf16","video_vae":"bf16"}}"#,
         ])
         .expect("MiniMax H3 quantization config");
-        let Command::Serve(args) = parsed.command else {
-            panic!("expected serve command");
-        };
+        let Command::Serve(args) = parsed.command;
         let worker = args.runtime.worker_process.to_args();
         assert_eq!(worker.quantization_config["mode"], "performance");
         assert_eq!(
@@ -634,17 +598,9 @@ mod tests {
 
     #[test]
     fn serve_leaves_quantization_policy_to_model_by_default() {
-        let parsed = <Cli as clap::Parser>::try_parse_from([
-            "uniserve",
-            "serve",
-            "model",
-            "--model-description",
-            "minimax-h3",
-        ])
-        .expect("MiniMax H3 default precision policy");
-        let Command::Serve(args) = parsed.command else {
-            panic!("expected serve command");
-        };
+        let parsed = <Cli as clap::Parser>::try_parse_from(["uniserve", "serve", "model"])
+            .expect("MiniMax H3 default precision policy");
+        let Command::Serve(args) = parsed.command;
         let worker = args.runtime.worker_process.to_args();
         assert_eq!(worker.quantization_config, serde_json::json!({}));
     }
@@ -655,8 +611,6 @@ mod tests {
             "uniserve",
             "serve",
             "model",
-            "--model-description",
-            "minimax-h3",
             "--quantization-config",
             r#"["fp8"]"#,
         ])

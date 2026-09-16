@@ -55,6 +55,17 @@ impl ModelDescription {
             Self::MiniMaxH3 => "minimax_h3",
         }
     }
+
+    /// Resolves the served profile from a checkpoint's `model_type` field.
+    ///
+    /// The repository configuration is the only source of model identity, so a
+    /// checkpoint UniServe does not implement is rejected here rather than
+    /// mismatching a separately supplied name.
+    pub fn from_model_type(model_type: &str) -> Option<Self> {
+        [Self::Qwen3, Self::SenseNova, Self::Bagel, Self::MiniMaxH3]
+            .into_iter()
+            .find(|description| description.model_type() == model_type)
+    }
 }
 
 impl std::str::FromStr for ModelDescription {
@@ -132,7 +143,6 @@ pub struct ModelConfig {
 impl ModelConfig {
     /// Resolves vocabulary, checkpoint defaults, and model-specific settings once.
     pub fn from_files(
-        description: ModelDescription,
         model_id: &str,
         files: &ResolvedModelFiles,
         max_model_tokens: Option<u32>,
@@ -144,12 +154,12 @@ impl ModelConfig {
             .ok_or(assets::Error::MissingField {
                 field: "model_type",
             })?;
-        if actual_model_type != description.model_type() {
-            return Err(assets::Error::ModelTypeMismatch {
-                expected: description.model_type(),
-                actual: actual_model_type.to_owned(),
-            });
-        }
+        let description =
+            ModelDescription::from_model_type(actual_model_type).ok_or_else(|| {
+                assets::Error::UnsupportedModelType {
+                    actual: actual_model_type.to_owned(),
+                }
+            })?;
         let generation_config = load_generation_config(files.generation_config_path.as_deref())?;
         let tokenizer_config = load_tokenizer_config(files.tokenizer_config_path.as_deref())?;
         let (primary_eos_token_id, eos_token_ids) =
@@ -306,8 +316,7 @@ mod tests {
             let (_directory, files) = configured_files(model_type);
             let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
             let profile =
-                ModelConfig::from_files(description, description.id(), &files, None, &tokenizer)
-                    .unwrap();
+                ModelConfig::from_files(description.id(), &files, None, &tokenizer).unwrap();
             assert_eq!(profile.description(), description);
             assert_eq!(profile.max_model_tokens, Some(4096));
             assert_eq!(profile.sampling_defaults.max_output_tokens, Some(512));
@@ -350,20 +359,14 @@ mod tests {
     }
 
     #[test]
-    fn model_description_must_match_repository_model_type() {
-        let (_directory, files) = configured_files("bagel");
+    fn unsupported_repository_model_type_is_rejected() {
+        let (_directory, files) = configured_files("llama");
         let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
-        let error = ModelConfig::from_files(
-            ModelDescription::SenseNova,
-            "configured-model",
-            &files,
-            None,
-            &tokenizer,
-        )
-        .unwrap_err();
+        let error =
+            ModelConfig::from_files("configured-model", &files, None, &tokenizer).unwrap_err();
         assert!(matches!(
             error,
-            crate::profile::assets::Error::ModelTypeMismatch { expected: "neo_chat", actual } if actual == "bagel"
+            crate::profile::assets::Error::UnsupportedModelType { actual } if actual == "llama"
         ));
     }
 
@@ -371,14 +374,7 @@ mod tests {
     fn omni_descriptions_define_prompt_framing_and_image_geometry() {
         let (_directory, files) = configured_files("neo_chat");
         let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
-        let config = ModelConfig::from_files(
-            ModelDescription::SenseNova,
-            "sensenova",
-            &files,
-            None,
-            &tokenizer,
-        )
-        .unwrap();
+        let config = ModelConfig::from_files("sensenova", &files, None, &tokenizer).unwrap();
         let ModelParameters::SenseNova(profile) = config.parameters else {
             unreachable!()
         };
@@ -421,9 +417,7 @@ mod tests {
 
         let (_directory, files) = configured_files("bagel");
         let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
-        let config =
-            ModelConfig::from_files(ModelDescription::Bagel, "bagel", &files, None, &tokenizer)
-                .unwrap();
+        let config = ModelConfig::from_files("bagel", &files, None, &tokenizer).unwrap();
         let ModelParameters::Bagel(profile) = config.parameters else {
             unreachable!()
         };

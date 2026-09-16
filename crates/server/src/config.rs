@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::profile::ModelDescription;
 use crate::serving::chat::ChatTemplateContentFormatOption;
 use anyhow::Result;
 use serde::Serialize;
@@ -112,10 +111,7 @@ pub struct Config {
     pub engine: EngineSettings,
     /// Backend model identifier used for engine loading.
     pub model: String,
-    /// Closed description that owns model-specific serving behavior.
-    pub model_description: ModelDescription,
     /// Validated checkpoint variant metadata resolved before worker loading.
-    pub model_contract: Option<Value>,
     /// Single model name exposed to clients via the OpenAI API. When absent,
     /// the resolved model identifier is used.
     pub served_model_name: Option<String>,
@@ -157,8 +153,6 @@ impl Default for Config {
         Self {
             engine: EngineSettings::default(),
             model: String::new(),
-            model_description: ModelDescription::Qwen3,
-            model_contract: None,
             served_model_name: None,
             listener_mode: HttpListenerMode::BindTcp {
                 host: "127.0.0.1".to_string(),

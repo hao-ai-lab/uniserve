@@ -8,11 +8,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::EngineSettings;
-use crate::profile::assets::{ResolvedModelFiles, resolve_model_file};
+use crate::profile::assets::{ResolvedModelFiles, is_media_checkpoint, resolve_model_file};
 use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
-use crate::profile::{ModelConfig, ModelDescription, ModelParameters, SamplingDefaults};
+use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use thiserror::Error;
 use uniserve_core::{
     CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
@@ -214,24 +214,21 @@ impl ModelConfig {
             .served_model_name
             .clone()
             .unwrap_or_else(|| config.model.clone());
-        if config.model_description == ModelDescription::MiniMaxH3 {
+        // A video checkpoint declares itself with its inference manifest rather
+        // than a root `config.json`, so the manifest selects this profile before
+        // any diffusion asset is resolved. The denoise-step count is a property
+        // of the loaded numerical plan and is bound from the worker handshake
+        // once the engine reports it.
+        if is_media_checkpoint(&config.model).await {
             let tokenizer_path =
                 resolve_model_file(&config.model, "tokenizer/tokenizer.json").await?;
             let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&tokenizer_path)?);
-            let num_inference_steps = config.model_contract.as_ref()
-                .and_then(|contract| contract.get("denoise_steps"))
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|steps| u32::try_from(steps).ok())
-                .filter(|steps| *steps > 0)
-                .ok_or_else(|| ModelResolutionError::MediaContract(
-                    "resolve the checkpoint with the installed worker before building the server".to_owned()
-                ))?;
             return Ok((
                 Self {
                     served_name,
                     parameters: ModelParameters::MiniMaxH3 {
                         max_video_seconds: config.engine.max_video_seconds,
-                        num_inference_steps,
+                        num_inference_steps: 0,
                     },
                     sampling_defaults: SamplingDefaults::default(),
                     max_model_tokens: Some(config.engine.max_model_len.unwrap_or(16_384)),
@@ -245,7 +242,6 @@ impl ModelConfig {
         let files = ResolvedModelFiles::new(&config.model).await?;
         let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path)?);
         let mut model = Self::from_files(
-            config.model_description,
             &served_name,
             &files,
             config.engine.max_model_len,
@@ -340,6 +336,7 @@ impl InputProcessor {
         limits: GenerationLimits,
         sampling_controls: Vec<ServedSamplingControl>,
         max_model_tokens: u32,
+        denoise_steps: u32,
         parse_reasoning: bool,
     ) -> Result<Self> {
         let needs = match &config.parameters {
@@ -358,8 +355,24 @@ impl InputProcessor {
                 ModelResolutionError::MissingTemplate,
             ));
         }
-        // Bind the actual worker ceiling once before sharing immutable model facts.
+        // Bind the actual worker ceilings once before sharing immutable model facts.
         config.max_model_tokens = Some(max_model_tokens);
+        if let ModelParameters::MiniMaxH3 {
+            num_inference_steps,
+            ..
+        } = &mut config.parameters
+        {
+            // The denoise-step count belongs to the loaded numerical plan, so
+            // the worker handshake is its only authority.
+            if denoise_steps == 0 {
+                return Err(ServeError::ModelResolution(
+                    ModelResolutionError::MediaContract(
+                        "worker advertised no denoise steps for a video checkpoint".to_owned(),
+                    ),
+                ));
+            }
+            *num_inference_steps = denoise_steps;
+        }
         Ok(Self {
             config,
             tokenizer,

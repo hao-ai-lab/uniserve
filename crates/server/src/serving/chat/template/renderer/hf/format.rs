@@ -349,4 +349,3 @@ pub(super) fn detect_chat_template_content_format(template: &str) -> ChatTemplat
         ChatTemplateContentFormat::String
     }
 }
-

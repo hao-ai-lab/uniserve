@@ -251,8 +251,6 @@ def test_component_bindings_release_cancelled_requests(
         str(require_uniserve_binary()),
         "serve",
         model_value,
-        "--model-description",
-        "minimax-h3",
         "--served-model-name",
         "MiniMax-H3",
         "--host",

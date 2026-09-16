@@ -242,8 +242,6 @@ def configured_sim_server(
         str(binary),
         "serve",
         str(model),
-        "--model-description",
-        description,
         "--served-model-name",
         served_model_name,
         "--host",

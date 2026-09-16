@@ -219,11 +219,6 @@ pub(crate) async fn videos_create(
         id: id.clone(),
         object: "video",
         model: state.served_model_name().to_owned(),
-        revision: state
-            .model_contract
-            .as_ref()
-            .and_then(|value| value["revision"].as_str())
-            .map(str::to_owned),
         created_at: timestamp(),
         completed_at: None,
         expires_at: None,
@@ -409,11 +404,7 @@ fn media_body<M: AsRef<[u8]> + Send + Sync + 'static>(media: Arc<M>) -> Body {
 }
 
 pub(crate) async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
-    let mut value = state
-        .model_contract
-        .clone()
-        .unwrap_or_else(|| serde_json::json!({}));
-    value["model"] = serde_json::json!(state.served_model_name());
+    let mut value = serde_json::json!({"model": state.served_model_name()});
     value["video"] = state.runtime().model().video_capabilities();
     value["video_jobs"] = serde_json::json!({
         "max_jobs": crate::video_jobs::MAX_VIDEO_JOBS,

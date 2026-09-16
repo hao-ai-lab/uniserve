@@ -37,11 +37,9 @@ pub enum Error {
         /// Required metadata field name.
         field: &'static str,
     },
-    #[error("model type mismatch: expected {expected}, found {actual}")]
-    /// Model metadata declares a different architecture family.
-    ModelTypeMismatch {
-        /// Architecture family required by the selected profile.
-        expected: &'static str,
+    #[error("unsupported model type {actual}")]
+    /// Model metadata declares an architecture family UniServe does not serve.
+    UnsupportedModelType {
         /// Architecture family declared by the model.
         actual: String,
     },

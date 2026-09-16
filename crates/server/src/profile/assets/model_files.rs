@@ -40,6 +40,29 @@ impl ResolvedModelFiles {
     }
 }
 
+/// Name of the manifest a video-generation checkpoint publishes at its root.
+///
+/// Media checkpoints ship component directories instead of a root
+/// `config.json`, so this manifest is what identifies the family before any
+/// component is resolved.
+const MEDIA_CHECKPOINT_MANIFEST: &str = "fastvideo_inference.json";
+
+/// Reports whether `model_id` resolves to a video-generation checkpoint.
+///
+/// A local directory is probed directly; a Hub repository is probed through the
+/// same cache-then-download path used for any other required file. A repository
+/// that does not publish the manifest is simply not a media checkpoint, so a
+/// resolution failure here is not an error.
+pub async fn is_media_checkpoint(model_id: &str) -> bool {
+    let local = Path::new(model_id);
+    if local.is_dir() {
+        return local.join(MEDIA_CHECKPOINT_MANIFEST).is_file();
+    }
+    resolve_model_file(model_id, MEDIA_CHECKPOINT_MANIFEST)
+        .await
+        .is_ok()
+}
+
 /// Resolves one required file from a local model directory, the local Hub cache, or the Hub.
 pub async fn resolve_model_file(model_id: &str, filename: &'static str) -> Result<PathBuf> {
     let local = Path::new(model_id);

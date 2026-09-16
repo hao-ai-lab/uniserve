@@ -35,7 +35,6 @@ Save the placement as `workers.json`:
 
 ```bash
 uniserve serve /workspace/models/Qwen3-32B \
-  --model-description qwen3 \
   --workers "$(cat workers.json)"
 ```
 

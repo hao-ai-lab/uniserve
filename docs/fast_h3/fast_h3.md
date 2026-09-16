@@ -46,8 +46,6 @@ Pass the model root containing `modular_model_index.json`, `fastvideo_inference.
 ## Start the server
 
 ```bash
-uniserve doctor --model "$H3_MODEL" --worker-ranks 4
-
 uniserve serve "$H3_MODEL" \
   --worker-ranks 4 \
   --served-model-name FastH3 \

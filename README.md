@@ -33,11 +33,10 @@ The `gpu` extra includes FlashAttention-4 and the native `uniserve-kernel` packa
 
 ## Start a server
 
-Every server invocation supplies the model path or Hugging Face repository and its closed description:
+Every server invocation supplies the model path or Hugging Face repository. The checkpoint's own configuration selects the serving profile:
 
 ```bash
 uniserve serve Qwen/Qwen3-32B \
-  --model-description qwen3 \
   --served-model-name Qwen3-32B
 ```
 
@@ -45,7 +44,6 @@ Local model directories use the same command shape:
 
 ```bash
 uniserve serve /models/SenseNova-U1 \
-  --model-description sensenova \
   --served-model-name SenseNova-U1
 ```
 
@@ -117,7 +115,6 @@ curl -s http://127.0.0.1:8000/v1/images/generations \
 | Option | Default | Purpose |
 | --- | --- | --- |
 | Positional `MODEL` | Required | Local model directory or Hugging Face repository |
-| `--model-description` | Required | `qwen3`, `sensenova`, `bagel`, or `minimax-h3` request processing and output behavior |
 | `--served-model-name` | Resolved model ID | Single public model ID |
 | `--host`, `--port` | `127.0.0.1`, `8000` | TCP listener |
 | `--uds` | Unset | Unix-domain listener instead of TCP |
@@ -139,7 +136,6 @@ For tensor-parallel execution, select one rank per participating GPU:
 
 ```bash
 uniserve serve /models/Qwen3-32B \
-  --model-description qwen3 \
   --served-model-name Qwen3-32B \
   --worker-ranks 4
 ```

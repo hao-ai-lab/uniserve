@@ -68,8 +68,6 @@ def production_server(
         str(binary),
         "serve",
         str(model),
-        "--model-description",
-        "sensenova",
         "--served-model-name",
         SERVED_MODEL,
         "--host",

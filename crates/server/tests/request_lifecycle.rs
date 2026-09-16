@@ -61,6 +61,7 @@ fn runtime() -> ServingRuntime {
         client.generation_limits(),
         ServedSamplingControl::ALL.to_vec(),
         4096,
+        0,
         false,
     )
     .unwrap();

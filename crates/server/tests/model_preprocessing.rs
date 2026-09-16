@@ -101,14 +101,8 @@ fn try_resolved_model(
         ChatTemplateContentFormatOption::String,
     )
     .unwrap();
-    let config = ModelConfig::from_files(
-        description,
-        description.id(),
-        &files,
-        None,
-        tokenizer.as_ref(),
-    )
-    .unwrap();
+    let config =
+        ModelConfig::from_files(description.id(), &files, None, tokenizer.as_ref()).unwrap();
     let model = InputProcessor::new(
         config,
         Arc::clone(&tokenizer),
@@ -116,6 +110,7 @@ fn try_resolved_model(
         limits,
         uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
         4096,
+        0,
         true,
     )?;
     Ok((directory, tokenizer, model))
@@ -345,6 +340,7 @@ fn worker_context_capacity_limits_preprocessed_requests() {
         runtime_limits(),
         uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
         8,
+        0,
         true,
     )
     .unwrap();
