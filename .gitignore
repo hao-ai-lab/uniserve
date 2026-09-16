@@ -10,7 +10,7 @@ wheels/
 uniserve_worker/_uniserve_ipc*.so
 
 # Virtual environments
-.venv
+.venv*
 
 # Python tooling
 .pytest_cache/

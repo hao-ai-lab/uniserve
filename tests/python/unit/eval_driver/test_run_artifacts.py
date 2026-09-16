@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from uniserve_eval.datasets.jsonl import JsonlDataset
 from uniserve_eval.load import WarmupFailure
 from uniserve_eval.pipeline.run import run_point
 from uniserve_eval.types import (
@@ -19,6 +20,36 @@ from uniserve_eval.types import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_jsonl_video_row_preserves_duration_override(tmp_path: Path) -> None:
+    dataset = tmp_path / "video.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "heldout-video",
+                "prompt": "A camera pans across a quiet harbor.",
+                "seed": 73001,
+                "seconds": 10.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    point = BenchmarkPoint(
+        name="video",
+        server="server",
+        task=TaskName.VIDEO,
+        model="model",
+        dataset="jsonl",
+        dataset_path=str(dataset),
+        metrics=(MetricDefinition(("videos_per_second",), "higher"),),
+        load=LoadConfig(num_prompts=1),
+    )
+
+    examples = JsonlDataset(point).load()
+
+    assert examples[0].seconds == 10.0
 
 
 class _EmptyStreamHandler(BaseHTTPRequestHandler):

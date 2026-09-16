@@ -21,6 +21,7 @@ _OPTIONAL = (
     "steps",
     "seed",
     "aspect_ratio",
+    "seconds",
 )
 
 
