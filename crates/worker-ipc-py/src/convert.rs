@@ -102,53 +102,60 @@ impl NativeRequestTypes {
     /// Imports worker model types and caches every constructor and enum member.
     fn build(py: Python<'_>) -> PyResult<Self> {
         // Resolve classes once so per-request conversion uses direct constructor
-        // calls without repeated module or attribute lookup.
-        let module = py.import("uniserve_worker.protocol.batch")?;
-        let class = |name: &str| -> PyResult<Py<PyAny>> { Ok(module.getattr(name)?.unbind()) };
+        // calls without repeated module or attribute lookup. Each name is
+        // imported from the protocol module that owns it at the current Python
+        // package structure.
+        let batch = py.import("uniserve_worker.protocol.batch")?;
+        let operation = py.import("uniserve_worker.protocol.operation")?;
+        let identity = py.import("uniserve_worker.protocol.identity")?;
+        let tensor = py.import("uniserve_worker.protocol.tensor")?;
+        let class = |module: &Bound<'_, PyModule>, name: &str| -> PyResult<Py<PyAny>> {
+            Ok(module.getattr(name)?.unbind())
+        };
 
         Ok(Self {
-            operation: class("ScheduledRequest")?,
-            computation_id: class("ComputationId")?,
-            request_key: class("RequestKey")?,
-            tensor_ref: class("TensorRef")?,
-            buffer_id: class("BufferId")?,
-            shape_bound: class("ShapeBound")?,
-            static_dim: class("StaticDim")?,
-            device_dim: class("DeviceDim")?,
-            bounds: class("Bounds")?,
-            rng: class("Rng")?,
-            sampling_state: class("SamplingState")?,
-            block_table: class("BlockTable")?,
-            cache_page_allocation: class("CachePageAllocation")?,
-            start: class("Start")?,
-            finish: class("Finish")?,
-            free: class("Free")?,
-            native_run: class("native_run")?,
+            operation: class(&operation, "ScheduledRequest")?,
+            computation_id: class(&identity, "ComputationId")?,
+            request_key: class(&identity, "RequestKey")?,
+            tensor_ref: class(&tensor, "TensorRef")?,
+            buffer_id: class(&identity, "BufferId")?,
+            shape_bound: class(&tensor, "ShapeBound")?,
+            static_dim: class(&tensor, "StaticDim")?,
+            device_dim: class(&tensor, "DeviceDim")?,
+            bounds: class(&operation, "Bounds")?,
+            rng: class(&operation, "Rng")?,
+            sampling_state: class(&operation, "SamplingState")?,
+            block_table: class(&batch, "BlockTable")?,
+            cache_page_allocation: class(&batch, "CachePageAllocation")?,
+            start: class(&batch, "Start")?,
+            finish: class(&batch, "Finish")?,
+            free: class(&batch, "Free")?,
+            native_run: class(&batch, "native_run")?,
 
             // Enum members follow the stable Rust discriminant order used by
             // the indexed accessors below.
             dtypes: enum_members(
-                &module,
+                &tensor,
                 "DType",
                 ["u8", "i32", "i64", "f16", "bf16", "f32", "i16"],
             )?,
             draw_layouts: enum_members(
-                &module,
+                &operation,
                 "DrawLayout",
                 ["target_sampling", "speculative_proposal", "flow_noise"],
             )?,
             forward_modes: enum_members(
-                &module,
+                &operation,
                 "ForwardMode",
                 ForwardMode::ALL.map(ForwardMode::as_str),
             )?,
             pipeline_stages: enum_members(
-                &module,
+                &operation,
                 "PipelineStage",
                 PipelineStage::ALL.map(PipelineStage::as_str),
             )?,
             transfer_modes: enum_members(
-                &module,
+                &operation,
                 "TransferMode",
                 TransferMode::ALL.map(TransferMode::as_str),
             )?,

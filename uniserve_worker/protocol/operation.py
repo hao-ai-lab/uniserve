@@ -801,7 +801,7 @@ class ScheduledRequest:
         if bounds is None:
             bounds = Bounds.from_mapping(get("bounds"), f"{where}.bounds")
 
-        inputs = tensor.tensor._fast_tensor_refs(get("inputs", ()))
+        inputs = tensor._fast_tensor_refs(get("inputs", ()))
         if inputs is None:
             inputs = tuple(
                 tensor.TensorRef.from_mapping(item, f"{where}.inputs[{index}]")
@@ -809,7 +809,7 @@ class ScheduledRequest:
                     _seq(get("inputs", ()), f"{where}.inputs")
                 )
             )
-        outputs = tensor.tensor._fast_tensor_refs(get("outputs", ()))
+        outputs = tensor._fast_tensor_refs(get("outputs", ()))
         if outputs is None:
             outputs = tuple(
                 tensor.TensorRef.from_mapping(item, f"{where}.outputs[{index}]")
