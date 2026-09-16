@@ -43,7 +43,9 @@ artifacts/
 
 target/
 refs/
-specs/*
+# Specifications are versioned; the evidence they cite is not. Traces,
+# profiles, checkpoints and benchmark bundles belong in an artifact store.
+specs/artifacts/
 
 AGENTS.md
 
