@@ -31,7 +31,6 @@ from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
 from uniserve.model import Logits
 from uniserve_models.stub import Model
-from uniserve_models.stub import entry_paths as entry_paths
 from uniserve_models.stub import entry_points as entry_points
 from uniserve_worker.config import LaneConfig, WorkerConfig
 from uniserve_worker.foundation.errors import WorkerError

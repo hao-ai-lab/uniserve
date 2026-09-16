@@ -9,6 +9,7 @@ from torch import nn
 
 from uniserve.model import (
     CausalLM,
+    ComponentEntry,
     EntryPoint,
     ImageDecoder,
     PatchEncoder,
@@ -69,17 +70,17 @@ class Model(nn.Module):
 def entry_points(config: Config):
     return MappingProxyType(
         {
-            "": (
-                EntryPoint("text.forward", groups=("tp", "sp", "pp")),
-                EntryPoint("text.embed_input_ids", "first", ("tp",)),
-                EntryPoint("text.compute_logits", "last", ("tp",)),
-                EntryPoint("denoiser.forward", groups=("tp", "sp", "pp")),
-                EntryPoint("vision_encoder.encode"),
-                EntryPoint("latent_encoder.encode"),
-                EntryPoint("image_decoder.decode"),
+            "model": ComponentEntry(
+                "",
+                (
+                    EntryPoint("text.forward", groups=("tp", "sp", "pp")),
+                    EntryPoint("text.embed_input_ids", "first", ("tp",)),
+                    EntryPoint("text.compute_logits", "last", ("tp",)),
+                    EntryPoint("denoiser.forward", groups=("tp", "sp", "pp")),
+                    EntryPoint("vision_encoder.encode"),
+                    EntryPoint("latent_encoder.encode"),
+                    EntryPoint("image_decoder.decode"),
+                ),
             ),
         }
     )
-
-
-entry_paths = MappingProxyType({"model": "text.forward"})

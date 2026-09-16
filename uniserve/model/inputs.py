@@ -42,6 +42,28 @@ class EntryPoint:
 
 
 @dataclass(frozen=True, slots=True)
+class ComponentEntry:
+    """One IPC-addressable component and the numerical methods it exports.
+
+    ``component`` is the owning module path relative to the model root; the
+    empty string names the model itself. ``points`` are the methods serving
+    ranks may invoke, with nested methods written relative to ``component``.
+
+    A model declares one of these per IPC entry name, so the entry name, its
+    owning module and its callable methods are stated once together.
+    """
+
+    component: str
+    points: tuple[EntryPoint, ...]
+
+    def __post_init__(self):
+        if not self.points:
+            raise ValueError(
+                "a component entry must export at least one method"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class EmbeddingReplacement:
     """Precomputed embeddings spliced in place of token embeddings.
 

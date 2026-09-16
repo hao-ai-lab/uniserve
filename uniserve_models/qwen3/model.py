@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from uniserve.model import CausalLM, EntryPoint
+from uniserve.model import CausalLM, ComponentEntry, EntryPoint
 from uniserve.nn.linear import VocabParallelHead
 
 from .config import Config
@@ -28,17 +28,19 @@ class Model(CausalLM):
             self.lm_head.weight = self.backbone.embedding.weight
 
 
-entry_paths = MappingProxyType({"model": "forward"})
-
-
-def entry_points(config: Config) -> Mapping[str, tuple[EntryPoint, ...]]:
+def entry_points(config: Config) -> Mapping[str, ComponentEntry]:
     """Declare the numerical methods serving ranks may invoke on this model."""
     return MappingProxyType(
         {
-            "": (
-                EntryPoint("forward", groups=("tp", "sp", "pp")),
-                EntryPoint("embed_input_ids", stage="first", groups=("tp",)),
-                EntryPoint("compute_logits", stage="last", groups=("tp",)),
-            )
+            "model": ComponentEntry(
+                "",
+                (
+                    EntryPoint("forward", groups=("tp", "sp", "pp")),
+                    EntryPoint(
+                        "embed_input_ids", stage="first", groups=("tp",)
+                    ),
+                    EntryPoint("compute_logits", stage="last", groups=("tp",)),
+                ),
+            ),
         }
     )

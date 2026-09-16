@@ -1,7 +1,7 @@
 """Qwen3 numerical models and checkpoint definitions."""
 
 from .config import Config, config_sources, read_config
-from .model import Model, entry_paths, entry_points
+from .model import Model, entry_points
 from .transformer import Attention, MoE, Transformer, TransformerLayer
 from .weights import checkpoint_mappings, checkpoint_sources, precisions
 
@@ -16,7 +16,6 @@ __all__ = [
     "read_config",
     "Model",
     "entry_points",
-    "entry_paths",
     "Attention",
     "MoE",
     "Transformer",

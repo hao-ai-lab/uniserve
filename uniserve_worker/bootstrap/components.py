@@ -12,9 +12,9 @@ from uniserve.distributed import DeviceMesh
 from uniserve.model import (
     AudioDecoder,
     CausalLM,
+    ComponentEntry,
     Denoiser,
     Encoder,
-    EntryPoint,
     ImageDecoder,
     PatchEncoder,
     TextEncoder,
@@ -80,33 +80,31 @@ def call_operations(calls: Iterable[Call]) -> frozenset[Computation]:
 def describe_components(
     model: nn.Module,
     *,
-    entries: Mapping[str, tuple[EntryPoint, ...]] | None = None,
-    paths: Mapping[str, str] | None = None,
+    entries: Mapping[str, ComponentEntry] | None = None,
 ) -> dict[str, tuple[Call, ...]]:
-    """Bind exported methods to their explicitly declared component owner.
+    """Bind each IPC entry's exported methods to their resident modules.
 
-    EntryPoint methods are relative to the component path, including nested
-    methods such as ``conditioner.encode``. IPC names select one exported
-    method and thereby name its whole component. Numerical sharing does not
-    imply placement ownership.
+    A model declares one `ComponentEntry` per IPC entry name, naming its owning
+    component and the methods serving ranks may invoke. EntryPoint methods are
+    relative to that component, including nested methods such as
+    ``conditioner.encode``. Numerical sharing does not imply placement
+    ownership, so one component belongs to exactly one entry.
     """
-    if entries is None or paths is None:
-        package = import_module(type(model).__module__)
-        entries = (
-            package.entry_points(model.config) if entries is None else entries
+    if entries is None:
+        entries = import_module(type(model).__module__).entry_points(
+            model.config
         )
-        paths = package.entry_paths if paths is None else paths
 
     owners: dict[tuple[str, str], str] = {}
-    calls: dict[str, list[Call]] = {path: [] for path in entries}
-    for component, points in entries.items():
-        for point in points:
+    calls: dict[str, list[Call]] = {name: [] for name in entries}
+    for name, entry in entries.items():
+        for point in entry.points:
             nested, _, method = point.method.rpartition(".")
-            path = ".".join(part for part in (component, nested) if part)
+            path = ".".join(part for part in (entry.component, nested) if part)
             key = (path, method)
             if key in owners:
                 raise unsupported_setup(f"model repeats numerical method {key}")
-            owners[key] = component
+            owners[key] = name
             try:
                 module = model.get_submodule(path)
             except AttributeError as error:
@@ -150,32 +148,9 @@ def describe_components(
                 raise unsupported_setup(
                     f"worker cannot execute capability {path}.{method}"
                 )
-            calls[component].append(call)
+            calls[name].append(call)
 
-    anchors = {}
-    for name, path in paths.items():
-        owner, _, method = path.rpartition(".")
-        key = (owner, method)
-        if key not in owners:
-            raise unsupported_setup(
-                f"IPC entry {name!r} references undeclared method {path!r}"
-            )
-        component = owners[key]
-        if component in anchors:
-            raise unsupported_setup(
-                f"component {component!r} belongs to multiple IPC entries"
-            )
-        anchors[component] = name
-
-    missing = entries.keys() - anchors.keys()
-    if missing:
-        raise unsupported_setup(
-            f"components {sorted(missing)} require an explicit IPC entry"
-        )
-
-    return {
-        name: tuple(calls[component]) for component, name in anchors.items()
-    }
+    return {name: tuple(items) for name, items in calls.items()}
 
 
 def supported_operations(model: nn.Module) -> frozenset[Computation]:
@@ -237,11 +212,10 @@ def validate_components(
     model: nn.Module,
     components: Mapping[str, ComponentConfig],
     *,
-    entries: Mapping[str, tuple[EntryPoint, ...]] | None = None,
-    paths: Mapping[str, str] | None = None,
+    entries: Mapping[str, ComponentEntry] | None = None,
 ) -> dict[str, tuple[Call, ...]]:
     """Validate physical placement before loading weights or creating groups."""
-    declared = describe_components(model, entries=entries, paths=paths)
+    declared = describe_components(model, entries=entries)
     unknown = components.keys() - declared.keys()
     if unknown:
         raise unsupported_setup(
@@ -271,8 +245,7 @@ def bind_components(
     model: nn.Module,
     bindings: Mapping[str, ModelEntry],
     *,
-    entries: Mapping[str, tuple[EntryPoint, ...]] | None = None,
-    paths: Mapping[str, str] | None = None,
+    entries: Mapping[str, ComponentEntry] | None = None,
 ) -> None:
     """Borrow methods and communicator views for each local stage.
 
@@ -282,7 +255,6 @@ def bind_components(
         model,
         {name: binding.config for name, binding in bindings.items()},
         entries=entries,
-        paths=paths,
     )
     for name, binding in bindings.items():
         binding.calls = ()

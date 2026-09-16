@@ -441,6 +441,7 @@ class WorkerProcessArgs:
                 namespace, device=device, generation_device=generation_device
             ),
             load=_load_config(namespace),
+            use_stub_model=use_stub_model,
             components=parse_entries(
                 namespace.entries, int(namespace.world_size)
             ),

@@ -18,7 +18,7 @@ from uniserve import loading
 from uniserve.distributed import DeviceMesh
 from uniserve.loading import checkpoint
 from uniserve.loading import weights as weight_options
-from uniserve.model import EntryPoint
+from uniserve.model import ComponentEntry
 from uniserve.nn.attention import AttentionParallelConfig
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizationConfig, Quantizer
@@ -51,7 +51,7 @@ class Config(Generic[ConfigT, ModelT]):
     model_class: Callable[[ConfigT], ModelT]
     checkpoint: tuple[checkpoint.Source, ...]
     mapping: Callable[[ModelT], tuple[weight_options.ModuleMapping, ...]]
-    entry_points: Mapping[str, tuple[EntryPoint, ...]]
+    entry_points: Mapping[str, ComponentEntry]
     weights: weight_options.Config
     precisions: Mapping[str, weight_options.Config]
     checkpoint_format: str | None
@@ -62,15 +62,10 @@ class Config(Generic[ConfigT, ModelT]):
     modules: frozenset[str] | None
 
     def __post_init__(self):
+        # ``ComponentEntry`` is already immutable, so only the mapping needs
+        # freezing here.
         object.__setattr__(
-            self,
-            "entry_points",
-            MappingProxyType(
-                {
-                    path: tuple(entries)
-                    for path, entries in self.entry_points.items()
-                }
-            ),
+            self, "entry_points", MappingProxyType(dict(self.entry_points))
         )
         object.__setattr__(
             self, "precisions", MappingProxyType(dict(self.precisions))

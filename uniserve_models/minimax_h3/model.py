@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import MappingProxyType
 
 from torch import nn
 
-from uniserve.model import EntryPoint
+from uniserve.model import ComponentEntry, EntryPoint
 
 from .config import Config
 from .decoding import AudioDecoder, VideoDecoder
@@ -37,30 +38,34 @@ class Model(nn.Module):
 
 # IPC component names select methods on independently placeable numerical
 # modules.
-entry_paths = MappingProxyType(
-    {
-        "text_encoder": "text_encoder.encode",
-        "denoiser": "denoiser.forward",
-        "video_decoder": "video_decoder.decode",
-        "audio_decoder": "audio_decoder.decode",
-        "output": "video_postprocessor.forward",
-    }
-)
-
-
-def entry_points(config: Config):
-    """Declare each component's callable stages and their parallel groups."""
+def entry_points(config: Config) -> Mapping[str, ComponentEntry]:
+    """Declare each IPC entry's owning component and its callable stages."""
     return MappingProxyType(
         {
-            "text_encoder": (EntryPoint("encode", groups=("tp",)),),
-            "denoiser": (
-                EntryPoint("conditioner.encode", stage="first", groups=("tp",)),
-                EntryPoint(
-                    "forward", groups=("tp", "sp", "pp", "cp", "ulysses")
+            "text_encoder": ComponentEntry(
+                "text_encoder", (EntryPoint("encode", groups=("tp",)),)
+            ),
+            "denoiser": ComponentEntry(
+                "denoiser",
+                (
+                    EntryPoint(
+                        "conditioner.encode", stage="first", groups=("tp",)
+                    ),
+                    EntryPoint(
+                        "forward", groups=("tp", "sp", "pp", "cp", "ulysses")
+                    ),
                 ),
             ),
-            "video_decoder": (EntryPoint("decode"),),
-            "audio_decoder": (EntryPoint("decode"),),
-            "video_postprocessor": (EntryPoint("forward"),),
+            "video_decoder": ComponentEntry(
+                "video_decoder", (EntryPoint("decode"),)
+            ),
+            "audio_decoder": ComponentEntry(
+                "audio_decoder", (EntryPoint("decode"),)
+            ),
+            # The muxed media product is published under `output`, while its
+            # numerical owner is the postprocessor module.
+            "output": ComponentEntry(
+                "video_postprocessor", (EntryPoint("forward"),)
+            ),
         }
     )

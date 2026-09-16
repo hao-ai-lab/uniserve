@@ -13,7 +13,7 @@ from .decoding import AudioDecoder, VideoDecoder
 from .denoiser import Denoiser
 from .encoder import TextEncoder, TextEncoderConfig
 from .inputs import AttentionInput, DenoiserInput, DenoiserSize
-from .model import Model, entry_paths, entry_points
+from .model import Model, entry_points
 from .modelopt import calibrated_weight_config
 from .modulation import OutputNorm, TimestepEmbedding
 from .output import VideoPostprocessor
@@ -55,7 +55,6 @@ __all__ = [
     "checkpoint_sources",
     "checkpoint_mappings",
     "entry_points",
-    "entry_paths",
     "precisions",
     "weight_config",
     "calibrated_weight_config",

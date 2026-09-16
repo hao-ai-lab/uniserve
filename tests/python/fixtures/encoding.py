@@ -6,7 +6,13 @@ from types import MappingProxyType
 import torch
 from torch import nn
 
-from uniserve.model import Encoder, EntryPoint, TextEncoder, TransformerDecoder
+from uniserve.model import (
+    ComponentEntry,
+    Encoder,
+    EntryPoint,
+    TextEncoder,
+    TransformerDecoder,
+)
 from uniserve.nn.attention import Attention, SequenceLengths, VarlenInput
 
 
@@ -64,17 +70,12 @@ class Model(nn.Module):
 def entry_points(config):
     return MappingProxyType(
         {
-            "text_encoder": (EntryPoint("encode"),),
-            "conditioner": (EntryPoint("encode", stage="first"),),
-            "dense": (EntryPoint("encode"),),
+            "text_encoder": ComponentEntry(
+                "text_encoder", (EntryPoint("encode"),)
+            ),
+            "conditioner": ComponentEntry(
+                "conditioner", (EntryPoint("encode", stage="first"),)
+            ),
+            "dense": ComponentEntry("dense", (EntryPoint("encode"),)),
         }
     )
-
-
-entry_paths = MappingProxyType(
-    {
-        "text_encoder": "text_encoder.encode",
-        "conditioner": "conditioner.encode",
-        "dense": "dense.encode",
-    }
-)

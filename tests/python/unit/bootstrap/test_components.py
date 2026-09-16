@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from uniserve.model import Encoder, EntryPoint
+from uniserve.model import ComponentEntry, Encoder, EntryPoint
 from uniserve_worker.bootstrap.components import validate_components
 from uniserve_worker.bootstrap.config import ComponentConfig
 from uniserve_worker.foundation.errors import WorkerError
@@ -18,8 +18,9 @@ def test_binding_rejects_a_missing_numerical_method():
         validate_components(
             model,
             {"encoder": ComponentConfig((0,))},
-            entries={"encoder": (EntryPoint("encode"),)},
-            paths={"encoder": "encoder.encode"},
+            entries={
+                "encoder": ComponentEntry("encoder", (EntryPoint("encode"),))
+            },
         )
 
 
@@ -30,25 +31,25 @@ def test_source_validation_rejects_conflicting_stage_declarations():
             model,
             {"encoder": ComponentConfig((0,))},
             entries={
-                "": (EntryPoint("encode"), EntryPoint("encode", stage="last"))
+                "encoder": ComponentEntry(
+                    "",
+                    (
+                        EntryPoint("encode"),
+                        EntryPoint("encode", stage="last"),
+                    ),
+                )
             },
-            paths={"encoder": "encode"},
         )
 
 
-def test_component_requires_explicit_placement():
+def test_placement_rejects_an_undeclared_computation_entry():
     network = torch.nn.Linear(4, 4)
     model = torch.nn.Module()
     model.first = Encoder(network)
     model.second = Encoder(network)
-    model.conditioner = Encoder(network)
-    with pytest.raises(WorkerError, match="require an explicit IPC entry"):
+    with pytest.raises(WorkerError, match="unknown computation entries"):
         validate_components(
             model,
             {"first": ComponentConfig((0,)), "second": ComponentConfig((0,))},
-            entries={
-                path: (EntryPoint("encode"),)
-                for path in ("first", "second", "conditioner")
-            },
-            paths={"first": "first.encode", "second": "second.encode"},
+            entries={"first": ComponentEntry("first", (EntryPoint("encode"),))},
         )

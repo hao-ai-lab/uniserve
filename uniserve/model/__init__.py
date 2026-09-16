@@ -7,6 +7,7 @@ from .decoder import ImageDecoder
 from .denoiser import Denoiser, ImageDenoiser
 from .encoder import Encoder, PatchEncoder, TextEncoder
 from .inputs import (
+    ComponentEntry,
     DenoiserInput,
     EmbeddingReplacement,
     EntryPoint,
@@ -23,6 +24,7 @@ from .video import AudioDecoder, VideoDecoder, VideoPostprocessor
 __all__ = [
     "DenoiserInput",
     "EmbeddingReplacement",
+    "ComponentEntry",
     "EntryPoint",
     "LatentInput",
     "TextInput",

@@ -7,7 +7,6 @@ from .model import (
     STUB_EOS_TOKEN_ID,
     STUB_IMG_START_TOKEN_ID,
     Model,
-    entry_paths,
     entry_points,
 )
 from .processing import image_processor
@@ -21,5 +20,4 @@ __all__ = [
     "STUB_EOS_TOKEN_ID",
     "STUB_IMG_START_TOKEN_ID",
     "entry_points",
-    "entry_paths",
 ]

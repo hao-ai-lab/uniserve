@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from uniserve.media import image
-from uniserve.model import EntryPoint, VideoDecoder
+from uniserve.model import ComponentEntry, EntryPoint, VideoDecoder
 from uniserve.nn.vae import LatentDecoder
 from uniserve.tensors import OutputLayout
 
@@ -86,7 +86,10 @@ class DecodedModel(nn.Module):
 
 
 def entry_points(config):
-    return MappingProxyType({"reconstruction": (EntryPoint("decode"),)})
-
-
-entry_paths = MappingProxyType({"reconstruction": "reconstruction.decode"})
+    return MappingProxyType(
+        {
+            "reconstruction": ComponentEntry(
+                "reconstruction", (EntryPoint("decode"),)
+            )
+        }
+    )

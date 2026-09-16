@@ -10,6 +10,7 @@ from torch import nn
 from uniserve.distributed import Communicator
 from uniserve.model import (
     CausalLM,
+    ComponentEntry,
     EntryPoint,
     ImageDecoder,
     PatchEncoder,
@@ -199,17 +200,17 @@ def entry_points(config: Config):
     """Declare the numerical methods serving ranks may invoke on this model."""
     return MappingProxyType(
         {
-            "": (
-                EntryPoint("forward"),
-                EntryPoint("embed_input_ids"),
-                EntryPoint("compute_logits"),
-                EntryPoint("denoiser.forward"),
-                EntryPoint("vision_encoder.encode"),
-                EntryPoint("latent_encoder.encode"),
-                EntryPoint("image_decoder.decode"),
+            "model": ComponentEntry(
+                "",
+                (
+                    EntryPoint("forward"),
+                    EntryPoint("embed_input_ids"),
+                    EntryPoint("compute_logits"),
+                    EntryPoint("denoiser.forward"),
+                    EntryPoint("vision_encoder.encode"),
+                    EntryPoint("latent_encoder.encode"),
+                    EntryPoint("image_decoder.decode"),
+                ),
             ),
         }
     )
-
-
-entry_paths = MappingProxyType({"model": "forward"})
