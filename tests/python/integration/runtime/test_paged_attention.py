@@ -20,11 +20,9 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
     "causal", [(False,) * 3, (True,) * 3, (True, False, True)]
 )
 @pytest.mark.parametrize("decode", [False, True])
-@pytest.mark.parametrize(
-    "tensor_cores,fast_plan", [(False, False), (True, False), (True, True)]
-)
+@pytest.mark.parametrize("tensor_cores", [False, True])
 def test_paged_replay_retains_each_length_and_page_generation(
-    causal, decode, tensor_cores, fast_plan
+    causal, decode, tensor_cores
 ):
     generator = torch.Generator(device="cuda:0").manual_seed(618)
     device = torch.device("cuda", 0)
@@ -54,7 +52,6 @@ def test_paged_replay_retains_each_length_and_page_generation(
             decode_split_tile_size=1 if tensor_cores else None,
             prefill_split_tile_size=1,
             disable_split_kv=True,
-            fast_decode_plan=fast_plan,
         )
     )
     layouts = (

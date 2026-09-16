@@ -391,8 +391,6 @@ pub(crate) struct WorkerProcessOptions {
     pub flashinfer_prefill_split_tile_size: Option<u32>,
     #[arg(long, hide = true)]
     pub flashinfer_disable_split_kv: bool,
-    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
-    pub flashinfer_fast_decode_plan: bool,
 }
 
 impl WorkerProcessOptions {
@@ -423,7 +421,6 @@ impl WorkerProcessOptions {
             flashinfer_decode_split_tile_size: self.flashinfer_decode_split_tile_size,
             flashinfer_prefill_split_tile_size: self.flashinfer_prefill_split_tile_size,
             flashinfer_disable_split_kv: self.flashinfer_disable_split_kv,
-            flashinfer_fast_decode_plan: self.flashinfer_fast_decode_plan,
             ..WorkerProcessArgs::default()
         }
     }

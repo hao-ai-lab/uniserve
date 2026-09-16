@@ -108,8 +108,6 @@ pub struct WorkerProcessArgs {
     pub flashinfer_prefill_split_tile_size: Option<u32>,
     /// Whether FlashInfer split-KV execution is disabled.
     pub flashinfer_disable_split_kv: bool,
-    /// Whether FlashInfer may reuse its optimized decode planning path.
-    pub flashinfer_fast_decode_plan: bool,
     /// Maximum model context length in tokens.
     pub max_model_len: u32,
     /// Maximum accepted video duration in seconds.

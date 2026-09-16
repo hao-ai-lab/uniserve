@@ -173,11 +173,6 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
     )
-    parser.add_argument(
-        "--flashinfer-fast-decode-plan",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
 
     # The engine's own IPC and process tests launch a real worker without model
     # weights; the serving command line cannot request this.

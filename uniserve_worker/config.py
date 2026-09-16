@@ -423,7 +423,6 @@ def worker_config_from_namespace(
                 namespace.flashinfer_prefill_split_tile_size
             ),
             disable_split_kv=bool(namespace.flashinfer_disable_split_kv),
-            fast_decode_plan=bool(namespace.flashinfer_fast_decode_plan),
         ),
     )
 

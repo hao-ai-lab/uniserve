@@ -182,7 +182,6 @@ impl Default for WorkerProcessArgs {
             flashinfer_decode_split_tile_size: None,
             flashinfer_prefill_split_tile_size: None,
             flashinfer_disable_split_kv: false,
-            flashinfer_fast_decode_plan: true,
             max_model_len: 8192,
             max_video_seconds: 15.0,
         }
@@ -259,9 +258,6 @@ impl WorkerProcessArgs {
         }
         if self.flashinfer_disable_split_kv {
             cmd.arg("--flashinfer-disable-split-kv");
-        }
-        if !self.flashinfer_fast_decode_plan {
-            cmd.arg("--no-flashinfer-fast-decode-plan");
         }
         cmd.arg("--max-model-len")
             .arg(self.max_model_len.to_string());

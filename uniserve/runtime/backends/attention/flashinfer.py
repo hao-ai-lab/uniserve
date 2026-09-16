@@ -4,8 +4,11 @@ FlashInfer attention with explicit host planning and graph-stable page
 metadata.
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import accumulate
+from typing import Any
 
 import torch
 import triton
@@ -23,12 +26,29 @@ from uniserve.tensors import BufferConfig
 
 from . import Backend as _Backend
 from . import Operator as _Operator
-from ._flashinfer_plan import (
-    _fast_decode_plan_with_cpu_metadata,
-    _plan_workspace,
-)
 
 __all__ = ["Backend", "Config"]
+
+
+@contextmanager
+def _plan_workspace(wrapper: Any) -> Iterator[None]:
+    """Give a native plan an immutable pinned upload generation.
+
+    FlashInfer writes this host workspace and enqueues its DMA directly. Its
+    next plan may run before the previous upload has reached the device. A fresh
+    allocation plus allocator stream tracking protects both reuse and teardown
+    while allowing CPU planning to continue asynchronously.
+    """
+    from uniserve_kernel.peer_memory import record_host_usage
+
+    source = torch.empty_like(
+        wrapper._pin_memory_int_workspace_buffer, pin_memory=True
+    )
+    wrapper._pin_memory_int_workspace_buffer = source
+    try:
+        yield
+    finally:
+        record_host_usage(source, torch.cuda.current_stream(wrapper.device))
 
 
 @dataclass(frozen=True)
@@ -45,7 +65,6 @@ class Config:
     decode_split_tile_size: int | None = None
     prefill_split_tile_size: int | None = None
     disable_split_kv: bool = False
-    fast_decode_plan: bool = True
 
     def __post_init__(self):
         if self.workspace_size < 1:
@@ -205,23 +224,6 @@ class _PagePlan:
         }
         with _plan_workspace(self.wrapper):
             if self.decode:
-                if (
-                    owner.config.fast_decode_plan
-                    and _fast_decode_plan_with_cpu_metadata(
-                        self.wrapper,
-                        self.indptr,
-                        self.indices[: sum(counts)],
-                        self.last,
-                        owner.num_heads,
-                        owner.num_kv_heads,
-                        owner.head_dim,
-                        table.block_size,
-                        global_override_indptr_cpu=indptr,
-                        global_override_last_page_len_cpu=last,
-                        **options,
-                    )
-                ):
-                    return
                 self.wrapper.plan(
                     indptr,
                     self.indices[: sum(counts)],
