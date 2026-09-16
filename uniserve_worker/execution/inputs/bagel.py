@@ -1,8 +1,8 @@
 """Construct BAGEL's framed image input at the worker boundary."""
 
 from uniserve.model import LatentInput
+from uniserve.processing import BranchSource
 from uniserve_models.bagel import DenoiserInput
-from uniserve_models.processing import BranchSource
 
 from .image import ImageBuilder
 

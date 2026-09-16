@@ -20,9 +20,8 @@ from uniserve.loading import checkpoint
 from uniserve.loading import weights as weight_options
 from uniserve.model import EntryPoint
 from uniserve.nn.attention import AttentionParallelConfig
+from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizationConfig, Quantizer
-
-from .processing import FlowPrompt, ImageProcessor
 
 ConfigT = TypeVar("ConfigT")
 ModelT = TypeVar("ModelT", bound=nn.Module)

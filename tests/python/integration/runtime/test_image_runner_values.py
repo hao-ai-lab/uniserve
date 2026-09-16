@@ -364,7 +364,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         flow_graph_shapes=((16, 16),),
         flow_graph_batch_sizes=(1,),
     )
-    from uniserve_models.processing import ImageProcessor, PatchTransform
+    from uniserve.processing import ImageProcessor, PatchTransform
 
     processor = (
         ImageProcessor(

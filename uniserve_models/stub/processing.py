@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from uniserve_models.processing import (
+from uniserve.processing import (
     FeatureInjection,
     FeatureLayout,
     ImageProcessor,

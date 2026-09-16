@@ -9,7 +9,7 @@ import torch
 from uniserve.diffusion import Branch, normal_noise
 from uniserve.media import image
 from uniserve.model import ImageDenoiser
-from uniserve_models.processing import BranchSource
+from uniserve.processing import BranchSource
 
 
 class ImageBuilder:

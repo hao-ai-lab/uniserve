@@ -13,13 +13,13 @@ from uniserve.diffusion import Branch
 from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.model import CausalLM, PatchEncoder, VideoPostprocessor
-from uniserve.runtime.device import canonical_device, device_memory_budget
-from uniserve.tensors import BufferConfig
-from uniserve_models.processing import (
+from uniserve.processing import (
     FeatureLayout,
     ImageProcessor,
     PatchTransform,
 )
+from uniserve.runtime.device import canonical_device, device_memory_budget
+from uniserve.tensors import BufferConfig
 
 from ..config import WorkerConfig
 from ..execution.input_buffers import InputBufferConfig

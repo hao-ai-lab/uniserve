@@ -19,13 +19,13 @@ from uniserve.nn.attention import (
     Ulysses,
 )
 from uniserve.nn.vae.patch import PatchAutoencoder
-from uniserve.quantization import QuantizationConfig, Quantizer
-from uniserve_models import loading as models
-from uniserve_models.processing import (
+from uniserve.processing import (
     FlowPrompt,
     ImageProcessor,
     load_tokenizer,
 )
+from uniserve.quantization import QuantizationConfig, Quantizer
+from uniserve_models import loading as models
 
 from ..config import WorkerConfig
 from ..execution.model_entry import ModelEntry

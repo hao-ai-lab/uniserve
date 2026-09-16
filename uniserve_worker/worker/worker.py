@@ -19,6 +19,7 @@ from torch import nn
 from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.model import CausalLM, VideoPostprocessor
+from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.profiling import profile_range
 from uniserve.quantization import Quantizer
 from uniserve.runtime import EventPool, PrefixCache
@@ -28,7 +29,6 @@ from uniserve.runtime.process_groups import (
     initialize_process_groups,
 )
 from uniserve.runtime.resources import close_resources
-from uniserve_models.processing import FlowPrompt, ImageProcessor
 from uniserve_worker.profiling import (
     WorkerProfiler,
     record_failure,

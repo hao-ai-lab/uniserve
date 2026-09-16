@@ -8,7 +8,7 @@ import pytest
 import torch
 from PIL import Image
 
-from uniserve_models.processing import (
+from uniserve.processing import (
     ImageProcessor,
     PatchTransform,
     StrideResize,

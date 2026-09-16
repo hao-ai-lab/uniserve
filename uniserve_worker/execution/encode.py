@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from uniserve.media import image
-from uniserve_models.processing import (
+from uniserve.processing import (
     FeatureInjection,
     FeatureLayout,
     PatchTransform,

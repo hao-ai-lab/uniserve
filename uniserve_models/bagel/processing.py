@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from uniserve_models.processing import (
+from uniserve.processing import (
     FeatureInjection,
     FeatureLayout,
     ImageProcessor,

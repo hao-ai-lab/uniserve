@@ -10,9 +10,9 @@ import torch
 from uniserve.execution import TextRunner
 from uniserve.model import CausalLM, TextInput, TextSize
 from uniserve.nn.attention import PagedInput
+from uniserve.processing import load_tokenizer
 from uniserve.runtime import ExecutionContext, PrefixCache
 from uniserve_models.loading import load_model, read_config
-from uniserve_models.processing import load_tokenizer
 
 
 @torch.inference_mode()

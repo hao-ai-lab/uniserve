@@ -6,7 +6,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
-from uniserve_models.processing import BranchSource, FlowPrompt
+from uniserve.processing import BranchSource, FlowPrompt
 from uniserve_worker.execution.diffusion_state import resolve_prefix
 from uniserve_worker.foundation.errors import WorkerError
 

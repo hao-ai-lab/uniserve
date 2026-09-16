@@ -14,9 +14,9 @@ from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.media import image
 from uniserve.model import CausalLM, PatchEncoder, VideoPostprocessor
+from uniserve.processing import ImageProcessor
 from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
-from uniserve_models.processing import ImageProcessor
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.protocol.operation import COMPUTATIONS, Computation
 

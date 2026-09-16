@@ -9,7 +9,7 @@ import torch
 
 from uniserve.diffusion import Branch, Guidance, Schedule
 from uniserve.media.image import Config
-from uniserve_models.processing import BranchSource, FlowPrompt
+from uniserve.processing import BranchSource, FlowPrompt
 
 from ..foundation.errors import invalid_descriptor
 

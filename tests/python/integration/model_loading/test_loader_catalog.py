@@ -17,10 +17,10 @@ from uniserve import loading
 from uniserve.loading import weights
 from uniserve.model import TextInput, TextSize
 from uniserve.nn.attention import SequenceLengths, VarlenInput
+from uniserve.processing import load_tokenizer
 from uniserve.quantization import QuantizationConfig, QuantizedTensor, Quantizer
 from uniserve.runtime import ExecutionContext
 from uniserve_models import loading as models
-from uniserve_models.processing import load_tokenizer
 
 pytestmark = pytest.mark.integration
 

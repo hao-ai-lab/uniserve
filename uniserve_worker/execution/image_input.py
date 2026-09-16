@@ -15,7 +15,7 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as vision
 
-from uniserve_models.processing import (
+from uniserve.processing import (
     ImageProcessor,
     PatchTransform,
     StrideResize,

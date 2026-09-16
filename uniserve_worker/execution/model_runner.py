@@ -29,6 +29,7 @@ from uniserve.model import (
     VideoPostprocessor,
 )
 from uniserve.nn.vae import PatchAutoencoder
+from uniserve.processing import ImageProcessor
 from uniserve.runtime import (
     CUDAGraph,
     CUDAStream,
@@ -41,7 +42,6 @@ from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.device import canonical_device, fill_cpu_ints
 from uniserve.runtime.resources import close_resources
 from uniserve.tensors import OutputLayout, TensorOutput
-from uniserve_models.processing import ImageProcessor
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.foundation.errors import (
     ComputeError,
