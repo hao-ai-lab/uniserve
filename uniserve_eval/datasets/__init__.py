@@ -33,11 +33,6 @@ def get_dataset(name: str) -> type[Dataset]:
     return DATASETS[name]
 
 
-def list_datasets() -> tuple[type[Dataset], ...]:
-    """Return registered dataset adapters in name order."""
-    return tuple(DATASETS[name] for name in sorted(DATASETS))
-
-
 def load_examples(point: BenchmarkPoint) -> tuple[list[Example], Any | None]:
     """Load the exact row count and optional tokenizer for a benchmark point."""
     dataset_cls = get_dataset(point.dataset)
@@ -73,6 +68,5 @@ __all__ = [
     "ShareGPTDataset",
     "UEvalDataset",
     "get_dataset",
-    "list_datasets",
     "load_examples",
 ]

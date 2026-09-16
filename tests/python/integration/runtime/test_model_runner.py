@@ -1760,9 +1760,9 @@ def test_tensor_entry_input_preserves_values_through_output_release(
 ) -> None:
     from threading import Event
 
+    from tests.python.fixtures.transport import make_transport
     from uniserve.runtime import EventPool
     from uniserve_worker.protocol.transfer import WorkerEndpoint
-    from uniserve_worker.transfer.tickets import make_transport
 
     events = EventPool()
     producer = make_transport(

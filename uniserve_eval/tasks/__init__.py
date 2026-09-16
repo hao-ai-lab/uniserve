@@ -30,11 +30,6 @@ def get_task(name: str | TaskName) -> type[BenchmarkTask]:
     return TASKS[key]
 
 
-def list_tasks() -> tuple[type[BenchmarkTask], ...]:
-    """Return registered task adapters in identifier order."""
-    return tuple(TASKS[name] for name in sorted(TASKS))
-
-
 __all__ = [
     "TASKS",
     "BenchmarkTask",
@@ -46,5 +41,4 @@ __all__ = [
     "TextTask",
     "VideoTask",
     "get_task",
-    "list_tasks",
 ]

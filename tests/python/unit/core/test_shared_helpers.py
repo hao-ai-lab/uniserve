@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from uniserve.env import env_flag, flag_from_value
+from uniserve.env import flag_from_value
 from uniserve.math import ceil_div
 
 pytestmark = pytest.mark.unit
@@ -23,16 +23,6 @@ def test_flag_from_value_allowlist_semantics():
     assert flag_from_value("garbage", default=True) is True
     # Explicit false tokens always win over a True default.
     assert flag_from_value("0", default=True) is False
-
-
-def test_env_flag_reads_environment(monkeypatch):
-    monkeypatch.setenv("UNISERVE_TEST_FLAG", "on")
-    assert env_flag("UNISERVE_TEST_FLAG") is True
-    monkeypatch.setenv("UNISERVE_TEST_FLAG", "off")
-    assert env_flag("UNISERVE_TEST_FLAG") is False
-    monkeypatch.delenv("UNISERVE_TEST_FLAG", raising=False)
-    assert env_flag("UNISERVE_TEST_FLAG") is False
-    assert env_flag("UNISERVE_TEST_FLAG", default=True) is True
 
 
 def test_ceil_div_rounds_up_and_guards_zero_divisor():

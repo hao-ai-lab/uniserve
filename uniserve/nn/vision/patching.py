@@ -7,7 +7,6 @@ import torch
 __all__ = [
     "patchify",
     "patchify_batch",
-    "unpatchify_batch",
     "build_abs_positions_from_grid_hw",
 ]
 
@@ -48,36 +47,6 @@ def patchify_batch(
     else:
         x = torch.einsum("nchpwq->nhwpqc", x)
     return x.reshape(batch, h * w, p * p * channels)
-
-
-def unpatchify_batch(
-    patches: torch.Tensor,
-    patch_size: int,
-    *,
-    height: int | None = None,
-    width: int | None = None,
-    channels: int | None = None,
-) -> torch.Tensor:
-    """Convert ``(N,L,patch_size**2*C)`` patch rows back to ``(N,C,H,W)``.
-
-    ``channels`` defaults to ``3`` (RGB) but can be set explicitly for latent
-    folds (e.g. VAE latents with ``vae_z_channels`` channels); when omitted
-    it is inferred from the patch-row width so the channel count is named in
-    one place.
-    """
-    p = int(patch_size)
-    if channels is None:
-        c = int(patches.shape[-1]) // (p * p)
-    else:
-        c = int(channels)
-    if height is None or width is None:
-        h = w = int(patches.shape[1] ** 0.5)
-    else:
-        h = int(height) // p
-        w = int(width) // p
-    x = patches.reshape(patches.shape[0], h, w, p, p, c)
-    x = torch.einsum("nhwpqc->nchpwq", x)
-    return x.reshape(patches.shape[0], c, h * p, w * p)
 
 
 def build_abs_positions_from_grid_hw(

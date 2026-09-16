@@ -140,9 +140,11 @@ def test_h3_worker_advertises_bounded_media_products():
             products[name].shape_bound.max_elements == torch.Size(shape).numel()
         )
 
-    from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
+    from uniserve_worker.bootstrap.worker_info_builder import (
+        build_worker_layout,
+    )
 
-    info = build_worker_info(model, config, queue_depth=6)
+    info = build_worker_layout(model, config, queue_depth=6).info
     assert info.num_inference_steps == 4
     assert info.request_slots == 2
     assert info.kv_cache is None
@@ -240,7 +242,9 @@ def test_sensenova_reader_rejects_unimplemented_sliding_attention(tmp_path):
 @pytest.mark.parametrize("storage", ("bfloat16", "float8_e4m3fn"))
 def test_text_worker_reports_exact_cache_capacity(storage):
     from uniserve_models.qwen3 import Config, Model
-    from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
+    from uniserve_worker.bootstrap.worker_info_builder import (
+        build_worker_layout,
+    )
     from uniserve_worker.config import WorkerConfig
 
     with torch.device("meta"):
@@ -271,7 +275,7 @@ def test_text_worker_reports_exact_cache_capacity(storage):
         kv_cache_dtype=storage,
         max_sequence_tokens=128,
     )
-    info = build_worker_info(model, config)
+    info = build_worker_layout(model, config).info
     cache = info.kv_cache
     assert cache.num_blocks == 4
     assert cache.total_layers == cache.num_layers == 2

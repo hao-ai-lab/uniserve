@@ -7,7 +7,7 @@ import pytest
 from tests.python.fixtures.worker_config import stub_worker_config
 from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.capacity import derive_runtime_kv_capacity
-from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
+from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
 
 TEST_WORKER_CONFIG = stub_worker_config(64, max_batch_tokens=8192)
 
@@ -43,7 +43,9 @@ def _worker_config(*, token_capacity: int | None):
 
 
 def test_explicit_kv_capacity_provisions_one_physical_page_pool():
-    info = build_worker_info(_model(), _worker_config(token_capacity=131072))
+    info = build_worker_layout(
+        _model(), _worker_config(token_capacity=131072)
+    ).info
 
     assert info.kv_cache is not None
     assert info.kv_cache.num_blocks * BLOCK_SIZE == 131072
@@ -93,13 +95,13 @@ def test_automatic_capacity_charges_request_and_input_storage() -> None:
         max_batch_operations=4,
         max_batch_tokens=64,
     )
-    small = build_worker_info(model, config)
-    larger_requests = build_worker_info(
+    small = build_worker_layout(model, config).info
+    larger_requests = build_worker_layout(
         model, replace(config, max_request_pool_size=128)
-    )
-    larger_input = build_worker_info(
+    ).info
+    larger_input = build_worker_layout(
         model, replace(config, max_batch_tokens=65536)
-    )
+    ).info
     assert small.kv_cache is not None
     assert larger_requests.kv_cache is not None
     assert larger_input.kv_cache is not None
@@ -117,11 +119,11 @@ def test_explicit_pages_cannot_displace_resident_encoder_storage() -> None:
         max_batch_tokens=64,
     )
     processor = image_processor()
-    build_worker_info(model, config, image_processor=processor)
+    build_worker_layout(model, config, image_processor=processor).info
     # The processor's admitted image area owns the complete resident feature
     # bound.
     processor = replace(
         processor, vit=replace(processor.vit, max_pixels=1024**3 * 16**2)
     )
     with pytest.raises(ValueError, match="grant"):
-        build_worker_info(model, config, image_processor=processor)
+        build_worker_layout(model, config, image_processor=processor).info

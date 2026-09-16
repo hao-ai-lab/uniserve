@@ -23,7 +23,6 @@ from uniserve_worker.protocol.operation import (
 from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.protocol.tensor import TensorRef
 from uniserve_worker.protocol.transfer import KvTransfer
-from uniserve_worker.runtime.request import RequestState
 
 from . import operations
 from .batch_state import BatchState
@@ -673,18 +672,6 @@ def prefix_row(
         write_kv=True,
         causal=True,
     )
-
-
-def require_image(request: RequestState) -> ImageParams:
-    """Return the request image input required by image-conditioned.
-
-    diffusion.
-    """
-    if request.image is None:
-        raise invalid_descriptor(
-            "flow execution requires admitted image parameters"
-        )
-    return request.image
 
 
 def flow_rows(

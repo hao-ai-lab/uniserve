@@ -10,8 +10,6 @@ from PIL import Image
 
 __all__ = [
     "pil_image_to_png_bytes",
-    "pil_image_to_png_b64",
-    "png_bytes_to_b64",
     "quantize_image_hwc",
     "uint8_image_to_png_base64_bytes",
 ]
@@ -26,16 +24,6 @@ def pil_image_to_png_bytes(image: Image.Image) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG", compress_level=1)
     return buffer.getvalue()
-
-
-def png_bytes_to_b64(png: bytes) -> str:
-    """Encode PNG container bytes as an ASCII base64 string."""
-    return base64.b64encode(png).decode("ascii")
-
-
-def pil_image_to_png_b64(image: Image.Image) -> str:
-    """Encode a PIL image as a base64 PNG string."""
-    return png_bytes_to_b64(pil_image_to_png_bytes(image))
 
 
 def quantize_image_hwc(

@@ -51,7 +51,6 @@ __all__ = [
     "LocalTransport",
     "ShmTransport",
     "CudaIpcTransport",
-    "make_transport",
     "TransportKind",
     "TRANSPORTS",
 ]
@@ -1797,24 +1796,6 @@ class CudaIpcTransport(Transport):
                 _endpoints.pop(self.endpoint(), None)
         if self._failed_publication is not None:
             raise self._failed_publication[0]
-
-
-def make_transport(
-    name: str | TransportKind,
-    *,
-    byte_capacity: int,
-    ticket_capacity: int,
-    event_pool: EventPool,
-    source: WorkerEndpoint | None = None,
-) -> Transport:
-    """Construct one bounded physical backend for a standalone endpoint."""
-    return make_transports(
-        (str(name),),
-        byte_capacity=byte_capacity,
-        ticket_capacity=ticket_capacity,
-        event_pool=event_pool,
-        source=source,
-    )[str(name)]
 
 
 def make_transports(

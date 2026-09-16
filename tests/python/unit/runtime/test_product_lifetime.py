@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from tests.python.fixtures.cache import mha_pool
+from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
 from uniserve_worker.execution.output import OutputBuffer, OutputPool
 from uniserve_worker.foundation.errors import WorkerError
@@ -41,7 +42,6 @@ from uniserve_worker.runtime.cpu import CpuPool
 from uniserve_worker.runtime.latent_pool import LatentPool
 from uniserve_worker.runtime.request import RequestPool
 from uniserve_worker.runtime.tensor_store import FeatureMetadata, TensorStore
-from uniserve_worker.transfer.tickets import make_transport
 
 
 def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() -> (  # noqa: E501

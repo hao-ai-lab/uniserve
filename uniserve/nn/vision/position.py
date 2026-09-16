@@ -2,69 +2,13 @@
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 
 __all__ = [
-    "get_1d_sincos_pos_embed_from_grid",
-    "get_2d_sincos_pos_embed_from_grid",
-    "get_2d_sincos_pos_embed",
     "get_flattened_position_ids_extrapolate",
     "PositionEmbedding",
 ]
-
-
-def get_1d_sincos_pos_embed_from_grid(
-    embed_dim: int, pos: np.ndarray
-) -> np.ndarray:
-    """Create sine-then-cosine features for arbitrary one-dimensional
-    positions.
-    """  # noqa: D205
-    if embed_dim % 2 != 0:
-        raise ValueError("embed_dim must be even")
-
-    # Frequencies span 10000**-1 .. 10000**0 across the half-width spectrum.
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega
-    pos = pos.reshape(-1)
-    out = np.einsum("m,d->md", pos, omega)
-    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
-
-
-def get_2d_sincos_pos_embed_from_grid(
-    embed_dim: int, grid: np.ndarray
-) -> np.ndarray:
-    """Concatenate independent height and width sinusoidal grid embeddings."""
-    if embed_dim % 2 != 0:
-        raise ValueError("embed_dim must be even")
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
-    return np.concatenate([emb_h, emb_w], axis=1)
-
-
-def get_2d_sincos_pos_embed(
-    embed_dim: int,
-    grid_size: int,
-    *,
-    cls_token: bool = False,
-    extra_tokens: int = 0,
-    pe_interpolation: float = 1.0,
-) -> np.ndarray:
-    """Create a square 2D sinusoidal table with optional leading special-token
-    rows.
-    """  # noqa: D205
-    grid_h = np.arange(grid_size, dtype=np.float32) / pe_interpolation
-    grid_w = np.arange(grid_size, dtype=np.float32) / pe_interpolation
-    grid_axes = np.meshgrid(grid_w, grid_h)
-    grid = np.stack(grid_axes, axis=0).reshape([2, 1, grid_size, grid_size])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token and extra_tokens > 0:
-        pos_embed = np.concatenate(
-            [np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0
-        )
-    return pos_embed
 
 
 def get_flattened_position_ids_extrapolate(

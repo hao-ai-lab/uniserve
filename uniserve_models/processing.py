@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
@@ -95,7 +95,6 @@ __all__ = [
     "BranchSource",
     "PositionLayout",
     "load_tokenizer",
-    "resolve_input_tokens",
     "FeatureInjection",
     "FeatureLayout",
     "ImageProcessor",
@@ -149,52 +148,6 @@ class FlowPrompt:
                 framed, add_special_tokens=self.add_special_tokens
             )
         )
-
-
-def resolve_input_tokens(
-    processor: ImageProcessor | None, tokenizer: Any | None
-) -> ImageProcessor | None:
-    """Resolve model-specific input token identities from tokenizer metadata."""
-    if processor is None or processor.feature_injection is None:
-        return processor
-    injection = processor.feature_injection
-
-    updates: dict[str, int] = {}
-    for token_field, id_field in (
-        ("start_token", "start_token_id"),
-        ("end_token", "end_token_id"),
-    ):
-        token = getattr(injection, token_field)
-        token_id = getattr(injection, id_field)
-        if token_id is not None or token is None:
-            continue
-        if tokenizer is None:
-            raise ValueError(
-                f"model input declaration requires tokenizer resolution "
-                f"for {token!r}"
-            )
-        resolved = tokenizer.convert_tokens_to_ids(token)
-        if (
-            resolved is None
-            or int(resolved) < 0
-            or (
-                resolved == tokenizer.unk_token_id
-                and token != tokenizer.unk_token
-            )
-        ):
-            raise ValueError(
-                f"tokenizer does not define declared token {token!r}"
-            )
-        updates[id_field] = int(resolved)
-
-    if not updates:
-        return processor
-    resolved_injection = replace(
-        injection,
-        start_token_id=updates.get("start_token_id", injection.start_token_id),
-        end_token_id=updates.get("end_token_id", injection.end_token_id),
-    )
-    return replace(processor, feature_injection=resolved_injection)
 
 
 def load_tokenizer(path: Path):

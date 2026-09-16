@@ -52,7 +52,6 @@ from .worker_info import EntryInfo, WorkerInfo
 
 __all__ = [
     "WorkerLayout",
-    "build_worker_info",
     "build_worker_layout",
     "configuration_identity",
 ]
@@ -145,28 +144,6 @@ def configuration_identity(
     )
 
     return hashlib.sha256(encoded.encode()).hexdigest()
-
-
-def build_worker_info(
-    model: nn.Module,
-    worker_config: WorkerConfig,
-    *,
-    image_processor: ImageProcessor | None = None,
-    model_name: str | None = None,
-    queue_depth: int = 1,
-    completion_payload_bytes: int = 1 << 20,
-    endpoint: WorkerEndpoint | None = None,
-) -> WorkerInfo:
-    """Build the post-load worker capacity handshake."""
-    return build_worker_layout(
-        model,
-        worker_config,
-        image_processor=image_processor,
-        model_name=model_name,
-        queue_depth=queue_depth,
-        completion_payload_bytes=completion_payload_bytes,
-        endpoint=endpoint,
-    ).info
 
 
 def build_worker_layout(

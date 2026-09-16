@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from tests.python.fixtures.shm_publication import serve_pending_publication
+from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import BufferAllocation
@@ -25,7 +26,6 @@ from uniserve_worker.runtime.buffer_pool import BufferPool
 from uniserve_worker.runtime.latent_pool import LatentPool
 from uniserve_worker.runtime.tensor_store import TensorStore
 from uniserve_worker.transfer.layout import region_view
-from uniserve_worker.transfer.tickets import make_transport
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

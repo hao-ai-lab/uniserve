@@ -10,6 +10,7 @@ import torch
 
 from tests.python.fixtures.cache import mha_pool
 from tests.python.fixtures.shm_publication import serve_pending_publication
+from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.identity import (
@@ -22,7 +23,6 @@ from uniserve_worker.protocol.transfer import (
     Locator,
     TensorTransfer,
 )
-from uniserve_worker.transfer.tickets import make_transport
 
 pytestmark = pytest.mark.integration
 

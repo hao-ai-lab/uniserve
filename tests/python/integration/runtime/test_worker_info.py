@@ -9,7 +9,7 @@ import pytest
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_config import stub_worker_config
 from uniserve_models.stub import Model, image_processor
-from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
+from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
 from uniserve_worker.config import LaneConfig, WorkerConfig
 from uniserve_worker.protocol.operation import COMPUTATIONS, ForwardMode
 from uniserve_worker.worker import Worker
@@ -120,7 +120,9 @@ def test_worker_info_reports_limits_safe_for_all_bound_lanes(
     # The scheduler receives one shared bound even when lanes constrain
     # different dimensions. Unspecified lane limits inherit the configured
     # model capacity.
-    info = build_worker_info(Model(), config, image_processor=image_processor())
+    info = build_worker_layout(
+        Model(), config, image_processor=image_processor()
+    ).info
 
     assert info.max_batch_ops == (2 if with_lane_limits else 4)
     assert info.max_batch_tokens == (128 if with_lane_limits else 256)

@@ -8,7 +8,6 @@ from uniserve.runtime.triton import triton_available
 
 __all__ = [
     "write_locations",
-    "decode_write_locations",
     "paged_kv_write",
 ]
 
@@ -123,18 +122,6 @@ def write_locations(
     page_ids = block_table.gather(1, page_slots)
 
     return page_ids.to(dtype=torch.int64), offsets.to(dtype=torch.int64)
-
-
-def decode_write_locations(
-    block_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    page_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return page ids and offsets for one-token paged decode writes."""
-    page_ids, offsets = write_locations(
-        block_table, cache_seqlens.unsqueeze(1), page_size
-    )
-    return page_ids.squeeze(1), offsets.squeeze(1)
 
 
 def _triton_paged_kv_write_eligible(
