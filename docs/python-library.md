@@ -16,7 +16,7 @@ Models compose ordinary `torch.nn.Module` layers. Capabilities such as `CausalLM
 
 ## Model packages
 
-Each architecture has a package under `uniserve_models`: `qwen3`, `bagel`, `sensenova_u1` and `minimax_h3`. `siglip` supplies the reusable visual tower, and `stub` supplies deterministic simulator computation. Import public objects from the package, for example `from uniserve_models.bagel import Config, Model`; package initializers declare exports rather than implement networks.
+Each architecture has a package under `uniserve_models`: `qwen3`, `bagel`, `sensenova_u1` and `minimax_h3`. `siglip` supplies the reusable visual tower, and `stub` supplies the deterministic computation the engine's IPC and process tests run without model weights. Import public objects from the package, for example `from uniserve_models.bagel import Config, Model`; package initializers declare exports rather than implement networks.
 
 | Module | Responsibility |
 | --- | --- |
@@ -27,9 +27,9 @@ Each architecture has a package under `uniserve_models`: `qwen3`, `bagel`, `sens
 | `weights.py` | Checkpoint sources, tensor assignments and precision presets; H3's component precision policies live in `precision.py` |
 | `processing.py` | Architecture-specific image transforms and prompt framing |
 
-Packages contain the modules their computations need. SigLIP exposes an encoder rather than a serving model, and the simulator has no checkpoint loader. Image/audio/video codecs and other architecture-specific submodules retain their domain names. A submodule's own configuration stays with that submodule when it is independently composed.
+Packages contain the modules their computations need. SigLIP exposes an encoder rather than a serving model, and the deterministic test model has no checkpoint loader. Image/audio/video codecs and other architecture-specific submodules retain their domain names. A submodule's own configuration stays with that submodule when it is independently composed.
 
-Shared discovery and materialization remain in `uniserve_models.loading`; shared preprocessing value types and tokenizer utilities remain in `uniserve_models.processing`. Loadable packages declare `config_sources` for checkpoint headers needed during architecture inspection, and provide their own image-processor factory and flow prompt. These are loading-time assets used by callers, not resources retained by numerical modules.
+Shared discovery and materialization remain in `uniserve_models.loading`; shared preprocessing value types and tokenizer utilities live in `uniserve.processing`, alongside the rest of the computation library. Loadable packages declare `config_sources` for checkpoint headers needed during architecture inspection, and provide their own image-processor factory and flow prompt. These are loading-time assets used by callers, not resources retained by numerical modules.
 
 ## Text logits and prefix storage
 

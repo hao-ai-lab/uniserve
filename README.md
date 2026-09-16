@@ -178,7 +178,7 @@ crates/foundation/observability/         Runtime metrics and process registry
 crates/foundation/observability-derive/  Metrics proc-macro
 crates/worker-ipc/                       Worker messages, serialization, and iceoryx endpoints
 crates/worker-ipc-py/                    Python worker IPC extension
-crates/engine/                           Scheduler, KV pool, executors, simulator, and engine process
+crates/engine/                           Scheduler, KV pool, executors, and engine process
 crates/server/                           Model profiles, serving funnel, OpenAI API, HTTP, and engine clients
 crates/bin/uniserve/                     `serve` and `engine` CLI entrypoints
 uniserve/                                 Numerical layers, loading, and resource binding
