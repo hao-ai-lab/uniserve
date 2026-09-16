@@ -4106,6 +4106,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uniserve-core",
+ "uniserve-engine",
  "uniserve-worker-ipc",
 ]
 

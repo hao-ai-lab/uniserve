@@ -1,7 +1,8 @@
 //! In-process scheduling, memory management, worker execution, and request control.
 //!
 //! The crate owns the engine thread and exports request handles, configuration,
-//! execution backends, statistics, and a GPU-free simulator.
+//! execution backends, and statistics. The `testing` feature additionally
+//! exports a GPU-free simulated executor for control-plane tests.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod core;
@@ -11,6 +12,7 @@ mod kv;
 /// Scheduler-owned allocation and worker-params primitives.
 pub mod memory;
 mod scheduler;
+#[cfg(feature = "testing")]
 mod sim;
 mod worker;
 
@@ -32,6 +34,7 @@ pub use crate::scheduler::{
     ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats, Scheduler, SchedulerConfig,
     SchedulerStats, SchedulerStatsReporter, SchedulingPolicy, TimingStats, WorkerStats,
 };
+#[cfg(feature = "testing")]
 pub use crate::sim::{SimEngine, SimExecutor};
 pub use crate::worker::{
     FlashInferBackend, FlashInferBackendParseError, LaneConfig, RunSubmitError, WorkerExecutor,

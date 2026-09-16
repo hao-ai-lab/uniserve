@@ -18,8 +18,7 @@ use uniserve_engine::{
     FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::{
-    ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
-    SchedulingPolicy,
+    ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, SchedulingPolicy,
 };
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
@@ -132,11 +131,6 @@ pub(crate) struct SharedRuntimeArgs {
     /// Response-ring slot capacity in bytes for the worker IPC transport.
     #[arg(long, default_value_t = EngineSettings::DEFAULT_RESP_SLOT_CAP, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub resp_slot_cap: usize,
-
-    /// Run the GPU-free CPU simulation engine instead of spawning the real
-    /// forward-only worker. No Python and no GPU are required.
-    #[arg(long, hide = true)]
-    pub sim: bool,
     /// Compute device for the forward-only worker.
     #[arg(long, default_value = "cuda")]
     pub device: String,
@@ -268,11 +262,6 @@ impl SharedRuntimeArgs {
         worker_process.block_size = self.block_size;
         worker_process.attention_backend = self.attention_backend.clone();
         EngineSettings {
-            backend: if self.sim {
-                EngineBackendKind::Sim
-            } else {
-                EngineBackendKind::Worker
-            },
             max_batch: self
                 .max_batch
                 .unwrap_or(if is_media { 2 } else { DEFAULT_MAX_BATCH }),
@@ -339,8 +328,6 @@ impl SharedRuntimeArgs {
 #[derive(Educe, Clone, Args)]
 #[educe(Debug)]
 pub(crate) struct WorkerProcessOptions {
-    #[arg(long, hide = true)]
-    pub worker_stub: bool,
     /// Checkpoint loader format used by every model worker.
     #[arg(long, default_value = "auto", value_parser = ["auto", "safetensors", "pt", "dummy", "layered"])]
     pub load_format: String,
@@ -412,7 +399,6 @@ impl WorkerProcessOptions {
     /// Converts CLI worker options into the engine's process-launch contract.
     fn to_args(&self) -> WorkerProcessArgs {
         WorkerProcessArgs {
-            stub: self.worker_stub,
             load_format: self.load_format.clone(),
             download_dir: self.download_dir.clone(),
             load_threads: self.load_threads,

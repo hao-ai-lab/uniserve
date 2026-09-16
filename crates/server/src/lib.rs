@@ -26,16 +26,16 @@ pub use crate::profile::ModelDescription;
 pub use crate::serving::chat::ChatTemplateContentFormatOption;
 use crate::serving::{InputProcessor, ServingRuntime};
 use anyhow::{Context as _, Result};
-pub use config::{Config, EngineBackendKind, EngineSettings, HttpListenerMode};
+pub use config::{Config, EngineSettings, HttpListenerMode};
 use tracing::info;
 pub use uniserve_engine::SchedulingPolicy;
-use uniserve_engine::{EngineConfig, SimEngine, SimExecutor, SpecialTokenIds, WorkerProcessArgs};
+use uniserve_engine::{EngineConfig, SpecialTokenIds, WorkerProcessArgs};
 
 pub use crate::http::{ApiError, build_router, serve};
 pub use crate::state::AppState;
 
-/// Resolves canonical model control tokens for the selected engine backend.
-fn special_token_ids(model: &ModelConfig, backend: EngineBackendKind) -> SpecialTokenIds {
+/// Resolves canonical model control tokens for the loaded model.
+fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
     let controls = model.generation_controls();
     let bos = controls.map_or(0, |value| value.bos);
     let end_of_image = controls.map_or(0, |value| value.end_of_image);
@@ -47,9 +47,6 @@ fn special_token_ids(model: &ModelConfig, backend: EngineBackendKind) -> Special
     if let Some(primary_eos) = primary_eos {
         eos.retain(|value| *value != primary_eos);
         eos.insert(0, primary_eos);
-    }
-    if backend == EngineBackendKind::Sim && eos.is_empty() {
-        eos.push(151645);
     }
     SpecialTokenIds {
         bos,
@@ -65,12 +62,11 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model))?;
     let effective_max_model_len = model_config.max_model_tokens();
     let request_slot_capacity = model_config.request_slot_capacity();
-    let control_tokens = special_token_ids(&model_config, config.engine.backend);
+    let control_tokens = special_token_ids(&model_config);
     let generation_limits =
         model_config.generation_limits(config.engine.worker_process.model_dtype.clone());
 
     info!(
-        backend = ?config.engine.backend,
         workers = ?config.engine.workers,
         block_size = config.engine.worker_process.block_size,
         pipeline_depth = config.engine.worker_process.pipeline_depth,
@@ -112,33 +108,8 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         eos: control_tokens.eos,
         end_of_image: control_tokens.end_of_image,
     };
-    let client = if config.engine.backend == EngineBackendKind::Sim {
-        let mut sim = SimEngine::new();
-        let special_tokens = [
-            control_tokens.bos,
-            model_config
-                .generation_controls()
-                .map_or(0, |tokens| tokens.start_of_image),
-            control_tokens.end_of_image,
-        ]
-        .into_iter()
-        .filter(|token| *token != 0)
-        .collect::<Vec<_>>();
-        sim.configure_control_tokens(
-            engine_config.eos.first().copied().unwrap_or(151645),
-            &special_tokens,
-        );
-        let executor = SimExecutor::new(sim);
-        let command_waker = executor.command_waker();
-        EngineClient::connect_with_executor_and_waker(
-            engine_config,
-            Box::new(executor),
-            command_waker,
-        )
-    } else {
-        EngineClient::connect(engine_config)
-    }
-    .context("failed to start the UniServe engine")?;
+    let client =
+        EngineClient::connect(engine_config).context("failed to start the UniServe engine")?;
 
     let engine = Arc::new(client);
     let route_max_model_len = effective_max_model_len.min(engine.max_model_len());

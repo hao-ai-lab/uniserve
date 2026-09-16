@@ -36,22 +36,10 @@ pub enum HttpListenerMode {
     },
 }
 
-/// Which forward-only worker the UniServe Rust engine drives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
-pub enum EngineBackendKind {
-    /// GPU-free CPU simulation engine — no Python, no GPU.
-    Sim,
-    /// The real GPU path: a Python forward-only worker over the shared-memory ring.
-    #[default]
-    Worker,
-}
-
 /// Configuration of the in-process UniServe engine. Rust owns scheduling and
 /// engine execution; Python owns model forward execution.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EngineSettings {
-    /// Which forward-only worker to drive.
-    pub backend: EngineBackendKind,
     /// Maximum ops assembled into one forward batch.
     pub max_batch: usize,
     /// Maximum number of tokens scheduled in one engine step.
@@ -85,7 +73,6 @@ impl Default for EngineSettings {
     /// Returns the default value.
     fn default() -> Self {
         Self {
-            backend: EngineBackendKind::Worker,
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,

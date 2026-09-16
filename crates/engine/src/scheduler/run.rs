@@ -115,7 +115,7 @@ impl Scheduler {
         family: RuntimeFamily,
     ) -> Self {
         let generation_limits = match family {
-            RuntimeFamily::Umm => sim_umm_generation_limits(),
+            RuntimeFamily::Umm => unbounded_umm_generation_limits(),
             RuntimeFamily::Ar | RuntimeFamily::Diffusion => uniserve_core::GenerationLimits {
                 features: if family == RuntimeFamily::Ar {
                     uniserve_core::GenerationFeatures::UNDERSTANDING

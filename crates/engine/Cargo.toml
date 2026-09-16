@@ -24,8 +24,14 @@ uniserve-worker-ipc.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
+[features]
+# Exposes the GPU-free simulated executor to control-plane tests and examples.
+# It is never part of a serving build.
+testing = []
+
 [dev-dependencies]
 tracing-subscriber.workspace = true
+uniserve-engine = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true

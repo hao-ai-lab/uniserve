@@ -179,9 +179,12 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         default=True,
     )
 
-    # Synthetic-model escape hatch and admission bounds.
+    # The engine's own IPC and process tests launch a real worker without model
+    # weights; the serving command line cannot request this.
     parser.add_argument("--no-model", action="store_true")
     parser.add_argument("--allow-stub", action="store_true", default=False)
+
+    # Admission bounds.
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--max-video-seconds", type=float, default=15.0)
     return parser

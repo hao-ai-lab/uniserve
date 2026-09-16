@@ -26,7 +26,6 @@ from uniserve_models.processing import (
     ImageProcessor,
     load_tokenizer,
 )
-from uniserve_models.stub import image_processor
 
 from ..config import WorkerConfig
 from ..execution.model_entry import ModelEntry
@@ -211,7 +210,7 @@ def load_worker_model(
 ) -> WorkerModel:
     """Materialize selected modules and attach borrowed capability methods."""
     if config.use_stub_model:
-        from uniserve_models.stub import Model
+        from uniserve_models.stub import Model, image_processor
 
         model = Model().to(config.execution.device)
         for path, device in (

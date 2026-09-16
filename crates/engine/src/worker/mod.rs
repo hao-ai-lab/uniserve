@@ -35,6 +35,10 @@ pub struct WorkerProcessArgs {
     pub ranks: Vec<crate::WorkerRank>,
     /// Computation entry membership and parallel geometry.
     pub entries: std::collections::BTreeMap<String, crate::ComponentConfig>,
+    /// Launch the worker without model weights, using its deterministic test
+    /// model. Only the engine's own IPC and process tests set this; the serving
+    /// command line cannot request it.
+    pub stub: bool,
     /// Maximum number of physical runs concurrently in flight per rank.
     pub pipeline_depth: usize,
     /// Request IPC slot capacity in bytes.
@@ -56,8 +60,6 @@ pub struct WorkerProcessArgs {
     pub capability_groups: Vec<String>,
     /// Product transport exposed by the worker pool.
     pub transfer: crate::executor::TransferConfig,
-    /// Whether to launch the deterministic worker stub without model weights.
-    pub stub: bool,
     /// Checkpoint loader format.
     pub load_format: String,
     /// Optional cache directory for downloaded model artifacts.

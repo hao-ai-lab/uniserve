@@ -241,6 +241,7 @@ impl EngineConfig {
     ///
     /// Pair this with [`EngineCore::with_executor`]: [`EngineCore::new`] cannot
     /// build a `Sim` backend because it has no spawnable worker process.
+    #[cfg(feature = "testing")]
     pub fn sim(model: impl Into<String>) -> Self {
         let worker_process = WorkerProcessArgs {
             model: model.into(),
@@ -253,7 +254,7 @@ impl EngineConfig {
         };
         Self {
             runtime_family: RuntimeFamily::Umm,
-            generation_limits: crate::scheduler::sim_umm_generation_limits(),
+            generation_limits: crate::scheduler::unbounded_umm_generation_limits(),
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,

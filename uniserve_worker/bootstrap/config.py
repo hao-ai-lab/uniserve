@@ -376,10 +376,10 @@ class WorkerProcessArgs:
         publication_backends = _parse_transfer_backends(
             namespace.publish_backends
         )
-        use_stub_model = bool(namespace.no_model)
         model_path = str(namespace.model or "").strip()
 
         _validate_scalars(namespace)
+        use_stub_model = bool(namespace.no_model)
         if use_stub_model and not bool(namespace.allow_stub):
             raise ValueError(
                 "--no-model loads synthetic outputs and requires --allow-stub"
@@ -441,7 +441,6 @@ class WorkerProcessArgs:
                 namespace, device=device, generation_device=generation_device
             ),
             load=_load_config(namespace),
-            use_stub_model=use_stub_model,
             components=parse_entries(
                 namespace.entries, int(namespace.world_size)
             ),

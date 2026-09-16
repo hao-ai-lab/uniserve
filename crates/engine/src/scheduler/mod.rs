@@ -464,8 +464,12 @@ struct PendingMedia {
     event_tx: EventTx,
 }
 
-/// Returns simulator capabilities for unified multimodal generation.
-pub(crate) fn sim_umm_generation_limits() -> uniserve_core::GenerationLimits {
+/// Permissive unified-multimodal limits for a scheduler built without
+/// worker-advertised capacity.
+///
+/// A serving deployment supplies real limits through `EngineConfig`; this
+/// default only bounds a scheduler constructed directly from an executor.
+pub(crate) fn unbounded_umm_generation_limits() -> uniserve_core::GenerationLimits {
     uniserve_core::GenerationLimits {
         features: uniserve_core::GenerationFeatures::UNDERSTANDING
             | uniserve_core::GenerationFeatures::VISION_ENCODE
