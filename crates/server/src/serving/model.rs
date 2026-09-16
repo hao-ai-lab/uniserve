@@ -327,18 +327,36 @@ impl ModelConfig {
     }
 }
 
+/// Capabilities the loaded worker advertises during its startup handshake.
+///
+/// These are facts about the running worker rather than the checkpoint, so they
+/// arrive after the engine connects and are bound onto the model once.
+pub struct WorkerCapabilities {
+    /// Runtime generation features and resource limits.
+    pub limits: GenerationLimits,
+    /// Sampling controls the engine exposes to served requests.
+    pub sampling_controls: Vec<ServedSamplingControl>,
+    /// Effective context ceiling after intersecting model and worker limits.
+    pub max_model_tokens: u32,
+    /// Fixed media prediction count, zero for a worker that serves no video.
+    pub denoise_steps: u32,
+}
+
 impl InputProcessor {
     /// Binds model resources to verified worker capabilities without rebuilding model data.
     pub fn new(
         mut config: ModelConfig,
         tokenizer: DynTokenizer,
         renderer: Option<HfChatRenderer>,
-        limits: GenerationLimits,
-        sampling_controls: Vec<ServedSamplingControl>,
-        max_model_tokens: u32,
-        denoise_steps: u32,
+        worker: WorkerCapabilities,
         parse_reasoning: bool,
     ) -> Result<Self> {
+        let WorkerCapabilities {
+            limits,
+            sampling_controls,
+            max_model_tokens,
+            denoise_steps,
+        } = worker;
         let needs = match &config.parameters {
             ModelParameters::Qwen3 => GenerationFeatures::UNDERSTANDING,
             ModelParameters::SenseNova(profile) => {
@@ -701,6 +719,7 @@ impl InputProcessor {
     }
 
     /// Tokenizes model input and resolves its final engine and output requirements.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn preprocess_generation(
         &self,
         request_id: crate::serving::ServeRequestId,

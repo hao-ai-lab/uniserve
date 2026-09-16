@@ -117,10 +117,12 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         model_config,
         tokenizer,
         renderer,
-        engine.generation_limits(),
-        engine.served_sampling_controls(),
-        route_max_model_len,
-        engine.denoise_steps(),
+        crate::serving::WorkerCapabilities {
+            limits: engine.generation_limits(),
+            sampling_controls: engine.served_sampling_controls(),
+            max_model_tokens: route_max_model_len,
+            denoise_steps: engine.denoise_steps(),
+        },
         config.reasoning_parsing,
     )
     .context("failed to bind the configured model description")?;

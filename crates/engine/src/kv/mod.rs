@@ -854,6 +854,7 @@ impl KvCacheCoordinator {
     }
 
     /// Acquires the longest cache prefix present across every KV group atomically per block.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn acquire_prefix(
         &self,
         pool: &BlockPool,

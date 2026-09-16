@@ -58,10 +58,12 @@ fn runtime() -> ServingRuntime {
             )
             .unwrap(),
         ),
-        client.generation_limits(),
-        ServedSamplingControl::ALL.to_vec(),
-        4096,
-        0,
+        uniserve_server::serving::WorkerCapabilities {
+            limits: client.generation_limits(),
+            sampling_controls: ServedSamplingControl::ALL.to_vec(),
+            max_model_tokens: 4096,
+            denoise_steps: 0,
+        },
         false,
     )
     .unwrap();

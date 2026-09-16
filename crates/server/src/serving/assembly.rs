@@ -54,6 +54,7 @@ struct TerminalAccounting {
 }
 
 /// Applies text filtering and emits visible, reasoning, and terminal updates in order.
+#[allow(clippy::too_many_arguments)]
 async fn emit_text_update(
     context: &EmitContext<'_>,
     sink: &mut OutputSink,

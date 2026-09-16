@@ -15,17 +15,12 @@ dependencies = [
     "torchvision>=0.28,<0.29",
     "transformers>=4.57.1",
     "safetensors",
-    "einops",
-    "accelerate",
     "numpy",
     "pillow",
     "packaging<=25.0",
-    "tqdm",
-    "sentencepiece",
     "huggingface_hub",
     "diffusers>=0.36",
     "av>=14",
-    "nccl4py==0.3.1; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -35,13 +30,8 @@ eval-datasets = [
     "pyarrow<20",
 ]
 test = [
-    "coverage[toml]>=7.6",
-    "jsonschema>=4.22",
     "pytest>=8.1",
-    "pytest-rerunfailures>=14",
-    "pytest-shard>=0.1",
     "pytest-timeout>=2.3",
-    "pytest-xdist>=3.6",
 ]
 dev = [
     "build>=1.2",
@@ -172,11 +162,3 @@ typeCheckingMode = "basic"
 include = ["uniserve", "uniserve_models", "uniserve_worker", "uniserve_eval"]
 exclude = ["refs", "target", ".venv"]
 reportMissingImports = "warning"
-
-[tool.coverage.run]
-branch = true
-source = ["uniserve", "uniserve_models", "uniserve_worker", "uniserve_eval"]
-
-[tool.coverage.report]
-show_missing = true
-skip_covered = true

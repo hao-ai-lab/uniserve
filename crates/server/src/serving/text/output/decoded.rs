@@ -137,6 +137,7 @@ impl DecodeState<'_> {
     }
 
     /// Decodes one committed token, applies stop-string holdback, and emits terminal metadata.
+    #[allow(clippy::too_many_arguments)]
     async fn consume_token(
         &mut self,
         tokenizer: &HuggingFaceTokenizer,
@@ -252,6 +253,7 @@ fn decode_one_token(
 }
 
 /// Decodes one canonical generation event stream into text-runtime events.
+#[allow(clippy::too_many_arguments)]
 #[try_stream]
 pub async fn decoded_text_event_stream(
     request_id: String,

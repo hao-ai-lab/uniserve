@@ -100,7 +100,6 @@ flatbuffers-build = "0.2.4"
 flatc-fork = "0.6.0"
 
 [workspace.lints.clippy]
-too_many_arguments = "allow"
 clone_on_ref_ptr = "warn"
 large_futures = "warn"
 mem_forget = "warn"

@@ -76,6 +76,7 @@ struct RenderedImage {
 }
 
 /// Fills the SenseNova prompt, image inputs, and image-generation parameters.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn preprocess_sensenova(
     profile: &SenseNovaProfile,
     processor: &crate::serving::InputProcessor,
@@ -135,6 +136,7 @@ pub(super) fn preprocess_sensenova(
 }
 
 /// Renders Bagel input with the model's context-image conditioning rules.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn preprocess_bagel(
     profile: &BagelProfile,
     processor: &crate::serving::InputProcessor,

@@ -49,6 +49,7 @@ macro_rules! bail_server_error {
 }
 
 /// Collects a chat event stream into one non-streaming response.
+#[allow(clippy::too_many_arguments)]
 pub async fn collect_chat_completion(
     stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
     request_id: String,
@@ -335,6 +336,7 @@ async fn collect_chat_events(
 }
 
 /// Converts one serving event stream into OpenAI chat-completion chunks.
+#[allow(clippy::too_many_arguments)]
 #[try_stream]
 pub async fn chat_completion_chunk_stream(
     stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,

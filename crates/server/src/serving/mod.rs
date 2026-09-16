@@ -42,7 +42,7 @@ pub use input::{
 };
 pub use model::{
     InputProcessor, ModelSupport, ServedEndpoint, ServedFeature, ServedModality,
-    ServedSamplingControl,
+    ServedSamplingControl, WorkerCapabilities,
 };
 
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, Qwen3ChatOutputProcessor};

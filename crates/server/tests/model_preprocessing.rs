@@ -107,10 +107,12 @@ fn try_resolved_model(
         config,
         Arc::clone(&tokenizer),
         Some(renderer),
-        limits,
-        uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
-        4096,
-        0,
+        uniserve_server::serving::WorkerCapabilities {
+            limits,
+            sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
+            max_model_tokens: 4096,
+            denoise_steps: 0,
+        },
         true,
     )?;
     Ok((directory, tokenizer, model))
@@ -337,10 +339,12 @@ fn worker_context_capacity_limits_preprocessed_requests() {
         loaded.config().clone(),
         tokenizer,
         Some(renderer),
-        runtime_limits(),
-        uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
-        8,
-        0,
+        uniserve_server::serving::WorkerCapabilities {
+            limits: runtime_limits(),
+            sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
+            max_model_tokens: 8,
+            denoise_steps: 0,
+        },
         true,
     )
     .unwrap();

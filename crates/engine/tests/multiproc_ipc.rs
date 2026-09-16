@@ -2356,6 +2356,7 @@ fn text_admission(
     )?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn token_batch(
     run_id: u64,
     collective_seq: u64,

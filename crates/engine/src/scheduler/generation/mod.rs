@@ -399,6 +399,7 @@ pub(super) fn plan_decode(
 }
 
 /// Plans a feature write, retaining an exact token count only when the encoder supplies one.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plan_image_extend(
     limits: &uniserve_core::GenerationLimits,
     request: &GenerationRequest,
