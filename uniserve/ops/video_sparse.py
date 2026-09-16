@@ -9,12 +9,8 @@ into exchange shards.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import lru_cache
-
 import torch
 
-from uniserve.ops.core import Dispatcher, Operator
 from uniserve.runtime.triton import triton_available
 
 try:
@@ -685,214 +681,6 @@ def _compose_to_head_shards(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class PackQKVReq:
-    """Q/K/V projections to pack into newly allocated head-major storage."""
-
-    query: torch.Tensor
-    key: torch.Tensor
-    value: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class PoolQKVMeansReq:
-    """Q/K/V projections, tile occupancy, and caller-owned pooled outputs."""
-
-    query: torch.Tensor
-    key: torch.Tensor
-    value: torch.Tensor
-    valid_sizes: torch.Tensor
-    pooled_query: torch.Tensor
-    pooled_key: torch.Tensor
-    pooled_value: torch.Tensor
-    query_tile_offset: int = 0
-    key_tile_offset: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class ThresholdTopKReq:
-    """Tile scores and caller-owned selected-index storage."""
-
-    scores: torch.Tensor
-    output: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class AddCompressionReq:
-    """Tensors for gated composition.
-
-    Attention, gate, compression, and output tensors for gated composition.
-    """
-
-    attended: torch.Tensor
-    gate: torch.Tensor
-    compressed: torch.Tensor
-    output: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class ComposeHeadShardsReq:
-    """Values and shards for global-head composition.
-
-    Rank-local attention values and destination shards for global-head
-    composition.
-    """
-
-    attended: torch.Tensor
-    gate: torch.Tensor
-    compressed: torch.Tensor
-    outputs: tuple[torch.Tensor, ...]
-    source_rank: int
-
-
-class _TritonPackQKV(Operator):
-    """Pack Q/K/V through the Triton sparse-video kernel.
-
-    Packs query, key, and value tensors through the Triton sparse-video
-    kernel.
-    """
-
-    def __init__(self) -> None:
-        """Register the Triton QKV-packing provider identity."""
-        super().__init__("triton", "video_sparse_pack_qkv")
-
-    def can_run(self, req: PackQKVReq) -> bool:
-        """Return whether Triton can pack tensors on the query device."""
-        return triton is not None and triton_available(req.query.device)
-
-    def run(self, req: PackQKVReq) -> torch.Tensor:
-        """Allocate and return head-major packed Q/K/V storage."""
-        return _pack_qkv(req.query, req.key, req.value)
-
-
-class _TritonPoolQKVMeans(Operator):
-    """Computes per-tile Q/K/V means through the Triton sparse-video kernel."""
-
-    def __init__(self) -> None:
-        """Register the Triton tile-pooling provider identity."""
-        super().__init__("triton", "video_sparse_pool_qkv_means")
-
-    def can_run(self, req: PoolQKVMeansReq) -> bool:
-        """Return whether Triton can pool tensors on the query device."""
-        return triton is not None and triton_available(req.query.device)
-
-    def run(self, req: PoolQKVMeansReq) -> None:
-        """Fill caller-owned pooled Q/K/V buffers.
-
-        Fill caller-owned pooled Q/K/V buffers through the custom operator.
-        """
-        _pool_qkv_means_custom(
-            req.query,
-            req.key,
-            req.value,
-            req.valid_sizes,
-            req.pooled_query,
-            req.pooled_key,
-            req.pooled_value,
-            req.query_tile_offset,
-            req.key_tile_offset,
-        )
-
-
-class _TritonThresholdTopK(Operator):
-    """Selects thresholded top-k video tiles through the Triton kernel."""
-
-    def __init__(self) -> None:
-        """Register the Triton threshold-selection provider identity."""
-        super().__init__("triton", "video_sparse_threshold_topk")
-
-    def can_run(self, req: ThresholdTopKReq) -> bool:
-        """Return whether Triton can select scores on their current device."""
-        return triton is not None and triton_available(req.scores.device)
-
-    def run(self, req: ThresholdTopKReq) -> None:
-        """Fill the request's selected-index output buffer."""
-        _threshold_topk_indices_custom(req.scores, req.output)
-
-
-class _TritonAddCompression(Operator):
-    """Add compression tokens through the Triton sparse-video kernel.
-
-    Adds trained compression tokens through the Triton sparse-video kernel.
-    """
-
-    def __init__(self) -> None:
-        """Register the Triton compression-composition provider identity."""
-        super().__init__("triton", "video_sparse_add_compression")
-
-    def can_run(self, req: AddCompressionReq) -> bool:
-        """Return whether Triton can compose on the attention output device."""
-        return triton is not None and triton_available(req.attended.device)
-
-    def run(self, req: AddCompressionReq) -> None:
-        """Fill row-major composed output storage."""
-        _unpack_add_compression(
-            req.attended, req.gate, req.compressed, req.output
-        )
-
-
-class _TritonComposeHeadShards(Operator):
-    """Compose rank-local heads through the Triton sparse-video kernel.
-
-    Composes rank-local attention heads through the Triton sparse-video
-    kernel.
-    """
-
-    def __init__(self) -> None:
-        """Register the Triton head-shard composition provider identity."""
-        super().__init__("triton", "video_sparse_compose_head_shards")
-
-    def can_run(self, req: ComposeHeadShardsReq) -> bool:
-        """Return whether Triton and the destination layout are available."""
-        return (
-            triton is not None
-            and triton_available(req.attended.device)
-            and len(req.outputs) >= 1
-        )
-
-    def run(self, req: ComposeHeadShardsReq) -> None:
-        """Compose local heads directly into destination-rank output shards."""
-        _compose_to_head_shards(
-            req.attended,
-            req.gate,
-            req.compressed,
-            req.outputs,
-            req.source_rank,
-        )
-
-
-@lru_cache(maxsize=1)
-def pack_qkv_dispatcher() -> Dispatcher[PackQKVReq, torch.Tensor]:
-    """Return the process-wide sparse QKV-packing dispatcher."""
-    return Dispatcher("video_sparse_pack_qkv", [_TritonPackQKV()])
-
-
-@lru_cache(maxsize=1)
-def pool_qkv_means_dispatcher() -> Dispatcher[PoolQKVMeansReq, None]:
-    """Return the process-wide sparse tile-pooling dispatcher."""
-    return Dispatcher("video_sparse_pool_qkv_means", [_TritonPoolQKVMeans()])
-
-
-@lru_cache(maxsize=1)
-def threshold_topk_dispatcher() -> Dispatcher[ThresholdTopKReq, None]:
-    """Return the process-wide sparse threshold-selection dispatcher."""
-    return Dispatcher("video_sparse_threshold_topk", [_TritonThresholdTopK()])
-
-
-@lru_cache(maxsize=1)
-def add_compression_dispatcher() -> Dispatcher[AddCompressionReq, None]:
-    """Return the process-wide compression-composition dispatcher."""
-    return Dispatcher("video_sparse_add_compression", [_TritonAddCompression()])
-
-
-@lru_cache(maxsize=1)
-def compose_head_shards_dispatcher() -> Dispatcher[ComposeHeadShardsReq, None]:
-    """Return the process-wide head-shard composition dispatcher."""
-    return Dispatcher(
-        "video_sparse_compose_head_shards", [_TritonComposeHeadShards()]
-    )
-
-
 def pack_qkv(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
 ) -> torch.Tensor:
@@ -901,7 +689,7 @@ def pack_qkv(
     Return Q/K/V packed from ``[rows, heads, width]`` to component-head
     order.
     """
-    return pack_qkv_dispatcher().run(PackQKVReq(query, key, value))
+    return _pack_qkv(query, key, value)
 
 
 def pool_qkv_means(
@@ -916,18 +704,16 @@ def pool_qkv_means(
     key_tile_offset: int = 0,
 ) -> None:
     """Fill per-tile Q/K/V means using ``valid_sizes`` for partial tiles."""
-    pool_qkv_means_dispatcher().run(
-        PoolQKVMeansReq(
-            query,
-            key,
-            value,
-            valid_sizes,
-            pooled_query,
-            pooled_key,
-            pooled_value,
-            query_tile_offset,
-            key_tile_offset,
-        )
+    _pool_qkv_means_custom(
+        query,
+        key,
+        value,
+        valid_sizes,
+        pooled_query,
+        pooled_key,
+        pooled_value,
+        query_tile_offset,
+        key_tile_offset,
     )
 
 
@@ -937,7 +723,7 @@ def threshold_topk_indices(scores: torch.Tensor, output: torch.Tensor) -> None:
     Fill selected score-column indices, using ``output`` width as selection
     count.
     """
-    threshold_topk_dispatcher().run(ThresholdTopKReq(scores, output))
+    _threshold_topk_indices_custom(scores, output)
 
 
 def unpack_add_compression(
@@ -951,9 +737,7 @@ def unpack_add_compression(
     Fill row-major output with gated per-tile compression added to
     attention.
     """
-    add_compression_dispatcher().run(
-        AddCompressionReq(attended, gate, compressed, output)
-    )
+    _unpack_add_compression(attended, gate, compressed, output)
 
 
 def compose_to_head_shards(
@@ -968,27 +752,15 @@ def compose_to_head_shards(
     Compose local heads into destination shards at ``source_rank``'s head
     range.
     """
-    compose_head_shards_dispatcher().run(
-        ComposeHeadShardsReq(
-            attended, gate, compressed, outputs, int(source_rank)
-        )
+    _compose_to_head_shards(
+        attended, gate, compressed, outputs, int(source_rank)
     )
 
 
 __all__ = [
-    "AddCompressionReq",
-    "ComposeHeadShardsReq",
-    "PackQKVReq",
-    "PoolQKVMeansReq",
-    "ThresholdTopKReq",
-    "add_compression_dispatcher",
-    "compose_head_shards_dispatcher",
     "compose_to_head_shards",
     "pack_qkv",
-    "pack_qkv_dispatcher",
     "pool_qkv_means",
-    "pool_qkv_means_dispatcher",
-    "threshold_topk_dispatcher",
     "threshold_topk_indices",
     "unpack_add_compression",
 ]
