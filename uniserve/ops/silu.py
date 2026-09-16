@@ -321,6 +321,60 @@ if triton is not None:
             tl.store(partials_ptr + tl.program_id(0), partial)
 
     @triton.jit
+    def _swiglu_kernel(
+        value_ptr,
+        gate_ptr,
+        value_bias_ptr,
+        gate_bias_ptr,
+        output_ptr,
+        partials_ptr,
+        elements,
+        width: tl.constexpr,
+        value_row_stride: tl.constexpr,
+        gate_row_stride: tl.constexpr,
+        HAS_VALUE_BIAS: tl.constexpr,  # noqa: N803
+        HAS_GATE_BIAS: tl.constexpr,  # noqa: N803
+        RETURN_ABSMAX: tl.constexpr,  # noqa: N803
+        BLOCK: tl.constexpr,  # noqa: N803
+    ):
+        """Evaluate SwiGLU from separate value and gate channel views."""
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        offsets = offsets.to(tl.int64)
+        mask = offsets < elements
+        row = offsets // width
+        column = offsets - row * width
+
+        value = tl.load(
+            value_ptr + row * value_row_stride + column,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        gate = tl.load(
+            gate_ptr + row * gate_row_stride + column,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        if HAS_VALUE_BIAS:
+            value += tl.load(value_bias_ptr + column, mask=mask, other=0.0).to(
+                tl.float32
+            )
+        if HAS_GATE_BIAS:
+            gate += tl.load(gate_bias_ptr + column, mask=mask, other=0.0).to(
+                tl.float32
+            )
+
+        output = (value * gate / (1.0 + tl.exp(-gate))).to(
+            output_ptr.dtype.element_ty
+        )
+        tl.store(output_ptr + offsets, output, mask=mask)
+
+        if RETURN_ABSMAX:
+            partial = tl.max(
+                tl.where(mask, tl.abs(output.to(tl.float32)), 0.0), axis=0
+            )
+            tl.store(partials_ptr + tl.program_id(0), partial)
+
+    @triton.jit
     def _value_first_swiglu_fp8_kernel(
         value_gate_ptr,
         output_ptr,
@@ -376,9 +430,9 @@ if triton is not None:
         tl.store(output_ptr, tl.max(values, axis=0))
 
 
-def finish_absmax(partials: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Reduce Triton magnitude partials into a scalar of the requested dtype."""
-    maximum = torch.empty((), dtype=dtype, device=partials.device)
+def finish_absmax(partials: torch.Tensor) -> torch.Tensor:
+    """Reduce FP32 magnitude partials into an FP32 scalar."""
+    maximum = torch.empty((), dtype=torch.float32, device=partials.device)
     finish_block = triton.next_power_of_2(int(partials.numel()))
     _finish_absmax_kernel[(1,)](
         partials,
@@ -474,7 +528,7 @@ def value_first_swiglu_absmax(
     width = _validate_value_first(value_gate, bias)
     if not _value_first_inputs_eligible(value_gate):
         output = _value_first_tensor(value_gate, bias).to(value_gate.dtype)
-        return output, output.abs().amax()
+        return output, output.float().abs().amax()
 
     # The main kernel writes one magnitude partial per program; a second
     # single-program kernel reduces them to the scalar absmax.
@@ -502,7 +556,154 @@ def value_first_swiglu_absmax(
         BLOCK=block,
         num_warps=8,
     )
-    return output, finish_absmax(partials, value_gate.dtype)
+    return output, finish_absmax(partials)
+
+
+def _validate_swiglu_inputs(
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    value_bias: torch.Tensor | None,
+    gate_bias: torch.Tensor | None,
+) -> int:
+    """Validate separate value/gate views without requiring packed storage."""
+    if (
+        value.ndim < 1
+        or value.shape != gate.shape
+        or value.dtype != gate.dtype
+        or value.device != gate.device
+        or value.shape[-1] < 1
+    ):
+        raise ValueError("SwiGLU value and gate tensors must match")
+    width = int(value.shape[-1])
+    for name, bias in (("value", value_bias), ("gate", gate_bias)):
+        if bias is not None and (
+            bias.shape != (width,)
+            or bias.device != value.device
+            or bias.dtype != value.dtype
+        ):
+            raise ValueError(
+                f"SwiGLU {name} bias must match the channel width and tensor"
+            )
+    return width
+
+
+def _swiglu_tensor(
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    value_bias: torch.Tensor | None,
+    gate_bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """Evaluate separate SwiGLU inputs with FP32 arithmetic."""
+    value_fp32 = value.float()
+    gate_fp32 = gate.float()
+    if value_bias is not None:
+        value_fp32 = value_fp32 + value_bias.float()
+    if gate_bias is not None:
+        gate_fp32 = gate_fp32 + gate_bias.float()
+    return (value_fp32 * F.silu(gate_fp32)).to(value.dtype)
+
+
+def _swiglu_triton_eligible(value: torch.Tensor, gate: torch.Tensor) -> bool:
+    """Whether separate channel views can be indexed as strided rows."""
+    if not (
+        triton is not None
+        and value.is_cuda
+        and triton_available(value.device)
+        and value.stride(-1) == 1
+        and gate.stride(-1) == 1
+    ):
+        return False
+    try:
+        value.reshape(-1, value.shape[-1])
+        gate.reshape(-1, gate.shape[-1])
+    except RuntimeError:
+        return False
+    return True
+
+
+def _swiglu_separate(
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    value_bias: torch.Tensor | None,
+    gate_bias: torch.Tensor | None,
+    *,
+    return_absmax: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Run separate-input SwiGLU, optionally reducing the rounded output."""
+    width = _validate_swiglu_inputs(value, gate, value_bias, gate_bias)
+    if not _swiglu_triton_eligible(value, gate):
+        output = _swiglu_tensor(value, gate, value_bias, gate_bias)
+        return (
+            (output, output.float().abs().amax()) if return_absmax else output
+        )
+
+    value_rows = value.reshape(-1, width)
+    gate_rows = gate.reshape(-1, width)
+    output = torch.empty_like(value, memory_format=torch.contiguous_format)
+    elements = output.numel()
+    block = 32768 if return_absmax else 1024
+    partial_count = triton.cdiv(elements, block)
+    partials = (
+        torch.empty((partial_count,), dtype=torch.float32, device=value.device)
+        if return_absmax
+        else None
+    )
+    _swiglu_kernel[(partial_count,)](
+        value_rows,
+        gate_rows,
+        value_bias,
+        gate_bias,
+        output,
+        partials,
+        elements=elements,
+        width=width,
+        value_row_stride=value_rows.stride(0),
+        gate_row_stride=gate_rows.stride(0),
+        HAS_VALUE_BIAS=value_bias is not None,
+        HAS_GATE_BIAS=gate_bias is not None,
+        RETURN_ABSMAX=return_absmax,
+        BLOCK=block,
+        num_warps=8 if return_absmax else 4,
+    )
+    return (output, finish_absmax(partials)) if return_absmax else output
+
+
+def swiglu(
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    *,
+    value_bias: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply SwiGLU to separate value and gate channel views.
+
+    Separate views let merged projections preserve their shared backing rather
+    than copying both branches into a reversed packed layout.
+    """
+    return _swiglu_separate(
+        value,
+        gate,
+        value_bias,
+        gate_bias,
+        return_absmax=False,
+    )
+
+
+def swiglu_absmax(
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    *,
+    value_bias: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return separate-input SwiGLU and its rounded-output FP32 absmax."""
+    return _swiglu_separate(
+        value,
+        gate,
+        value_bias,
+        gate_bias,
+        return_absmax=True,
+    )
 
 
 def value_first_swiglu_fp8(

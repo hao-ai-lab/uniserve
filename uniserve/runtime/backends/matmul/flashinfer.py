@@ -4,8 +4,14 @@ import torch
 
 from uniserve.quantization import QuantizedTensor, ScaleLayout
 
+from . import Backend as _IndependentBackend
 from . import Operator as _Operator
-from .grouped import Backend as _Backend
+from .grouped import Backend as _GroupedBackend
+
+
+def _requires_grouped(weights):
+    """Whether standalone block GEMMs reject a projection's dimensions."""
+    return any(min(weight.shape) < 128 for weight in weights.values())
 
 
 class _FlashInferOperator(_Operator):
@@ -73,5 +79,73 @@ class _FlashInferOperator(_Operator):
         return out if target is out else out.copy_(target)
 
 
-class Backend(_Backend):
+class Backend(_GroupedBackend):
+    """Prepare native block GEMMs with size-appropriate output ownership.
+
+    Large independent branches write directly to their contiguous BF16
+    destinations. FlashInfer rejects block GEMMs below 128 rows or columns, so
+    those projections retain the grouped kernel that supports small matrices.
+    """
+
     operator_class = _FlashInferOperator
+
+    def merged_workspace_buffers(
+        self,
+        weights,
+        *,
+        input_dtype,
+        input_quantizer,
+        max_rows,
+        branch_width,
+        output_dtype,
+    ):
+        if _requires_grouped(weights):
+            return super().merged_workspace_buffers(
+                weights,
+                input_dtype=input_dtype,
+                input_quantizer=input_quantizer,
+                max_rows=max_rows,
+                branch_width=branch_width,
+                output_dtype=output_dtype,
+            )
+        return _IndependentBackend.merged_workspace_buffers(
+            self,
+            weights,
+            input_dtype=input_dtype,
+            input_quantizer=input_quantizer,
+            max_rows=max_rows,
+            branch_width=branch_width,
+            output_dtype=output_dtype,
+        )
+
+    def prepare_merged(
+        self,
+        weights,
+        *,
+        input_dtype,
+        input_quantizer,
+        max_rows,
+        branch_width,
+        output_dtype,
+        workspace,
+    ):
+        if _requires_grouped(weights):
+            return super().prepare_merged(
+                weights,
+                input_dtype=input_dtype,
+                input_quantizer=input_quantizer,
+                max_rows=max_rows,
+                branch_width=branch_width,
+                output_dtype=output_dtype,
+                workspace=workspace,
+            )
+        return _IndependentBackend.prepare_merged(
+            self,
+            weights,
+            input_dtype=input_dtype,
+            input_quantizer=input_quantizer,
+            max_rows=max_rows,
+            branch_width=branch_width,
+            output_dtype=output_dtype,
+            workspace=workspace,
+        )

@@ -103,6 +103,46 @@ def test_quantizer_rejects_unsupported_format_axis_combinations(format, axis):
         Quantizer(format, axis=axis)
 
 
+def test_calibrated_nvfp4_scale_is_validated_and_frozen():
+    for value in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="calibrated amax"):
+            Quantizer("nvfp4", calibrated_amax=value)
+    with pytest.raises(ValueError, match="calibrated amax"):
+        Quantizer("fp8", calibrated_amax=1.0)
+
+    calibrated = Quantizer("nvfp4", calibrated_amax=24.0)
+    assert calibrated.calibrated_amax == 24.0
+
+
+@pytest.mark.gpu
+def test_calibrated_nvfp4_scale_is_cuda_graph_capturable():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (
+        10,
+        0,
+    ):
+        pytest.skip("NVFP4 graph capture requires an SM100-class CUDA device")
+    source = torch.randn(8, 32, device="cuda", dtype=torch.bfloat16)
+    quantizer = Quantizer("nvfp4", calibrated_amax=24.0)
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        quantizer.quantize(source)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        encoded = quantizer.quantize(source)
+    graph.replay()
+
+    torch.testing.assert_close(
+        encoded.buffers()["tensor_scale"],
+        torch.tensor(24.0 / (448.0 * 6.0), device="cuda"),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_fp8_encoding_rejects_incomplete_or_incompatible_backing():
     converter = Quantizer("fp8", axis=0)
     fields = {

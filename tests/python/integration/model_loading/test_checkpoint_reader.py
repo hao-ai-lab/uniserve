@@ -75,6 +75,39 @@ def test_fp8_source_slices_keep_original_scales(tmp_path, axis):
         )
 
 
+def test_modelopt_nvfp4_source_preserves_packed_values_and_scales(tmp_path):
+    values = torch.tensor(
+        [
+            [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE],
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF],
+        ],
+        dtype=torch.uint8,
+    )
+    scale = torch.tensor([[2.0], [1.0]], dtype=torch.float8_e4m3fn)
+    tensor_scale = torch.tensor(0.25, dtype=torch.float32)
+    save_file(
+        {
+            "layer.weight_packed": values,
+            "layer.weight_scale": scale,
+            "layer.weight_tensor_scale": tensor_scale,
+        },
+        tmp_path / "model.safetensors",
+    )
+
+    io = Config()
+    with checkpoint.Config().resolve(tmp_path, io=io).open(io=io) as reader:
+        weight = reader.get("layer.weight")
+        assert isinstance(weight, checkpoint.NVFP4Weight)
+        encoded = weight.read((slice(1, 2), slice(0, 16)))
+        assert torch.equal(encoded.buffers()["values"], values[1:2])
+        assert torch.equal(
+            encoded.buffers()["block_scale"], scale[1:2].view(torch.uint8)
+        )
+        torch.testing.assert_close(
+            encoded.buffers()["tensor_scale"], tensor_scale
+        )
+
+
 def test_index_and_checksum_enforce_declared_file_set(tmp_path):
     path = tmp_path / "model.safetensors"
     save_file({"weight": torch.ones(2)}, path)

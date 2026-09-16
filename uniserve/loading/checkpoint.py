@@ -310,6 +310,65 @@ class FP8Weight(Weight):
 
 
 @dataclass(frozen=True, slots=True)
+class NVFP4Weight(Weight):
+    """Expose packed ModelOpt NVFP4 values in their calibrated scale domain."""
+
+    name: str
+    values: Weight
+    block_scale: Weight
+    tensor_scale: Weight
+    dtype: torch.dtype = torch.bfloat16
+
+    def __post_init__(self):
+        if (
+            len(self.values.shape) != 2
+            or self.values.dtype != torch.uint8
+            or self.block_scale.dtype not in {torch.uint8, torch.float8_e4m3fn}
+            or self.tensor_scale.dtype != torch.float32
+            or math.prod(self.tensor_scale.shape) != 1
+        ):
+            raise ValueError(
+                "NVFP4 checkpoint requires packed U8 matrices, E4M3 K16 "
+                "scales and one FP32 tensor scale"
+            )
+        rows, packed_columns = self.values.shape
+        if self.block_scale.shape != (rows, packed_columns // 8):
+            raise ValueError(
+                "NVFP4 block scales must contain one E4M3 value per K16 block"
+            )
+
+    @property
+    def shape(self):
+        return (self.values.shape[0], self.values.shape[1] * 2)
+
+    def read(self, region=None) -> QuantizedTensor:
+        region = _region(self.shape, region)
+        rows, columns = region
+        if columns.start % 16 or columns.stop % 16:
+            raise ValueError(
+                "NVFP4 checkpoint slices must preserve complete K16 blocks"
+            )
+        values = self.values.read(
+            (rows, slice(columns.start // 2, columns.stop // 2))
+        ).contiguous()
+        scales = self.block_scale.read(
+            (rows, slice(columns.start // 16, columns.stop // 16))
+        ).contiguous()
+        if scales.dtype == torch.float8_e4m3fn:
+            scales = scales.view(torch.uint8)
+        tensor_scale = self.tensor_scale.read().reshape(()).contiguous()
+        return Quantizer("nvfp4").from_tensors(
+            {
+                "values": values,
+                "block_scale": scales,
+                "tensor_scale": tensor_scale,
+            },
+            shape=(rows.stop - rows.start, columns.stop - columns.start),
+            dtype=self.dtype,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _ScaleWeight(Weight):
     """Interpret singleton or vector checkpoint scales.
 
@@ -387,6 +446,31 @@ class Reader:
                         logical, shape, dtype, self, logical
                     )
                     self._locations[logical] = (path, name)
+        self._weights = dict(sorted(self._weights.items()))
+
+        # ModelOpt exports two E2M1 values per byte, one E4M3 scale per K16
+        # block, and one FP32 tensor multiplier. Present them under the
+        # original logical ``.weight`` name so architecture mappings and TP
+        # slicing remain identical to an unquantized checkpoint.
+        for name, values in tuple(self._weights.items()):
+            if not name.endswith(".weight_packed"):
+                continue
+            prefix = name.removesuffix(".weight_packed")
+            logical = prefix + ".weight"
+            if logical in self._weights:
+                raise ValueError(
+                    f"NVFP4 checkpoint {logical!r} also contains a dense weight"
+                )
+            block_scale = self._weights.get(prefix + ".weight_scale")
+            tensor_scale = self._weights.get(prefix + ".weight_tensor_scale")
+            if block_scale is None or tensor_scale is None:
+                raise ValueError(
+                    f"NVFP4 checkpoint {logical!r} requires block and tensor "
+                    "scales"
+                )
+            self._weights[logical] = NVFP4Weight(
+                logical, values, block_scale, tensor_scale
+            )
         self._weights = dict(sorted(self._weights.items()))
 
         # Pair serialized E4M3 weights with their weight_scale tensors into
@@ -553,7 +637,11 @@ class _DummyReader(Reader):
     def _read(self, logical, region):
         self._require_open()
         weight = self._weights[logical]
-        raw = weight.values if isinstance(weight, FP8Weight) else weight
+        raw = (
+            weight.values
+            if isinstance(weight, (FP8Weight, NVFP4Weight))
+            else weight
+        )
 
         seed = int.from_bytes(
             hashlib.sha256(logical.encode()).digest()[:8], "little"
@@ -568,7 +656,11 @@ class _DummyReader(Reader):
         # A tensor serving as an FP8 scale domain must dequantize to the
         # values' original magnitudes, not random noise.
         if any(
-            isinstance(item, FP8Weight) and item.scale.name == logical
+            (isinstance(item, FP8Weight) and item.scale.name == logical)
+            or (
+                isinstance(item, NVFP4Weight)
+                and item.tensor_scale.name == logical
+            )
             for item in self._weights.values()
         ):
             value.fill_(1.0)

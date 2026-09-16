@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve.ops import value_first_swiglu_absmax
+from uniserve.ops import swiglu, swiglu_absmax, value_first_swiglu_absmax
 from uniserve.ops.patch import unpatchify_video_tokens
 from uniserve.ops.residual import (
     scaled_residual_layer_norm_absmax,
@@ -51,8 +51,9 @@ def test_normalization_and_magnitude_preserve_rms_values(device, width) -> None:
         actual_normalized, expected_normalized, rtol=2e-2, atol=2e-2
     )
     torch.testing.assert_close(
-        actual_maximum, actual_normalized.abs().amax(), rtol=0, atol=0
+        actual_maximum, actual_normalized.float().abs().amax(), rtol=0, atol=0
     )
+    assert actual_maximum.dtype is torch.float32
 
     residual = (
         hidden.double()
@@ -80,8 +81,12 @@ def test_normalization_and_magnitude_preserve_rms_values(device, width) -> None:
         atol=2e-2,
     )
     torch.testing.assert_close(
-        actual_maximum, actual_residual_normalized.abs().amax(), rtol=0, atol=0
+        actual_maximum,
+        actual_residual_normalized.float().abs().amax(),
+        rtol=0,
+        atol=0,
     )
+    assert actual_maximum.dtype is torch.float32
 
 
 @pytest.mark.parametrize("width", (257, 2048))
@@ -113,7 +118,10 @@ def test_layernorm_and_magnitude_preserve_affine_values(device, width) -> None:
         eps=eps,
     )
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(maximum, actual.abs().amax(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        maximum, actual.float().abs().amax(), rtol=0, atol=0
+    )
+    assert maximum.dtype is torch.float32
 
 
 def test_swiglu_and_magnitude_preserve_gated_values(device) -> None:
@@ -130,7 +138,40 @@ def test_swiglu_and_magnitude_preserve_gated_values(device) -> None:
     expected = (value * torch.nn.functional.silu(gate)).to(value_gate.dtype)
     actual, maximum = value_first_swiglu_absmax(value_gate, bias)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(maximum, actual.abs().amax(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        maximum, actual.float().abs().amax(), rtol=0, atol=0
+    )
+    assert maximum.dtype is torch.float32
+
+
+@pytest.mark.parametrize("layout", ("separate", "reversed_views"))
+def test_separate_swiglu_avoids_packed_layout_requirements(
+    device, layout
+) -> None:
+    torch.manual_seed(49)
+    rows, width = 17, 2048
+    value = torch.randn((rows, width), dtype=torch.bfloat16, device=device)
+    gate = torch.randn_like(value)
+    if layout == "reversed_views":
+        backing = torch.cat((gate, value), dim=-1)
+        gate, value = backing.chunk(2, dim=-1)
+    value_bias = torch.randn((width,), dtype=value.dtype, device=device)
+    gate_bias = torch.randn_like(value_bias)
+
+    expected = (
+        (value.double() + value_bias.double())
+        * torch.nn.functional.silu(gate.double() + gate_bias.double())
+    ).to(value.dtype)
+    options = {"value_bias": value_bias, "gate_bias": gate_bias}
+    torch.testing.assert_close(
+        swiglu(value, gate, **options), expected, rtol=2e-2, atol=2e-2
+    )
+    actual, maximum = swiglu_absmax(value, gate, **options)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(
+        maximum, actual.float().abs().amax(), rtol=0, atol=0
+    )
+    assert maximum.dtype is torch.float32
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
@@ -289,7 +330,8 @@ def test_scaled_residual_normalizes_the_unrounded_fp32_sum(device, width):
     torch.testing.assert_close(actual_hidden, residual)
     torch.testing.assert_close(hidden, residual)
     torch.testing.assert_close(actual, expected)
-    assert torch.equal(magnitude, actual.abs().amax())
+    assert torch.equal(magnitude, actual.float().abs().amax())
+    assert magnitude.dtype is torch.float32
 
 
 @pytest.mark.parametrize(

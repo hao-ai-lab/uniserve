@@ -37,6 +37,8 @@ from uniserve.ops.rope import (
 )
 from uniserve.ops.silu import (
     silu_and_mul_fp8,
+    swiglu,
+    swiglu_absmax,
     value_first_swiglu,
     value_first_swiglu_absmax,
     value_first_swiglu_fp8,
@@ -47,6 +49,8 @@ __all__ = [
     "gated_residual",
     "gated_residual_rms_norm",
     "gated_residual_rms_norm_fp8",
+    "swiglu",
+    "swiglu_absmax",
     "value_first_swiglu",
     "value_first_swiglu_absmax",
     "value_first_swiglu_fp8",

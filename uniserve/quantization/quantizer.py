@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from math import prod
@@ -34,6 +35,7 @@ class Quantizer:
 
     format: Literal["fp8", "mxfp8", "nvfp4"]
     axis: Literal[0] | None = field(default=None, kw_only=True)
+    calibrated_amax: float | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         if self.format not in {"fp8", "mxfp8", "nvfp4"}:
@@ -43,6 +45,17 @@ class Quantizer:
         ):
             raise ValueError(
                 "only FP8 supports the retained statistical axis zero"
+            )
+        if self.calibrated_amax is not None and (
+            self.format != "nvfp4"
+            or self.axis is not None
+            or not isinstance(self.calibrated_amax, (int, float))
+            or isinstance(self.calibrated_amax, bool)
+            or not math.isfinite(self.calibrated_amax)
+            or self.calibrated_amax <= 0
+        ):
+            raise ValueError(
+                "calibrated amax requires one positive finite NVFP4 scalar"
             )
 
     def _shape(self, shape, dtype):
@@ -267,7 +280,18 @@ class Quantizer:
                 if rowwise(x, fields["values"], fields["scale"]):
                     return target
 
-        if amax is None and self.format != "mxfp8":
+        # A calibrated activation tensor scale is a checkpoint fact. Runtime
+        # callers may still supply scratch statistics used by the dynamic
+        # path, but those must never replace the frozen calibration domain.
+        if self.calibrated_amax is not None:
+            # A host-to-device scalar copy is illegal while a CUDA graph is
+            # being captured. Fill graph-owned device storage instead; the
+            # immutable Python value remains the checkpoint fact and replay
+            # never searches or changes it.
+            amax = torch.empty((), dtype=torch.float32, device=x.device).fill_(
+                self.calibrated_amax
+            )
+        elif amax is None and self.format != "mxfp8":
             amax = self.amax(x, distribution=distribution)
 
         layout = ScaleLayout.LINEAR if out is None else out.scale_layout

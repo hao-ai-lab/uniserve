@@ -458,14 +458,34 @@ def _merged_linear(
         )
 
     if out is None:
-        # Logical branches share caller-owned output storage. A fused GEMM can
-        # write this matrix directly, and its consumers can borrow adjacent
-        # channels without concatenating or depending on execution scratch.
-        widths = tuple(weight.shape[0] for weight in weights.values())
-        packed = torch.empty(
-            (*x.shape[:-1], sum(widths)), dtype=dtype, device=x.device
+        block_scaled = all(
+            isinstance(weight, QuantizedTensor)
+            and weight.quantizer.format in {"nvfp4", "mxfp8"}
+            for weight in weights.values()
         )
-        outputs = dict(zip(weights, packed.split(widths, dim=-1), strict=True))
+        if block_scaled:
+            # Independent block-scaled branches have distinct tensor-scale
+            # domains and therefore distinct GEMMs. Give each native kernel a
+            # contiguous destination instead of copying from a temporary into
+            # channel views of an output it cannot fuse.
+            outputs = {
+                name: torch.empty(
+                    (*x.shape[:-1], weight.shape[0]),
+                    dtype=dtype,
+                    device=x.device,
+                )
+                for name, weight in weights.items()
+            }
+        else:
+            # Fusable branches share caller-owned output storage so one GEMM
+            # can write the complete channel matrix directly.
+            widths = tuple(weight.shape[0] for weight in weights.values())
+            packed = torch.empty(
+                (*x.shape[:-1], sum(widths)), dtype=dtype, device=x.device
+            )
+            outputs = dict(
+                zip(weights, packed.split(widths, dim=-1), strict=True)
+            )
     else:
         outputs = out
 

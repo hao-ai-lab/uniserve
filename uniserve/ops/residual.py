@@ -432,7 +432,7 @@ def weighted_rms_norm_absmax(
     """Return normalized activation rows and their global absolute maximum."""
     if not _fused_rows(hidden, weight):
         output = weighted_rms_norm(hidden, weight, eps=eps)
-        return output, output.abs().amax()
+        return output, output.float().abs().amax()
 
     output_dtype = (
         torch.get_autocast_dtype("cuda")
@@ -453,7 +453,7 @@ def weighted_rms_norm_absmax(
         BLOCK=triton.next_power_of_2(int(hidden.shape[-1])),
         num_warps=8,
     )
-    return output, finish_absmax(partials, output.dtype)
+    return output, finish_absmax(partials)
 
 
 def scaled_residual_rms_norm_(
@@ -532,8 +532,8 @@ def scaled_residual_rms_norm_absmax_(
     Update a residual in place and return normalized values with their
     magnitude.
 
-    Returns ``(residual, normalized, absmax)`` where ``absmax`` is a scalar of
-    the normalized output's dtype.
+    Returns ``(residual, normalized, absmax)`` where ``absmax`` is an FP32
+    scalar over the rounded normalized output.
     """
     if hidden.shape != update.shape or hidden.device != update.device:
         raise ValueError(
@@ -552,7 +552,7 @@ def scaled_residual_rms_norm_absmax_(
             update_bias=update_bias,
             eps=eps,
         )
-        return hidden, output, output.abs().amax()
+        return hidden, output, output.float().abs().amax()
 
     output_dtype = (
         torch.get_autocast_dtype("cuda")
@@ -577,7 +577,7 @@ def scaled_residual_rms_norm_absmax_(
         BLOCK=triton.next_power_of_2(int(hidden.shape[-1])),
         num_warps=8,
     )
-    return hidden, output, finish_absmax(partials, output.dtype)
+    return hidden, output, finish_absmax(partials)
 
 
 def scaled_residual_(
@@ -715,7 +715,7 @@ def scaled_residual_layer_norm_absmax(
             update_bias=update_bias,
             eps=eps,
         )
-        return output, output.abs().amax()
+        return output, output.float().abs().amax()
 
     output_dtype = (
         torch.get_autocast_dtype("cuda")
@@ -741,4 +741,4 @@ def scaled_residual_layer_norm_absmax(
         BLOCK=triton.next_power_of_2(int(hidden.shape[-1])),
         num_warps=8,
     )
-    return output, finish_absmax(partials, output.dtype)
+    return output, finish_absmax(partials)

@@ -127,6 +127,13 @@ def _full(shape):
 def _source_names(weight):
     if isinstance(weight, checkpoint.FP8Weight):
         return _source_names(weight.values) | _source_names(weight.scale)
+    if isinstance(weight, checkpoint.NVFP4Weight):
+        return {
+            weight.name,
+            *_source_names(weight.values),
+            *_source_names(weight.block_scale),
+            *_source_names(weight.tensor_scale),
+        }
     return {weight.name}
 
 
@@ -137,6 +144,14 @@ def _source_identity(weight):
             _source_identity(weight.values),
             _source_identity(weight.scale),
             weight.axis,
+            weight.dtype,
+        )
+    if isinstance(weight, checkpoint.NVFP4Weight):
+        return (
+            type(weight),
+            _source_identity(weight.values),
+            _source_identity(weight.block_scale),
+            _source_identity(weight.tensor_scale),
             weight.dtype,
         )
     return id(weight)
@@ -628,12 +643,12 @@ class _Loader:
         if (
             quantizer is not None
             and isinstance(value, QuantizedTensor)
-            and quantizer.format == value.quantizer.format == "fp8"
+            and quantizer.format == value.quantizer.format
+            and quantizer.format in {"fp8", "nvfp4"}
         ):
-            # A serialized FP8 scale describes the checkpoint's complete
-            # statistical domain. Selecting FP8 execution does not derive a
-            # smaller per-row or rank-local scale from that already encoded
-            # value.
+            # Serialized FP8 and NVFP4 scales describe the checkpoint's
+            # complete statistical domain. Execution must not derive a
+            # rank-local replacement from already encoded values.
             pass
         elif quantizer is not None:
             owner, _ = self._owners[key]
