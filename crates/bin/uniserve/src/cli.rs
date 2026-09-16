@@ -547,8 +547,6 @@ mod tests {
             "off",
             "--prefill-cuda-graph",
             "true",
-            "--flashinfer-fast-decode-plan",
-            "false",
             "--worker-mesh",
             "tower=text:cpu",
             "--lane",
