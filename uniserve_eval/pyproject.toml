@@ -1,0 +1,34 @@
+# Packages the benchmark and evaluation driver independently from the serving
+# runtime. The driver speaks HTTP to a running server and is never imported by
+# it, so the inference distribution must not carry its dependencies or install
+# its console script.
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uniserve-eval"
+version = "0.2.0"
+description = "UniServe benchmark and evaluation driver"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx[socks]>=0.27",
+    "pillow>=10.4",
+]
+
+[project.optional-dependencies]
+# Hub-hosted evaluation datasets (MJHQ-30K, UEval, ShareGPT, PIE-Bench, Beans).
+datasets = [
+    "datasets>=3",
+    "pyarrow<20",
+]
+
+[project.scripts]
+uniserve-eval = "uniserve_eval.cli:main"
+
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["uniserve_eval*"]
+
+[tool.setuptools.package-data]
+uniserve_eval = ["profiles.toml"]

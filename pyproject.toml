@@ -24,11 +24,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Hub-hosted evaluation datasets (MJHQ-30K, UEval, ShareGPT, PIE-Bench, Beans).
-eval-datasets = [
-    "datasets>=3",
-    "pyarrow<20",
-]
 test = [
     "pytest>=8.1",
     "pytest-timeout>=2.3",
@@ -41,9 +36,7 @@ dev = [
     "ruff>=0.6",
 ]
 bench = [
-    "datasets>=2.0",
-    "httpx[socks]>=0.27",
-    "pillow>=10.4",
+    "uniserve-eval[datasets]",
 ]
 # Optional accelerator kernels. Model bindings require their declared native
 # capabilities at startup. UniServe kernels live in the independent
@@ -67,19 +60,17 @@ h3 = [
 
 [tool.uv.sources]
 uniserve-kernel = { path = "uniserve_kernel", editable = true }
+uniserve-eval = { path = "uniserve_eval", editable = true }
 
 [project.scripts]
 uniserve-worker = "uniserve_worker.main:main"
-uniserve-eval = "uniserve_eval.cli:main"
 
 [tool.setuptools.packages.find]
-# Optional UniServe kernels are packaged independently
-# (`uniserve_kernel/pyproject.toml`) so the root worker distribution cannot mask
-# a missing kernel install.
-include = ["uniserve", "uniserve.*", "uniserve_models*", "uniserve_worker*", "uniserve_eval*"]
-
-[tool.setuptools.package-data]
-uniserve_eval = ["profiles.toml"]
+# Optional UniServe kernels and the benchmark driver are packaged independently
+# (`uniserve_kernel/pyproject.toml`, `uniserve_eval/pyproject.toml`) so the root
+# serving distribution cannot mask a missing kernel install and does not ship a
+# console script whose dependencies it never declares.
+include = ["uniserve", "uniserve.*", "uniserve_models*", "uniserve_worker*"]
 
 # Native worker IPC extension (PyO3).
 [[tool.setuptools-rust.ext-modules]]
