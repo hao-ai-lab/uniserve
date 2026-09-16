@@ -14,6 +14,34 @@ The authorized objective governs all work. Measure progress by delivered behavio
 - Separate observed facts, measurements, metric-derived conclusions, supported causes, hypotheses, and unproven profiling targets. Never report a plausible explanation as a demonstrated root cause.
 - Continue authorized work until the intended outcome is complete or a genuine external impasse remains. Effort, activity, and procedural completeness do not substitute for delivery.
 
+## Common Development Workflow
+
+### Environment and Discovery
+
+- Work from the repository root and use the repository environment explicitly, normally `.venv/bin/python`, so commands do not silently select a different interpreter. Bootstrap a basic editable installation with `scripts/bootstrap.sh`; for a complete developer environment use `uv sync --locked --python /usr/bin/python3.12 --extra dev --extra test --extra bench` and add `--extra gpu` for general GPU development or `--extra h3` for FastH3 work. Preserve the lockfile and do not replace pinned accelerator packages with ad hoc versions during formal validation.
+- Begin with `git status --short`, then use `rg` and `rg --files` to locate owners, callers, tests, configuration, and documentation. Read the relevant public contract and implementation before editing. Treat pre-existing modifications as user work and do not reformat, stage, revert, or overwrite unrelated files.
+- Use the repository's existing public interfaces and ownership boundaries. When a change crosses Python, Rust, model, worker, or evaluation packages, trace the complete request and data path before deciding where the behavior belongs.
+
+### Edit and Validate
+
+- Make the smallest coherent change that fully implements the required behavior, including affected callers, tests, configuration, and documentation. Use `apply_patch` for source edits; use project formatters only for mechanical formatting.
+- Run the narrowest behavior-oriented test first, for example `.venv/bin/python -m pytest -q path/to/test_file.py`. Select broader suites by their declared markers: `just test-python-fast`, `just test-python-integration`, and `just test-python-e2e`. GPU end-to-end tests require the documented model assets and `UNISERVE_RUN_GPU_E2E=1`; do not substitute a simulated result for a required GPU run.
+- Check Python changes with `.venv/bin/python -m ruff check <paths>` and `.venv/bin/python -m ruff format --check <paths>`. Use `just lint` when the change warrants the complete Python and Rust lint surface. Run `just fmt`, `just clippy`, and `just test-rust` for Rust changes, and use `just test-all` only when the full repository suite is justified by the change scope.
+- Reinstall the editable package or rebuild the affected native target after changing build metadata, PyO3 bindings, or Rust binaries. Do not rely on a stale `target/` binary or an extension built from earlier sources.
+- Before handoff, run `git diff --check`, inspect the final diff and status, and report the exact checks actually completed. Distinguish unrun checks from failures and from checks that require unavailable hardware or assets.
+
+### Serving, Evaluation, and Artifacts
+
+- Start serving through `uniserve serve <model> --model-description <description> --served-model-name <name>` and inspect `uniserve serve --help` for current options. Resolve evaluation configuration with `.venv/bin/uniserve-eval --config <profiles> plan <profile>` before an artifact-producing run, then execute the fixed profile with the matching `run` command.
+- Keep generated checkpoints, profiles, logs, media, and benchmark outputs under `artifacts/` in stable domain-specific paths. The directory is Git-ignored; commit only source, tests, release documentation, and small fixtures that are required to reproduce behavior. Never add credentials, local model assets, downloaded dependencies, or machine-specific caches.
+- Apply the benchmark and evaluation rules below to every formal measurement. Run measurement points serially, preserve failed or superseded evidence outside the canonical result path, and make the canonical artifact unambiguous rather than overwriting history silently.
+
+### Commits
+
+- Organize commits around complete, reviewable behavior. Stage files deliberately and inspect `git diff --cached` before each commit; do not sweep unrelated working-tree changes into the commit.
+- Use `type(scope): imperative summary` subjects, with established types such as `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `style`, `build`, and `chore`. Keep the subject concise and add a body that explains the delivered behavior, important design or protocol constraints, and validation performed. Do not put conversational history, secrets, temporary paths, or unsupported claims in commit messages.
+- Split independently reviewable changes when they have distinct ownership or rollback boundaries, but keep implementation, required tests, and directly corresponding documentation together when separating them would leave an invalid intermediate commit.
+
 ## Model Library Boundary
 
 - Do not introduce project-owned types named with `Geometry` or `Gemotry`, including aliases and compatibility wrappers. Remove the existing types in the library refactor described by `specs/library-refactor.md`. Do not preserve generic objects that bundle unrelated dimensions, configuration, capacity, placement, or execution state by merely renaming them to Config, Layout, or another suffix; put each value with its actual owner and pass only the information its consumer needs.
