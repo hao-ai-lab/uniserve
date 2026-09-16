@@ -19,7 +19,7 @@ _formats = {
     "bf16": ("bf16", "bf16", "bf16", "fp16"),
     "balanced": ("bf16", "bf16", "bf16", "nvfp4"),
     "performance": ("bf16", "fp8", "bf16", "nvfp4"),
-    "maximum": ("nvfp4", "mxfp8", "fp8", "nvfp4"),
+    "maximum": ("bf16", "nvfp4", "fp8", "nvfp4"),
     "fp8": ("fp8", "fp8", "bf16", "fp16"),
     "mxfp8": ("bf16", "mxfp8", "bf16", "fp16"),
     "nvfp4": ("nvfp4", "nvfp4", "nvfp4", "nvfp4"),
@@ -101,6 +101,11 @@ def weight_config(
     else:
         dtype = torch.bfloat16
         quantization[f"{path}.decoder.output"] = encoded(video_vae)
+        # The decoder input weight selects the autocast dtype for the complete
+        # VAE invocation. NVFP4 projections natively consume and emit BF16, so
+        # keep both unquantized boundary projections at that compute boundary.
+        dtypes[f"{path}.post_quant_conv"] = dtype
+        dtypes[f"{path}.decoder.input"] = dtype
         dtypes[f"{path}.decoder.output"] = dtype
 
     for index in range(VideoConfig().decoder_num_layers):

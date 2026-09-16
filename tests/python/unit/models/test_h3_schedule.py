@@ -38,7 +38,7 @@ def test_fixed_modality_endpoints():
 def test_rejects_untrained_schedule(steps, shift):
     with torch.device("meta"):
         model = Denoiser(TransformerConfig(), DiffusionConfig())
-    with pytest.raises(ValueError, match="four evaluations"):
+    with pytest.raises(ValueError, match="4 evaluations"):
         model.make_schedules(steps, shift=shift, device="cpu")
 
 

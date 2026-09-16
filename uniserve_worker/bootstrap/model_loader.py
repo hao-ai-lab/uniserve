@@ -112,6 +112,19 @@ def _weight_config(source, options, execution) -> weights.Config:
             "precision mode and quant_method are mutually exclusive"
         )
 
+    checkpoint_format = source.checkpoint_format
+    numerical_overrides = options.keys() & {
+        "mode",
+        "quant_method",
+        "components",
+        "ignored_layers",
+    }
+    if checkpoint_format is not None and numerical_overrides:
+        raise ValueError(
+            f"checkpoint format {checkpoint_format!r} owns its numerical "
+            "configuration; remove --quantization-config"
+        )
+
     selected = options.get("mode", options.get("quant_method"))
     components = options.get("components", {})
     if not isinstance(components, Mapping):

@@ -14,6 +14,7 @@ from .denoiser import Denoiser
 from .encoder import TextEncoder, TextEncoderConfig
 from .inputs import AttentionInput, DenoiserInput, DenoiserSize
 from .model import Model, entry_paths, entry_points
+from .modelopt import calibrated_weight_config
 from .modulation import OutputNorm, TimestepEmbedding
 from .output import VideoPostprocessor
 from .packing import Packing
@@ -57,4 +58,5 @@ __all__ = [
     "entry_paths",
     "precisions",
     "weight_config",
+    "calibrated_weight_config",
 ]

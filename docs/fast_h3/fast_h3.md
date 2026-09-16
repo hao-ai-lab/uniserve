@@ -141,7 +141,7 @@ Precision is selected at startup with `--quantization-config`:
 | `quality` | BF16 | BF16 | BF16 | FP16 |
 | `balanced` (default) | BF16 | BF16 | BF16 | NVFP4 |
 | `performance` | BF16 | FP8 | BF16 | NVFP4 |
-| `maximum` | NVFP4 | MXFP8 | FP8 | NVFP4 |
+| `maximum` | BF16 | NVFP4 | FP8 | NVFP4 |
 
 Example:
 
@@ -151,10 +151,22 @@ Example:
 
 `--graph-policy auto` captures supported entries, `full` requires every declared numerical entry to capture, and `off` disables CUDA graphs. Precision, placement, duration capacity, prompt capacity, and graph policy are startup settings; restart the server after changing them.
 
+The four named modes above are runtime dynamic-quantization presets for dense checkpoints. A packed ModelOpt PTQ checkpoint is self-describing and loads without `--quantization-config`. Its static activation tensor scales come from the recorded calibration cohort; the runtime computes only the per-input K16 NVFP4 block encoding and does not search a new global scale. Packed checkpoints reject runtime precision presets and component overrides because their weights and scales form one immutable numerical contract.
+
+UniServe can load the published packed checkpoints directly from the Hub. Both [the 4-step NVFP4 checkpoint](https://huggingface.co/skx618/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) and [the 8-step NVFP4 checkpoint](https://huggingface.co/skx618/FastVideo-FastH3-8-Step-V2-NVFP4) quantize their calibrated denoiser MLP and Video VAE Transformer projections while retaining the BF16 text encoder. Each repository's `modelopt_manifest.json` is the authoritative component and scale contract.
+
+```bash
+uniserve serve skx618/FastVideo-FastH3-8-Step-V2-NVFP4 \
+  --worker-ranks 4 \
+  --served-model-name FastH3 \
+  --dtype bfloat16
+```
+
 ## Fixed model contract
 
-- Four denoiser forwards with inference grid `[1, 0.75, 0.5, 0.25, 0]` and video/audio sigma shifts `12/3`.
-- VSA sparse attention with tile size 64 and sparsity 0.9. The shared provider selects the installed implementation from the execution device; SM100 uses the native SM100a kernel and supports incremental row production. Dense attention selects a compatible provider from each request’s dtype, head layout and mask. GB200 has end-to-end validation; other hardware requires its own validation before performance claims.
+- The 4-step Preview contract uses four denoiser forwards, inference grid `[1, 0.75, 0.5, 0.25, 0]`, video/audio sigma shifts `12/3`, and VSA sparsity 0.9.
+- The 8-Step V2 contract uses eight denoiser forwards, inference grid `[1, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0]`, video/audio sigma shifts `10/3`, and VSA sparsity 0.8.
+- Both contracts use VSA tile size 64. The shared provider selects the installed implementation from the execution device; SM100 uses the native SM100a kernel and supports incremental row production. Dense attention selects a compatible provider from each request’s dtype, head layout and mask. GB200 has end-to-end validation; other hardware requires its own validation before performance claims.
 - Fixed 1344×768 output, 24 fps, and stereo 32-kHz audio.
 - Text-only conditioning. Image/video references, LoRA, variable resolution, guidance changes, and step-count changes are rejected.
 

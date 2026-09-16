@@ -21,11 +21,10 @@ from .inputs import AttentionInput
 class Attention(nn.Module):
     """Compose head projections and VSA over the complete visible key domain."""
 
-    def __init__(self, config: TransformerConfig, *, sparsity: float = 0.9):
+    def __init__(self, config: TransformerConfig):
         super().__init__()
-        if not 0 <= sparsity < 1:
-            raise ValueError("VSA sparsity must lie in [0, 1)")
-        self.head_dim, self.sparsity = config.head_dim, sparsity
+        self.head_dim = config.head_dim
+        self.sparsity = config.vsa_sparsity
         inner = config.num_attention_heads * config.head_dim
         self.projection = MergedColumnParallelLinear(
             config.hidden_size,

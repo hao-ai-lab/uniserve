@@ -171,8 +171,10 @@ class Transformer(nn.Module):
     contiguous activations and owns every state, constant, and workspace tensor.
     """
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, *, num_steps: int = 4):
         super().__init__()
+        if type(num_steps) is not int or num_steps <= 0:
+            raise ValueError("H3 transformer requires a positive step count")
         self.config = config
         self.mesh = DeviceMesh(ranks=(0,), shape=(1,), axes=("tp",), rank=0)
         self.video_input = Linear(
@@ -187,19 +189,21 @@ class Transformer(nn.Module):
                 for index in range(config.num_hidden_layers)
             }
         )
-        # Precomputed affine products of the fixed four-evaluation ladder:
+        # Precomputed affine products of the checkpoint evaluation ladder:
         # [step, layer, modality, packed shift/scale/gate] per transformer
         # layer, and [step, modality, shift + scale] for the final output
         # norm.
         self.modulation = Modulation(
             torch.empty(
-                4,
+                num_steps,
                 config.num_hidden_layers,
                 2,
                 18 * config.hidden_size,
                 dtype=torch.bfloat16,
             ),
-            torch.empty(4, 2, 2 * config.hidden_size, dtype=torch.bfloat16),
+            torch.empty(
+                num_steps, 2, 2 * config.hidden_size, dtype=torch.bfloat16
+            ),
         )
         self.output_norm = OutputNorm(config)
         self.video_output = Linear(

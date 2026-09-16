@@ -32,7 +32,7 @@ def schedules(
 ) -> Mapping[str, Schedule]:
     """Materialize sigma before subtracting it from one in FP32.
 
-    The analytical coordinates retain the unrounded trained ladder. Its four
+    The analytical coordinates retain the checkpoint's trained ladder. Model
     evaluations exclude the clean endpoint, which the solver still consumes.
     """
     result = {}
@@ -69,7 +69,7 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
             solver=CleanSampleEulerSolver(),
         )
         self.config, self.diffusion = config, diffusion
-        self.transformer = Transformer(config)
+        self.transformer = Transformer(config, num_steps=len(diffusion.ladder))
         self.conditioner = Conditioner(config)
         self.rotary = RotaryEmbedding(
             2 * config.rope_frequency_dim, theta=config.rope_theta
@@ -131,7 +131,8 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
             or shift is not None
         ):
             raise ValueError(
-                "H3 requires four evaluations with its trained modality shifts"
+                f"H3 requires {len(self.diffusion.ladder)} evaluations with "
+                "its trained modality shifts"
             )
         return schedules(self.diffusion, device=device)
 
@@ -320,7 +321,7 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
             self.diffusion.ladder
         ):
             raise ValueError(
-                "H3 denoising requires one sample on its four-evaluation ladder"
+                "H3 denoising requires one sample on its checkpoint ladder"
             )
         size = inputs.sizes[0]
         packing = self._packing(size)

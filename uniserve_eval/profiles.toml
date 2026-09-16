@@ -29,7 +29,7 @@ CUDA_VISIBLE_DEVICES = "0"
 [servers.minimax-h3]
 host = "127.0.0.1"
 port = 18083
-command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--model-description", "minimax-h3", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--worker-ranks", "${UNISERVE_H3_WORKER_RANKS:-4}", "--pipeline-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--quantization-config", '{"mode":"quality"}']
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--model-description", "minimax-h3", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--worker-ranks", "${UNISERVE_H3_WORKER_RANKS:-4}", "--pipeline-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"${UNISERVE_H3_QUANT_MODE:-balanced}\"}"]
 
 [servers.minimax-h3.environment]
 CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"

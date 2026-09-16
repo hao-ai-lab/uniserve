@@ -65,7 +65,7 @@ def inspect_model(
             "model_id": manifest["model_id"],
             "checkpoint_content_sha256": manifest["checkpoint_content_sha256"],
             "attention": "vsa",
-            "sparsity": 0.9,
+            "sparsity": architecture.denoiser.vsa_sparsity,
             "tasks": ["t2va"],
             "inference_grid": [
                 *(step / diffusion.time_scale for step in diffusion.ladder),
@@ -78,6 +78,7 @@ def inspect_model(
             "fps": output.frame_rate,
             "audio_rate": output.sample_rate,
             "precision_presets": list(source.precisions),
+            "checkpoint_format": source.checkpoint_format,
             "revision": root.name if root.parent.name == "snapshots" else None,
         }
     return {

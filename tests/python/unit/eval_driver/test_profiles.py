@@ -18,14 +18,28 @@ def test_fast_h3_server_topology_accepts_environment_override(
     monkeypatch.setenv("UNISERVE_H3_WORKER_RANKS", "2")
     monkeypatch.setenv("UNISERVE_H3_CUDA_VISIBLE_DEVICES", "0,1")
     monkeypatch.setenv("UNISERVE_H3_MEM_FRACTION", "0.99")
+    monkeypatch.setenv("UNISERVE_H3_QUANT_MODE", "performance")
 
     server = load_config().servers["minimax-h3"]
     rank_value = server.command.index("--worker-ranks") + 1
     fraction_value = server.command.index("--mem-fraction-static") + 1
+    precision_value = server.command.index("--quantization-config") + 1
 
     assert server.command[rank_value] == "2"
     assert server.command[fraction_value] == "0.99"
+    assert json.loads(server.command[precision_value]) == {
+        "mode": "performance"
+    }
     assert server.environment["CUDA_VISIBLE_DEVICES"] == "0,1"
+
+
+def test_fast_h3_server_defaults_to_balanced_precision(monkeypatch) -> None:
+    monkeypatch.delenv("UNISERVE_H3_QUANT_MODE", raising=False)
+
+    server = load_config().servers["minimax-h3"]
+    precision_value = server.command.index("--quantization-config") + 1
+
+    assert json.loads(server.command[precision_value]) == {"mode": "balanced"}
 
 
 def test_toml_rejects_an_unknown_benchmark_field(tmp_path: Path) -> None:

@@ -36,7 +36,10 @@ pytestmark = [
 
 
 @torch.inference_mode()
-def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration():  # noqa: E501
+@pytest.mark.parametrize("precision", ("quality", "balanced"))
+def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(  # noqa: E501
+    precision,
+):
     checkpoint = os.environ.get("UNISERVE_H3_MODEL", "")
     if not checkpoint or not Path(checkpoint).is_dir():
         pytest.fail(
@@ -63,7 +66,7 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
             ),
         )
         model = models.load_model(
-            source, device="cuda:0", precision="quality"
+            source, device="cuda:0", precision=precision
         ).model
         runner = ModelRunner(
             model,

@@ -14,22 +14,18 @@ from .encoder import TextEncoderConfig
 
 FASTH3_LADDER = (1000, 750, 500, 250)
 FASTH3_SHIFTS = (12.0, 3.0)
+FASTH3_8_STEP_LADDER = (1000, 875, 750, 625, 500, 375, 250, 125)
+FASTH3_8_STEP_SHIFTS = (10.0, 3.0)
 FASTH3_TIME_SCALE = 1000.0
 
 FASTH3_MODEL_ID = "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree"
 FASTH3_REVISION = "5ea076f35b84da4c3c82217112fa733d8eea2ae1"
+FASTH3_8_STEP_MODEL_ID = "FastVideo/FastVideo-FastH3-8-Step-V2"
+FASTH3_8_STEP_REVISION = "3da2ddfe1954d9cda4c05b643dc0f26007a655c5"
 
-
-def _validate_manifest(manifest: Mapping[str, object]) -> None:
-    """Validate the supported full VSA checkpoint before allocating components.
-
-    The manifest's training indices do not select the inference schedule. The
-    pinned FastVideo basic_fasth3 recipe uses five uniformly spaced grid points;
-    its explicit DMD-index override is a different numerical protocol.
-    """
-    expected = {
-        "schema_version": "fasth3-inference-contract-v1",
-        "model_id": FASTH3_MODEL_ID,
+FASTH3_VARIANTS = {
+    FASTH3_MODEL_ID: {
+        "revision": FASTH3_REVISION,
         "checkpoint_content_sha256": (
             "b36987515e4c75fa4c7aaa632a7842c829ea141b235358a54d782b51230497b3"
         ),
@@ -37,14 +33,65 @@ def _validate_manifest(manifest: Mapping[str, object]) -> None:
             "dcad0fbee2a7c7e75e53435f4fd98fccf3138844883874edf057962ab48fa428"
         ),
         "fastvideo_commit": "48a047c05ff4138f20cfa33351499c6ec5945f5d",
-        "task": "t2av",
         "transformer_forwards": 4,
         "num_inference_steps": 5,
         "dmd_denoising_steps": [999, 749, 500, 250],
+        "vsa_sparsity": 0.9,
+        "ladder": FASTH3_LADDER,
+        "shifts": FASTH3_SHIFTS,
+    },
+    FASTH3_8_STEP_MODEL_ID: {
+        "revision": FASTH3_8_STEP_REVISION,
+        "checkpoint_content_sha256": (
+            "516323fa396fa5dff4e82669d4e9a08a5791692a3d3b98ff6bc3de3fc6a33d11"
+        ),
+        "checkpoint_metadata_sha256": (
+            "ca9f2d609c05742ba465d24989981ec02cca26acb6ca2f163dc0f6dc8d11c27b"
+        ),
+        "fastvideo_commit": "24bbe7fddd05ca6f2c34b3dbed06ac1c75b72086",
+        "transformer_forwards": 8,
+        "num_inference_steps": 9,
+        "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
+        "vsa_sparsity": 0.8,
+        "ladder": FASTH3_8_STEP_LADDER,
+        "shifts": FASTH3_8_STEP_SHIFTS,
+    },
+}
+
+
+def _validate_manifest(manifest: Mapping[str, object]) -> Mapping[str, object]:
+    """Validate a supported full VSA checkpoint before allocating components.
+
+    The manifest's training indices do not select the inference schedule. The
+    numerical ladder is owned by the pinned deployment contract for each
+    checkpoint variant.
+    """
+    model_id = manifest.get("model_id")
+    variant = FASTH3_VARIANTS.get(model_id)
+    if variant is None:
+        raise ValueError(
+            f"unsupported FastH3 checkpoint: model_id must be one of "
+            f"{tuple(FASTH3_VARIANTS)}, got {model_id!r}"
+        )
+    expected = {
+        "schema_version": "fasth3-inference-contract-v1",
+        "model_id": model_id,
+        "task": "t2av",
         "guidance_scale": 1.0,
         "attention_backend": "VIDEO_SPARSE_ATTN_H3",
         "vsa_tile_size": 64,
-        "vsa_sparsity": 0.9,
+        **{
+            name: variant[name]
+            for name in (
+                "checkpoint_content_sha256",
+                "checkpoint_metadata_sha256",
+                "fastvideo_commit",
+                "transformer_forwards",
+                "num_inference_steps",
+                "dmd_denoising_steps",
+                "vsa_sparsity",
+            )
+        },
     }
     for name, value in expected.items():
         if (
@@ -54,8 +101,9 @@ def _validate_manifest(manifest: Mapping[str, object]) -> None:
             raise ValueError(
                 f"unsupported FastH3 checkpoint: {name} must be {value!r}, "
                 f"got {manifest.get(name)!r}; "
-                f"use {FASTH3_MODEL_ID}@{FASTH3_REVISION}"
+                f"use {model_id}@{variant['revision']}"
             )
+    return variant
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +126,7 @@ class TransformerConfig:
     rope_theta: float = 10000.0
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
+    vsa_sparsity: float = 0.9
 
     def __post_init__(self) -> None:
         for name in (
@@ -111,6 +160,11 @@ class TransformerConfig:
                     f"H3 transformer {name} must be finite and positive"
                 )
         if (
+            not math.isfinite(self.vsa_sparsity)
+            or not 0 <= self.vsa_sparsity < 1
+        ):
+            raise ValueError("H3 transformer VSA sparsity must lie in [0, 1)")
+        if (
             self.frequency_dim % 2
             or self.rope_frequency_dim * 6 > self.head_dim
         ):
@@ -122,7 +176,7 @@ class TransformerConfig:
 
 @dataclass(frozen=True, slots=True)
 class DiffusionConfig:
-    """The supported four-evaluation clean-sample Euler recipe."""
+    """A checkpoint-owned FastH3 clean-sample Euler recipe."""
 
     ladder: tuple[int, ...] = FASTH3_LADDER
     video_shift: float = FASTH3_SHIFTS[0]
@@ -136,13 +190,17 @@ class DiffusionConfig:
                 not isinstance(value, int) or isinstance(value, bool)
                 for value in self.ladder
             )
-            or self.ladder != FASTH3_LADDER
+            or self.ladder not in {FASTH3_LADDER, FASTH3_8_STEP_LADDER}
         ):
-            raise ValueError("FastH3 requires its fixed four-evaluation ladder")
-        if (
-            self.video_shift,
-            self.audio_shift,
-        ) != FASTH3_SHIFTS or self.time_scale != FASTH3_TIME_SCALE:
+            raise ValueError("FastH3 requires a supported checkpoint ladder")
+        expected_shifts = (
+            FASTH3_SHIFTS
+            if self.ladder == FASTH3_LADDER
+            else FASTH3_8_STEP_SHIFTS
+        )
+        if (self.video_shift, self.audio_shift) != expected_shifts or (
+            self.time_scale != FASTH3_TIME_SCALE
+        ):
             raise ValueError(
                 "FastH3 requires its trained video/audio shifts and time scale"
             )
@@ -180,7 +238,11 @@ class Config:
         ):
             actual = getattr(self, name)
             for field in fields(expected):
-                if field.name in {"latents_mean", "latents_std"}:
+                if field.name in {
+                    "latents_mean",
+                    "latents_std",
+                    "vsa_sparsity",
+                }:
                     continue
                 value = getattr(actual, field.name)
                 supported = getattr(expected, field.name)
@@ -189,6 +251,13 @@ class Config:
                         f"FastH3 {name}.{field.name} must be {supported!r}, "
                         f"got {value!r}"
                     )
+        expected_sparsity = (
+            0.9 if self.diffusion.ladder == FASTH3_LADDER else 0.8
+        )
+        if self.denoiser.vsa_sparsity != expected_sparsity:
+            raise ValueError(
+                "FastH3 denoiser VSA sparsity must match its checkpoint ladder"
+            )
 
 
 # Checkpoint field names differ from the mathematical modules' established
@@ -239,7 +308,7 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
     ):
         if not isinstance(metadata.get(name), Mapping):
             raise ValueError(f"FastH3 requires {name} metadata")
-    _validate_manifest(metadata["inference"])
+    variant = _validate_manifest(metadata["inference"])
     transformer = metadata["transformer"]
     missing = set(TRANSFORMER_FIELDS) - transformer.keys()
     if missing:
@@ -254,10 +323,11 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
             "FastH3 transformer final_norm_eps must equal norm_eps"
         )
     denoiser = TransformerConfig(
+        vsa_sparsity=variant["vsa_sparsity"],
         **{
             target: transformer[source]
             for source, target in TRANSFORMER_FIELDS.items()
-        }
+        },
     )
 
     text = metadata["text_encoder"].get("text_config")
@@ -339,6 +409,7 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
         video_decoder=video_vae.Config(**video_values),
         audio_decoder=audio_vae.Config(**audio_values),
         diffusion=DiffusionConfig(
+            ladder=variant["ladder"],
             video_shift=metadata["scheduler"]["shift"],
             audio_shift=metadata["audio_scheduler"]["shift"],
         ),

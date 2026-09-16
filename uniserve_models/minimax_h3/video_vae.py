@@ -27,7 +27,7 @@ from uniserve.ops.residual import (
     weighted_rms_norm_absmax,
 )
 from uniserve.ops.rope import qk_rms_norm_partial_rope_
-from uniserve.ops.silu import value_first_swiglu, value_first_swiglu_absmax
+from uniserve.ops.silu import swiglu, swiglu_absmax
 from uniserve.quantization import QuantizedTensor
 
 
@@ -306,30 +306,25 @@ def _feed_forward(mlp, hidden, maximum=None):
         return mlp(hidden), None
 
     branches, biases = _project_branches(mlp.gate_up, hidden, maximum)
-    # Checkpoint feed-forward rows are value-first. Bias, SiLU and the product
-    # are evaluated together in FP32 before storing the activation dtype.
-    packed = torch.cat((branches["up"], branches["gate"]), dim=-1)
-    bias = (
-        None
-        if all(value is None for value in biases.values())
-        else torch.cat(
-            tuple(
-                biases[name]
-                if biases[name] is not None
-                else packed.new_zeros(branches[name].shape[-1])
-                for name in ("up", "gate")
-            )
-        )
-    )
+    # Checkpoint feed-forward rows are value-first. Consume the two adjacent
+    # projection views directly: reversing them into one packed tensor would
+    # copy the full activation before every decoder MLP.
+    options = {
+        "value_bias": biases["up"],
+        "gate_bias": biases["gate"],
+    }
     quantizer = mlp.down.input_quantizer
     if (
         quantizer is not None
         and quantizer.axis is None
         and quantizer.format != "mxfp8"
     ):
-        activated, maximum = value_first_swiglu_absmax(packed, bias)
+        activated, maximum = swiglu_absmax(
+            branches["up"], branches["gate"], **options
+        )
     else:
-        activated, maximum = value_first_swiglu(packed, bias), None
+        activated = swiglu(branches["up"], branches["gate"], **options)
+        maximum = None
 
     return _project(mlp.down, activated, maximum)
 

@@ -55,6 +55,7 @@ class Config(Generic[ConfigT, ModelT]):
     entry_points: Mapping[str, tuple[EntryPoint, ...]]
     weights: weight_options.Config
     precisions: Mapping[str, weight_options.Config]
+    checkpoint_format: str | None
     io: loading.Config
     tokenizer: Path | None
     image_processor: ImageProcessor | None
@@ -477,6 +478,8 @@ def read_config(
     precision = package.precisions.get(
         "default", package.precisions.get("bf16", weight_options.Config())
     )
+    precisions = package.precisions
+    checkpoint_format = None
     quantization = metadata.get("quantization_config")
     if quantization is not None:
         if not isinstance(quantization, dict):
@@ -502,6 +505,25 @@ def read_config(
                 },
             )
 
+    modelopt_manifest = root / "modelopt_manifest.json"
+    if modelopt_manifest.is_file():
+        if quantization is not None:
+            raise ValueError(
+                "a calibrated ModelOpt checkpoint cannot also declare a "
+                "dynamic quantization_config"
+            )
+        factory = getattr(package, "calibrated_weight_config", None)
+        if factory is None:
+            raise ValueError(
+                "checkpoint architecture does not support ModelOpt manifests"
+            )
+        precision = factory(_json(modelopt_manifest), model)
+        # Packed weights and their calibrated scales form one immutable
+        # checkpoint contract. Runtime precision presets apply only to dense
+        # checkpoints and must not be offered for this source.
+        precisions = MappingProxyType({})
+        checkpoint_format = "modelopt_nvfp4"
+
     return Config(
         model_config,
         package.Model,
@@ -509,7 +531,8 @@ def read_config(
         package.checkpoint_mappings,
         package.entry_points(model_config),
         precision,
-        package.precisions,
+        precisions,
+        checkpoint_format,
         io,
         tokenizer,
         processor,
