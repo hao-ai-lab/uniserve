@@ -1201,7 +1201,6 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
     if !identities.is_empty()
         || opt_string(dict, intern!(py, "message"))?.is_some()
         || opt_string(dict, intern!(py, "code"))?.is_some()
-        || opt_bool(dict, intern!(py, "retryable"))?.is_some()
         || opt_bool(dict, intern!(py, "fatal"))?.is_some()
         || opt_string(dict, intern!(py, "phase"))?.is_some()
         || opt_string(dict, intern!(py, "route"))?.is_some()
@@ -1232,7 +1231,6 @@ fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerRe
         error: WorkerResponseError {
             message: string_of(&get(dict, intern!(py, "message"))?)?,
             code: opt_string(dict, intern!(py, "code"))?,
-            retryable: bool_of(&get(dict, intern!(py, "retryable"))?)?,
             fatal: bool_of(&get(dict, intern!(py, "fatal"))?)?,
             phase: opt_string(dict, intern!(py, "phase"))?,
             route: opt_string(dict, intern!(py, "route"))?,

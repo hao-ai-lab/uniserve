@@ -1,11 +1,10 @@
 """Typed worker error taxonomy.
 
 Every failure is classified into a stable error class with ``code``,
-``message``, ``retryable``, and ``fatal`` (whether the worker process must
-be torn down).
+``message``, and ``fatal`` (whether the worker process must be torn down).
 
 ``to_mapping()`` produces ``{"kind": "error", "message", "code",
-"retryable", "fatal", ...}``. Message fields are scalars and short strings
+"fatal", ...}``. Message fields are scalars and short strings
 only — never tensors.
 """
 
@@ -32,8 +31,6 @@ __all__ = [
     "invalid_descriptor",
     "unsupported_setup",
     "unsupported_operation",
-    "unsupported_control",
-    "compute_error",
     "resource_error",
 ]
 
@@ -65,27 +62,26 @@ class ErrorPolicy(NamedTuple):
     ``capture_trace`` marks errors whose log record includes a stack trace.
     """
 
-    retryable: bool
     fatal: bool
     capture_trace: bool
 
 
 # ``capture_trace`` here is the single source for "which errors warrant a
 # traceback" so request-handling code never re-lists that set by hand.
-_DEFAULT_POLICY = ErrorPolicy(retryable=False, fatal=False, capture_trace=False)
+_DEFAULT_POLICY = ErrorPolicy(fatal=False, capture_trace=False)
 
 _POLICY: dict[WorkerErrorCode, ErrorPolicy] = {
-    WorkerErrorCode.UNSUPPORTED_OPERATION: ErrorPolicy(False, False, False),
-    WorkerErrorCode.UNSUPPORTED_CONTROL: ErrorPolicy(False, False, False),
-    WorkerErrorCode.INVALID_DESCRIPTOR: ErrorPolicy(False, False, False),
-    WorkerErrorCode.UNSUPPORTED_SETUP: ErrorPolicy(False, False, False),
-    WorkerErrorCode.RESOURCE_LEASE_VIOLATION: ErrorPolicy(False, False, False),
-    WorkerErrorCode.INPUT_ERROR: ErrorPolicy(False, False, False),
-    WorkerErrorCode.COMPUTE_ERROR: ErrorPolicy(False, False, True),
-    WorkerErrorCode.RESOURCE_ERROR: ErrorPolicy(True, False, True),
-    WorkerErrorCode.INVARIANT_VIOLATION: ErrorPolicy(False, True, True),
-    WorkerErrorCode.FATAL_WORKER_FAILURE: ErrorPolicy(False, True, True),
-    WorkerErrorCode.SCHEDULER_BUG: ErrorPolicy(False, False, False),
+    WorkerErrorCode.UNSUPPORTED_OPERATION: ErrorPolicy(False, False),
+    WorkerErrorCode.UNSUPPORTED_CONTROL: ErrorPolicy(False, False),
+    WorkerErrorCode.INVALID_DESCRIPTOR: ErrorPolicy(False, False),
+    WorkerErrorCode.UNSUPPORTED_SETUP: ErrorPolicy(False, False),
+    WorkerErrorCode.RESOURCE_LEASE_VIOLATION: ErrorPolicy(False, False),
+    WorkerErrorCode.INPUT_ERROR: ErrorPolicy(False, False),
+    WorkerErrorCode.COMPUTE_ERROR: ErrorPolicy(False, True),
+    WorkerErrorCode.RESOURCE_ERROR: ErrorPolicy(False, True),
+    WorkerErrorCode.INVARIANT_VIOLATION: ErrorPolicy(True, True),
+    WorkerErrorCode.FATAL_WORKER_FAILURE: ErrorPolicy(True, True),
+    WorkerErrorCode.SCHEDULER_BUG: ErrorPolicy(False, False),
 }
 
 
@@ -107,7 +103,6 @@ class WorkerError(Exception):
 
     code: WorkerErrorCode
     message: str
-    retryable: bool = False
     fatal: bool = False
     req_id: int | None = None
     op_id: ComputationId | None = None
@@ -137,7 +132,6 @@ class WorkerError(Exception):
             "kind": "error",
             "code": str(self.code),
             "message": self.message,
-            "retryable": bool(self.retryable),
             "fatal": bool(self.fatal),
             "phase": self.phase,
             "route": self.route,
@@ -166,10 +160,9 @@ class InputError(WorkerError):
     def __init__(self, message: str, **kw: Any) -> None:
         """Create a request-scoped input failure.
 
-        The failure carries the configured retry policy.
+        The failure carries the class's configured fatality policy.
         """
         policy = _POLICY[WorkerErrorCode.INPUT_ERROR]
-        kw.setdefault("retryable", policy.retryable)
         kw.setdefault("fatal", policy.fatal)
         super().__init__(
             code=WorkerErrorCode.INPUT_ERROR, message=message, **kw
@@ -182,10 +175,9 @@ class ComputeError(WorkerError):
     def __init__(self, message: str, **kw: Any) -> None:
         """Create a request-scoped execution failure.
 
-        The failure carries the configured retry policy.
+        The failure carries the class's configured fatality policy.
         """
         policy = _POLICY[WorkerErrorCode.COMPUTE_ERROR]
-        kw.setdefault("retryable", policy.retryable)
         kw.setdefault("fatal", policy.fatal)
         super().__init__(
             code=WorkerErrorCode.COMPUTE_ERROR, message=message, **kw
@@ -198,10 +190,9 @@ class ResourceError(WorkerError):
     def __init__(self, message: str, **kw: Any) -> None:
         """Create a resource failure.
 
-        The failure carries the configured retry and fatality policy.
+        The failure carries the class's configured fatality policy.
         """
         policy = _POLICY[WorkerErrorCode.RESOURCE_ERROR]
-        kw.setdefault("retryable", policy.retryable)
         kw.setdefault("fatal", policy.fatal)
         super().__init__(
             code=WorkerErrorCode.RESOURCE_ERROR, message=message, **kw
@@ -211,7 +202,6 @@ class ResourceError(WorkerError):
 def _make(code: WorkerErrorCode, message: str, **kw: Any) -> WorkerError:
     """Construct a classified worker error with shared contextual fields."""
     policy = _POLICY.get(code, _DEFAULT_POLICY)
-    kw.setdefault("retryable", policy.retryable)
     kw.setdefault("fatal", policy.fatal)
     return WorkerError(code=code, message=message, **kw)
 
@@ -259,14 +249,6 @@ def _looks_like_fatal_cuda(lowered_msg: str) -> bool:
     return any(tok in lowered_msg for tok in _FATAL_CUDA_TEXT_TOKENS)
 
 
-def unsupported_control(name: str) -> WorkerError:
-    """Create a classified error for an unrecognized control-plane request."""
-    return _make(
-        WorkerErrorCode.UNSUPPORTED_CONTROL,
-        f"control {name!r} is not supported by this worker",
-    )
-
-
 def unsupported_operation(kind: str, req_id: int | None = None) -> WorkerError:
     """Create a classified error for an unavailable operation kind.
 
@@ -291,11 +273,6 @@ def unsupported_setup(message: str, **kw: Any) -> WorkerError:
     The configuration is one the runtime cannot provide.
     """
     return _make(WorkerErrorCode.UNSUPPORTED_SETUP, message, **kw)
-
-
-def compute_error(message: str, **kw: Any) -> ComputeError:
-    """Create a nonfatal classified error for model execution failure."""
-    return ComputeError(message, **kw)
 
 
 def resource_error(message: str, **kw: Any) -> ResourceError:

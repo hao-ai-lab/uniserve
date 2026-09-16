@@ -529,7 +529,6 @@ table WorkerResponse {
   result:BatchOutput;
   message:string;
   code:string;
-  retryable:bool = null;
   fatal:bool = null;
   phase:string;
   route:string;

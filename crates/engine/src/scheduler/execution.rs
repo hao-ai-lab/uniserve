@@ -1660,14 +1660,13 @@ impl Scheduler {
         if let Some(failure) = error.downcast_ref::<WorkerFailure>() {
             let execution = failure.execution.as_ref();
             let code = execution.and_then(|value| value.code.as_deref());
-            let retryable = execution.is_some_and(|value| value.retryable);
             if matches!(code, Some("SchedulerBug" | "InvariantViolation")) {
                 self.fatal = true;
                 tracing::error!(worker = %failure.worker_id, ?code, "control-plane invariant failed: {error}");
             } else if code == Some("InputError") {
                 tracing::info!(worker = %failure.worker_id, ?code, "Worker rejected request: {error}");
             } else {
-                tracing::warn!(worker = %failure.worker_id, ?code, retryable, "Worker failed affected work: {error}");
+                tracing::warn!(worker = %failure.worker_id, ?code, "Worker failed affected work: {error}");
             }
             self.fail_after_worker_failure(failure);
             return;

@@ -620,7 +620,6 @@ impl RankProcess {
             WorkerResponse::Error { error, .. } => Err(WorkerExecError {
                 run_id: Some(run_id),
                 fatal: error.fatal,
-                retryable: error.retryable,
                 code: error.code,
                 message: error.message,
                 phase: error.phase,

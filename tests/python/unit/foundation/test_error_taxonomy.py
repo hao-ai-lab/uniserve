@@ -38,7 +38,6 @@ def test_runtime_error_with_oom_marker_classifies_as_resource_error(message):
 
     assert err.code == WorkerErrorCode.RESOURCE_ERROR
     assert err.code == "ResourceError"
-    assert err.retryable is True
     assert err.fatal is False
 
 
@@ -51,7 +50,6 @@ def test_out_of_memory_error_type_classifies_as_oom_without_message_marker():
     err = classify(OutOfMemoryError("workspace allocation request denied"))
 
     assert err.code == WorkerErrorCode.RESOURCE_ERROR
-    assert err.retryable is True
     assert err.fatal is False
 
 
@@ -74,7 +72,6 @@ def test_generic_runtime_error_classifies_as_compute_error():
 
     assert err.code == WorkerErrorCode.COMPUTE_ERROR
     assert err.code == "ComputeError"
-    assert err.retryable is False
     assert err.fatal is False
 
 
@@ -84,7 +81,6 @@ def test_event_pool_error_classifies_as_fatal_invariant_violation():
     )
 
     assert err.code == WorkerErrorCode.INVARIANT_VIOLATION
-    assert err.retryable is False
     assert err.fatal is True
 
 
@@ -103,7 +99,6 @@ def test_non_matching_allocation_messages_are_compute_error(message):
     err = classify(RuntimeError(message))
 
     assert err.code == WorkerErrorCode.COMPUTE_ERROR
-    assert err.retryable is False
 
 
 def test_fatal_cuda_marker_takes_precedence_over_oom_in_same_message():
@@ -117,14 +112,12 @@ def test_fatal_cuda_marker_takes_precedence_over_oom_in_same_message():
 
     assert err.code == WorkerErrorCode.FATAL_WORKER_FAILURE
     assert err.fatal is True
-    assert err.retryable is False
 
 
 def test_to_mapping_emits_canonical_error_context():
     err = WorkerError(
         code=WorkerErrorCode.RESOURCE_ERROR,
         message="CUDA out of memory",
-        retryable=True,
         fatal=False,
         req_id=42,
         op_id=ComputationId(7, 0),
@@ -140,7 +133,6 @@ def test_to_mapping_emits_canonical_error_context():
     assert snapshot["kind"] == "error"
     assert snapshot["code"] == "ResourceError"
     assert snapshot["message"] == "CUDA out of memory"
-    assert snapshot["retryable"] is True
     assert snapshot["fatal"] is False
     assert snapshot["phase"] == "run"
     assert snapshot["route"] == "language"

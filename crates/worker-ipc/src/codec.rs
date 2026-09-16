@@ -177,7 +177,6 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
     // Error metadata occupies independent optional fields on the wire.
     let message = response.message().map(str::to_owned);
     let code = response.code().map(str::to_owned);
-    let retryable = response.retryable();
     let fatal = response.fatal();
     let phase = response.phase().map(str::to_owned);
     let route = response.route().map(str::to_owned);
@@ -193,7 +192,6 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
         .unwrap_or_default();
     let carries_error = message.is_some()
         || code.is_some()
-        || retryable.is_some()
         || fatal.is_some()
         || phase.is_some()
         || route.is_some()
@@ -239,7 +237,6 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
                 error: WorkerResponseError {
                     message,
                     code,
-                    retryable: retryable.context("error response has no retryable flag")?,
                     fatal: fatal.context("error response has no fatal flag")?,
                     phase,
                     route,
@@ -1241,7 +1238,6 @@ fn response_to_fb(response: &WorkerResponse) -> CodecResult<fbs::WorkerResponseT
         result: result.map(run_result_to_fb).transpose()?.map(Box::new),
         message: error.map(|error| error.message.clone()),
         code: error.and_then(|error| error.code.clone()),
-        retryable: error.map(|error| error.retryable),
         fatal: error.map(|error| error.fatal),
         phase: error.and_then(|error| error.phase.clone()),
         route: error.and_then(|error| error.route.clone()),

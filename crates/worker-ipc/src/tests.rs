@@ -1539,7 +1539,6 @@ fn response_fixtures() -> Vec<WorkerResponse> {
             error: WorkerResponseError {
                 message: "device fault on decode".into(),
                 code: Some("compute_error".into()),
-                retryable: true,
                 fatal: false,
                 phase: Some("execute".into()),
                 route: Some("und.decode".into()),

@@ -1836,7 +1836,6 @@ def _execution_failure(
             phase="graph_or_device",
             route=forward_mode.value,
             operations=operations,
-            retryable=classified.retryable,
             fatal=classified.fatal,
         )
     return ComputeError(

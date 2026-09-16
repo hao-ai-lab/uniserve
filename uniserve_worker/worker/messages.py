@@ -27,7 +27,6 @@ def response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
         "result": None,
         "message": None,
         "code": None,
-        "retryable": None,
         "fatal": None,
         "phase": None,
         "route": None,

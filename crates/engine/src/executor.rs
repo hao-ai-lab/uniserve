@@ -886,9 +886,6 @@ pub struct WorkerExecError {
     pub run_id: Option<u64>,
     /// Whether the error invalidates the worker process or executor.
     pub fatal: bool,
-    /// Whether retrying the same op could succeed (e.g. transient OOM).
-    /// Defaults to `false` when the worker did not classify the error.
-    pub retryable: bool,
     /// Stable worker-defined error code, when classified.
     pub code: Option<String>,
     /// Human-readable failure description.

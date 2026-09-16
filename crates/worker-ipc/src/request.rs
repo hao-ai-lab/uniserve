@@ -151,8 +151,6 @@ pub struct WorkerResponseError {
     pub message: String,
     /// Optional stable machine-readable error code.
     pub code: Option<String>,
-    /// Whether resubmission may succeed without worker replacement.
-    pub retryable: bool,
     /// Whether the worker is unsafe to serve further requests.
     pub fatal: bool,
     /// Optional worker phase that failed.
