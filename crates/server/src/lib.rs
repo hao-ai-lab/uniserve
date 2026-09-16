@@ -152,14 +152,13 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             "loaded worker numerical plan contradicts the resolved checkpoint"
         );
     }
-    let snapshot = engine.snapshot();
-    let route_max_model_len = effective_max_model_len.min(snapshot.max_model_len);
+    let route_max_model_len = effective_max_model_len.min(engine.max_model_len());
     let model = InputProcessor::new(
         model_config,
         tokenizer,
         renderer,
-        snapshot.generation_limits,
-        snapshot.sampling_controls,
+        engine.generation_limits(),
+        engine.served_sampling_controls(),
         route_max_model_len,
         config.reasoning_parsing,
     )

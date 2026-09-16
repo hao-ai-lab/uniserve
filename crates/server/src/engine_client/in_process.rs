@@ -123,11 +123,6 @@ impl EngineClient {
         self.core.model_dtype()
     }
 
-    /// Returns the worker's UniServe protocol version string.
-    pub fn uniserve_version(&self) -> &str {
-        "uniserve"
-    }
-
     /// Returns aggregate paged-KV capacity across worker pools.
     pub fn total_num_gpu_blocks(&self) -> u64 {
         self.core.info().kv_num_blocks() as u64

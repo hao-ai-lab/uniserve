@@ -16,19 +16,12 @@ pub use uniserve_engine::EventRx;
 pub use uniserve_engine::StreamCancelCause;
 
 impl EngineClient {
-    /// Returns an immutable snapshot of engine identity and capacity.
-    pub fn snapshot(&self) -> EngineSnapshot {
-        EngineSnapshot {
-            model_name: self.model_name().to_string(),
-            engine_count: self.engine_count(),
-            max_model_len: self.max_model_len(),
-            model_dtype: self.model_dtype(),
-            generation_limits: self.generation_limits(),
-            sampling_controls: if self.supports_token_sampling() {
-                crate::serving::ServedSamplingControl::ALL.to_vec()
-            } else {
-                Vec::new()
-            },
+    /// Returns the sampling controls this engine exposes to served requests.
+    pub fn served_sampling_controls(&self) -> Vec<crate::serving::ServedSamplingControl> {
+        if self.supports_token_sampling() {
+            crate::serving::ServedSamplingControl::ALL.to_vec()
+        } else {
+            Vec::new()
         }
     }
 
@@ -41,21 +34,4 @@ impl EngineClient {
     pub async fn abort_request(&self, request_id: &str) -> Result<()> {
         self.abort(std::iter::once(request_id)).await
     }
-}
-
-/// Engine health and limits used while binding a served model.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EngineSnapshot {
-    /// Model identifier loaded by the engine.
-    pub model_name: String,
-    /// Number of engine instances represented by the client.
-    pub engine_count: usize,
-    /// Maximum supported model context length in tokens.
-    pub max_model_len: u32,
-    /// Numeric data type used by model execution.
-    pub model_dtype: uniserve_core::ModelDtype,
-    /// Runtime generation features and resource limits.
-    pub generation_limits: uniserve_core::GenerationLimits,
-    /// Sampling controls supported by this engine.
-    pub sampling_controls: Vec<crate::serving::ServedSamplingControl>,
 }
