@@ -12,10 +12,7 @@ import torch
 import torch.distributed as dist
 
 from uniserve.profiling import profile_range
-from uniserve.runtime._communication import (
-    stream_collectives,
-    try_sum_reduction,
-)
+from uniserve.runtime._communication import stream_collectives
 
 
 def divide(numerator: int, denominator: int) -> int:
@@ -306,7 +303,7 @@ class Communicator:
                 bound.all_reduce(result, op)
             elif op == "max":
                 _all_reduce_max(result, group.group_name)
-            elif op != "sum" or not try_sum_reduction(group, result):
+            else:
                 dist.all_reduce(result, op=operations[op], group=group)
         return result
 
