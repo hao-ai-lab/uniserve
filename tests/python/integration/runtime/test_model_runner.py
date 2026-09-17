@@ -317,7 +317,7 @@ def test_text_extension_rejects_missing_input_tokens() -> None:
 def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent() -> (  # noqa: E501
     None
 ):
-    worker = execution_worker(pipeline_depth=2)
+    worker = execution_worker(queue_depth=2)
     admission = ar_params(9, block_ids=(0,))
     predecessor = token_operation(
         admission.request_key,
@@ -366,7 +366,7 @@ def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent()
 
 
 def test_decode_reuses_the_published_request_page_table() -> None:
-    worker = execution_worker(pipeline_depth=2)
+    worker = execution_worker(queue_depth=2)
     admission = ar_params(10, block_ids=(0,))
     predecessor = token_operation(
         admission.request_key,
@@ -604,7 +604,7 @@ def test_independent_token_and_flow_match_homogeneous_results(
 def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
     None
 ):
-    worker = execution_worker(pipeline_depth=3)
+    worker = execution_worker(queue_depth=3)
     admission = umm_params(
         12, ImageParams(steps=1, height=16, width=16, seed=29, max_images=2)
     )
@@ -2694,9 +2694,7 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
     from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
     from uniserve_worker.protocol.output import BatchOutput
 
-    with execution_worker(
-        transfer_backends=("shm",), pipeline_depth=2
-    ) as worker:
+    with execution_worker(transfer_backends=("shm",), queue_depth=2) as worker:
         worker.warmup()
         admission = umm_params(
             76, ImageParams(steps=3, height=16, width=16, seed=29)

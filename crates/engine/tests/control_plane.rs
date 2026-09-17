@@ -213,7 +213,7 @@ fn run_requests(
     cases: &[(GenerationConstraint, usize)],
 ) -> HashMap<RequestId, Collected> {
     let mut sim = SimEngine::new();
-    sim.set_pipeline_depth(depth);
+    sim.set_queue_depth(depth);
     let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::with_policy(executor, ctrl(), 32, policy);
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -297,7 +297,7 @@ fn text_and_image_requests_complete() {
 #[test]
 fn cancellation_releases_latent_admission_for_a_waiting_image() {
     let mut sim = SimEngine::new();
-    sim.set_pipeline_depth(4);
+    sim.set_queue_depth(4);
     sim.mut_info_for_test().latent_page_units = 64;
     sim.mut_info_for_test().latent_pages = 65;
     sim.mut_info_for_test().buffer_pool_bytes = 16 << 20;
@@ -446,10 +446,10 @@ fn scheduler_clamps_max_batch_to_worker_info() {
     assert_eq!(sched.config().max_batch, 3);
 }
 
-/// Single-worker correctness must be identical regardless of pipeline depth:
+/// Single-worker correctness must be identical regardless of queue depth:
 /// the same prompts produce the same per-request token counts at depth 1 and 2.
 #[test]
-fn pipeline_depth_is_token_identical() {
+fn queue_depth_is_token_identical() {
     let d1 = run_requests(
         1,
         SchedulingPolicy::Fcfs,
@@ -472,7 +472,7 @@ fn pipeline_depth_is_token_identical() {
 #[test]
 fn operation_window_metrics_record_the_full_lifecycle() {
     let mut sim = SimEngine::new();
-    sim.set_pipeline_depth(2);
+    sim.set_queue_depth(2);
     sim.set_text_len(6);
     let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let request = generation_request(
@@ -545,7 +545,7 @@ fn relay_run(
     depth: u32,
 ) -> Vec<u32> {
     let mut sim = SimEngine::new();
-    sim.set_pipeline_depth(depth);
+    sim.set_queue_depth(depth);
     sim.set_text_len(text_len);
     let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let mut request = generation_request(
@@ -651,9 +651,9 @@ fn generalized_processor_successors_match_depth_one_before_observation() {
 #[test]
 fn image_context_decode_is_depth_invariant() {
     let mut runs = Vec::new();
-    for pipeline_depth in [1, 2] {
+    for queue_depth in [1, 2] {
         let mut sim = SimEngine::new();
-        sim.set_pipeline_depth(pipeline_depth);
+        sim.set_queue_depth(queue_depth);
         sim.set_text_len(8);
         let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
         let request = generation_request(
@@ -691,7 +691,7 @@ fn image_context_decode_is_depth_invariant() {
 #[test]
 fn stop_token_terminates_with_stop() {
     let mut sim = SimEngine::new();
-    sim.set_pipeline_depth(2);
+    sim.set_queue_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -735,7 +735,7 @@ fn stop_token_terminates_with_stop() {
 fn run_until_control(abort: bool) -> FinishReason {
     let mut sim = SimEngine::new();
     sim.set_text_len(1024);
-    sim.set_pipeline_depth(2);
+    sim.set_queue_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -792,7 +792,7 @@ fn abort_and_cancel_are_distinct() {
 fn stop_string_cutoff_is_request_local() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1024);
-    sim.set_pipeline_depth(2);
+    sim.set_queue_depth(2);
     let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -870,7 +870,7 @@ fn stop_string_cutoff_is_request_local() {
 fn hybrid_groups_handshake_runs() {
     use uniserve_core::{KvCacheGroup, KvGroupKind};
     let mut sim = SimEngine::new();
-    sim.set_pipeline_depth(2);
+    sim.set_queue_depth(2);
     // Group 0 covers [0, 2048); group 1 covers [2048, 4096).
     sim.set_groups(vec![
         KvCacheGroup {
@@ -1062,7 +1062,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
 #[test]
 fn chunked_prefill_progresses_with_decode() {
     let mut sim = SimEngine::new();
-    sim.set_pipeline_depth(2);
+    sim.set_queue_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
     let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
     sched.set_long_prefill_threshold(64); // cap a prefill chunk at 64 tokens
@@ -1267,7 +1267,7 @@ fn stochastic_sampling_reaches_synthetic_eos() {
 fn multimodal_encode_then_cache_hit() {
     use std::sync::atomic::Ordering;
     let mut sim = SimEngine::new();
-    sim.set_pipeline_depth(2);
+    sim.set_queue_depth(2);
     let executor = SimExecutor::new(sim);
     let wake = executor.command_waker();
     let sched = Scheduler::new(Box::new(executor), ctrl(), 32);
@@ -1345,7 +1345,7 @@ fn multimodal_encode_then_cache_hit() {
 fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
     let mut sim = SimEngine::new();
     sim.set_text_len(6);
-    sim.set_pipeline_depth(2);
+    sim.set_queue_depth(2);
     let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let request = |request_id| {
         generation_request(
@@ -1446,10 +1446,10 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
 #[test]
 fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
     let mut signatures = Vec::new();
-    for pipeline_depth in [1, 2] {
+    for queue_depth in [1, 2] {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000);
-        sim.set_pipeline_depth(pipeline_depth);
+        sim.set_queue_depth(queue_depth);
         let executor = Box::new(SimExecutor::new(sim));
         let sched = Scheduler::new(executor, ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -1526,7 +1526,7 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
 #[test]
 fn interleave_c4_generated_images_complete() {
     let mut sim = SimEngine::new();
-    sim.set_pipeline_depth(2);
+    sim.set_queue_depth(2);
     sim.set_text_len(1_000_000);
     let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let mut events = HashMap::new();
@@ -1669,7 +1669,7 @@ fn gen_branch_waits_for_model_image_starts() {
     for depth in [1, 2] {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000);
-        sim.set_pipeline_depth(depth);
+        sim.set_queue_depth(depth);
         let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
@@ -2015,7 +2015,7 @@ fn fcfs_policy_completes_text() {
 fn gen_branch_literal_trigger_starts_images() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000); // never EOS on its own
-    sim.set_pipeline_depth(2);
+    sim.set_queue_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
     // Sim emits 1000 + ((id*7 + n) % 5000) for request id=1: 1007, 1008, 1009…
     // After an image commits, the sim resets and the round repeats from 1007.

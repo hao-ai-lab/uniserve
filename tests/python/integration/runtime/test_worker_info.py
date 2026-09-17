@@ -144,7 +144,7 @@ def test_worker_identity_and_capabilities_reflect_enabled_operations() -> None:
             sampling_group=None,
             tokenizer=None,
             allowed_work_variants=allowed,
-            pipeline_depth=1,
+            queue_depth=1,
             completion_payload_bytes=65536,
         ) as worker:
             info = worker.info.to_mapping()

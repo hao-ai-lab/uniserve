@@ -212,8 +212,8 @@ impl EngineSettings {
             "block_size must be greater than 0"
         );
         anyhow::ensure!(
-            self.worker_process.pipeline_depth > 0,
-            "pipeline_depth must be greater than 0"
+            self.worker_process.queue_depth > 0,
+            "queue_depth must be greater than 0"
         );
         anyhow::ensure!(self.max_batch > 0, "max_batch must be greater than 0");
         anyhow::ensure!(

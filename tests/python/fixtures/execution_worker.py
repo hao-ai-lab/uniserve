@@ -21,7 +21,7 @@ def execution_worker(
     *,
     block_size: int = 16,
     device: str = "cpu",
-    pipeline_depth: int = 1,
+    queue_depth: int = 1,
     transfer_backends: tuple[str, ...] = ("local",),
     worker_id: str = "worker",
     execution: WorkerConfig | None = None,
@@ -79,7 +79,7 @@ def execution_worker(
         transfer_backends=transfer_backends,
         publication_backends=transfer_backends,
         worker_id=worker_id,
-        pipeline_depth=pipeline_depth,
+        queue_depth=queue_depth,
         completion_payload_bytes=1 << 16,
         components=components,
     )

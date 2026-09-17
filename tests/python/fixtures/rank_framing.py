@@ -17,7 +17,7 @@ def main():
     with WorkerIpcEndpoint(
         config.ipc.service_name,
         max_payload=config.ipc.max_payload_bytes,
-        max_inflight=config.ipc.max_inflight,
+        max_inflight=config.ipc.queue_depth,
     ) as endpoint:
         with Worker.from_config(config) as worker:
             pending = {}

@@ -492,7 +492,7 @@ def test_loaded_worker_warmup_retires_its_request_resources(tmp_path):
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
         allowed_work_variants=supported_operations(model),
-        pipeline_depth=2,
+        queue_depth=2,
         completion_payload_bytes=1 << 16,
     ) as worker:
         worker.warmup()

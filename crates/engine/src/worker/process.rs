@@ -149,7 +149,7 @@ impl Default for WorkerProcessArgs {
             ranks: crate::WorkerConfig::model("cuda", 1, 2).ranks,
             entries: crate::WorkerConfig::model("cuda", 1, 2).entries,
             stub: false,
-            pipeline_depth: 2,
+            queue_depth: 2,
             req_slot_cap: 1 << 20,
             resp_slot_cap: 8 << 20,
             kv_token_capacity: None,
@@ -208,14 +208,13 @@ impl WorkerProcessArgs {
         publish_backends: &str,
         distributed_init_method: Option<String>,
     ) -> anyhow::Result<serde_json::Value> {
-        let depth = self.pipeline_depth.max(1);
+        let depth = self.queue_depth.max(1);
         let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
         let mut fields = serde_json::Map::new();
         fields.insert("worker_id".into(), json!(self.worker_id));
         fields.insert("service_name".into(), json!(service));
-        fields.insert("pipeline_depth".into(), json!(depth));
+        fields.insert("queue_depth".into(), json!(depth));
         fields.insert("ipc_payload_cap".into(), json!(max_payload));
-        fields.insert("ipc_max_inflight".into(), json!(depth));
         fields.insert("model".into(), json!(self.model));
         fields.insert("device".into(), json!(device));
         fields.insert("rank".into(), json!(rank));
@@ -382,7 +381,7 @@ impl RankProcess {
         components: &std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<Self> {
-        let depth = args.pipeline_depth.max(1);
+        let depth = args.queue_depth.max(1);
         let max_payload = args.req_slot_cap.max(args.resp_slot_cap).max(1);
         let service = service_name(&format!("{}_{}_{}", std::process::id(), rank, nano_id()));
 
@@ -504,7 +503,7 @@ impl RankProcess {
         let host_depth = self.depth as u32;
         anyhow::ensure!(
             info.queue_depth == host_depth,
-            "worker pipeline_depth {} does not match launched depth {}",
+            "worker queue_depth {} does not match launched depth {}",
             info.queue_depth,
             host_depth
         );

@@ -312,7 +312,7 @@ def test_verify_commits_every_accepted_position() -> None:
 def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
     device: str,
 ) -> None:
-    worker = execution_worker(device=device, pipeline_depth=2)
+    worker = execution_worker(device=device, queue_depth=2)
     admission = ar_params(5, block_ids=(4,))
     extend = token_operation(
         admission.request_key,

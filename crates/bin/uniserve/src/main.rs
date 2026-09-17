@@ -107,7 +107,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 .served_model_name
                 .get_or_insert_with(|| args.runtime.model.clone());
             // The checkpoint decides whether this deployment serves video, and
-            // that choice sizes the pipeline, batch and IPC slot budgets.
+            // that choice sizes the queue, batch and IPC slot budgets.
             let is_media =
                 uniserve_server::profile::assets::is_media_checkpoint(&args.runtime.model).await;
             let settings = args.runtime.engine_settings(is_media);

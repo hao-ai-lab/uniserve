@@ -19,9 +19,8 @@ from uniserve_worker.bootstrap.config import WorkerProcessArgs
 DEFAULTS: dict[str, Any] = {
     "service_name": "test-worker",
     "worker_id": "worker",
-    "pipeline_depth": 2,
+    "queue_depth": 2,
     "ipc_payload_cap": 65536,
-    "ipc_max_inflight": 2,
     "model": "model",
     "device": "cpu",
     "rank": 0,

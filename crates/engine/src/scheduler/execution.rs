@@ -217,7 +217,7 @@ impl Scheduler {
         let mut progressed = self.flush_output_journals();
         // 1. Resolve one completed batch. Refilling immediately after one
         // completion preserves an occupied execution slot when multiple
-        // responses become ready together at pipeline depth greater than one.
+        // responses become ready together at queue depth greater than one.
         // The owner loop returns here without parking while progress is being
         // made, so subsequent ready completions are handled on successive turns.
         progressed |= self.poll_one_result();
@@ -258,7 +258,7 @@ impl Scheduler {
         self.admit();
         self.admit_media();
 
-        // 4. submit as many batches as pipeline capacity allows.
+        // 4. submit as many batches as the rank queues admit.
         loop {
             self.admit();
             self.admit_media();

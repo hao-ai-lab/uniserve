@@ -729,7 +729,7 @@ impl SimEngine {
     }
 
     /// Sets the advertised unresolved-run capacity, clamped to at least one.
-    pub fn set_pipeline_depth(&mut self, depth: u32) {
+    pub fn set_queue_depth(&mut self, depth: u32) {
         self.info.queue_depth = depth.max(1);
     }
 

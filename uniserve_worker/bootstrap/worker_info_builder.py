@@ -355,7 +355,7 @@ def _token_worker_layout(
     )
 
     arena_args = {
-        "pipeline_depth": int(queue_depth),
+        "queue_depth": int(queue_depth),
         "completion_payload_bytes": int(completion_payload_bytes),
         "request_pool_size": int(worker_config.max_request_pool_size),
         "num_latent_pages": num_latent_pages,
@@ -564,7 +564,7 @@ def _request_tensor_worker_layout(
         worker_config,
         bindings=bindings,
         state_buffers=state_buffers,
-        pipeline_depth=depth,
+        queue_depth=depth,
         completion_payload_bytes=completion_payload_bytes,
         num_blocks=0,
         request_pool_size=slots,

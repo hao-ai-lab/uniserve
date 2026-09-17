@@ -248,7 +248,7 @@ impl EngineConfig {
             model: model.into(),
             ranks: WorkerConfig::model("cpu", 1, 2).ranks,
             block_size: 64,
-            pipeline_depth: 2,
+            queue_depth: 2,
             max_batch_operations: DEFAULT_MAX_BATCH as u32,
             max_batch_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS as u32,
             ..WorkerProcessArgs::default()
@@ -329,7 +329,7 @@ impl EngineCore {
                 worker_id: worker.id.to_string(),
                 ranks: worker.ranks.clone(),
                 entries: worker.entries.clone(),
-                pipeline_depth: worker.queue_depth,
+                queue_depth: worker.queue_depth,
                 transfer: config.transfer.clone(),
                 ..config.worker_process.clone()
             });

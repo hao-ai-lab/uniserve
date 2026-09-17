@@ -55,7 +55,7 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
         )
 
     with execution_worker(
-        device="cuda:0", pipeline_depth=3, execution=policy
+        device="cuda:0", queue_depth=3, execution=policy
     ) as worker:
         parents = tuple(
             token_operation(
@@ -130,7 +130,7 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
 
 def test_same_request_continues_before_parent_report_materialization() -> None:
     device = "cuda:0"
-    worker = execution_worker(device=device, pipeline_depth=2)
+    worker = execution_worker(device=device, queue_depth=2)
     warm_admission = ar_params(30, block_ids=(1,))
     warm_operation = token_operation(
         warm_admission.request_key,
@@ -196,7 +196,7 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
 
 
 def test_device_continuation_chain_matches_serial_token_sequence() -> None:
-    worker = execution_worker(device="cuda:0", pipeline_depth=4)
+    worker = execution_worker(device="cuda:0", queue_depth=4)
     admission = ar_params(32, block_ids=(0,))
     operation = token_operation(
         admission.request_key,
@@ -255,7 +255,7 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
 
 
 def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
-    worker = execution_worker(device="cuda:0", pipeline_depth=3)
+    worker = execution_worker(device="cuda:0", queue_depth=3)
     admission = ar_params(33, block_ids=(0,))
     operation = token_operation(
         admission.request_key,
@@ -310,7 +310,7 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
 def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> (  # noqa: E501
     None
 ):
-    worker = execution_worker(device="cuda:0", pipeline_depth=2)
+    worker = execution_worker(device="cuda:0", queue_depth=2)
     sampling = SamplingParams(temperature=0.8, top_k=32, top_p=0.93, seed=917)
     pipelined = ar_params(41, block_ids=(2,), sampling=sampling)
     predecessor = token_operation(
@@ -359,7 +359,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
     successor_report = finalized_report(worker, successor_report)
     successor_tokens = successor_report.completions[0].committed_tokens
 
-    serial_worker = execution_worker(device="cuda:0", pipeline_depth=1)
+    serial_worker = execution_worker(device="cuda:0", queue_depth=1)
     serial = ar_params(41, block_ids=(2,), sampling=sampling)
     serial_parent = token_operation(
         serial.request_key,
@@ -429,7 +429,7 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         frequency_penalty=0.6,
         presence_penalty=0.3,
     )
-    worker = execution_worker(device="cuda:0", pipeline_depth=2)
+    worker = execution_worker(device="cuda:0", queue_depth=2)
     pipelined = ar_params(57, block_ids=(3,), sampling=sampling)
     predecessor = token_operation(
         pipelined.request_key,
@@ -477,7 +477,7 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
     successor_report = finalized_report(worker, successor_report)
     successor_tokens = successor_report.completions[0].committed_tokens
 
-    serial_worker = execution_worker(device="cuda:0", pipeline_depth=1)
+    serial_worker = execution_worker(device="cuda:0", queue_depth=1)
     serial = ar_params(57, block_ids=(3,), sampling=sampling)
     serial_parent = token_operation(
         serial.request_key,

@@ -317,14 +317,13 @@ def parse_entries(
 class WorkerIpcConfig:
     """Configures IPC launch settings.
 
-    Covers the service name, payload bound, inflight limit, and pipeline
-    depth.
+    Covers the service name, the payload bound and the queue depth, which
+    bounds the batches this rank holds in flight.
     """
 
     service_name: str
     max_payload_bytes: int
-    max_inflight: int
-    pipeline_depth: int
+    queue_depth: int
 
 
 @dataclass(frozen=True)
@@ -417,8 +416,7 @@ class WorkerProcessArgs:
             ipc=WorkerIpcConfig(
                 service_name=str(namespace.service_name),
                 max_payload_bytes=int(namespace.ipc_payload_cap),
-                max_inflight=int(namespace.ipc_max_inflight),
-                pipeline_depth=int(namespace.pipeline_depth),
+                queue_depth=int(namespace.queue_depth),
             ),
             local_rank=int(namespace.local_rank),
             distributed_backend=_optional_text(namespace.distributed_backend),
@@ -457,9 +455,8 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
         "--block-size": namespace.block_size,
         "--max-batch-operations": namespace.max_batch_operations,
         "--max-batch-tokens": namespace.max_batch_tokens,
-        "--pipeline-depth": namespace.pipeline_depth,
+        "--queue-depth": namespace.queue_depth,
         "--ipc-payload-cap": namespace.ipc_payload_cap,
-        "--ipc-max-inflight": namespace.ipc_max_inflight,
         "--world-size": namespace.world_size,
         "--max-model-len": namespace.max_model_len,
     }

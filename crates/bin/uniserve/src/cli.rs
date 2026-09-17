@@ -157,7 +157,7 @@ pub(crate) struct SharedRuntimeArgs {
     pub worker_process: WorkerProcessOptions,
     /// How many op-batches the scheduler keeps in flight against the worker.
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
-    pub pipeline_depth: Option<usize>,
+    pub queue_depth: Option<usize>,
     /// Maximum number of ops assembled into one forward batch.
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub max_batch: Option<usize>,
@@ -246,13 +246,13 @@ impl SharedRuntimeArgs {
     /// Builds the UniServe Rust-engine settings from these CLI arguments.
     ///
     /// `is_media` comes from the checkpoint itself; video deployments size their
-    /// pipeline, batch and IPC slots differently from token deployments.
+    /// queue, batch and IPC slots differently from token deployments.
     pub(crate) fn engine_settings(&self, is_media: bool) -> EngineSettings {
         let mut worker_process = self.worker_process.to_args();
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
-        let pipeline_depth = self.pipeline_depth.unwrap_or(if is_media { 6 } else { 2 });
-        worker_process.pipeline_depth = pipeline_depth;
+        let queue_depth = self.queue_depth.unwrap_or(if is_media { 6 } else { 2 });
+        worker_process.queue_depth = queue_depth;
         worker_process.resp_slot_cap = if is_media {
             EngineSettings::MEDIA_IPC_SLOT_CAP
         } else {
@@ -288,9 +288,9 @@ impl SharedRuntimeArgs {
             max_video_seconds: self.max_video_seconds,
             workers: self.workers.clone().map(Vec::from).unwrap_or_else(|| {
                 vec![if is_media {
-                    WorkerConfig::h3(&self.device, self.worker_ranks, pipeline_depth)
+                    WorkerConfig::h3(&self.device, self.worker_ranks, queue_depth)
                 } else {
-                    WorkerConfig::model(&self.device, self.worker_ranks, pipeline_depth)
+                    WorkerConfig::model(&self.device, self.worker_ranks, queue_depth)
                 }]
             }),
             transfer: self.transfer.clone().unwrap_or_default(),
@@ -520,7 +520,7 @@ mod tests {
             "2",
             "--page-size",
             "128",
-            "--pipeline-depth",
+            "--queue-depth",
             "3",
             "--max-batch",
             "7",

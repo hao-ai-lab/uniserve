@@ -69,7 +69,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     info!(
         workers = ?config.engine.workers,
         block_size = config.engine.worker_process.block_size,
-        pipeline_depth = config.engine.worker_process.pipeline_depth,
+        queue_depth = config.engine.worker_process.queue_depth,
         "starting UniServe Rust engine"
     );
     let max_batch_operations = u32::try_from(

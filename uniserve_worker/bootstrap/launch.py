@@ -27,7 +27,7 @@ def run_worker(config: WorkerProcessArgs) -> None:
         WorkerIpcEndpoint(
             config.ipc.service_name,
             max_payload=config.ipc.max_payload_bytes,
-            max_inflight=config.ipc.max_inflight,
+            max_inflight=config.ipc.queue_depth,
         ) as endpoint,
         Worker.from_config(config) as worker,
     ):
@@ -37,7 +37,7 @@ def run_worker(config: WorkerProcessArgs) -> None:
             extra={
                 "service": config.ipc.service_name,
                 "max_payload_bytes": config.ipc.max_payload_bytes,
-                "max_inflight": config.ipc.max_inflight,
+                "max_inflight": config.ipc.queue_depth,
                 "supported_ops": sorted(
                     value.value for value in config.supported_ops
                 ),

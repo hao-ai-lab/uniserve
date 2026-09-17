@@ -231,7 +231,7 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
     arena = model_arena_capacity(
         TEST_MODEL,
         worker_config,
-        pipeline_depth=1,
+        queue_depth=1,
         completion_payload_bytes=1024,
         num_blocks=2,
         request_pool_size=4,

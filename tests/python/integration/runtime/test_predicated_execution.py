@@ -73,7 +73,7 @@ def _release_relay_outputs(worker, *operations: ScheduledRequest) -> None:
 def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> (
     None
 ):
-    worker = execution_worker(device="cpu", pipeline_depth=2)
+    worker = execution_worker(device="cpu", queue_depth=2)
     admission = ar_params(50, block_ids=(0,))
     base = token_operation(
         admission.request_key,
@@ -125,7 +125,7 @@ def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> (
 
 def test_false_device_predicate_preserves_parent_cutoff_across_registered_descendants(  # noqa: E501
 ) -> None:
-    worker = execution_worker(device="cpu", pipeline_depth=2)
+    worker = execution_worker(device="cpu", queue_depth=2)
     base = ar_params(51, block_ids=(0,))
     admission = NewRequest(
         base.request_key,
@@ -247,7 +247,7 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
 
 def test_false_generation_predicate_preserves_the_selected_text_state_and_latent_capacity(  # noqa: E501
 ) -> None:
-    worker = execution_worker(device="cpu", pipeline_depth=2)
+    worker = execution_worker(device="cpu", queue_depth=2)
     generation = umm_params(
         52, ImageParams(steps=2, height=16, width=16, seed=29)
     )

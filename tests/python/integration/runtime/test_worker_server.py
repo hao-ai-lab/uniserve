@@ -69,7 +69,7 @@ def test_info_request_is_served_before_close() -> None:
             {"kind": "close", "call_id": 2},
         )
     )
-    with execution_worker(pipeline_depth=1) as worker:
+    with execution_worker(queue_depth=1) as worker:
         worker.bind(endpoint)
         worker.run()
 
@@ -80,9 +80,9 @@ def test_info_request_is_served_before_close() -> None:
     assert responses[2]["kind"] == "ok"
 
 
-@pytest.mark.parametrize("pipeline_depth", (1, 3))
+@pytest.mark.parametrize("queue_depth", (1, 3))
 def test_duplicate_submissions_are_rejected_while_the_original_completes(
-    pipeline_depth,
+    queue_depth,
 ) -> None:
     _admission, _operation, run = _token_run(
         request_id=11,
@@ -98,7 +98,7 @@ def test_duplicate_submissions_are_rejected_while_the_original_completes(
             {"kind": "close", "call_id": 4},
         )
     )
-    with execution_worker(pipeline_depth=pipeline_depth) as worker:
+    with execution_worker(queue_depth=queue_depth) as worker:
         worker.bind(endpoint)
         worker.run()
 
@@ -112,7 +112,7 @@ def test_duplicate_submissions_are_rejected_while_the_original_completes(
 
 
 def test_failed_submissions_cannot_be_reused_and_allow_shutdown() -> None:
-    with execution_worker(pipeline_depth=2) as worker:
+    with execution_worker(queue_depth=2) as worker:
         admission = replace(
             ar_params(91), request_pool_idx=worker.info.request_slots + 1
         )
@@ -174,7 +174,7 @@ def test_conflicting_run_identity_fails_before_new_admission() -> None:
             {"kind": "close", "call_id": 5},
         )
     )
-    with execution_worker(pipeline_depth=3) as worker:
+    with execution_worker(queue_depth=3) as worker:
         worker.bind(endpoint)
         worker.run()
 

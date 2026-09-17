@@ -223,7 +223,7 @@ class Worker:
                 transfer_backends=config.data_plane.backends,
                 publication_backends=config.data_plane.publication_backends,
                 worker_id=config.worker_id,
-                pipeline_depth=config.ipc.pipeline_depth,
+                queue_depth=config.ipc.queue_depth,
                 completion_payload_bytes=config.ipc.max_payload_bytes,
                 components=config.components,
                 process_groups=distributed,
@@ -246,7 +246,7 @@ class Worker:
         sampling_group: Communicator | None,
         tokenizer: Any | None,
         allowed_work_variants: frozenset[Computation],
-        pipeline_depth: int,
+        queue_depth: int,
         completion_payload_bytes: int,
         attention: str | None = None,
         transfer_backends: tuple[str, ...] = ("local",),
@@ -283,7 +283,7 @@ class Worker:
             if not isinstance(worker_config, WorkerConfig):
                 raise unsupported_setup("model worker requires a WorkerConfig")
 
-            if pipeline_depth <= 0:
+            if queue_depth <= 0:
                 raise unsupported_setup(
                     "worker pipeline depth must be positive"
                 )
@@ -340,7 +340,7 @@ class Worker:
                 model,
                 worker_config,
                 state_buffers=runner.state_buffers,
-                pipeline_depth=pipeline_depth,
+                queue_depth=queue_depth,
                 bindings=bindings,
                 capacity_group=(
                     None
@@ -358,7 +358,7 @@ class Worker:
                 state_buffers=runner.state_buffers,
                 endpoint=endpoint,
                 bindings=bindings,
-                queue_depth=int(pipeline_depth),
+                queue_depth=int(queue_depth),
                 completion_payload_bytes=int(completion_payload_bytes),
                 allowed_work_variants=allowed_work_variants,
                 transfer_backends=transfer_backends,
@@ -459,7 +459,7 @@ class Worker:
                     import_capacity=int(info.max_unresolved_ops),
                     request_pool_size=int(info.request_slots),
                     max_blocks_per_request=max_blocks_per_row,
-                    staging_depth=int(pipeline_depth),
+                    staging_depth=int(queue_depth),
                 )
                 startup.callback(self.kv_cache.close)
 
@@ -546,7 +546,7 @@ class Worker:
             startup.callback(self.device_events.close)
 
             self.output_pool = OutputPool(
-                capacity=int(pipeline_depth) * int(info.max_batch_ops),
+                capacity=int(queue_depth) * int(info.max_batch_ops),
                 max_words=int(info.max_batch_ops)
                 * (4 + (int(completion_payload_bytes) + 3) // 4),
                 event_pool=self.device_events,
@@ -630,7 +630,7 @@ class Worker:
                         model, worker_config, self.kv_cache
                     ),
                     variants=frozenset(info.supported_ops),
-                    max_inflight=int(pipeline_depth),
+                    max_inflight=int(queue_depth),
                 )
 
             # Operation handlers borrow the resources owned by this rank.
@@ -701,7 +701,7 @@ class Worker:
 
         Covers admission limits, dependency chains, and ready-request queues.
         """
-        self.pipeline_depth = max(1, int(self.info.queue_depth))
+        self.queue_depth = max(1, int(self.info.queue_depth))
         self._next_sequence = 1
         self._transport_occupancy = 0
         self._admission_closed = False
@@ -801,7 +801,7 @@ class Worker:
 
                 if (
                     not self._admission_closed
-                    and self._transport_occupancy < self.pipeline_depth
+                    and self._transport_occupancy < self.queue_depth
                 ):
                     request = endpoint.try_recv()
                     if request is not None:
@@ -1011,7 +1011,7 @@ class Worker:
 
         Handles administrative and execution requests.
         """
-        execution_full = len(self.inflight) >= self.pipeline_depth
+        execution_full = len(self.inflight) >= self.queue_depth
         position = next(
             (
                 index

@@ -22,9 +22,8 @@ from .config import WorkerProcessArgs
 REQUIRED_FIELDS = (
     "service_name",
     "worker_id",
-    "pipeline_depth",
+    "queue_depth",
     "ipc_payload_cap",
-    "ipc_max_inflight",
     "model",
     "device",
     "rank",

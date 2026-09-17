@@ -66,9 +66,7 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
 ) -> None:
     with (
         execution_worker(transfer_backends=("shm",)) as producer,
-        execution_worker(
-            transfer_backends=("shm",), pipeline_depth=3
-        ) as worker,
+        execution_worker(transfer_backends=("shm",), queue_depth=3) as worker,
     ):
         incoming = ar_params(45, block_ids=(0,))
         admission = ar_params(44, block_ids=(0,))

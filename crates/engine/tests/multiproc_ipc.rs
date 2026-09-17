@@ -322,7 +322,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             id: WorkerId("worker".into()),
             ranks: args.ranks.clone(),
             entries: args.entries.clone(),
-            queue_depth: args.pipeline_depth,
+            queue_depth: args.queue_depth,
         }])?;
         args.transfer = transfer.clone();
         let mut executor = WorkerExecutor::try_new(
@@ -612,7 +612,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
 
     let transfer = uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?;
     let mut args = rank_group_args(1 << 20, 8 << 20);
-    args.pipeline_depth = 3;
+    args.queue_depth = 3;
     args.transfer = transfer.clone();
     args.entries = [
         (
@@ -1529,7 +1529,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         model: String::new(),
         ranks: WorkerConfig::model("cpu", WORLD_SIZE, 2).ranks,
         entries: WorkerConfig::model("cpu", WORLD_SIZE, 2).entries,
-        pipeline_depth: PIPELINE_DEPTH,
+        queue_depth: PIPELINE_DEPTH,
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
         kv_token_capacity: Some(4096),
@@ -1715,7 +1715,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         let binding = WorkerConfig::model("cpu", 1, depth);
         args.ranks = binding.ranks.clone();
         args.entries = binding.entries;
-        args.pipeline_depth = depth;
+        args.queue_depth = depth;
         args.worker_id = worker_id.into();
         if worker_id == "encoder-0" {
             args.python = wrapper.clone();
@@ -2288,7 +2288,7 @@ fn rank_group_args(
         model: String::new(),
         ranks: WorkerConfig::model("cpu", WORLD_SIZE, 2).ranks,
         entries: WorkerConfig::model("cpu", WORLD_SIZE, 2).entries,
-        pipeline_depth: PIPELINE_DEPTH,
+        queue_depth: PIPELINE_DEPTH,
         req_slot_cap: request_slot_capacity,
         resp_slot_cap: response_slot_capacity,
         kv_token_capacity: Some(4096),
@@ -2309,9 +2309,9 @@ fn stub_launch_descriptor(service: &str) -> serde_json::Value {
     const TEMPLATE: &str = r#"{
     "service_name": "__SERVICE__",
     "worker_id": "worker",
-    "pipeline_depth": 2,
+    "queue_depth": 2,
     "ipc_payload_cap": 1048576,
-    "ipc_max_inflight": 8,
+    "queue_depth": 8,
     "model": "",
     "device": "cpu",
     "rank": 0,

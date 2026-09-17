@@ -88,7 +88,7 @@ fn main() -> anyhow::Result<()> {
         python: "python3".into(),
         model: String::new(),
         ranks: uniserve_engine::WorkerConfig::model("cpu", 1, 2).ranks,
-        pipeline_depth: 2,
+        queue_depth: 2,
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
         kv_token_capacity: None,

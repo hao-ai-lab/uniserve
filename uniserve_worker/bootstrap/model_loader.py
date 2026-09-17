@@ -266,7 +266,7 @@ def load_worker_model(
     bind_components(model, bindings, entries=source.entry_points)
 
     worker_config = loaded_worker_config(
-        model, config.execution, config.ipc.pipeline_depth
+        model, config.execution, config.ipc.queue_depth
     )
     override = config.model.quantization_config.get("kv_cache_dtype")
     if override is not None:
@@ -325,11 +325,11 @@ def _devices(
 
 
 def loaded_worker_config(
-    model: nn.Module, config: WorkerConfig, pipeline_depth: int
+    model: nn.Module, config: WorkerConfig, queue_depth: int
 ) -> WorkerConfig:
     """Resolve media request slots from the worker's publication lifetime."""
     if any(isinstance(module, VideoDecoder) for module in model.modules()):
-        state_slots = min(config.max_batch_operations, pipeline_depth // 3)
+        state_slots = min(config.max_batch_operations, queue_depth // 3)
         if state_slots < 2:
             raise unsupported_setup(
                 "resident media execution requires two slots with "

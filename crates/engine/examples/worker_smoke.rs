@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
-    // pipeline_depth=2 exercises the descriptor ring with batches in flight.
+    // queue_depth=2 exercises the descriptor ring with batches in flight.
     let worker_config = WorkerProcessArgs {
         worker_id: "local".into(),
         stub: true,
@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
         python: "python3".into(),
         model: String::new(),
         ranks: uniserve_engine::WorkerConfig::model("cpu", 1, 2).ranks,
-        pipeline_depth: 2,
+        queue_depth: 2,
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
         kv_token_capacity: None,

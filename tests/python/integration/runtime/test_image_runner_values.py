@@ -381,7 +381,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         sampling_group=group,
         tokenizer=None,
         allowed_work_variants=supported_operations(model),
-        pipeline_depth=2,
+        queue_depth=2,
         completion_payload_bytes=1 << 16,
         components=(("model", placement),),
     ) as worker:

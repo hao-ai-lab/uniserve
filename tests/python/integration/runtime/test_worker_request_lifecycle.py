@@ -239,7 +239,7 @@ def test_retained_encoder_product_outlives_its_producer_request(
 def test_command_acknowledgement_waits_for_readers_without_delaying_other_results(  # noqa: E501
     retirement: str,
 ) -> None:
-    worker = execution_worker(pipeline_depth=2)
+    worker = execution_worker(queue_depth=2)
     worker.warmup()
     admission = ar_params(87, block_ids=(0,))
     operation = token_operation(

@@ -40,7 +40,7 @@ pub struct WorkerProcessArgs {
     /// command line cannot request it.
     pub stub: bool,
     /// Maximum number of physical runs concurrently in flight per rank.
-    pub pipeline_depth: usize,
+    pub queue_depth: usize,
     /// Request IPC slot capacity in bytes.
     pub req_slot_cap: usize,
     /// Response IPC slot capacity in bytes.

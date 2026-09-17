@@ -184,16 +184,16 @@ def tensor_slot_capacity(
     )
 
 
-def request_tensor_window(pipeline_depth: int, request_slots: int) -> int:
+def request_tensor_window(queue_depth: int, request_slots: int) -> int:
     """Return the output horizon for requests.
 
     One pipeline slot is reserved per request.
     """
-    if request_slots < 1 or pipeline_depth < 3 * request_slots:
+    if request_slots < 1 or queue_depth < 3 * request_slots:
         raise ValueError(
             "request tensor pipeline requires two unresolved outputs per slot"
         )
-    return pipeline_depth // request_slots - 1
+    return queue_depth // request_slots - 1
 
 
 def product_storage_bytes(
@@ -383,12 +383,12 @@ class ArenaCapacity:
     host_lane_inflight: int
 
 
-def operation_window(pipeline_depth: int, max_operations: int) -> int:
+def operation_window(queue_depth: int, max_operations: int) -> int:
     """Bound simultaneously live operations.
 
     The bound follows pipeline depth and per-batch capacity.
     """
-    depth = int(pipeline_depth)
+    depth = int(queue_depth)
     operations = int(max_operations)
     if depth < 1 or operations < 1:
         raise ValueError("operation-window sizing requires positive bounds")
@@ -398,11 +398,11 @@ def operation_window(pipeline_depth: int, max_operations: int) -> int:
 def request_tensor_arena_capacity(
     worker_config: WorkerConfig,
     *,
-    pipeline_depth: int,
+    queue_depth: int,
     product_bytes_per_request: int,
 ) -> ArenaCapacity:
     """Bound product, relay and transfer storage for fixed request tensors."""
-    depth = int(pipeline_depth)
+    depth = int(queue_depth)
     max_operations = int(worker_config.max_batch_operations)
     state_slots = int(worker_config.max_request_pool_size)
     slots = depth * max_operations
@@ -432,7 +432,7 @@ def model_arena_capacity(
     model: nn.Module,
     worker_config: WorkerConfig,
     *,
-    pipeline_depth: int,
+    queue_depth: int,
     completion_payload_bytes: int,
     num_blocks: int,
     request_pool_size: int,
@@ -449,7 +449,7 @@ def model_arena_capacity(
 
     Covers device-product, transfer, latent, and CPU arenas.
     """
-    depth = int(pipeline_depth)
+    depth = int(queue_depth)
     payload_bytes = int(completion_payload_bytes)
     max_operations = int(worker_config.max_batch_operations)
     if depth < 1 or payload_bytes < 1 or max_operations < 1:
@@ -464,7 +464,7 @@ def model_arena_capacity(
     if capability(model, VideoPostprocessor) is not None or state_buffers:
         return request_tensor_arena_capacity(
             worker_config,
-            pipeline_depth=depth,
+            queue_depth=depth,
             product_bytes_per_request=local_product_storage_bytes(
                 resolve_outputs(model, worker_config),
                 bindings=bindings or {},
@@ -680,7 +680,7 @@ def resolve_request_capacity(
     model: nn.Module,
     worker_config: WorkerConfig,
     *,
-    pipeline_depth: int,
+    queue_depth: int,
     capacity_group: Communicator | None,
     bindings: Mapping[str, ModelEntry] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
@@ -720,12 +720,12 @@ def resolve_request_capacity(
                     bindings=bindings or {},
                     pipeline_components=media_components(model),
                     max_unresolved_ops=request_tensor_window(
-                        pipeline_depth, count
+                        queue_depth, count
                     ),
                 )
                 arena = request_tensor_arena_capacity(
                     capacity_config,
-                    pipeline_depth=pipeline_depth,
+                    queue_depth=queue_depth,
                     product_bytes_per_request=product_bytes,
                 )
                 return count * product_bytes + arena.device_product_bytes
@@ -734,7 +734,7 @@ def resolve_request_capacity(
                 schema,
                 capacity_group,
                 maximum=min(
-                    worker_config.max_request_pool_size, pipeline_depth // 3
+                    worker_config.max_request_pool_size, queue_depth // 3
                 ),
                 minimum=worker_config.min_request_pool_size,
                 available_bytes=available,

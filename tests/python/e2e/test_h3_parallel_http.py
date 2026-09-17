@@ -266,7 +266,7 @@ def test_component_bindings_release_cancelled_requests(
             f"{source}->{destination}=cuda_ipc"
             for source, destination in sorted(edges)
         ),
-        "--pipeline-depth",
+        "--queue-depth",
         "6",
         "--max-batch",
         "2",
