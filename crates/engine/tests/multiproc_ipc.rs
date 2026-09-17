@@ -30,7 +30,7 @@ use uniserve_worker_ipc::{
 };
 
 const WORLD_SIZE: usize = 2;
-const PIPELINE_DEPTH: usize = 2;
+const QUEUE_DEPTH: usize = 2;
 static CHILD_LAUNCH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
@@ -1039,7 +1039,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
         max_cfg_branches: 1,
         ..Default::default()
     };
-    config.max_batch = PIPELINE_DEPTH * 8;
+    config.max_batch = QUEUE_DEPTH * 8;
     config.workers = vec![WorkerConfig::model("cpu", WORLD_SIZE, 2)];
     config.worker_process = rank_group_args(128 << 10, 128 << 10);
     let engine = {
@@ -1100,7 +1100,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     assert_eq!(info.world_size, WORLD_SIZE as u32);
     assert_eq!(info.max_batch_ops, 256);
     assert_eq!(info.max_batch_tokens, 256);
-    assert_eq!(info.queue_depth as usize, PIPELINE_DEPTH);
+    assert_eq!(info.queue_depth as usize, QUEUE_DEPTH);
 
     let mut admission = text_admission(11, 1, 1)?;
     let sampling = &mut admission.ar.as_mut().unwrap().sampling;
@@ -1529,7 +1529,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         model: String::new(),
         ranks: WorkerConfig::model("cpu", WORLD_SIZE, 2).ranks,
         entries: WorkerConfig::model("cpu", WORLD_SIZE, 2).entries,
-        queue_depth: PIPELINE_DEPTH,
+        queue_depth: QUEUE_DEPTH,
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
         kv_token_capacity: Some(4096),
@@ -2288,7 +2288,7 @@ fn rank_group_args(
         model: String::new(),
         ranks: WorkerConfig::model("cpu", WORLD_SIZE, 2).ranks,
         entries: WorkerConfig::model("cpu", WORLD_SIZE, 2).entries,
-        queue_depth: PIPELINE_DEPTH,
+        queue_depth: QUEUE_DEPTH,
         req_slot_cap: request_slot_capacity,
         resp_slot_cap: response_slot_capacity,
         kv_token_capacity: Some(4096),
