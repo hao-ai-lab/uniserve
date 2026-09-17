@@ -49,7 +49,7 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         """
         images = []
         for latent, size in zip(latents["image"], sizes, strict=True):
-            sample = latent.value
+            sample = latent.tensor
             pixels = unpatchify(
                 sample.unsqueeze(0),
                 size,

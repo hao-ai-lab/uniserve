@@ -9,6 +9,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from tests.python.fixtures.model_metadata import neo_metadata
 from uniserve.loading import Config as IOConfig
 from uniserve_models.bagel import read_config as bagel_config
 
@@ -151,31 +152,10 @@ def test_h3_worker_advertises_bounded_media_products():
     assert info.max_batch_ops == 2
 
 
-def _neo_metadata():
-    return {
-        "llm_config": {
-            "hidden_size": 16,
-            "intermediate_size": 32,
-            "vocab_size": 64,
-            "num_hidden_layers": 3,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 1,
-            "head_dim": 8,
-            "rope_theta": 10000.0,
-        },
-        "vision_config": {
-            "hidden_size": 8,
-            "llm_hidden_size": [16],
-            "downsample_ratio": [0.5],
-        },
-        "pad_token_id": 3,
-    }
-
-
 def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes(tmp_path):
     from uniserve_models.sensenova_u1 import read_config
 
-    raw = _neo_metadata()
+    raw = neo_metadata()
     raw["llm_config"].update(
         use_sliding_window=False, sliding_window=64, max_window_layers=1
     )
@@ -209,7 +189,7 @@ def test_sensenova_reader_rejects_inconsistent_checkpoint_math(
 ):
     from uniserve_models.sensenova_u1 import read_config
 
-    raw = _neo_metadata()
+    raw = neo_metadata()
     raw["llm_config"][field] = value
     (tmp_path / "config.json").write_text(json.dumps(raw))
     with pytest.raises(ValueError, match=error):
@@ -221,7 +201,7 @@ def test_sensenova_direct_config_rejects_mismatched_vision_features(tmp_path):
 
     from uniserve_models.sensenova_u1 import read_config
 
-    (tmp_path / "config.json").write_text(json.dumps(_neo_metadata()))
+    (tmp_path / "config.json").write_text(json.dumps(neo_metadata()))
     config = read_config(tmp_path, IOConfig())
     with pytest.raises(ValueError, match="vision output must match"):
         replace(config, vision=replace(config.vision, output_size=32))
@@ -230,7 +210,7 @@ def test_sensenova_direct_config_rejects_mismatched_vision_features(tmp_path):
 def test_sensenova_reader_rejects_unimplemented_sliding_attention(tmp_path):
     from uniserve_models.sensenova_u1 import read_config
 
-    raw = _neo_metadata()
+    raw = neo_metadata()
     raw["llm_config"].update(
         use_sliding_window=True, sliding_window=64, max_window_layers=1
     )
