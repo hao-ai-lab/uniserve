@@ -81,7 +81,7 @@ impl Default for EngineSettings {
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             max_video_seconds: 15.0,
-            workers: vec![WorkerConfig::model("cuda", 1, 2)],
+            workers: vec![WorkerConfig::model("localhost", "cuda", 1, 2)],
             transfer: TransferConfig::default(),
             worker_process: WorkerProcessArgs {
                 resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
