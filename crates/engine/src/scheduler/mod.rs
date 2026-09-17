@@ -95,7 +95,6 @@ enum BatchKind {
 const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
 const PREFILL_WINDOW_CREDITS: usize = 2;
 const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
-const FLOW_EXCLUSIVE_BATCH_ENV: &str = "UNISERVE_FLOW_EXCLUSIVE_BATCH";
 
 /// Builds a validated image-completion event from a PNG payload.
 fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<EngineCoreOutput> {
@@ -531,8 +530,6 @@ pub struct Scheduler {
     running_order: Vec<RequestId>,
     output: output::OutputSender,
     prefer_media: bool,
-    /// Diagnostic: keep denoise steps out of batches that carry text rows.
-    flow_exclusive_batch: bool,
     /// Engine-fatal latch: set when the executor/worker dies;
     /// the control loop exits and the host converts this into engine-dead.
     fatal: bool,
