@@ -13,7 +13,7 @@ use crate::executor::WorkerExecError;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use uniserve_worker_ipc::{ClientEndpoint, Frame, Pending, service_name};
+use uniserve_worker_ipc::{ClientEndpoint, Frame, Pending};
 use uniserve_worker_ipc::{
     ComputationId, RequestKey, ScheduleBatch, WorkerInfo, WorkerRequest, WorkerResponse,
 };
@@ -192,6 +192,32 @@ impl Default for WorkerProcessArgs {
 }
 
 impl WorkerProcessArgs {
+    /// Returns one rank's device index on its own host and that host's rank count.
+    ///
+    /// Section 5.1 of the serving architecture gives `LOCAL_RANK` and
+    /// `LOCAL_WORLD_SIZE` host-relative values: a rank's position among the
+    /// ranks the placement puts on the same node, and how many ranks that node
+    /// holds. Host count enters the system here and nowhere below it. The two
+    /// coincide with the global values while an instance occupies one host.
+    fn host_slot(&self, rank: u32) -> (u32, u32) {
+        let node = &self.ranks[rank as usize].node;
+        let resident = self
+            .ranks
+            .iter()
+            .enumerate()
+            .filter(|(_, placed)| &placed.node == node)
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        let index = resident
+            .iter()
+            .position(|position| *position == rank as usize)
+            .expect("a rank is resident on the node its placement names");
+        (
+            u32::try_from(index).expect("a host's rank index fits the launch arithmetic"),
+            u32::try_from(resident.len()).expect("a host's rank count fits the launch arithmetic"),
+        )
+    }
+
     /// Builds the typed launch descriptor the worker process consumes.
     ///
     /// Every tuning value is stated explicitly, so the launching side is the
@@ -203,7 +229,7 @@ impl WorkerProcessArgs {
         device: &str,
         rank: u32,
         world_size: u32,
-        service: &str,
+        registration: &str,
         components: &std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
         transfer_backends: &str,
         publish_backends: &str,
@@ -213,13 +239,13 @@ impl WorkerProcessArgs {
         let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
         let mut fields = serde_json::Map::new();
         fields.insert("worker_id".into(), json!(self.worker_id));
-        fields.insert("service_name".into(), json!(service));
+        fields.insert("registration_address".into(), json!(registration));
         fields.insert("queue_depth".into(), json!(depth));
         fields.insert("ipc_payload_cap".into(), json!(max_payload));
         fields.insert("model".into(), json!(self.model));
         fields.insert("device".into(), json!(device));
         fields.insert("rank".into(), json!(rank));
-        fields.insert("local_rank".into(), json!(rank));
+        fields.insert("local_rank".into(), json!(self.host_slot(rank).0));
         fields.insert("world_size".into(), json!(world_size));
         fields.insert("entries".into(), serde_json::to_value(components)?);
         fields.insert(
@@ -352,6 +378,26 @@ pub(super) struct RankProcess {
     death_watcher: Option<DeathWatcher>,
 }
 
+/// One spawned rank between process creation and its endpoint report.
+///
+/// The engine cannot bind the rank's channel until the rank names its own
+/// endpoint, so everything the channel needs is retained here meanwhile.
+pub(super) struct PendingRank {
+    /// Taken by adoption; a rank still held here is killed when the launch fails.
+    child: Option<Child>,
+    rank: u32,
+    world_size: u32,
+    depth: usize,
+    max_payload: usize,
+    /// Taken by adoption alongside the process it cancels.
+    startup_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    rendezvous: Option<std::sync::Arc<tempfile::TempDir>>,
+    /// Retains the launch descriptor until the rank has read it; adoption
+    /// transfers it to the channel that outlives this launch phase.
+    launch_descriptor: Option<tempfile::TempDir>,
+    components: std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
+}
+
 struct PendingRecord {
     kind: OutstandingKind,
     pending: Pending,
@@ -371,9 +417,12 @@ enum OutstandingKind {
     },
 }
 
-impl RankProcess {
-    /// Spawns one rank and connects its IPC client without waiting for model readiness.
-    pub(crate) fn spawn_rank_deferred(
+impl PendingRank {
+    /// Spawns one rank, which reports its endpoint to `registration`.
+    ///
+    /// The rank's channel is bound afterwards from that report, so nothing here
+    /// names the endpoint and nothing waits for model readiness.
+    pub(crate) fn spawn_rank(
         args: &WorkerProcessArgs,
         device: &str,
         rank: u32,
@@ -381,10 +430,10 @@ impl RankProcess {
         rendezvous: Option<std::sync::Arc<tempfile::TempDir>>,
         components: &std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        registration: &str,
     ) -> anyhow::Result<Self> {
         let depth = args.queue_depth.max(1);
         let max_payload = args.req_slot_cap.max(args.resp_slot_cap).max(1);
-        let service = service_name(&format!("{}_{}_{}", std::process::id(), rank, nano_id()));
 
         // Resolve mechanism ownership from the physical rank's incident edges.
         let (backends, publications) = args.transfer.rank_backends(&args.worker_id, rank);
@@ -406,7 +455,7 @@ impl RankProcess {
             device,
             rank,
             world_size,
-            &service,
+            registration,
             components,
             &names(&backends),
             &names(&publications),
@@ -431,10 +480,13 @@ impl RankProcess {
             .arg(world_size.to_string())
             .arg("--launch-descriptor")
             .arg(&descriptor_path);
+        // Torch and the numerical libraries read the host-relative pair; the
+        // global pair names the rank's place in the whole process world.
+        let (local_rank, local_world_size) = args.host_slot(rank);
         cmd.env("RANK", rank.to_string())
             .env("WORLD_SIZE", world_size.to_string())
-            .env("LOCAL_RANK", rank.to_string())
-            .env("LOCAL_WORLD_SIZE", world_size.to_string());
+            .env("LOCAL_RANK", local_rank.to_string())
+            .env("LOCAL_WORLD_SIZE", local_world_size.to_string());
         // CUDA IPC exports cudaMalloc allocations. Expandable VMM segments
         // cannot supply its memory handles; other ranks retain expandable
         // allocation to accommodate varying serving shapes.
@@ -454,21 +506,78 @@ impl RankProcess {
         }
         let child = cmd.spawn().context("spawning python worker")?;
 
-        let client = ClientEndpoint::connect(&service, max_payload, depth)
-            .context("connecting to worker IPC service")?;
+        Ok(Self {
+            child: Some(child),
+            rank,
+            world_size,
+            depth,
+            max_payload,
+            startup_abort: Some(startup_abort),
+            rendezvous,
+            launch_descriptor: Some(descriptor_directory),
+            components: components.clone(),
+        })
+    }
+
+    /// Returns the rank this process was launched as.
+    pub(crate) fn rank(&self) -> u32 {
+        self.rank
+    }
+
+    /// Fails by name when the rank exited before reporting its endpoint.
+    pub(crate) fn check_alive(&mut self) -> anyhow::Result<()> {
+        let child = self
+            .child
+            .as_mut()
+            .expect("an unadopted rank retains its process");
+        match child.try_wait() {
+            Ok(None) => Ok(()),
+            Ok(Some(status)) => Err(anyhow::anyhow!(
+                "rank {} exited with {status} before reporting its endpoint",
+                self.rank
+            )),
+            Err(error) => Err(error).context("checking a launched rank"),
+        }
+    }
+
+    /// Binds this rank's channel to the endpoint the rank reported.
+    pub(crate) fn adopt(mut self, endpoint: &str) -> anyhow::Result<RankProcess> {
+        let rank = self.rank;
+        let world_size = self.world_size;
+        let depth = self.depth;
+        // The process stays owned here until the channel exists, so a failed
+        // connection terminates the rank instead of orphaning it.
+        let client = ClientEndpoint::connect(endpoint, self.max_payload, depth)
+            .with_context(|| format!("connecting to the channel rank {rank} reported"))?;
+        // The endpoint is the rank's choice, so the head records what it bound.
+        tracing::info!(rank, endpoint, "bound rank channel from its registration");
+        let child = self
+            .child
+            .take()
+            .expect("an unadopted rank retains its process");
+        let launch_descriptor = self
+            .launch_descriptor
+            .take()
+            .expect("an unadopted rank retains its launch descriptor");
+        let startup_abort = self
+            .startup_abort
+            .take()
+            .expect("an unadopted rank retains its startup cancellation");
+        let rendezvous = self.rendezvous.take();
+        let components = std::mem::take(&mut self.components);
         let death_watcher =
             DeathWatcher::spawn(child.id(), client.death_wake(), startup_abort.clone());
-        Ok(Self {
+        Ok(RankProcess {
             client,
             info: WorkerInfo::default(),
             startup_cancel: Some(startup_abort),
             child,
             _rendezvous: rendezvous,
-            _launch_descriptor: descriptor_directory,
+            _launch_descriptor: launch_descriptor,
             depth,
             rank,
             world_size,
-            expected_components: components.clone(),
+            expected_components: components,
             pending: HashMap::new(),
             ready: VecDeque::new(),
             next_call_id: 1,
@@ -477,7 +586,20 @@ impl RankProcess {
             death_watcher,
         })
     }
+}
 
+impl Drop for PendingRank {
+    /// A rank that never reported an endpoint has no channel to close through,
+    /// so a failed launch terminates its process here rather than leaking it.
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl RankProcess {
     /// Publish capabilities only after model resources and warmup are ready.
     pub(crate) fn finish_startup(&mut self) -> anyhow::Result<()> {
         let call_id = self.alloc_call_id();
@@ -926,24 +1048,4 @@ impl Drop for RankProcess {
     fn drop(&mut self) {
         let _ = self.close();
     }
-}
-
-/// Returns a process-local identifier suitable for worker IPC service names.
-pub(crate) fn nano_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Build an id from a wall-clock timestamp in the high bits plus a process-wide
-    // monotonic counter in the low 16 bits. subsec_nanos alone wraps every second and
-    // would collide for workers spawned within the same wall-clock second; the counter
-    // makes ids produced within any 65536-call window distinct regardless of clock
-    // resolution or non-monotonicity, while the timestamp separates ids across windows.
-    // The full service name also includes pid + rank, so any residual aliasing in the
-    // shifted timestamp bits cannot produce a real cross-worker collision.
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    (nanos << 16) | (seq & 0xffff)
 }

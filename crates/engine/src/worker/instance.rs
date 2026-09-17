@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use super::{RankProcess, RunSubmitError};
+use super::registration::RankRegistry;
+use super::{PendingRank, RankProcess, RunSubmitError};
 use crate::executor::{WorkerExecError, WorkerFailure};
 use anyhow::Context;
 use sha2::{Digest as _, Sha256};
@@ -18,9 +19,23 @@ use crate::worker::WorkerProcessArgs;
 /// Maximum interval without rank progress before an in-flight run is treated as failed.
 const NEXT_RESULT_DEADLINE: Duration = Duration::from_secs(300);
 
+/// One worker group's spawned ranks and the address they report to.
+pub(crate) struct LaunchedRanks {
+    registry: RankRegistry,
+    ranks: Vec<PendingRank>,
+}
+
 impl WorkerProcessArgs {
     /// Launches and connects every rank in one physical worker group.
     fn launch(&self, cancel: Option<Arc<AtomicBool>>) -> anyhow::Result<Vec<RankProcess>> {
+        self.adopt_ranks(self.spawn_ranks(cancel)?)
+    }
+
+    /// Starts every rank of one group without waiting for its endpoint report.
+    ///
+    /// Spawning is separated from adoption so several groups start their
+    /// processes concurrently and then wait for all of their reports together.
+    fn spawn_ranks(&self, cancel: Option<Arc<AtomicBool>>) -> anyhow::Result<LaunchedRanks> {
         let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         crate::WorkerConfig::validate_members(&self.ranks, &self.entries)?;
         // This process owns exactly the ranks placed on its own host. Ranks
@@ -45,21 +60,51 @@ impl WorkerProcessArgs {
         } else {
             None
         };
-        let mut launched = Vec::with_capacity(self.ranks.len());
+        // Ranks name their own channel endpoints and report them here; the
+        // engine binds each channel from the report rather than choosing the
+        // endpoint before the process exists.
+        let registry = RankRegistry::bind()?;
+        let mut ranks = Vec::with_capacity(self.ranks.len());
         for rank in 0..self.ranks.len() {
             let rank_device = &self.ranks[rank].device;
-            let process = RankProcess::spawn_rank_deferred(
+            ranks.push(PendingRank::spawn_rank(
                 self,
-                &rank_device,
+                rank_device,
                 rank as u32,
                 self.ranks.len() as u32,
                 rendezvous.clone(),
                 &self.entries,
                 cancel.clone(),
-            )?;
-            launched.push(process);
+                registry.address(),
+            )?);
         }
-        Ok(launched)
+        Ok(LaunchedRanks { registry, ranks })
+    }
+
+    /// Binds every rank's channel to the endpoint that rank reported.
+    fn adopt_ranks(&self, launched: LaunchedRanks) -> anyhow::Result<Vec<RankProcess>> {
+        let LaunchedRanks {
+            registry,
+            mut ranks,
+        } = launched;
+        let reports = registry.collect(&self.worker_id, ranks.len(), || {
+            ranks
+                .iter_mut()
+                .try_for_each(|pending| pending.check_alive())
+        })?;
+        ranks
+            .into_iter()
+            .zip(reports)
+            .map(|(pending, report)| {
+                anyhow::ensure!(
+                    pending.rank() == report.rank,
+                    "rank {} adopted the endpoint reported by rank {}",
+                    pending.rank(),
+                    report.rank
+                );
+                pending.adopt(&report.endpoint)
+            })
+            .collect()
     }
 }
 
@@ -140,9 +185,16 @@ impl WorkerGroup {
 
     /// Launch the configured static rank groups and wait for loaded capabilities.
     pub fn spawn_all(arguments: Vec<WorkerProcessArgs>) -> anyhow::Result<Vec<Self>> {
+        // Every group's processes start before any group waits for reports, so
+        // their interpreter and library import overlap.
+        let launched = arguments
+            .iter()
+            .map(|args| args.spawn_ranks(None))
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let groups = arguments
             .iter()
-            .map(|args| args.launch(None))
+            .zip(launched)
+            .map(|(args, ranks)| args.adopt_ranks(ranks))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let mut workers = Vec::with_capacity(groups.len());
         for (mut ranks, args) in groups.into_iter().zip(arguments) {
