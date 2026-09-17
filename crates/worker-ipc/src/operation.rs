@@ -371,6 +371,34 @@ impl SamplingState {
     }
 }
 
+/// The coordinates one call executes at.
+///
+/// A rank would otherwise derive these by chaining from the operations that
+/// preceded it. The engine holds the request state they come from, so it states
+/// them and the rank asserts its own ledger agrees.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallCoordinates {
+    /// Position of this call's first token in the request's logical sequence.
+    pub logical_position: u32,
+    /// Tokens whose KV a numerical call may attend to at submission.
+    pub kv_visible_len: u32,
+    /// Tokens whose KV is initialized at submission; never below the visible extent.
+    pub kv_computed_len: u32,
+    /// Denoising steps completed for this request at submission.
+    pub flow_step: u32,
+}
+
+impl CallCoordinates {
+    /// Validates the containment the coordinates must satisfy.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.kv_visible_len <= self.kv_computed_len,
+            "call coordinates place visible KV beyond the computed extent"
+        );
+        Ok(())
+    }
+}
+
 /// One immutable computation with its identity, data dependencies, and output limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledRequest {
@@ -380,6 +408,8 @@ pub struct ScheduledRequest {
     pub op_id: ComputationId,
     /// Execution-order dependency; zero identifies admission, absent for independent work.
     pub predecessor: Option<ComputationId>,
+    /// Coordinates this call executes at, so a rank does not derive them.
+    pub coordinates: CallCoordinates,
     /// Computation entry bound within the selected Worker.
     pub entry: String,
     /// Computation performed by this operation.
@@ -507,6 +537,7 @@ impl ScheduledRequest {
         // Establish operation identity, family, lineage, and declared capacity.
         ensure_valid!(self.op_id.batch_id > 0, "operation id must be positive");
         ensure_valid!(!self.entry.is_empty(), "operation entry must not be empty");
+        self.coordinates.validate()?;
 
         ensure_valid!(
             !(self.advances_state()

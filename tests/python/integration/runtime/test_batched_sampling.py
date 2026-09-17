@@ -22,6 +22,7 @@ from tests.python.fixtures.depth_one import (
     finalized_report,
     record_completion,
     root_parent,
+    stamp_batch,
     token_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
@@ -356,10 +357,13 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
     )
     # Reserve the verifier's full possible prefix, as a queued scheduler would.
     # The decode must use the accepted prefix rather than the initialized tail.
-    successor_batch = replace(
-        execution_run(run_id=3, operations=(successor,)),
-        seq_lens=(
-            len(extend.input_token_ids) + len(verify.input_token_ids) + 1,
+    successor_batch = stamp_batch(
+        worker,
+        replace(
+            execution_run(run_id=3, operations=(successor,)),
+            seq_lens=(
+                len(extend.input_token_ids) + len(verify.input_token_ids) + 1,
+            ),
         ),
     )
     following = finalized_report(worker, worker.submit(successor_batch))

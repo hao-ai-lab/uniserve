@@ -1016,6 +1016,7 @@ mod tests {
         let admission = admission();
         let parent = ComputationId::new(0, 0);
         let operation = ScheduledRequest {
+            coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
 
             token_output: Some(token_output(ComputationId::new(run_id, request_index))),

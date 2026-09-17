@@ -30,6 +30,7 @@ from uniserve_worker.protocol.batch import (
 from uniserve_worker.protocol.identity import ComputationId, RequestKey
 from uniserve_worker.protocol.operation import (
     Bounds,
+    CallCoordinates,
     OpStatus,
     PipelineStage,
     ScheduledRequest,
@@ -268,6 +269,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(
         request_key=key,
         op_id=ComputationId(1, 0),
         predecessor=None,
+        coordinates=CallCoordinates(),
         kind=PipelineStage.TEXT_ENCODING,
         entry="text_encoder",
         bounds=Bounds(),
@@ -339,6 +341,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(
             request_key=key,
             op_id=ComputationId(2, 0),
             predecessor=None,
+            coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
             entry="text_encoder",
             bounds=Bounds(max_transfer_bytes=reference.max_bytes),
@@ -473,6 +476,7 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
             request_key=key,
             op_id=op,
             predecessor=None,
+            coordinates=CallCoordinates(),
             kind=PipelineStage.TEXT_ENCODING,
             entry="text_encoder",
             bounds=Bounds(),

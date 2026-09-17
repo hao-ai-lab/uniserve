@@ -476,6 +476,66 @@ class Rng:
 
 
 @dataclass(frozen=True, slots=True)
+class CallCoordinates:
+    """The coordinates a call executes at, as the engine states them.
+
+    A rank would otherwise chain these from the calls that preceded it. The
+    engine holds the request state they come from, so it sends them and the
+    rank asserts its own ledger agrees.
+    """
+
+    # Position of this call's first token in the request's logical sequence.
+    logical_position: int = 0
+    # Tokens whose KV a numerical call may attend to at submission.
+    kv_visible_len: int = 0
+    # Tokens whose KV is initialized at submission; never below the visible
+    # extent, and above it only while a verifier's rejected drafts remain.
+    kv_computed_len: int = 0
+    # Denoising steps completed for this request at submission.
+    flow_step: int = 0
+
+    @classmethod
+    def from_mapping(
+        cls, value: object, where: str = "coordinates"
+    ) -> CallCoordinates:
+        """Parse the coordinates a call states."""
+        coordinates = _fast_coordinates(value)
+        if coordinates is not None:
+            return coordinates
+        data = _map(value, where)
+        coordinates = cls(
+            logical_position=_uint(
+                data.get("logical_position"), f"{where}.logical_position"
+            ),
+            kv_visible_len=_uint(
+                data.get("kv_visible_len"), f"{where}.kv_visible_len"
+            ),
+            kv_computed_len=_uint(
+                data.get("kv_computed_len"), f"{where}.kv_computed_len"
+            ),
+            flow_step=_uint(data.get("flow_step"), f"{where}.flow_step"),
+        )
+        coordinates.validate()
+        return coordinates
+
+    def validate(self) -> None:
+        """Enforce the containment the two KV extents must satisfy."""
+        if self.kv_visible_len > self.kv_computed_len:
+            raise invalid_descriptor(
+                "call coordinates place visible KV beyond the computed extent"
+            )
+
+    def to_mapping(self) -> dict[str, object]:
+        """Serialize the coordinates a call states."""
+        return {
+            "logical_position": self.logical_position,
+            "kv_visible_len": self.kv_visible_len,
+            "kv_computed_len": self.kv_computed_len,
+            "flow_step": self.flow_step,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ScheduledRequest:
     """One computation with its request identity and dependencies.
 
@@ -487,6 +547,8 @@ class ScheduledRequest:
     # Immediate dependency within the request; must precede op_id and is
     # required for state-advancing work and KV installation.
     predecessor: identity.ComputationId | None
+    # Coordinates this call executes at, stated by the engine.
+    coordinates: CallCoordinates
     kind: Computation
     bounds: Bounds
     # Name of the worker model component that executes this computation.
@@ -601,6 +663,7 @@ class ScheduledRequest:
         # Identity and dependency ordering.
         if self.op_id.batch_id < 1:
             raise invalid_descriptor("operation id must be positive")
+        self.coordinates.validate()
         if not isinstance(self.entry, str) or not self.entry:
             raise invalid_descriptor("operation entry must not be empty")
         if self.kind not in COMPUTATIONS:
@@ -795,6 +858,9 @@ class ScheduledRequest:
                 predecessor_value, f"{where}.predecessor"
             )
         )
+        coordinates = CallCoordinates.from_mapping(
+            get("coordinates"), f"{where}.coordinates"
+        )
         entry = _str(get("entry"), f"{where}.entry")
         work = computation(get("code"), f"{where}.code")
         bounds = _fast_bounds(get("bounds"))
@@ -839,6 +905,7 @@ class ScheduledRequest:
             request_key=request_key,
             op_id=op_id,
             predecessor=predecessor,
+            coordinates=coordinates,
             entry=entry,
             kind=work,
             bounds=bounds,
@@ -939,6 +1006,7 @@ class ScheduledRequest:
             "predecessor": None
             if self.predecessor is None
             else self.predecessor.to_mapping(),
+            "coordinates": self.coordinates.to_mapping(),
             "entry": self.entry,
             "code": self.kind.value,
             "bounds": self.bounds.to_mapping(),
@@ -1142,6 +1210,32 @@ def _fast_bounds(value: object) -> Bounds | None:
             max_transfer_bytes,
         )
     return None
+
+
+def _fast_coordinates(value: object) -> CallCoordinates | None:
+    """Decode trusted call coordinates from the compact wire representation."""
+    if type(value) is not dict:
+        return None
+    logical_position = value.get("logical_position")
+    kv_visible_len = value.get("kv_visible_len")
+    kv_computed_len = value.get("kv_computed_len")
+    flow_step = value.get("flow_step")
+    if not (
+        type(logical_position) is int
+        and logical_position >= 0
+        and type(kv_visible_len) is int
+        and type(kv_computed_len) is int
+        and 0 <= kv_visible_len <= kv_computed_len
+        and type(flow_step) is int
+        and flow_step >= 0
+    ):
+        return None
+    coordinates = object.__new__(CallCoordinates)
+    object.__setattr__(coordinates, "logical_position", logical_position)
+    object.__setattr__(coordinates, "kv_visible_len", kv_visible_len)
+    object.__setattr__(coordinates, "kv_computed_len", kv_computed_len)
+    object.__setattr__(coordinates, "flow_step", flow_step)
+    return coordinates
 
 
 def _fast_rng(value: object) -> Rng | None:

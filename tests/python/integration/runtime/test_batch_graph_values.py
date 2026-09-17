@@ -357,6 +357,7 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
     from uniserve_worker.protocol.identity import ComputationId, RequestKey
     from uniserve_worker.protocol.operation import (
         Bounds,
+        CallCoordinates,
         ForwardMode,
         ScheduledRequest,
     )
@@ -437,6 +438,7 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
                         RequestKey(1, index, 0),
                         ComputationId(1, index),
                         None,
+                        CallCoordinates(),
                         mode,
                         Bounds(),
                     )

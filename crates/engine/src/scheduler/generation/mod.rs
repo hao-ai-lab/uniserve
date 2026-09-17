@@ -5,7 +5,7 @@
 //! output is named by request epoch, producer operation, point, and generation.
 
 use std::collections::HashSet;
-use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
+use uniserve_worker_ipc::{CallCoordinates, ForwardMode, PipelineStage, TransferMode};
 
 use uniserve_core::{GenerationRequest, ImageIngestStep, RequestId, SamplingParams};
 use uniserve_worker_ipc::{
@@ -169,6 +169,11 @@ impl super::RequestState {
         if record.status == OpStatus::Predicated {
             return Ok(());
         }
+        if matches!(operation.code, Computation::Forward(_)) {
+            // A forward reports the extent it initialized, which a verifier
+            // leaves above the prefix it accepted.
+            self.kv_computed_len = record.kv_computed_len;
+        }
         match operation.code {
             Computation::Forward(ForwardMode::Prefill) if is_prompt_extend(operation) => {
                 let count = operation.input_token_ids.len().min(u32::MAX as usize) as u32;
@@ -297,6 +302,7 @@ fn computation(request: &GenerationRequest, code: Computation) -> ScheduledReque
         request_key: RequestKey::new(0, request.request_id, 0),
         op_id: ComputationId::new(0, 0),
         predecessor: None,
+        coordinates: CallCoordinates::default(),
         entry: "model".into(),
         code,
         bounds: Bounds {

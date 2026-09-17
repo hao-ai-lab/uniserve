@@ -23,6 +23,7 @@ from tests.python.fixtures.depth_one import (
     kv_publication_operation,
     record_completion,
     root_parent,
+    stamp_batch,
     token_operation,
     umm_params,
     visual_state_operation,
@@ -45,6 +46,7 @@ from uniserve_worker.protocol.identity import ComputationId
 from uniserve_worker.protocol.operation import (
     COMPUTATIONS,
     Bounds,
+    CallCoordinates,
     ErrorCode,
     ForwardMode,
     ImageParams,
@@ -1592,6 +1594,7 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
             request_key=admission.request_key,
             op_id=ComputationId(2, 0),
             predecessor=observation.op_id,
+            coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
             bounds=Bounds(max_transfer_bytes=source.max_bytes),
             token_input=source,
@@ -1681,6 +1684,7 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         request_key=admission.request_key,
         op_id=ComputationId(2, 0),
         predecessor=root_parent(admission),
+        coordinates=CallCoordinates(),
         kind=TransferMode.TENSOR,
         bounds=Bounds(
             max_transfer_bytes=source.max_bytes,
@@ -1786,6 +1790,7 @@ def test_tensor_entry_input_preserves_values_through_output_release(
         request_key=admission.request_key,
         op_id=ComputationId(2, 0),
         predecessor=root_parent(admission),
+        coordinates=CallCoordinates(),
         kind=TransferMode.TENSOR,
         bounds=Bounds(max_transfer_bytes=source.max_bytes),
         inputs=(source,),
@@ -1909,6 +1914,7 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
             request_key=admission.request_key,
             op_id=ComputationId(3, 0),
             predecessor=preparation_observation.op_id,
+            coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
             bounds=Bounds(max_transfer_bytes=source.max_bytes),
             token_input=source,
@@ -2012,6 +2018,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
             request_key=admission.request_key,
             op_id=ComputationId(4, 0),
             predecessor=flow_observation.op_id,
+            coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
             bounds=Bounds(
                 max_transfer_bytes=final_latent.max_bytes,
@@ -2254,6 +2261,7 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
                 request_key=admission.request_key,
                 op_id=moved.producer_op_id,
                 predecessor=step.op_id,
+                coordinates=CallCoordinates(),
                 kind=TransferMode.TENSOR,
                 bounds=Bounds(max_transfer_bytes=image.max_bytes),
                 image_input=image,
@@ -2282,6 +2290,7 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             request_key=admission.request_key,
             op_id=ComputationId(6, 0),
             predecessor=step.op_id,
+            coordinates=CallCoordinates(),
             kind=PipelineStage.IMAGE_DECODING,
             bounds=Bounds(max_completion_bytes=65_536),
             image_input=image,
@@ -2746,9 +2755,15 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
         )
         waiting = execution_run(run_id=5, operations=(third,), commands=())
         release = execution_run(run_id=6, commands=(Free(retained.buffer_id),))
+        # This run reaches the worker through its IPC endpoint rather than
+        # the submit path, so it states its own coordinates here.
         endpoint = QueuedWorkerIpc(
             tuple(
-                {"kind": "submit", "call_id": run.run_id, "run": run}
+                {
+                    "kind": "submit",
+                    "call_id": run.run_id,
+                    "run": stamp_batch(worker, run),
+                }
                 for run in (waiting, release)
             )
         )

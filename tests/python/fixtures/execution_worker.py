@@ -83,7 +83,16 @@ def execution_worker(
         completion_payload_bytes=1 << 16,
         components=components,
     )
-    from .depth_one import configure_physical_pool
+    from .depth_one import configure_physical_pool, submitted_run
+
+    # The fixture stands in for the engine, which states every call's
+    # coordinates from the request state it owns as it submits the batch.
+    submit = worker.submit
+
+    def submit_stamped(batch, *arguments, **options):
+        return submit(submitted_run(worker, batch), *arguments, **options)
+
+    worker.submit = submit_stamped
 
     flow = worker.runner.image_builder
     configure_physical_pool(

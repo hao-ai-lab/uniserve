@@ -27,6 +27,7 @@ from uniserve_worker.protocol.identity import (
 )
 from uniserve_worker.protocol.operation import (
     Bounds,
+    CallCoordinates,
     ImageParams,
     PipelineStage,
     ScheduledRequest,
@@ -671,6 +672,7 @@ def latent_output():
             request_key=key,
             op_id=ComputationId(1, 0),
             predecessor=ComputationId(0, 0),
+            coordinates=CallCoordinates(),
             kind=PipelineStage.LATENT_PREPARATION,
             bounds=Bounds(),
         )

@@ -24,7 +24,12 @@ from uniserve_worker.protocol.identity import (
 )
 from uniserve_worker.protocol.operation import Computation
 
-from ..foundation.errors import WorkerError, WorkerErrorCode, resource_error
+from ..foundation.errors import (
+    WorkerError,
+    WorkerErrorCode,
+    invalid_descriptor,
+    resource_error,
+)
 from ..media.buffers import MediaLease
 from ..media.storage import publish_media_bytes
 from ..profiling import timing_events_enabled
@@ -1086,6 +1091,39 @@ def decode_logprobs(
     return details
 
 
+def _assert_stated_coordinates(
+    operation: ScheduledRequest, progress: RequestProgress | None
+) -> None:
+    """Require the chained ledger to agree with the coordinates the call states.
+
+    The engine computes a call's coordinates from the request state it owns;
+    the rank still derives them from its own predecessor chain. They describe
+    the same submission, so a disagreement is a protocol failure and not a
+    condition the rank can execute through.
+
+    A call with no state predecessor carries no ledger to compare against.
+    """
+    if progress is None:
+        return
+    stated = operation.coordinates
+    if (
+        stated.logical_position == progress.logical_position
+        and stated.kv_visible_len == progress.kv_visible_len
+        and stated.kv_computed_len == progress.kv_computed_len
+        and stated.flow_step == progress.flow_step
+    ):
+        return
+    raise invalid_descriptor(
+        f"operation {operation.op_id} states coordinates "
+        f"(position {stated.logical_position}, visible "
+        f"{stated.kv_visible_len}, computed {stated.kv_computed_len}, "
+        f"step {stated.flow_step}) that disagree with the chained ledger "
+        f"(position {progress.logical_position}, visible "
+        f"{progress.kv_visible_len}, computed {progress.kv_computed_len}, "
+        f"step {progress.flow_step})"
+    )
+
+
 class PendingOutput:
     """One operation's stable predecessor, projected progress.
 
@@ -1112,6 +1150,7 @@ class PendingOutput:
             if isinstance(predecessor, PendingOutput)
             else predecessor
         )
+        _assert_stated_coordinates(operation, self.projected_progress)
         self.accepted_progress: RequestProgress | None = None
         self.successors_ready: bool = False
 

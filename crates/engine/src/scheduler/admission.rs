@@ -112,6 +112,7 @@ impl Scheduler {
             round_closing: false,
             logical_position: 0,
             kv_visible_len: 0,
+            kv_computed_len: 0,
             next_token: 0,
             num_generated_tokens: 0,
             image_id: 0,
@@ -819,4 +820,5 @@ fn acquire_cached_prefix(
     state.num_computed_prompt_tokens = (hit.cached_blocks * block_size) as u32;
     state.logical_position = state.num_computed_prompt_tokens;
     state.kv_visible_len = state.num_computed_prompt_tokens;
+    state.kv_computed_len = state.num_computed_prompt_tokens;
 }
