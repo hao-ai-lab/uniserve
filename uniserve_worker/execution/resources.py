@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import torch
 from torch import nn
 
 from uniserve.model import (
@@ -75,6 +76,31 @@ def output_layouts(
             if prompt_tokens is None
             else prompt_tokens
         )
+
+    if isinstance(component, VideoPostprocessor):
+        # The rank that converts a media unit to RGB also encodes it, and the
+        # encoded unit is the product the muxer assembles. Its length is not
+        # known when the product is reserved, so a row is bounded and carries
+        # its own length.
+        from ..media.mux import encoded_unit_bytes
+
+        decoder = capability(model, VideoDecoder)
+        builder = media_builder(model, config)
+        count = builder.maximum.num_frames if frames is None else frames
+        windows = decoder.frame_slices(count)
+        row = encoded_unit_bytes(
+            max(window.stop - window.start for window in windows),
+            decoder.frame_size.height,
+            decoder.frame_size.width,
+        )
+        return {
+            "media_units": OutputLayout(
+                (len(windows), row),
+                torch.uint8,
+                (slice(0, len(windows)), slice(0, row)),
+                variable_axes=(0,),
+            )
+        }
 
     if not isinstance(component, (Denoiser, VideoDecoder, AudioDecoder)):
         return {}

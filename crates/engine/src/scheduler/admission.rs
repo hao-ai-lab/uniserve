@@ -167,7 +167,9 @@ impl Scheduler {
         for (role, output_count) in [
             (PipelineStage::TextEncoding, 1),
             (PipelineStage::Denoising, 2),
-            (PipelineStage::VideoDecoding, 1),
+            // The video decoder's entry declares the decoded windows and the
+            // media units encoded from them; both are indexed by media unit.
+            (PipelineStage::VideoDecoding, 2),
             (PipelineStage::AudioDecoding, 1),
         ] {
             let entry = self.info.pipeline_components.get(&role)?;
@@ -342,6 +344,7 @@ impl Scheduler {
                     conditioning: None,
                     latents: Vec::new(),
                     video_segments: BTreeMap::new(),
+                    encoded_segments: BTreeMap::new(),
                     audio: None,
                     admission,
                     admission_state: WorkerRegistration::Unsubmitted,

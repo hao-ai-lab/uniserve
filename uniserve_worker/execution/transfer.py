@@ -581,3 +581,31 @@ def _release_locators(
         return
     for locator in locators:
         transfer_backends[locator.backend].release(locator)
+
+
+def reserved_unit_row(
+    operation: ScheduledRequest,
+    completion_group: int,
+    *,
+    state: BatchState,
+):
+    """Return the product row reserved for one encoded media unit.
+
+    The row is published with its batch and filled when the host task that
+    encodes the unit completes. Nothing reads it before then: the muxer's call
+    is scheduled only once every encode round has completed.
+    """
+    from .encode import bound_device_write
+
+    outputs = operation.outputs
+    if len(outputs) != 1:
+        raise invalid_descriptor(
+            "encoded media unit requires exactly one declared product"
+        )
+    write = bound_device_write(completion_group, outputs[0], state=state)
+    row = write.tensor
+    if row.ndim != 2 or row.shape[0] != 1:
+        raise invalid_descriptor(
+            "encoded media unit product must reserve one row"
+        )
+    return row

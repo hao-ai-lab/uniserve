@@ -640,11 +640,7 @@ class Worker:
                 create_media_resources(
                     self.runner,
                     rank=worker_config.rank,
-                    owns_output=(
-                        "output" in self.runner.bindings
-                        and self.runner.bindings["output"].owns
-                        and worker_config.rank == info.output_rank("output")
-                    ),
+                    worker_info=info,
                     state_slots=info.request_slots,
                     unresolved_window=info.max_unresolved_ops,
                 )

@@ -249,6 +249,7 @@ def local_product_storage_bytes(
         (PipelineStage.DENOISING, PipelineStage.AUDIO_DECODING),
         (PipelineStage.VIDEO_DECODING, PipelineStage.VIDEO_ENCODING),
         (PipelineStage.AUDIO_DECODING, PipelineStage.AUDIO_ENCODING),
+        (PipelineStage.VIDEO_ENCODING, PipelineStage.MUXING),
     ):
         source = pipeline_components.get(source_stage)
         destination = pipeline_components.get(destination_stage)

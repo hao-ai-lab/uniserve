@@ -113,7 +113,7 @@ def test_component_bindings_release_cancelled_requests(
             "units_per_rank": 1,
         },
         "audio_decoder": {"ranks": [1]},
-        "output": {"ranks": [2]},
+        "muxer": {"ranks": [2]},
     }
     if parallel_kind in ("local", "ulysses2", "ulysses4"):
         degree = {"local": 1, "ulysses2": 2, "ulysses4": 4}[parallel_kind]
@@ -139,7 +139,7 @@ def test_component_bindings_release_cancelled_requests(
                 "units_per_rank": 1,
             },
             "audio_decoder": {"ranks": [0]},
-            "output": {"ranks": [0]},
+            "muxer": {"ranks": [0]},
         }
     elif parallel_kind in ("pipeline2", "pipeline4"):
         degree = 2 if parallel_kind == "pipeline2" else 4
@@ -206,7 +206,7 @@ def test_component_bindings_release_cancelled_requests(
         "split": [(name,) for name in worker_config],
         "mixed": [
             ("denoiser", "text_encoder"),
-            ("video_decoder", "audio_decoder", "output"),
+            ("video_decoder", "audio_decoder", "muxer"),
         ],
     }[grouping]
     workers = []
@@ -243,8 +243,8 @@ def test_component_bindings_release_cancelled_requests(
             ("text_encoder", "denoiser"),
             ("denoiser", "video_decoder"),
             ("denoiser", "audio_decoder"),
-            ("video_decoder", "output"),
-            ("audio_decoder", "output"),
+            ("video_decoder", "muxer"),
+            ("audio_decoder", "muxer"),
         )
     }
     command = [
