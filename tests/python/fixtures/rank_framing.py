@@ -5,8 +5,7 @@ from collections import deque
 from pathlib import Path
 
 from tests.python.fixtures.depth_one import finalized_report
-from uniserve_worker.bootstrap.cli import create_worker_cli_parser
-from uniserve_worker.bootstrap.config import WorkerProcessArgs
+from uniserve_worker.bootstrap.cli import parse_worker_args
 from uniserve_worker.bootstrap.launch import WorkerIpcEndpoint
 from uniserve_worker.media.storage import publish_media_bytes
 from uniserve_worker.protocol.output import MediaOutput, PosixShmArtifact
@@ -14,9 +13,7 @@ from uniserve_worker.worker import Worker
 
 
 def main():
-    config = WorkerProcessArgs.from_namespace(
-        create_worker_cli_parser().parse_args()
-    )
+    config = parse_worker_args()
     with WorkerIpcEndpoint(
         config.ipc.service_name,
         max_payload=config.ipc.max_payload_bytes,

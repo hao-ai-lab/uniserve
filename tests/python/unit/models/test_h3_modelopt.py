@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from tests.python.fixtures.launch import worker_args
 from uniserve.loading import Config as IOConfig
 from uniserve_models import loading as model_loading
 from uniserve_models.minimax_h3 import Config, Model
@@ -17,7 +18,6 @@ from uniserve_models.minimax_h3.modelopt import (
     text_modules,
     video_vae_modules,
 )
-from uniserve_worker.bootstrap.cli import parse_worker_args
 from uniserve_worker.bootstrap.model_loader import prepare_worker_model
 
 pytestmark = pytest.mark.unit
@@ -131,23 +131,15 @@ def test_packed_checkpoint_loads_without_a_precision_selector(
     ),
 )
 def test_packed_checkpoint_rejects_runtime_numerical_overrides(
-    packed_checkpoint, options
+    packed_checkpoint, options, tmp_path
 ):
-    config = parse_worker_args(
-        [
-            "--service-name",
-            "packed-checkpoint-test",
-            "--ipc-payload-cap",
-            "65536",
-            "--model",
-            str(packed_checkpoint),
-            "--entries",
-            '{"output":{"ranks":[0],"parallel_config":{}}}',
-            "--max-batch-tokens",
-            "8192",
-            "--quantization-config",
-            options,
-        ]
+    config = worker_args(
+        tmp_path,
+        service_name="packed-checkpoint-test",
+        model=str(packed_checkpoint),
+        entries={"output": {"ranks": [0], "parallel_config": {}}},
+        max_batch_tokens=8192,
+        quantization_config=json.loads(options),
     )
 
     with pytest.raises(ValueError, match="owns its numerical configuration"):

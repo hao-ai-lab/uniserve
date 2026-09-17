@@ -155,29 +155,16 @@ fn native_close_drains_results_and_releases_service() -> anyhow::Result<()> {
     ));
     // Reopen the identical transport resource after each graceful process exit.
     for _ in 0..2 {
+        let descriptor_directory = tempfile::tempdir()?;
+        let descriptor_path = descriptor_directory.path().join("launch.json");
+        std::fs::write(
+            &descriptor_path,
+            serde_json::to_vec(&stub_launch_descriptor(&service))?,
+        )?;
         let mut child = std::process::Command::new(worker_python())
-            .args(["-m", "uniserve_worker.main", "--service-name", &service])
-            .args([
-                "--device",
-                "cpu",
-                "--no-model",
-                "--allow-stub",
-                "--no-prefill-cuda-graph",
-                "--graph-policy",
-                "off",
-                "--ipc-payload-cap",
-                "1048576",
-                "--ipc-max-inflight",
-                "8",
-                "--pipeline-depth",
-                "2",
-                "--max-batch-tokens",
-                "256",
-                "--max-batch-operations",
-                "8",
-                "--kv-token-capacity",
-                "4096",
-            ])
+            .args(["-m", "uniserve_worker.main"])
+            .arg("--launch-descriptor")
+            .arg(&descriptor_path)
             .spawn()?;
         let result = (|| -> anyhow::Result<()> {
             let client = ClientEndpoint::connect(&service, 1 << 20, 8)?;
@@ -2312,6 +2299,73 @@ fn rank_group_args(
         transfer: Default::default(),
         ..config
     }
+}
+
+/// Builds the launch descriptor for a weightless CPU worker used by IPC tests.
+///
+/// Production launches receive the same descriptor from the engine; these tests
+/// state one directly because they drive the worker process without a group.
+fn stub_launch_descriptor(service: &str) -> serde_json::Value {
+    const TEMPLATE: &str = r#"{
+    "service_name": "__SERVICE__",
+    "worker_id": "worker",
+    "pipeline_depth": 2,
+    "ipc_payload_cap": 1048576,
+    "ipc_max_inflight": 8,
+    "model": "",
+    "device": "cpu",
+    "rank": 0,
+    "local_rank": 0,
+    "world_size": 1,
+    "entries": {
+        "model": {
+            "ranks": [
+                0
+            ]
+        }
+    },
+    "supported_ops": null,
+    "transfer_backends": "local",
+    "publish_backends": "local",
+    "distributed_init_method": null,
+    "distributed_backend": null,
+    "mesh": null,
+    "lane": [],
+    "no_model": true,
+    "allow_stub": true,
+    "load_format": "auto",
+    "download_dir": null,
+    "load_threads": null,
+    "checksum_manifest": null,
+    "model_dtype": "bfloat16",
+    "quantization_config": {},
+    "kv_cache_dtype": null,
+    "kv_memory_fraction": 0.7,
+    "kv_token_capacity": 4096,
+    "attention_backend": "torch_sdpa",
+    "block_size": 16,
+    "max_batch_operations": 8,
+    "max_batch_tokens": 256,
+    "max_model_len": 8192,
+    "max_video_seconds": 15.0,
+    "graph_policy": "off",
+    "decode_graph_batch_sizes": null,
+    "prefill_cuda_graph": false,
+    "prefill_graph_token_sizes": null,
+    "flow_graph_batch_sizes": null,
+    "flow_graph_shapes": null,
+    "flashinfer_workspace_size": 536870912,
+    "flashinfer_use_tensor_core": null,
+    "flashinfer_decode_backend": "fa2",
+    "flashinfer_prefill_backend": "auto",
+    "flashinfer_decode_split_tile_size": null,
+    "flashinfer_prefill_split_tile_size": null,
+    "flashinfer_disable_split_kv": false
+}"#;
+    let mut value: serde_json::Value =
+        serde_json::from_str(TEMPLATE).expect("stub launch descriptor template");
+    value["service_name"] = serde_json::Value::String(service.to_owned());
+    value
 }
 
 fn worker_python() -> PathBuf {

@@ -13,12 +13,13 @@ use std::thread::JoinHandle;
 
 use crate::executor::{Executor, TransferConfig, WorkerId};
 use crate::handle::{EngineHandle, EventRx, SubmitError};
+#[cfg(feature = "testing")]
 use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulerConfig, SchedulerStats,
-    SchedulingPolicy,
+    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
 };
 use crate::scheduler::{Scheduler, SpecialTokenIds};
+use crate::scheduler::{SchedulerConfig, SchedulerStats, SchedulingPolicy};
 use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
 use anyhow::Context as _;
 use uniserve_core::{

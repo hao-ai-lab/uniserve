@@ -12,6 +12,7 @@ use super::RunSubmitError;
 use crate::executor::WorkerExecError;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use uniserve_worker_ipc::{ClientEndpoint, Frame, Pending, service_name};
 use uniserve_worker_ipc::{
     ComputationId, RequestKey, ScheduleBatch, WorkerInfo, WorkerRequest, WorkerResponse,
@@ -189,80 +190,138 @@ impl Default for WorkerProcessArgs {
 }
 
 impl WorkerProcessArgs {
-    /// Appends model-loading, memory, graph, and sampler options to a worker command.
-    fn append_worker_args(&self, cmd: &mut Command) {
-        if self.stub {
-            cmd.arg("--no-model").arg("--allow-stub");
-        }
-        if self.load_format != "auto" {
-            cmd.arg("--load-format").arg(&self.load_format);
-        }
-        if let Some(value) = &self.download_dir {
-            cmd.arg("--download-dir").arg(value);
-        }
-        if let Some(value) = self.load_threads {
-            cmd.arg("--load-threads").arg(value.to_string());
-        }
-        if let Some(value) = &self.checksum_manifest {
-            cmd.arg("--checksum-manifest").arg(value);
-        }
-        cmd.arg("--model-dtype").arg(self.model_dtype.as_str());
-        cmd.arg("--quantization-config")
-            .arg(self.quantization_config.to_string());
-        if let Some(value) = &self.kv_cache_dtype {
-            cmd.arg("--kv-cache-dtype").arg(value.as_str());
-        }
-        cmd.arg("--kv-memory-fraction")
-            .arg(self.kv_memory_fraction.to_string());
-        if let Some(value) = &self.mesh {
-            cmd.arg("--mesh").arg(value);
-        }
-        if let Some(value) = &self.distributed_backend {
-            cmd.arg("--distributed-backend").arg(value);
-        }
-        for lane in &self.lanes {
-            cmd.arg("--lane").arg(lane.worker_arg());
-        }
-        cmd.args(["--graph-policy", &self.graph_policy]);
-        if let Some(value) = &self.decode_graph_batch_sizes {
-            cmd.arg("--decode-graph-batch-sizes").arg(value);
-        }
-        if self.prefill_cuda_graph {
-            cmd.arg("--prefill-cuda-graph");
-        }
-        if let Some(value) = &self.prefill_graph_token_sizes {
-            cmd.arg("--prefill-graph-token-sizes").arg(value);
-        }
-        if let Some(value) = &self.flow_graph_batch_sizes {
-            cmd.arg("--flow-graph-batch-sizes").arg(value);
-        }
-        if let Some(value) = &self.flow_graph_shapes {
-            cmd.arg("--flow-graph-shapes").arg(value);
-        }
-        cmd.arg("--flashinfer-workspace-size")
-            .arg(self.flashinfer_workspace_size.to_string());
-        if let Some(value) = &self.flashinfer_use_tensor_core {
-            cmd.arg("--flashinfer-use-tensor-core").arg(value);
-        }
-        cmd.arg("--flashinfer-decode-backend")
-            .arg(self.flashinfer_decode_backend.as_str());
-        cmd.arg("--flashinfer-prefill-backend")
-            .arg(self.flashinfer_prefill_backend.as_str());
-        if let Some(value) = self.flashinfer_decode_split_tile_size {
-            cmd.arg("--flashinfer-decode-split-tile-size")
-                .arg(value.to_string());
-        }
-        if let Some(value) = self.flashinfer_prefill_split_tile_size {
-            cmd.arg("--flashinfer-prefill-split-tile-size")
-                .arg(value.to_string());
-        }
-        if self.flashinfer_disable_split_kv {
-            cmd.arg("--flashinfer-disable-split-kv");
-        }
-        cmd.arg("--max-model-len")
-            .arg(self.max_model_len.to_string());
-        cmd.arg("--max-video-seconds")
-            .arg(self.max_video_seconds.to_string());
+    /// Builds the typed launch descriptor the worker process consumes.
+    ///
+    /// Every tuning value is stated explicitly, so the launching side is the
+    /// single source of defaults and the worker never re-derives one. The keys
+    /// are the worker configuration's own field names; only the process
+    /// identity and endpoint travel on argv.
+    fn launch_descriptor(
+        &self,
+        device: &str,
+        rank: u32,
+        world_size: u32,
+        service: &str,
+        components: &std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
+        transfer_backends: &str,
+        publish_backends: &str,
+        distributed_init_method: Option<String>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let depth = self.pipeline_depth.max(1);
+        let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
+        let mut fields = serde_json::Map::new();
+        fields.insert("worker_id".into(), json!(self.worker_id));
+        fields.insert("service_name".into(), json!(service));
+        fields.insert("pipeline_depth".into(), json!(depth));
+        fields.insert("ipc_payload_cap".into(), json!(max_payload));
+        fields.insert("ipc_max_inflight".into(), json!(depth));
+        fields.insert("model".into(), json!(self.model));
+        fields.insert("device".into(), json!(device));
+        fields.insert("rank".into(), json!(rank));
+        fields.insert("local_rank".into(), json!(rank));
+        fields.insert("world_size".into(), json!(world_size));
+        fields.insert("entries".into(), serde_json::to_value(components)?);
+        fields.insert(
+            "supported_ops".into(),
+            if self.capability_groups.is_empty() {
+                Value::Null
+            } else {
+                json!(self.capability_groups.join(","))
+            },
+        );
+        fields.insert("transfer_backends".into(), json!(transfer_backends));
+        fields.insert("publish_backends".into(), json!(publish_backends));
+        fields.insert(
+            "distributed_init_method".into(),
+            json!(distributed_init_method),
+        );
+        fields.insert(
+            "distributed_backend".into(),
+            json!(self.distributed_backend),
+        );
+        fields.insert("mesh".into(), json!(self.mesh));
+        fields.insert(
+            "lane".into(),
+            json!(
+                self.lanes
+                    .iter()
+                    .map(|lane| lane.worker_arg())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        fields.insert("no_model".into(), json!(self.stub));
+        fields.insert("allow_stub".into(), json!(self.stub));
+        fields.insert("load_format".into(), json!(self.load_format));
+        fields.insert("download_dir".into(), json!(self.download_dir));
+        fields.insert("load_threads".into(), json!(self.load_threads));
+        fields.insert("checksum_manifest".into(), json!(self.checksum_manifest));
+        fields.insert("model_dtype".into(), json!(self.model_dtype.as_str()));
+        fields.insert(
+            "quantization_config".into(),
+            self.quantization_config.clone(),
+        );
+        fields.insert(
+            "kv_cache_dtype".into(),
+            json!(self.kv_cache_dtype.as_ref().map(|value| value.as_str())),
+        );
+        fields.insert("kv_memory_fraction".into(), json!(self.kv_memory_fraction));
+        fields.insert("kv_token_capacity".into(), json!(self.kv_token_capacity));
+        fields.insert(
+            "attention_backend".into(),
+            json!(self.attention_backend.as_name()),
+        );
+        fields.insert("block_size".into(), json!(self.block_size));
+        fields.insert(
+            "max_batch_operations".into(),
+            json!(self.max_batch_operations),
+        );
+        fields.insert("max_batch_tokens".into(), json!(self.max_batch_tokens));
+        fields.insert("max_model_len".into(), json!(self.max_model_len));
+        fields.insert("max_video_seconds".into(), json!(self.max_video_seconds));
+        fields.insert("graph_policy".into(), json!(self.graph_policy));
+        fields.insert(
+            "decode_graph_batch_sizes".into(),
+            json!(self.decode_graph_batch_sizes),
+        );
+        fields.insert("prefill_cuda_graph".into(), json!(self.prefill_cuda_graph));
+        fields.insert(
+            "prefill_graph_token_sizes".into(),
+            json!(self.prefill_graph_token_sizes),
+        );
+        fields.insert(
+            "flow_graph_batch_sizes".into(),
+            json!(self.flow_graph_batch_sizes),
+        );
+        fields.insert("flow_graph_shapes".into(), json!(self.flow_graph_shapes));
+        fields.insert(
+            "flashinfer_workspace_size".into(),
+            json!(self.flashinfer_workspace_size),
+        );
+        fields.insert(
+            "flashinfer_use_tensor_core".into(),
+            json!(self.flashinfer_use_tensor_core),
+        );
+        fields.insert(
+            "flashinfer_decode_backend".into(),
+            json!(self.flashinfer_decode_backend.as_str()),
+        );
+        fields.insert(
+            "flashinfer_prefill_backend".into(),
+            json!(self.flashinfer_prefill_backend.as_str()),
+        );
+        fields.insert(
+            "flashinfer_decode_split_tile_size".into(),
+            json!(self.flashinfer_decode_split_tile_size),
+        );
+        fields.insert(
+            "flashinfer_prefill_split_tile_size".into(),
+            json!(self.flashinfer_prefill_split_tile_size),
+        );
+        fields.insert(
+            "flashinfer_disable_split_kv".into(),
+            json!(self.flashinfer_disable_split_kv),
+        );
+        Ok(Value::Object(fields))
     }
 }
 
@@ -274,6 +333,8 @@ pub(super) struct RankProcess {
     child: Child,
     /// Keep the shared store directory until every process in the group exits.
     _rendezvous: Option<std::sync::Arc<tempfile::TempDir>>,
+    /// Retains the launch descriptor until the worker has read it.
+    _launch_descriptor: tempfile::TempDir,
     depth: usize,
     rank: u32,
     world_size: u32,
@@ -322,43 +383,7 @@ impl RankProcess {
         let depth = args.pipeline_depth.max(1);
         let max_payload = args.req_slot_cap.max(args.resp_slot_cap).max(1);
         let service = service_name(&format!("{}_{}_{}", std::process::id(), rank, nano_id()));
-        let mut cmd = Command::new(&args.python);
-        cmd.arg("-m")
-            .arg("uniserve_worker.main")
-            .arg("--worker-id")
-            .arg(&args.worker_id)
-            .arg("--service-name")
-            .arg(&service)
-            .arg("--pipeline-depth")
-            .arg(depth.to_string())
-            .arg("--ipc-payload-cap")
-            .arg(max_payload.to_string())
-            .arg("--ipc-max-inflight")
-            .arg(depth.to_string())
-            .arg("--model")
-            .arg(&args.model)
-            .arg("--device")
-            .arg(device)
-            .arg("--attention-backend")
-            .arg(args.attention_backend.as_name())
-            .arg("--block-size")
-            .arg(args.block_size.to_string())
-            .arg("--max-batch-operations")
-            .arg(args.max_batch_operations.to_string())
-            .arg("--max-batch-tokens")
-            .arg(args.max_batch_tokens.to_string())
-            .arg("--rank")
-            .arg(rank.to_string())
-            .arg("--world-size")
-            .arg(world_size.to_string());
-        cmd.arg("--local-rank")
-            .arg(rank.to_string())
-            .arg("--entries")
-            .arg(serde_json::to_string(&components)?);
-        if !args.capability_groups.is_empty() {
-            cmd.arg("--supported-ops")
-                .arg(args.capability_groups.join(","));
-        }
+
         // Resolve mechanism ownership from the physical rank's incident edges.
         let (backends, publications) = args.transfer.rank_backends(&args.worker_id, rank);
         let names = |backends: &std::collections::BTreeSet<crate::executor::TransferBackend>| {
@@ -368,8 +393,42 @@ impl RankProcess {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        cmd.arg("--transfer-backends").arg(names(&backends));
-        cmd.arg("--publish-backends").arg(names(&publications));
+        let distributed_init_method = rendezvous
+            .as_ref()
+            .map(|directory| format!("file://{}", directory.path().join("store").display()));
+
+        // One typed descriptor carries every launch value. argv keeps the
+        // process identity and the descriptor's location so a running worker
+        // remains identifiable from the process table.
+        let descriptor = args.launch_descriptor(
+            device,
+            rank,
+            world_size,
+            &service,
+            components,
+            &names(&backends),
+            &names(&publications),
+            distributed_init_method,
+        )?;
+        let descriptor_directory = tempfile::Builder::new()
+            .prefix("uniserve-worker-launch")
+            .tempdir()
+            .context("creating the worker launch descriptor directory")?;
+        let descriptor_path = descriptor_directory.path().join("launch.json");
+        std::fs::write(&descriptor_path, serde_json::to_vec_pretty(&descriptor)?)
+            .context("writing the worker launch descriptor")?;
+
+        let mut cmd = Command::new(&args.python);
+        cmd.arg("-m")
+            .arg("uniserve_worker.main")
+            .arg("--worker-id")
+            .arg(&args.worker_id)
+            .arg("--rank")
+            .arg(rank.to_string())
+            .arg("--world-size")
+            .arg(world_size.to_string())
+            .arg("--launch-descriptor")
+            .arg(&descriptor_path);
         cmd.env("RANK", rank.to_string())
             .env("WORLD_SIZE", world_size.to_string())
             .env("LOCAL_RANK", rank.to_string())
@@ -387,15 +446,6 @@ impl RankProcess {
             };
             cmd.env("PYTORCH_CUDA_ALLOC_CONF", allocation);
         }
-        if let Some(directory) = &rendezvous {
-            let store = directory.path().join("store");
-            cmd.arg("--distributed-init-method")
-                .arg(format!("file://{}", store.display()));
-        }
-        if let Some(c) = args.kv_token_capacity {
-            cmd.arg("--kv-token-capacity").arg(c.to_string());
-        }
-        args.append_worker_args(&mut cmd);
         if let Ok(cwd) = std::env::current_dir() {
             let pp = std::env::var("PYTHONPATH").unwrap_or_default();
             cmd.env("PYTHONPATH", format!("{}:{}", cwd.display(), pp));
@@ -412,6 +462,7 @@ impl RankProcess {
             startup_cancel: Some(startup_abort),
             child,
             _rendezvous: rendezvous,
+            _launch_descriptor: descriptor_directory,
             depth,
             rank,
             world_size,

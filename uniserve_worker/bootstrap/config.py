@@ -503,12 +503,19 @@ def _load_config(namespace: argparse.Namespace) -> IOConfig:
 
 
 def _parse_supported_ops(value: object) -> frozenset[Computation]:
-    """Resolve unique launch capability selectors to concrete computations."""
+    """Resolve launch capability selectors to concrete computations.
+
+    The capability group names are a worker-side vocabulary that the launching
+    side does not model, so it narrows the set only when it has a reason to.
+    An absent selector therefore means every group this worker implements.
+    """
+    if value is None:
+        value = ",".join(SUPPORTED_OP_GROUPS)
     names = tuple(
         part.strip() for part in str(value).split(",") if part.strip()
     )
     if not names:
-        raise ValueError("--supported-ops must list at least one operation")
+        raise ValueError("supported operations must list at least one group")
     try:
         operations = tuple(
             operation
@@ -517,7 +524,7 @@ def _parse_supported_ops(value: object) -> frozenset[Computation]:
         )
     except KeyError as error:
         raise ValueError(
-            f"unknown operation in --supported-ops {value!r}"
+            f"unknown operation in supported operations {value!r}"
         ) from error
     if len(set(operations)) != len(operations):
         raise ValueError("--supported-ops contains duplicate operations")

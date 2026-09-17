@@ -1,200 +1,101 @@
-"""Command-line adapter for :class:`WorkerProcessArgs`."""
+"""Launch adapter for :class:`WorkerProcessArgs`.
+
+The engine writes one typed launch descriptor per rank and passes its location
+on the command line. Every tuning value lives in that descriptor, so the
+launching side is the single source of defaults and this module never restates
+one. Only the process identity travels on argv, which keeps a running worker
+identifiable from the process table.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+from argparse import Namespace
 from collections.abc import Sequence
+from pathlib import Path
 
-from .capacity import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
-from .config import SUPPORTED_OP_GROUPS, WorkerProcessArgs
+from .config import WorkerProcessArgs
 
-
-def _json_object(value: str) -> dict[str, object]:
-    """Parse a command-line JSON object and reject non-object values."""
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as error:
-        raise argparse.ArgumentTypeError(
-            f"invalid JSON: {error.msg}"
-        ) from error
-    if not isinstance(parsed, dict):
-        raise argparse.ArgumentTypeError(
-            "quantization config must be a JSON object"
-        )
-    return parsed
+# Values the descriptor must carry. A launch that omits one is a contract
+# violation rather than something to paper over with a local default.
+REQUIRED_FIELDS = (
+    "service_name",
+    "worker_id",
+    "pipeline_depth",
+    "ipc_payload_cap",
+    "ipc_max_inflight",
+    "model",
+    "device",
+    "rank",
+    "local_rank",
+    "world_size",
+    "entries",
+    "transfer_backends",
+    "publish_backends",
+    "attention_backend",
+    "block_size",
+    "max_batch_operations",
+    "max_batch_tokens",
+    "max_model_len",
+    "max_video_seconds",
+    "model_dtype",
+    "quantization_config",
+    "kv_memory_fraction",
+    "graph_policy",
+    "prefill_cuda_graph",
+    "flashinfer_workspace_size",
+    "flashinfer_decode_backend",
+    "flashinfer_prefill_backend",
+    "flashinfer_disable_split_kv",
+    "load_format",
+    "no_model",
+    "allow_stub",
+)
 
 
 def create_worker_cli_parser() -> argparse.ArgumentParser:
-    """Build the worker CLI parser.
-
-    Options cover launch, params, resource, execution, and loading.
-    """
+    """Build the worker launch parser over identity and the descriptor."""
     parser = argparse.ArgumentParser()
-
-    # Service identity and IPC transport bounds.
-    parser.add_argument("--service-name", required=True)
+    parser.add_argument("--launch-descriptor", required=True, type=Path)
+    # Identity is repeated on argv so `ps` identifies a worker without reading
+    # its descriptor; the descriptor remains the authority.
     parser.add_argument("--worker-id", default="worker")
-    parser.add_argument("--pipeline-depth", type=int, default=2)
-    parser.add_argument("--ipc-payload-cap", type=int, required=True)
-    parser.add_argument("--ipc-max-inflight", type=int, default=1)
-
-    # Checkpoint selection and device placement.
-    parser.add_argument("--model", default="")
-    parser.add_argument(
-        "--supported-ops",
-        default=",".join(SUPPORTED_OP_GROUPS),
-        help=(
-            "comma-separated computation capability groups "
-            "assigned to this pool"
-        ),
-    )
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--mesh",
-        default="",
-        help=(
-            "comma-separated params entries: "
-            "tower=text:<device>;gen:<device> and "
-            "tower-kv-capacity=<tokens>"
-        ),
-    )
-
-    # Host product transfer and publication mechanisms.
-    parser.add_argument(
-        "--transfer-backends",
-        default="local",
-        help="comma-separated physical backends: local, shm, cuda_ipc",
-    )
-    parser.add_argument(
-        "--publish-backends",
-        default="local",
-        help="comma-separated bound backends required for outbound products",
-    )
-
-    # Numerical backends and checkpoint loading policy.
-    parser.add_argument("--attention-backend", default="auto")
-    parser.add_argument(
-        "--quantization-config",
-        type=_json_object,
-        default={},
-        help=(
-            'JSON quantization policy, for example {"mode":"balanced"}; '
-            "an empty object selects the model-owned default"
-        ),
-    )
-    parser.add_argument(
-        "--load-format",
-        default="auto",
-        choices=("auto", "safetensors", "pt", "dummy", "layered"),
-    )
-    parser.add_argument("--download-dir", default=None)
-    parser.add_argument("--load-threads", type=int, default=None)
-    parser.add_argument("--checksum-manifest", default=None)
-
-    # Batching and KV pool bounds.
-    parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
-    parser.add_argument(
-        "--max-batch-operations", type=int, default=DEFAULT_MAX_BATCH_OPS
-    )
-    parser.add_argument("--max-batch-tokens", type=int, required=True)
-    parser.add_argument("--kv-token-capacity", type=int, default=None)
-    parser.add_argument("--kv-cache-dtype", default=None)
-    parser.add_argument("--kv-memory-fraction", type=float, default=0.70)
-    parser.add_argument("--model-dtype", default="bfloat16")
-
-    # Process topology and component placement.
-    parser.add_argument(
-        "--rank",
-        type=int,
-        default=0,
-        help="process rank",
-    )
-    parser.add_argument(
-        "--world-size",
-        type=int,
-        default=1,
-        help="process world size",
-    )
-    parser.add_argument("--local-rank", type=int, default=0)
-    parser.add_argument(
-        "--entries",
-        type=_json_object,
-        default={"model": {"ranks": [0], "parallel_config": {}}},
-        help="host-expanded component membership and logical parallel settings",
-    )
-    parser.add_argument("--distributed-backend", default=None)
-    parser.add_argument("--distributed-init-method", default=None)
-    parser.add_argument(
-        "--lane",
-        action="append",
-        default=[],
-        help=(
-            "repeatable JSON lane descriptor with lane_id, sm_budget, "
-            "and domains"
-        ),
-    )
-
-    # CUDA graph capture policy.
-    parser.add_argument(
-        "--graph-policy", choices=("off", "auto", "full"), default="auto"
-    )
-    parser.add_argument("--decode-graph-batch-sizes", default=None)
-    parser.add_argument(
-        "--prefill-cuda-graph",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    parser.add_argument("--prefill-graph-token-sizes", default=None)
-    parser.add_argument("--flow-graph-batch-sizes", default=None)
-    parser.add_argument("--flow-graph-shapes", default=None)
-
-    # FlashInfer attention backend tuning.
-    parser.add_argument(
-        "--flashinfer-workspace-size",
-        type=int,
-        default=512 * 1024 * 1024,
-    )
-    parser.add_argument("--flashinfer-use-tensor-core", default=None)
-    parser.add_argument("--flashinfer-decode-backend", default="fa2")
-    parser.add_argument("--flashinfer-prefill-backend", default="auto")
-    parser.add_argument(
-        "--flashinfer-decode-split-tile-size",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--flashinfer-prefill-split-tile-size",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--flashinfer-disable-split-kv",
-        action="store_true",
-        default=False,
-    )
-
-    # The engine's own IPC and process tests launch a real worker without model
-    # weights; the serving command line cannot request this.
-    parser.add_argument("--no-model", action="store_true")
-    parser.add_argument("--allow-stub", action="store_true", default=False)
-
-    # Admission bounds.
-    parser.add_argument("--max-model-len", type=int, default=8192)
-    parser.add_argument("--max-video-seconds", type=float, default=15.0)
+    parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--world-size", type=int, default=1)
     return parser
+
+
+def read_launch_descriptor(path: Path) -> Namespace:
+    """Load one launch descriptor into the namespace the config consumes."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise ValueError(
+            f"unreadable launch descriptor {path}: {error}"
+        ) from error
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"invalid launch descriptor {path}: {error.msg}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise ValueError("launch descriptor must be a JSON object")
+
+    missing = [name for name in REQUIRED_FIELDS if name not in payload]
+    if missing:
+        raise ValueError(f"launch descriptor omits {sorted(missing)}")
+    return Namespace(**payload)
 
 
 def parse_worker_args(
     arguments: Sequence[str] | None = None,
 ) -> WorkerProcessArgs:
-    """Parse CLI arguments.
-
-    Return their validated worker-process configuration.
-    """
+    """Resolve the validated worker-process configuration for this launch."""
     parser = create_worker_cli_parser()
     namespace = parser.parse_args(arguments)
     try:
-        return WorkerProcessArgs.from_namespace(namespace)
+        return WorkerProcessArgs.from_namespace(
+            read_launch_descriptor(namespace.launch_descriptor)
+        )
     except ValueError as error:
         parser.error(str(error))
