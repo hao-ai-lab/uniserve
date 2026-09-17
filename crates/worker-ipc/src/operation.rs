@@ -1453,6 +1453,15 @@ impl ScheduleBatch {
                 "a submission batch repeats a computation identity"
             );
         }
+        // A batch is one numerical call on one component: every call in it
+        // performs the same computation through the same entry, so a rank
+        // executes it as a single homogeneous group and returns one result.
+        ensure_valid!(
+            self.operations
+                .windows(2)
+                .all(|pair| { pair[0].code == pair[1].code && pair[0].entry == pair[1].entry }),
+            "a submission batch mixes computations or entries"
+        );
 
         let operations = self
             .operations

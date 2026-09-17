@@ -16,16 +16,16 @@ impl Scheduler {
     ///
     /// Each request contributes at most one operation, prefill chunks consume only
     /// the remaining token budget, and first dispatch carries typed admission.
-    pub(super) fn assemble(&mut self) -> Option<ExecutionBatch> {
+    pub(super) fn assemble(&mut self) -> Vec<ExecutionBatch> {
         let ids = self.assembly_order();
         let lane = self.select_batch_kind(&ids);
-        let batch = self.assemble_pass(&ids, lane);
-        if batch.is_none() && !self.fatal && lane == Some(BatchKind::Prefill) {
+        let batches = self.assemble_pass(&ids, lane);
+        if batches.is_empty() && !self.fatal && lane == Some(BatchKind::Prefill) {
             // A blocked prefill lane must not prevent already-ready decode work
             // from using the execution slot.
             return self.assemble_pass(&ids, Some(BatchKind::Decode));
         }
-        batch
+        batches
     }
 
     /// Charges actual token work, including each denoising step and CFG branch.
@@ -128,28 +128,32 @@ impl Scheduler {
         &mut self,
         ids: &[RequestId],
         lane: Option<BatchKind>,
-    ) -> Option<ExecutionBatch> {
-        let mut batch = ExecutionBatch::new(0, Vec::new(), Vec::new(), Vec::new());
+    ) -> Vec<ExecutionBatch> {
+        // One batch per computation: a batch is one numerical call on one
+        // component, so a rank receives it as a single homogeneous group. The
+        // entry a call binds to follows from its computation, so the two
+        // together name one group. Computations keep the order in which their
+        // first call was selected.
+        let mut code_order: Vec<Computation> = Vec::new();
+        let mut code_batches: HashMap<Computation, ExecutionBatch> = HashMap::new();
         let submit_at = Instant::now();
         // The per-step token budget is the binding limit; individual prefill
         // chunks are clipped to its remaining capacity.
         let mut budget: usize = self.config.max_num_batched_tokens;
-        // Text prefill tokens may ride along inside a decode batch (mixed
-        // extend+decode forward): the prompt work then shares the decode
-        // step's weight sweep instead of paying a full sweep of its own.
-        // Mixed prefill rows are appended after the decode rows so the batch
-        // keeps an extend row last (graph token-bucket padding extends the
-        // last row).
+        // A decode pass may also co-schedule text prefill tokens, bounded by
+        // this budget, so a prompt does not wait for a pass of its own. Each
+        // computation still travels as its own batch and its own numerical
+        // call.
         let mut mixed_left: usize = if lane == Some(BatchKind::Decode) {
             self.config.mixed_prefill_tokens
         } else {
             0
         };
-        let mut mixed_ops = Vec::new();
         let denoise_occupies_decode_pipeline =
             lane == Some(BatchKind::Decode) && self.has_pending_denoising();
+        let mut selected = 0usize;
         for id in ids.iter().copied() {
-            if batch.requests.len() + mixed_ops.len() >= self.config.max_batch {
+            if selected >= self.config.max_batch {
                 break;
             }
             if budget == 0 {
@@ -167,10 +171,9 @@ impl Scheduler {
                 continue;
             }
             let next_type = self.peek_next_operation_variant(id);
-            // When a decode pass admits text prefill rows, the worker receives a
-            // single mixed forward. There is no `supports_mixed_op_kinds` gate;
-            // co-batched rows shift each other's numerics only through inherent
-            // batched-kernel FP non-invariance, not structural corruption.
+            // A decode pass may co-schedule text prefill rows. They are
+            // dispatched as their own batch, so the two computations remain
+            // separate numerical calls.
             let mut mixed_prefill = false;
             if let (Some(target), Some(operation_variant)) = (lane, next_type)
                 && {
@@ -219,12 +222,18 @@ impl Scheduler {
                     );
                     continue;
                 };
-                if batch.id == 0 {
-                    batch.id = self.next_batch_id();
+                let code = op.code;
+                if !code_batches.contains_key(&code) {
+                    let batch_id = self.next_batch_id();
+                    code_batches.insert(
+                        code,
+                        ExecutionBatch::new(batch_id, Vec::new(), Vec::new(), Vec::new()),
+                    );
+                    code_order.push(code);
                 }
-                let request_index = u32::try_from(batch.requests.len() + mixed_ops.len())
+                let request_index = u32::try_from(code_batches[&code].requests.len())
                     .expect("selected request count fits the IPC index");
-                op.op_id = ComputationId::new(batch.id, request_index);
+                op.op_id = ComputationId::new(code_batches[&code].id, request_index);
                 op.coordinates = self
                     .projected_coordinates(id)
                     .expect("scheduled request retains its running state");
@@ -257,38 +266,51 @@ impl Scheduler {
                     // Admission is the first request-state dependency.
                     st.last_state_op_id = ComputationId::default();
                     st.latest_token = None;
-                    batch
+                    code_batches
+                        .get_mut(&code)
+                        .expect("computation batch exists")
                         .commands
                         .push(BatchCommand::Start { request: admission });
                     admitted = true;
                 }
-                self.prepare_generation_operation(
+                let mut batch = code_batches
+                    .remove(&code)
+                    .expect("computation batch exists");
+                let prepared = self.prepare_generation_operation(
                     op,
                     reserved_buffers,
                     admitted,
                     planned_us,
                     submit_at,
                     &mut batch,
-                )?;
-                if mixed_prefill {
-                    mixed_ops.push(batch.requests.pop().expect("prepared computation exists"));
+                );
+                code_batches.insert(code, batch);
+                if prepared.is_none() {
+                    // Preparation marks the scheduler fatal before it fails.
+                    return Vec::new();
                 }
+                selected += 1;
             }
         }
-        batch.requests.extend(mixed_ops);
-        if batch.requests.is_empty() {
-            return None;
+        code_order.retain(|code| {
+            code_batches
+                .get(code)
+                .is_some_and(|batch| !batch.requests.is_empty())
+        });
+        if code_order.is_empty() {
+            return Vec::new();
         }
 
-        // Prompt commands remain disjoint from earlier state writers.
-        let prompt_batch = batch
-            .requests
+        // Prompt commands remain disjoint from earlier state writers. The
+        // round's retirements travel with the last batch so no earlier call
+        // loses the state it still reads.
+        let prompt_only = code_order
             .iter()
-            .all(|(operation, _)| batch_kind(operation.code) == BatchKind::Prefill);
-        let commands = if prompt_batch {
-            let requests = batch
-                .requests
+            .all(|code| batch_kind(*code) == BatchKind::Prefill);
+        let commands = if prompt_only {
+            let requests = code_order
                 .iter()
+                .flat_map(|code| code_batches[code].requests.iter())
                 .map(|(operation, _)| operation.request_key.request_id)
                 .collect::<HashSet<_>>();
             self.take_commands(|command| {
@@ -298,8 +320,20 @@ impl Scheduler {
         } else {
             self.take_commands(|_| true)
         };
-        batch.commands.extend(commands);
-        Some(self.finish_generation_batch(batch, submit_at))
+        let last = *code_order
+            .last()
+            .expect("selected calls name a computation");
+        let mut batches = Vec::with_capacity(code_order.len());
+        for code in code_order {
+            let mut batch = code_batches
+                .remove(&code)
+                .expect("computation batch exists");
+            if code == last {
+                batch.commands.extend(commands.iter().cloned());
+            }
+            batches.push(self.finish_generation_batch(batch, submit_at));
+        }
+        batches
     }
 
     /// Chooses the highest-priority execution lane that has schedulable work.
@@ -922,13 +956,6 @@ impl Scheduler {
             .kv_cache
             .free_blocks
             .store(self.free_blocks(), Ordering::Relaxed);
-        let mixed = batch.requests.first().is_some_and(|(first, _)| {
-            batch
-                .requests
-                .iter()
-                .any(|(operation, _)| operation.code != first.code)
-        });
-
         if self.trace_enabled() {
             let trace_ops = batch
                 .requests
@@ -948,7 +975,6 @@ impl Scheduler {
                 "at_s": now(),
                 "batch_id": batch.id,
                 "batch_size": batch.requests.len(),
-                "mixed": mixed,
                 "request_ids": batch.requests.iter().map(|(operation, _)| operation.request_key.request_id.0).collect::<Vec<_>>(),
                 "admitted_request_ids": batch.admissions().map(|request| request.request_key.request_id.0).collect::<Vec<_>>(),
                 "commands": batch.commands,
@@ -967,25 +993,6 @@ impl Scheduler {
                 "worker_image_latent_capacity": self.info.latent_capacity_units(),
             }));
         }
-        if mixed {
-            let operation_types: Vec<&'static str> = batch
-                .requests
-                .iter()
-                .map(|(operation, _)| operation.code.as_str())
-                .collect();
-            let req_ids: Vec<u64> = batch
-                .requests
-                .iter()
-                .map(|(operation, _)| operation.request_key.request_id.0)
-                .collect();
-            tracing::debug!(
-                batch_id = batch.id,
-                ?operation_types,
-                ?req_ids,
-                "submitting mixed forward batch"
-            );
-        }
-
         self.register_pending_batch(&batch, submit_at);
         batch
     }
