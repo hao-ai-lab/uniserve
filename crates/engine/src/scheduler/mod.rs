@@ -369,6 +369,8 @@ struct MediaFlowState {
     conditioning: Option<TensorRef>,
     latents: Vec<TensorRef>,
     video_segments: BTreeMap<u32, (u32, TensorRef)>,
+    /// Encoded media units by the cursor of the round that produced them.
+    encoded_segments: BTreeMap<u32, (u32, TensorRef)>,
     audio: Option<TensorRef>,
     admission: NewRequest,
     admission_state: WorkerRegistration,

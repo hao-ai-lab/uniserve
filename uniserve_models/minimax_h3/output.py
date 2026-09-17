@@ -86,7 +86,20 @@ class VideoPostprocessor(BaseVideoPostprocessor):
 
     def workspace_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
         layout = self.output_layout(num_frames)["video"]
-        return {"rgb_frames": BufferConfig(layout.shape, layout.dtype)}
+        # One call reconstructs one media unit, so the RGB workspace holds the
+        # longest unit rather than the whole timeline; the last unit is the
+        # longest because it keeps its own overlap tail.
+        unit = max(
+            window.stop - window.start for window in frame_slices(num_frames)
+        )
+        return {
+            "rgb_frames": BufferConfig((unit, *layout.shape[1:]), layout.dtype),
+            # Receives the predecessor media unit's overlap from the ring.
+            "overlap_exchange": BufferConfig(
+                (1, 3, 5, self.frame_size.height, self.frame_size.width),
+                torch.float16,
+            ),
+        }
 
     def constant_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
         frame_slices(num_frames)

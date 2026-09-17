@@ -196,7 +196,9 @@ impl WorkerConfig {
                 },
             ),
             (
-                "output".into(),
+                // The muxer assembles encoded media units into the artifact and
+                // owns no numerical method, so it is placed alone.
+                "muxer".into(),
                 ComponentConfig::parallel(vec![0], ParallelConfig::default()),
             ),
         ]);

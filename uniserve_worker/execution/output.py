@@ -1161,6 +1161,11 @@ class PendingOutput:
 
         self.kv_output: KvTransfer | None = None
         self.products: tuple[TensorPublication, ...] = ()
+        # A product whose bytes a host task produces is published with its
+        # batch and filled when the task completes. Its consumer is scheduled
+        # only after this operation completes, so the bytes are in place before
+        # any rank can read them.
+        self.encoded_unit_row: torch.Tensor | None = None
 
         # Physical latent versions are staged here and committed with the output
         # group.
@@ -1279,6 +1284,14 @@ class PendingOutput:
             try:
                 for task in self.completion_tasks:
                     result = task.result()
+                    if (
+                        isinstance(result, bytes)
+                        and self.encoded_unit_row is not None
+                    ):
+                        from ..media.mux import frame_encoded_unit
+
+                        frame_encoded_unit(result, self.encoded_unit_row)
+                        continue
                     if isinstance(result, bytes) and self._reports_output:
                         result = MediaOutput(
                             handle=PosixShmArtifact(

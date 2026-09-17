@@ -1009,9 +1009,18 @@ def _reserve_host_tasks(
         }:
             continue
 
-        # With a video postprocessor, only the output rank materializes media.
-        if postprocessor is not None and config.rank != worker_info.output_rank(
-            operation.entry
+        # A distributed entry's host work belongs to whichever of its ranks
+        # received the operation, because each holds its own media units. Any
+        # other entry materializes on its single publication owner.
+        distributed = any(
+            component.name == operation.entry
+            and component.config.distribution is not None
+            for component in worker_info.components
+        )
+        if (
+            postprocessor is not None
+            and not distributed
+            and config.rank != worker_info.output_rank(operation.entry)
         ):
             continue
 
