@@ -12,7 +12,12 @@ from torch import nn
 from uniserve.diffusion import Branch
 from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
-from uniserve.model import CausalLM, PatchEncoder, VideoPostprocessor
+from uniserve.model import (
+    CausalLM,
+    PatchEncoder,
+    VideoDecoder,
+    VideoPostprocessor,
+)
 from uniserve.processing import (
     FeatureLayout,
     ImageProcessor,
@@ -32,7 +37,7 @@ from ..runtime.cache_manager import CacheManager
 from ..runtime.results import resolve_outputs
 from ..runtime.tensor_store import TensorStore, device_product_capacity_bytes
 from .components import media_components
-from .inputs import capability, image_builder
+from .inputs import capability, image_builder, media_builder
 
 _DEVICE_PRODUCTS_PER_OPERATION = 6
 _DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
@@ -401,12 +406,19 @@ def request_tensor_arena_capacity(
     *,
     queue_depth: int,
     product_bytes_per_request: int,
+    concurrent_imports: int = 0,
 ) -> ArenaCapacity:
-    """Bound product, relay and transfer storage for fixed request tensors."""
+    """Bound product, relay and transfer storage for fixed request tensors.
+
+    ``concurrent_imports`` is how many remote product regions one request's
+    calls can have in flight at once beyond its operation window, which is what
+    the artifact's assembly costs: it reads every encode round of the request,
+    and each round was written by every rank that held a media unit in it.
+    """
     depth = int(queue_depth)
     max_operations = int(worker_config.max_batch_operations)
     state_slots = int(worker_config.max_request_pool_size)
-    slots = depth * max_operations
+    slots = max(depth * max_operations, state_slots * int(concurrent_imports))
     unresolved_window = request_tensor_window(depth, state_slots)
     tensor_store = _DEVICE_PRODUCTS_PER_OPERATION * (
         slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
@@ -427,6 +439,30 @@ def request_tensor_arena_capacity(
         transfer_tickets=max(1, min(slots, _MAX_TRANSFER_ENTRIES)),
         host_lane_inflight=state_slots * (unresolved_window + 1),
     )
+
+
+def artifact_import_regions(
+    model: nn.Module,
+    worker_config: WorkerConfig,
+    *,
+    bindings: Mapping[str, ModelEntry],
+) -> int:
+    """Count the remote product regions assembling one artifact reads.
+
+    Media units are encoded on the ranks that reconstruct them, one round at a
+    time, and the muxer reads every round. Each round holds one media unit per
+    participating rank and the muxer produced one of them itself.
+    """
+    components = media_components(model)
+    entry = components.get(PipelineStage.VIDEO_ENCODING)
+    binding = None if entry is None else bindings.get(entry)
+    decoder = capability(model, VideoDecoder)
+    builder = media_builder(model, worker_config)
+    if binding is None or decoder is None or builder is None:
+        return 0
+    ranks = len(binding.config.ranks)
+    units = len(decoder.frame_slices(builder.maximum.num_frames))
+    return ceil_div(units, ranks) * max(0, ranks - 1)
 
 
 def model_arena_capacity(
@@ -473,6 +509,9 @@ def model_arena_capacity(
                 max_unresolved_ops=request_tensor_window(
                     depth, request_pool_size
                 ),
+            ),
+            concurrent_imports=artifact_import_regions(
+                model, worker_config, bindings=bindings or {}
             ),
         )
 
