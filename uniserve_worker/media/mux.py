@@ -46,6 +46,12 @@ _LENGTH_BYTES = 8
 # Container structure and the codec's parameter sets cost about a kilobyte and a
 # half regardless of raster, so a row is never smaller than this.
 _CONTAINER_FLOOR = 1 << 16
+# Each media unit is its own encoder session, and several ranks encode at once
+# on one host, so a session must not size its thread pool to the machine.
+# Measured at this preset and raster, eight threads encode a unit as fast as an
+# unbounded pool does, while an unbounded pool costs an order of magnitude more
+# than the encoding itself to create inside a worker process.
+_ENCODER_THREADS = 8
 
 
 def require_media_codecs(video_codec: str, audio_codec: str) -> None:
@@ -172,6 +178,7 @@ def encode_video_unit(config: AvMuxConfig, rgb24: np.ndarray) -> bytes:
         stream.width, stream.height = config.width, config.height
         stream.pix_fmt = "yuv420p"
         stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
+        stream.codec_context.thread_count = _ENCODER_THREADS
         for index, pixels in enumerate(rgb24):
             frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
             frame.pts = index
@@ -210,6 +217,7 @@ def encode_audio_track(config: AvMuxConfig, pcm: np.ndarray) -> bytes:
         stream.sample_rate = config.audio_rate
         stream.bit_rate = 144_000
         stream.options = {"aac_coder": "fast"}
+        stream.codec_context.thread_count = _ENCODER_THREADS
         pts = 0
         for start in range(0, target, config.audio_frame_samples):
             stop = min(start + config.audio_frame_samples, target)
