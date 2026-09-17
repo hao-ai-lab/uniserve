@@ -2354,6 +2354,7 @@ fn stub_launch_descriptor(service: &str) -> serde_json::Value {
     "prefill_graph_token_sizes": null,
     "flow_graph_batch_sizes": null,
     "flow_graph_shapes": null,
+    "video_graph_shapes": null,
     "flashinfer_workspace_size": 536870912,
     "flashinfer_use_tensor_core": null,
     "flashinfer_decode_backend": "fa2",

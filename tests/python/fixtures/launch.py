@@ -58,6 +58,7 @@ DEFAULTS: dict[str, Any] = {
     "prefill_graph_token_sizes": None,
     "flow_graph_batch_sizes": None,
     "flow_graph_shapes": None,
+    "video_graph_shapes": None,
     "flashinfer_workspace_size": 536870912,
     "flashinfer_use_tensor_core": None,
     "flashinfer_decode_backend": "fa2",

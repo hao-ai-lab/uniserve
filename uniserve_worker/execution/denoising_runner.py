@@ -98,6 +98,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         capture_stream: torch.cuda.Stream | None,
         groups: tuple[Communicator, ...],
         capacity: int,
+        shapes: int = 1,
         cache: PrefixCache | None = None,
         attention="auto",
         matmul="auto",
@@ -107,6 +108,10 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             raise ValueError(
                 "denoising requires a positive resident request capacity"
             )
+        if shapes < 1:
+            raise ValueError(
+                "denoising requires a positive resident size capacity"
+            )
 
         self.model, self.device = model, device
         self.capture_stream, self.groups, self.capacity = (
@@ -114,6 +119,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             groups,
             capacity,
         )
+        self.shapes = shapes
         self.cache, self.attention, self.matmul = cache, attention, matmul
 
         # Captured graphs draw their workspace from per-device memory pools.
@@ -129,10 +135,21 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         self.prepared_inputs: OrderedDict[Hashable, ExecutionContext] = (
             OrderedDict()
         )
-        self._slots: OrderedDict[Hashable, tuple[Hashable, Hashable]] = (
+        # One entry per resident ladder: a request slot's sample addresses at
+        # one numerical signature, mapped to the prepared size it borrows.
+        # Least recently used ladders retire first.
+        self._resident: OrderedDict[tuple[Hashable, Hashable], Hashable] = (
             OrderedDict()
         )
         self._closed = False
+
+    @property
+    def captures(self) -> bool:
+        """Whether this runner replays captured graphs.
+
+        A runner without a capture stream evaluates every step eagerly.
+        """
+        return self.capture_stream is not None
 
     def prepare_inputs(
         self, key: Hashable, size: SizeT
@@ -145,7 +162,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             raise RuntimeError("denoising runner is closed")
 
         if key not in self.prepared_inputs:
-            if len(self.prepared_inputs) >= self.capacity:
+            if len(self.prepared_inputs) >= self.shapes:
                 self.release_inputs(next(iter(self.prepared_inputs)))
 
             context = ExecutionContext(
@@ -213,8 +230,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                 context.stream or torch.cuda.current_stream(self.device)
             ).synchronize()
 
-    @torch.inference_mode()
-    def step(
+    def _resident_ladder(
         self,
         inputs: InputT,
         schedules: Mapping[str, Schedule],
@@ -222,17 +238,17 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         state: Mapping[str, torch.Tensor],
         slot: Hashable,
         input_key: Hashable,
-    ) -> tuple[Mapping[str, tuple[torch.Tensor, ...]], str]:
-        """Run one numerical update.
+    ):
+        """Return the graph one call replays, capturing it when it is missing.
 
-        the worker separately commits request progress.
+        Yields the graph, its graph-owned temporal storage, the caller's
+        temporal values, the prepared context and whether this call captured.
+        Capture never advances the caller's samples.
         """
-        context, operation = self._operation(
-            inputs, schedules, state, input_key
-        )
-        if self.capture_stream is None:
-            with context.activate():
-                return operation(), "eager"
+        if self._closed:
+            raise RuntimeError("denoising runner is closed")
+
+        context = self.prepared_inputs[input_key]
 
         # Request slots retain sample and conditioning backing. Schedules are
         # rebuilt per trajectory, so their values are copied into graph-owned
@@ -268,13 +284,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             key not in self.graphs, self.groups, self.device
         )
         if missing:
-            resident = self._slots.get(slot)
-            if resident is not None and resident != (signature, input_key):
-                self.release_slot(slot)
-                resident = None
-            if resident is None and len(self._slots) >= self.capacity:
-                self.release_slot(next(iter(self._slots)))
-
+            self._admit((slot, signature), input_key)
             self._discard_graph(key)
             self.warmup(inputs, schedules, state=state, input_key=input_key)
 
@@ -310,18 +320,89 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                 graph.close()
                 raise
             self.graphs[key] = graph, staged
-            self._slots[slot] = signature, input_key
 
-        self._slots.move_to_end(slot)
+        self._resident.move_to_end((slot, signature))
+        graph, staged = self.graphs[key]
+        return graph, staged, temporal, context, missing
+
+    @torch.inference_mode()
+    def capture(
+        self,
+        inputs: InputT,
+        schedules: Mapping[str, Schedule],
+        *,
+        state: Mapping[str, torch.Tensor],
+        slot: Hashable,
+        input_key: Hashable,
+    ) -> None:
+        """Make one ladder step's graph resident for a request slot.
+
+        Warmup calls this for every step of the production ladder on every slot
+        so no request pays capture on its own path. The caller's samples are
+        unchanged when this returns.
+        """
+        if self.capture_stream is None:
+            raise RuntimeError(
+                "denoising graph capture requires a capture stream"
+            )
+        self._resident_ladder(
+            inputs, schedules, state=state, slot=slot, input_key=input_key
+        )
+
+    @torch.inference_mode()
+    def step(
+        self,
+        inputs: InputT,
+        schedules: Mapping[str, Schedule],
+        *,
+        state: Mapping[str, torch.Tensor],
+        slot: Hashable,
+        input_key: Hashable,
+    ) -> tuple[Mapping[str, tuple[torch.Tensor, ...]], str]:
+        """Run one numerical update.
+
+        the worker separately commits request progress.
+        """
+        if self.capture_stream is None:
+            context, operation = self._operation(
+                inputs, schedules, state, input_key
+            )
+            with context.activate():
+                return operation(), "eager"
+
+        graph, staged, temporal, context, captured = self._resident_ladder(
+            inputs, schedules, state=state, slot=slot, input_key=input_key
+        )
         current = torch.cuda.current_stream(self.device)
         context.stream.wait_stream(current)
 
-        graph, staged = self.graphs[key]
         with context.activate():
             copy_inputs(staged, temporal)
             result = graph.replay()
         current.wait_stream(context.stream)
-        return result, "graph_capture" if missing else "graph_replay"
+        return result, "graph_capture" if captured else "graph_replay"
+
+    def _admit(
+        self, ladder: tuple[Hashable, Hashable], input_key: Hashable
+    ) -> None:
+        """Reserve residency for one slot's ladder at one numerical signature.
+
+        Residency spans every slot at every prepared size, so a ladder captured
+        at startup survives until its slot or its prepared size retires.
+        """
+        if ladder not in self._resident and len(self._resident) >= (
+            self.capacity * self.shapes
+        ):
+            self._release_ladder(next(iter(self._resident)))
+        self._resident[ladder] = input_key
+
+    def _release_ladder(self, ladder: tuple[Hashable, Hashable]) -> None:
+        """Retire every captured step of one slot's ladder."""
+        slot, signature = ladder
+        for key in tuple(self.graphs):
+            if key[0] == slot and key[1] == signature:
+                self._discard_graph(key)
+        self._resident.pop(ladder, None)
 
     def _discard_graph(self, key):
         resident = self.graphs.pop(key, None)
@@ -339,16 +420,15 @@ class DenoisingRunner(Generic[InputT, SizeT]):
 
         reused.
         """
-        for key in tuple(self.graphs):
-            if key[0] == slot:
-                self._discard_graph(key)
-        self._slots.pop(slot, None)
+        for ladder in tuple(self._resident):
+            if ladder[0] == slot:
+                self._release_ladder(ladder)
 
     def release_inputs(self, key: Hashable) -> None:
         """Retire dependent calls before releasing their execution context."""
-        for slot, (_signature, resident_key) in tuple(self._slots.items()):
+        for ladder, resident_key in tuple(self._resident.items()):
             if resident_key == key:
-                self.release_slot(slot)
+                self._release_ladder(ladder)
 
         context = self.prepared_inputs.pop(key, None)
         if context is not None:

@@ -274,6 +274,13 @@ class ModelRunner:
                             capture_stream=self.capture_stream(),
                             groups=call.groups,
                             capacity=worker_config.max_request_pool_size,
+                            # Resident requests may carry different numerical
+                            # sizes, and every declared video shape holds the
+                            # context its captured ladders borrow.
+                            shapes=max(
+                                worker_config.max_request_pool_size,
+                                len(worker_config.video_graph_shapes),
+                            ),
                             attention=self.attention,
                             additional_devices=self._capture_devices(
                                 binding.device
@@ -1298,6 +1305,7 @@ class ModelRunner:
         """Run media warmup passes, then drain every owned stream."""
         if self.media_builder is not None:
             from .video import (
+                capture_denoising,
                 warmup_decoders,
                 warmup_denoising,
                 warmup_postprocess,
@@ -1306,6 +1314,9 @@ class ModelRunner:
             warmup_denoising(self, storage)
             warmup_decoders(self)
             warmup_postprocess(self, storage)
+            # Capture last so the declared shapes hold the prepared contexts
+            # the captured ladders borrow.
+            capture_denoising(self, storage)
         self.synchronize()
 
     @torch.inference_mode()

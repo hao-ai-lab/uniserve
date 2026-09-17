@@ -94,6 +94,8 @@ pub struct WorkerProcessArgs {
     pub flow_graph_batch_sizes: Option<String>,
     /// Optional diffusion tensor shapes selected for CUDA graph capture.
     pub flow_graph_shapes: Option<String>,
+    /// Optional video request shapes whose denoising ladders warmup captures.
+    pub video_graph_shapes: Option<String>,
     /// FlashInfer workspace capacity in bytes.
     pub flashinfer_workspace_size: u64,
     /// Optional FlashInfer tensor-core selection forwarded to the worker.

@@ -311,6 +311,10 @@ class WorkerConfig:
         (1152, 2048),
         (2048, 1152),
     )
+    # Video request shapes, as (duration in seconds, prompt tokens), whose
+    # denoising ladders warmup makes resident on every request slot. A shape a
+    # deployment does not declare still serves; its first request captures.
+    video_graph_shapes: tuple[tuple[float, int], ...] = ()
     flashinfer: FlashInferConfig = FlashInferConfig()
 
     def __post_init__(self) -> None:
@@ -406,6 +410,7 @@ def worker_config_from_namespace(
             default=(1, 2, 3, 4),
         ),
         flow_graph_shapes=_parse_image_shapes(namespace.flow_graph_shapes),
+        video_graph_shapes=_parse_video_shapes(namespace.video_graph_shapes),
         flashinfer=FlashInferConfig(
             workspace_size=max(
                 1,
@@ -503,6 +508,36 @@ def _parse_image_shapes(raw: object | None) -> tuple[tuple[int, int], ...]:
 
     if not values:
         raise ValueError("flow graph shapes must not be empty")
+    return tuple(values)
+
+
+def _parse_video_shapes(raw: object | None) -> tuple[tuple[float, int], ...]:
+    """Parse the video shapes whose denoising ladders warmup makes resident.
+
+    Each item is ``SECONDSxTOKENS``: the request duration and its prompt length
+    in tokenizer tokens. Both determine the denoiser's numerical size, so a
+    declared shape only serves requests that match it exactly.
+    """
+    if raw is None:
+        return ()
+
+    values: list[tuple[float, int]] = []
+    for item in str(raw).split(","):
+        text = item.strip().lower()
+        if not text:
+            continue
+        seconds_text, separator, tokens_text = text.partition("x")
+        if not separator:
+            raise ValueError("video graph shapes must use SECONDSxTOKENS")
+        shape = float(seconds_text), int(tokens_text)
+        if not math.isfinite(shape[0]) or shape[0] <= 0 or shape[1] < 1:
+            raise ValueError(
+                "video graph shapes must have a positive duration and prompt "
+                "length"
+            )
+        if shape in values:
+            raise ValueError("video graph shapes must be unique")
+        values.append(shape)
     return tuple(values)
 
 

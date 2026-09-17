@@ -377,6 +377,10 @@ pub(crate) struct WorkerProcessOptions {
     pub flow_graph_batch_sizes: Option<String>,
     #[arg(long, hide = true)]
     pub flow_graph_shapes: Option<String>,
+    /// Video request shapes whose denoising ladders warmup captures,
+    /// as `SECONDSxTOKENS` items, e.g. `5x1000,15x10000`.
+    #[arg(long)]
+    pub video_graph_shapes: Option<String>,
     #[arg(long, default_value_t = 512 * 1024 * 1024, hide = true)]
     pub flashinfer_workspace_size: u64,
     #[arg(long, hide = true)]
@@ -414,6 +418,7 @@ impl WorkerProcessOptions {
             prefill_graph_token_sizes: self.prefill_graph_token_sizes.clone(),
             flow_graph_batch_sizes: self.flow_graph_batch_sizes.clone(),
             flow_graph_shapes: self.flow_graph_shapes.clone(),
+            video_graph_shapes: self.video_graph_shapes.clone(),
             flashinfer_workspace_size: self.flashinfer_workspace_size,
             flashinfer_use_tensor_core: self.flashinfer_use_tensor_core.clone(),
             flashinfer_decode_backend: self.flashinfer_decode_backend.clone(),

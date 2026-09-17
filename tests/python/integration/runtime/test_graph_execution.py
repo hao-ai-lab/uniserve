@@ -110,3 +110,106 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
     finally:
         torch.cuda.current_stream(device).synchronize()
         runner.close()
+
+
+@torch.inference_mode()
+def test_captured_ladders_replay_on_every_slot_with_eager_values():
+    """Startup capture leaves every slot's ladder resident and exact.
+
+    Warmup captures one graph per ladder step on each request slot, so the
+    steps a request runs replay rather than capture, and their values match an
+    eager evaluation of the same ladder from the same samples.
+    """
+    device = torch.device("cuda:0")
+    model = LinearDenoiser().to(device)
+    steps = 2
+    schedules = model.make_schedules(steps, shift=1.0, device=device)
+    size = Size(32, 2.0)
+    slots = (1, 2)
+
+    def ladder(runner, samples):
+        """Advance every slot one full ladder and report its step paths."""
+        values, paths = {}, []
+        for slot in slots:
+            for step in range(steps):
+                result, path = runner.step(
+                    DenoiserInput(
+                        {
+                            "image": (
+                                LatentInput(
+                                    samples[slot],
+                                    schedules["image"].timesteps[step],
+                                ),
+                            )
+                        },
+                        (size,),
+                        step,
+                    ),
+                    schedules,
+                    state={},
+                    slot=slot,
+                    input_key=size,
+                )
+                paths.append(path)
+            values[slot] = result["image"][0].clone()
+        return values, paths
+
+    eager = DenoisingRunner(
+        model, device=device, capture_stream=None, groups=(), capacity=2
+    )
+    try:
+        eager.prepare_inputs(size, size)
+        expected, _ = ladder(
+            eager,
+            {slot: torch.full((32,), 7.0, device=device) for slot in slots},
+        )
+    finally:
+        torch.cuda.current_stream(device).synchronize()
+        eager.close()
+
+    runner = DenoisingRunner(
+        model,
+        device=device,
+        capture_stream=torch.cuda.Stream(device=device),
+        groups=(),
+        capacity=2,
+        shapes=2,
+    )
+    try:
+        runner.prepare_inputs(size, size)
+        samples = {
+            slot: torch.full((32,), 7.0, device=device) for slot in slots
+        }
+        for slot in slots:
+            resting = samples[slot].clone()
+            for step in range(steps):
+                runner.capture(
+                    DenoiserInput(
+                        {
+                            "image": (
+                                LatentInput(
+                                    samples[slot],
+                                    schedules["image"].timesteps[step],
+                                ),
+                            )
+                        },
+                        (size,),
+                        step,
+                    ),
+                    schedules,
+                    state={},
+                    slot=slot,
+                    input_key=size,
+                )
+            # Capture must leave the slot's samples where it found them.
+            torch.testing.assert_close(samples[slot], resting, rtol=0, atol=0)
+
+        actual, paths = ladder(runner, samples)
+        assert paths == ["graph_replay"] * (len(slots) * steps)
+        for slot in slots:
+            torch.testing.assert_close(
+                actual[slot], expected[slot], rtol=1e-6, atol=1e-6
+            )
+    finally:
+        torch.cuda.current_stream(device).synchronize()
+        runner.close()

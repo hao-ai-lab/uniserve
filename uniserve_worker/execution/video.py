@@ -199,6 +199,66 @@ def warmup_denoising(
 
 
 @torch.inference_mode()
+def capture_denoising(
+    runner: ModelRunner, storage: tuple[TensorBuffers, ...]
+) -> None:
+    """Make every declared video shape's denoising ladder resident.
+
+    A denoising graph is captured per request slot and per ladder step, so a
+    request that first meets its shape would otherwise pay one capture per step
+    on its own path. Capture is collective across the component's ranks and
+    belongs here, where warmup holds them in lockstep. Samples are unchanged
+    when this returns; a shape the deployment does not declare still serves and
+    captures on first use.
+    """
+    builder, denoising = runner.media_builder, runner.denoising
+    shapes = runner.worker_config.video_graph_shapes
+    if denoising is None or not shapes or not denoising.captures:
+        return
+    if builder is None or not storage:
+        raise RuntimeError(
+            "denoising capture requires its input builder and request storage"
+        )
+
+    frame_rate = runner.video_postprocessor.frame_rate
+    schedules = builder.schedules(device=runner.worker_config.device)
+    for seconds, num_text_tokens in shapes:
+        # Admission converts a duration at the output sampling clock and rounds
+        # it up to the next complete native window, so a declared duration
+        # resolves to the frame count its requests carry.
+        frames = builder.denoiser.legal_frame_count(
+            int(seconds * frame_rate + 0.5)
+        )
+        try:
+            size = builder.size(frames, num_text_tokens)
+        except ValueError as error:
+            raise invalid_descriptor(
+                f"declared video graph shape {seconds} s x "
+                f"{num_text_tokens} tokens exceeds worker capacity: {error}"
+            ) from error
+
+        context = denoising.prepare_inputs(size, size)
+        for slot, buffers in enumerate(storage, start=1):
+            views = buffers.view(builder.buffers(size))
+            # Capture records kernel launches over these addresses; the values
+            # it reads are irrelevant, and the first real request stages its
+            # own seeded noise and conditioning before replay.
+            with context.activate():
+                views["text_condition"].zero_()
+                for name in builder.denoiser.modalities:
+                    views[name].zero_()
+
+            for index in range(builder.num_steps):
+                denoising.capture(
+                    builder.bind(size, views, schedules, index),
+                    schedules,
+                    state=views,
+                    slot=slot,
+                    input_key=size,
+                )
+
+
+@torch.inference_mode()
 def warmup_decoders(runner: ModelRunner) -> None:
     """Prepare reconstruction kernels with the admitted maximum latent.
 

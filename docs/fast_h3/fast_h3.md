@@ -68,6 +68,8 @@ uniserve serve "$H3_MODEL" \
 
 A FastH3 deployment defaults to `--max-video-seconds 15` and `--max-model-len 16384`; set them only to change those limits. `--max-running-requests` caps concurrently resident requests, and the engine clamps that cap to the worker's advertised request-slot capacity; lowering it trades throughput for per-request latency and memory headroom.
 
+`--video-graph-shapes 5x1000,15x10000` declares the duration and prompt length of the requests a deployment serves, and warmup captures each declared shape's denoising ladder on every request slot before the server reports ready. Without it the first request of each shape on each slot captures one graph per denoising step on its own path, which costs several seconds. A request whose duration or prompt length is not declared still serves.
+
 Check the live limits and served model name after startup:
 
 ```bash
