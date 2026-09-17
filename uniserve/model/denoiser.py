@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 import torch
 from torch import nn
@@ -11,9 +11,10 @@ from uniserve.diffusion import NoiseScale, Schedule, Solver
 from uniserve.distributed import DeviceMesh
 from uniserve.media import image
 from uniserve.nn.functional import patchify
+from uniserve.processing import BranchSource
 from uniserve.tensors import TensorOutput
 
-from .inputs import DenoiserInput
+from .inputs import DenoiserInput, LatentInput
 
 InputT = TypeVar("InputT", bound=DenoiserInput)
 SizeT = TypeVar("SizeT")
@@ -102,7 +103,38 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
     downsample measures output pixels per canonical patch token. Native spatial
     latents therefore have patch_size pixels per token on each spatial axis.
     A network with a different native draw layout overrides noise_shape.
+
+    ``framing_tokens`` and ``image_unconditional`` describe how this network
+    frames a generated image and which prefix its image-unconditional guidance
+    branch reads. Execution owns the buffers and the stepping; the network
+    states these layout facts and assembles its own typed input.
     """
+
+    framing_tokens: int = 0
+    image_unconditional: BranchSource = BranchSource.START
+
+    @property
+    def max_sequence_tokens(self) -> int:
+        """Longest image sequence this network accepts, framing included."""
+        raise NotImplementedError
+
+    def bind_inputs(
+        self,
+        *,
+        latents: Mapping[str, tuple[LatentInput, ...]],
+        sizes: tuple[image.Config, ...],
+        step_index: int,
+        positions: torch.Tensor,
+        sequence_lengths: tuple[int, ...],
+        attention: Any,
+    ) -> InputT:
+        """Assemble this network's typed input for one denoising step.
+
+        The caller supplies borrowed numerical views; the network selects the
+        fields its own forward consumes and derives any per-step conditioning
+        from them.
+        """
+        raise NotImplementedError
 
     def __init__(
         self,

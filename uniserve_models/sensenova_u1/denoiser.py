@@ -12,6 +12,7 @@ from uniserve.diffusion import (
     make_schedule,
 )
 from uniserve.model import ImageDenoiser
+from uniserve.nn.functional import unpatchify
 from uniserve.nn.linear import Linear
 from uniserve.nn.routing import RouteSpan
 from uniserve.nn.timestep import TimestepEmbedding
@@ -25,6 +26,54 @@ from .transformer import Transformer
 
 class Denoiser(ImageDenoiser[DenoiserInput]):
     """Predict image velocity from pixels through the shared text/flow backbone."""  # noqa: E501
+
+    @property
+    def max_sequence_tokens(self) -> int:
+        return self.config.max_image_seq_len
+
+    def bind_inputs(
+        self,
+        *,
+        latents,
+        sizes,
+        step_index,
+        positions,
+        sequence_lengths,
+        attention,
+    ) -> DenoiserInput:
+        """Assemble one denoising step's typed input and per-step conditioning.
+
+        This tower consumes the current image, which must be rebuilt after every
+        solver update and must stay distinct from a trajectory's conditioning
+        prefix in the K/V cache.
+        """
+        images = []
+        for latent, size in zip(latents["image"], sizes, strict=True):
+            sample = latent.value
+            pixels = unpatchify(
+                sample.unsqueeze(0),
+                size,
+                patch_size=self.patch_size,
+                channels=self.latent_channels,
+            )
+            patch = self.config.vision.patch_size
+            grid = torch.tensor(
+                [[size.height // patch, size.width // patch]],
+                device=sample.device,
+                dtype=torch.int64,
+            )
+            scale = sample.new_tensor([self.noise_scale.scale(sample.shape[0])])
+            images.append(ImageConditioning(pixels, grid, scale))
+
+        return DenoiserInput(
+            latents=latents,
+            sizes=sizes,
+            step_index=step_index,
+            positions=positions,
+            sequence_lengths=sequence_lengths,
+            attention=attention,
+            images=tuple(images),
+        )
 
     def __init__(self, config: Config, backbone: Transformer):
         stride = config.vision.patch_size * round(

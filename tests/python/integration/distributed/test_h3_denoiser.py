@@ -344,7 +344,7 @@ def test_partitioned_denoising_and_feedback(tmp_path):
 @torch.inference_mode()
 def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
     from uniserve_worker.execution.denoising_runner import DenoisingRunner
-    from uniserve_worker.execution.inputs.h3 import Inputs
+    from uniserve_worker.execution.inputs.media import MediaBuilder
 
     source = _checkpoint(tmp_path)
     device = torch.device("cuda", 0)
@@ -378,7 +378,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                 }
             ),
         ).model
-        factory = Inputs(model, max_frames=22, max_text_tokens=65)
+        factory = MediaBuilder(model, max_frames=22, max_text_tokens=65)
         size = factory.size(22, 63)
         matrices = {name: value.to(device) for name, value in source.items()}
         runner = DenoisingRunner(

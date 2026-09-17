@@ -9,6 +9,7 @@ import torch
 
 from uniserve.diffusion import CleanSampleEulerSolver, Schedule
 from uniserve.model import Denoiser as BaseDenoiser
+from uniserve.model import LatentInput
 from uniserve.nn import RotaryEmbedding
 from uniserve.nn.attention import vsa
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
@@ -61,6 +62,41 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
     Text features are the output of ``conditioner.encode``. Packed padding is
     numerical attention input and never represents a second computation batch.
     """
+
+    # A native temporal window covers 17 new frames and carries a 5-frame
+    # overlap, so a legal input length is 5 + 17k with a 22-frame minimum.
+    NATIVE_WINDOW_FRAMES = 17
+    NATIVE_OVERLAP_FRAMES = 5
+
+    def legal_frame_count(self, requested: int) -> int:
+        """Round a requested duration up to the next complete native window."""
+        window, overlap = self.NATIVE_WINDOW_FRAMES, self.NATIVE_OVERLAP_FRAMES
+        return max(overlap + window, requested + (overlap - requested) % window)
+
+    def make_size(self, num_frames: int, num_text_tokens: int) -> DenoiserSize:
+        """Build this network's size descriptor for one admitted request."""
+        return DenoiserSize(num_frames, num_text_tokens)
+
+    @property
+    def text_condition_width(self) -> int:
+        """Feature width of the retained text conditioning."""
+        return self.config.hidden_size
+
+    def bind_inputs(
+        self,
+        *,
+        latents: Mapping[str, tuple[LatentInput, ...]],
+        sizes: tuple[DenoiserSize, ...],
+        step_index: int,
+        text_features: tuple[torch.Tensor, ...],
+    ) -> DenoiserInput:
+        """Assemble one denoising step's typed input from resident tensors."""
+        return DenoiserInput(
+            latents=latents,
+            sizes=sizes,
+            step_index=step_index,
+            text_features=text_features,
+        )
 
     def __init__(self, config: TransformerConfig, diffusion: DiffusionConfig):
         super().__init__(

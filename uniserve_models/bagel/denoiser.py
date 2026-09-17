@@ -17,6 +17,7 @@ from uniserve.nn.linear import Linear
 from uniserve.nn.routing import RouteSpan
 from uniserve.nn.timestep import TimestepEmbedding
 from uniserve.nn.vision import PositionEmbedding
+from uniserve.processing import BranchSource
 from uniserve.tensors import OutputLayout, TensorOutput
 
 from .config import Config
@@ -26,6 +27,11 @@ from .transformer import Transformer
 
 class Denoiser(ImageDenoiser[DenoiserInput]):
     """Predict image-latent velocity through the shared text/flow backbone."""
+
+    # BAGEL frames each generated image with its start and end marker tokens,
+    # and its image-unconditional branch reads the conditioning prefix.
+    framing_tokens = 2
+    image_unconditional = BranchSource.CONDITIONING
 
     def __init__(self, config: Config, backbone: Transformer):
         super().__init__(
@@ -54,6 +60,30 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
                 device="cpu",
             ),
             persistent=False,
+        )
+
+    @property
+    def max_sequence_tokens(self) -> int:
+        return self.config.max_latent_size**2
+
+    def bind_inputs(
+        self,
+        *,
+        latents,
+        sizes,
+        step_index,
+        positions,
+        sequence_lengths,
+        attention,
+    ) -> DenoiserInput:
+        """Assemble one denoising step's typed input from resident tensors."""
+        return DenoiserInput(
+            latents=latents,
+            sizes=sizes,
+            step_index=step_index,
+            positions=positions,
+            sequence_lengths=sequence_lengths,
+            attention=attention,
         )
 
     def noise_shape(self, modality: str, size: image.Config):

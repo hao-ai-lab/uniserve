@@ -8,7 +8,7 @@ import torch
 
 from uniserve.diffusion import Branch, normal_noise
 from uniserve.media import image
-from uniserve.model import ImageDenoiser
+from uniserve.model import ImageDenoiser, LatentInput
 from uniserve.processing import BranchSource
 
 
@@ -20,15 +20,43 @@ class ImageBuilder:
     the worker inserts a generated image into a continuing conversation.
     """
 
-    framing = 0
     rope_advance = 2
-    image_unconditional = BranchSource.START
 
     def __init__(self, denoiser: ImageDenoiser):
         self.denoiser = denoiser
 
+    @property
+    def framing(self) -> int:
+        """Framing tokens the network places around a generated image."""
+        return self.denoiser.framing_tokens
+
+    @property
+    def max_tokens(self) -> int:
+        """Longest image sequence the network accepts."""
+        return self.denoiser.max_sequence_tokens
+
     def sequence_length(self, size: image.Config) -> int:
         return self.denoiser.latent_shape("image", size)[0] + self.framing
+
+    def bind(
+        self, *, samples, sizes, timesteps, positions, attention, step_index
+    ):
+        """Delegate typed input construction to the network that owns it."""
+        return self.denoiser.bind_inputs(
+            latents={
+                "image": tuple(
+                    LatentInput(value, time)
+                    for value, time in zip(samples, timesteps, strict=True)
+                )
+            },
+            sizes=sizes,
+            step_index=step_index,
+            positions=positions,
+            sequence_lengths=tuple(
+                self.sequence_length(size) for size in sizes
+            ),
+            attention=attention,
+        )
 
     def positions(
         self, size: image.Config, temporal: int, *, device
@@ -59,7 +87,7 @@ class ImageBuilder:
         if branch is Branch.TEXT_UNCONDITIONAL:
             return BranchSource.NEGATIVE_OR_START
         if branch is Branch.IMAGE_UNCONDITIONAL:
-            return self.image_unconditional
+            return self.denoiser.image_unconditional
         raise ValueError("unknown image guidance branch")
 
     @torch.inference_mode()

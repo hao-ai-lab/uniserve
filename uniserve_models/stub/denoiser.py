@@ -24,6 +24,30 @@ from .inputs import DenoiserInput
 class Denoiser(ImageDenoiser):
     """Zero-valued image prediction over the real diffusion solver machinery."""
 
+    framing_tokens = 2
+
+    @property
+    def max_sequence_tokens(self) -> int:
+        return 1024
+
+    def bind_inputs(
+        self,
+        *,
+        latents,
+        sizes,
+        step_index,
+        positions,
+        sequence_lengths,
+        attention,
+    ) -> DenoiserInput:
+        """Assemble one denoising step's typed input from resident tensors."""
+        return DenoiserInput(
+            latents=latents,
+            sizes=sizes,
+            step_index=step_index,
+            attention=attention,
+        )
+
     def __init__(self, config: Config, backbone: TransformerDecoder):
         super().__init__(
             patch_size=config.patch_size,

@@ -1,4 +1,4 @@
-"""Construct H3 numerical inputs from the worker's admitted media requests."""
+"""Stage numerical media inputs for the worker's admitted requests."""
 
 from __future__ import annotations
 
@@ -8,9 +8,8 @@ from dataclasses import replace
 import torch
 
 from uniserve.diffusion import Schedule, normal_noise
-from uniserve.model import LatentInput
+from uniserve.model import Denoiser, LatentInput
 from uniserve.tensors import BufferConfig
-from uniserve_models.minimax_h3 import Denoiser, DenoiserInput, DenoiserSize
 
 
 class MediaBuilder:
@@ -18,7 +17,8 @@ class MediaBuilder:
 
     Native CPU noise, pinned transfer sources and retained conditioning belong
     to serving. The model sees only the exact sample, constants and workspace
-    views required for one invocation.
+    views required for one invocation, and states its own native window and
+    size descriptor.
     """
 
     def __init__(
@@ -26,13 +26,13 @@ class MediaBuilder:
     ) -> None:
         # Admission advertises complete native windows, including the final
         # overlap. Cover the configured duration with the next legal input.
-        frames = max(22, max_frames + (5 - max_frames) % 17)
-        self.maximum = DenoiserSize(frames, max_text_tokens)
+        frames = denoiser.legal_frame_count(max_frames)
+        self.maximum = denoiser.make_size(frames, max_text_tokens)
         self.denoiser = denoiser
         self.num_steps = len(denoiser.diffusion.ladder)
 
-    def size(self, num_frames: int, num_text_tokens: int) -> DenoiserSize:
-        size = DenoiserSize(num_frames, num_text_tokens)
+    def size(self, num_frames: int, num_text_tokens: int):
+        size = self.denoiser.make_size(num_frames, num_text_tokens)
         if (
             size.num_frames > self.maximum.num_frames
             or size.num_text_tokens > self.maximum.num_text_tokens
@@ -42,7 +42,7 @@ class MediaBuilder:
             )
         return size
 
-    def buffers(self, size: DenoiserSize) -> Mapping[str, BufferConfig]:
+    def buffers(self, size) -> Mapping[str, BufferConfig]:
         """Describe request state.
 
         complete CPU draws and transfer source views.
@@ -54,7 +54,7 @@ class MediaBuilder:
             )
             result[f"{name}_source"] = replace(result[name], host=True)
         result["text_condition"] = BufferConfig(
-            (size.num_text_tokens, self.denoiser.config.hidden_size),
+            (size.num_text_tokens, self.denoiser.text_condition_width),
             torch.bfloat16,
         )
         return result
@@ -84,7 +84,7 @@ class MediaBuilder:
     @torch.inference_mode()
     def initialize(
         self,
-        size: DenoiserSize,
+        size,
         tensors: Mapping[str, torch.Tensor],
         *,
         seed: int,
@@ -116,16 +116,16 @@ class MediaBuilder:
 
     def bind(
         self,
-        size: DenoiserSize,
+        size,
         tensors: Mapping[str, torch.Tensor],
         schedules: Mapping[str, Schedule],
         index: int,
-    ) -> DenoiserInput:
+    ):
         """Assemble one denoising step's typed input from resident tensors."""
         if not 0 <= index < self.num_steps:
             raise ValueError("denoising index is outside the fixed schedule")
 
-        return DenoiserInput(
+        return self.denoiser.bind_inputs(
             latents={
                 name: (
                     LatentInput(
