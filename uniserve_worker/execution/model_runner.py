@@ -30,6 +30,7 @@ from uniserve.model import (
 )
 from uniserve.nn.vae import PatchAutoencoder
 from uniserve.processing import ImageProcessor
+from uniserve.profiling import profile_range
 from uniserve.runtime import (
     CUDAGraph,
     CUDAStream,
@@ -602,69 +603,76 @@ class ModelRunner:
         its result is cloned so the caller owns values independent of the
         context's staging storage.
         """
-        binding, call = self._module_call(name, method)
-        context = self.prepare_module(name, size, method=call.entry.method)
-        started, path = time.perf_counter_ns(), "eager"
+        # The range's ``work`` field lets timeline tooling attribute this
+        # entry's kernels and copies to the serving stage that issued them.
+        with profile_range(
+            f"uniserve.model.module rank={self.worker_config.rank} work={name}"
+        ):
+            binding, call = self._module_call(name, method)
+            context = self.prepare_module(name, size, method=call.entry.method)
+            started, path = time.perf_counter_ns(), "eager"
 
-        stream = context.stream
-        if stream is not None:
-            stream.wait_stream(torch.cuda.current_stream(binding.device))
+            stream = context.stream
+            if stream is not None:
+                stream.wait_stream(torch.cuda.current_stream(binding.device))
 
-        # These views belong to this prepared context. Graph input staging owns
-        # only changing numerical arguments, never a duplicate of the workspace.
-        resources = {}
-        if isinstance(call.module, (VideoDecoder, VideoPostprocessor)):
-            resources["constants"] = context.constants
-            resources["workspace"] = context.workspace
-        elif isinstance(call.module, AudioDecoder):
-            resources["workspace"] = context.workspace
+            # These views belong to this prepared context. Graph input staging
+            # owns only changing numerical arguments, never a duplicate of the
+            # workspace.
+            resources = {}
+            if isinstance(call.module, (VideoDecoder, VideoPostprocessor)):
+                resources["constants"] = context.constants
+                resources["workspace"] = context.workspace
+            elif isinstance(call.module, AudioDecoder):
+                resources["workspace"] = context.workspace
 
-        values = (args, kwargs)
-        key = (id(context), input_signature(values))
-        graph = self._module_graphs.get(key)
-        can_capture = (
-            stream is not None
-            and self.worker_config.graph_policy != "off"
-            and not isinstance(call.module, VideoPostprocessor)
-        )
-        with context.activate():
-            if can_capture:
-                missing = capture_required(
-                    graph is None, call.groups, binding.device
-                )
-                if missing:
-                    if graph is not None:
-                        graph[0].close()
-                    # One eager warmup run on the static inputs precedes
-                    # capture.
-                    static = clone_inputs(values)
-                    call.forward(*static[0], **static[1], **resources)
-                    executable = CUDAGraph(
-                        context=context, pools=self._module_pools[id(context)]
+            values = (args, kwargs)
+            key = (id(context), input_signature(values))
+            graph = self._module_graphs.get(key)
+            can_capture = (
+                stream is not None
+                and self.worker_config.graph_policy != "off"
+                and not isinstance(call.module, VideoPostprocessor)
+            )
+            with context.activate():
+                if can_capture:
+                    missing = capture_required(
+                        graph is None, call.groups, binding.device
                     )
-                    try:
-                        executable.capture(
-                            lambda: call.forward(
-                                *static[0], **static[1], **resources
-                            )
+                    if missing:
+                        if graph is not None:
+                            graph[0].close()
+                        # One eager warmup run on the static inputs precedes
+                        # capture.
+                        static = clone_inputs(values)
+                        call.forward(*static[0], **static[1], **resources)
+                        executable = CUDAGraph(
+                            context=context,
+                            pools=self._module_pools[id(context)],
                         )
-                    except BaseException:
-                        executable.close()
-                        raise
-                    graph = (executable, static)
-                    self._module_graphs[key] = graph
-                    path = "graph_capture"
+                        try:
+                            executable.capture(
+                                lambda: call.forward(
+                                    *static[0], **static[1], **resources
+                                )
+                            )
+                        except BaseException:
+                            executable.close()
+                            raise
+                        graph = (executable, static)
+                        self._module_graphs[key] = graph
+                        path = "graph_capture"
+                    else:
+                        path = "graph_replay"
+                    copy_inputs(graph[1], values)
+                    result = graph[0].replay()
                 else:
-                    path = "graph_replay"
-                copy_inputs(graph[1], values)
-                result = graph[0].replay()
-            else:
-                result = call.forward(*args, **kwargs, **resources)
-            output = self._result(result).clone()
+                    result = call.forward(*args, **kwargs, **resources)
+                output = self._result(result).clone()
 
-        if stream is not None:
-            torch.cuda.current_stream(binding.device).wait_stream(stream)
-        return replace(output, stats=_observations(name, started, path))
+            if stream is not None:
+                torch.cuda.current_stream(binding.device).wait_stream(stream)
+            return replace(output, stats=_observations(name, started, path))
 
     @staticmethod
     def _result(result):
@@ -695,9 +703,13 @@ class ModelRunner:
         if self.denoising is None:
             raise InputError("rank does not own denoising computation")
         started = time.perf_counter_ns()
-        values, path = self.denoising.step(
-            inputs, schedules, state=state, slot=slot, input_key=input_key
-        )
+        with profile_range(
+            f"uniserve.model.denoise rank={self.worker_config.rank} "
+            "work=denoiser"
+        ):
+            values, path = self.denoising.step(
+                inputs, schedules, state=state, slot=slot, input_key=input_key
+            )
         return replace(
             self._result(values), stats=_observations("denoiser", started, path)
         )
@@ -1663,92 +1675,100 @@ class ModelRunner:
         buffers = entry.input_buffers
         assert buffers is not None
 
-        try:
-            if lane_runtime is not None:
-                lane_runtime.wait(torch.cuda.current_stream(target))
-            stream_context = (
-                nullcontext()
-                if lane_runtime is None
-                else torch.cuda.stream(lane_runtime.stream)
-            )
-            with stream_context:
-                batch = buffers.stage(
-                    tasks,
-                    forward_mode=forward_mode,
-                    cache=cache,
-                    tables=tables,
-                    states=states,
+        # Staging copies and the forward itself belong to one stage on the
+        # timeline, so the range opens before input staging.
+        with profile_range(
+            f"uniserve.model.forward rank={self.worker_config.rank} "
+            f"work={operations[0].entry}.{forward_mode.value}"
+        ):
+            try:
+                if lane_runtime is not None:
+                    lane_runtime.wait(torch.cuda.current_stream(target))
+                stream_context = (
+                    nullcontext()
+                    if lane_runtime is None
+                    else torch.cuda.stream(lane_runtime.stream)
                 )
-                request_pool_indices = batch.request_pool_indices
-        except Exception as error:
-            output_event = (
-                None if lane_runtime is None else lane_runtime.record()
-            )
-            if output_event is not None:
-                torch.cuda.current_stream(target).wait_event(output_event)
-            raise _input_failure(error, forward_mode, operation_keys) from error
-
-        def invoke(value: InputBatch) -> ExecutionOutput:
-            return self.batch_forward(entry, value)
-
-        output_event = None
-        try:
-            # Only a uniform single-token last-logits decode may borrow the
-            # graph's output storage; mixed rows receive owned values.
-            with torch.inference_mode():
-                output = self.run_batch(
-                    entry,
-                    batch,
-                    invoke,
-                    eligible=graph_eligible,
-                    borrow_output=all(
-                        (
-                            task.request_indexed_decode
-                            or task.token_ids is not None
-                        )
-                        and task.query_tokens == 1
-                        and task.selection is TokenSelection.LAST_LOGITS
-                        for task in tasks
-                    ),
-                )
-
-            output.validate_for(batch)
-            _validate_outputs(output.values, tasks, target)
-
-            output_event = (
-                None if lane_runtime is None else lane_runtime.record()
-            )
-            duration_us = (time.perf_counter_ns() - started) // 1000
-            if output.stats is None:
-                raise RuntimeError(
-                    "entry forward lost its execution statistics"
-                )
-            stats = replace(
-                output.stats,
-                mode_counts={forward_mode.value: 1},
-                mode_tokens={forward_mode.value: len(tasks)},
-                mode_us={forward_mode.value: duration_us},
-                component_us={"forward": duration_us},
-            )
-            return replace(
-                output,
-                request_pool_indices=request_pool_indices,
-                output_event=output_event,
-                stats=stats,
-            )
-        except Exception as error:
-            # A failed model can leave kernels on a lane stream. Its caller
-            # retires storage behind the current stream's output fence, so join
-            # every submitted lane access before reporting the failure.
-            if output_event is None:
+                with stream_context:
+                    batch = buffers.stage(
+                        tasks,
+                        forward_mode=forward_mode,
+                        cache=cache,
+                        tables=tables,
+                        states=states,
+                    )
+                    request_pool_indices = batch.request_pool_indices
+            except Exception as error:
                 output_event = (
                     None if lane_runtime is None else lane_runtime.record()
                 )
-            if output_event is not None:
-                torch.cuda.current_stream(target).wait_event(output_event)
-            raise _execution_failure(
-                error, forward_mode, operation_keys
-            ) from error
+                if output_event is not None:
+                    torch.cuda.current_stream(target).wait_event(output_event)
+                raise _input_failure(
+                    error, forward_mode, operation_keys
+                ) from error
+
+            def invoke(value: InputBatch) -> ExecutionOutput:
+                return self.batch_forward(entry, value)
+
+            output_event = None
+            try:
+                # Only a uniform single-token last-logits decode may borrow the
+                # graph's output storage; mixed rows receive owned values.
+                with torch.inference_mode():
+                    output = self.run_batch(
+                        entry,
+                        batch,
+                        invoke,
+                        eligible=graph_eligible,
+                        borrow_output=all(
+                            (
+                                task.request_indexed_decode
+                                or task.token_ids is not None
+                            )
+                            and task.query_tokens == 1
+                            and task.selection is TokenSelection.LAST_LOGITS
+                            for task in tasks
+                        ),
+                    )
+
+                output.validate_for(batch)
+                _validate_outputs(output.values, tasks, target)
+
+                output_event = (
+                    None if lane_runtime is None else lane_runtime.record()
+                )
+                duration_us = (time.perf_counter_ns() - started) // 1000
+                if output.stats is None:
+                    raise RuntimeError(
+                        "entry forward lost its execution statistics"
+                    )
+                stats = replace(
+                    output.stats,
+                    mode_counts={forward_mode.value: 1},
+                    mode_tokens={forward_mode.value: len(tasks)},
+                    mode_us={forward_mode.value: duration_us},
+                    component_us={"forward": duration_us},
+                )
+                return replace(
+                    output,
+                    request_pool_indices=request_pool_indices,
+                    output_event=output_event,
+                    stats=stats,
+                )
+            except Exception as error:
+                # A failed model can leave kernels on a lane stream. Its caller
+                # retires storage behind the current stream's output fence, so
+                # join every submitted lane access before reporting the failure.
+                if output_event is None:
+                    output_event = (
+                        None if lane_runtime is None else lane_runtime.record()
+                    )
+                if output_event is not None:
+                    torch.cuda.current_stream(target).wait_event(output_event)
+                raise _execution_failure(
+                    error, forward_mode, operation_keys
+                ) from error
 
 
 def _validate_outputs(
