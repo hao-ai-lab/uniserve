@@ -8,6 +8,10 @@
 !README.md
 !crates
 !crates/**
+!uniserve
+!uniserve/**
+!uniserve_models
+!uniserve_models/**
 !uniserve_worker
 !uniserve_worker/**
 !uniserve_kernel
