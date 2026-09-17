@@ -247,6 +247,9 @@ impl super::RequestState {
                 }
             }
             Computation::Pipeline(PipelineStage::ImageDecoding) => {
+                // Decoding the artifact releases the trajectory, so the request
+                // leaves the flow and its next call enters at step zero.
+                self.num_completed_denoise_steps = 0;
                 self.feedback_source = operation.image_output.clone();
                 self.feedback_encoder_index = 0;
                 self.feedback_features = None;

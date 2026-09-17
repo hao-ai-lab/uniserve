@@ -1100,7 +1100,9 @@ impl Scheduler {
         Some(self.pending_operations.get(&id).into_iter().flatten().fold(
             state.num_completed_denoise_steps,
             |steps, pending| match pending.operation.code {
-                Computation::Pipeline(PipelineStage::LatentPreparation) => 0,
+                Computation::Pipeline(
+                    PipelineStage::LatentPreparation | PipelineStage::ImageDecoding,
+                ) => 0,
                 Computation::Pipeline(PipelineStage::Denoising) => steps.saturating_add(
                     pending.operation.bounds.max_tokens.min(u32::from(u16::MAX)) as u16,
                 ),

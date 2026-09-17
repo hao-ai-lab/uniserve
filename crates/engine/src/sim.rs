@@ -281,6 +281,11 @@ impl Drop for SimExecutor {
 struct SimRequestState {
     admission: NewRequest,
     logical_position: u32,
+    /// Whether the model, rather than this simulator, owns the request's
+    /// logical positions. An image contributes positions through its rope
+    /// advance, which the simulator does not implement, so once a request has
+    /// ingested one it takes the position each call states.
+    positions_from_model: bool,
     kv_visible_len: u32,
     emitted: usize,
     flow_step: u16,
@@ -303,6 +308,7 @@ impl SimRequestState {
         Self {
             admission,
             logical_position: prefix_len,
+            positions_from_model: false,
             kv_visible_len: prefix_len,
             emitted: 0,
             flow_step: 0,
@@ -487,6 +493,27 @@ impl SimEngine {
         operation: &ScheduledRequest,
         request: &mut SimRequestState,
     ) -> anyhow::Result<RequestOutput> {
+        // A call states the coordinates it executes at. The simulator holds the
+        // same request state a rank does, so a disagreement is a scheduling
+        // failure and not a condition it can execute through. A call with no
+        // request predecessor carries no coordinates.
+        if operation.predecessor.is_some() {
+            let stated = operation.coordinates;
+            if request.positions_from_model {
+                request.logical_position = stated.logical_position;
+            }
+            let held = uniserve_worker_ipc::CallCoordinates {
+                logical_position: request.logical_position,
+                kv_visible_len: request.kv_visible_len,
+                kv_computed_len: request.kv_visible_len,
+                flow_step: u32::from(request.flow_step),
+            };
+            anyhow::ensure!(
+                stated == held,
+                "operation {:?} states coordinates {stated:?} that disagree with the request's own progress {held:?}",
+                operation.op_id
+            );
+        }
         let mut record = RequestOutput {
             sampled_logprob: None,
             top_logprobs: Vec::new(),
@@ -521,6 +548,7 @@ impl SimEngine {
                     operation.vision_input.is_some() || operation.latent_feature_input.is_some();
                 let samples_token = operation.token_output.is_some();
                 if visual_state {
+                    request.positions_from_model = true;
                     request.kv_visible_len = request
                         .kv_visible_len
                         .saturating_add(operation.bounds.max_tokens);
@@ -1074,6 +1102,14 @@ mod tests {
         let mut selected = batch(1, 3);
         let mut successor = batch(1, 4).requests.remove(0);
         successor.0.predecessor = Some(ComputationId::new(1, 3));
+        // The selected prompt covers two positions, so its successor in the
+        // same batch enters where it left off.
+        successor.0.coordinates = uniserve_worker_ipc::CallCoordinates {
+            logical_position: 2,
+            kv_visible_len: 2,
+            kv_computed_len: 2,
+            flow_step: 0,
+        };
         selected.requests.push(successor);
         executor.submit(selected).expect("submit logical batch");
         let report = executor
