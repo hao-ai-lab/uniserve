@@ -60,7 +60,12 @@ def test_video_windows_preserve_pixels_across_separate_calls():
     state = {
         "video_overlap": torch.full((1, 3, 2, 2, 3), 10, dtype=torch.float16)
     }
-    scratch = {"rgb_frames": torch.empty((11, 2, 3, 3), dtype=torch.uint8)}
+    scratch = {
+        "rgb_frames": torch.empty((11, 2, 3, 3), dtype=torch.uint8),
+        # One rank reconstructs every unit here, so the ring delivers each
+        # window's own overlap to the call that follows it.
+        "overlap_exchange": torch.empty((1, 3, 2, 2, 3), dtype=torch.float16),
+    }
     # The first interval resets overlap numerically; later intervals consume
     # the exact successor state left by the previous independent call.
     parts = []

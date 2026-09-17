@@ -7,6 +7,7 @@ from collections.abc import Mapping
 import torch
 from torch import nn
 
+from uniserve.distributed import Communicator
 from uniserve.media import image
 from uniserve.nn.vae import LatentDecoder
 from uniserve.tensors import OutputLayout, TensorOutput
@@ -228,6 +229,12 @@ class VideoPostprocessor(nn.Module):
     overlap within each native NCTHW segment. A frame slice starting at zero
     resets the overlap; later slices consume the preceding window's state.
     Returned tensors borrow disjoint slices of ``workspace['rgb_frames']``.
+
+    Media units of one round are reconstructed by different ranks, and a unit's
+    leading frames blend with the overlap its predecessor decoded, so ``units``
+    orders those ranks as the units they hold and carries that overlap between
+    them. Alone, a rank carries its own overlap forward, which is the serial
+    reconstruction.
     """
 
     def __init__(
@@ -255,6 +262,8 @@ class VideoPostprocessor(nn.Module):
             "overlap_weights", overlap_weights, persistent=False
         )
         self.frame_size, self.frame_rate = frame_size, frame_rate
+        # Rebound by the runtime to the ranks this component is placed on.
+        self.units = Communicator()
 
     def reconstruction_slices(
         self, frames: slice, num_frames: int
@@ -275,7 +284,14 @@ class VideoPostprocessor(nn.Module):
         state: Mapping[str, torch.Tensor],
         constants: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
+        unit_count: int = 1,
     ) -> tuple[TensorOutput, ...]:
+        """Reconstruct this rank's media units of one round.
+
+        ``unit_count`` is how many members of ``units`` hold a media unit in
+        this round, which is fewer than the whole ring when the track has fewer
+        units left than the component has ranks.
+        """
         if (
             not segments
             or len(segments) != len(frames)
@@ -284,7 +300,15 @@ class VideoPostprocessor(nn.Module):
             raise ValueError(
                 "video segments, frame slices and durations must align"
             )
-        overlap = state["video_overlap"]
+        if (
+            type(unit_count) is not int
+            or not 0 <= self.units.rank < unit_count <= self.units.size
+        ):
+            raise ValueError(
+                "media unit ring position must lie within the round it serves"
+            )
+        retained = state["video_overlap"]
+        overlap = retained
         pixels = workspace["rgb_frames"]
         mean, std = constants["pixel_mean"], constants["pixel_std"]
         height, width = self.frame_size.height, self.frame_size.width
@@ -353,6 +377,32 @@ class VideoPostprocessor(nn.Module):
             raise ValueError(
                 "video overlap state must contain the complete temporal overlap"
             )
+        # Every participant sends the tail of its last unit to the rank holding
+        # the next one and receives its predecessor's, so one exchange carries
+        # the whole round's overlaps. The rank holding the round's first unit
+        # blends with what it retained from the previous round and keeps what
+        # arrives here for the next one; the ring's wrap-around therefore
+        # delivers one tail that the final round never consumes.
+        incoming = workspace["overlap_exchange"]
+        outgoing = values[-1][:, :, slices[-1][1]]
+        if incoming.shape != outgoing.shape or incoming.dtype != outgoing.dtype:
+            raise ValueError(
+                "video overlap exchange must match the overlap it carries"
+            )
+        if unit_count == 1:
+            incoming.copy_(outgoing)
+        else:
+            position = self.units.rank
+            self.units.send_recv(
+                outgoing,
+                dst=(position + 1) % unit_count,
+                src=(position - 1) % unit_count,
+                out=incoming,
+            )
+        if self.units.rank:
+            # Only the round's first unit reads a retained overlap; every other
+            # rank blends with the one its predecessor just sent.
+            overlap = incoming
         if (
             pixels.ndim != 4
             or pixels.shape[1:] != (height, width, 3)
@@ -416,4 +466,7 @@ class VideoPostprocessor(nn.Module):
                     ),
                 )
             )
+        if not self.units.rank:
+            # The round's last tail belongs to the round that follows it.
+            retained.copy_(incoming)
         return tuple(outputs)

@@ -346,7 +346,8 @@ impl Scheduler {
 struct LaneDemand {
     component: Option<String>,
     units: u32,
-    host: u32,
+    /// Ranks whose host lane this call occupies, one slot on each.
+    host_ranks: Vec<u32>,
 }
 
 /// Lane occupancy across the media calls in flight.
@@ -354,13 +355,19 @@ struct LaneDemand {
 struct LaneLedger {
     exclusive: HashMap<String, RequestId>,
     units: HashMap<String, u32>,
-    host: u32,
+    /// Every rank owns one host lane, so occupancy is counted per rank.
+    host: HashMap<u32, u32>,
 }
 
 impl LaneLedger {
     /// Returns whether one request's call fits the lanes it occupies.
     fn admits(&self, demand: &LaneDemand, request: RequestId, scheduler: &Scheduler) -> bool {
-        if self.host + demand.host > scheduler.info.host_lane_capacity.max(1) {
+        let capacity = scheduler.info.host_lane_capacity.max(1);
+        if demand
+            .host_ranks
+            .iter()
+            .any(|rank| self.host.get(rank).copied().unwrap_or(0) + 1 > capacity)
+        {
             return false;
         }
         let Some(component) = demand.component.as_deref() else {
@@ -378,7 +385,9 @@ impl LaneLedger {
 
     /// Marks the lanes one request's call occupies until it completes.
     fn occupy(&mut self, demand: &LaneDemand, request: RequestId) {
-        self.host += demand.host;
+        for rank in &demand.host_ranks {
+            *self.host.entry(*rank).or_default() += 1;
+        }
         let Some(component) = demand.component.as_deref() else {
             return;
         };
@@ -490,23 +499,53 @@ impl Scheduler {
     fn lane_demand(&self, stage: PipelineStage, units: u32) -> LaneDemand {
         let component = self.media_component(stage);
         let device_units = match stage {
+            // A device lane is occupied by a decode round. Encoding a media
+            // unit is admitted on its rank's host lane, so it overlaps the
+            // decode round that follows it rather than excluding it, and the
+            // post-processing it begins with rides on the same admission.
             PipelineStage::VideoDecoding | PipelineStage::AudioDecoding => component
                 .as_deref()
                 .and_then(|name| self.device_lane_units(name))
                 .map_or(0, |_| units.max(1)),
             _ => 0,
         };
-        let host = match stage {
+        let host_ranks = match stage {
             PipelineStage::VideoEncoding | PipelineStage::AudioEncoding | PipelineStage::Muxing => {
-                1
+                self.host_lane_ranks(component.as_deref(), units)
             }
-            _ => 0,
+            _ => Vec::new(),
         };
         LaneDemand {
             component,
             units: device_units,
-            host,
+            host_ranks,
         }
+    }
+
+    /// Returns the ranks whose host lane one call of a component occupies.
+    ///
+    /// A distributed component's round runs on as many of its ranks as it has
+    /// media units; any other component runs on all of its ranks.
+    fn host_lane_ranks(&self, component: Option<&str>, units: u32) -> Vec<u32> {
+        let Some(binding) = self
+            .info
+            .components
+            .iter()
+            .find(|binding| Some(binding.name.as_str()) == component)
+        else {
+            return Vec::new();
+        };
+        let ranks = &binding.config.ranks;
+        let width = match binding.config.distribution {
+            Some(_) => (units.max(1) as usize)
+                .div_ceil(binding.config.units_per_rank.max(1))
+                .min(ranks.len()),
+            None => ranks.len(),
+        };
+        ranks[..width]
+            .iter()
+            .map(|rank| u32::try_from(*rank).expect("a rank index fits the lane ledger"))
+            .collect()
     }
 
     /// Accumulates the lanes the media calls in flight occupy.
@@ -557,6 +596,11 @@ impl Scheduler {
             PipelineStage::VideoDecoding => width()
                 .min(state.request.sampling.num_decode_chunks - state.num_scheduled_decode_chunks),
             PipelineStage::AudioDecoding => width(),
+            // An encode round covers the media units the decode round produced.
+            PipelineStage::VideoEncoding => state
+                .video_segments
+                .get(&state.num_scheduled_video_chunks)
+                .map_or(1, |(units, _)| *units),
             _ => 1,
         }
     }
@@ -675,6 +719,12 @@ impl Scheduler {
                 PipelineStage::AudioEncoding => {
                     vec![state.audio.as_ref().expect("audio is ready").clone()]
                 }
+                // The muxer assembles every encoded media unit of the request.
+                PipelineStage::Muxing => state
+                    .encoded_segments
+                    .values()
+                    .map(|(_, product)| product.clone())
+                    .collect(),
                 _ => Vec::new(),
             };
             let mut buffers = Vec::new();
@@ -683,15 +733,31 @@ impl Scheduler {
                 || last_step
                 || matches!(
                     stage,
-                    PipelineStage::VideoDecoding | PipelineStage::AudioDecoding
+                    PipelineStage::VideoDecoding
+                        | PipelineStage::AudioDecoding
+                        | PipelineStage::VideoEncoding
                 )
             {
-                let count = if last_step { 2 } else { 1 };
-                for index in 0..count {
+                // An entry declares its products in the order its methods do.
+                // The video decoder's entry declares the decoded windows and
+                // then the media units encoded from them, so a decode round
+                // reserves the first and an encode round the second.
+                let declared: &[u32] = match stage {
+                    _ if last_step => &[0, 1],
+                    PipelineStage::VideoEncoding => &[1],
+                    _ => &[0],
+                };
+                for &index in declared {
                     let reserved = &state.allocations.tensors[&(entry.to_owned(), index)];
                     let mut shape_bound = reserved.shape_bound.clone();
-                    let start = if stage == PipelineStage::VideoDecoding {
-                        let range = decode.as_ref().expect("video decode has an input range");
+                    // A media unit round writes its own slice of the track's
+                    // reservation, whether the slice holds decoded windows or
+                    // the units encoded from them.
+                    let start = if matches!(
+                        stage,
+                        PipelineStage::VideoDecoding | PipelineStage::VideoEncoding
+                    ) {
+                        let range = decode.as_ref().expect("a media round has a unit range");
                         shape_bound.dims[0] = DimBound::Static(range.max_units);
                         range.cursor
                     } else {
@@ -786,10 +852,12 @@ impl Scheduler {
                     state.audio = Some(operation.outputs[0].clone());
                 }
                 PipelineStage::VideoEncoding => {
-                    state.num_scheduled_video_chunks += decode
-                        .as_ref()
-                        .expect("video write has an input range")
-                        .max_units;
+                    let range = decode.as_ref().expect("video write has an input range");
+                    state.num_scheduled_video_chunks += range.max_units;
+                    state.encoded_segments.insert(
+                        range.cursor,
+                        (range.max_units, operation.outputs[0].clone()),
+                    );
                 }
                 PipelineStage::AudioEncoding => state.audio_encoding_scheduled = true,
                 PipelineStage::Muxing => state.muxing_scheduled = true,
@@ -1662,7 +1730,14 @@ impl Scheduler {
                             consumed_products.push(product);
                         }
                     }
-                    Computation::Pipeline(PipelineStage::Muxing) => state.muxed = true,
+                    Computation::Pipeline(PipelineStage::Muxing) => {
+                        state.muxed = true;
+                        // The artifact is assembled, so every encoded media
+                        // unit it consumed retires with it.
+                        consumed_products
+                            .extend(state.encoded_segments.values().map(|(_, p)| p.clone()));
+                        state.encoded_segments.clear();
+                    }
                     _ => {}
                 }
                 let phase = match operation.code {

@@ -634,7 +634,11 @@ impl WorkerExecutor {
         let source = entries.iter().find(|entry| entry.name == producer.entry);
         let destination = entries.iter().find(|entry| entry.name == consumer_entry);
         if producer.entry == consumer_entry {
-            return source.is_none_or(|entry| entry.config.distribution.is_none());
+            // A consumer call on the entry that produced the product is aligned
+            // with the round that produced it: the same media units in the same
+            // order on the same ranks, so each rank consumes the shard it wrote
+            // and no rank needs another's.
+            return true;
         }
         source
             .zip(destination)

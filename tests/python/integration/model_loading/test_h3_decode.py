@@ -49,7 +49,7 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
     modules = {
         "video_decoder": ComponentConfig((0,), distribution="temporal_units"),
         "audio_decoder": ComponentConfig((0,)),
-        "output": ComponentConfig((0,)),
+        "muxer": ComponentConfig((0,)),
     }
     with initialize_process_groups(
         rank=0, local_rank=0, world_size=1, device="cuda:0"
@@ -222,7 +222,7 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                         ),
                     )
                     result = runner.run_module(
-                        "output",
+                        "video_decoder",
                         (TensorOutput(segment, segment_layout),),
                         method="forward",
                         size=frames,

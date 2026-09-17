@@ -8,7 +8,7 @@ from importlib import import_module
 
 from torch import nn
 
-from uniserve.distributed import DeviceMesh
+from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.model import (
     AudioDecoder,
     CausalLM,
@@ -33,6 +33,14 @@ from ..protocol.operation import (
 )
 from .config import ComponentConfig
 
+# The muxer assembles encoded media units and the encoded audio track into the
+# artifact on its host lane. It owns no numerical method, so the worker declares
+# it rather than the model, which declares numerical components only.
+MUXER_COMPONENT = "muxer"
+MUXER_COMPUTATIONS = frozenset(
+    {PipelineStage.AUDIO_ENCODING, PipelineStage.MUXING}
+)
+
 
 def call_operations(calls: Iterable[Call]) -> frozenset[Computation]:
     """Resolve computation from capability type and method.
@@ -51,13 +59,9 @@ def call_operations(calls: Iterable[Call]) -> frozenset[Computation]:
                 (PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING)
             )
         elif isinstance(module, VideoPostprocessor) and method == "forward":
-            operations.update(
-                (
-                    PipelineStage.VIDEO_ENCODING,
-                    PipelineStage.AUDIO_ENCODING,
-                    PipelineStage.MUXING,
-                )
-            )
+            # The post-processor converts one media unit to RGB on the rank that
+            # decoded it; encoding that unit is the host half of the same call.
+            operations.add(PipelineStage.VIDEO_ENCODING)
         elif method == "encode":
             if isinstance(module, TextEncoder):
                 operations.add(PipelineStage.TEXT_ENCODING)
@@ -150,15 +154,24 @@ def describe_components(
                 )
             calls[name].append(call)
 
-    return {name: tuple(items) for name, items in calls.items()}
+    described = {name: tuple(items) for name, items in calls.items()}
+    if any(
+        isinstance(call.module, VideoPostprocessor)
+        for items in described.values()
+        for call in items
+    ):
+        # A model that reconstructs video also needs somewhere to assemble it.
+        described[MUXER_COMPONENT] = ()
+    return described
 
 
 def supported_operations(model: nn.Module) -> frozenset[Computation]:
     """Collect every computation and transfer mode the model can serve."""
-    calls = tuple(
-        call for calls in describe_components(model).values() for call in calls
-    )
+    components = describe_components(model)
+    calls = tuple(call for calls in components.values() for call in calls)
     operations = {TransferMode.TENSOR, *call_operations(calls)}
+    if MUXER_COMPONENT in components:
+        operations.update(MUXER_COMPUTATIONS)
     if any(isinstance(call.module, CausalLM) for call in calls):
         operations.update((TransferMode.KV_PUBLISH, TransferMode.KV_INSTALL))
     return frozenset(operations)
@@ -187,7 +200,11 @@ def media_components(model: nn.Module) -> dict[PipelineStage, str]:
 
     routes = {}
     for name, calls in components.items():
-        for stage in call_operations(calls) & stages:
+        owned = call_operations(calls) & stages
+        if name == MUXER_COMPONENT:
+            # The muxer's stages are host tasks with no numerical owner.
+            owned = MUXER_COMPUTATIONS
+        for stage in owned:
             if stage in routes:
                 raise unsupported_setup(
                     f"media pipeline repeats {stage.value} computation"
@@ -224,7 +241,15 @@ def validate_components(
     for name, component in components.items():
         calls = declared[name]
         if not calls:
-            raise unsupported_setup(f"entry {name!r} has no numerical methods")
+            if name != MUXER_COMPONENT:
+                raise unsupported_setup(
+                    f"entry {name!r} has no numerical methods"
+                )
+            if component.distribution is not None:
+                raise unsupported_setup(
+                    "the muxer assembles one artifact and is not distributed"
+                )
+            continue
         if any(isinstance(call.module, VideoDecoder) for call in calls):
             if (
                 component.distribution != "temporal_units"
@@ -302,4 +327,14 @@ def bind_components(
             calls.append(replace(call, groups=tuple(groups.values())))
 
         binding.calls = tuple(calls)
-        binding.computations = tuple(call_operations(calls))
+        binding.computations = tuple(
+            MUXER_COMPUTATIONS
+            if name == MUXER_COMPONENT
+            else call_operations(calls)
+        )
+        # A module that reconstructs media units borrows the ring of ranks
+        # holding consecutive ones, the way a parallel module borrows its mesh.
+        if binding.units is not None:
+            for call in calls:
+                if isinstance(call.module.__dict__.get("units"), Communicator):
+                    call.module.units = binding.units

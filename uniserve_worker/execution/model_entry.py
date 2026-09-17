@@ -67,6 +67,9 @@ class ModelEntry:
     process_group: Communicator
     mesh: DeviceMesh | None
     device: torch.device
+    # The ranks this component's media units are distributed over, ordered by
+    # unit. Only a distributed entry has one, and only on its own members.
+    units: Communicator | None = None
     forward: Callable[..., TensorOutput | ExecutionOutput] | None = None
     groups: tuple[Communicator, ...] = ()
     outputs: tuple[OutputInfo, ...] = ()

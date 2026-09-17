@@ -119,9 +119,11 @@ def test_h3_worker_advertises_bounded_media_products():
         PipelineStage.DENOISING: "denoiser",
         PipelineStage.VIDEO_DECODING: "video_decoder",
         PipelineStage.AUDIO_DECODING: "audio_decoder",
-        PipelineStage.VIDEO_ENCODING: "output",
-        PipelineStage.AUDIO_ENCODING: "output",
-        PipelineStage.MUXING: "output",
+        # The rank that decodes a media unit also post-processes and encodes
+        # it; the muxer owns no numerical method and only assembles.
+        PipelineStage.VIDEO_ENCODING: "video_decoder",
+        PipelineStage.AUDIO_ENCODING: "muxer",
+        PipelineStage.MUXING: "muxer",
     }
     products = {
         value.name: value for values in outputs.values() for value in values
@@ -134,6 +136,11 @@ def test_h3_worker_advertises_bounded_media_products():
         "audio_latents": (2 * 65, 32),
         "video_segments": (2, 1, 3, 25, 768, 1344),
         "audio_samples": (52_000, 2),
+        # Each media unit is encoded where it was reconstructed. A row is
+        # bounded by a quarter of the planar raster its longest unit encodes,
+        # and carries an eight-byte length because the encoded size is not
+        # known when the product is reserved.
+        "media_units": (2, 8 + 22 * 768 * 1344 * 3 // 8),
     }
     assert products.keys() == expected.keys()
     for name, shape in expected.items():
