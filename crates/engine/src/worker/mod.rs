@@ -33,6 +33,10 @@ pub struct WorkerProcessArgs {
     pub model: String,
     /// Ordered physical members of this WorkerGroup instance.
     pub ranks: Vec<crate::WorkerRank>,
+    /// This process's own host identity. The engine owns exactly the ranks
+    /// whose placement node matches it, so a placement may name its host
+    /// explicitly instead of relying on a reserved local name.
+    pub host: String,
     /// Computation entry membership and parallel geometry.
     pub entries: std::collections::BTreeMap<String, crate::ComponentConfig>,
     /// Launch the worker without model weights, using its deterministic test
