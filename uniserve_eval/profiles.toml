@@ -29,9 +29,53 @@ CUDA_VISIBLE_DEVICES = "0"
 [servers.minimax-h3]
 host = "127.0.0.1"
 port = 18083
-command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--worker-ranks", "${UNISERVE_H3_WORKER_RANKS:-4}", "--pipeline-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "${UNISERVE_H3_VIDEO_GRAPH_SHAPES:-5x1000,5x10000,15x1000,15x10000}", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"${UNISERVE_H3_QUANT_MODE:-balanced}\"}"]
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--worker-ranks", "${UNISERVE_H3_WORKER_RANKS:-4}", "--pipeline-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"${UNISERVE_H3_QUANT_MODE:-balanced}\"}"]
 
 [servers.minimax-h3.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+# Serves one request shape, declared so its denoising ladders, decoders and
+# conditioning path are resident before the first request.
+[servers.minimax-h3-5s-1k]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--worker-ranks", "${UNISERVE_H3_WORKER_RANKS:-4}", "--pipeline-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "5x1000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"${UNISERVE_H3_QUANT_MODE:-balanced}\"}"]
+
+[servers.minimax-h3-5s-1k.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+# Serves one request shape, declared so its denoising ladders, decoders and
+# conditioning path are resident before the first request.
+[servers.minimax-h3-5s-10k]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--worker-ranks", "${UNISERVE_H3_WORKER_RANKS:-4}", "--pipeline-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "5x10000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"${UNISERVE_H3_QUANT_MODE:-balanced}\"}"]
+
+[servers.minimax-h3-5s-10k.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+# Serves one request shape, declared so its denoising ladders, decoders and
+# conditioning path are resident before the first request.
+[servers.minimax-h3-15s-1k]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--worker-ranks", "${UNISERVE_H3_WORKER_RANKS:-4}", "--pipeline-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "15x1000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"${UNISERVE_H3_QUANT_MODE:-balanced}\"}"]
+
+[servers.minimax-h3-15s-1k.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+# Serves one request shape, declared so its denoising ladders, decoders and
+# conditioning path are resident before the first request.
+[servers.minimax-h3-15s-10k]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--worker-ranks", "${UNISERVE_H3_WORKER_RANKS:-4}", "--pipeline-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "15x10000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"${UNISERVE_H3_QUANT_MODE:-balanced}\"}"]
+
+[servers.minimax-h3-15s-10k.environment]
 CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 NCCL_CUMEM_HOST_ENABLE = "1"
 
@@ -372,7 +416,7 @@ timestep_shift = 1.0
 images_per_second = "higher"
 
 [benchmarks.minimax-h3-5s-1k]
-server = "minimax-h3"
+server = "minimax-h3-5s-1k"
 task = "video"
 model = "MiniMax-H3"
 dataset = "minimax-h3"
@@ -394,7 +438,7 @@ videos_per_second = "higher"
 "video_latency_ms.mean" = "lower"
 
 [benchmarks.minimax-h3-5s-10k]
-server = "minimax-h3"
+server = "minimax-h3-5s-10k"
 task = "video"
 model = "MiniMax-H3"
 dataset = "minimax-h3"
@@ -416,7 +460,7 @@ videos_per_second = "higher"
 "video_latency_ms.mean" = "lower"
 
 [benchmarks.minimax-h3-15s-1k]
-server = "minimax-h3"
+server = "minimax-h3-15s-1k"
 task = "video"
 model = "MiniMax-H3"
 dataset = "minimax-h3"
@@ -438,7 +482,7 @@ videos_per_second = "higher"
 "video_latency_ms.mean" = "lower"
 
 [benchmarks.minimax-h3-15s-10k]
-server = "minimax-h3"
+server = "minimax-h3-15s-10k"
 task = "video"
 model = "MiniMax-H3"
 dataset = "minimax-h3"

@@ -198,6 +198,54 @@ def warmup_denoising(
         )
 
 
+def declared_sizes(runner: ModelRunner) -> tuple:
+    """Resolve the worker's declared video shapes into numerical sizes.
+
+    A declared shape names the duration and prompt length of the requests a
+    deployment serves. Admission converts a duration at the output sampling
+    clock and rounds it up to the next complete native window, so a declared
+    duration resolves to the frame count its requests carry.
+    """
+    builder = runner.media_builder
+    if builder is None:
+        return ()
+
+    frame_rate = runner.video_postprocessor.frame_rate
+    sizes = []
+    for seconds, num_text_tokens in runner.worker_config.video_graph_shapes:
+        frames = builder.denoiser.legal_frame_count(
+            int(seconds * frame_rate + 0.5)
+        )
+        try:
+            size = builder.size(frames, num_text_tokens)
+        except ValueError as error:
+            raise invalid_descriptor(
+                f"declared video graph shape {seconds} s x "
+                f"{num_text_tokens} tokens exceeds worker capacity: {error}"
+            ) from error
+        if size not in sizes:
+            sizes.append(size)
+    return tuple(sizes)
+
+
+def decoded_units(runner: ModelRunner, name: str, count: int) -> tuple:
+    """List the media unit indices this rank decodes for one unit count.
+
+    The engine hands each decode round as many units as the component has
+    ranks, in rank order, so a rank's share follows from its position.
+    """
+    binding = runner.bindings[name]
+    ranks = binding.config.ranks
+    position = ranks.index(binding.process_group.global_rank)
+    units, cursor = [], 0
+    while cursor < count:
+        width = min(len(ranks), count - cursor)
+        if position < width:
+            units.append(cursor + position)
+        cursor += width
+    return tuple(units)
+
+
 @torch.inference_mode()
 def capture_denoising(
     runner: ModelRunner, storage: tuple[TensorBuffers, ...]
@@ -212,31 +260,16 @@ def capture_denoising(
     captures on first use.
     """
     builder, denoising = runner.media_builder, runner.denoising
-    shapes = runner.worker_config.video_graph_shapes
-    if denoising is None or not shapes or not denoising.captures:
+    sizes = declared_sizes(runner)
+    if denoising is None or not sizes or not denoising.captures:
         return
     if builder is None or not storage:
         raise RuntimeError(
             "denoising capture requires its input builder and request storage"
         )
 
-    frame_rate = runner.video_postprocessor.frame_rate
     schedules = builder.schedules(device=runner.worker_config.device)
-    for seconds, num_text_tokens in shapes:
-        # Admission converts a duration at the output sampling clock and rounds
-        # it up to the next complete native window, so a declared duration
-        # resolves to the frame count its requests carry.
-        frames = builder.denoiser.legal_frame_count(
-            int(seconds * frame_rate + 0.5)
-        )
-        try:
-            size = builder.size(frames, num_text_tokens)
-        except ValueError as error:
-            raise invalid_descriptor(
-                f"declared video graph shape {seconds} s x "
-                f"{num_text_tokens} tokens exceeds worker capacity: {error}"
-            ) from error
-
+    for size in sizes:
         context = denoising.prepare_inputs(size, size)
         for slot, buffers in enumerate(storage, start=1):
             views = buffers.view(builder.buffers(size))
@@ -260,48 +293,89 @@ def capture_denoising(
 
 @torch.inference_mode()
 def warmup_decoders(runner: ModelRunner) -> None:
-    """Prepare reconstruction kernels with the admitted maximum latent.
+    """Prepare reconstruction kernels for the admitted and declared extents.
 
-    extent.
+    A decoder's prepared context and captured graph follow its frame count and,
+    for video, the media unit it reconstructs, so a declared duration warms
+    every unit this rank decodes at that duration. The admitted maximum stays
+    covered so an undeclared duration still meets compiled kernels.
     """
-    size = runner.media_builder.maximum
+    builder = runner.media_builder
+    frames = tuple(
+        dict.fromkeys(
+            size.num_frames
+            for size in (builder.maximum, *declared_sizes(runner))
+        )
+    )
     for (name, _, method), (binding, call) in runner._module_entries.items():
         if method != "decode":
             continue
         module = call.module
-        if isinstance(module, VideoDecoder):
-            shape = runner.media_builder.denoiser.latent_shape("video", size)
-            latent = torch.zeros(
-                shape, dtype=torch.float32, device=binding.device
-            )
-            runner.run_module(
-                name,
-                (latent,),
-                method="decode",
-                size=size.num_frames,
-                frames=(module.frame_slices(size.num_frames)[0],),
-                num_frames=(size.num_frames,),
-            )
-        elif isinstance(module, AudioDecoder):
-            shape = runner.media_builder.denoiser.latent_shape("audio", size)
-            latent = torch.zeros(
-                shape, dtype=torch.float32, device=binding.device
-            )
-            samples = audio_samples(runner, size.num_frames)
-            runner.run_module(
-                name,
-                (latent,),
-                method="decode",
-                size=module.latent_frames(samples),
-                num_samples=(samples,),
-            )
+        for num_frames in frames:
+            size = builder.size(num_frames, builder.maximum.num_text_tokens)
+            if isinstance(module, VideoDecoder):
+                shape = builder.denoiser.latent_shape("video", size)
+                latent = torch.zeros(
+                    shape, dtype=torch.float32, device=binding.device
+                )
+                windows = module.frame_slices(num_frames)
+                for unit in decoded_units(runner, name, len(windows)):
+                    runner.run_module(
+                        name,
+                        (latent,),
+                        method="decode",
+                        size=num_frames,
+                        frames=(windows[unit],),
+                        num_frames=(num_frames,),
+                    )
+            elif isinstance(module, AudioDecoder):
+                shape = builder.denoiser.latent_shape("audio", size)
+                latent = torch.zeros(
+                    shape, dtype=torch.float32, device=binding.device
+                )
+                samples = audio_samples(runner, num_frames)
+                runner.run_module(
+                    name,
+                    (latent,),
+                    method="decode",
+                    size=module.latent_frames(samples),
+                    num_samples=(samples,),
+                )
+
+
+@torch.inference_mode()
+def warmup_conditioning(runner: ModelRunner) -> None:
+    """Compile and capture the conditioning path at every declared length.
+
+    The text encoder and the denoiser's conditioning encoder each prepare one
+    context and capture one graph per exact token count. Running them in their
+    serving order gives the conditioning encoder the same input the request
+    path hands it, so a declared prompt length is warmed here rather than on
+    the first request that carries it.
+    """
+    kinds = runner.encoder_kinds
+    if "text" not in kinds:
+        return
+    for length in dict.fromkeys(
+        size.num_text_tokens for size in declared_sizes(runner)
+    ):
+        encoded = runner.run_encoder(
+            "text", runner.stage_text_tokens((0,) * length)
+        )
+        if "conditioning" in kinds:
+            runner.run_encoder("conditioning", *encoded.values)
 
 
 @torch.inference_mode()
 def warmup_postprocess(
     runner: ModelRunner, storage: tuple[TensorBuffers, ...]
 ) -> None:
-    """Exercise one real output window using its public numerical interface."""
+    """Exercise real output windows through the public numerical interface.
+
+    One post-processing call converts the media units of one decode round, so
+    its prepared context follows the frame count and the round's unit span. The
+    admitted maximum and every declared duration are covered.
+    """
     entries = [
         (name, call)
         for (name, _, _), (_, call) in runner._module_entries.items()
@@ -313,32 +387,50 @@ def warmup_postprocess(
         raise RuntimeError("video output warmup requires request storage")
 
     name, call = entries[0]
-    frames = runner.media_builder.maximum.num_frames
-    decoder = runner.video_decoder
-    window = decoder.frame_slices(frames)[0]
-    layout = decoder.output_layout(frames)["video"]
-    segment = torch.zeros(
-        (1, *layout.shape[1:]),
-        dtype=layout.dtype,
-        device=runner.bindings[name].device,
+    builder, decoder = runner.media_builder, runner.video_decoder
+    device = runner.bindings[name].device
+    decoding = next(
+        component
+        for (component, _, _), (_, entry) in runner._module_entries.items()
+        if isinstance(entry.module, VideoDecoder)
     )
-    state = storage[0].view(call.module.state_buffers(frames))
-    runner.run_module(
-        name,
-        (
-            TensorOutput(
-                segment,
-                replace(
-                    layout, local_slice=(slice(0, 1), *layout.local_slice[1:])
-                ),
-            ),
-        ),
-        method="forward",
-        size=frames,
-        frames=(window,),
-        num_frames=(frames,),
-        state=state,
-    )
+    units_per_round = len(runner.bindings[decoding].config.ranks)
+    for frames in dict.fromkeys(
+        size.num_frames for size in (builder.maximum, *declared_sizes(runner))
+    ):
+        windows = decoder.frame_slices(frames)
+        layout = decoder.output_layout(frames)["video"]
+        state = storage[0].view(call.module.state_buffers(frames))
+        cursor = 0
+        while cursor < len(windows):
+            count = min(units_per_round, len(windows) - cursor)
+            segments = tuple(
+                TensorOutput(
+                    torch.zeros(
+                        (1, *layout.shape[1:]),
+                        dtype=layout.dtype,
+                        device=device,
+                    ),
+                    replace(
+                        layout,
+                        local_slice=(
+                            slice(cursor + index, cursor + index + 1),
+                            *layout.local_slice[1:],
+                        ),
+                    ),
+                )
+                for index in range(count)
+            )
+            runner.run_module(
+                name,
+                segments,
+                method="forward",
+                size=frames,
+                frames=tuple(windows[cursor : cursor + count]),
+                num_frames=(frames,) * count,
+                state=state,
+            )
+            cursor += count
 
 
 def create_media_resources(

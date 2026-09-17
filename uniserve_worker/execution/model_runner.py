@@ -1306,12 +1306,14 @@ class ModelRunner:
         if self.media_builder is not None:
             from .video import (
                 capture_denoising,
+                warmup_conditioning,
                 warmup_decoders,
                 warmup_denoising,
                 warmup_postprocess,
             )
 
             warmup_denoising(self, storage)
+            warmup_conditioning(self)
             warmup_decoders(self)
             warmup_postprocess(self, storage)
             # Capture last so the declared shapes hold the prepared contexts
