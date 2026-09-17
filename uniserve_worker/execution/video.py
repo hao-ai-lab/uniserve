@@ -34,7 +34,7 @@ from uniserve_worker.protocol.operation import (
     ScheduledRequest,
 )
 from uniserve_worker.protocol.output import FinishFlags
-from uniserve_worker.runtime.cpu import CpuTask
+from uniserve_worker.runtime.host_lane import HostTask
 
 from . import operations
 from .batch_state import BatchState
@@ -577,7 +577,7 @@ def execute(
         raise unsupported_setup("output owner has no video mux resources")
     from . import transfer
 
-    tasks: tuple[CpuTask, ...] = ()
+    tasks: tuple[HostTask, ...] = ()
     products: tuple[TensorPublication, ...] = ()
     if operation.kind is PipelineStage.LATENT_PREPARATION:
         params = trajectory_params(operation, state=state)
@@ -894,7 +894,7 @@ def execute(
             ),
         )
 
-    # Configured CpuTask now owns the media lease through its final CPU read.
+    # Configured HostTask now owns the media lease through its final CPU read.
     request.media_lease = None
     request.status = OpStatus.OK
     # Reconstruction and mux operations consume products without advancing the

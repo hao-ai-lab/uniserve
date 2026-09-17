@@ -1,4 +1,4 @@
-"""Bounded CPU tasks whose capacity and input leases follow actual execution."""
+"""The rank's host lane: bounded host tasks with leased inputs."""
 
 from __future__ import annotations
 
@@ -13,29 +13,31 @@ from uniserve.runtime.resources import close_resources
 
 from ..foundation.errors import resource_error
 
-__all__ = ["CpuPool", "CpuTask"]
+__all__ = ["HostLane", "HostTask"]
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
 
-class CpuPool:
-    """Own admitted tasks until cancellation before submission or actual.
+class HostLane:
+    """One rank's host execution resource.
 
-    completion.
+    The lane admits at most ``max_inflight`` tasks and owns each one until it is
+    cancelled before submission or actually completes. Its capacity is the one
+    the rank advertises, so the engine's lane ledger never overcommits it.
     """
 
-    def __init__(self, *, capacity: int, workers: int) -> None:
-        self.capacity = int(capacity)
-        if self.capacity < 1:
-            raise ValueError("CPU task capacity must be positive")
-        if workers < 1 or workers > self.capacity:
-            raise ValueError("CPU worker count must be within task capacity")
+    def __init__(self, *, max_inflight: int, workers: int) -> None:
+        self.max_inflight = int(max_inflight)
+        if self.max_inflight < 1:
+            raise ValueError("host lane capacity must be positive")
+        if workers < 1 or workers > self.max_inflight:
+            raise ValueError("host lane workers must be within its capacity")
         self._lock = Lock()
         self._closed = False
-        self._tasks: set[CpuTask] = set()
+        self._tasks: set[HostTask] = set()
         self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="worker-cpu"
+            max_workers=workers, thread_name_prefix="worker-host-lane"
         )
         self._completion_wake: Callable[[], None] | None = None
 
@@ -48,29 +50,29 @@ class CpuPool:
         with self._lock:
             return len(self._tasks)
 
-    def reserve(self) -> CpuTask:
+    def reserve(self) -> HostTask:
         """Admit a task under the pool's capacity lease before its inputs.
 
         exist.
         """
         with self._lock:
             if self._closed:
-                raise resource_error("worker CPU pool is closed")
-            if len(self._tasks) >= self.capacity:
-                raise resource_error("worker CPU task capacity is exhausted")
-            task = CpuTask(self)
+                raise resource_error("worker host lane is closed")
+            if len(self._tasks) >= self.max_inflight:
+                raise resource_error("worker host lane capacity is exhausted")
+            task = HostTask(self)
             self._tasks.add(task)
             return task
 
-    def _submit(self, task: CpuTask) -> None:
+    def _submit(self, task: HostTask) -> None:
         error: BaseException | None = None
         with self._lock:
             if self._closed or task not in self._tasks:
-                raise RuntimeError("CPU task is no longer admitted")
+                raise RuntimeError("host task is no longer admitted")
             if task._future is not None:
-                raise RuntimeError("CPU task was submitted more than once")
+                raise RuntimeError("host task was submitted more than once")
             if task._action is None:
-                raise RuntimeError("CPU task has no action")
+                raise RuntimeError("host task has no action")
             # Serialize executor admission with close; callbacks run
             # outside this lock.
             try:
@@ -84,15 +86,12 @@ class CpuPool:
         assert task._future is not None
         task._future.add_done_callback(task._completed)
 
-    def _remove(self, task: CpuTask) -> None:
+    def _remove(self, task: HostTask) -> None:
         with self._lock:
             self._tasks.discard(task)
 
     def close(self) -> None:
-        """Reject admission, cancel unsubmitted tasks, and drain actual CPU.
-
-        readers.
-        """
+        """Reject admission, cancel unsubmitted tasks and drain host readers."""
         with self._lock:
             self._closed = True
             unused = tuple(task for task in self._tasks if task._future is None)
@@ -104,16 +103,16 @@ class CpuPool:
             self._executor.shutdown(wait=True, cancel_futures=False)
 
 
-class CpuTask:
-    """One admitted action, result promise and input lease.
+class HostTask:
+    """One admitted host call: its action, result promise and input lease.
 
-    no separate job owner. Configure after reserving the operation's
-    capacity, once its input exists.
-    The worker calls submit_if_ready to advance deferred actions; ready is pure.
-    Abandoning submitted work does not cancel its reads or return its capacity.
+    Configure it after reserving the call's lane capacity, once its input
+    exists. The worker calls ``submit_if_ready`` to advance deferred actions;
+    ``ready`` is pure. Abandoning submitted work neither cancels its reads nor
+    returns its capacity.
     """
 
-    def __init__(self, pool: CpuPool) -> None:
+    def __init__(self, pool: HostLane) -> None:
         self._pool = pool
         self.promise: concurrent.futures.Future[Any] = (
             concurrent.futures.Future()
@@ -126,7 +125,7 @@ class CpuTask:
             Callable[[], concurrent.futures.Future[None]] | None
         ) = None
         self._release: Callable[[], None] | None = None
-        self._profile_name = "uniserve.cpu"
+        self._profile_name = "uniserve.host"
 
     def configure(
         self,
@@ -137,17 +136,17 @@ class CpuTask:
         input_completion: Callable[[], concurrent.futures.Future[None]]
         | None = None,
         release: Callable[[], None] | None = None,
-        profile_name: str = "uniserve.cpu",
-    ) -> CpuTask:
+        profile_name: str = "uniserve.host",
+    ) -> HostTask:
         """Attach an action and transfer its input release responsibility.
 
         to this task.
         """
         with self._pool._lock:
             if self not in self._pool._tasks or self._pool._closed:
-                raise RuntimeError("CPU task is no longer admitted")
+                raise RuntimeError("host task is no longer admitted")
             if self._action is not None:
-                raise RuntimeError("CPU task was configured more than once")
+                raise RuntimeError("host task was configured more than once")
             self._action = action
             self._dependencies = dependencies
             self._input_ready = input_ready
@@ -227,7 +226,9 @@ class CpuTask:
         loop.
         """
         if not self.ready():
-            raise RuntimeError("CPU task result was observed before completion")
+            raise RuntimeError(
+                "host task result was observed before completion"
+            )
         return self.promise.result(timeout=0)
 
     def abandon(self) -> None:

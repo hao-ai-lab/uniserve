@@ -38,7 +38,7 @@ from ..protocol.output import (
     TimingCounters,
 )
 from ..protocol.transfer import KvTransfer, Locator
-from ..runtime.cpu import CpuTask
+from ..runtime.host_lane import HostTask
 from ..runtime.latent_pool import LatentStaging
 from ..runtime.request import RequestProgress, RequestState
 from ..runtime.tensor_store import TensorRead, TensorRecord
@@ -1188,7 +1188,7 @@ class PendingOutput:
         self._completion_timing: tuple[int, int, int, int] | None = None
         self._observed = False
 
-        self.completion_tasks: tuple[CpuTask, ...] = ()
+        self.completion_tasks: tuple[HostTask, ...] = ()
         self.media_lease: MediaLease | None = None
         self._reports_output = True
         self._media_output: MediaOutput | None = None

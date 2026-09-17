@@ -161,6 +161,7 @@ table WorkerInfo {
   max_unresolved_ops:uint = 1;
   pipeline_components:[PipelineComponent];
   num_inference_steps:uint;
+  host_lane_capacity:uint = 1;
 }
 
 // Request identities and operation records.

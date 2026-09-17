@@ -37,7 +37,7 @@ from .inputs import capability, image_builder
 _DEVICE_PRODUCTS_PER_OPERATION = 6
 _DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
 _MAX_TRANSFER_ENTRIES = 256
-_CPU_TASKS = 256
+_HOST_LANE_INFLIGHT = 256
 _REQUEST_RELAY_ROW_BYTES = 18
 _REQUEST_RELAY_RETIREMENT_LANES = 1
 
@@ -380,7 +380,7 @@ class ArenaCapacity:
     device_product_bytes: int
     transfer_bytes: int
     transfer_tickets: int
-    cpu_tasks: int
+    host_lane_inflight: int
 
 
 def operation_window(pipeline_depth: int, max_operations: int) -> int:
@@ -424,7 +424,7 @@ def request_tensor_arena_capacity(
         ),
         transfer_bytes=max(1, state_slots * product_bytes_per_request),
         transfer_tickets=max(1, min(slots, _MAX_TRANSFER_ENTRIES)),
-        cpu_tasks=state_slots * (unresolved_window + 1),
+        host_lane_inflight=state_slots * (unresolved_window + 1),
     )
 
 
@@ -545,7 +545,7 @@ def model_arena_capacity(
         device_product_bytes=device_product_bytes,
         transfer_bytes=max_transfer_bytes * transfer_tickets,
         transfer_tickets=transfer_tickets,
-        cpu_tasks=_CPU_TASKS,
+        host_lane_inflight=_HOST_LANE_INFLIGHT,
     )
 
 

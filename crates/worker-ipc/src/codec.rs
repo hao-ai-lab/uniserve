@@ -978,6 +978,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
         encoder_cache_entries: info.encoder_cache_entries(),
         encoder_entry_bytes: info.encoder_entry_bytes(),
         max_unresolved_ops: info.max_unresolved_ops(),
+        host_lane_capacity: info.host_lane_capacity(),
         pipeline_components: {
             let mut components = std::collections::BTreeMap::new();
             if let Some(bindings) = info.pipeline_components() {
@@ -2005,6 +2006,7 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
         encoder_cache_entries: info.encoder_cache_entries,
         encoder_entry_bytes: info.encoder_entry_bytes,
         max_unresolved_ops: info.max_unresolved_ops,
+        host_lane_capacity: info.host_lane_capacity,
         pipeline_components: Some(
             info.pipeline_components
                 .iter()

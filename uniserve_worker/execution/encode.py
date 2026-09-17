@@ -36,7 +36,7 @@ from uniserve_worker.protocol.transfer import (
     EncoderTransferValue,
     TensorTransfer,
 )
-from uniserve_worker.runtime.cpu import CpuTask
+from uniserve_worker.runtime.host_lane import HostTask
 from uniserve_worker.runtime.tensor_store import (
     FeatureMetadata,
     ImageMetadata,
@@ -409,7 +409,7 @@ def non_state_outcome(
     *,
     state: BatchState,
     products: tuple[TensorPublication, ...] = (),
-    completion_tasks: tuple[CpuTask, ...] = (),
+    completion_tasks: tuple[HostTask, ...] = (),
 ) -> PendingOutput:
     """Record a stateless completion and its already materialized output.
 
@@ -750,7 +750,7 @@ def defer_image_encoding(
     *,
     state: BatchState,
     max_bytes: int,
-) -> CpuTask:
+) -> HostTask:
     """Reserve output storage and schedule image encoding after the device copy.
 
     completes.

@@ -21,7 +21,7 @@ from ..protocol.transfer import KvTransfer, TensorTransfer
 from ..transfer.layout import fetch_tensor
 from ..transfer.tickets import TransferTicket, Transport
 from .block_tables import page_spans
-from .cpu import CpuPool
+from .host_lane import HostLane
 
 if TYPE_CHECKING:
     from .cache_manager import CacheManager
@@ -95,7 +95,7 @@ class CacheImports:
     def __init__(self, pool: CacheManager, *, capacity: int) -> None:
         self.pool = pool
         workers = min(4, int(capacity))
-        self._tasks = CpuPool(capacity=capacity, workers=workers)
+        self._tasks = HostLane(max_inflight=capacity, workers=workers)
 
         # One conversion page holds a full KV page:
         # [tokens, layers, heads, dim].

@@ -38,7 +38,7 @@ from uniserve_worker.protocol.tensor import (
     TensorRef,
 )
 from uniserve_worker.runtime.buffer_pool import BufferPool
-from uniserve_worker.runtime.cpu import CpuPool
+from uniserve_worker.runtime.host_lane import HostLane
 from uniserve_worker.runtime.latent_pool import LatentPool
 from uniserve_worker.runtime.request import RequestPool
 from uniserve_worker.runtime.tensor_store import FeatureMetadata, TensorStore
@@ -47,7 +47,7 @@ from uniserve_worker.runtime.tensor_store import FeatureMetadata, TensorStore
 def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() -> (  # noqa: E501
     None
 ):
-    pool = CpuPool(capacity=2, workers=1)
+    pool = HostLane(capacity=2, workers=1)
     predecessor = pool.reserve().configure(
         lambda: 1, profile_name="output.predecessor"
     )

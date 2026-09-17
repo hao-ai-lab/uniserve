@@ -272,6 +272,7 @@ class WorkerInfo:
     latent_pages: int
     buffer_pool_bytes: int
     max_unresolved_ops: int
+    host_lane_capacity: int
     encoder_cache_entries: int = 0
     encoder_entry_bytes: int = 0
     configuration_id: str = ""
@@ -331,6 +332,7 @@ class WorkerInfo:
             "max_batch_tokens",
             "request_slots",
             "max_unresolved_ops",
+            "host_lane_capacity",
         ):
             if getattr(self, name) < 1:
                 raise invalid_descriptor(f"worker info.{name} must be positive")
@@ -474,6 +476,9 @@ class WorkerInfo:
             max_unresolved_ops=_uint(
                 data.get("max_unresolved_ops"), f"{where}.max_unresolved_ops"
             ),
+            host_lane_capacity=_uint(
+                data.get("host_lane_capacity"), f"{where}.host_lane_capacity"
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -507,6 +512,7 @@ class WorkerInfo:
             "encoder_cache_entries": self.encoder_cache_entries,
             "encoder_entry_bytes": self.encoder_entry_bytes,
             "max_unresolved_ops": self.max_unresolved_ops,
+            "host_lane_capacity": self.host_lane_capacity,
         }
 
 

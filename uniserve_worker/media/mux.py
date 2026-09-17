@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from av.video.stream import VideoStream
 
     from ..execution.output import OutputBuffer
-    from ..runtime.cpu import CpuTask
+    from ..runtime.host_lane import HostTask
     from .buffers import MediaLease
 
 __all__ = ["AvMuxConfig", "AvMuxSession", "require_media_codecs"]
@@ -407,14 +407,14 @@ class MediaMux:
     def _task(
         self,
         request_key: RequestKey,
-        reservation: CpuTask,
+        reservation: HostTask,
         action: Callable[[AvMuxSession], object],
         output: OutputBuffer | None,
         dependencies: tuple[concurrent.futures.Future[object], ...],
         ring_lease: MediaLease | None = None,
         *,
         profile_name: str,
-    ) -> CpuTask:
+    ) -> HostTask:
         """Submit one ordered mux action.
 
         Its reservation and ring lease are released on completion.
@@ -440,10 +440,10 @@ class MediaMux:
         unit_count: int,
         frames: torch.Tensor,
         output: OutputBuffer,
-        reservation: CpuTask,
+        reservation: HostTask,
         ring_lease: MediaLease,
         operation_id: ComputationId,
-    ) -> CpuTask:
+    ) -> HostTask:
         """Schedule ordered RGB frame encoding.
 
         Frames come from a captured output-ring slot.
@@ -478,10 +478,10 @@ class MediaMux:
         request_key: RequestKey,
         pcm: torch.Tensor,
         output: OutputBuffer,
-        reservation: CpuTask,
+        reservation: HostTask,
         ring_lease: MediaLease,
         operation_id: ComputationId,
-    ) -> CpuTask:
+    ) -> HostTask:
         """Schedule PCM encoding from a captured output-ring slot."""
         self.validate_track(request_key, MediaTrack.AUDIO, 0, 1)
         dependency = self._sessions[request_key].audio_tail
@@ -511,9 +511,9 @@ class MediaMux:
     def finalize_artifact(
         self,
         request_key: RequestKey,
-        reservation: CpuTask,
+        reservation: HostTask,
         operation_id: ComputationId,
-    ) -> CpuTask:
+    ) -> HostTask:
         """Schedule mux finalization and shared-memory publication.
 
         Finalization runs after all segment jobs.

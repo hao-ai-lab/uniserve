@@ -191,6 +191,9 @@ pub struct WorkerInfo {
     pub encoder_entry_bytes: u64,
     /// Maximum unresolved operations per request lineage.
     pub max_unresolved_ops: u32,
+    /// Concurrent host-lane tasks this rank's bounded host executor admits.
+    #[serde(default)]
+    pub host_lane_capacity: u32,
 }
 
 impl WorkerInfo {
@@ -399,6 +402,7 @@ impl Default for WorkerInfo {
             encoder_cache_entries: 0,
             encoder_entry_bytes: 0,
             max_unresolved_ops: 1,
+            host_lane_capacity: 1,
         }
     }
 }

@@ -336,9 +336,69 @@ impl Scheduler {
             shape_bound: ShapeBound::default(),
         }
     }
+}
 
-    /// Select a ready stage from actual producer completion and destination capacity.
-    fn schedule_diffusion(&self, state: &MediaFlowState) -> Option<PipelineStage> {
+/// The lanes one media call occupies while it is in flight.
+///
+/// A component lane measured in media units carries `units`; every other
+/// component lane is exclusive and admits one request at a time. `host` counts
+/// the tasks the call places on the muxer rank's bounded host executor.
+struct LaneDemand {
+    component: Option<String>,
+    units: u32,
+    host: u32,
+}
+
+/// Lane occupancy across the media calls in flight.
+#[derive(Default)]
+struct LaneLedger {
+    exclusive: HashMap<String, RequestId>,
+    units: HashMap<String, u32>,
+    host: u32,
+}
+
+impl LaneLedger {
+    /// Returns whether one request's call fits the lanes it occupies.
+    fn admits(&self, demand: &LaneDemand, request: RequestId, scheduler: &Scheduler) -> bool {
+        if self.host + demand.host > scheduler.info.host_lane_capacity.max(1) {
+            return false;
+        }
+        let Some(component) = demand.component.as_deref() else {
+            return true;
+        };
+        if demand.units > 0 {
+            let capacity = scheduler.device_lane_units(component).unwrap_or(1);
+            self.units.get(component).copied().unwrap_or(0) + demand.units <= capacity
+        } else {
+            self.exclusive
+                .get(component)
+                .is_none_or(|holder| *holder == request)
+        }
+    }
+
+    /// Marks the lanes one request's call occupies until it completes.
+    fn occupy(&mut self, demand: &LaneDemand, request: RequestId) {
+        self.host += demand.host;
+        let Some(component) = demand.component.as_deref() else {
+            return;
+        };
+        if demand.units > 0 {
+            *self.units.entry(component.to_owned()).or_default() += demand.units;
+        } else {
+            self.exclusive.insert(component.to_owned(), request);
+        }
+    }
+}
+
+impl Scheduler {
+    /// Lists every call of one request whose inputs are produced.
+    ///
+    /// A request is a set of calls with data dependencies, so a tick offers all
+    /// of them and the lane ledger decides which ones fit. At most one call of
+    /// each kind is ready at once: the cursors this returns against advance as
+    /// calls are scheduled, so a unit group only becomes ready once its
+    /// predecessor is submitted.
+    fn ready_calls(&self, state: &MediaFlowState) -> Vec<PipelineStage> {
         let sampling = state.request.sampling;
         let produced = |product: &TensorRef| {
             !self
@@ -349,90 +409,174 @@ impl Scheduler {
                         .any(|op| op.operation.op_id == product.producer_op_id)
                 })
         };
-        let mut ready = [None; 4];
         if !state.text_encoding_scheduled {
-            ready[0] = Some(PipelineStage::TextEncoding);
-        } else if !state.latent_preparation_scheduled {
-            ready[0] = Some(PipelineStage::LatentPreparation);
-        } else if state.num_scheduled_steps < sampling.num_inference_steps {
-            ready[0] = Some(PipelineStage::Denoising);
-        } else {
-            // Consume completed decoder outputs first. Audio and video retain
-            // independent readiness and capacity when the other branch is busy.
-            if let Some((_, product)) = state.video_segments.get(&state.num_scheduled_video_chunks)
-                && produced(product)
-            {
-                ready[0] = Some(PipelineStage::VideoEncoding);
+            return vec![PipelineStage::TextEncoding];
+        }
+        if !state.latent_preparation_scheduled {
+            return vec![PipelineStage::LatentPreparation];
+        }
+        if state.num_scheduled_steps < sampling.num_inference_steps {
+            return vec![PipelineStage::Denoising];
+        }
+
+        // Consume completed decoder outputs first. Audio and video retain
+        // independent readiness and capacity when the other branch is busy.
+        let mut ready = Vec::new();
+        if let Some((_, product)) = state.video_segments.get(&state.num_scheduled_video_chunks)
+            && produced(product)
+        {
+            ready.push(PipelineStage::VideoEncoding);
+        }
+        if !state.audio_encoding_scheduled && state.audio.as_ref().is_some_and(produced) {
+            ready.push(PipelineStage::AudioEncoding);
+        }
+        if state.num_scheduled_decode_chunks < sampling.num_decode_chunks {
+            ready.push(PipelineStage::VideoDecoding);
+        }
+        if !state.audio_decoding_scheduled {
+            ready.push(PipelineStage::AudioDecoding);
+        }
+        // Mux waits for completed writes, never just their scheduled counts.
+        if !state.muxing_scheduled
+            && state.audio_encoded
+            && state.num_encoded_video_chunks == sampling.num_decode_chunks
+        {
+            ready.push(PipelineStage::Muxing);
+        }
+        ready
+    }
+
+    /// Returns the component whose lanes one media call occupies.
+    fn media_component(&self, stage: PipelineStage) -> Option<String> {
+        self.info.pipeline_components.get(&stage).cloned()
+    }
+
+    /// Returns a component's device lane capacity in media units.
+    ///
+    /// A component that distributes its work measures its lane in the units its
+    /// ranks reconstruct together; every other component's lane is exclusive
+    /// and admits one request at a time.
+    fn device_lane_units(&self, component: &str) -> Option<u32> {
+        self.info
+            .components
+            .iter()
+            .find(|binding| binding.name == component)
+            .and_then(|binding| {
+                binding.config.distribution.as_ref().map(|_| {
+                    (binding.config.ranks.len() * binding.config.units_per_rank.max(1)) as u32
+                })
+            })
+    }
+
+    /// Returns the lanes one media call occupies and how much of each.
+    fn lane_demand(&self, stage: PipelineStage, units: u32) -> LaneDemand {
+        let component = self.media_component(stage);
+        let device_units = match stage {
+            PipelineStage::VideoDecoding | PipelineStage::AudioDecoding => component
+                .as_deref()
+                .and_then(|name| self.device_lane_units(name))
+                .map_or(0, |_| units.max(1)),
+            _ => 0,
+        };
+        let host = match stage {
+            PipelineStage::VideoEncoding | PipelineStage::AudioEncoding | PipelineStage::Muxing => {
+                1
             }
-            if !state.audio_encoding_scheduled && state.audio.as_ref().is_some_and(produced) {
-                ready[1] = Some(PipelineStage::AudioEncoding);
-            }
-            if state.num_scheduled_decode_chunks < sampling.num_decode_chunks {
-                ready[2] = Some(PipelineStage::VideoDecoding);
-            }
-            if !state.audio_decoding_scheduled {
-                ready[3] = Some(PipelineStage::AudioDecoding);
-            }
-            // Mux waits for completed writes, never just their scheduled counts.
-            if !state.muxing_scheduled
-                && state.audio_encoded
-                && state.num_encoded_video_chunks == sampling.num_decode_chunks
-            {
-                ready[0] = Some(PipelineStage::Muxing);
+            _ => 0,
+        };
+        LaneDemand {
+            component,
+            units: device_units,
+            host,
+        }
+    }
+
+    /// Accumulates the lanes the media calls in flight occupy.
+    fn lane_occupancy(&self) -> LaneLedger {
+        let mut ledger = LaneLedger::default();
+        for (id, queue) in &self.pending_operations {
+            for op in queue {
+                let Computation::Pipeline(stage) = op.operation.code else {
+                    continue;
+                };
+                let units = match &op.input {
+                    InflightInput::Media {
+                        decode: Some(range),
+                        ..
+                    } => range.max_units,
+                    _ => 1,
+                };
+                ledger.occupy(&self.lane_demand(stage, units), *id);
             }
         }
-        ready.into_iter().flatten().find(|stage| {
-            self.info
-                .pipeline_components
-                .get(stage)
-                .is_some_and(|entry| {
-                    self.entry_candidates(Computation::Pipeline(*stage), entry)
-                        .any(|(worker, _, _)| self.executor.has_capacity(worker))
-                })
-        })
+        ledger
+    }
+
+    /// Returns whether the rank group that owns one call can accept a batch.
+    fn stage_has_queue_capacity(&self, stage: PipelineStage) -> bool {
+        self.info
+            .pipeline_components
+            .get(&stage)
+            .is_some_and(|entry| {
+                self.entry_candidates(Computation::Pipeline(stage), entry)
+                    .any(|(worker, _, _)| self.executor.has_capacity(worker))
+            })
+    }
+
+    /// Returns the media units one scheduled call of this kind would occupy.
+    fn call_units(&self, state: &MediaFlowState, stage: PipelineStage) -> u32 {
+        match stage {
+            PipelineStage::VideoDecoding => self
+                .media_component(stage)
+                .as_deref()
+                .and_then(|name| self.device_lane_units(name))
+                .unwrap_or(1)
+                .min(state.request.sampling.num_decode_chunks - state.num_scheduled_decode_chunks),
+            _ => 1,
+        }
     }
 
     /// Select eligible media requests and prepare their bounded computation inputs. Independent
     /// audio and video branches carry Tensor edges, without a state predecessor.
     pub(super) fn prepare_media_batch(&mut self) -> Option<ExecutionBatch> {
-        let max_unresolved =
-            usize::try_from(self.info.max_unresolved_ops.max(1)).unwrap_or(usize::MAX);
-        let mut candidates = self
-            .running_order
-            .iter()
-            .enumerate()
-            .filter_map(|(index, id)| {
-                let state = self.media_state(*id)?;
-                let inflight = self.num_pending_operations(*id);
-                if state.terminal_intent.is_terminal()
-                    || state.admission_state == WorkerRegistration::InFlight
-                    || inflight >= max_unresolved
-                {
-                    return None;
+        // Every resident request offers the complete set of calls whose inputs
+        // are produced, in arrival order, and each one is dispatched when the
+        // lanes it occupies have free capacity. There is no per-kind rule and
+        // no cap on how many calls of one request are in flight.
+        let mut ledger = self.lane_occupancy();
+        let mut candidates = Vec::new();
+        for id in self.running_order.clone() {
+            let Some(state) = self.media_state(id) else {
+                continue;
+            };
+            if state.terminal_intent.is_terminal()
+                || state.admission_state == WorkerRegistration::InFlight
+            {
+                continue;
+            }
+            for stage in self.ready_calls(state) {
+                let demand = self.lane_demand(stage, self.call_units(state, stage));
+                if !ledger.admits(&demand, id, self) || !self.stage_has_queue_capacity(stage) {
+                    continue;
                 }
-                self.schedule_diffusion(state)
-                    .map(|stage| (inflight, index, *id, stage))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_unstable_by_key(|(inflight, index, ..)| (*inflight > 0, *index));
-        candidates.truncate(self.config.max_batch);
+                ledger.occupy(&demand, id);
+                candidates.push((id, stage));
+            }
+        }
         if candidates.is_empty() {
             return None;
         }
 
         let batch_id = self.next_batch_id();
         let submit_at = Instant::now();
-        let candidate_requests = candidates
-            .iter()
-            .map(|(_, _, id, _)| *id)
-            .collect::<HashSet<_>>();
+        let candidate_requests = candidates.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
         let commands = self.take_commands(|command| {
             candidate_requests.contains(&command.request_key().request_id)
                 || matches!(command, BatchCommand::Finish { .. })
         });
         let mut admissions = Vec::new();
         let mut logical_ops = Vec::with_capacity(candidates.len());
-        for (request_index, (_, _, id, stage)) in candidates.into_iter().enumerate() {
+        for (request_index, (id, stage)) in candidates.into_iter().enumerate() {
             let op_id = ComputationId::new(
                 batch_id,
                 u32::try_from(request_index).expect("selected request count fits the IPC index"),

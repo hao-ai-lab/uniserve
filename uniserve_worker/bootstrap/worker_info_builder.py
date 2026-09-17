@@ -484,6 +484,7 @@ def _token_worker_layout(
         max_unresolved_ops=unresolved_window,
         pipeline_components=dict(media_components(model)),
         num_inference_steps=0,
+        host_lane_capacity=1,
     )
     arena = model_arena_capacity(
         model,
@@ -494,7 +495,9 @@ def _token_worker_layout(
         **arena_args,
     )
     return WorkerLayout(
-        info=info,
+        # The rank's host executor owns the host lane, so its advertised
+        # capacity is the one the arena reserved.
+        info=replace(info, host_lane_capacity=int(arena.host_lane_inflight)),
         arena=arena,
         input_config=input_config,
         fixed_device_bytes=tuple(fixed_bytes.items()),
@@ -554,26 +557,30 @@ def _request_tensor_worker_layout(
         max_unresolved_ops=unresolved_window,
         pipeline_components=dict(media_components(model)),
         num_inference_steps=media_builder(model, worker_config).num_steps,
+        host_lane_capacity=1,
+    )
+    arena = model_arena_capacity(
+        model,
+        worker_config,
+        bindings=bindings,
+        state_buffers=state_buffers,
+        pipeline_depth=depth,
+        completion_payload_bytes=completion_payload_bytes,
+        num_blocks=0,
+        request_pool_size=slots,
+        num_latent_pages=0,
+        latent_page_units=0,
+        latent_width=0,
+        max_latent_feature_bytes=0,
+        max_vision_feature_bytes=0,
+        bytes_per_token=0,
     )
 
     return WorkerLayout(
-        info=info,
-        arena=model_arena_capacity(
-            model,
-            worker_config,
-            bindings=bindings,
-            state_buffers=state_buffers,
-            pipeline_depth=depth,
-            completion_payload_bytes=completion_payload_bytes,
-            num_blocks=0,
-            request_pool_size=slots,
-            num_latent_pages=0,
-            latent_page_units=0,
-            latent_width=0,
-            max_latent_feature_bytes=0,
-            max_vision_feature_bytes=0,
-            bytes_per_token=0,
-        ),
+        # The rank's host executor owns the host lane, so its advertised
+        # capacity is the one the arena reserved.
+        info=replace(info, host_lane_capacity=int(arena.host_lane_inflight)),
+        arena=arena,
         input_config=None,
         fixed_device_bytes=(),
         physical_buffer_pool_bytes=slots

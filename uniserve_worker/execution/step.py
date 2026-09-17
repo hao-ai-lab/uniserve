@@ -43,8 +43,8 @@ if TYPE_CHECKING:
     from uniserve_worker.media.mux import MediaMux
     from uniserve_worker.runtime.block_tables import BlockTables
     from uniserve_worker.runtime.cache_manager import CacheManager
-    from uniserve_worker.runtime.cpu import CpuPool
     from uniserve_worker.runtime.decode_state import DecodeState
+    from uniserve_worker.runtime.host_lane import HostLane
     from uniserve_worker.runtime.latent_pool import LatentPool
     from uniserve_worker.runtime.request import RequestPool
     from uniserve_worker.runtime.tensor_store import TensorStore
@@ -73,7 +73,7 @@ def execute_batch(
     *,
     propagate_errors: bool = False,
     kv_cache: CacheManager | None,
-    cpu_tasks: CpuPool,
+    host_tasks: HostLane,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
@@ -130,7 +130,7 @@ def execute_batch(
                     completion_group,
                     predicate_values,
                     kv_cache=kv_cache,
-                    cpu_tasks=cpu_tasks,
+                    host_tasks=host_tasks,
                     tensor_store=tensor_store,
                     worker_info=worker_info,
                     latent_pool=latent_pool,

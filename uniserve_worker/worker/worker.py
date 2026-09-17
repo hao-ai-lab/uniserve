@@ -79,8 +79,8 @@ from ..protocol.transfer import WorkerEndpoint
 from ..runtime.block_tables import BlockTables
 from ..runtime.buffer_pool import BufferPool
 from ..runtime.cache_manager import CacheManager
-from ..runtime.cpu import CpuPool
 from ..runtime.decode_state import DecodeState
+from ..runtime.host_lane import HostLane
 from ..runtime.latent_pool import LatentPool
 from ..runtime.request import RequestPool
 from ..runtime.tensor_store import TensorStore
@@ -578,11 +578,11 @@ class Worker:
             )
             startup.callback(self.tensor_store.close)
 
-            self.cpu_tasks = CpuPool(
-                capacity=int(arena.cpu_tasks),
-                workers=min(4, int(arena.cpu_tasks)),
+            self.host_tasks = HostLane(
+                max_inflight=int(arena.host_lane_inflight),
+                workers=min(4, int(arena.host_lane_inflight)),
             )
-            startup.callback(self.cpu_tasks.close)
+            startup.callback(self.host_tasks.close)
 
             transfer_byte_capacity = int(arena.transfer_bytes)
             if (
@@ -1463,7 +1463,7 @@ class Worker:
             state,
             propagate_errors=state.propagate_errors,
             kv_cache=self.kv_cache,
-            cpu_tasks=self.cpu_tasks,
+            host_tasks=self.host_tasks,
             tensor_store=self.tensor_store,
             worker_info=self.info,
             latent_pool=self.latent_pool,
@@ -1958,7 +1958,7 @@ class Worker:
         actions.append(self._release_service_runs)
 
         # Submitted jobs retain their mux sessions until host work has finished.
-        actions.append(self.cpu_tasks.close)
+        actions.append(self.host_tasks.close)
         if self.media_mux is not None:
             actions.append(self.media_mux.close)
 
@@ -2019,7 +2019,7 @@ class Worker:
                 self.tensor_store,
                 self.buffer_pool,
                 self.device_events,
-                self.cpu_tasks,
+                self.host_tasks,
                 self.transports,
                 self.publication_transports,
             )
@@ -2062,7 +2062,7 @@ class Worker:
         """
         self._completion_wake = wake
         self.device_events.set_completion_wake(wake_on_stream)
-        self.cpu_tasks.set_completion_wake(wake)
+        self.host_tasks.set_completion_wake(wake)
 
         for transport in self.transports.values():
             transport.set_completion_wake(wake)

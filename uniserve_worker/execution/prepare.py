@@ -69,7 +69,7 @@ if TYPE_CHECKING:
     from uniserve_worker.media.mux import MediaMux
     from uniserve_worker.runtime.block_tables import BlockTables
     from uniserve_worker.runtime.cache_manager import CacheManager
-    from uniserve_worker.runtime.cpu import CpuPool
+    from uniserve_worker.runtime.host_lane import HostLane
     from uniserve_worker.runtime.latent_pool import LatentPool
     from uniserve_worker.runtime.request import RequestPool
     from uniserve_worker.runtime.tensor_store import TensorStore
@@ -751,7 +751,7 @@ def _open_group(
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
-    cpu_tasks: CpuPool,
+    host_tasks: HostLane,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
@@ -863,10 +863,10 @@ def _open_group(
         try:
             # Bind physical state in dependency order before decoding
             # transferred inputs.
-            _reserve_cpu_tasks(
+            _reserve_host_tasks(
                 active_operations,
                 completion_group,
-                cpu_tasks=cpu_tasks,
+                host_tasks=host_tasks,
                 worker_info=worker_info,
                 media_buffers=media_buffers,
                 postprocessor=model_runner.video_postprocessor,
@@ -985,12 +985,12 @@ def _completion_words(scheduled: tuple[ScheduledRequest, ...]) -> int:
     )
 
 
-def _reserve_cpu_tasks(
+def _reserve_host_tasks(
     scheduled: tuple[ScheduledRequest, ...],
     completion_group: int,
     *,
     state: BatchState,
-    cpu_tasks: CpuPool,
+    host_tasks: HostLane,
     worker_info: WorkerInfo,
     media_buffers: MediaBuffers | None,
     postprocessor: VideoPostprocessor | None,
@@ -1023,7 +1023,7 @@ def _reserve_cpu_tasks(
                 "materialization repeats its CPU task identity"
             )
 
-        reservation = cpu_tasks.reserve()
+        reservation = host_tasks.reserve()
         try:
             if operation.kind in {
                 PipelineStage.VIDEO_ENCODING,

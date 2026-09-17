@@ -9,11 +9,11 @@ import torch
 from uniserve.runtime import EventPool
 from uniserve_worker.execution.output import OutputPool
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.runtime.cpu import CpuPool
+from uniserve_worker.runtime.host_lane import HostLane
 
 
 def test_submitted_task_retains_capacity_until_actual_completion() -> None:
-    pool = CpuPool(capacity=1, workers=1)
+    pool = HostLane(capacity=1, workers=1)
     entered, finish = Event(), Event()
 
     def work() -> int:
@@ -42,7 +42,7 @@ def test_submitted_task_retains_capacity_until_actual_completion() -> None:
 def test_close_cancels_unsubmitted_dependency_and_drains_submitted_work() -> (
     None
 ):
-    pool = CpuPool(capacity=2, workers=1)
+    pool = HostLane(capacity=2, workers=1)
     predecessor = pool.reserve()
     successor = pool.reserve().configure(
         lambda: 2, dependencies=(predecessor.promise,)
@@ -61,7 +61,7 @@ def test_close_cancels_unsubmitted_dependency_and_drains_submitted_work() -> (
 
 
 def test_ready_does_not_submit_and_failure_releases_capacity() -> None:
-    pool = CpuPool(capacity=1, workers=1)
+    pool = HostLane(capacity=1, workers=1)
     called = Event()
 
     def fail() -> None:
@@ -81,7 +81,7 @@ def test_ready_does_not_submit_and_failure_releases_capacity() -> None:
 
 
 def test_cancel_preserves_input_until_its_producer_completes() -> None:
-    pool = CpuPool(capacity=1, workers=1)
+    pool = HostLane(capacity=1, workers=1)
     copied: Future[None] = Future()
     released = Event()
     task = pool.reserve().configure(
@@ -104,7 +104,7 @@ def test_cancel_preserves_input_until_its_producer_completes() -> None:
 def test_abandoned_output_remains_readable_until_cpu_reader_finishes() -> None:
     events = EventPool()
     outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
-    pool = CpuPool(capacity=1, workers=1)
+    pool = HostLane(capacity=1, workers=1)
     entered, finish = Event(), Event()
     buffer = outputs.acquire(1, token_capacity=8)
     capture = buffer.capture_bytes(torch.tensor([3, 5, 7], dtype=torch.uint8))
