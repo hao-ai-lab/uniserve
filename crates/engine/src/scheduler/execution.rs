@@ -265,10 +265,11 @@ impl Scheduler {
             if self.pending_batches.len() >= self.info.queue_depth.max(1) as usize {
                 break;
             }
-            let Some(batch) = self.schedule_batch() else {
+            let batches = self.schedule_batches();
+            if batches.is_empty() {
                 break;
-            };
-            self.pending_submissions.push_back(batch);
+            }
+            self.pending_submissions.extend(batches);
             progressed = true;
             self.dispatch_submissions(&mut blocked_workers);
             if self.fatal {
@@ -298,24 +299,30 @@ impl Scheduler {
         progressed
     }
 
-    /// Selects one batch under the shared queue budget and existing family fairness.
-    fn schedule_batch(&mut self) -> Option<ExecutionBatch> {
-        if self.prefer_media
-            && let Some(batch) = self.prepare_media_batch()
-        {
-            self.prefer_media = false;
-            return Some(batch);
-        }
-        let Some(batch) = self.assemble() else {
-            if self.fatal {
-                return None;
+    /// Selects the batches of one pass under the shared queue budget and
+    /// existing family fairness. A pass yields one batch per `(kind,
+    /// component)` it selected, each a single numerical call.
+    fn schedule_batches(&mut self) -> Vec<ExecutionBatch> {
+        if self.prefer_media {
+            let batches = self.prepare_media_batches();
+            if !batches.is_empty() {
+                self.prefer_media = false;
+                return batches;
             }
-            let batch = self.prepare_media_batch()?;
-            self.prefer_media = false;
-            return Some(batch);
-        };
+        }
+        let batches = self.assemble();
+        if batches.is_empty() {
+            if self.fatal {
+                return Vec::new();
+            }
+            let batches = self.prepare_media_batches();
+            if !batches.is_empty() {
+                self.prefer_media = false;
+            }
+            return batches;
+        }
         self.prefer_media = true;
-        Some(batch)
+        batches
     }
 
     /// Allocates a request-scoped product reference for a terminal media result.
@@ -607,7 +614,7 @@ impl Scheduler {
 
     /// Select eligible media requests and prepare their bounded computation inputs. Independent
     /// audio and video branches carry Tensor edges, without a state predecessor.
-    pub(super) fn prepare_media_batch(&mut self) -> Option<ExecutionBatch> {
+    pub(super) fn prepare_media_batches(&mut self) -> Vec<ExecutionBatch> {
         // Every resident request offers the complete set of calls whose inputs
         // are produced, in arrival order, and each one is dispatched when the
         // lanes it occupies have free capacity. There is no per-kind rule and
@@ -633,19 +640,35 @@ impl Scheduler {
             }
         }
         if candidates.is_empty() {
-            return None;
+            return Vec::new();
         }
 
-        let batch_id = self.next_batch_id();
         let submit_at = Instant::now();
         let candidate_requests = candidates.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
         let commands = self.take_commands(|command| {
             candidate_requests.contains(&command.request_key().request_id)
                 || matches!(command, BatchCommand::Finish { .. })
         });
+        // One batch per stage: a batch is one numerical call on one component,
+        // so a rank receives it as a single homogeneous group. Stages keep the
+        // order in which their first call was selected.
+        let mut stage_order = Vec::new();
+        let mut stage_batches: HashMap<
+            PipelineStage,
+            (u64, Vec<(ScheduledRequest, RequestPlacement)>),
+        > = HashMap::new();
+        for (_, stage) in &candidates {
+            if !stage_batches.contains_key(stage) {
+                stage_batches.insert(*stage, (self.next_batch_id(), Vec::new()));
+                stage_order.push(*stage);
+            }
+        }
         let mut admissions = Vec::new();
-        let mut logical_ops = Vec::with_capacity(candidates.len());
-        for (request_index, (id, stage)) in candidates.into_iter().enumerate() {
+        for (id, stage) in candidates.into_iter() {
+            let (batch_id, request_index) = {
+                let (batch_id, operations) = &stage_batches[&stage];
+                (*batch_id, operations.len())
+            };
             let op_id = ComputationId::new(
                 batch_id,
                 u32::try_from(request_index).expect("selected request count fits the IPC index"),
@@ -899,16 +922,46 @@ impl Scheduler {
                 submit_at,
                 0,
             );
-            logical_ops.push((operation, placement));
+            stage_batches
+                .get_mut(&stage)
+                .expect("stage batch exists")
+                .1
+                .push((operation, placement));
         }
-        let mut batch_commands = admissions
-            .into_iter()
-            .map(|request| BatchCommand::Start { request })
-            .collect::<Vec<_>>();
-        batch_commands.extend(commands);
-        let batch = ExecutionBatch::new(batch_id, logical_ops, batch_commands, Vec::new());
-        self.register_pending_batch(&batch, submit_at);
-        Some(batch)
+
+        // A request's admission travels with the first call that uses it, and
+        // the round's retirements travel with the last batch so no earlier call
+        // loses the state it still reads.
+        let mut starts: HashMap<PipelineStage, Vec<BatchCommand>> = HashMap::new();
+        for request in admissions {
+            let owner = stage_order
+                .iter()
+                .copied()
+                .find(|stage| {
+                    stage_batches[stage]
+                        .1
+                        .iter()
+                        .any(|(operation, _)| operation.request_key == request.request_key)
+                })
+                .expect("admitted request has a selected call");
+            starts
+                .entry(owner)
+                .or_default()
+                .push(BatchCommand::Start { request });
+        }
+        let last = *stage_order.last().expect("selected calls name a stage");
+        let mut batches = Vec::with_capacity(stage_order.len());
+        for stage in stage_order {
+            let (batch_id, operations) = stage_batches.remove(&stage).expect("stage batch exists");
+            let mut batch_commands = starts.remove(&stage).unwrap_or_default();
+            if stage == last {
+                batch_commands.extend(commands.iter().cloned());
+            }
+            let batch = ExecutionBatch::new(batch_id, operations, batch_commands, Vec::new());
+            self.register_pending_batch(&batch, submit_at);
+            batches.push(batch);
+        }
+        batches
     }
 
     /// Publishes cache state and drained cache events to scheduler counters.

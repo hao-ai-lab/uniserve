@@ -417,6 +417,39 @@ fn decoder_requires_one_concrete_computation() {
 }
 
 #[test]
+fn every_computation_variant_round_trips_in_its_own_batch() {
+    let batches = comprehensive_batches();
+    assert_eq!(batches.len(), Computation::ALL.len());
+    for batch in batches {
+        assert_eq!(execute_round_trip(batch.clone()), batch);
+    }
+}
+
+#[test]
+fn a_batch_carries_one_computation_through_one_entry() {
+    let decode = operation_for(
+        Computation::Forward(ForwardMode::Decode),
+        ComputationId::new(1, 0),
+    );
+    let prefill = operation_for(
+        Computation::Forward(ForwardMode::Prefill),
+        ComputationId::new(1, 1),
+    );
+    let mixed = batch_with_operations(1, Vec::new(), vec![decode.clone(), prefill]);
+    let error = mixed.validate().unwrap_err().to_string();
+    assert!(error.contains("mixes computations or entries"), "{error}");
+
+    let mut other_entry = operation_for(
+        Computation::Forward(ForwardMode::Decode),
+        ComputationId::new(1, 1),
+    );
+    other_entry.entry = "encoder".into();
+    let split = batch_with_operations(1, Vec::new(), vec![decode, other_entry]);
+    let error = split.validate().unwrap_err().to_string();
+    assert!(error.contains("mixes computations or entries"), "{error}");
+}
+
+#[test]
 fn decoder_requires_every_call_to_state_its_coordinates() {
     use crate::schema::uniserve::ipc as fbs;
 
@@ -1275,14 +1308,38 @@ fn full_image() -> ImageParams {
     }
 }
 
-/// One operation per closed `Computation` variant, each on its own request key so the
-/// batch admits them together; the first two keys also carry admissions.
-fn comprehensive_batch() -> ScheduleBatch {
+/// One batch per closed `Computation` variant, each carrying that variant's
+/// single call on its own request key; the first two keys also carry
+/// admissions. A batch is one numerical call on one component, so the variants
+/// cannot share one.
+fn comprehensive_batches() -> Vec<ScheduleBatch> {
+    let ar_params = NewRequest::new(
+        key_for_request(100),
+        100,
+        Some(ArRequestParams {
+            sampling: full_sampling(),
+            negative_token_ids: vec![100, 101],
+            finish_token_ids: vec![2, 7],
+            initial_position: 128,
+        }),
+        None,
+    )
+    .unwrap();
+    let umm_params = NewRequest::new(
+        key_for_request(110),
+        110,
+        None,
+        Some(UmmRequestParams {
+            image: full_image(),
+        }),
+    )
+    .unwrap();
     let variants = Computation::ALL;
-    let mut operations = Vec::new();
+    let mut batches = Vec::new();
     for (index, kind) in variants.into_iter().enumerate() {
+        let mut operations = Vec::new();
         let key = key_for_request(100 + index as u64);
-        let op_id = ComputationId::new(11, index as u32);
+        let op_id = ComputationId::new(42 + index as u64, 0);
         let predecessor = if index % 2 == 0 {
             ComputationId::new(0, 0)
         } else {
@@ -1363,39 +1420,38 @@ fn comprehensive_batch() -> ScheduleBatch {
                 },
             }),
         });
+        // The admissions ride on the first batch of the pass, as a scheduler
+        // places them ahead of the calls that use them.
+        let admissions = if index == 0 {
+            operations[0].input_token_ids = vec![7, 8, 9, 10];
+            vec![ar_params.clone(), umm_params.clone()]
+        } else {
+            Vec::new()
+        };
+        batches.push(batch_with_operations(
+            42 + index as u64,
+            admissions,
+            operations,
+        ));
     }
-    let ar_params = NewRequest::new(
-        key_for_request(100),
-        100,
-        Some(ArRequestParams {
-            sampling: full_sampling(),
-            negative_token_ids: vec![100, 101],
-            finish_token_ids: vec![2, 7],
-            initial_position: 128,
-        }),
-        None,
-    )
-    .unwrap();
-    let umm_params = NewRequest::new(
-        key_for_request(110),
-        110,
-        None,
-        Some(UmmRequestParams {
-            image: full_image(),
-        }),
-    )
-    .unwrap();
-    let commands = vec![BatchCommand::Finish {
+    // The pass's retirement rides on its last batch, so no earlier call loses
+    // state it still reads.
+    let last = batches.pop().expect("one batch per computation variant");
+    batches.push(last.with_commands(vec![BatchCommand::Finish {
         request_key: key_for_request(201),
         retained_buffers: Vec::new(),
-    }];
-    operations[0].input_token_ids = vec![7, 8, 9, 10];
-    batch_with_operations(42, vec![ar_params, umm_params], operations).with_commands(commands)
+    }]));
+    batches
 }
 
 /// One fixture per `RequestKind`, plus call-id coverage on the submit frame.
 fn request_fixtures() -> Vec<WorkerRequest> {
-    let mut submit = WorkerRequest::submit(comprehensive_batch());
+    let mut submit = WorkerRequest::submit(
+        comprehensive_batches()
+            .into_iter()
+            .next()
+            .expect("one batch per computation variant"),
+    );
     submit.set_call_id(Some(91));
     vec![
         WorkerRequest::info(),
