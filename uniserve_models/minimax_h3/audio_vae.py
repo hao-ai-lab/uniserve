@@ -11,7 +11,62 @@ from torch import nn
 
 from uniserve.nn.vae.decoder import LatentDecoder
 
-__all__ = ["Config", "Model"]
+__all__ = ["Config", "Model", "receptive_field"]
+
+
+# The BigVGAN alias-free activations resample by this ratio with this filter
+# length, fixed by the decoder module rather than by the checkpoint.
+_ACTIVATION_RATIO = 2
+_ACTIVATION_KERNEL = 12
+
+
+def receptive_field(config: Config) -> int:
+    """Latent frames of context one decoded sample depends on, per side.
+
+    Walks the decoder in forward order accumulating how far one dependency
+    spreads. ``rate`` is the number of output samples one latent frame has
+    become at the current point, so a span of ``n`` samples there is ``n /
+    rate`` latent frames. The residual branches of a stage run in parallel on
+    the same input, so a stage contributes the widest of them rather than their
+    sum. The result is the context a media unit must carry on each side for its
+    decode to equal the whole-track decode of the same samples; it rounds up
+    and may exceed the exact field, which costs context and never correctness.
+    """
+    spread, rate = 0.0, 1.0
+
+    def convolution(kernel: int, dilation: int = 1) -> float:
+        return (kernel - 1) * dilation / rate
+
+    def activation() -> float:
+        # An alias-free activation upsamples through a sinc filter, applies
+        # SnakeBeta, and low-passes back down at the same ratio.
+        upsampled = (
+            math.ceil(_ACTIVATION_KERNEL / _ACTIVATION_RATIO) - 1
+        ) / rate
+        return upsampled + (_ACTIVATION_KERNEL - 1) / (rate * _ACTIVATION_RATIO)
+
+    spread += convolution(7)
+    for upsample, kernel in zip(
+        config.decoder_rates, config.decoder_kernel_sizes, strict=True
+    ):
+        spread += (math.ceil(kernel / upsample) - 1) / rate
+        rate *= upsample
+        widest = 0.0
+        for block_kernel, dilations in zip(
+            config.resblock_kernel_sizes,
+            config.resblock_dilation_sizes,
+            strict=True,
+        ):
+            branch = 0.0
+            for dilation in dilations:
+                branch += activation() + convolution(block_kernel, dilation)
+                branch += activation() + convolution(block_kernel)
+            widest = max(widest, branch)
+        spread += widest
+    spread += activation() + convolution(7)
+
+    # The spread covers both sides of one dependency, so one side is half.
+    return math.ceil(spread / 2.0)
 
 
 @dataclass(frozen=True, slots=True)

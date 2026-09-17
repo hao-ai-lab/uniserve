@@ -180,7 +180,7 @@ impl WorkerConfig {
             (
                 "video_decoder".into(),
                 ComponentConfig {
-                    ranks,
+                    ranks: ranks.clone(),
                     parallel_config: ParallelConfig::default(),
                     distribution: Some(ComponentDistribution::TemporalUnits),
                     units_per_rank: 1,
@@ -188,7 +188,12 @@ impl WorkerConfig {
             ),
             (
                 "audio_decoder".into(),
-                ComponentConfig::parallel(vec![0], ParallelConfig::default()),
+                ComponentConfig {
+                    ranks: ranks.clone(),
+                    parallel_config: ParallelConfig::default(),
+                    distribution: Some(ComponentDistribution::TemporalUnits),
+                    units_per_rank: 1,
+                },
             ),
             (
                 "output".into(),

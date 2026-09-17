@@ -1535,14 +1535,23 @@ impl ScheduleBatch {
                 ),
                 "decode params does not name media decode work"
             );
+            // Audio reconstruction divides the sample timeline into as many
+            // media units as its component has ranks, and one round covers
+            // them all, so an audio decode range starts at the first unit.
             ensure_valid!(
                 !matches!(
                     operation.code,
-                    Computation::Pipeline(
-                        PipelineStage::AudioDecoding | PipelineStage::AudioEncoding
-                    )
+                    Computation::Pipeline(PipelineStage::AudioDecoding)
+                ) || (params.cursor == 0 && params.max_units >= 1),
+                "audio decode range must start at the first media unit"
+            );
+            // Audio encoding consumes the assembled track as one host call.
+            ensure_valid!(
+                !matches!(
+                    operation.code,
+                    Computation::Pipeline(PipelineStage::AudioEncoding)
                 ) || (params.cursor == 0 && params.max_units == 1),
-                "audio decode range must address its single sample stream"
+                "audio encode range must address its single sample stream"
             );
         }
 

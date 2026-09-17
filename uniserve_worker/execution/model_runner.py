@@ -758,12 +758,33 @@ class ModelRunner:
 
         # Protocol decoder outputs contain the units in this scheduled call;
         # numerical decoder layouts describe their complete temporal timeline.
-        units = layout.shape[0] if decode is None else decode.max_units
+        # A video layout leads with its unit axis, so the total is read from
+        # it; an audio layout leads with samples, so the placement states how
+        # many media units its ranks reconstruct together.
+        audio = isinstance(call.module, AudioDecoder)
+        total = (
+            len(binding.config.ranks) * max(1, binding.config.units_per_rank)
+            if audio
+            else layout.shape[0]
+        )
+        units = total if decode is None else decode.max_units
         position = binding.config.ranks.index(binding.process_group.global_rank)
         start = position * binding.config.units_per_rank
         count = min(binding.config.units_per_rank, units - start)
         if count < 1:
             return None
+
+        if audio:
+            # An audio media unit is a span of the sample timeline, so this
+            # rank publishes the samples of the units it reconstructs.
+            spans = call.module.unit_samples(layout.shape[0], units)
+            return replace(
+                layout,
+                local_slice=(
+                    slice(spans[start].start, spans[start + count - 1].stop),
+                    *layout.local_slice[1:],
+                ),
+            )
 
         return replace(
             layout,
