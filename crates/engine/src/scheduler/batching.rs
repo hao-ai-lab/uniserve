@@ -194,16 +194,6 @@ impl Scheduler {
             {
                 continue;
             }
-            // Diagnostic: a denoise step and text rows in one forward take the
-            // packed route, which costs more than running each on its own. When
-            // the flag is set a flow op only opens an empty batch, and the loop
-            // below closes the batch as soon as one is placed.
-            if self.flow_exclusive_batch
-                && next_type == Some(Computation::Pipeline(PipelineStage::Denoising))
-                && !(batch.requests.is_empty() && mixed_ops.is_empty())
-            {
-                continue;
-            }
             // Build one operation when its exact resident resources fit.
             let op_budget = if mixed_prefill {
                 budget.min(mixed_left)
@@ -269,7 +259,6 @@ impl Scheduler {
                         .push(BatchCommand::Start { request: admission });
                     admitted = true;
                 }
-                let placed_denoise = op.code == Computation::Pipeline(PipelineStage::Denoising);
                 self.prepare_generation_operation(
                     op,
                     reserved_buffers,
@@ -280,9 +269,6 @@ impl Scheduler {
                 )?;
                 if mixed_prefill {
                     mixed_ops.push(batch.requests.pop().expect("prepared computation exists"));
-                }
-                if self.flow_exclusive_batch && placed_denoise {
-                    budget = 0;
                 }
             }
         }

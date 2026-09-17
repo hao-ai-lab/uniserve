@@ -200,8 +200,6 @@ impl Scheduler {
         // Environment switches select scheduling behavior without changing the
         // model capabilities.
         let denoise_step_burst = denoise_step_burst_from_env();
-        let flow_exclusive_batch = env::var(FLOW_EXCLUSIVE_BATCH_ENV)
-            .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "TRUE"));
 
         let mut trace_sink = crate::scheduler::bench_trace::RuntimeTraceSink::from_env();
         if let Some(sink) = trace_sink.as_mut() {
@@ -285,7 +283,6 @@ impl Scheduler {
             output: output::OutputSender::default(),
             prefer_media: true,
             config,
-            flow_exclusive_batch,
             fatal: false,
             trace_sink,
             peak_ops_in_batch: 0,
