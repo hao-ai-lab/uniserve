@@ -15,6 +15,7 @@ from uniserve_worker.execution.rows import ForwardRow
 from uniserve_worker.protocol.identity import ComputationId, RequestKey
 from uniserve_worker.protocol.operation import (
     Bounds,
+    CallCoordinates,
     PipelineStage,
     ScheduledRequest,
 )
@@ -127,6 +128,7 @@ def _run(runner, manager, rows):
             RequestKey(1, index, 0),
             ComputationId(1, 0),
             None,
+            CallCoordinates(),
             row.forward_mode,
             Bounds(),
         )

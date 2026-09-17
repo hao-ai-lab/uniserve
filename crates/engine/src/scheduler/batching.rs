@@ -225,6 +225,9 @@ impl Scheduler {
                 let request_index = u32::try_from(batch.requests.len() + mixed_ops.len())
                     .expect("selected request count fits the IPC index");
                 op.op_id = ComputationId::new(batch.id, request_index);
+                op.coordinates = self
+                    .projected_coordinates(id)
+                    .expect("scheduled request retains its running state");
                 let finish_token_ids = self
                     .running
                     .get(&id)

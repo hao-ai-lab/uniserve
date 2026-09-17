@@ -30,6 +30,12 @@ fn ar_decode_operation() -> ScheduledRequest {
     let kind = Computation::Forward(ForwardMode::Decode);
     ScheduledRequest {
         token_input: None,
+        coordinates: CallCoordinates {
+            logical_position: 7,
+            kv_visible_len: 5,
+            kv_computed_len: 6,
+            flow_step: 0,
+        },
 
         token_output: Some(output_product(ComputationId::new(11, 0))),
         vision_input: None,
@@ -70,6 +76,7 @@ fn ar_decode_operation() -> ScheduledRequest {
 
 fn operation_for(kind: Computation, op_id: ComputationId) -> ScheduledRequest {
     ScheduledRequest {
+        coordinates: CallCoordinates::default(),
         token_input: None,
 
         token_output: None,
@@ -410,6 +417,49 @@ fn decoder_requires_one_concrete_computation() {
 }
 
 #[test]
+fn decoder_requires_every_call_to_state_its_coordinates() {
+    use crate::schema::uniserve::ipc as fbs;
+
+    let run = batch_with_operations(1, Vec::new(), vec![ar_decode_operation()]);
+    let bytes = encode_request(&WorkerRequest::submit(run)).unwrap();
+    let frame = fbs::root_as_worker_request(&bytes).unwrap().unpack();
+
+    let mut absent = frame.clone();
+    absent.run.as_mut().unwrap().operations.as_mut().unwrap()[0].coordinates = None;
+    let mut builder = flatbuffers::FlatBufferBuilder::new();
+    let root = absent.pack(&mut builder);
+    builder.finish(root, None);
+    let error = decode_request(builder.finished_data()).unwrap_err();
+    assert!(
+        error.to_string().contains("operation.coordinates"),
+        "absent coordinates must be named: {error}"
+    );
+
+    let mut uncontained = frame;
+    uncontained
+        .run
+        .as_mut()
+        .unwrap()
+        .operations
+        .as_mut()
+        .unwrap()[0]
+        .coordinates
+        .as_mut()
+        .unwrap()
+        .kv_computed_len = 1;
+    let mut builder = flatbuffers::FlatBufferBuilder::new();
+    let root = uncontained.pack(&mut builder);
+    builder.finish(root, None);
+    let error = decode_request(builder.finished_data()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("visible KV beyond the computed extent"),
+        "uncontained KV extents must be named: {error}"
+    );
+}
+
+#[test]
 fn solver_parameters_round_trip_with_request_or_paged_storage() {
     let operation = operation_for(
         Computation::Pipeline(PipelineStage::Denoising),
@@ -442,6 +492,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
     .enumerate()
     {
         let operation = ScheduledRequest {
+            coordinates: CallCoordinates::default(),
             token_input: None,
 
             token_output: None,
@@ -1238,6 +1289,7 @@ fn comprehensive_batch() -> ScheduleBatch {
             ComputationId::new(9, 0)
         };
         operations.push(ScheduledRequest {
+            coordinates: CallCoordinates::default(),
             token_input: None,
 
             token_output: None,

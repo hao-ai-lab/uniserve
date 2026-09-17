@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
+use uniserve_worker_ipc::{CallCoordinates, ForwardMode, PipelineStage, TransferMode};
 
 use anyhow::Context as _;
 use uniserve_core::{
@@ -425,6 +425,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             ..value.clone()
         };
         let publish = ScheduledRequest {
+            coordinates: CallCoordinates::default(),
             token_input: Some(value.clone()),
 
             token_output: Some(publication.clone()),
@@ -467,6 +468,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             ..publication.clone()
         };
         let consume = ScheduledRequest {
+            coordinates: CallCoordinates::default(),
             token_input: Some(publication.clone()),
 
             token_output: Some(copy.clone()),
@@ -610,6 +612,12 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     resumed.operations[0].predicate = Some(verifier.operations[0].token_output.clone().unwrap());
     // Five initialized cache positions are the verifier's maximum. Its first
     // rejected draft must leave only three positions visible to the next decode.
+    resumed.operations[0].coordinates = CallCoordinates {
+        logical_position: 3,
+        kv_visible_len: 3,
+        kv_computed_len: 5,
+        flow_step: 0,
+    };
     let commands = first.commands.clone();
     let requests = [first, successor, verifier, resumed]
         .into_iter()
@@ -729,6 +737,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
     // The stub has no text conditioning computation. Registration succeeds,
     // then the operation reports its actual execution error without a product.
     let produce = ScheduledRequest {
+        coordinates: CallCoordinates::default(),
         token_input: None,
 
         token_output: None,
@@ -771,6 +780,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         ..value.clone()
     };
     let consume = ScheduledRequest {
+        coordinates: CallCoordinates::default(),
         token_input: None,
 
         token_output: None,
@@ -1344,6 +1354,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         generation: 2,
     };
     let operation = ScheduledRequest {
+        coordinates: coordinates_after(&first.results[0].output),
         token_input: None,
 
         token_output: None,
@@ -1678,6 +1689,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         ..input.clone()
     };
     let operation = ScheduledRequest {
+        coordinates: CallCoordinates::default(),
         token_input: None,
 
         token_output: None,
@@ -1877,6 +1889,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         ..source.clone()
     };
     let publish = ScheduledRequest {
+        coordinates: coordinates_after(&produced.results[0].output),
         token_input: Some(source.clone()),
 
         token_output: Some(publication.clone()),
@@ -1921,6 +1934,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         ..publication.clone()
     };
     let transfer = ScheduledRequest {
+        coordinates: CallCoordinates::default(),
         token_input: Some(publication.clone()),
 
         token_output: Some(copy.clone()),
@@ -1972,6 +1986,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         },
     };
     let encode = ScheduledRequest {
+        coordinates: CallCoordinates::default(),
         token_input: None,
 
         token_output: None,
@@ -2089,6 +2104,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     // The retained product's separate lifetime survives request slot reuse.
     let next = text_admission(59, 1, 5)?;
     let retained = ScheduledRequest {
+        coordinates: CallCoordinates::default(),
         token_input: None,
         token_output: None,
         vision_input: Some(feature.clone()),
@@ -2465,6 +2481,17 @@ fn text_admission(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The coordinates a call entering after `output` executes at, as the engine
+/// derives them from the completion it observed.
+fn coordinates_after(output: &uniserve_worker_ipc::RequestOutput) -> CallCoordinates {
+    CallCoordinates {
+        logical_position: output.position,
+        kv_visible_len: output.kv_visible_len,
+        kv_computed_len: output.kv_computed_len,
+        flow_step: output.num_completed_steps,
+    }
+}
+
 fn token_batch(
     run_id: u64,
     collective_seq: u64,
@@ -2487,6 +2514,14 @@ fn token_batch(
         shape_bound: ShapeBound::default(),
     };
     let operation = ScheduledRequest {
+        // These requests hold no cached prefix and no image positions, so the
+        // logical sequence and the initialized cache advance together.
+        coordinates: CallCoordinates {
+            logical_position: prefix_length,
+            kv_visible_len: prefix_length,
+            kv_computed_len: prefix_length,
+            flow_step: 0,
+        },
         token_input: None,
 
         token_output: Some(token_output),

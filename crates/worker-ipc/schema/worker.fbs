@@ -205,10 +205,21 @@ table SamplingState {
   force_finish:bool;
 }
 
+// The coordinates a call carries so a rank does not derive them from the
+// operations that preceded it. The engine holds the request state they come
+// from; the rank asserts its own ledger agrees.
+table CallCoordinates {
+  logical_position:uint;
+  kv_visible_len:uint;
+  kv_computed_len:uint;
+  flow_step:uint;
+}
+
 table ScheduledRequest {
   request_key:RequestKey;
   op_id:ComputationId;
   predecessor:ComputationId;
+  coordinates:CallCoordinates;
   entry:string (required);
   code:Computation (required);
   max_tokens:uint;

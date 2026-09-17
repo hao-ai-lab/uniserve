@@ -8,14 +8,15 @@ use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RequestId, SamplingParam
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
     ArRequestParams, ArtifactHandle, BatchCommand, BatchOutput, BlockTable, Bounds,
-    BufferAllocation, BufferId, CachePageAllocation, Computation, ComputationId, DType,
-    DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, ErrorOperationIdentity,
-    FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats, KvCacheInfo, KvTransfer,
-    LatentParams, Locator, MediaOutput, NewRequest, OpStatus, PipelineStage, RegistrationAck,
-    RequestKey, RequestKind, RequestOutput, ResponseKind, Rng, SamplingState, ScheduleBatch,
-    ScheduledRequest, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
-    TransferHandle, TransferMode, TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerInfo,
-    WorkerRequest, WorkerResponse, WorkerResponseError,
+    BufferAllocation, BufferId, CachePageAllocation, CallCoordinates, Computation, ComputationId,
+    DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode,
+    ErrorOperationIdentity, FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats,
+    KvCacheInfo, KvTransfer, LatentParams, Locator, MediaOutput, NewRequest, OpStatus,
+    PipelineStage, RegistrationAck, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
+    SamplingState, ScheduleBatch, ScheduledRequest, ShapeBound, TensorPublication, TensorRef,
+    TensorTransfer, TimingCounters, TransferHandle, TransferMode, TransferTransport,
+    UmmRequestParams, WorkerEndpoint, WorkerInfo, WorkerRequest, WorkerResponse,
+    WorkerResponseError,
 };
 
 /// Result type returned by FlatBuffers codec operations.
@@ -502,11 +503,34 @@ fn buffer_allocation_from_table(
     })
 }
 
+/// Reads the coordinates a call states. Every call states them, so absence is a
+/// malformed frame rather than an origin default.
+fn coordinates_from_table(table: Option<fbs::CallCoordinates<'_>>) -> CodecResult<CallCoordinates> {
+    let value = table.context("operation.coordinates")?;
+    Ok(CallCoordinates {
+        logical_position: value.logical_position(),
+        kv_visible_len: value.kv_visible_len(),
+        kv_computed_len: value.kv_computed_len(),
+        flow_step: value.flow_step(),
+    })
+}
+
+/// Writes the coordinates a call states.
+fn coordinates_to_fb(value: CallCoordinates) -> fbs::CallCoordinatesT {
+    fbs::CallCoordinatesT {
+        logical_position: value.logical_position,
+        kv_visible_len: value.kv_visible_len,
+        kv_computed_len: value.kv_computed_len,
+        flow_step: value.flow_step,
+    }
+}
+
 /// Decodes one computation and its entry binding.
 fn operation_from_table(operation: fbs::ScheduledRequest<'_>) -> CodecResult<ScheduledRequest> {
     let operation = ScheduledRequest {
         request_key: request_key_from_table(operation.request_key(), "operation.request_key")?,
         op_id: computation_id_from_fb(operation.op_id())?,
+        coordinates: coordinates_from_table(operation.coordinates())?,
         input_image: operation.input_image().map(std::sync::Arc::from),
         kv_input: operation.kv_input().map(buffer_id_from_table).transpose()?,
         kv_output: operation
@@ -1416,6 +1440,7 @@ fn operation_to_fb(operation: &ScheduledRequest) -> CodecResult<fbs::ScheduledRe
     Ok(fbs::ScheduledRequestT {
         request_key: Some(Box::new(request_key_to_fb(operation.request_key))),
         op_id: Some(computation_id_to_fb(operation.op_id)),
+        coordinates: Some(Box::new(coordinates_to_fb(operation.coordinates))),
         input_token_ids: Some(operation.input_token_ids.clone()),
         input_image: operation.input_image.as_deref().map(str::to_owned),
         kv_input: operation.kv_input.map(buffer_id_to_fb).map(Box::new),

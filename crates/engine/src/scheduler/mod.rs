@@ -161,6 +161,10 @@ pub(crate) struct RequestState {
     /// Model position and accepted physical KV length differ for image inputs.
     logical_position: u32,
     kv_visible_len: u32,
+    /// Accepted tokens whose KV is initialized. A verifier initializes its
+    /// rejected drafts, so this exceeds the visible extent until the next
+    /// forward makes exactly what it initializes visible.
+    kv_computed_len: u32,
     next_token: u32,
     num_generated_tokens: usize,
     image_id: u32,
