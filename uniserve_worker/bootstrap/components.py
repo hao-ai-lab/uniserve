@@ -234,6 +234,18 @@ def validate_components(
                     "video decoding requires temporal_units with one native "
                     "unit per rank"
                 )
+        elif any(isinstance(call.module, AudioDecoder) for call in calls):
+            # An audio media unit is a span of the latent timeline rather than
+            # a native window, so a rank may reconstruct several of them, but
+            # the division is still by media unit.
+            if component.distribution not in (None, "temporal_units") or (
+                component.distribution is not None
+                and component.units_per_rank < 1
+            ):
+                raise unsupported_setup(
+                    "audio decoding distributes by temporal_units with at "
+                    "least one media unit per rank"
+                )
         elif component.distribution is not None:
             raise unsupported_setup(
                 f"entry {name!r} requires model-parallel membership"
