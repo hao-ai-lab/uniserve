@@ -857,7 +857,11 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
     from uniserve.sampling import SamplingParams
 
     from ..protocol.batch import GenerationParams, NewRequest
-    from ..protocol.operation import Bounds, ScheduledRequest
+    from ..protocol.operation import (
+        Bounds,
+        CallCoordinates,
+        ScheduledRequest,
+    )
 
     variants = requests.worker.info.supported_ops
     if ForwardMode.PREFILL not in variants:
@@ -889,6 +893,21 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
     }
 
     next_product_generation = 1
+    # Warmup owns this synthetic sequence, so it states the position each call
+    # enters at and advances it by the tokens that call adds. Every warmup
+    # request starts at the origin and holds no cached prefix, so its visible
+    # and computed KV extents both track the logical position.
+    positions = dict.fromkeys(request_ids, 0)
+
+    def coordinates_for(sid: int, tokens: int) -> CallCoordinates:
+        """State the entry coordinates of one call and advance the sequence."""
+        position = positions[sid]
+        positions[sid] = position + tokens
+        return CallCoordinates(
+            logical_position=position,
+            kv_visible_len=position,
+            kv_computed_len=position,
+        )
 
     def prompt_op(
         sid: int,
@@ -906,6 +925,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
             request_key=keys[sid],
             op_id=op_id,
             predecessor=predecessor,
+            coordinates=coordinates_for(sid, len(tokens)),
             kind=ForwardMode.PREFILL,
             bounds=Bounds(max_tokens=max(1, len(tokens))),
             input_token_ids=tokens,
@@ -931,6 +951,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
             request_key=keys[sid],
             op_id=op_id,
             predecessor=predecessor.op_id,
+            coordinates=coordinates_for(sid, 1),
             kind=ForwardMode.DECODE,
             bounds=Bounds(max_tokens=1),
             token_output=outputs,
@@ -995,6 +1016,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
     from ..protocol.batch import NewRequest
     from ..protocol.operation import (
         Bounds,
+        CallCoordinates,
         DrawLayout,
         Rng,
         ScheduledRequest,
@@ -1083,6 +1105,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                     request_key=key,
                     op_id=op_id,
                     predecessor=root,
+                    coordinates=CallCoordinates(),
                     kind=TransferMode.KV_PUBLISH,
                     bounds=Bounds(max_transfer_bytes=1 << 20),
                     kv_output=conditioning,
@@ -1139,6 +1162,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                     request_key=key,
                     op_id=op_id,
                     predecessor=root,
+                    coordinates=CallCoordinates(),
                     kind=PipelineStage.LATENT_PREPARATION,
                     bounds=Bounds(
                         max_tokens=1,
@@ -1168,8 +1192,9 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         current_latents = tuple(initial_latents)
         flow_predecessors = dict(zip(request_ids, transitions, strict=True))
 
-        # Chain two denoise quanta so back-to-back execution shapes run.
-        for _ in range(2):
+        # Chain two denoise quanta so back-to-back execution shapes run. Each
+        # quantum covers one step, so it enters at the step its index names.
+        for quantum in range(2):
             outputs: list[TensorRef] = []
             flows: list[ScheduledRequest] = []
             for request_id, key, conditioning, current in zip(
@@ -1191,6 +1216,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                         request_key=key,
                         op_id=op_id,
                         predecessor=flow_predecessors[request_id].op_id,
+                        coordinates=CallCoordinates(flow_step=quantum),
                         kind=PipelineStage.DENOISING,
                         bounds=Bounds(
                             max_tokens=1,

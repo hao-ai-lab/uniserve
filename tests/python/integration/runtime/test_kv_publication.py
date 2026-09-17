@@ -34,6 +34,7 @@ from uniserve_worker.protocol.batch import (
 from uniserve_worker.protocol.identity import BufferId, ComputationId
 from uniserve_worker.protocol.operation import (
     Bounds,
+    CallCoordinates,
     ForwardMode,
     OpStatus,
     ScheduledRequest,
@@ -284,6 +285,7 @@ def _installation_operation(
             request_key=admission.request_key,
             op_id=op_id,
             predecessor=predecessor,
+            coordinates=CallCoordinates(),
             kind=TransferMode.KV_INSTALL,
             bounds=Bounds(max_transfer_bytes=1 << 20),
             kv_input=source,
@@ -335,6 +337,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         request_key=closure_template.request_key,
         op_id=closure_template.op_id,
         predecessor=closure_template.predecessor,
+        coordinates=closure_template.coordinates,
         kind=closure_template.kind,
         bounds=closure_template.bounds,
         inputs=closure_template.inputs,
@@ -393,6 +396,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         request_key=suffix_template.request_key,
         op_id=suffix_template.op_id,
         predecessor=suffix_template.predecessor,
+        coordinates=suffix_template.coordinates,
         kind=suffix_template.kind,
         bounds=suffix_template.bounds,
         inputs=suffix_template.inputs,

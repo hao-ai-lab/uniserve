@@ -11,7 +11,9 @@ consumed by token work.
 from __future__ import annotations
 
 import time
+import weakref
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from uniserve.sampling import SamplingParams
@@ -39,6 +41,7 @@ from uniserve_worker.protocol.identity import (
 )
 from uniserve_worker.protocol.operation import (
     Bounds,
+    CallCoordinates,
     DrawLayout,
     ForwardMode,
     ImageParams,
@@ -67,6 +70,20 @@ _OP_KV_LENGTHS: dict[
     tuple[RequestKey, ComputationId], tuple[int, int, int, int]
 ] = {}
 _OP_KV_RESULTS: dict[tuple[RequestKey, ComputationId], int] = {}
+# Where each request currently stands on one worker, which its next call
+# states. This is the engine's role: it projects a call's effect when it
+# submits the call and replaces the projection with the rank's report when the
+# call completes. The record is per worker, because a request admitted into two
+# workers stands at two independent positions.
+_LEDGERS: weakref.WeakKeyDictionary[object, _Ledger]
+_LEDGERS = weakref.WeakKeyDictionary()
+# What each built call is projected to leave behind. A call whose result only a
+# device selection resolves records nothing and waits for its completion.
+_CALL_PROJECTIONS: dict[tuple[RequestKey, ComputationId], tuple[str, int]] = {}
+# Runs this fixture assembled. A worker also submits its own warmup batches,
+# which state their own coordinates and are left untouched. Each entry holds
+# its run so the identity stays valid until the run is submitted.
+_FIXTURE_RUNS: dict[int, ScheduleBatch] = {}
 _LATENT_STEPS: dict[TensorRef, int] = {}
 _MAX_CFG_BRANCHES = 1
 _REQUEST_POOL_SIZE = 1
@@ -108,11 +125,27 @@ def _reset_request(rk: RequestKey) -> None:
     _ALTERNATIVE_SLOTS.pop(rk, None)
     _ALTERNATIVE_PAGES.pop(rk, None)
     _IMAGE_PARAMS.pop(rk, None)
-    for table in (_PAGES_TO_ZERO, _OP_KV_LENGTHS, _OP_KV_RESULTS):
+    for ledger in _LEDGERS.values():
+        ledger.current.pop(rk, None)
+        for identity in tuple(
+            identity for identity in ledger.submitted if identity[0] == rk
+        ):
+            ledger.submitted.pop(identity, None)
+    for table in (
+        _PAGES_TO_ZERO,
+        _OP_KV_LENGTHS,
+        _OP_KV_RESULTS,
+        _CALL_PROJECTIONS,
+    ):
         for identity in tuple(
             identity for identity in table if identity[0] == rk
         ):
             table.pop(identity, None)
+    _FIXTURE_RUNS.clear()
+    for ledger in _LEDGERS.values():
+        ledger.detached.difference_update(
+            identity for identity in tuple(ledger.detached) if identity[0] == rk
+        )
     for product in tuple(
         product for product in _LATENT_STEPS if product.request_key == rk
     ):
@@ -158,6 +191,54 @@ def _latent_params(operation: ScheduledRequest) -> LatentParams:
 
 def _parent_kv_length(rk: RequestKey, predecessor: ComputationId) -> int:
     return _OP_KV_RESULTS.get((rk, predecessor), 0)
+
+
+def _ledger(worker: object) -> _Ledger:
+    """The per-worker record of where each of its requests stands."""
+    return _LEDGERS.setdefault(worker, _Ledger())
+
+
+def _project_tokens(rk: RequestKey, op_id: ComputationId, tokens: int) -> None:
+    """Record a call that adds `tokens` positions and initializes them."""
+    _CALL_PROJECTIONS[(rk, op_id)] = ("tokens", int(tokens))
+
+
+def _project_flow_step(
+    rk: RequestKey, op_id: ComputationId, flow_step: int
+) -> None:
+    """Record that a call leaves the request's trajectory at `flow_step`."""
+    _CALL_PROJECTIONS[(rk, op_id)] = ("flow_step", int(flow_step))
+
+
+class _Ledger:
+    """One worker's view of its own requests.
+
+    Holds where each request stands and where each submitted call entered from.
+    """
+
+    def __init__(self) -> None:
+        self.current: dict[RequestKey, CallCoordinates] = {}
+        self.submitted: dict[
+            tuple[RequestKey, ComputationId], CallCoordinates
+        ] = {}
+        # Calls with no request predecessor carry no coordinates, so their
+        # completions report none and leave the request where it was.
+        self.detached: set[tuple[RequestKey, ComputationId]] = set()
+
+
+def _projected(
+    entry: CallCoordinates, rule: tuple[str, int]
+) -> CallCoordinates:
+    """Apply one call's recorded effect to where the request stands."""
+    name, value = rule
+    if name == "flow_step":
+        return replace(entry, flow_step=value)
+    return CallCoordinates(
+        logical_position=entry.logical_position + value,
+        kv_visible_len=entry.kv_visible_len + value,
+        kv_computed_len=entry.kv_visible_len + value,
+        flow_step=entry.flow_step,
+    )
 
 
 def record_kv_result(
@@ -240,6 +321,85 @@ def _alternative_pages(rk: RequestKey, tokens: int) -> tuple[int, ...]:
         )
     _ALTERNATIVE_PAGES[rk] = selected
     return selected
+
+
+def stamp_batch(worker: object, batch: ScheduleBatch) -> ScheduleBatch:
+    """State every call's coordinates from the worker's request ledger.
+
+    The engine stamps coordinates when it assembles a batch, from the request
+    state it owns, and carries its own projection forward so the next call it
+    submits states where this one leaves off.
+    """
+    _FIXTURE_RUNS.pop(id(batch), None)
+    ledger = _ledger(worker).current
+    submitted = _ledger(worker).submitted
+    detached = _ledger(worker).detached
+    for command in batch.commands:
+        admission = getattr(command, "request", None)
+        if admission is None or not isinstance(admission, NewRequest):
+            continue
+        # Admission starts the request at the position it was admitted with.
+        prefix = (
+            0
+            if admission.generation is None
+            else int(admission.generation.initial_position)
+        )
+        ledger[admission.request_key] = CallCoordinates(
+            logical_position=prefix,
+            kv_visible_len=prefix,
+            kv_computed_len=prefix,
+        )
+    stamped = []
+    for operation in batch.operations:
+        identity = (operation.request_key, operation.op_id)
+        entry = ledger.get(operation.request_key, CallCoordinates())
+        submitted[identity] = entry
+        if operation.predecessor is None:
+            detached.add(identity)
+        rule = _CALL_PROJECTIONS.get(identity)
+        if rule is not None:
+            ledger[operation.request_key] = _projected(entry, rule)
+        stamped.append(replace(operation, coordinates=entry))
+    return replace(batch, operations=tuple(stamped))
+
+
+def submitted_run(worker: object, batch: ScheduleBatch) -> ScheduleBatch:
+    """State the coordinates of a run this fixture assembled.
+
+    A worker also submits its own warmup batches, which state their own
+    coordinates and pass through untouched.
+    """
+    if _FIXTURE_RUNS.get(id(batch)) is None:
+        return batch
+    return stamp_batch(worker, batch)
+
+
+def observe_completions(worker: object, report: BatchOutput) -> None:
+    """Advance each request to where its accepted calls left it.
+
+    A rank chains a call from the operation it last accepted, and this is the
+    same record the engine keeps from the completions it observes. A failed
+    operation accepts nothing, so it leaves the request where it was.
+    """
+    ledger = _ledger(worker).current
+    submitted = _ledger(worker).submitted
+    detached = _ledger(worker).detached
+    for record in report.completions:
+        if (record.request_key, record.op_id) in detached:
+            continue
+        if record.status is OpStatus.ERROR:
+            # A failed call accepts nothing, so the request stays where it
+            # entered that call.
+            entry = submitted.get((record.request_key, record.op_id))
+            if entry is not None:
+                ledger[record.request_key] = entry
+            continue
+        ledger[record.request_key] = CallCoordinates(
+            logical_position=record.position,
+            kv_visible_len=record.kv_visible_len,
+            kv_computed_len=record.kv_computed_len,
+            flow_step=record.num_completed_steps,
+        )
 
 
 def execution_run(
@@ -396,7 +556,7 @@ def execution_run(
     for allocation in new_cache_pages:
         identity = (allocation.request_pool_idx, allocation.group_id)
         allocations.setdefault(identity, set()).update(allocation.page_ids)
-    return ScheduleBatch(
+    run = ScheduleBatch(
         batch_id=operations[0].op_id.batch_id if operations else int(run_id),
         run_id=int(run_id),
         collective_seq=int(run_id) * 1024 + 2,
@@ -434,6 +594,8 @@ def execution_run(
         commands=tuple(Start(request) for request in admissions)
         + tuple(commands),
     )
+    _FIXTURE_RUNS[id(run)] = run
+    return run
 
 
 def request_key(request_id: int, request_epoch: int = 1) -> RequestKey:
@@ -499,6 +661,7 @@ def finalized_report(worker: Worker, state: BatchState) -> BatchOutput:
         output = worker.poll(state)
         if output is not None:
             fragments.append(output)
+            observe_completions(worker, output)
             if output.done:
                 return BatchOutput.combine(fragments)
         if time.monotonic() >= deadline:
@@ -561,6 +724,7 @@ def token_operation(
     )
     if mode is not ForwardMode.VERIFY:
         _OP_KV_RESULTS[(rk, op_id)] = prefix_length + input_length
+        _project_tokens(rk, op_id, input_length)
 
     token_output = TensorRef(
         request_key=rk,
@@ -574,6 +738,7 @@ def token_operation(
         request_key=rk,
         op_id=op_id,
         predecessor=predecessor,
+        coordinates=CallCoordinates(),
         kind=mode,
         bounds=Bounds(
             max_tokens=max(1, len(tokens)),
@@ -618,6 +783,7 @@ def encode_operation(
         request_key=rk,
         op_id=op_id,
         predecessor=predecessor,
+        coordinates=CallCoordinates(),
         kind=mode,
         bounds=Bounds(max_tokens=64, max_latent_bytes=8_192),
         input_image=image_base64,
@@ -656,10 +822,12 @@ def diffusion_prepare_operation(
         shape_bound=ShapeBound(),
     )
     _record_existing_kv(rk, op_id, predecessor, 0)
+    _project_flow_step(rk, op_id, 0)
     operation = ScheduledRequest(
         request_key=rk,
         op_id=op_id,
         predecessor=predecessor,
+        coordinates=CallCoordinates(),
         kind=PipelineStage.LATENT_PREPARATION,
         bounds=Bounds(max_tokens=1, max_latent_bytes=latent.max_bytes),
         kv_input=conditioning,
@@ -693,10 +861,12 @@ def diffusion_step_operation(
         shape_bound=latent.shape_bound,
     )
     _record_existing_kv(rk, op_id, predecessor, 0)
+    _project_flow_step(rk, op_id, _LATENT_STEPS.get(latent, 0) + int(steps))
     operation = ScheduledRequest(
         request_key=rk,
         op_id=op_id,
         predecessor=predecessor,
+        coordinates=CallCoordinates(),
         kind=PipelineStage.DENOISING,
         bounds=Bounds(max_tokens=int(steps), max_latent_bytes=output.max_bytes),
         kv_input=conditioning,
@@ -724,6 +894,7 @@ def kv_publication_operation(
         request_key=rk,
         op_id=op_id,
         predecessor=predecessor,
+        coordinates=CallCoordinates(),
         kind=TransferMode.KV_PUBLISH,
         bounds=Bounds(max_transfer_bytes=1 << 20),
         kv_output=product,
@@ -749,10 +920,12 @@ def diffusion_finalize_operation(
             dtype=DType.BF16,
             shape_bound=ShapeBound((DeviceDim(3 * 16 * 16),)),
         )
+    _project_flow_step(rk, op_id, 0)
     return ScheduledRequest(
         request_key=rk,
         op_id=op_id,
         predecessor=predecessor,
+        coordinates=CallCoordinates(),
         kind=PipelineStage.IMAGE_DECODING,
         bounds=Bounds(
             max_latent_bytes=(3 * 16 * 16 * 2 if feedback_source else 0),
@@ -795,6 +968,7 @@ def visual_state_operation(
         request_key=rk,
         op_id=op_id,
         predecessor=predecessor,
+        coordinates=CallCoordinates(),
         kind=ForwardMode.PREFILL,
         bounds=Bounds(max_tokens=max_tokens),
         vision_input=feature,
@@ -815,6 +989,9 @@ __all__ = [
     "umm_params",
     "diffusion_finalize_operation",
     "kv_publication_operation",
+    "observe_completions",
+    "stamp_batch",
+    "submitted_run",
     "record_kv_result",
     "request_key",
     "root_parent",

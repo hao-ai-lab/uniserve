@@ -64,6 +64,7 @@ struct NativeRequestTypes {
     static_dim: Py<PyAny>,
     device_dim: Py<PyAny>,
     bounds: Py<PyAny>,
+    call_coordinates: Py<PyAny>,
     rng: Py<PyAny>,
     sampling_state: Py<PyAny>,
     block_table: Py<PyAny>,
@@ -123,6 +124,7 @@ impl NativeRequestTypes {
             static_dim: class(&tensor, "StaticDim")?,
             device_dim: class(&tensor, "DeviceDim")?,
             bounds: class(&operation, "Bounds")?,
+            call_coordinates: class(&operation, "CallCoordinates")?,
             rng: class(&operation, "Rng")?,
             sampling_state: class(&operation, "SamplingState")?,
             block_table: class(&batch, "BlockTable")?,
@@ -303,6 +305,12 @@ impl<'py> NativeRequestConversion<'py> {
             .predecessor
             .map(|id| self.computation_id(id))
             .transpose()?;
+        let coordinates = self.types.call_coordinates.bind(self.py).call1((
+            operation.coordinates.logical_position,
+            operation.coordinates.kv_visible_len,
+            operation.coordinates.kv_computed_len,
+            operation.coordinates.flow_step,
+        ))?;
         let bounds = self.types.bounds.bind(self.py).call1((
             operation.bounds.max_tokens,
             operation.bounds.max_kv_pages,
@@ -370,6 +378,7 @@ impl<'py> NativeRequestConversion<'py> {
                 request_key.into_any(),
                 self.computation_id(operation.op_id)?,
                 predecessor.into_pyobject(py)?.into_any(),
+                coordinates.into_any(),
                 self.types.kind(py, operation.code),
                 bounds.into_any(),
                 operation.entry.clone().into_pyobject(py)?.into_any(),
@@ -1909,6 +1918,7 @@ mod tests {
             shape_bound: ShapeBound::default(),
         };
         let operation = ScheduledRequest {
+            coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
 
             token_output: Some(token),
@@ -1981,6 +1991,7 @@ mod tests {
         )
         .unwrap();
         let media_operation = ScheduledRequest {
+            coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
 
             token_output: None,
@@ -2030,6 +2041,7 @@ mod tests {
             generation: 3,
         };
         let kv_operation = ScheduledRequest {
+            coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
             token_output: None,
             vision_input: None,

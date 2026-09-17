@@ -15,6 +15,7 @@ from tests.python.fixtures.depth_one import (
     finalized_report,
     record_completion,
     root_parent,
+    stamp_batch,
     token_operation,
     visual_state_operation,
 )
@@ -25,6 +26,7 @@ from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import Finish, Free, NewRequest
 from uniserve_worker.protocol.identity import ComputationId, RequestKey
 from uniserve_worker.protocol.operation import (
+    CallCoordinates,
     ErrorCode,
     ForwardMode,
     OpStatus,
@@ -79,6 +81,7 @@ def test_independent_product_work_preserves_request_progress(
             request_key=admission.request_key,
             op_id=ComputationId(2, 0),
             predecessor=None,
+            coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
             bounds=Bounds(max_transfer_bytes=source.max_bytes),
             inputs=(source,),
@@ -617,3 +620,58 @@ def test_finish_of_uninstalled_admission_allows_slot_reuse() -> None:
     )
     assert report.completions[0].status is OpStatus.OK
     worker.close()
+
+
+def test_a_call_whose_coordinates_contradict_the_request_is_refused() -> None:
+    """The engine states where a call executes; a rank refuses a wrong claim.
+
+    A rank must not silently execute a call at a position other than the one
+    it was scheduled for, so a claim that disagrees with the request's own
+    progress ends the call rather than producing a token at the wrong place.
+    """
+    from dataclasses import replace
+
+    worker = execution_worker()
+    admission = ar_params(91, block_ids=(0,))
+    prefill = token_operation(
+        admission.request_key,
+        op_id=ComputationId(1, 0),
+        predecessor=root_parent(admission),
+        mode=ForwardMode.PREFILL,
+        tokens=(7, 8),
+    )
+    with worker:
+        primed = finalized_report(
+            worker,
+            worker.submit(
+                execution_run(
+                    run_id=1,
+                    admissions=(admission,),
+                    operations=(prefill,),
+                )
+            ),
+        )
+        assert primed.completions[0].status is OpStatus.OK
+        assert primed.completions[0].position == 2
+        observation = record_completion(prefill, primed)
+
+        decode = token_operation(
+            admission.request_key,
+            op_id=ComputationId(2, 0),
+            predecessor=observation.op_id,
+            mode=ForwardMode.DECODE,
+            tokens=(primed.completions[0].committed_tokens[0],),
+        )
+        run = stamp_batch(worker, execution_run(run_id=2, operations=(decode,)))
+        # The prompt left the request at position two; claim the origin.
+        contradicted = replace(
+            run,
+            operations=(
+                replace(run.operations[0], coordinates=CallCoordinates()),
+            ),
+        )
+        refused = finalized_report(worker, worker.submit(contradicted))
+
+        assert refused.completions[0].status is OpStatus.ERROR
+        assert refused.completions[0].error_code is ErrorCode.INVALID_OPERATION
+        assert refused.completions[0].committed_tokens == ()

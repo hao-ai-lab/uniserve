@@ -5,7 +5,7 @@
 //! request and operation identities before mutating runtime state.
 
 use super::*;
-use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
+use uniserve_worker_ipc::{CallCoordinates, ForwardMode, PipelineStage, TransferMode};
 
 impl Scheduler {
     /// Enumerates loaded entries that can execute the requested operation.
@@ -799,6 +799,12 @@ impl Scheduler {
                 .then(|| self.media_completion_product(request_key, op_id));
             let mut operation = ScheduledRequest {
                 token_input: None,
+                coordinates: CallCoordinates {
+                    logical_position: 0,
+                    kv_visible_len: 0,
+                    kv_computed_len: 0,
+                    flow_step: step,
+                },
 
                 token_output: None,
                 vision_input: None,
@@ -1057,6 +1063,35 @@ impl Scheduler {
             }
         }
         Some((logical, physical))
+    }
+
+    /// The coordinates the next call of this request executes at.
+    ///
+    /// Each value is the request's own accepted state projected through the
+    /// calls already submitted, so a rank receives them instead of chaining
+    /// them from its predecessors. A submitted forward collapses the computed
+    /// extent onto the visible one: it initializes exactly the tokens it makes
+    /// visible. Only a verifier leaves the two apart, and its acceptance
+    /// resolves before any successor is scheduled.
+    pub(super) fn projected_coordinates(&self, id: RequestId) -> Option<CallCoordinates> {
+        let state = self.running.get(&id)?;
+        let (logical_position, kv_visible_len) = self.scheduled_token_lengths(id)?;
+        let forward_submitted = self
+            .pending_operations
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .any(|pending| matches!(pending.operation.code, Computation::Forward(_)));
+        Some(CallCoordinates {
+            logical_position,
+            kv_visible_len,
+            kv_computed_len: if forward_submitted {
+                kv_visible_len
+            } else {
+                state.kv_computed_len.max(kv_visible_len)
+            },
+            flow_step: u32::from(self.num_scheduled_denoise_steps(id)?),
+        })
     }
 
     /// Last denoising step covered by submitted intervals, without accepting them.
