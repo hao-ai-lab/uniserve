@@ -47,7 +47,7 @@ from uniserve_worker.runtime.tensor_store import FeatureMetadata, TensorStore
 def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() -> (  # noqa: E501
     None
 ):
-    pool = HostLane(capacity=2, workers=1)
+    pool = HostLane(max_inflight=2, workers=1)
     predecessor = pool.reserve().configure(
         lambda: 1, profile_name="output.predecessor"
     )
