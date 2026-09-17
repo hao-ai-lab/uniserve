@@ -383,10 +383,13 @@ impl PyServer {
 
     /// Converts and publishes one response for the active request.
     fn respond(&self, py: Python<'_>, response: &Bound<'_, PyAny>) -> PyResult<()> {
-        // Every response kind decodes through the schema the protocol derives,
-        // so one representation defines the boundary in both directions.
-        let resp: WorkerResponse = depythonize(response)
-            .map_err(|err| PyErr::new::<PyValueError, _>(format!("invalid response: {err}")))?;
+        // Per-step result reports use the typed extractor. Every other response
+        // kind is decoded by the schema-derived converter.
+        let resp: WorkerResponse = match convert::try_completion_response_from_py(response)? {
+            Some(resp) => resp,
+            None => depythonize(response)
+                .map_err(|err| PyErr::new::<PyValueError, _>(format!("invalid response: {err}")))?,
+        };
         // Publish without the GIL while retaining exclusive endpoint ownership.
         let mut endpoint = self.take_endpoint()?;
         let (endpoint, result) = py.detach(move || {

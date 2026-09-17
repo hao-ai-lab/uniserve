@@ -7,20 +7,23 @@
 //! [`execute_request_to_py`] builds worker input, while
 //! [`try_completion_response_from_py`] strictly decodes worker output.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyString};
-use uniserve_core::{ImageParams, SamplingParams};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
+use uniserve_core::{ImageParams, SamplingParams, TokenLogprob};
 use uniserve_worker_ipc::{
-    ArRequestParams, BatchCommand, BlockTable, BufferAllocation, BufferId, CachePageAllocation,
-    Computation, ComputationId, DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout,
-    FeatureKind, KvTransfer, LatentParams, Locator, NewRequest, RequestKey, RequestKind,
-    ScheduleBatch, ScheduledRequest, ShapeBound, TensorPublication, TensorRef, TensorTransfer,
-    TransferHandle, TransferTransport, UmmRequestParams, WorkerRequest,
+    ArRequestParams, ArtifactHandle, BatchCommand, BatchOutput, BlockTable, BufferAllocation,
+    BufferId, CachePageAllocation, Computation, ComputationId, DType, DecodeRange,
+    DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, ErrorOperationIdentity, FeatureKind,
+    FinishFlags, ForwardStats, KvTransfer, LatentParams, Locator, MediaOutput, NewRequest,
+    OpStatus, RegistrationAck, RequestKey, RequestKind, RequestOutput, ScheduleBatch,
+    ScheduledRequest, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
+    TransferHandle, TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerRequest,
+    WorkerResponse, WorkerResponseError,
 };
 
 #[cfg(test)]
@@ -1151,6 +1154,515 @@ fn dtype_py<'py>(py: Python<'py>, dtype: DType) -> &'py Bound<'py, PyString> {
     }
 }
 
+/// Decodes a Python result or error mapping with strict field typing.
+///
+/// Returns `None` for response kinds handled by the schema-derived converter.
+pub(crate) fn try_completion_response_from_py(
+    response: &Bound<'_, PyAny>,
+) -> PyResult<Option<WorkerResponse>> {
+    let py = response.py();
+    let dict = response
+        .cast::<PyDict>()
+        .map_err(|_| PyValueError::new_err("worker response must be a mapping"))?;
+    let kind = dict
+        .get_item(intern!(py, "kind"))?
+        .ok_or_else(|| PyValueError::new_err("worker response has no kind"))?;
+    let kind = kind
+        .extract::<String>()
+        .map_err(|_| PyValueError::new_err("worker response kind must be a string"))?;
+    match kind.as_str() {
+        "result" => decode_completion_response_from_py(response)
+            .map(Some)
+            .ok_or_else(|| PyValueError::new_err("invalid result worker response")),
+        "error" => decode_error_response_from_py(response)
+            .map(Some)
+            .ok_or_else(|| PyValueError::new_err("invalid error worker response")),
+        _ => Ok(None),
+    }
+}
+
+/// Decodes a result response and rejects fields reserved for other variants.
+fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerResponse> {
+    let py = response.py();
+    let dict = response.cast::<PyDict>().ok()?;
+    let kind = str_field(dict, intern!(py, "kind"))?;
+    if kind.to_str().ok()? != "result" {
+        return None;
+    }
+    // Result reports reserve worker information for its response kind.
+    for key in [intern!(py, "info")] {
+        if !absent_or_none(dict, key)? {
+            return None;
+        }
+    }
+    // Decode the required result before checking that no error fields carry data.
+    let report = run_result_from_py(&get(dict, intern!(py, "result"))?)?;
+    let identities = error_operations_from_py(dict)?;
+    if !identities.is_empty()
+        || opt_string(dict, intern!(py, "message"))?.is_some()
+        || opt_string(dict, intern!(py, "code"))?.is_some()
+        || opt_bool(dict, intern!(py, "fatal"))?.is_some()
+        || opt_string(dict, intern!(py, "phase"))?.is_some()
+        || opt_string(dict, intern!(py, "route"))?.is_some()
+    {
+        return None;
+    }
+    Some(WorkerResponse::Result {
+        call_id: opt_u64(dict, intern!(py, "call_id"))?,
+        result: report,
+    })
+}
+
+/// Decodes an error response and rejects success payloads.
+fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerResponse> {
+    let py = response.py();
+    let dict = response.cast::<PyDict>().ok()?;
+    if str_field(dict, intern!(py, "kind"))?.to_str().ok()? != "error" {
+        return None;
+    }
+    for key in [intern!(py, "info"), intern!(py, "result")] {
+        if !absent_or_none(dict, key)? {
+            return None;
+        }
+    }
+    let identities = error_operations_from_py(dict)?;
+    Some(WorkerResponse::Error {
+        call_id: opt_u64(dict, intern!(py, "call_id"))?,
+        error: WorkerResponseError {
+            message: string_of(&get(dict, intern!(py, "message"))?)?,
+            code: opt_string(dict, intern!(py, "code"))?,
+            fatal: bool_of(&get(dict, intern!(py, "fatal"))?)?,
+            phase: opt_string(dict, intern!(py, "phase"))?,
+            route: opt_string(dict, intern!(py, "route"))?,
+            operations: identities,
+        },
+    })
+}
+
+/// Decodes an ordered run result from its Python mapping.
+fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+
+    // Preserve completion and product order while converting owned records.
+    let completions = get(dict, intern!(py, "completions"))?;
+    let completions = completions.cast::<PyList>().ok()?;
+    let mut records = Vec::with_capacity(completions.len());
+    for item in completions.iter() {
+        records.push(completion_record_from_py(&item)?);
+    }
+    let products = get(dict, intern!(py, "products"))?;
+    let products = products.cast::<PyList>().ok()?;
+    let mut payloads = Vec::with_capacity(products.len());
+    for item in products.iter() {
+        payloads.push(tensor_publication_from_py(&item)?);
+    }
+    // Decode aggregate acknowledgements and optional instrumentation metadata.
+    let registration = get(dict, intern!(py, "registration"))?;
+    let registration = registration.cast::<PyDict>().ok()?;
+    let registration = RegistrationAck {
+        visible: bool_of(&get(registration, intern!(py, "visible"))?)?,
+    };
+    let forward_stats = match dict.get_item(intern!(py, "forward_stats")).ok()? {
+        None => None,
+        Some(value) if value.is_none() => None,
+        Some(value) => Some(forward_stats_from_py(&value)?),
+    };
+    Some(BatchOutput {
+        batch_id: u64_of(&get(dict, intern!(py, "batch_id"))?)?,
+        run_id: u64_of(&get(dict, intern!(py, "run_id"))?)?,
+        completions: records,
+        products: payloads,
+        registration,
+        worker_exec_us: opt_u64(dict, intern!(py, "worker_exec_us"))?,
+        forward_stats,
+        done: bool_of(&get(dict, intern!(py, "done"))?)?,
+    })
+}
+
+/// Decodes the complete set of worker forward-path counters.
+fn forward_stats_from_py(value: &Bound<'_, PyAny>) -> Option<ForwardStats> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+    Some(ForwardStats {
+        // Aggregate execution-mode counters.
+        mode_counts: u64_map(dict, intern!(py, "mode_counts"))?,
+        mode_tokens: u64_map(dict, intern!(py, "mode_tokens"))?,
+        mode_us: u64_map(dict, intern!(py, "mode_us"))?,
+        component_us: u64_map(dict, intern!(py, "component_us"))?,
+
+        // Attention backend activity.
+        attention_launches: u64_of(&get(dict, intern!(py, "attention_launches"))?)?,
+        attention_us: u64_of(&get(dict, intern!(py, "attention_us"))?)?,
+        attention_backend_counts: u64_map(dict, intern!(py, "attention_backend_counts"))?,
+
+        // CUDA graph lifecycle and padding behavior.
+        cuda_graph_captures: u64_of(&get(dict, intern!(py, "cuda_graph_captures"))?)?,
+        cuda_graph_replays: u64_of(&get(dict, intern!(py, "cuda_graph_replays"))?)?,
+        cuda_graph_misses: u64_of(&get(dict, intern!(py, "cuda_graph_misses"))?)?,
+        cuda_graph_fallbacks: u64_of(&get(dict, intern!(py, "cuda_graph_fallbacks"))?)?,
+        cuda_graph_unpadded_tokens: u64_of(&get(dict, intern!(py, "cuda_graph_unpadded_tokens"))?)?,
+        cuda_graph_padded_tokens: u64_of(&get(dict, intern!(py, "cuda_graph_padded_tokens"))?)?,
+        cuda_graph_runtime_mode_counts: u64_map(
+            dict,
+            intern!(py, "cuda_graph_runtime_mode_counts"),
+        )?,
+
+        // Decode relay cache effectiveness.
+        text_decode_token_relay_hits: u64_of(&get(
+            dict,
+            intern!(py, "text_decode_token_relay_hits"),
+        )?)?,
+        text_decode_token_relay_misses: u64_of(&get(
+            dict,
+            intern!(py, "text_decode_token_relay_misses"),
+        )?)?,
+        text_decode_position_relay_hits: u64_of(&get(
+            dict,
+            intern!(py, "text_decode_position_relay_hits"),
+        )?)?,
+        text_decode_position_relay_misses: u64_of(&get(
+            dict,
+            intern!(py, "text_decode_position_relay_misses"),
+        )?)?,
+
+        // FlashInfer planning activity.
+        flashinfer_decode_plan_calls: u64_of(&get(
+            dict,
+            intern!(py, "flashinfer_decode_plan_calls"),
+        )?)?,
+        flashinfer_decode_plan_reuses: u64_of(&get(
+            dict,
+            intern!(py, "flashinfer_decode_plan_reuses"),
+        )?)?,
+        flashinfer_decode_plan_rows: u64_of(&get(
+            dict,
+            intern!(py, "flashinfer_decode_plan_rows"),
+        )?)?,
+        flashinfer_decode_plan_indices: u64_of(&get(
+            dict,
+            intern!(py, "flashinfer_decode_plan_indices"),
+        )?)?,
+        flashinfer_decode_graph_plan_calls: u64_of(&get(
+            dict,
+            intern!(py, "flashinfer_decode_graph_plan_calls"),
+        )?)?,
+        flashinfer_decode_graph_plan_reuses: u64_of(&get(
+            dict,
+            intern!(py, "flashinfer_decode_graph_plan_reuses"),
+        )?)?,
+
+        // Speculative-verification outcomes.
+        spec_verify_rows: u64_of(&get(dict, intern!(py, "spec_verify_rows"))?)?,
+        spec_verify_draft_tokens: u64_of(&get(dict, intern!(py, "spec_verify_draft_tokens"))?)?,
+        spec_verify_accepted_tokens: u64_of(&get(
+            dict,
+            intern!(py, "spec_verify_accepted_tokens"),
+        )?)?,
+        spec_verify_rejected_tokens: u64_of(&get(
+            dict,
+            intern!(py, "spec_verify_rejected_tokens"),
+        )?)?,
+        spec_verify_committed_tokens: u64_of(&get(
+            dict,
+            intern!(py, "spec_verify_committed_tokens"),
+        )?)?,
+        spec_verify_path_counts: u64_map(dict, intern!(py, "spec_verify_path_counts"))?,
+    })
+}
+
+/// Reads ranked score arrays without an intermediate byte serialization.
+fn token_logprobs_from_py(value: &Bound<'_, PyAny>) -> Option<Vec<TokenLogprob>> {
+    value
+        .try_iter()
+        .ok()?
+        .map(|entry| {
+            let entry = entry.ok()?;
+            let dict = entry.cast::<PyDict>().ok()?;
+            let py = entry.py();
+            Some(TokenLogprob {
+                token_id: u32_of(&get(dict, intern!(py, "token_id"))?)?,
+                logprob: get(dict, intern!(py, "logprob"))?.extract::<f32>().ok()?,
+                rank: u32_of(&get(dict, intern!(py, "rank"))?)?,
+            })
+        })
+        .collect()
+}
+
+/// Decodes one completion with its accepted progress and output fields.
+fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+
+    // Decode terminal status and optional error classification before result
+    // data so invalid enum spellings fail the whole record.
+    let status = str_field(dict, intern!(py, "status"))?;
+    let status = match status.to_str().ok()? {
+        "ok" => OpStatus::Ok,
+        "predicated" => OpStatus::Predicated,
+        "error" => OpStatus::Error,
+        _ => return None,
+    };
+    let error_code = match get(dict, intern!(py, "error_code"))? {
+        value if value.is_none() => None,
+        value => Some(match value.cast::<PyString>().ok()?.to_str().ok()? {
+            "invalid_operation" => ErrorCode::InvalidOperation,
+            "resource_exhausted" => ErrorCode::ResourceExhausted,
+            "compute_error" => ErrorCode::ComputeError,
+            "cancelled" => ErrorCode::Cancelled,
+            "internal" => ErrorCode::Internal,
+            _ => return None,
+        }),
+    };
+
+    let flags = get(dict, intern!(py, "finish_flags"))?;
+    let flags = flags.cast::<PyDict>().ok()?;
+    let finish_flags = FinishFlags {
+        eos: bool_of(&get(flags, intern!(py, "eos"))?)?,
+        length: bool_of(&get(flags, intern!(py, "length"))?)?,
+        stop: bool_of(&get(flags, intern!(py, "stop"))?)?,
+    };
+    let timing = get(dict, intern!(py, "timing_counters"))?;
+    let timing = timing.cast::<PyDict>().ok()?;
+    let timing_counters = TimingCounters {
+        queued_us: u64_of(&get(timing, intern!(py, "queued_us"))?)?,
+        device_us: u64_of(&get(timing, intern!(py, "device_us"))?)?,
+        copy_us: u64_of(&get(timing, intern!(py, "copy_us"))?)?,
+        host_us: u64_of(&get(timing, intern!(py, "host_us"))?)?,
+    };
+
+    // Media metadata is optional, but a present handle must use the supported
+    // shared-memory transport and complete its nested value mapping.
+    let media_output = if absent_or_none(dict, intern!(py, "media_output"))? {
+        None
+    } else {
+        let output = get(dict, intern!(py, "media_output"))?;
+        let output = output.cast::<PyDict>().ok()?;
+        let handle = get(output, intern!(py, "handle"))?;
+        let handle = handle.cast::<PyDict>().ok()?;
+        if string_of(&get(handle, intern!(py, "transport"))?)? != "posix_shm" {
+            return None;
+        }
+        let value = get(handle, intern!(py, "value"))?;
+        let value = value.cast::<PyDict>().ok()?;
+        Some(MediaOutput {
+            handle: ArtifactHandle::PosixShm {
+                name: string_of(&get(value, intern!(py, "name"))?)?,
+            },
+            bytes: u64_of(&get(output, intern!(py, "bytes"))?)?,
+        })
+    };
+    Some(RequestOutput {
+        sampled_logprob: {
+            let value = get(dict, intern!(py, "sampled_logprob"))?;
+            if value.is_none() {
+                None
+            } else {
+                Some(value.extract::<f32>().ok()?)
+            }
+        },
+        top_logprobs: token_logprobs_from_py(&get(dict, intern!(py, "top_logprobs"))?)?,
+        prompt_logprobs: get(dict, intern!(py, "prompt_logprobs"))?
+            .try_iter()
+            .ok()?
+            .map(|position| token_logprobs_from_py(&position.ok()?))
+            .collect::<Option<Vec<_>>>()?,
+        request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
+        op_id: computation_id_from_py(&get(dict, intern!(py, "op_id"))?)?,
+        status,
+        product_generations: u32_vec(&get(dict, intern!(py, "product_generations"))?)?,
+        error_code,
+        timing_counters,
+        code: {
+            let name = string_of(&get(dict, intern!(py, "code"))?)?;
+            Computation::ALL
+                .into_iter()
+                .find(|code| code.as_str() == name)?
+        },
+        position: u32_of(&get(dict, intern!(py, "position"))?)?,
+        kv_visible_len: u32_of(&get(dict, intern!(py, "kv_visible_len"))?)?,
+        kv_computed_len: u32_of(&get(dict, intern!(py, "kv_computed_len"))?)?,
+        num_completed_steps: u32_of(&get(dict, intern!(py, "num_completed_steps"))?)?,
+        committed_tokens: u32_vec(&get(dict, intern!(py, "committed_tokens"))?)?,
+        finish_flags,
+        media_output,
+        kv_output: if absent_or_none(dict, intern!(py, "kv_output"))? {
+            None
+        } else {
+            Some(kv_transfer_from_py(&get(dict, intern!(py, "kv_output"))?)?)
+        },
+    })
+}
+
+/// Decodes a tensor publication and its declared reference.
+fn tensor_publication_from_py(value: &Bound<'_, PyAny>) -> Option<TensorPublication> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+
+    let transfer = get(dict, intern!(py, "value"))?;
+    let transfer = transfer.cast::<PyDict>().ok()?;
+    let kind = str_field(transfer, intern!(py, "kind"))?;
+    let payload = get(transfer, intern!(py, "value"))?;
+    let payload = payload.cast::<PyDict>().ok()?;
+
+    let value = match kind.to_str().ok()? {
+        "encoder" => TransferHandle::Encoder {
+            height: u32_of(&get(payload, intern!(py, "height"))?)?,
+            width: u32_of(&get(payload, intern!(py, "width"))?)?,
+            payload_kind: feature_kind_from_py(&get(payload, intern!(py, "payload_kind"))?)?,
+            tensor: tensor_transfer_from_py(&get(payload, intern!(py, "tensor"))?)?,
+        },
+        "device_product" => TransferHandle::DeviceProduct {
+            height: u32_of(&get(payload, intern!(py, "height"))?)?,
+            width: u32_of(&get(payload, intern!(py, "width"))?)?,
+            value_range: string_of(&get(payload, intern!(py, "value_range"))?)?,
+            tensor: tensor_transfer_from_py(&get(payload, intern!(py, "tensor"))?)?,
+        },
+        "latent" => TransferHandle::Latent {
+            height: u32_of(&get(payload, intern!(py, "height"))?)?,
+            width: u32_of(&get(payload, intern!(py, "width"))?)?,
+            latent_units: u32_of(&get(payload, intern!(py, "latent_units"))?)?,
+            step: u32_of(&get(payload, intern!(py, "step"))?)?,
+            tensor: tensor_transfer_from_py(&get(payload, intern!(py, "tensor"))?)?,
+        },
+        _ => return None,
+    };
+
+    // Bind the materialized value to its independently decoded product identity.
+    Some(TensorPublication {
+        product: tensor_ref_from_py(&get(dict, intern!(py, "product"))?)?,
+        value,
+    })
+}
+
+/// Decodes transport coordinates and their common logical tensor metadata.
+fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+
+    // The transport tag determines which coordinate set must be present.
+    let transport = match string_of(&get(dict, intern!(py, "transport"))?)?.as_str() {
+        "local" => TransferTransport::Local {
+            endpoint: string_of(&get(dict, intern!(py, "endpoint"))?)?,
+            key: u64_of(&get(dict, intern!(py, "key"))?)?,
+        },
+        "posix_shm" => TransferTransport::PosixShm {
+            endpoint: string_of(&get(dict, intern!(py, "endpoint"))?)?,
+            name: string_of(&get(dict, intern!(py, "name"))?)?,
+        },
+        "cuda_ipc" => TransferTransport::CudaIpc {
+            endpoint: string_of(&get(dict, intern!(py, "endpoint"))?)?,
+            publication_id: string_of(&get(dict, intern!(py, "publication_id"))?)?,
+            storage_size_bytes: u64_of(&get(dict, intern!(py, "storage_size_bytes"))?)?,
+            storage_offsets_bytes: u64_vec(&get(dict, intern!(py, "storage_offsets_bytes"))?)?,
+            span_lengths: u64_vec(&get(dict, intern!(py, "span_lengths"))?)?,
+            span_counts: u32_vec(&get(dict, intern!(py, "span_counts"))?)?,
+            tensor_stride: i64_vec(&get(dict, intern!(py, "tensor_stride"))?)?,
+            ready_event_handle: bytes_of(&get(dict, intern!(py, "ready_event_handle"))?)?,
+        },
+        _ => return None,
+    };
+    // Common tensor metadata remains independent of the selected transport.
+    let source_value = get(dict, intern!(py, "source"))?;
+    let source = source_value.cast::<PyDict>().ok()?;
+    Some(Locator {
+        source: WorkerEndpoint {
+            worker_id: string_of(&get(source, intern!(py, "worker_id"))?)?,
+            rank: u32_of(&get(source, intern!(py, "rank"))?)?,
+            node: string_of(&get(source, intern!(py, "node"))?)?,
+            address_space: string_of(&get(source, intern!(py, "address_space"))?)?,
+            incarnation: string_of(&get(source, intern!(py, "incarnation"))?)?,
+        },
+        transport,
+        nbytes: u64_of(&get(dict, intern!(py, "nbytes"))?)?,
+        dtype: string_of(&get(dict, intern!(py, "dtype"))?)?,
+        shape: u64_vec(&get(dict, intern!(py, "shape"))?)?,
+        device: string_of(&get(dict, intern!(py, "device"))?)?,
+        offset: u64_vec(&get(dict, intern!(py, "offset"))?)?,
+    })
+}
+
+/// Decodes the persistent buffer that identifies a KV publication.
+fn buffer_id_mapping_from_py(value: &Bound<'_, PyAny>) -> Option<BufferId> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+    Some(BufferId {
+        owner: request_key_from_py(&get(dict, intern!(py, "owner"))?)?,
+        producer_op_id: computation_id_from_py(&get(dict, intern!(py, "producer_op_id"))?)?,
+        output_index: u16_of(&get(dict, intern!(py, "output_index"))?)?,
+        generation: u32_of(&get(dict, intern!(py, "generation"))?)?,
+    })
+}
+
+/// Decodes a product identity, storage contract, and bounded shape.
+fn tensor_ref_from_py(value: &Bound<'_, PyAny>) -> Option<TensorRef> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+
+    let dtype = str_field(dict, intern!(py, "dtype"))?;
+    let dtype = match dtype.to_str().ok()? {
+        "u8" => DType::U8,
+        "i32" => DType::I32,
+        "i64" => DType::I64,
+        "f16" => DType::F16,
+        "bf16" => DType::BF16,
+        "f32" => DType::F32,
+        "i16" => DType::I16,
+        _ => return None,
+    };
+    // Reconstruct each dimension from its tagged static-or-device bound.
+    let shape = get(dict, intern!(py, "shape_bound"))?;
+    let shape = shape.cast::<PyDict>().ok()?;
+    let dims = get(shape, intern!(py, "dims"))?;
+    let dims = dims.cast::<PyList>().ok()?;
+    let mut shape_bound = ShapeBound {
+        dims: Vec::with_capacity(dims.len()),
+    };
+    for item in dims.iter() {
+        let entry = item.cast::<PyDict>().ok()?;
+        let value = get(entry, intern!(py, "value"))?;
+        let dim_kind = str_field(entry, intern!(py, "kind"))?;
+        let dim = match dim_kind.to_str().ok()? {
+            "static" => DimBound::Static(u32_of(&value)?),
+            "device" => {
+                let value = value.cast::<PyDict>().ok()?;
+                DimBound::Device {
+                    max: u32_of(&get(value, intern!(py, "max"))?)?,
+                }
+            }
+            _ => return None,
+        };
+        shape_bound.dims.push(dim);
+    }
+    Some(TensorRef {
+        request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
+        producer_op_id: computation_id_from_py(&get(dict, intern!(py, "producer_op_id"))?)?,
+        output_index: u16_of(&get(dict, intern!(py, "output_index"))?)?,
+        generation: u32_of(&get(dict, intern!(py, "generation"))?)?,
+        dtype,
+        shape_bound,
+    })
+}
+
+/// Decodes a Python product-family spelling.
+fn feature_kind_from_py(value: &Bound<'_, PyAny>) -> Option<FeatureKind> {
+    Some(match string_of(value)?.as_str() {
+        "vision_feature" => FeatureKind::Vision,
+        "latent_feature" => FeatureKind::Latent,
+        _ => return None,
+    })
+}
+
+/// Decodes both coordinates of a computation's logical identity.
+fn computation_id_from_py(value: &Bound<'_, PyAny>) -> Option<ComputationId> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+    Some(ComputationId::new(
+        u64_of(&get(dict, intern!(py, "batch_id"))?)?,
+        u32_of(&get(dict, intern!(py, "request_index"))?)?,
+    ))
+}
+
 fn computation_id_to_py(py: Python<'_>, id: ComputationId) -> PyResult<Bound<'_, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "batch_id"), id.batch_id)?;
@@ -1158,16 +1670,183 @@ fn computation_id_to_py(py: Python<'_>, id: ComputationId) -> PyResult<Bound<'_,
     Ok(dict)
 }
 
+/// Decodes a request identity from its Python mapping.
+fn request_key_from_py(value: &Bound<'_, PyAny>) -> Option<RequestKey> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+    Some(RequestKey {
+        engine_id: u64_of(&get(dict, intern!(py, "engine_id"))?)?,
+        request_id: uniserve_core::RequestId(u64_of(&get(dict, intern!(py, "request_id"))?)?),
+        request_epoch: u64_of(&get(dict, intern!(py, "request_epoch"))?)?,
+    })
+}
+
+/// Decodes one request and operation identity attached to an error.
+fn error_operation_from_py(value: &Bound<'_, PyAny>) -> Option<ErrorOperationIdentity> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+    Some(ErrorOperationIdentity {
+        request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
+        op_id: computation_id_from_py(&get(dict, intern!(py, "op_id"))?)?,
+    })
+}
+
+/// Decodes an optional ordered list of operation identities attached to an error.
+fn error_operations_from_py(dict: &Bound<'_, PyDict>) -> Option<Vec<ErrorOperationIdentity>> {
+    let py = dict.py();
+    let Some(operations) = dict.get_item(intern!(py, "operations")).ok()? else {
+        return Some(Vec::new());
+    };
+    if operations.is_none() {
+        return Some(Vec::new());
+    }
+    let operations = operations.cast::<PyList>().ok()?;
+    let mut identities = Vec::with_capacity(operations.len());
+    for item in operations.iter() {
+        identities.push(error_operation_from_py(&item)?);
+    }
+    Some(identities)
+}
+
+/// Returns a required mapping value, collapsing lookup errors and absence.
+fn get<'py>(dict: &Bound<'py, PyDict>, key: &Bound<'py, PyString>) -> Option<Bound<'py, PyAny>> {
+    dict.get_item(key).ok().flatten()
+}
+
+/// Returns whether a mapping key is absent or explicitly set to `None`.
+fn absent_or_none(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<bool> {
+    match dict.get_item(key).ok()? {
+        Some(value) => Some(value.is_none()),
+        None => Some(true),
+    }
+}
+
+/// Extracts a required mapping value as a borrowed Python string.
+fn str_field<'py>(
+    dict: &Bound<'py, PyDict>,
+    key: &Bound<'py, PyString>,
+) -> Option<Bound<'py, PyString>> {
+    get(dict, key)?.cast_into::<PyString>().ok()
+}
+
+/// Extracts a `u64` while rejecting Python booleans as integers.
+fn u64_of(value: &Bound<'_, PyAny>) -> Option<u64> {
+    // Integer fields reject Python booleans, which are a distinct protocol type.
+    if value.cast::<PyBool>().is_ok() {
+        return None;
+    }
+    value.extract().ok()
+}
+
+/// Extracts a `u32` while rejecting Python booleans as integers.
+fn u32_of(value: &Bound<'_, PyAny>) -> Option<u32> {
+    if value.cast::<PyBool>().is_ok() {
+        return None;
+    }
+    value.extract().ok()
+}
+
+/// Extracts a `u16` while rejecting Python booleans as integers.
+fn u16_of(value: &Bound<'_, PyAny>) -> Option<u16> {
+    if value.cast::<PyBool>().is_ok() {
+        return None;
+    }
+    value.extract().ok()
+}
+
+/// Extracts a strict Python boolean.
+fn bool_of(value: &Bound<'_, PyAny>) -> Option<bool> {
+    Some(value.cast::<PyBool>().ok()?.is_true())
+}
+
+/// Copies a strict Python string into owned Rust storage.
+fn string_of(value: &Bound<'_, PyAny>) -> Option<String> {
+    Some(value.cast::<PyString>().ok()?.to_str().ok()?.to_owned())
+}
+
+/// Decodes a required string-to-`u64` mapping with deterministic key order.
+fn u64_map(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<BTreeMap<String, u64>> {
+    let values = get(dict, key)?;
+    let values = values.cast::<PyDict>().ok()?;
+    let mut result = BTreeMap::new();
+    for (key, value) in values.iter() {
+        result.insert(string_of(&key)?, u64_of(&value)?);
+    }
+    Some(result)
+}
+
+/// Copies a Python list into a strictly typed `u32` vector.
+fn u32_vec(value: &Bound<'_, PyAny>) -> Option<Vec<u32>> {
+    let list = value.cast::<PyList>().ok()?;
+    let mut values = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        values.push(u32_of(&item)?);
+    }
+    Some(values)
+}
+
+/// Copies a Python list into a strictly typed `u64` vector.
+fn u64_vec(value: &Bound<'_, PyAny>) -> Option<Vec<u64>> {
+    let list = value.cast::<PyList>().ok()?;
+    let mut values = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        values.push(u64_of(&item)?);
+    }
+    Some(values)
+}
+
+/// Copies a Python list into an `i64` vector while rejecting booleans.
+fn i64_vec(value: &Bound<'_, PyAny>) -> Option<Vec<i64>> {
+    let list = value.cast::<PyList>().ok()?;
+    let mut values = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        if item.cast::<PyBool>().is_ok() {
+            return None;
+        }
+        values.push(item.extract().ok()?);
+    }
+    Some(values)
+}
+
+/// Copies strict Python `bytes` into owned Rust storage.
+fn bytes_of(value: &Bound<'_, PyAny>) -> Option<Vec<u8>> {
+    Some(value.cast::<PyBytes>().ok()?.as_bytes().to_vec())
+}
+
+/// Decodes an absent, `None`, or strict `u64` mapping field.
+fn opt_u64(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Option<u64>> {
+    match dict.get_item(key).ok()? {
+        None => Some(None),
+        Some(value) if value.is_none() => Some(None),
+        Some(value) => Some(Some(u64_of(&value)?)),
+    }
+}
+
+/// Decodes an absent, `None`, or strict boolean mapping field.
+fn opt_bool(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Option<bool>> {
+    match dict.get_item(key).ok()? {
+        None => Some(None),
+        Some(value) if value.is_none() => Some(None),
+        Some(value) => Some(Some(bool_of(&value)?)),
+    }
+}
+
+/// Decodes an absent, `None`, or strict string mapping field.
+fn opt_string(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Option<String>> {
+    match dict.get_item(key).ok()? {
+        None => Some(None),
+        Some(value) if value.is_none() => Some(None),
+        Some(value) => Some(Some(string_of(&value)?)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime};
 
     use pythonize::pythonize;
-    use uniserve_core::{BlockId, RequestId, TokenLogprob};
-    use uniserve_worker_ipc::{
-        BatchOutput, ClientEndpoint, FinishFlags, OpStatus, RegistrationAck, RequestOutput,
-        TimingCounters, WorkerResponse,
-    };
+    use uniserve_core::{BlockId, RequestId};
+    use uniserve_worker_ipc::ClientEndpoint;
 
     use super::*;
 
@@ -1664,6 +2343,24 @@ fn tensor_transfer_to_py<'py>(
     Ok(dict)
 }
 
+fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+    let raw = get(dict, intern!(py, "locations"))?;
+    let locations = raw
+        .cast::<PyList>()
+        .ok()?
+        .iter()
+        .map(|location| transfer_locator_from_py(&location))
+        .collect::<Option<Vec<_>>>()?;
+    let tensor = TensorTransfer {
+        shape: u64_vec(&get(dict, intern!(py, "shape"))?)?,
+        locations,
+    };
+    tensor.validate().ok()?;
+    Some(tensor)
+}
+
 fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bound<'py, PyDict>> {
     let KvTransfer {
         tensors,
@@ -1698,4 +2395,35 @@ fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bo
     value.set_item(intern!(py, "compute_dtype"), compute_dtype.as_str())?;
     value.set_item(intern!(py, "page_size"), page_size)?;
     Ok(value)
+}
+
+fn kv_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvTransfer> {
+    let py = value.py();
+    let payload = value.cast::<PyDict>().ok()?;
+    // Preserve tensor order because it identifies the worker's
+    // physical KV tensor layout.
+    let raw_tensors = get(payload, intern!(py, "tensors"))?;
+    let raw_tensors = raw_tensors.cast::<PyList>().ok()?;
+    let mut tensors = Vec::with_capacity(raw_tensors.len());
+    for tensor in raw_tensors.iter() {
+        tensors.push(tensor_transfer_from_py(&tensor)?);
+    }
+    Some(KvTransfer {
+        tensors,
+        source: buffer_id_mapping_from_py(&get(payload, intern!(py, "source"))?)?,
+        destination: string_of(&get(payload, intern!(py, "destination"))?)?,
+        base: if absent_or_none(payload, intern!(py, "base"))? {
+            None
+        } else {
+            Some(buffer_id_mapping_from_py(&get(
+                payload,
+                intern!(py, "base"),
+            )?)?)
+        },
+        base_extent: u32_of(&get(payload, intern!(py, "base_extent"))?)?,
+        published_extent: u32_of(&get(payload, intern!(py, "published_extent"))?)?,
+        group_id: u32_of(&get(payload, intern!(py, "group_id"))?)?,
+        compute_dtype: string_of(&get(payload, intern!(py, "compute_dtype"))?)?,
+        page_size: u32_of(&get(payload, intern!(py, "page_size"))?)?,
+    })
 }
