@@ -144,22 +144,74 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Reads one rank's registration report and returns the endpoint it names.
+fn accept_reported_endpoint(listener: &std::net::TcpListener) -> anyhow::Result<String> {
+    use std::io::BufRead as _;
+
+    let (stream, _) = listener.accept()?;
+    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+    let mut line = String::new();
+    std::io::BufReader::new(stream).read_line(&mut line)?;
+    let report: serde_json::Value = serde_json::from_str(line.trim())?;
+    Ok(report["endpoint"]
+        .as_str()
+        .context("rank registration named no endpoint")?
+        .to_owned())
+}
+
 #[test]
-fn native_close_drains_results_and_releases_service() -> anyhow::Result<()> {
+fn launch_refuses_a_rank_that_offers_an_unsupported_channel() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // A rank names its own endpoint, so the mechanism it offers is data the
+    // head has to check rather than a value it chose.
+    let directory = tempfile::tempdir()?;
+    let wrapper = directory.path().join("worker");
+    std::fs::write(
+        &wrapper,
+        r#"#!/usr/bin/env python3
+import json, socket, sys
+
+descriptor = json.load(open(sys.argv[sys.argv.index("--launch-descriptor") + 1]))
+host, _, port = descriptor["registration_address"].rpartition(":")
+report = {
+    "worker_id": descriptor["worker_id"],
+    "rank": descriptor["rank"],
+    "transport": "socket",
+    "endpoint": "unreachable",
+}
+with socket.create_connection((host, int(port)), timeout=60) as connection:
+    connection.sendall(json.dumps(report).encode() + b"\n")
+"#,
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+    let mut args = rank_group_args(1 << 20, 8 << 20);
+    args.python = wrapper;
+
+    let reported = match WorkerGroup::spawn(args) {
+        Ok(_) => anyhow::bail!("an unsupported channel transport was accepted"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        reported.contains("unsupported channel transport socket"),
+        "launch failure did not name the offered transport: {reported}"
+    );
+    Ok(())
+}
+
+#[test]
+fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
     use uniserve_worker_ipc::{ClientEndpoint, WorkerRequest, WorkerResponse};
 
-    let service = uniserve_worker_ipc::service_name(&format!(
-        "close_{}_{}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-    ));
-    // Reopen the identical transport resource after each graceful process exit.
+    // Each launch names its own endpoint and reports it here, so a graceful
+    // exit is observable as the next launch registering and serving again.
     for _ in 0..2 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let descriptor_directory = tempfile::tempdir()?;
         let descriptor_path = descriptor_directory.path().join("launch.json");
         std::fs::write(
             &descriptor_path,
-            serde_json::to_vec(&stub_launch_descriptor(&service))?,
+            serde_json::to_vec(&stub_launch_descriptor(&listener.local_addr()?.to_string()))?,
         )?;
         let mut child = std::process::Command::new(worker_python())
             .args(["-m", "uniserve_worker.main"])
@@ -167,7 +219,8 @@ fn native_close_drains_results_and_releases_service() -> anyhow::Result<()> {
             .arg(&descriptor_path)
             .spawn()?;
         let result = (|| -> anyhow::Result<()> {
-            let client = ClientEndpoint::connect(&service, 1 << 20, 8)?;
+            let client =
+                ClientEndpoint::connect(&accept_reported_endpoint(&listener)?, 1 << 20, 8)?;
             let admission = text_admission(51, 1, 1)?;
             let run = token_batch(
                 1,
@@ -2305,9 +2358,9 @@ fn rank_group_args(
 ///
 /// Production launches receive the same descriptor from the engine; these tests
 /// state one directly because they drive the worker process without a group.
-fn stub_launch_descriptor(service: &str) -> serde_json::Value {
+fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     const TEMPLATE: &str = r#"{
-    "service_name": "__SERVICE__",
+    "registration_address": "__REGISTRATION__",
     "worker_id": "worker",
     "queue_depth": 2,
     "ipc_payload_cap": 1048576,
@@ -2365,7 +2418,7 @@ fn stub_launch_descriptor(service: &str) -> serde_json::Value {
 }"#;
     let mut value: serde_json::Value =
         serde_json::from_str(TEMPLATE).expect("stub launch descriptor template");
-    value["service_name"] = serde_json::Value::String(service.to_owned());
+    value["registration_address"] = serde_json::Value::String(registration.to_owned());
     value
 }
 

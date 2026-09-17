@@ -17,7 +17,7 @@ from uniserve_worker.bootstrap.config import WorkerProcessArgs
 # Neutral values for every field the descriptor must carry. They mirror what
 # the engine emits for a single-rank CPU worker.
 DEFAULTS: dict[str, Any] = {
-    "service_name": "test-worker",
+    "registration_address": "127.0.0.1:0",
     "worker_id": "worker",
     "queue_depth": 2,
     "ipc_payload_cap": 65536,

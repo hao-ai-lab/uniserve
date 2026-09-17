@@ -6,7 +6,11 @@ from pathlib import Path
 
 from tests.python.fixtures.depth_one import finalized_report
 from uniserve_worker.bootstrap.cli import parse_worker_args
-from uniserve_worker.bootstrap.launch import WorkerIpcEndpoint
+from uniserve_worker.bootstrap.launch import (
+    WorkerIpcEndpoint,
+    endpoint_name,
+    register_endpoint,
+)
 from uniserve_worker.media.storage import publish_media_bytes
 from uniserve_worker.protocol.output import MediaOutput, PosixShmArtifact
 from uniserve_worker.worker import Worker
@@ -14,11 +18,13 @@ from uniserve_worker.worker import Worker
 
 def main():
     config = parse_worker_args()
+    service = endpoint_name(config)
     with WorkerIpcEndpoint(
-        config.ipc.service_name,
+        service,
         max_payload=config.ipc.max_payload_bytes,
         max_inflight=config.ipc.queue_depth,
     ) as endpoint:
+        register_endpoint(config, service)
         with Worker.from_config(config) as worker:
             pending = {}
             worker.warmup()

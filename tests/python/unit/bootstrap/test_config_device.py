@@ -16,7 +16,6 @@ pytestmark = pytest.mark.unit
 def test_flow_component_device_is_resolved_with_the_rank_device(mesh, tmp_path):
     config = worker_args(
         tmp_path,
-        service_name="component-devices",
         max_batch_tokens=8192,
         device="cuda:0",
         mesh=mesh,
@@ -34,7 +33,6 @@ def test_expert_devices_reject_inconsistent_rank_or_repeated_devices(
     with pytest.raises(SystemExit):
         worker_args(
             tmp_path,
-            service_name="component-devices",
             max_batch_tokens=8192,
             device="cuda:0",
             mesh=mesh,
@@ -51,7 +49,6 @@ def test_cuda_ipc_publication_rejects_nonexportable_allocations(
     with pytest.raises(SystemExit):
         worker_args(
             tmp_path,
-            service_name="cuda-publication",
             ipc_payload_cap=65536,
             model="model",
             max_batch_tokens=8192,
@@ -64,7 +61,6 @@ def test_cuda_ipc_publication_rejects_nonexportable_allocations(
 def test_quantization_config_defaults_to_model_policy(tmp_path) -> None:
     config = worker_args(
         tmp_path,
-        service_name="precision-default-test",
         ipc_payload_cap=65536,
         model="model",
         max_batch_tokens=8192,
@@ -77,7 +73,6 @@ def test_quantization_config_defaults_to_model_policy(tmp_path) -> None:
 def test_engine_batch_capacity_reaches_worker_resources(tmp_path) -> None:
     config = worker_args(
         tmp_path,
-        service_name="capacity-test",
         ipc_payload_cap=65536,
         model="model",
         device="cpu",
@@ -92,7 +87,6 @@ def test_engine_batch_capacity_reaches_worker_resources(tmp_path) -> None:
 def test_quantization_config_reaches_model_launch_config(tmp_path) -> None:
     config = worker_args(
         tmp_path,
-        service_name="precision-test",
         ipc_payload_cap=65536,
         model="model",
         max_batch_tokens=8192,
@@ -108,7 +102,6 @@ def test_component_quantization_config_reaches_model_launch_config(
 ) -> None:
     config = worker_args(
         tmp_path,
-        service_name="precision-test",
         ipc_payload_cap=65536,
         model="model",
         max_batch_tokens=8192,
@@ -136,7 +129,6 @@ def test_component_quantization_config_reaches_model_launch_config(
 def test_execution_lanes_are_typed_and_domain_disjoint(tmp_path) -> None:
     config = worker_args(
         tmp_path,
-        service_name="lane-test",
         max_batch_tokens=8192,
         lane=[
             '{"lane_id":"decode","sm_budget":64,"domains":["decode"]}',
@@ -160,7 +152,6 @@ def test_execution_lanes_reject_duplicate_domain_bindings(tmp_path) -> None:
     with pytest.raises(SystemExit):
         worker_args(
             tmp_path,
-            service_name="lane-test",
             max_batch_tokens=8192,
             lane=[
                 '{"lane_id":"a","sm_budget":64,"domains":["decode"]}',
@@ -192,7 +183,6 @@ def test_launch_capabilities_select_concrete_computations(
 ):
     config = worker_args(
         tmp_path,
-        service_name="capabilities",
         max_batch_tokens=8192,
         supported_ops=selector,
     )

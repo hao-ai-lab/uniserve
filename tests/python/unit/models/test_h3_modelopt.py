@@ -135,7 +135,6 @@ def test_packed_checkpoint_rejects_runtime_numerical_overrides(
 ):
     config = worker_args(
         tmp_path,
-        service_name="packed-checkpoint-test",
         model=str(packed_checkpoint),
         entries={"output": {"ranks": [0], "parallel_config": {}}},
         max_batch_tokens=8192,

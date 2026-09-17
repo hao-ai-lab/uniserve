@@ -3,22 +3,26 @@
 The caller owns the endpoint and Worker in one resource scope:
 
 ```python
-from uniserve_worker.bootstrap.ipc import WorkerIpcEndpoint
+from uniserve_worker.bootstrap.launch import (
+    WorkerIpcEndpoint,
+    endpoint_name,
+    register_endpoint,
+)
 from uniserve_worker.worker import Worker
 
-with (
-    WorkerIpcEndpoint(
-        config.ipc.service_name,
-        max_payload=config.ipc.max_payload_bytes,
-        max_inflight=config.ipc.max_inflight,
-    ) as endpoint,
-    Worker.from_config(config) as worker,
-):
-    worker.bind(endpoint)
-    worker.run()
+service = endpoint_name(config)
+with WorkerIpcEndpoint(
+    service,
+    max_payload=config.ipc.max_payload_bytes,
+    max_inflight=config.ipc.queue_depth,
+) as endpoint:
+    register_endpoint(config, service)
+    with Worker.from_config(config) as worker:
+        worker.bind(endpoint)
+        worker.run()
 ```
 
-Context managers enter from left to right and exit in reverse order. The endpoint opens before model loading, allowing the frontend to establish the bounded IPC connection during startup. Worker resources close before the endpoint. If model construction fails, the endpoint still closes. The production entry is `uniserve_worker.bootstrap.launch.run_worker`.
+The rank names its own endpoint and reports it to the head's registration address, which the launch descriptor carries; the head binds the rank's channel from that report. Reporting happens once the endpoint exists and before model loading, so the head establishes the bounded connection during startup. Worker resources close before the endpoint, and a failed model construction still closes it. The production entry is `uniserve_worker.bootstrap.launch.run_worker`.
 
 ## Construction and ownership
 
