@@ -23,16 +23,10 @@ impl WorkerProcessArgs {
     fn launch(&self, cancel: Option<Arc<AtomicBool>>) -> anyhow::Result<Vec<RankProcess>> {
         let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         crate::WorkerConfig::validate_members(&self.ranks, &self.entries)?;
-        // This process owns exactly the ranks placed on its own host. Ranks
-        // placed elsewhere belong to another host's launcher, which this
-        // engine does not start.
-        if let Some(remote) = self.ranks.iter().find(|rank| rank.node != self.host) {
-            anyhow::bail!(
-                "rank placed on host {} cannot be launched by the engine on host {}",
-                remote.node,
-                self.host
-            );
-        }
+        anyhow::ensure!(
+            self.ranks.iter().all(|rank| rank.node == "localhost"),
+            "remote worker process launch is unavailable"
+        );
         // Local ranks share a unique filesystem rendezvous for their entire
         // lifetime. Probing and releasing a TCP port cannot reserve it for the
         // Python store that starts after process creation.

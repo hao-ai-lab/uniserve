@@ -152,10 +152,6 @@ pub(crate) struct SharedRuntimeArgs {
     /// KV block size in tokens (the page size).
     #[arg(long = "page-size", default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     pub block_size: u32,
-    /// This instance's host identity. Ranks are placed on it by name, and the
-    /// engine owns exactly the ranks whose placement node matches.
-    #[arg(long = "host-identity", default_value = "localhost")]
-    pub host_identity: String,
     /// Explicit Python worker launch/runtime arguments.
     #[command(flatten)]
     pub worker_process: WorkerProcessOptions,
@@ -253,7 +249,6 @@ impl SharedRuntimeArgs {
     /// queue, batch and IPC slots differently from token deployments.
     pub(crate) fn engine_settings(&self, is_media: bool) -> EngineSettings {
         let mut worker_process = self.worker_process.to_args();
-        worker_process.host = self.host_identity.clone();
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
         let queue_depth = self.queue_depth.unwrap_or(if is_media { 6 } else { 2 });
@@ -293,19 +288,9 @@ impl SharedRuntimeArgs {
             max_video_seconds: self.max_video_seconds,
             workers: self.workers.clone().map(Vec::from).unwrap_or_else(|| {
                 vec![if is_media {
-                    WorkerConfig::h3(
-                        &self.host_identity,
-                        &self.device,
-                        self.worker_ranks,
-                        queue_depth,
-                    )
+                    WorkerConfig::h3(&self.device, self.worker_ranks, queue_depth)
                 } else {
-                    WorkerConfig::model(
-                        &self.host_identity,
-                        &self.device,
-                        self.worker_ranks,
-                        queue_depth,
-                    )
+                    WorkerConfig::model(&self.device, self.worker_ranks, queue_depth)
                 }]
             }),
             transfer: self.transfer.clone().unwrap_or_default(),

@@ -124,12 +124,11 @@ impl WorkerConfig {
         Ok(())
     }
 
-    /// Expands the single-instance CLI shorthand into explicit device membership
-    /// on one named host.
-    pub fn model(host: &str, device: &str, rank_count: usize, queue_depth: usize) -> Self {
+    /// Expands the single-instance CLI shorthand into explicit device membership.
+    pub fn model(device: &str, rank_count: usize, queue_depth: usize) -> Self {
         let ranks = (0..rank_count)
             .map(|rank| WorkerRank {
-                node: host.into(),
+                node: "localhost".into(),
                 device: if matches!(device, "cuda" | "gpu") {
                     format!("cuda:{rank}")
                 } else {
@@ -155,8 +154,8 @@ impl WorkerConfig {
     }
 
     /// Resolves the explicit device budget into the established H3 Ulysses params.
-    pub fn h3(host: &str, device: &str, rank_count: usize, queue_depth: usize) -> Self {
-        let mut worker = Self::model(host, device, rank_count, queue_depth);
+    pub fn h3(device: &str, rank_count: usize, queue_depth: usize) -> Self {
+        let mut worker = Self::model(device, rank_count, queue_depth);
         let ranks: Vec<_> = (0..rank_count).collect();
         let denoiser = ParallelConfig {
             sequence_parallel: SequenceParallel::Ulysses {
@@ -247,7 +246,7 @@ impl EngineConfig {
     pub fn sim(model: impl Into<String>) -> Self {
         let worker_process = WorkerProcessArgs {
             model: model.into(),
-            ranks: WorkerConfig::model("localhost", "cpu", 1, 2).ranks,
+            ranks: WorkerConfig::model("cpu", 1, 2).ranks,
             block_size: 64,
             queue_depth: 2,
             max_batch_operations: DEFAULT_MAX_BATCH as u32,
@@ -264,7 +263,7 @@ impl EngineConfig {
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: 8192,
-            workers: vec![WorkerConfig::model("localhost", "cpu", 1, 2)],
+            workers: vec![WorkerConfig::model("cpu", 1, 2)],
             transfer: TransferConfig::default(),
             worker_process,
             // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
@@ -524,7 +523,7 @@ mod tests {
     fn static_components_validate_their_own_parallel_members() -> anyhow::Result<()> {
         let mut workers = Vec::new();
         for (name, degree) in [("text_encoder", 1), ("denoiser", 4), ("video_decoder", 2)] {
-            let mut worker = WorkerConfig::model("localhost", "cuda", degree, 2);
+            let mut worker = WorkerConfig::model("cuda", degree, 2);
             worker.id = WorkerId(name.into());
             let entry = worker.entries.remove("model").unwrap();
             worker.entries.insert(name.into(), entry);
@@ -538,7 +537,7 @@ mod tests {
 
     #[test]
     fn entry_geometry_uses_unique_ordered_rank_members() {
-        let mut worker = WorkerConfig::h3("localhost", "cuda", 4, 2);
+        let mut worker = WorkerConfig::h3("cuda", 4, 2);
         assert!(worker.validate().is_ok());
         worker.entries.get_mut("denoiser").unwrap().ranks.swap(0, 3);
         assert!(worker.validate().is_ok());
@@ -548,7 +547,7 @@ mod tests {
 
     #[test]
     fn static_bindings_reject_duplicate_identities_and_entry_owners() {
-        let worker = WorkerConfig::model("localhost", "cuda", 1, 2);
+        let worker = WorkerConfig::model("cuda", 1, 2);
         let mut other = worker.clone();
         assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
         other.id = WorkerId("other".into());
