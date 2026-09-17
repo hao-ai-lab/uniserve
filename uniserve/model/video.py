@@ -99,10 +99,15 @@ class VideoDecoder(nn.Module):
 
 
 class AudioDecoder(nn.Module):
-    """Decode a packed latent timeline and crop to the requested sample count.
+    """Decode media units of a packed latent timeline into sample-major PCM.
 
-    Subclasses define ``latent_frames`` and ``unpack_latents`` from their
-    codec's compression and channel layout. The decoded tensor is sample-major.
+    Subclasses define ``latent_frames``, ``latent_rate``, ``latent_halo`` and
+    ``unpack_latents`` from their codec's compression and channel layout. A
+    media unit is a contiguous span of latent frames; because the decoder is
+    convolutional, decoding a unit together with ``latent_halo`` frames of
+    context on each side and discarding that context reproduces the whole-track
+    decode of those samples exactly. The halo is the decoder's receptive field,
+    so a unit's result depends on no sample outside the context it was given.
     """
 
     def __init__(self, decoder: LatentDecoder, *, sample_rate: int):
@@ -114,35 +119,104 @@ class AudioDecoder(nn.Module):
     def latent_frames(self, num_samples: int) -> int:
         raise NotImplementedError
 
-    def unpack_latents(self, latent, num_samples, *, workspace):
-        """Return the codec's native channel and time representation."""
+    @property
+    def latent_rate(self) -> int:
+        """Output samples one latent frame produces."""
         raise NotImplementedError
+
+    def latent_halo(self) -> int:
+        """Latent frames of context one decoded sample depends on, per side."""
+        raise NotImplementedError
+
+    def unpack_latents(self, latent, num_samples, *, window, workspace):
+        """Return the codec's native channel and time representation.
+
+        ``window`` selects the contiguous latent frames to unpack, including
+        the halo the caller added around the media unit.
+        """
+        raise NotImplementedError
+
+    def unit_frames(self, num_samples: int, units: int) -> tuple[slice, ...]:
+        """Partition the latent timeline into ``units`` contiguous media units.
+
+        Units divide latent frames rather than samples so every boundary falls
+        on a frame the decoder produces whole.
+        """
+        frames = self.latent_frames(num_samples)
+        if type(units) is not int or not 1 <= units <= frames:
+            raise ValueError(
+                "audio media units must divide the latent timeline"
+            )
+        edges = [frames * index // units for index in range(units + 1)]
+        return tuple(
+            slice(edges[index], edges[index + 1]) for index in range(units)
+        )
+
+    def unit_samples(self, num_samples: int, units: int) -> tuple[slice, ...]:
+        """Return each media unit's span of the output sample timeline."""
+        rate = self.latent_rate
+        return tuple(
+            slice(window.start * rate, min(window.stop * rate, num_samples))
+            for window in self.unit_frames(num_samples, units)
+        )
 
     @torch.inference_mode()
     def decode(
         self,
         latents: tuple[torch.Tensor, ...],
         *,
+        frames: tuple[slice, ...],
         num_samples: tuple[int, ...],
         workspace: Mapping[str, torch.Tensor],
     ) -> tuple[torch.Tensor, ...]:
-        if not latents or len(latents) != len(num_samples):
-            raise ValueError("audio latents and sample counts must align")
+        if (
+            not latents
+            or len(latents) != len(num_samples)
+            or len(latents) != len(frames)
+        ):
+            raise ValueError(
+                "audio latents, media units and sample counts must align"
+            )
         if any(type(count) is not int or count < 1 for count in num_samples):
             raise ValueError(
                 "audio durations must contain a positive sample count"
             )
 
+        rate, halo = self.latent_rate, self.latent_halo()
         outputs = []
-        for latent, count in zip(latents, num_samples, strict=True):
-            inputs = self.unpack_latents(latent, count, workspace=workspace)
+        for latent, window, count in zip(
+            latents, frames, num_samples, strict=True
+        ):
+            total = self.latent_frames(count)
+            if (
+                window.step not in (None, 1)
+                or window.start is None
+                or window.stop is None
+                or not 0 <= window.start < window.stop <= total
+            ):
+                raise ValueError(
+                    "audio media unit must lie within its latent timeline"
+                )
+
+            # The halo is clipped at the track's own boundaries, where the
+            # whole-track decode has no context either.
+            context = slice(
+                max(0, window.start - halo), min(total, window.stop + halo)
+            )
+            inputs = self.unpack_latents(
+                latent, count, window=context, workspace=workspace
+            )
             decoded = self.decoder(inputs)
-            if decoded.ndim != 2 or decoded.shape[0] < count:
+            produced = (context.stop - context.start) * rate
+            if decoded.ndim != 2 or decoded.shape[0] < produced:
                 raise ValueError(
                     "decoded audio must cover the requested sample timeline"
                 )
-            output = decoded[:count]
-            outputs.append(output.clone() if len(latents) > 1 else output)
+
+            # Discard the halo, then crop the final unit to the exact duration.
+            begin = (window.start - context.start) * rate
+            end = begin + min(window.stop * rate, count) - window.start * rate
+            outputs.append(decoded[begin:end].clone())
         return tuple(outputs)
 
 

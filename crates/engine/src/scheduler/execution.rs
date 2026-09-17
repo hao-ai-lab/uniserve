@@ -451,6 +451,24 @@ impl Scheduler {
         self.info.pipeline_components.get(&stage).cloned()
     }
 
+    /// Returns how many media units one call of this kind covers at once.
+    ///
+    /// A distributed component reconstructs one media unit per rank per round,
+    /// so its rank count is the width of a round.
+    fn component_width(&self, work: Computation, entry: &str) -> u32 {
+        let (_, bound, info) = self
+            .entry_candidates(work, entry)
+            .next()
+            .expect("scheduled decoder has a configured owner");
+        let component = info
+            .components
+            .iter()
+            .find(|component| component.name == bound)
+            .expect("scheduled decoder has a loaded component");
+        u32::try_from(component.config.ranks.len())
+            .expect("loaded component rank count fits the decode range")
+    }
+
     /// Returns a component's device lane capacity in media units.
     ///
     /// A component that distributes its work measures its lane in the units its
@@ -524,14 +542,21 @@ impl Scheduler {
     }
 
     /// Returns the media units one scheduled call of this kind would occupy.
+    ///
+    /// A decode round covers one media unit on each rank of its component, so
+    /// it occupies that component's whole lane unless the track has fewer
+    /// units left than the component has ranks.
     fn call_units(&self, state: &MediaFlowState, stage: PipelineStage) -> u32 {
-        match stage {
-            PipelineStage::VideoDecoding => self
-                .media_component(stage)
+        let width = || {
+            self.media_component(stage)
                 .as_deref()
                 .and_then(|name| self.device_lane_units(name))
                 .unwrap_or(1)
+        };
+        match stage {
+            PipelineStage::VideoDecoding => width()
                 .min(state.request.sampling.num_decode_chunks - state.num_scheduled_decode_chunks),
+            PipelineStage::AudioDecoding => width(),
             _ => 1,
         }
     }
@@ -592,35 +617,28 @@ impl Scheduler {
             // Freeze the actual decode/write interval before advancing scheduled
             // counters. Completion consumes this same range from the submission.
             let decode = match stage {
-                PipelineStage::VideoDecoding => {
-                    let (_, bound, info) = self
-                        .entry_candidates(work, &entry)
-                        .next()
-                        .expect("scheduled decoder has a configured owner");
-                    let component = info
-                        .components
-                        .iter()
-                        .find(|component| component.name == bound)
-                        .expect("scheduled decoder has a loaded component");
-                    let width = u32::try_from(component.config.ranks.len())
-                        .expect("loaded component rank count fits the decode range");
-                    Some(DecodeRange {
-                        request_key,
-                        op_id,
-                        cursor: state.num_scheduled_decode_chunks,
-                        max_units: width.min(
-                            state.request.sampling.num_decode_chunks
-                                - state.num_scheduled_decode_chunks,
-                        ),
-                    })
-                }
+                PipelineStage::VideoDecoding => Some(DecodeRange {
+                    request_key,
+                    op_id,
+                    cursor: state.num_scheduled_decode_chunks,
+                    max_units: self.component_width(work, &entry).min(
+                        state.request.sampling.num_decode_chunks
+                            - state.num_scheduled_decode_chunks,
+                    ),
+                }),
                 PipelineStage::VideoEncoding => Some(DecodeRange {
                     request_key,
                     op_id,
                     cursor: state.num_scheduled_video_chunks,
                     max_units: state.video_segments[&state.num_scheduled_video_chunks].0,
                 }),
-                PipelineStage::AudioDecoding | PipelineStage::AudioEncoding => Some(DecodeRange {
+                PipelineStage::AudioDecoding => Some(DecodeRange {
+                    request_key,
+                    op_id,
+                    cursor: 0,
+                    max_units: self.component_width(work, &entry),
+                }),
+                PipelineStage::AudioEncoding => Some(DecodeRange {
                     request_key,
                     op_id,
                     cursor: 0,

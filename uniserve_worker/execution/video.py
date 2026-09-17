@@ -90,6 +90,33 @@ def audio_samples(runner: ModelRunner, num_frames: int) -> int:
     return round(num_frames * decoder.sample_rate / output.frame_rate)
 
 
+def audio_unit_count(runner: ModelRunner, entry: str) -> int:
+    """Return the media units the audio decoder's ranks reconstruct together.
+
+    The division follows the component's placement, which the engine and every
+    rank read from the same document, so both sides name the same units without
+    carrying the count on the wire.
+    """
+    binding = runner.bindings[entry]
+    if binding.config.distribution is None:
+        return 1
+    return len(binding.config.ranks) * max(1, binding.config.units_per_rank)
+
+
+def audio_unit_windows(
+    runner: ModelRunner, entry: str, num_samples: int
+) -> tuple[slice, ...]:
+    """Return every audio media unit's latent window for one request."""
+    decoder = runner.audio_decoder
+    units = audio_unit_count(runner, entry)
+    if decoder.latent_frames(num_samples) < units:
+        raise unsupported_setup(
+            "audio decoder placement declares more media units than the "
+            "request has latent frames"
+        )
+    return decoder.unit_frames(num_samples, units)
+
+
 def prepare_call(
     runner: ModelRunner, trajectory: VideoState, operation, storage
 ):
@@ -334,13 +361,16 @@ def warmup_decoders(runner: ModelRunner) -> None:
                     shape, dtype=torch.float32, device=binding.device
                 )
                 samples = audio_samples(runner, num_frames)
-                runner.run_module(
-                    name,
-                    (latent,),
-                    method="decode",
-                    size=module.latent_frames(samples),
-                    num_samples=(samples,),
-                )
+                windows = audio_unit_windows(runner, name, samples)
+                for unit in decoded_units(runner, name, len(windows)):
+                    runner.run_module(
+                        name,
+                        (latent,),
+                        method="decode",
+                        size=module.latent_frames(samples),
+                        frames=(windows[unit],),
+                        num_samples=(samples,),
+                    )
 
 
 @torch.inference_mode()
@@ -713,30 +743,27 @@ def execute(
             PipelineStage.VIDEO_DECODING,
             PipelineStage.AUDIO_DECODING,
         }:
-            # Each rank of a video decoder binding owns one window of the
-            # declared chunk range; audio decodes as a single stereo latent.
-            window = None
-            if track is MediaTrack.VIDEO:
-                windows = model_runner.video_decoder.frame_slices(
-                    media.num_frames
-                )
-                binding = model_runner.bindings[operation.entry]
-                position = binding.config.ranks.index(
-                    binding.process_group.global_rank
-                )
-                if (
-                    position >= count
-                    or cursor < 0
-                    or cursor + count > len(windows)
-                ):
-                    raise invalid_descriptor(
-                        "video decoder assignment exceeds its window range"
-                    )
-                window = windows[cursor + position]
-            elif cursor != 0 or count != 1:
+            # Each rank of a distributed decoder binding owns one media unit
+            # of the declared range, on either track.
+            samples = (
+                None
+                if track is MediaTrack.VIDEO
+                else audio_samples(model_runner, media.num_frames)
+            )
+            windows = (
+                model_runner.video_decoder.frame_slices(media.num_frames)
+                if samples is None
+                else audio_unit_windows(model_runner, operation.entry, samples)
+            )
+            binding = model_runner.bindings[operation.entry]
+            position = binding.config.ranks.index(
+                binding.process_group.global_rank
+            )
+            if position >= count or cursor < 0 or cursor + count > len(windows):
                 raise invalid_descriptor(
-                    "audio decoding requires one complete stereo latent"
+                    "media decoder assignment exceeds its media unit range"
                 )
+            window = windows[cursor + position]
             if read.tensor is None:
                 raise invalid_descriptor(
                     "media decoder has no complete numerical input"
@@ -752,13 +779,13 @@ def execute(
                     num_frames=(media.num_frames,),
                 )
             else:
-                samples = audio_samples(model_runner, media.num_frames)
                 decoder = model_runner.component(operation.kind)
                 result = model_runner.run_module(
                     operation.entry,
                     (read.tensor,),
                     method="decode",
                     size=decoder.latent_frames(samples),
+                    frames=(window,),
                     num_samples=(samples,),
                 )
             if result.stats is None:

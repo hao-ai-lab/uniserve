@@ -155,11 +155,13 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                         expected_audio = model.audio_decoder.decoder(
                             native_audio
                         )[:samples].clone()
+                packed = native_audio.transpose(1, 2).reshape(-1, 32)
                 result = runner.run_module(
                     "audio_decoder",
-                    (native_audio.transpose(1, 2).reshape(-1, 32),),
+                    (packed,),
                     method="decode",
                     size=count,
+                    frames=(slice(0, count),),
                     num_samples=(samples,),
                 )
                 assert result.values[0].shape == (samples, 2)
@@ -167,6 +169,35 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                 torch.testing.assert_close(
                     result.values[0], expected_audio, rtol=0, atol=0
                 )
+
+                # Section 5.5 distributes audio by media unit, and a unit
+                # decoded with the decoder's receptive field of context and
+                # trimmed is that unit's share of the whole-track decode.
+                # `tests/python/unit/models/test_h3_audio_units.py` holds that
+                # to exact equality, where arithmetic does not depend on tensor
+                # length. It is not asserted here because it does not hold
+                # bitwise on these kernels: decoding one unit's samples with
+                # the receptive field of context and with twice or three times
+                # it, all sufficient, already disagree by the same few units in
+                # the last place. `specs/serving-architecture-progress.md`
+                # records that measurement and its control.
+                for units in (2, 4):
+                    pieces = [
+                        runner.run_module(
+                            "audio_decoder",
+                            (packed,),
+                            method="decode",
+                            size=count,
+                            frames=(window,),
+                            num_samples=(samples,),
+                        ).values[0]
+                        for window in model.audio_decoder.unit_frames(
+                            samples, units
+                        )
+                    ]
+                    joined = torch.cat(pieces, dim=0)
+                    assert joined.shape == expected_audio.shape
+                    assert joined.dtype == torch.int16
 
                 # A new timeline ignores overlap retained from prior requests.
                 state = storage.view(
@@ -237,6 +268,7 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                     (native_audio.transpose(1, 2).reshape(-1, 32),),
                     method="decode",
                     size=count,
+                    frames=(slice(0, count),),
                     num_samples=(samples,),
                 )
                 audio_values = audio_result.values[0].cpu()

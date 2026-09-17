@@ -156,7 +156,14 @@ class AudioDecoder(BaseAudioDecoder):
             raise ValueError(
                 "audio duration must contain a positive sample count"
             )
-        return math.ceil(num_samples / math.prod(self.config.encoder_rates))
+        return math.ceil(num_samples / self.latent_rate)
+
+    @property
+    def latent_rate(self) -> int:
+        return math.prod(self.config.encoder_rates)
+
+    def latent_halo(self) -> int:
+        return audio_vae.receptive_field(self.config)
 
     def workspace_buffers(
         self, latent_frames: int
@@ -171,7 +178,7 @@ class AudioDecoder(BaseAudioDecoder):
             )
         }
 
-    def unpack_latents(self, latent, num_samples, *, workspace):
+    def unpack_latents(self, latent, num_samples, *, window, workspace):
         frames, channels = (
             self.latent_frames(num_samples),
             self.config.latent_channels,
@@ -180,17 +187,20 @@ class AudioDecoder(BaseAudioDecoder):
             raise ValueError(
                 "audio decoder requires one complete stereo latent timeline"
             )
+        span = window.stop - window.start
         backing = workspace["audio_latents"]
         if (
             backing.ndim != 3
             or backing.shape[:2] != (2, channels)
-            or backing.shape[2] < frames
+            or backing.shape[2] < span
         ):
             raise ValueError(
                 "audio workspace must cover both channel-major latent sequences"
             )
-        # Repack [2 * frames, channels] token rows into the VAE's channel-major
-        # [stereo, channels, frames] layout.
-        inputs = backing[:, :, :frames]
-        inputs.copy_(latent.reshape(2, frames, channels).permute(0, 2, 1))
+        # Repack the window's [2 * frames, channels] token rows into the VAE's
+        # channel-major [stereo, channels, frames] layout.
+        inputs = backing[:, :, :span]
+        inputs.copy_(
+            latent.reshape(2, frames, channels)[:, window, :].permute(0, 2, 1)
+        )
         return inputs
