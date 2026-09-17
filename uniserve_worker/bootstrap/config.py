@@ -317,11 +317,13 @@ def parse_entries(
 class WorkerIpcConfig:
     """Configures IPC launch settings.
 
-    Covers the service name, the payload bound and the queue depth, which
-    bounds the batches this rank holds in flight.
+    Covers the head's registration address, the payload bound and the queue
+    depth, which bounds the batches this rank holds in flight. The rank names
+    its own channel endpoint and reports it to the registration address; the
+    head binds the channel from that report.
     """
 
-    service_name: str
+    registration_address: str
     max_payload_bytes: int
     queue_depth: int
 
@@ -414,7 +416,7 @@ class WorkerProcessArgs:
             worker_id=str(namespace.worker_id),
             supported_ops=supported_ops,
             ipc=WorkerIpcConfig(
-                service_name=str(namespace.service_name),
+                registration_address=str(namespace.registration_address),
                 max_payload_bytes=int(namespace.ipc_payload_cap),
                 queue_depth=int(namespace.queue_depth),
             ),

@@ -20,7 +20,7 @@ from .config import WorkerProcessArgs
 # Values the descriptor must carry. A launch that omits one is a contract
 # violation rather than something to paper over with a local default.
 REQUIRED_FIELDS = (
-    "service_name",
+    "registration_address",
     "worker_id",
     "queue_depth",
     "ipc_payload_cap",

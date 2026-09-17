@@ -5,11 +5,12 @@ mod death_watch;
 mod executor;
 mod instance;
 mod process;
+mod registration;
 
 pub use executor::WorkerExecutor;
 pub use instance::WorkerGroup;
-use process::RankProcess;
 pub use process::{FlashInferBackend, FlashInferBackendParseError, LaneConfig};
+use process::{PendingRank, RankProcess};
 
 /// Backpressure and terminal failures returned by a WorkerGroup run submission.
 #[derive(Debug, thiserror::Error)]

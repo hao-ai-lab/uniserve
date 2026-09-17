@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
+use pyo3::wrap_pyfunction;
 use pythonize::{depythonize, pythonize};
 use uniserve_worker_ipc::{RequestKind, WorkerRequest, WorkerResponse};
 use uniserve_worker_ipc::{ServerEndpoint, WakeSender};
@@ -454,11 +455,21 @@ impl PyServer {
     }
 }
 
+#[pyfunction]
+/// Returns the shared-memory service name for one endpoint identifier.
+///
+/// A rank names its own channel endpoint and reports it to the head, so both
+/// sides have to spell the name the same way; this is that one spelling.
+fn service_name(id: &str) -> String {
+    uniserve_worker_ipc::service_name(id)
+}
+
 #[pymodule]
 /// Registers the worker IPC Python extension module.
 fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyServer>()?;
     m.add_class::<PyStreamSignal>()?;
+    m.add_function(wrap_pyfunction!(service_name, m)?)?;
     Ok(())
 }
 

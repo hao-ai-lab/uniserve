@@ -1,11 +1,12 @@
 """Endpoint ownership across real native IPC and worker launch failures."""
 
 import json
+import socket
 from uuid import uuid4
 
 import pytest
 
-from uniserve_worker.bootstrap.cli import parse_worker_args
+from tests.python.fixtures.launch import worker_args
 from uniserve_worker.bootstrap.launch import WorkerIpcEndpoint, run_worker
 from uniserve_worker.protocol.identity import ComputationId
 from uniserve_worker.protocol.operation import ForwardMode
@@ -13,21 +14,31 @@ from uniserve_worker.protocol.operation import ForwardMode
 pytestmark = pytest.mark.integration
 
 
-def _model_config(service, directory):
-    return parse_worker_args(
-        [
-            "--service-name",
-            service,
-            "--ipc-payload-cap",
-            "65536",
-            "--max-batch-tokens",
-            "256",
-            "--device",
-            "cpu",
-            "--model",
-            str(directory),
-        ]
+def _model_config(directory, **overrides):
+    """Launch one rank against a model path that cannot load."""
+    directory.mkdir(parents=True, exist_ok=True)
+    return worker_args(
+        directory,
+        ipc_payload_cap=65536,
+        max_batch_tokens=256,
+        device="cpu",
+        model=str(directory),
+        **overrides,
     )
+
+
+def _registration_listener():
+    """Stand in for the head, which binds a rank's channel from its report."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    return listener, "{}:{}".format(*listener.getsockname())
+
+
+def _reported_endpoint(listener):
+    """Return the endpoint the rank named for itself."""
+    connection, _ = listener.accept()
+    with connection:
+        connection.settimeout(60)
+        return json.loads(connection.makefile("r").readline())["endpoint"]
 
 
 def test_native_endpoint_close_releases_service_and_rejects_io():
@@ -71,63 +82,42 @@ def test_endpoint_scope_closes_and_preserves_body_error(failing_scope):
         assert replacement.try_recv() is None
 
 
-def test_model_loading_failure_releases_the_launch_endpoint(tmp_path):
-    service = f"worker-{uuid4().hex}"
-    config = _model_config(service, tmp_path)
-    with pytest.raises(FileNotFoundError, match="modular_model_index.json"):
-        run_worker(config)
-    with WorkerIpcEndpoint(service, max_payload=65536) as endpoint:
-        assert endpoint.try_recv() is None
-
-
-def test_endpoint_binding_failure_prevents_model_loading(tmp_path):
-    service = f"worker-{uuid4().hex}"
-    config = _model_config(service, tmp_path)
-    # The model directory is invalid, but an occupied endpoint prevents launch
-    # from reaching checkpoint I/O in the first place.
-    with WorkerIpcEndpoint(service, max_payload=65536) as endpoint:
-        with pytest.raises(RuntimeError, match="failed to bind IPC service"):
+def test_model_loading_failure_releases_the_reported_endpoint(tmp_path):
+    # A rank reports the endpoint it created before it loads anything, so the
+    # endpoint has to survive the report and be released by the failure.
+    listener, address = _registration_listener()
+    config = _model_config(tmp_path / "launch", registration_address=address)
+    with listener:
+        with pytest.raises(FileNotFoundError, match="modular_model_index.json"):
             run_worker(config)
+        service = _reported_endpoint(listener)
+    with WorkerIpcEndpoint(service, max_payload=65536) as endpoint:
         assert endpoint.try_recv() is None
 
 
-def _stub_config(service, *, rank=0, world_size=1, init_method=None):
-    args = [
-        "--service-name",
-        service,
-        "--ipc-payload-cap",
-        "65536",
-        "--max-batch-tokens",
-        "256",
-        "--max-batch-operations",
-        "2",
-        "--device",
-        "cpu",
-        "--no-model",
-        "--allow-stub",
-        "--rank",
-        str(rank),
-        "--world-size",
-        str(world_size),
-        "--kv-token-capacity",
-        "4096",
-    ]
-    args.extend(
-        [
-            "--entries",
-            json.dumps(
-                {
-                    "model": {
-                        "ranks": list(range(world_size)),
-                        "parallel_config": {"tensor_parallel_size": world_size},
-                    }
-                }
-            ),
-        ]
+def _stub_config(directory, *, rank=0, world_size=1, init_method=None):
+    """Launch one weightless rank of a tensor-parallel stub entry."""
+    directory.mkdir(parents=True, exist_ok=True)
+    return worker_args(
+        directory,
+        ipc_payload_cap=65536,
+        max_batch_tokens=256,
+        max_batch_operations=2,
+        device="cpu",
+        no_model=True,
+        allow_stub=True,
+        rank=rank,
+        local_rank=rank,
+        world_size=world_size,
+        kv_token_capacity=4096,
+        entries={
+            "model": {
+                "ranks": list(range(world_size)),
+                "parallel_config": {"tensor_parallel_size": world_size},
+            }
+        },
+        distributed_init_method=init_method,
     )
-    if init_method is not None:
-        args.extend(["--distributed-init-method", init_method])
-    return parse_worker_args(args)
 
 
 @pytest.mark.parametrize("failure", (None, "model_loading", "process_world"))
@@ -146,14 +136,16 @@ def test_worker_preserves_a_caller_owned_process_group(tmp_path, failure):
             with pytest.raises(
                 FileNotFoundError, match="modular_model_index.json"
             ):
-                Worker.from_config(_model_config("borrowed-world", tmp_path))
+                Worker.from_config(_model_config(tmp_path / "borrowed"))
         elif failure == "process_world":
             with pytest.raises(WorkerError, match="rank/world_size") as raised:
-                Worker.from_config(_stub_config("borrowed-world", world_size=2))
+                Worker.from_config(
+                    _stub_config(tmp_path / "borrowed-world", world_size=2)
+                )
             assert raised.value.code is WorkerErrorCode.UNSUPPORTED_SETUP
             assert not raised.value.fatal
         else:
-            with Worker.from_config(_stub_config("borrowed-world")):
+            with Worker.from_config(_stub_config(tmp_path / "borrowed-world")):
                 pass
         value = torch.tensor([7])
         dist.all_reduce(value)
@@ -164,6 +156,7 @@ def test_worker_preserves_a_caller_owned_process_group(tmp_path, failure):
 
 def _owned_world(rank, directory):
     from dataclasses import replace
+    from pathlib import Path
 
     import torch
     import torch.distributed as dist
@@ -176,7 +169,7 @@ def _owned_world(rank, directory):
     # process free to create another world.
     for failure in ("model_loading", "execution_setup", None):
         config = _stub_config(
-            "owned-world",
+            Path(directory) / f"owned-world-{rank}",
             rank=rank,
             world_size=2,
             init_method=f"file://{directory}/world-{failure}",
