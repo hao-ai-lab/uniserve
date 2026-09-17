@@ -142,7 +142,7 @@ uniserve serve /models/Qwen3-32B \
 
 For sequence and pipeline parallelism, combined layouts, and shared execution capabilities, use the [parallel execution guide](docs/parallel-execution.md).
 
-For text-to-video-and-audio generation with `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`, use the [FastH3 cheat sheet](docs/fast_h3/fast_h3.md).
+For text-to-video-and-audio generation with the FastH3 checkpoints, including the packed NVFP4 releases, use the [FastH3 cheat sheet](docs/fast_h3/fast_h3.md).
 
 ## Development and verification
 
