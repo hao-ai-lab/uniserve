@@ -14,7 +14,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 WORKDIR /opt/uniserve
 COPY . .
-RUN uv sync --locked --python /usr/bin/python3.12 --extra h3
+RUN uv sync --locked --python /usr/bin/python3.12 --extra gpu
 
 EXPOSE 8000
 ENTRYPOINT ["uniserve"]

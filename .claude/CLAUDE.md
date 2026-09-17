@@ -18,7 +18,7 @@ The authorized objective governs all work. Measure progress by delivered behavio
 
 ### Environment and Discovery
 
-- Work from the repository root and use the repository environment explicitly, normally `.venv/bin/python`, so commands do not silently select a different interpreter. Bootstrap a basic editable installation with `scripts/bootstrap.sh`; for a complete developer environment use `uv sync --locked --python /usr/bin/python3.12 --extra dev --extra test --extra bench` and add `--extra gpu` for general GPU development or `--extra h3` for FastH3 work. Preserve the lockfile and do not replace pinned accelerator packages with ad hoc versions during formal validation.
+- Work from the repository root and use the repository environment explicitly, normally `.venv/bin/python`, so commands do not silently select a different interpreter. Bootstrap a basic editable installation with `scripts/bootstrap.sh`; for a complete developer environment use `uv sync --locked --python /usr/bin/python3.12 --extra dev --extra test --extra bench` and add `--extra gpu` for GPU development, including FastH3. Preserve the lockfile and do not replace pinned accelerator packages with ad hoc versions during formal validation.
 - Begin with `git status --short`, then use `rg` and `rg --files` to locate owners, callers, tests, configuration, and documentation. Read the relevant public contract and implementation before editing. Treat pre-existing modifications as user work and do not reformat, stage, revert, or overwrite unrelated files.
 - Use the repository's existing public interfaces and ownership boundaries. When a change crosses Python, Rust, model, worker, or evaluation packages, trace the complete request and data path before deciding where the behavior belongs.
 
