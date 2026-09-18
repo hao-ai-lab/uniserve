@@ -431,6 +431,11 @@ table Locator {
   // was probed for: a fabric handle another host can import, or a process
   // descriptor that reaches only this one.
   allocation_handle:[ubyte];
+  // Byte offset of the publication's acknowledgment header inside the exported
+  // allocation, where a consumer writes its own slot's word once its reads have
+  // retired. Negative when the publication carries no header and so retires by
+  // its producer's own accounting.
+  acknowledgment_offset:long = -1;
   nbytes:ulong;
   dtype:string;
   shape:[ulong];

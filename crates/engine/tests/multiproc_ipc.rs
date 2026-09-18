@@ -2272,6 +2272,8 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     const TEMPLATE: &str = r#"{
     "registration_address": "__REGISTRATION__",
     "channel_transport": "iceoryx2",
+    "acknowledgment_slot": 0,
+    "product_consumers": [],
     "worker_id": "worker",
     "queue_depth": 2,
     "ipc_payload_cap": 1048576,

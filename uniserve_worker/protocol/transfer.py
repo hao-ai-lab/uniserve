@@ -151,6 +151,11 @@ class CudaVmmTransfer:
     # travels with the publication rather than through a descriptor grant that
     # only reaches this one.
     allocation_handle: bytes = b""
+    # Byte offset of this publication's acknowledgment header inside the
+    # exported allocation. A consumer writes its own slot's word there once its
+    # reads retire, which retires the chunk without a host-local connection.
+    # Negative when the publication carries no header.
+    acknowledgment_offset: int = -1
 
     def __post_init__(self) -> None:
         """Validate native CUDA handles and the declared allocation bounds."""
