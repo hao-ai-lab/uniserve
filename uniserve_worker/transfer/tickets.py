@@ -41,7 +41,7 @@ from ..protocol.transfer import (
 )
 from .endpoint import PublicationEndpoint, finish_reader, open_reader
 from .layout import region_view, validate_destination
-from .vmm_pool import PoolExhaustedError, VmmPool
+from .vmm_pool import PoolChunk, PoolExhaustedError, VmmPool
 
 if TYPE_CHECKING:
     import torch
@@ -205,12 +205,19 @@ class Transport(ABC):
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
+        consumers: int = 0,
     ) -> Locator:
         """Expose a descriptor and producer fence for an immutable version.
 
         The allocation owner must retain the published range, without writes,
         until publication_retirement() completes after release(). Keeping a
         tensor reference does not authorize reuse of an arena or page range.
+
+        `consumers` is how many ranks the component names as readers of this
+        product. A device transport retires its storage once that many have
+        acknowledged it, which is how a consumer on another host retires a
+        product it could not acknowledge over a host-local connection. A
+        transport whose storage does not move between hosts ignores it.
         """
 
     @abstractmethod
@@ -835,6 +842,9 @@ class LocalTransport(Transport):
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
+        # Storage that never leaves this host retires with its readers'
+        # connections, so the acknowledgment count does not apply.
+        consumers: int = 0,  # noqa: ARG002
     ) -> Locator:
         """Register a detached tensor in the in-process endpoint table.
 
@@ -1221,6 +1231,9 @@ class ShmTransport(Transport):
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
+        # Storage that never leaves this host retires with its readers'
+        # connections, so the acknowledgment count does not apply.
+        consumers: int = 0,  # noqa: ARG002
     ) -> Locator:
         """Register source storage before exposing its readiness descriptor."""
         import torch
@@ -1429,10 +1442,17 @@ class _CudaSource:
     handle: bytes
     copied_source: torch.Tensor | tuple[torch.Tensor, ...] | None = None
     retirement: concurrent.futures.Future[None] | None = None
+    #: Pool and chunk this publication occupies, when it came from a pool.
+    pool: VmmPool | None = None
+    chunk: PoolChunk | None = None
 
     def events_released(self) -> None:
         # A shareable handle is bytes the publication carried, not a process
-        # descriptor this rank owns, so nothing is closed here.
+        # descriptor this rank owns, so nothing is closed here. A chunk whose
+        # consumers are still acknowledging is returned by the pool's sweep
+        # instead, so only an unawaited chunk is released here.
+        if self.pool is not None and self.chunk is not None:
+            self.pool.release(self.chunk)
         self.capacity.release(self.nbytes)
         if self.retirement is not None:
             self.retirement.set_result(None)
@@ -1525,6 +1545,7 @@ class CudaVmmTransport(Transport):
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
+        consumers: int = 0,
     ) -> Locator:
         """Export an immutable source and retain capacity.
 
@@ -1583,7 +1604,9 @@ class CudaVmmTransport(Transport):
                 first = shared
                 descriptor = pool.handle
                 storage_size = pool.capacity
-                storage_offset = chunk.offset
+                # A consumer reads the payload, which follows the chunk's
+                # acknowledgment words, so the offset names the payload.
+                storage_offset = chunk.payload_offset
             else:
                 exported = export_handle(first)
                 if exported is None:
@@ -1606,8 +1629,20 @@ class CudaVmmTransport(Transport):
             self._events.retain(event, first.device)
             self._events.record(event, first.device)
             publication = _CudaSource(
-                source, event, nbytes, self._bytes, descriptor, copied_source
+                source,
+                event,
+                nbytes,
+                self._bytes,
+                descriptor,
+                copied_source,
+                pool=pool if chunk is not None else None,
+                chunk=chunk,
             )
+            if chunk is not None and consumers > 0:
+                # The chunk returns to its pool once every rank the component
+                # names has written its acknowledgment, which a consumer on
+                # another host can do and a reader connection could not carry.
+                pool.await_acknowledgment(chunk, consumers)
 
             # Run-length encode first-axis span lengths so the importer can
             # rebuild every span view without a per-span locator entry.
@@ -1890,11 +1925,15 @@ def publish_tensor(
     *,
     retain: Callable[[concurrent.futures.Future[None]], None],
     offset: tuple[int, ...] | None = None,
+    consumers: int = 0,
 ) -> tuple[Locator, ...]:
     """Publish one representation through each explicitly required backend.
 
     A partial failure revokes all preceding locations. Each backend continues
     to retain the source until its submitted device work and readers retire.
+
+    `consumers` is how many ranks the component names as readers, which a
+    device transport uses to know when its storage may be reused.
     """
     if not transports:
         raise unsupported_setup(
@@ -1903,7 +1942,9 @@ def publish_tensor(
     locations: list[Locator] = []
     try:
         for transport in transports.values():
-            location = transport.publish(source, offset=offset)
+            location = transport.publish(
+                source, offset=offset, consumers=consumers
+            )
             locations.append(location)
             retain(transport.publication_retirement(location))
     except BaseException:
