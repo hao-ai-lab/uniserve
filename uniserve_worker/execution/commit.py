@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 def _commit_group(
-    run_id: int,
+    batch_id: int,
     completion_group: int,
     outcomes: tuple[PendingOutput, ...],
     started: int,

@@ -8,15 +8,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use super::RunSubmitError;
+use super::BatchSubmitError;
 use crate::executor::WorkerExecError;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use uniserve_worker_ipc::{Batch, WorkerInfo, WorkerRequest, WorkerResponse};
 use uniserve_worker_ipc::{ClientEndpoint, Frame, Pending};
-use uniserve_worker_ipc::{
-    ComputationId, RequestKey, ScheduleBatch, WorkerInfo, WorkerRequest, WorkerResponse,
-};
 
 use crate::worker::WorkerProcessArgs;
 use crate::worker::death_watch::DeathWatcher;
@@ -411,10 +409,7 @@ fn release_consumed_request(record: PendingRecord) -> OutstandingKind {
 }
 
 enum OutstandingKind {
-    Batch {
-        run_id: u64,
-        remaining_operations: HashSet<(RequestKey, ComputationId)>,
-    },
+    Batch { batch_id: u64 },
 }
 
 impl PendingRank {
@@ -768,9 +763,8 @@ impl RankProcess {
             let record = self.pending.remove(&call_id).ok_or_else(|| {
                 anyhow::anyhow!("pending record {call_id} disappeared while routing response")
             })?;
-            // Consuming a partial execute response ends this physical IPC
-            // request. Release its iceoryx active-request slot before routing
-            // can submit the continuation poll for the remaining lanes.
+            // Consuming the response ends this IPC request. Release its
+            // iceoryx active-request slot before routing the result.
             let kind = release_consumed_request(record);
             self.route(call_id, kind, frame)?;
             drained += 1;
@@ -780,16 +774,13 @@ impl RankProcess {
 
     /// Acquires output storage before validating response correlation.
     fn route(&mut self, call_id: u64, kind: OutstandingKind, frame: Frame) -> anyhow::Result<()> {
-        let OutstandingKind::Batch {
-            run_id,
-            remaining_operations,
-        } = kind;
+        let OutstandingKind::Batch { batch_id } = kind;
         let response = frame.decode_response()?;
         let echoed = response.call_id();
         let report = match response {
             WorkerResponse::Result { result, .. } => Ok(WorkerResult::receive(result)),
             WorkerResponse::Error { error, .. } => Err(WorkerExecError {
-                run_id: Some(run_id),
+                batch_id: Some(batch_id),
                 fatal: error.fatal,
                 code: error.code,
                 message: error.message,
@@ -814,17 +805,8 @@ impl RankProcess {
         {
             bail!("worker response echoed call id {echoed}, expected {call_id}");
         }
-        self.route_batch(run_id, remaining_operations, report?)
-    }
-
-    /// Accumulates a partial run response or schedules polling for remaining operations.
-    fn route_batch(
-        &mut self,
-        run_id: u64,
-        mut remaining_operations: HashSet<(RequestKey, ComputationId)>,
-        r: WorkerResult,
-    ) -> anyhow::Result<()> {
-        for product in &r.products {
+        let report = report?;
+        for product in &report.products {
             anyhow::ensure!(
                 product
                     .value
@@ -833,54 +815,12 @@ impl RankProcess {
                 "worker published a product from an unbound rank incarnation"
             );
         }
-        if r.run_id != run_id {
-            bail!(
-                "worker result step id mismatch: expected {run_id}, got {}",
-                r.run_id
-            );
-        }
-        for output in &r.results {
-            anyhow::ensure!(
-                remaining_operations.remove(&(output.output.request_key, output.output.op_id)),
-                "worker returned a duplicate or unknown operation for step {run_id}"
-            );
-        }
         anyhow::ensure!(
-            !r.done || remaining_operations.is_empty(),
-            "worker run completion flag disagrees with remaining physical work"
+            report.batch_id == batch_id,
+            "worker result batch id mismatch: expected {batch_id}, got {}",
+            report.batch_id
         );
-        anyhow::ensure!(
-            !r.results.is_empty() || r.done,
-            "worker returned an empty partial completion for step {run_id}"
-        );
-        let done = r.done;
-        self.ready.push_back(r);
-        if !done {
-            self.submit_completion_poll(run_id, remaining_operations)?;
-        }
-        Ok(())
-    }
-
-    /// Submits a continuation poll for the unresolved operations of one run.
-    fn submit_completion_poll(
-        &mut self,
-        run_id: u64,
-        remaining_operations: HashSet<(RequestKey, ComputationId)>,
-    ) -> anyhow::Result<()> {
-        let call_id = self.alloc_call_id();
-        let mut request = WorkerRequest::poll(run_id);
-        request.set_call_id(Some(call_id));
-        let pending = self.send_request_checked(&request, "completion poll")?;
-        self.pending.insert(
-            call_id,
-            PendingRecord {
-                kind: OutstandingKind::Batch {
-                    run_id,
-                    remaining_operations,
-                },
-                pending,
-            },
-        );
+        self.ready.push_back(report);
         Ok(())
     }
 
@@ -897,30 +837,22 @@ impl RankProcess {
     }
 
     /// Submits one physical run and records its outstanding operation identities.
-    pub(super) fn submit_run(&mut self, batch: ScheduleBatch) -> Result<(), RunSubmitError> {
-        self.drain_ready().map_err(RunSubmitError::Failed)?;
+    pub(super) fn submit_batch(&mut self, batch: Batch) -> Result<(), BatchSubmitError> {
+        self.drain_ready().map_err(BatchSubmitError::Failed)?;
         if self.pending.len() >= self.depth {
-            return Err(RunSubmitError::WouldBlock(batch));
+            return Err(BatchSubmitError::WouldBlock(batch));
         }
-        let run_id = batch.run_id;
-        let remaining_operations = batch
-            .operations
-            .iter()
-            .map(|operation| (operation.request_key, operation.op_id))
-            .collect::<HashSet<_>>();
+        let batch_id = batch.batch_id;
         let call_id = self.alloc_call_id();
         let mut req = WorkerRequest::submit(batch);
         req.set_call_id(Some(call_id));
         let pending = self
             .send_request_checked(&req, "batch submit")
-            .map_err(RunSubmitError::Failed)?;
+            .map_err(BatchSubmitError::Failed)?;
         self.pending.insert(
             call_id,
             PendingRecord {
-                kind: OutstandingKind::Batch {
-                    run_id,
-                    remaining_operations,
-                },
+                kind: OutstandingKind::Batch { batch_id },
                 pending,
             },
         );
@@ -928,7 +860,7 @@ impl RankProcess {
     }
 
     /// Drives IPC progress until a result, command wake, worker death, or timeout.
-    pub(super) fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
+    pub(super) fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
         if self.command_wake_pending {
             return Ok(None);
         }

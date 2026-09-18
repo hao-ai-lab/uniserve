@@ -13,7 +13,7 @@ import torch
 
 from tests.python.fixtures.depth_one import (
     ar_params,
-    execution_run,
+    execution_batch,
     finalized_report,
     record_completion,
     root_parent,
@@ -92,8 +92,8 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 extended = finalized_report(
                     owner,
                     owner.submit(
-                        execution_run(
-                            run_id=1,
+                        execution_batch(
+                            batch_id=1,
                             admissions=(request,),
                             operations=(extend,),
                         )
@@ -108,8 +108,8 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 published = finalized_report(
                     owner,
                     owner.submit(
-                        execution_run(
-                            run_id=2, operations=(publication,), commands=()
+                        execution_batch(
+                            batch_id=2, operations=(publication,), commands=()
                         )
                     ),
                 )
@@ -183,36 +183,40 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 )
                 installation, installed = _installation_operation(
                     incoming,
-                    op_id=ComputationId(3, 0),
+                    op_id=ComputationId(4, 0),
                     predecessor=root_parent(incoming),
                     source=source.source,
                 )
                 independent = ar_params(46, block_ids=(1,))
                 operation = token_operation(
                     independent.request_key,
-                    op_id=ComputationId(1, 0),
+                    op_id=ComputationId(5, 0),
                     predecessor=root_parent(independent),
                     mode=ForwardMode.PREFILL,
                     tokens=(6, 7),
                 )
                 runs = (
-                    execution_run(run_id=3, commands=(finish,)),
-                    execution_run(
-                        run_id=4,
+                    execution_batch(batch_id=3, commands=(finish,)),
+                    execution_batch(
+                        batch_id=4,
                         admissions=(incoming,),
                         operations=(installation,),
                         kv_inputs=(incoming_payload,),
                         **_installation_allocation(installation, 2),
                     ),
-                    execution_run(
-                        run_id=5,
+                    execution_batch(
+                        batch_id=5,
                         admissions=(independent,),
                         operations=(operation,),
                     ),
                 )
                 ipc = QueuedWorkerIpc(
                     tuple(
-                        {"kind": "submit", "call_id": run.run_id, "run": run}
+                        {
+                            "kind": "submit",
+                            "call_id": run.batch_id,
+                            "batch": run,
+                        }
                         for run in runs
                     )
                 )
@@ -231,7 +235,6 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     reader_held = False
                     response = ipc.receive()
                     assert response["call_id"] == 3, response
-                    assert BatchOutput.from_mapping(response["result"]).done
                     assert accepted.wait(5), (
                         "retiring storage did not start the dependent read"
                     )
@@ -318,8 +321,8 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         tokens=(3, 4),
     )
     first_result = worker.submit(
-        execution_run(
-            run_id=1,
+        execution_batch(
+            batch_id=1,
             admissions=(admission,),
             operations=(extend,),
         )
@@ -347,8 +350,8 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     closure_result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=2,
+            execution_batch(
+                batch_id=2,
                 admissions=(),
                 operations=(closure,),
                 commands=(),
@@ -369,8 +372,8 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     publication_result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 admissions=(),
                 operations=(publication,),
                 commands=(),
@@ -406,8 +409,8 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     suffix_result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=4,
+            execution_batch(
+                batch_id=4,
                 admissions=(),
                 operations=(suffix_closure,),
             )
@@ -424,8 +427,8 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     incremental_result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=5,
+            execution_batch(
+                batch_id=5,
                 admissions=(),
                 operations=(incremental,),
                 commands=(),
@@ -454,8 +457,8 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
     )
     try:
         extended = producer.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(extend,),
             )
@@ -470,8 +473,8 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         published = finalized_report(
             producer,
             producer.submit(
-                execution_run(
-                    run_id=2,
+                execution_batch(
+                    batch_id=2,
                     operations=(publication,),
                     commands=(),
                 )
@@ -484,8 +487,8 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             predecessor=root_parent(admission),
             source=source,
         )
-        batch = execution_run(
-            run_id=3,
+        batch = execution_batch(
+            batch_id=3,
             admissions=(admission,),
             operations=(installation,),
             kv_inputs=(published.completions[0].kv_output,),
@@ -513,7 +516,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         repeated = finalized_report(
             producer,
             producer.submit(
-                execution_run(run_id=4, operations=(repeated_publication,))
+                execution_batch(batch_id=4, operations=(repeated_publication,))
             ),
         )
         repeated_install, repeated_installed = _installation_operation(
@@ -522,8 +525,8 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             predecessor=root_parent(admission),
             source=repeated_source,
         )
-        repeated_batch = execution_run(
-            run_id=5,
+        repeated_batch = execution_batch(
+            batch_id=5,
             operations=(repeated_install,),
             kv_inputs=(repeated.completions[0].kv_output,),
             block_tables=(BlockTable(admission.request_pool_idx, 0, (1,), 2),),
@@ -538,8 +541,8 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         finalized_report(
             producer,
             producer.submit(
-                execution_run(
-                    run_id=6,
+                execution_batch(
+                    batch_id=6,
                     commands=(Free(source),),
                 )
             ),
@@ -551,8 +554,8 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             source=source,
         )
         expired = released_consumer.submit(
-            execution_run(
-                run_id=5,
+            execution_batch(
+                batch_id=5,
                 admissions=(admission,),
                 operations=(expired_install,),
                 kv_inputs=(published.completions[0].kv_output,),
@@ -589,8 +592,8 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
     )
     try:
         extended = producer.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(extend,),
             )
@@ -606,8 +609,8 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             finalized_report(
                 producer,
                 producer.submit(
-                    execution_run(
-                        run_id=2, operations=(publication,), commands=()
+                    execution_batch(
+                        batch_id=2, operations=(publication,), commands=()
                     )
                 ),
             )
@@ -639,8 +642,8 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             source=source,
         )
         prepared = consumer.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 admissions=(admission,),
                 operations=(installation,),
                 kv_inputs=(payload,),
@@ -667,8 +670,8 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             source=source,
         )
         prepared_retry = consumer.submit(
-            execution_run(
-                run_id=4,
+            execution_batch(
+                batch_id=4,
                 admissions=(admission,),
                 operations=(retry,),
                 kv_inputs=(published,),

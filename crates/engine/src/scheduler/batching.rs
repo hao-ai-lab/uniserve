@@ -19,11 +19,11 @@ impl Scheduler {
     pub(super) fn assemble(&mut self) -> Vec<ExecutionBatch> {
         let ids = self.assembly_order();
         let lane = self.select_batch_kind(&ids);
-        let batches = self.assemble_pass(&ids, lane);
+        let batches = self.assemble_batch(&ids, lane);
         if batches.is_empty() && !self.fatal && lane == Some(BatchKind::Prefill) {
             // A blocked prefill lane must not prevent already-ready decode work
             // from using the execution slot.
-            return self.assemble_pass(&ids, Some(BatchKind::Decode));
+            return self.assemble_batch(&ids, Some(BatchKind::Decode));
         }
         batches
     }
@@ -124,7 +124,7 @@ impl Scheduler {
     }
 
     /// Selects compatible computations within one lane's token and sequence budgets.
-    pub(super) fn assemble_pass(
+    pub(super) fn assemble_batch(
         &mut self,
         ids: &[RequestId],
         lane: Option<BatchKind>,
@@ -302,8 +302,11 @@ impl Scheduler {
         }
 
         // Prompt commands remain disjoint from earlier state writers. The
-        // round's retirements travel with the last batch so no earlier call
-        // loses the state it still reads.
+        // round's retirements travel with its last batch so no earlier call
+        // loses the state it still reads. They do not travel in a batch of
+        // their own: a rank's queue depth bounds submissions, not round trips,
+        // so a command-only batch costs the round a queue slot and halves how
+        // many rounds a depth-two rank can hold in flight.
         let prompt_only = code_order
             .iter()
             .all(|code| batch_kind(*code) == BatchKind::Prefill);

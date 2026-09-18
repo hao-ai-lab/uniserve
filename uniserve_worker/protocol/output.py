@@ -604,72 +604,14 @@ class ForwardStats:
 
 @dataclass(frozen=True, slots=True)
 class BatchOutput:
-    """One wire-ready response fragment containing only host-owned values."""
+    """One batch's complete result, carrying only host-owned values."""
 
     batch_id: int
-    run_id: int
     completions: tuple[RequestOutput, ...] = ()
     products: tuple[TensorPublication, ...] = ()
     registration: RegistrationAck = field(default_factory=RegistrationAck)
     worker_exec_us: int | None = None
     forward_stats: ForwardStats | None = None
-    done: bool = True
-
-    @classmethod
-    def combine(cls, fragments: Sequence[BatchOutput]) -> BatchOutput:
-        """Collect response fragments from one run.
-
-        Does not change field ordering.
-        """
-        if not fragments:
-            raise ValueError("batch output requires at least one fragment")
-        first = fragments[0]
-        if any(
-            (value.batch_id, value.run_id) != (first.batch_id, first.run_id)
-            for value in fragments
-        ):
-            raise invalid_descriptor(
-                "output fragments belong to different batches"
-            )
-
-        # Only fragments that carry results participate in merged timing,
-        # stats, and registration visibility; empty fragments are inert.
-        payloads = tuple(
-            value
-            for value in fragments
-            if value.completions
-            or value.products
-            or value.worker_exec_us is not None
-            or value.forward_stats is not None
-        )
-        durations = tuple(
-            value.worker_exec_us
-            for value in payloads
-            if value.worker_exec_us is not None
-        )
-        stats = tuple(
-            value.forward_stats
-            for value in payloads
-            if value.forward_stats is not None
-        )
-
-        return cls(
-            batch_id=first.batch_id,
-            run_id=first.run_id,
-            completions=tuple(
-                output for value in fragments for output in value.completions
-            ),
-            products=tuple(
-                output for value in fragments for output in value.products
-            ),
-            registration=RegistrationAck(
-                visible=bool(payloads)
-                and all(value.registration.visible for value in payloads)
-            ),
-            worker_exec_us=max(durations) if durations else None,
-            forward_stats=ForwardStats.combine(stats) if stats else None,
-            done=fragments[-1].done,
-        )
 
     @classmethod
     def from_mapping(
@@ -682,7 +624,6 @@ class BatchOutput:
         data = _map(value, where)
         return cls(
             batch_id=_uint(data.get("batch_id"), f"{where}.batch_id"),
-            run_id=_uint(data.get("run_id"), f"{where}.run_id"),
             completions=tuple(
                 RequestOutput.from_mapping(
                     item, f"{where}.completions[{index}]"
@@ -712,7 +653,6 @@ class BatchOutput:
                     data["forward_stats"], f"{where}.forward_stats"
                 )
             ),
-            done=_bool(data.get("done", True), f"{where}.done"),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -722,7 +662,6 @@ class BatchOutput:
         """
         return {
             "batch_id": self.batch_id,
-            "run_id": self.run_id,
             "completions": [value.to_mapping() for value in self.completions],
             "products": [value.to_mapping() for value in self.products],
             "registration": self.registration.to_mapping(),
@@ -730,5 +669,4 @@ class BatchOutput:
             "forward_stats": None
             if self.forward_stats is None
             else self.forward_stats.to_mapping(),
-            "done": self.done,
         }

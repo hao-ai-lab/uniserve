@@ -28,6 +28,7 @@ from ..execution.graph_inputs import DiffusionShape
 from ..execution.model_runner import capture_image_parameters
 from ..foundation.errors import invalid_descriptor
 from ..protocol.batch import (
+    Batch,
     BatchCommand,
     BlockTable,
     BufferAllocation,
@@ -36,7 +37,6 @@ from ..protocol.batch import (
     Free,
     LatentParams,
     NewRequest,
-    ScheduleBatch,
     Start,
     TensorPublication,
 )
@@ -72,7 +72,7 @@ class _WarmupRequests:
         self._free_buffer_ranges: list[tuple[int, int]] = [
             (0, int(self.worker.info.buffer_pool_bytes))
         ]
-        self._run_id = 0
+        self._batch_id = 0
 
     def drop_request(self, request_id: int) -> None:
         """Release warmup state for one identifier.
@@ -120,12 +120,11 @@ class _WarmupRequests:
 
         The same acknowledgement serving uses.
         """
-        self._run_id += 1
+        self._batch_id += 1
         _execute_warmup(
             self,
-            ScheduleBatch(
-                batch_id=self._run_id,
-                run_id=self._run_id,
+            Batch(
+                batch_id=self._batch_id,
                 commands=commands,
             ),
             retain_device_outputs=True,
@@ -191,7 +190,7 @@ class _WarmupRequests:
 
 def _warmup_batch(
     *,
-    run_id: int,
+    batch_id: int,
     admissions: tuple[NewRequest, ...],
     operations: tuple[ScheduledRequest, ...],
     block_tables: dict[
@@ -209,17 +208,16 @@ def _warmup_batch(
     latent_params: dict[tuple[RequestKey, ComputationId], LatentParams],
     buffer_allocations: tuple[BufferAllocation, ...],
     input_products: tuple[TensorPublication, ...] = (),
-) -> ScheduleBatch:
+) -> Batch:
     """Assemble warmup operations and their physical input columns.
 
     forward_inputs maps each operation to its forward-row columns:
     (request_pool_indices, seq_lens, query_lens, write_kv). The batch
-    flattens them into the ScheduleBatch's parallel row arrays.
+    flattens them into the Batch's parallel row arrays.
     """
-    return ScheduleBatch(
-        batch_id=run_id,
-        run_id=run_id,
-        collective_seq=max(1, int(run_id) * 16 + 1),
+    return Batch(
+        batch_id=batch_id,
+        collective_seq=max(1, int(batch_id) * 16 + 1),
         operations=operations,
         block_tables=tuple(
             table
@@ -322,7 +320,7 @@ def _warmup_token_output(
 
 def _execute_warmup(
     requests: _WarmupRequests,
-    batch: ScheduleBatch,
+    batch: Batch,
     *,
     retain_device_outputs: bool = False,
 ) -> BatchOutput:
@@ -333,20 +331,13 @@ def _execute_warmup(
     worker = requests.worker
     state = worker.submit(batch, propagate_errors=True)
 
-    # Drive the worker loop until the run's final fragment arrives.
-    fragments: list[BatchOutput] = []
+    # A batch is one call on one component, so it returns one result.
     while True:
         worker.advance()
-        output = worker.poll(state)
-        if output is None:
-            time.sleep(0.00005)
-            continue
-
-        fragments.append(output)
-        if output.done:
+        finalized = worker.poll(state)
+        if finalized is not None:
             break
-
-    finalized = BatchOutput.combine(fragments)
+        time.sleep(0.00005)
     device_buffers = tuple(
         output.buffer_id
         for operation in batch.operations
@@ -401,12 +392,12 @@ def _build_warmup_batch(
     operations: tuple[ScheduledRequest, ...],
     input_products: tuple[TensorPublication, ...] = (),
     image_size: tuple[int, int] | None = None,
-) -> ScheduleBatch:
+) -> Batch:
     """Derive allocations for a warmup submission.
 
     Covers cache, latent, buffer, and row allocations.
     """
-    requests._run_id += 1
+    requests._batch_id += 1
     admissions_by_key = {
         admission.request_key: admission for admission in admissions
     }
@@ -654,7 +645,7 @@ def _build_warmup_batch(
             forward_inputs[identity] = flow_rows
 
     return _warmup_batch(
-        run_id=requests._run_id,
+        batch_id=requests._batch_id,
         admissions=admissions,
         operations=operations,
         block_tables=block_tables,
@@ -962,7 +953,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
     operations: list[ScheduledRequest] = []
     for sid in request_ids:
         root = ComputationId(0, 0)
-        op_id = ComputationId(requests._run_id + 1, len(operations))
+        op_id = ComputationId(requests._batch_id + 1, len(operations))
         operation = prompt_op(sid, op_id, root, (0,))
         operations.append(operation)
 
@@ -982,7 +973,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
             selected = request_ids[:batch_size]
             operations = []
             for sid in selected:
-                op_id = ComputationId(requests._run_id + 1, len(operations))
+                op_id = ComputationId(requests._batch_id + 1, len(operations))
                 operations.append(decode_op(sid, op_id, predecessors[sid]))
 
             _execute_warmup(
@@ -1091,7 +1082,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         conditionings: list[BufferId] = []
         publications: list[ScheduledRequest] = []
         for key, root in zip(keys, roots, strict=True):
-            op_id = ComputationId(requests._run_id + 1, len(publications))
+            op_id = ComputationId(requests._batch_id + 1, len(publications))
             conditioning = BufferId(
                 owner=key,
                 producer_op_id=op_id,
@@ -1137,7 +1128,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         for key, root, conditioning in zip(
             keys, roots, conditionings, strict=True
         ):
-            op_id = ComputationId(requests._run_id + 1, len(transitions))
+            op_id = ComputationId(requests._batch_id + 1, len(transitions))
             initial_latent = TensorRef(
                 request_key=key,
                 producer_op_id=op_id,
@@ -1192,7 +1183,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         current_latents = tuple(initial_latents)
         flow_predecessors = dict(zip(request_ids, transitions, strict=True))
 
-        # Chain two denoise quanta so back-to-back execution shapes run. Each
+        # Chain two denoise quanta so back-to-back execution shapes batch. Each
         # quantum covers one step, so it enters at the step its index names.
         for quantum in range(2):
             outputs: list[TensorRef] = []
@@ -1200,7 +1191,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
             for request_id, key, conditioning, current in zip(
                 request_ids, keys, conditionings, current_latents, strict=True
             ):
-                op_id = ComputationId(requests._run_id + 1, len(flows))
+                op_id = ComputationId(requests._batch_id + 1, len(flows))
                 output = TensorRef(
                     request_key=key,
                     producer_op_id=op_id,

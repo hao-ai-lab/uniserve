@@ -1,4 +1,4 @@
-"""Depth-one ``ScheduledRequest``/``ScheduleBatch`` builders.
+"""Depth-one ``ScheduledRequest``/``Batch`` builders.
 
 These are builders for worker forward-behavior tests.
 
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from uniserve_worker.worker import Worker
 
 from uniserve_worker.protocol.batch import (
+    Batch,
     BatchCommand,
     BlockTable,
     BufferAllocation,
@@ -30,7 +31,6 @@ from uniserve_worker.protocol.batch import (
     GenerationParams,
     LatentParams,
     NewRequest,
-    ScheduleBatch,
     Start,
     TensorPublication,
 )
@@ -83,7 +83,7 @@ _CALL_PROJECTIONS: dict[tuple[RequestKey, ComputationId], tuple[str, int]] = {}
 # Runs this fixture assembled. A worker also submits its own warmup batches,
 # which state their own coordinates and are left untouched. Each entry holds
 # its run so the identity stays valid until the run is submitted.
-_FIXTURE_RUNS: dict[int, ScheduleBatch] = {}
+_FIXTURE_BATCHES: dict[int, Batch] = {}
 _LATENT_STEPS: dict[TensorRef, int] = {}
 _MAX_CFG_BRANCHES = 1
 _REQUEST_POOL_SIZE = 1
@@ -141,7 +141,7 @@ def _reset_request(rk: RequestKey) -> None:
             identity for identity in table if identity[0] == rk
         ):
             table.pop(identity, None)
-    _FIXTURE_RUNS.clear()
+    _FIXTURE_BATCHES.clear()
     for ledger in _LEDGERS.values():
         ledger.detached.difference_update(
             identity for identity in tuple(ledger.detached) if identity[0] == rk
@@ -323,14 +323,14 @@ def _alternative_pages(rk: RequestKey, tokens: int) -> tuple[int, ...]:
     return selected
 
 
-def stamp_batch(worker: object, batch: ScheduleBatch) -> ScheduleBatch:
+def stamp_batch(worker: object, batch: Batch) -> Batch:
     """State every call's coordinates from the worker's request ledger.
 
     The engine stamps coordinates when it assembles a batch, from the request
     state it owns, and carries its own projection forward so the next call it
     submits states where this one leaves off.
     """
-    _FIXTURE_RUNS.pop(id(batch), None)
+    _FIXTURE_BATCHES.pop(id(batch), None)
     ledger = _ledger(worker).current
     submitted = _ledger(worker).submitted
     detached = _ledger(worker).detached
@@ -363,13 +363,13 @@ def stamp_batch(worker: object, batch: ScheduleBatch) -> ScheduleBatch:
     return replace(batch, operations=tuple(stamped))
 
 
-def submitted_run(worker: object, batch: ScheduleBatch) -> ScheduleBatch:
+def submitted_batch(worker: object, batch: Batch) -> Batch:
     """State the coordinates of a run this fixture assembled.
 
     A worker also submits its own warmup batches, which state their own
     coordinates and pass through untouched.
     """
-    if _FIXTURE_RUNS.get(id(batch)) is None:
+    if _FIXTURE_BATCHES.get(id(batch)) is None:
         return batch
     return stamp_batch(worker, batch)
 
@@ -402,9 +402,9 @@ def observe_completions(worker: object, report: BatchOutput) -> None:
         )
 
 
-def execution_run(
+def execution_batch(
     *,
-    run_id: int,
+    batch_id: int,
     admissions: Sequence[NewRequest] = (),
     operations: Sequence[ScheduledRequest] = (),
     input_products: Sequence[TensorPublication] = (),
@@ -412,10 +412,15 @@ def execution_run(
     commands: Sequence[BatchCommand] = (),
     block_tables: Sequence[BlockTable] = (),
     new_cache_pages: Sequence[CachePageAllocation] = (),
-) -> ScheduleBatch:
+) -> Batch:
     """Build scheduler columns and physical allocations.
 
     The columns and allocations drive observable worker behavior.
+
+    A submission that carries calls takes its identity from them, because a
+    call's ``op_id`` already names the batch that carries it. ``batch_id``
+    names a command-only submission and orders every submission's
+    collectives, so successive submissions to one worker must advance it.
     """
     for admission in admissions:
         if admission.image is not None:
@@ -556,10 +561,12 @@ def execution_run(
     for allocation in new_cache_pages:
         identity = (allocation.request_pool_idx, allocation.group_id)
         allocations.setdefault(identity, set()).update(allocation.page_ids)
-    run = ScheduleBatch(
-        batch_id=operations[0].op_id.batch_id if operations else int(run_id),
-        run_id=int(run_id),
-        collective_seq=int(run_id) * 1024 + 2,
+    # A call's identity names the batch that carries it, so a submission that
+    # carries calls takes its identity from them; `batch_id` names a
+    # command-only submission and orders every submission's collectives.
+    run = Batch(
+        batch_id=operations[0].op_id.batch_id if operations else int(batch_id),
+        collective_seq=int(batch_id) * 1024 + 2,
         operations=tuple(operations),
         block_tables=tuple(tables.values()),
         new_cache_pages=tuple(
@@ -594,7 +601,7 @@ def execution_run(
         commands=tuple(Start(request) for request in admissions)
         + tuple(commands),
     )
-    _FIXTURE_RUNS[id(run)] = run
+    _FIXTURE_BATCHES[id(run)] = run
     return run
 
 
@@ -650,20 +657,14 @@ def root_parent(admission: NewRequest) -> ComputationId:
 
 
 def finalized_report(worker: Worker, state: BatchState) -> BatchOutput:
-    """Drive the public Worker interface.
-
-    The drive continues until every response fragment is delivered.
-    """
+    """Drive the public Worker interface until the batch returns its result."""
     deadline = time.monotonic() + 10.0
-    fragments: list[BatchOutput] = []
     while True:
         worker.advance()
         output = worker.poll(state)
         if output is not None:
-            fragments.append(output)
             observe_completions(worker, output)
-            if output.done:
-                return BatchOutput.combine(fragments)
+            return output
         if time.monotonic() >= deadline:
             raise TimeoutError("worker completion did not become query-ready")
         time.sleep(0.00005)
@@ -982,7 +983,7 @@ __all__ = [
     "bind_request_allocation",
     "record_completion",
     "encode_operation",
-    "execution_run",
+    "execution_batch",
     "finalized_report",
     "diffusion_step_operation",
     "diffusion_prepare_operation",
@@ -991,7 +992,7 @@ __all__ = [
     "kv_publication_operation",
     "observe_completions",
     "stamp_batch",
-    "submitted_run",
+    "submitted_batch",
     "record_kv_result",
     "request_key",
     "root_parent",

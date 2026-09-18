@@ -16,8 +16,8 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use uniserve_worker_ipc::{
-    BatchCommand, BatchOutput, BlockTable, BufferAllocation, CachePageAllocation, Computation,
-    ComputationId, DecodeRange, ForwardBatch, LatentParams, NewRequest, RequestKey, ScheduleBatch,
+    Batch, BatchCommand, BatchOutput, BlockTable, BufferAllocation, CachePageAllocation,
+    Computation, ComputationId, DecodeRange, ForwardBatch, LatentParams, NewRequest, RequestKey,
     ScheduledRequest, TensorPublication, WorkerInfo,
 };
 
@@ -40,7 +40,7 @@ pub struct RequestPlacement {
     pub buffers: Vec<BufferAllocation>,
 }
 
-/// One logical executor submission. Physical runs are derived only inside an executor.
+/// One logical executor submission. Its rank projections are derived only inside an executor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionBatch {
     /// Logical batch identity used to correlate partial completions.
@@ -404,7 +404,7 @@ impl ExecutorInfo {
     }
 }
 
-/// One operation result returned from an executor-owned physical run.
+/// One operation result returned from an executor-owned batch.
 #[derive(Debug, Clone)]
 pub struct OpResult {
     /// Validated completion values; media storage is carried by `media` below.
@@ -417,14 +417,12 @@ pub struct OpResult {
 #[derive(Debug)]
 pub struct WorkerResult {
     pub batch_id: u64,
-    pub run_id: u64,
     pub results: Vec<OpResult>,
     /// Tensor publications remain owned by the executor's transfer consumers.
     pub products: Vec<TensorPublication>,
     pub registration: uniserve_worker_ipc::RegistrationAck,
     pub worker_exec_us: Option<u64>,
     pub forward_stats: Option<uniserve_worker_ipc::ForwardStats>,
-    pub done: bool,
 }
 
 impl WorkerResult {
@@ -451,13 +449,11 @@ impl WorkerResult {
             .collect();
         Self {
             batch_id: report.batch_id,
-            run_id: report.run_id,
             results,
             products: report.products,
             registration: report.registration,
             worker_exec_us: report.worker_exec_us,
             forward_stats: report.forward_stats,
-            done: report.done,
         }
     }
 }
@@ -486,11 +482,11 @@ pub struct CommandResult {
 pub struct BatchResult {
     /// Logical batch identity assigned at submission.
     pub batch_id: u64,
-    /// Operation completions ready in this result fragment.
+    /// Operation completions this join reports as ready.
     pub results: Vec<OpResult>,
     /// Control commands acknowledged by all target pools.
     pub command_results: Vec<CommandResult>,
-    /// Whether this fragment terminates the logical batch.
+    /// Whether this join completes the batch.
     pub done: bool,
     /// Per-worker execution durations in microseconds.
     pub worker_exec_us: Vec<u64>,
@@ -880,10 +876,10 @@ impl TransferConfigError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("worker execute error: {message}")]
 pub struct WorkerExecError {
-    /// Physical submission whose response carried this error. Composite
-    /// executors use it to join the same terminal outcome across ranks before
-    /// returning the failure to the scheduler.
-    pub run_id: Option<u64>,
+    /// Batch whose response carried this error. Composite executors use it to
+    /// join the same terminal outcome across ranks before returning the
+    /// failure to the scheduler.
+    pub batch_id: Option<u64>,
     /// Whether the error invalidates the worker process or executor.
     pub fatal: bool,
     /// Stable worker-defined error code, when classified.
@@ -918,16 +914,15 @@ pub struct WorkerFailure {
     pub message: String,
 }
 
-/// Lowers a logical batch into a validated physical worker run.
-pub(crate) fn physical_run(
+/// Lowers a logical batch into a validated wire batch.
+pub(crate) fn physical_batch(
     batch_id: u64,
-    run_id: u64,
     collective_seq: u64,
     requests: Vec<(ScheduledRequest, RequestPlacement)>,
     commands: Vec<BatchCommand>,
     input_products: Vec<TensorPublication>,
     kv_inputs: Vec<uniserve_worker_ipc::KvTransfer>,
-) -> anyhow::Result<ScheduleBatch> {
+) -> anyhow::Result<Batch> {
     let mut block_tables = Vec::new();
     let mut new_cache_pages = Vec::new();
     let mut forward = ForwardBatch::default();
@@ -944,9 +939,8 @@ pub(crate) fn physical_run(
         buffer_allocations.extend(placement.buffers);
         operations.push(operation);
     }
-    let run = ScheduleBatch {
+    let batch = Batch {
         batch_id,
-        run_id,
         collective_seq,
         operations,
         block_tables,
@@ -959,8 +953,8 @@ pub(crate) fn physical_run(
         input_products,
         kv_inputs,
     };
-    run.validate()?;
-    Ok(run)
+    batch.validate()?;
+    Ok(batch)
 }
 
 /// The asynchronous, pipelined boundary the scheduler drives.

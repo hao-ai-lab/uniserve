@@ -217,7 +217,7 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
 
     from tests.python.fixtures.depth_one import (
         ar_params,
-        execution_run,
+        execution_batch,
         finalized_report,
         root_parent,
         token_operation,
@@ -287,8 +287,8 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
         result = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=1,
+                execution_batch(
+                    batch_id=1,
                     admissions=(admission,),
                     operations=(operation,),
                 )

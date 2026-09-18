@@ -23,10 +23,10 @@ use uniserve_engine::{
     EngineConfig, EngineCore, Executor, WorkerConfig, WorkerFailure, WorkerGroup, WorkerProcessArgs,
 };
 use uniserve_worker_ipc::{
-    ArRequestParams, BatchCommand, BlockTable, Bounds, CachePageAllocation, Computation,
+    ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, CachePageAllocation, Computation,
     ComputationId, DType, DimBound, ErrorCode, ForwardBatch, Locator, NewRequest, OpStatus,
-    RequestKey, ScheduleBatch, ScheduledRequest, ShapeBound, TensorPublication, TensorRef,
-    TransferHandle, TransferTransport,
+    RequestKey, ScheduledRequest, ShapeBound, TensorPublication, TensorRef, TransferHandle,
+    TransferTransport,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -58,7 +58,7 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
     let second = text_admission(52, 1, 2)?;
     let first_key = first.request_key;
     let second_key = second.request_key;
-    let mut run = token_batch(
+    let mut batch = token_batch(
         1,
         1,
         first_key,
@@ -86,33 +86,32 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
     for index in &mut other.forward.operation_indices {
         *index += 1;
     }
-    run.operations.extend(other.operations);
-    run.commands.extend(other.commands);
-    run.input_products.extend(other.input_products);
-    run.forward.append(other.forward, 0);
-    run.block_tables.extend(other.block_tables);
-    run.new_cache_pages.extend(other.new_cache_pages);
-    let starts = std::mem::take(&mut run.commands);
+    batch.operations.extend(other.operations);
+    batch.commands.extend(other.commands);
+    batch.input_products.extend(other.input_products);
+    batch.forward.append(other.forward, 0);
+    batch.block_tables.extend(other.block_tables);
+    batch.new_cache_pages.extend(other.new_cache_pages);
+    let starts = std::mem::take(&mut batch.commands);
     let admission = execute(
         &mut worker,
-        ScheduleBatch::new(1, vec![], vec![]).with_commands(starts),
+        Batch::new(1, vec![], vec![]).with_commands(starts),
     )?;
-    assert!(admission.done && admission.results.is_empty());
-    run.batch_id = 2;
-    run.run_id = 2;
-    run.collective_seq = 2;
-    worker.submit_run(run)?;
+    assert!(admission.results.is_empty());
+    batch.batch_id = 2;
+    batch.collective_seq = 2;
+    worker.submit_batch(batch)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut completed = std::collections::BTreeSet::new();
     let mut terminal = false;
     while std::time::Instant::now() < deadline && !terminal {
-        if let Some(report) = worker.poll_run(Duration::from_millis(100))? {
+        if let Some(report) = worker.poll_batch(Duration::from_millis(100))? {
             for completion in report.results {
                 assert_eq!(completion.output.status, OpStatus::Ok);
                 assert_eq!(completion.output.committed_tokens.as_slice().len(), 1);
                 assert!(completed.insert(completion.output.op_id));
             }
-            terminal = report.done;
+            terminal = true;
         }
     }
     assert!(terminal, "independent entry work did not retire");
@@ -124,8 +123,8 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
     );
 
     // Closing a request releases every participating rank's physical storage.
-    worker.submit_run(
-        ScheduleBatch::new(3, vec![], vec![]).with_commands(
+    worker.submit_batch(
+        Batch::new(3, vec![], vec![]).with_commands(
             [first_key, second_key]
                 .into_iter()
                 .map(|request_key| BatchCommand::Finish {
@@ -136,9 +135,8 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
         ),
     )?;
     let report = worker
-        .poll_run(Duration::from_secs(5))?
+        .poll_batch(Duration::from_secs(5))?
         .context("request release did not retire")?;
-    assert!(report.done);
     assert!(report.results.is_empty());
     worker.close()?;
     Ok(())
@@ -222,7 +220,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
             let client =
                 ClientEndpoint::connect(&accept_reported_endpoint(&listener)?, 1 << 20, 8)?;
             let admission = text_admission(51, 1, 1)?;
-            let run = token_batch(
+            let batch = token_batch(
                 1,
                 1,
                 admission.request_key,
@@ -238,7 +236,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 request.set_call_id(Some(call_id));
                 request
             };
-            let initial = client.send_request(&request(WorkerRequest::submit(run.clone()), 1))?;
+            let initial = client.send_request(&request(WorkerRequest::submit(batch.clone()), 1))?;
             let first = client
                 .recv_response_timeout(&initial, Duration::from_secs(30))?
                 .context("initial submission did not complete")?
@@ -246,7 +244,6 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
             let WorkerResponse::Result { result: first, .. } = first else {
                 anyhow::bail!("initial submission failed: {first:?}");
             };
-            anyhow::ensure!(first.done, "initial result is not terminal");
             anyhow::ensure!(
                 first.completions.len() == 1,
                 "initial completion count changed"
@@ -275,18 +272,16 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 0,
             );
             let accepted = client.send_request(&request(WorkerRequest::submit(other_run), 2))?;
-            let rejected = client.send_request(&request(WorkerRequest::submit(run.clone()), 3))?;
-            let duplicate = client.send_request(&request(WorkerRequest::submit(run), 4))?;
-            // A terminal run has no continuation: repeated Poll preserves that wire error.
-            let poll = client.send_request(&request(WorkerRequest::poll(1), 5))?;
-            let repeated_poll = client.send_request(&request(WorkerRequest::poll(1), 6))?;
-            let close = client.send_request(&request(WorkerRequest::close(), 7))?;
+            let rejected =
+                client.send_request(&request(WorkerRequest::submit(batch.clone()), 3))?;
+            let duplicate = client.send_request(&request(WorkerRequest::submit(batch), 4))?;
+            let close = client.send_request(&request(WorkerRequest::close(), 5))?;
             let closed = client
                 .recv_response_timeout(&close, Duration::from_secs(30))?
                 .context("Close did not drain accepted work")?
                 .decode_response()?;
             anyhow::ensure!(
-                closed == WorkerResponse::Ok { call_id: Some(7) },
+                closed == WorkerResponse::Ok { call_id: Some(5) },
                 "Close failed: {closed:?}"
             );
 
@@ -301,8 +296,8 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 anyhow::bail!("independent submission did not return a result");
             };
             anyhow::ensure!(
-                other.done && other.completions.len() == 1,
-                "independent run did not complete"
+                other.completions.len() == 1,
+                "independent batch did not complete"
             );
             anyhow::ensure!(
                 other.completions[0].op_id == ComputationId::new(2, 0),
@@ -315,15 +310,6 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 anyhow::ensure!(
                     error.code.as_deref() == Some("InvalidDescriptor"),
                     "duplicate must be a protocol error"
-                );
-            }
-            for pending in [&poll, &repeated_poll] {
-                let WorkerResponse::Error { error, .. } = receive(pending)? else {
-                    anyhow::bail!("terminal Poll must reject the absent continuation");
-                };
-                anyhow::ensure!(
-                    error.code.as_deref() == Some("InvalidDescriptor"),
-                    "terminal Poll changed its error: {error:?}"
                 );
             }
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -382,7 +368,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             vec![(WorkerId("worker".into()), WorkerGroup::spawn(args)?)],
             transfer,
         )?;
-        let bind = |mut batch: ScheduleBatch, entry: &str| {
+        let bind = |mut batch: Batch, entry: &str| {
             let mut operation = batch.operations.remove(0);
             operation.entry = entry.into();
             ExecutionBatch::new(
@@ -460,7 +446,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
         };
         logical
             .requests
-            .extend(bind(ScheduleBatch::new(1, vec![], vec![publish]), "model").requests);
+            .extend(bind(Batch::new(1, vec![], vec![publish]), "model").requests);
 
         let copy = TensorRef {
             producer_op_id: ComputationId::new(1, 2),
@@ -503,7 +489,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
         };
         logical
             .requests
-            .extend(bind(ScheduleBatch::new(1, vec![], vec![consume]), "output").requests);
+            .extend(bind(Batch::new(1, vec![], vec![consume]), "output").requests);
         executor.submit(logical)?;
         let mut completions = std::collections::BTreeMap::new();
         loop {
@@ -544,16 +530,21 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
 
     let transfer = uniserve_engine::TransferConfig::default();
+    // Four calls of one request travel as four batches, all submitted before
+    // any result is read, so each successor starts from its predecessor's
+    // device product rather than from a host observation.
+    let mut args = rank_group_args(1 << 20, 8 << 20);
+    args.queue_depth = 4;
     let mut executor = WorkerExecutor::try_new(
-        vec![(WorkerId("worker".into()), spawn_rank_group()?)],
+        vec![(WorkerId("worker".into()), WorkerGroup::spawn(args)?)],
         transfer,
     )?;
     let admission = text_admission(63, 1, 1)?;
     let key = admission.request_key;
     let first_id = ComputationId::new(9, 0);
-    let second_id = ComputationId::new(9, 1);
-    let verify_id = ComputationId::new(9, 2);
-    let resumed_id = ComputationId::new(9, 3);
+    let second_id = ComputationId::new(10, 0);
+    let verify_id = ComputationId::new(11, 0);
+    let resumed_id = ComputationId::new(12, 0);
     let first = token_batch(
         9,
         1,
@@ -567,7 +558,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         0,
     );
     let mut successor = token_batch(
-        9,
+        10,
         2,
         key,
         None,
@@ -583,7 +574,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     successor.operations[0].input_token_ids.clear();
     successor.operations[0].predicate = Some(first.operations[0].token_output.clone().unwrap());
     let mut verifier = token_batch(
-        9,
+        11,
         3,
         key,
         None,
@@ -597,7 +588,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     verifier.operations[0].input_token_ids = vec![900, 901];
     verifier.operations[0].predicate = Some(successor.operations[0].token_output.clone().unwrap());
     let mut resumed = token_batch(
-        9,
+        12,
         4,
         key,
         None,
@@ -618,34 +609,32 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         kv_computed_len: 5,
         flow_step: 0,
     };
-    let commands = first.commands.clone();
-    let requests = [first, successor, verifier, resumed]
-        .into_iter()
-        .map(|mut run| {
-            (
-                run.operations.remove(0),
-                RequestPlacement {
-                    worker: WorkerId("worker".into()),
-                    block_tables: run.block_tables,
-                    new_cache_pages: run.new_cache_pages,
-                    forward: run.forward,
-                    latent: None,
-                    decode: None,
-                    buffers: run.buffer_allocations,
-                },
-            )
-        })
-        .collect();
-    executor.submit(ExecutionBatch::new(9, requests, commands, vec![]))?;
+    for mut batch in [first, successor, verifier, resumed] {
+        let batch_id = batch.batch_id;
+        let commands = std::mem::take(&mut batch.commands);
+        let operation = batch.operations.remove(0);
+        let placement = RequestPlacement {
+            worker: WorkerId("worker".into()),
+            block_tables: batch.block_tables,
+            new_cache_pages: batch.new_cache_pages,
+            forward: batch.forward,
+            latent: None,
+            decode: None,
+            buffers: batch.buffer_allocations,
+        };
+        executor.submit(ExecutionBatch::new(
+            batch_id,
+            vec![(operation, placement)],
+            commands,
+            vec![],
+        ))?;
+    }
     let mut outputs = std::collections::BTreeMap::new();
-    loop {
+    while outputs.len() < 4 {
         let result = poll_logical(&mut executor)?.context("device successor did not complete")?;
         for result in result.results {
             assert_eq!(result.output.status, OpStatus::Ok);
             assert!(outputs.insert(result.output.op_id, result.output).is_none());
-        }
-        if result.done {
-            break;
         }
     }
     assert_eq!(
@@ -691,7 +680,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         vec![(WorkerId("worker".into()), WorkerGroup::spawn(args)?)],
         transfer,
     )?;
-    let bind = |mut batch: ScheduleBatch, entry: &str| {
+    let bind = |mut batch: Batch, entry: &str| {
         let mut operation = batch.operations.remove(0);
         operation.entry = entry.into();
         ExecutionBatch::new(
@@ -767,7 +756,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         predicate: None,
         rng: None,
     };
-    let mut source = ScheduleBatch::new(1, vec![admission], vec![produce]);
+    let mut source = Batch::new(1, vec![admission], vec![produce]);
     source.buffer_allocations.push(BufferAllocation {
         buffer: value.buffer_id(),
         offset: 0,
@@ -813,7 +802,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         predicate: None,
         rng: None,
     };
-    let mut consumer = ScheduleBatch::new(1, vec![], vec![consume]);
+    let mut consumer = Batch::new(1, vec![], vec![consume]);
     consumer.buffer_allocations.push(BufferAllocation {
         buffer: copied.buffer_id(),
         offset: 256,
@@ -913,7 +902,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
         let python = serde_json::to_string(&worker_python())?;
         let fixture = serde_json::to_string(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/python/fixtures/rank_framing.py"),
+                .join("../../tests/python/fixtures/rank_media.py"),
         )?;
         let name = serde_json::to_string(&name_path)?;
         std::fs::write(
@@ -927,7 +916,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
         args.python = wrapper;
         let mut worker = WorkerGroup::spawn(args)?;
         let admission = text_admission(81, 1, 1)?;
-        let run = token_batch(
+        let batch = token_batch(
             1,
             1,
             admission.request_key,
@@ -939,15 +928,15 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
             BlockId(1),
             0,
         );
-        worker.submit_run(run)?;
+        worker.submit_batch(batch)?;
         let rejected = matches!(case, "unknown-operation" | "rank-output");
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let mut terminal = false;
         let mut results = Vec::new();
         while std::time::Instant::now() < deadline && !terminal {
-            match worker.poll_run(Duration::from_millis(100)) {
+            match worker.poll_batch(Duration::from_millis(100)) {
                 Ok(Some(report)) => {
-                    terminal = report.done;
+                    terminal = true;
                     results.extend(report.results);
                 }
                 Ok(None) => {}
@@ -994,91 +983,6 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
         }
         worker.close()?;
     }
-    Ok(())
-}
-
-#[test]
-fn rank_result_fragmentation_preserves_independent_completions() -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let wrapper =
-        std::env::temp_dir().join(format!("uniserve-framing-{}-{nonce}", std::process::id()));
-    let python = serde_json::to_string(&worker_python())?;
-    let fixture = serde_json::to_string(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/python/fixtures/rank_framing.py"),
-    )?;
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/usr/bin/env python3\nimport os, sys\nos.execv({python}, [{python}, {fixture}, *sys.argv[3:]])\n"
-        ),
-    )?;
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-    let mut args = rank_group_args(1 << 20, 8 << 20);
-    args.python = wrapper.clone();
-    let mut worker = WorkerGroup::spawn(args)?;
-    let root = ComputationId::new(0, 0);
-    let first = text_admission(41, 1, 1)?;
-    let second = text_admission(42, 1, 2)?;
-    let mut run = token_batch(
-        1,
-        1,
-        first.request_key,
-        Some(first),
-        ComputationId::new(1, 0),
-        root.clone(),
-        Computation::Forward(ForwardMode::Prefill),
-        &[7, 8],
-        BlockId(1),
-        0,
-    );
-    let mut other = token_batch(
-        1,
-        1,
-        second.request_key,
-        Some(second),
-        ComputationId::new(1, 1),
-        root,
-        Computation::Forward(ForwardMode::Prefill),
-        &[9, 10],
-        BlockId(2),
-        0,
-    );
-    for index in &mut other.forward.operation_indices {
-        *index += run.operations.len() as u32;
-    }
-    run.operations.extend(other.operations);
-    run.commands.extend(other.commands);
-    run.input_products.extend(other.input_products);
-    run.forward.append(other.forward, 0);
-    run.block_tables.extend(other.block_tables);
-    run.new_cache_pages.extend(other.new_cache_pages);
-    worker.submit_run(run)?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut completed = std::collections::BTreeSet::new();
-    let mut terminal = false;
-    while std::time::Instant::now() < deadline && !terminal {
-        if let Some(report) = worker.poll_run(Duration::from_millis(100))? {
-            for completion in report.results {
-                assert_eq!(completion.output.status, OpStatus::Ok);
-                assert_eq!(completion.output.committed_tokens.as_slice().len(), 1);
-                assert!(completed.insert(completion.output.op_id));
-            }
-            terminal = report.done;
-        }
-    }
-    let _ = remove_file(&wrapper);
-    assert!(
-        terminal,
-        "rank-local report grouping prevented terminal completion"
-    );
-    assert_eq!(
-        completed,
-        [ComputationId::new(1, 0), ComputationId::new(1, 1)]
-            .into_iter()
-            .collect()
-    );
     Ok(())
 }
 
@@ -1203,7 +1107,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     assert_eq!(first_record.prompt_logprobs.len(), 1);
     assert_eq!(first_record.prompt_logprobs[0][0].token_id, 8);
 
-    assert!(executor.submit_run(initial).is_err());
+    assert!(executor.submit_batch(initial).is_err());
 
     let conflicting = token_batch(
         1,
@@ -1217,7 +1121,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         BlockId(1),
         0,
     );
-    assert!(executor.submit_run(conflicting).is_err());
+    assert!(executor.submit_batch(conflicting).is_err());
 
     let selected = completed_operation(first_record);
     let stale_key = RequestKey::new(
@@ -1275,21 +1179,18 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         0,
     );
     close_batch.commands.push(close.clone());
-    executor.submit_run(close_batch.clone())?;
+    executor.submit_batch(close_batch.clone())?;
+    // A batch returns one result: the call's completion and the retirement
+    // it carries arrive together.
     let result = executor
-        .poll_run(Duration::from_secs(30))?
+        .poll_batch(Duration::from_secs(30))?
         .ok_or_else(|| anyhow::anyhow!("independent operation did not complete"))?;
-    assert!(!result.done);
     assert_eq!(result.results.len(), 1);
     assert_eq!(result.results[0].output.status, OpStatus::Ok);
-    let acknowledgement = executor
-        .poll_run(Duration::from_secs(30))?
-        .ok_or_else(|| anyhow::anyhow!("Finish acknowledgement did not arrive"))?;
-    assert!(acknowledgement.done);
-    assert!(acknowledgement.results.is_empty());
+    assert!(executor.poll_batch(Duration::from_millis(50))?.is_none());
     assert!(matches!(
-        executor.submit_run(close_batch),
-        Err(uniserve_engine::RunSubmitError::Failed(_))
+        executor.submit_batch(close_batch),
+        Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
     let descendant = token_batch(
         8,
@@ -1311,16 +1212,16 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     qualify_kv_rank_locations(&mut executor)?;
     executor.close()?;
     assert!(!executor.is_ready());
-    assert!(executor.poll_run(Duration::ZERO)?.is_none());
+    assert!(executor.poll_batch(Duration::ZERO)?.is_none());
     assert!(matches!(
-        executor.submit_run(command_batch(
+        executor.submit_batch(command_batch(
             100,
             BatchCommand::Finish {
                 request_key: admission.request_key,
                 retained_buffers: Vec::new(),
             }
         )),
-        Err(uniserve_engine::RunSubmitError::Failed(_))
+        Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
     executor.close()?;
     Ok(())
@@ -1387,7 +1288,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         predicate: None,
         rng: None,
     };
-    let mut publish = ScheduleBatch::new(10, Vec::new(), vec![operation]);
+    let mut publish = Batch::new(10, Vec::new(), vec![operation]);
     publish.collective_seq = 6;
     publish.block_tables = tables;
 
@@ -1476,24 +1377,19 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     first.forward.append(finished.forward, 0);
     first.input_products.extend(finished.input_products);
     execute(&mut executor, first)?;
-    let mut close = ScheduleBatch::new(2, Vec::new(), Vec::new());
+    let mut close = Batch::new(2, Vec::new(), Vec::new());
     close.collective_seq = 2;
     close.commands.push(BatchCommand::Finish {
         request_key: finished_key,
         retained_buffers: Vec::new(),
     });
-    let mut report = execute(&mut executor, close)?;
-    while !report.done {
-        report = executor
-            .poll_run(Duration::from_secs(30))?
-            .context("request Finish did not acknowledge physical retirement")?;
-    }
+    execute(&mut executor, close)?;
 
     let lost_admission = text_admission(22, 1, 2)?;
     let lost_root = ComputationId::new(0, 0);
-    // Keep this rank from completing the run before the test terminates it.
+    // Keep this rank from completing the batch before the test terminates it.
     let paused = PausedProcess::new(victim.try_into()?)?;
-    executor.submit_run(token_batch(
+    executor.submit_batch(token_batch(
         3,
         3,
         lost_admission.request_key,
@@ -1507,7 +1403,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     ))?;
     paused.terminate()?;
     let loss = executor
-        .poll_run(Duration::from_secs(30))
+        .poll_batch(Duration::from_secs(30))
         .expect_err("rank loss must be reported");
     let loss = loss
         .downcast_ref::<WorkerFailure>()
@@ -1528,7 +1424,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
             std::time::Instant::now() < ready_deadline,
             "replacement did not become ready"
         );
-        executor.poll_run(Duration::from_millis(100))?;
+        executor.poll_batch(Duration::from_millis(100))?;
     }
 
     let recovered_admission = text_admission(23, 1, 1)?;
@@ -1649,27 +1545,27 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         0,
     );
 
-    executor.submit_run(slow.clone())?;
+    executor.submit_batch(slow.clone())?;
     assert!(matches!(
-        executor.submit_run(slow),
-        Err(uniserve_engine::RunSubmitError::Failed(_))
+        executor.submit_batch(slow),
+        Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
-    executor.submit_run(fast)?;
+    executor.submit_batch(fast)?;
     let first = executor
-        .poll_run(Duration::from_secs(30))?
+        .poll_batch(Duration::from_secs(30))?
         .ok_or_else(|| anyhow::anyhow!("fast submission did not complete"))?;
-    assert_eq!(first.run_id, 2);
+    assert_eq!(first.batch_id, 2);
     assert!(!publication.published.load(Ordering::Acquire));
     assert_eq!(first.results[0].output.status, OpStatus::Ok);
 
-    // Waiting does not submit the slow run again. Its original result remains
+    // Waiting does not submit the slow batch again. Its original result remains
     // available after the external publisher makes the dependency readable.
-    assert!(executor.poll_run(Duration::from_millis(50))?.is_none());
+    assert!(executor.poll_batch(Duration::from_millis(50))?.is_none());
     publication.publish()?;
     let second = executor
-        .poll_run(Duration::from_secs(30))?
+        .poll_batch(Duration::from_secs(30))?
         .ok_or_else(|| anyhow::anyhow!("slow submission did not complete"))?;
-    assert_eq!(second.run_id, 1);
+    assert_eq!(second.batch_id, 1);
     assert_eq!(second.results[0].output.status, OpStatus::Ok);
 
     let admission = text_admission(33, 1, 3)?;
@@ -1722,7 +1618,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         predicate: None,
         rng: None,
     };
-    let mut batch = ScheduleBatch::new(3, vec![admission], vec![operation]);
+    let mut batch = Batch::new(3, vec![admission], vec![operation]);
     batch.buffer_allocations = [(&input, 0), (&output, 256)]
         .into_iter()
         .map(|(product, offset)| uniserve_worker_ipc::BufferAllocation {
@@ -1735,9 +1631,9 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         product: input,
         value: publication.descriptor()?,
     });
-    executor.submit_run(batch)?;
+    executor.submit_batch(batch)?;
     let transferred = executor
-        .poll_run(Duration::from_secs(30))?
+        .poll_batch(Duration::from_secs(30))?
         .context("tensor input did not reach its computation entry")?;
     assert_eq!(transferred.results[0].output.status, OpStatus::Ok);
     assert_eq!(transferred.products[0].product, output);
@@ -1802,7 +1698,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     )?;
     let pid = std::fs::read_to_string(&pid_file)?.parse::<i32>()?;
     let mut paused = PausedProcess::new(pid)?;
-    let bind = |batch: ScheduleBatch, worker: &str| {
+    let bind = |batch: Batch, worker: &str| {
         assert_eq!(batch.operations.len(), 1);
         let operation = batch.operations.into_iter().next().unwrap();
         ExecutionBatch::new(
@@ -1823,14 +1719,14 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             batch.input_products,
         )
     };
-    let make_run = |run_id, request_index, request_id, page| -> anyhow::Result<ScheduleBatch> {
+    let make_batch = |batch_id, request_index, request_id, page| -> anyhow::Result<Batch> {
         let admission = text_admission(request_id, 1, page)?;
         Ok(token_batch(
-            run_id,
-            run_id,
+            batch_id,
+            batch_id,
             admission.request_key,
             Some(admission),
-            ComputationId::new(run_id, request_index),
+            ComputationId::new(batch_id, request_index),
             ComputationId::new(0, 0),
             Computation::Forward(ForwardMode::Prefill),
             &[7],
@@ -1838,14 +1734,14 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             0,
         ))
     };
-    let slow = make_run(1, 0, 51, 1)?;
+    let slow = make_batch(1, 0, 51, 1)?;
     executor.submit(bind(slow, "encoder-0"))?;
-    let blocked = bind(make_run(2, 0, 52, 2)?, "encoder-0");
+    let blocked = bind(make_batch(2, 0, 52, 2)?, "encoder-0");
     let blocked = match executor.submit(blocked) {
         Err(ExecutorSubmitError::WouldBlock(batch)) => batch,
         other => anyhow::bail!("occupied instance did not apply its capacity bound: {other:?}"),
     };
-    let independent = make_run(3, 0, 53, 1)?;
+    let independent = make_batch(3, 0, 53, 1)?;
     let token = independent.operations[0].token_output.clone().unwrap();
     executor.submit(bind(independent, "encoder-1"))?;
     let first = poll_logical(&mut executor)?.context("independent worker did not complete")?;
@@ -1876,7 +1772,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
 
     // The same request owns numerical state on one instance and a transported
     // product on another; Finish must retire both physical owners.
-    let shared = make_run(5, 0, 54, 3)?;
+    let shared = make_batch(5, 0, 54, 3)?;
     let admission = shared.admissions().next().unwrap().clone();
     let source = shared.operations[0].token_output.clone().unwrap();
     executor.submit(bind(shared, "encoder-0"))?;
@@ -1922,7 +1818,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         predicate: None,
         rng: None,
     };
-    let publish = ScheduleBatch::new(6, Vec::new(), vec![publish]);
+    let publish = Batch::new(6, Vec::new(), vec![publish]);
 
     executor.submit(bind(publish, "encoder-0"))?;
     let published = poll_logical(&mut executor)?.context("source publication did not complete")?;
@@ -1968,7 +1864,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         rng: None,
     };
     executor.submit(bind(
-        ScheduleBatch::new(7, vec![admission.clone()], vec![transfer]),
+        Batch::new(7, vec![admission.clone()], vec![transfer]),
         "encoder-1",
     ))?;
     let copied = poll_logical(&mut executor)?.context("auxiliary transfer did not complete")?;
@@ -1977,7 +1873,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     let image_bytes = b"iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGN0SGhgIAUwkaR6VMOohiGlAQCjvQFA6eri4wAAAABJRU5ErkJggg==".to_vec();
     let feature = TensorRef {
         request_key: admission.request_key,
-        producer_op_id: ComputationId::new(16, 0),
+        producer_op_id: ComputationId::new(8, 0),
         output_index: 0,
         generation: 4,
         dtype: DType::BF16,
@@ -2006,7 +1902,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         input_token_ids: Vec::new(),
         sampling_state: None,
         request_key: admission.request_key,
-        op_id: ComputationId::new(16, 0),
+        op_id: ComputationId::new(8, 0),
         predecessor: Some(ComputationId::new(0, 0)),
         entry: "model".into(),
         code: Computation::Pipeline(PipelineStage::VisionEncoding),
@@ -2020,7 +1916,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         predicate: None,
         rng: None,
     };
-    let mut encode = ScheduleBatch::new(16, Vec::new(), vec![encode]);
+    let mut encode = Batch::new(8, Vec::new(), vec![encode]);
     encode
         .buffer_allocations
         .push(uniserve_worker_ipc::BufferAllocation {
@@ -2035,11 +1931,11 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: admission.request_key,
         retained_buffers: vec![feature.buffer_id()],
     };
-    executor.submit(ExecutionBatch::new(8, Vec::new(), vec![finish], Vec::new()))?;
+    executor.submit(ExecutionBatch::new(9, Vec::new(), vec![finish], Vec::new()))?;
     let closed = poll_logical(&mut executor)?.context("shared request did not retire")?;
     assert!(closed.done);
-    for (batch_id, request_id, worker) in [(9, 55, "encoder-0"), (10, 56, "encoder-1")] {
-        executor.submit(bind(make_run(batch_id, 0, request_id, 3)?, worker))?;
+    for (batch_id, request_id, worker) in [(10, 55, "encoder-0"), (11, 56, "encoder-1")] {
+        executor.submit(bind(make_batch(batch_id, 0, request_id, 3)?, worker))?;
         let reused = poll_logical(&mut executor)?.context("retired slot was not reusable")?;
         assert!(reused.done);
         assert_eq!(reused.results[0].output.status, OpStatus::Ok);
@@ -2048,8 +1944,8 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     // Closing one request leaves admitted work on both instances independent.
     let closing_key = RequestKey::new(1, RequestId(56), 1);
     let active_key = RequestKey::new(1, RequestId(61), 1);
-    let mut mixed = bind(make_run(12, 0, 57, 4)?, "encoder-0");
-    let affected = bind(make_run(12, 1, 61, 6)?, "encoder-1");
+    let mut mixed = bind(make_batch(12, 0, 57, 4)?, "encoder-0");
+    let affected = bind(make_batch(12, 1, 61, 6)?, "encoder-1");
     mixed.requests.extend(affected.requests);
     mixed.commands.extend(affected.commands);
     mixed.input_transfers.extend(affected.input_transfers);
@@ -2097,7 +1993,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             .context("request close did not retire")?
             .done
     );
-    executor.submit(bind(make_run(14, 0, 58, 3)?, "encoder-1"))?;
+    executor.submit(bind(make_batch(14, 0, 58, 3)?, "encoder-1"))?;
     let reused = poll_logical(&mut executor)?.context("closed request slot was not reusable")?;
     assert_eq!(reused.results[0].output.status, OpStatus::Ok);
 
@@ -2141,7 +2037,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         predicate: None,
         rng: None,
     };
-    let mut retained = ScheduleBatch::new(15, vec![next], vec![retained]);
+    let mut retained = Batch::new(15, vec![next], vec![retained]);
     retained
         .buffer_allocations
         .push(uniserve_worker_ipc::BufferAllocation {
@@ -2156,7 +2052,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     executor.submit(bind(retained, "encoder-0"))?;
     let retained = poll_logical(&mut executor)?.context("retained product was not readable")?;
     assert_eq!(retained.results[0].output.status, OpStatus::Ok);
-    executor.submit(bind(make_run(17, 0, 62, 6)?, "encoder-1"))?;
+    executor.submit(bind(make_batch(17, 0, 62, 6)?, "encoder-1"))?;
     let fresh =
         poll_logical(&mut executor)?.context("WorkerGroup did not accept work after closure")?;
     assert_eq!(fresh.results[0].output.status, OpStatus::Ok);
@@ -2450,11 +2346,11 @@ fn worker_python() -> PathBuf {
 
 fn execute(
     executor: &mut WorkerGroup,
-    batch: ScheduleBatch,
+    batch: Batch,
 ) -> anyhow::Result<uniserve_engine::WorkerResult> {
-    executor.submit_run(batch)?;
+    executor.submit_batch(batch)?;
     executor
-        .poll_run(Duration::from_secs(30))?
+        .poll_batch(Duration::from_secs(30))?
         .ok_or_else(|| anyhow::anyhow!("submission did not complete"))
 }
 
@@ -2493,7 +2389,7 @@ fn coordinates_after(output: &uniserve_worker_ipc::RequestOutput) -> CallCoordin
 }
 
 fn token_batch(
-    run_id: u64,
+    batch_id: u64,
     collective_seq: u64,
     request_key: RequestKey,
     admission: Option<NewRequest>,
@@ -2503,7 +2399,7 @@ fn token_batch(
     tokens: &[u32],
     page: BlockId,
     prefix_length: u32,
-) -> ScheduleBatch {
+) -> Batch {
     let request_pool_idx = admission.as_ref().map_or(1, |value| value.request_pool_idx);
     let token_output = TensorRef {
         request_key,
@@ -2556,7 +2452,7 @@ fn token_batch(
         rng: None,
     };
     let input_length = tokens.len() as u32;
-    let mut batch = ScheduleBatch::new(run_id, admission.into_iter().collect(), vec![operation]);
+    let mut batch = Batch::new(batch_id, admission.into_iter().collect(), vec![operation]);
     batch.collective_seq = collective_seq;
     batch.block_tables = vec![BlockTable {
         request_pool_idx,
@@ -2583,8 +2479,8 @@ fn token_batch(
     batch
 }
 
-fn command_batch(run_id: u64, command: BatchCommand) -> ScheduleBatch {
-    ScheduleBatch::new(run_id, Vec::new(), Vec::new()).with_commands(vec![command])
+fn command_batch(batch_id: u64, command: BatchCommand) -> Batch {
+    Batch::new(batch_id, Vec::new(), Vec::new()).with_commands(vec![command])
 }
 
 fn completed_operation(record: &uniserve_worker_ipc::RequestOutput) -> ComputationId {

@@ -7,16 +7,15 @@ use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RequestId, SamplingParam
 
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
-    ArRequestParams, ArtifactHandle, BatchCommand, BatchOutput, BlockTable, Bounds,
+    ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds,
     BufferAllocation, BufferId, CachePageAllocation, CallCoordinates, Computation, ComputationId,
     DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode,
     ErrorOperationIdentity, FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats,
     KvCacheInfo, KvTransfer, LatentParams, Locator, MediaOutput, NewRequest, OpStatus,
     PipelineStage, RegistrationAck, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
-    SamplingState, ScheduleBatch, ScheduledRequest, ShapeBound, TensorPublication, TensorRef,
-    TensorTransfer, TimingCounters, TransferHandle, TransferMode, TransferTransport,
-    UmmRequestParams, WorkerEndpoint, WorkerInfo, WorkerRequest, WorkerResponse,
-    WorkerResponseError,
+    SamplingState, ScheduledRequest, ShapeBound, TensorPublication, TensorRef, TensorTransfer,
+    TimingCounters, TransferHandle, TransferMode, TransferTransport, UmmRequestParams,
+    WorkerEndpoint, WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 /// Result type returned by FlatBuffers codec operations.
@@ -136,30 +135,18 @@ pub fn decode_response(bytes: &[u8]) -> CodecResult<WorkerResponse> {
 fn request_from_table(request: fbs::WorkerRequest<'_>) -> CodecResult<WorkerRequest> {
     let kind = request_kind_from_fb(request.kind())?;
     let call_id = request.call_id();
-    let run = request.run().map(run_from_table).transpose()?;
-    let run_id = request.poll_run_id();
-    let payload_count = usize::from(run.is_some()) + usize::from(run_id.is_some());
+    let batch = request.batch().map(batch_from_table).transpose()?;
     Ok(match kind {
         RequestKind::Info => {
-            codec_ensure!(payload_count == 0, "info carries a payload");
+            codec_ensure!(batch.is_none(), "info carries a payload");
             WorkerRequest::Info { call_id }
         }
-        RequestKind::Submit => {
-            codec_ensure!(payload_count == 1, "submit requires exactly one run");
-            WorkerRequest::Submit {
-                call_id,
-                run: run.context("submit request has no run")?,
-            }
-        }
-        RequestKind::Poll => {
-            codec_ensure!(payload_count == 1, "poll requires one run id");
-            WorkerRequest::Poll {
-                call_id,
-                run_id: run_id.context("poll request has no run id")?,
-            }
-        }
+        RequestKind::Submit => WorkerRequest::Submit {
+            call_id,
+            batch: batch.context("submit request has no batch")?,
+        },
         RequestKind::Close => {
-            codec_ensure!(payload_count == 0, "close carries a payload");
+            codec_ensure!(batch.is_none(), "close carries a payload");
             WorkerRequest::Close { call_id }
         }
     })
@@ -249,12 +236,11 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
 }
 
 /// Decodes an owned run and validates all nested operation and params contracts.
-fn run_from_table(run: fbs::ScheduleBatch<'_>) -> CodecResult<ScheduleBatch> {
+fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
     // Preserve wire order for operations, controls, and products because later
     // validation and execution interpret those collections positionally.
-    let run = ScheduleBatch {
+    let run = Batch {
         batch_id: run.batch_id(),
-        run_id: run.run_id(),
         collective_seq: run.collective_seq(),
 
         // Decode executable graph records in their submitted order.
@@ -766,7 +752,6 @@ fn run_result_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutpu
     // are reconciled by `BatchOutput::validate` after both are materialized.
     let report = BatchOutput {
         batch_id: report.batch_id(),
-        run_id: report.run_id(),
         completions: report
             .completions()
             .map(|items| {
@@ -795,7 +780,6 @@ fn run_result_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutpu
         },
         worker_exec_us: report.worker_exec_us(),
         forward_stats: report.forward_stats().map(forward_stats_from_table),
-        done: report.done(),
     };
     report.validate()?;
     Ok(report)
@@ -1231,19 +1215,17 @@ where
 
 /// Converts a validated request into its FlatBuffers object representation.
 fn request_to_fb(request: &WorkerRequest) -> CodecResult<fbs::WorkerRequestT> {
-    let (run, run_id) = match request {
-        WorkerRequest::Info { .. } | WorkerRequest::Close { .. } => (None, None),
-        WorkerRequest::Submit { run, .. } => {
-            run.validate()?;
-            (Some(run), None)
+    let batch = match request {
+        WorkerRequest::Info { .. } | WorkerRequest::Close { .. } => None,
+        WorkerRequest::Submit { batch, .. } => {
+            batch.validate()?;
+            Some(batch)
         }
-        WorkerRequest::Poll { run_id, .. } => (None, Some(*run_id)),
     };
     Ok(fbs::WorkerRequestT {
         kind: request_kind_to_fb(request.kind()),
         call_id: request.call_id(),
-        run: run.map(run_to_fb).transpose()?.map(Box::new),
-        poll_run_id: run_id,
+        batch: batch.map(batch_to_fb).transpose()?.map(Box::new),
     })
 }
 
@@ -1276,12 +1258,11 @@ fn response_to_fb(response: &WorkerResponse) -> CodecResult<fbs::WorkerResponseT
     })
 }
 
-fn run_to_fb(run: &ScheduleBatch) -> CodecResult<fbs::ScheduleBatchT> {
+fn batch_to_fb(run: &Batch) -> CodecResult<fbs::BatchT> {
     run.validate()?;
 
-    Ok(fbs::ScheduleBatchT {
+    Ok(fbs::BatchT {
         batch_id: run.batch_id,
-        run_id: run.run_id,
         collective_seq: run.collective_seq,
 
         // Preserve executable graph order in the serialized vectors.
@@ -1672,7 +1653,6 @@ fn run_result_to_fb(report: &BatchOutput) -> CodecResult<fbs::BatchOutputT> {
     report.validate()?;
     Ok(fbs::BatchOutputT {
         batch_id: report.batch_id,
-        run_id: report.run_id,
         completions: Some(
             report
                 .completions
@@ -1696,7 +1676,6 @@ fn run_result_to_fb(report: &BatchOutput) -> CodecResult<fbs::BatchOutputT> {
             .as_ref()
             .map(forward_stats_to_fb)
             .map(Box::new),
-        done: report.done,
     })
 }
 
@@ -2685,7 +2664,6 @@ fn request_kind_to_fb(kind: RequestKind) -> fbs::ReqKind {
     match kind {
         RequestKind::Info => fbs::ReqKind::Info,
         RequestKind::Submit => fbs::ReqKind::Submit,
-        RequestKind::Poll => fbs::ReqKind::Poll,
         RequestKind::Close => fbs::ReqKind::Close,
     }
 }

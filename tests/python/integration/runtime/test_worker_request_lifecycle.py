@@ -11,7 +11,7 @@ from tests.python.fixtures.depth_one import (
     ar_params,
     bind_request_allocation,
     encode_operation,
-    execution_run,
+    execution_batch,
     finalized_report,
     record_completion,
     root_parent,
@@ -66,8 +66,8 @@ def test_independent_product_work_preserves_request_progress(
         produced = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=1,
+                execution_batch(
+                    batch_id=1,
                     admissions=(admission,),
                     operations=(first,),
                 )
@@ -90,8 +90,8 @@ def test_independent_product_work_preserves_request_progress(
         copied = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=2,
+                execution_batch(
+                    batch_id=2,
                     operations=(independent,),
                     commands=(),
                 )
@@ -108,8 +108,8 @@ def test_independent_product_work_preserves_request_progress(
         continued = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=3,
+                execution_batch(
+                    batch_id=3,
                     operations=(next_op,),
                 )
             ),
@@ -154,8 +154,8 @@ def test_retained_encoder_product_outlives_its_producer_request(
         produced = finalized_report(
             producer,
             producer.submit(
-                execution_run(
-                    run_id=1,
+                execution_batch(
+                    batch_id=1,
                     admissions=(admission,),
                     operations=(encode,),
                 )
@@ -166,10 +166,10 @@ def test_retained_encoder_product_outlives_its_producer_request(
             admission.request_key,
             retained_buffers=(product.buffer_id,),
         )
-        assert finalized_report(
+        finalized_report(
             producer,
-            producer.submit(execution_run(run_id=2, commands=(finish,))),
-        ).done
+            producer.submit(execution_batch(batch_id=2, commands=(finish,))),
+        )
 
         template = ar_params(92, block_ids=(1,))
         replacement = NewRequest(
@@ -190,8 +190,8 @@ def test_retained_encoder_product_outlives_its_producer_request(
             sample_continuation=True,
             max_tokens=2,
         )
-        batch = execution_run(
-            run_id=3,
+        batch = execution_batch(
+            batch_id=3,
             admissions=(replacement,),
             operations=(visual,),
             input_products=produced.products,
@@ -218,20 +218,19 @@ def test_retained_encoder_product_outlives_its_producer_request(
             product, consumer_op_id=ComputationId(2, 0)
         )
         freed = producer.submit(
-            execution_run(run_id=4, commands=(Free(product.buffer_id),))
+            execution_batch(batch_id=4, commands=(Free(product.buffer_id),))
         )
         assert not freed.complete
         producer.tensor_store.complete_reads((read,))
         freed = finalized_report(producer, freed)
-        assert freed.done
         with pytest.raises(WorkerError):
             producer.tensor_store.consume(
                 product, consumer_op_id=ComputationId(3, 0)
             )
-        assert finalized_report(
+        finalized_report(
             producer,
-            producer.submit(execution_run(run_id=5, commands=(finish,))),
-        ).done
+            producer.submit(execution_batch(batch_id=5, commands=(finish,))),
+        )
     finally:
         if consumer is not producer:
             consumer.close()
@@ -256,8 +255,8 @@ def test_command_acknowledgement_waits_for_readers_without_delaying_other_result
         produced = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=1,
+                execution_batch(
+                    batch_id=1,
                     admissions=(admission,),
                     operations=(operation,),
                 )
@@ -279,13 +278,13 @@ def test_command_acknowledgement_waits_for_readers_without_delaying_other_result
         independent = ar_params(88, block_ids=(1,))
         next_operation = token_operation(
             independent.request_key,
-            op_id=ComputationId(1, 0),
+            op_id=ComputationId(3, 0),
             predecessor=root_parent(independent),
             mode=ForwardMode.PREFILL,
             tokens=(7, 8),
         )
-        batch = execution_run(
-            run_id=3,
+        batch = execution_batch(
+            batch_id=3,
             admissions=(independent,),
             operations=(next_operation,),
             commands=(command,),
@@ -294,13 +293,13 @@ def test_command_acknowledgement_waits_for_readers_without_delaying_other_result
         later = ar_params(89, block_ids=(2,))
         later_operation = token_operation(
             later.request_key,
-            op_id=ComputationId(1, 0),
+            op_id=ComputationId(4, 0),
             predecessor=root_parent(later),
             mode=ForwardMode.PREFILL,
             tokens=(9,),
         )
-        later_run = execution_run(
-            run_id=4,
+        later_run = execution_batch(
+            batch_id=4,
             admissions=(later,),
             operations=(later_operation,),
         )
@@ -308,37 +307,28 @@ def test_command_acknowledgement_waits_for_readers_without_delaying_other_result
         class Endpoint(QueuedWorkerIpc):
             def respond(self, response):
                 super().respond(response)
-                if response.get("call_id") == 1:
-                    partial = response["result"]
-                    assert not partial["done"]
-                    assert len(partial["completions"]) == 1
-                    self.submit({"kind": "submit", "run": batch, "call_id": 2})
-                elif response.get("call_id") == 2:
-                    assert response["kind"] == "error"
-                    assert response["code"] == "InvalidDescriptor"
-                    self.submit({"kind": "poll", "run_id": 3, "call_id": 4})
-                    self.submit(
-                        {"kind": "submit", "run": later_run, "call_id": 3}
-                    )
-                elif response.get("call_id") == 3:
-                    result = response["result"]
-                    assert result["done"]
-                    assert len(result["completions"]) == 1
+                if response.get("call_id") == 2:
+                    # The later batch owns no retired storage, so its result
+                    # must arrive while the first batch still waits.
+                    assert len(response["result"]["completions"]) == 1
                     worker.tensor_store.complete_reads((read,))
-                elif response.get("call_id") == 4:
-                    terminal = response["result"]
-                    assert terminal["done"]
-                    assert not terminal["completions"]
-                    self.submit({"kind": "close", "call_id": 5})
+                elif response.get("call_id") == 1:
+                    assert len(response["result"]["completions"]) == 1
+                    self.submit({"kind": "close", "call_id": 3})
 
-        endpoint = Endpoint(({"kind": "submit", "run": batch, "call_id": 1},))
+        endpoint = Endpoint(
+            (
+                {"kind": "submit", "batch": batch, "call_id": 1},
+                {"kind": "submit", "batch": later_run, "call_id": 2},
+            )
+        )
         worker.bind(endpoint).run()
+        # The retiring batch answers after the reader retires, behind the
+        # independent batch it does not order.
         assert [response["call_id"] for response in endpoint.responses] == [
-            1,
             2,
+            1,
             3,
-            4,
-            5,
         ]
         assert endpoint.responses[-1]["kind"] == "ok"
     finally:
@@ -359,8 +349,8 @@ def test_cancelled_admission_cannot_publish_over_a_reused_request_slot() -> (
     )
     try:
         pending = worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(operation,),
             )
@@ -369,7 +359,8 @@ def test_cancelled_admission_cannot_publish_over_a_reused_request_slot() -> (
             admission.request_key,
         )
         finalized_report(
-            worker, worker.submit(execution_run(run_id=2, commands=(finish,)))
+            worker,
+            worker.submit(execution_batch(batch_id=2, commands=(finish,))),
         )
         template = ar_params(90, block_ids=(1,))
         replacement = NewRequest(
@@ -384,14 +375,14 @@ def test_cancelled_admission_cannot_publish_over_a_reused_request_slot() -> (
         )
         next_operation = token_operation(
             replacement.request_key,
-            op_id=ComputationId(1, 0),
+            op_id=ComputationId(3, 0),
             predecessor=root_parent(replacement),
             mode=ForwardMode.PREFILL,
             tokens=(7, 8),
         )
         current = worker.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 admissions=(replacement,),
                 operations=(next_operation,),
             )
@@ -431,8 +422,8 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
     report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(closed_admission, active_admission),
                 operations=(closed_extend, active_extend),
             )
@@ -444,7 +435,7 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
     close = Finish(
         request_key=closed_admission.request_key,
     )
-    worker.submit(execution_run(run_id=3, commands=(close,)))
+    worker.submit(execution_batch(batch_id=3, commands=(close,)))
 
     closed_decode = token_operation(
         closed_admission.request_key,
@@ -456,8 +447,8 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
     closed_report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=4,
+            execution_batch(
+                batch_id=4,
                 operations=(closed_decode,),
             )
         ),
@@ -477,8 +468,8 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
     active_report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=5,
+            execution_batch(
+                batch_id=5,
                 operations=(active_decode,),
             )
         ),
@@ -499,8 +490,8 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
         tokens=(3, 4),
     )
     worker.submit(
-        execution_run(
-            run_id=1,
+        execution_batch(
+            batch_id=1,
             admissions=(retired,),
             operations=(retired_operation,),
         )
@@ -524,7 +515,7 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
     )
     replacement_operation = token_operation(
         replacement.request_key,
-        op_id=ComputationId(1, 0),
+        op_id=ComputationId(2, 0),
         predecessor=root_parent(replacement),
         mode=ForwardMode.PREFILL,
         tokens=(7, 8),
@@ -532,8 +523,8 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
     replacement_report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=2,
+            execution_batch(
+                batch_id=2,
                 admissions=(replacement,),
                 operations=(replacement_operation,),
             )
@@ -546,15 +537,15 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
     finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 commands=(Finish(retired.request_key),),
             )
         ),
     )
     decoded = token_operation(
         replacement.request_key,
-        op_id=ComputationId(2, 0),
+        op_id=ComputationId(4, 0),
         predecessor=replacement_operation.op_id,
         mode=ForwardMode.DECODE,
         tokens=(replacement_report.completions[0].committed_tokens[0],),
@@ -562,8 +553,8 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
     continued = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=4,
+            execution_batch(
+                batch_id=4,
                 operations=(decoded,),
             )
         ),
@@ -571,12 +562,22 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
     assert continued.completions[0].status is OpStatus.OK
     assert continued.completions[0].kv_visible_len == 3
 
+    # The retired key is refused whatever call names it, so this repeats the
+    # original call under its own identity rather than resubmitting one the
+    # first batch still owns.
+    retired_again = token_operation(
+        retired.request_key,
+        op_id=ComputationId(5, 0),
+        predecessor=root_parent(retired),
+        mode=ForwardMode.PREFILL,
+        tokens=(3, 4),
+    )
     retired_report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=5,
-                operations=(retired_operation,),
+            execution_batch(
+                batch_id=5,
+                operations=(retired_again,),
             )
         ),
     )
@@ -593,12 +594,13 @@ def test_finish_of_uninstalled_admission_allows_slot_reuse() -> None:
     finish = Finish(
         request_key=admission.request_key,
     )
-    for run_id in (1, 2):
-        report = finalized_report(
+    for batch_id in (1, 2):
+        finalized_report(
             worker,
-            worker.submit(execution_run(run_id=run_id, commands=(finish,))),
+            worker.submit(
+                execution_batch(batch_id=batch_id, commands=(finish,))
+            ),
         )
-        assert report.done
 
     replacement = ar_params(86, block_ids=(0,))
     operation = token_operation(
@@ -611,8 +613,8 @@ def test_finish_of_uninstalled_admission_allows_slot_reuse() -> None:
     report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 admissions=(replacement,),
                 operations=(operation,),
             )
@@ -644,8 +646,8 @@ def test_a_call_whose_coordinates_contradict_the_request_is_refused() -> None:
         primed = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=1,
+                execution_batch(
+                    batch_id=1,
                     admissions=(admission,),
                     operations=(prefill,),
                 )
@@ -662,7 +664,9 @@ def test_a_call_whose_coordinates_contradict_the_request_is_refused() -> None:
             mode=ForwardMode.DECODE,
             tokens=(primed.completions[0].committed_tokens[0],),
         )
-        run = stamp_batch(worker, execution_run(run_id=2, operations=(decode,)))
+        run = stamp_batch(
+            worker, execution_batch(batch_id=2, operations=(decode,))
+        )
         # The prompt left the request at position two; claim the origin.
         contradicted = replace(
             run,

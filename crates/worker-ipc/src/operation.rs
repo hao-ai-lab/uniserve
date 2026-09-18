@@ -1338,15 +1338,14 @@ impl BufferAllocation {
     }
 }
 
-/// One executor-produced physical worker invocation. Execution domains,
-/// attention selection, and captured buckets are derived by the worker.
+/// One numerical call on one component, with the calls of every request that
+/// participates in it. Execution domains, attention selection, and captured
+/// buckets are derived by the worker.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ScheduleBatch {
-    /// Submission batch identity assigned by the executor.
+pub struct Batch {
+    /// Batch identity assigned by the executor, strictly increasing in each
+    /// worker's Submit order.
     pub batch_id: u64,
-    /// Physical invocation identity, strictly increasing in each worker's Submit order.
-    /// Logical batch allocation and result completion may occur in a different order.
-    pub run_id: u64,
     /// Monotonic sequence shared by collective participants.
     pub collective_seq: u64,
     /// Operations executed by this invocation.
@@ -1372,7 +1371,7 @@ pub struct ScheduleBatch {
     pub kv_inputs: Vec<KvTransfer>,
 }
 
-impl ScheduleBatch {
+impl Batch {
     /// Constructs a run with admissions and operations using default metadata.
     pub fn new(
         batch_id: u64,
@@ -1381,7 +1380,6 @@ impl ScheduleBatch {
     ) -> Self {
         Self {
             batch_id,
-            run_id: batch_id,
             collective_seq: batch_id.max(1),
             operations,
             block_tables: Vec::new(),
@@ -1749,14 +1747,12 @@ impl ScheduleBatch {
     }
 }
 
-/// One independently ready subset of a physical run.
+/// One batch's complete result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BatchOutput {
-    /// Submission batch identity copied from the run.
+    /// Batch identity copied from the submission.
     pub batch_id: u64,
-    /// Physical invocation identity copied from the run.
-    pub run_id: u64,
-    /// Operation completions contained in this fragment.
+    /// Operation completions, one per call the batch carried.
     pub completions: Vec<RequestOutput>,
     /// Product values published by completed operations.
     pub products: Vec<TensorPublication>,
@@ -1766,10 +1762,6 @@ pub struct BatchOutput {
     pub worker_exec_us: Option<u64>,
     /// Model-forward statistics, when reported by the worker.
     pub forward_stats: Option<ForwardStats>,
-    /// Whether all operations and command-owned physical resources have retired.
-    /// Free/Finish runs publish a separate empty terminal fragment after any
-    /// operation fragments, even when retirement is immediately ready.
-    pub done: bool,
 }
 
 impl BatchOutput {
@@ -1785,10 +1777,6 @@ impl BatchOutput {
 
     /// Validates completion and product identities for this run.
     pub fn validate(&self) -> ValidationResult<()> {
-        ensure_valid!(
-            !self.completions.is_empty() || self.done,
-            "an empty completion report must terminate its run"
-        );
         let mut identities = HashSet::with_capacity(self.completions.len());
         for completion in &self.completions {
             completion.validate()?;

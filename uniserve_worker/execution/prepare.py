@@ -36,8 +36,8 @@ from uniserve_worker.foundation.errors import (
 )
 from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.batch import (
+    Batch,
     LatentParams,
-    ScheduleBatch,
     TensorPublication,
 )
 from uniserve_worker.protocol.identity import BufferId, ComputationId
@@ -278,7 +278,7 @@ def prepare_inputs(
             }
             if len(devices) != 1:
                 raise invalid_descriptor(
-                    "transferred product requires one consumer device per run"
+                    "transferred product requires one consumer device per batch"
                 )
             device = next(iter(devices))
 
@@ -745,7 +745,7 @@ def capture_predicates(state: BatchState, tensor_store: TensorStore) -> None:
 
 
 def _open_group(
-    batch: ScheduleBatch,
+    batch: Batch,
     completion_group: int,
     predicate_values: Mapping[OperationIdentity, bool],
     *,
@@ -1053,13 +1053,13 @@ def _reserve_host_tasks(
 
 
 def validate_batch(
-    batch: ScheduleBatch,
+    batch: Batch,
     *,
     worker_info: WorkerInfo,
     model_runner: ModelRunner,
     config: WorkerConfig,
 ) -> None:
-    """Validate run identity, completion group resources, routing.
+    """Validate batch identity, completion group resources, routing.
 
     and operation support before staging.
     """
@@ -1068,7 +1068,7 @@ def validate_batch(
         for params in batch.buffer_allocations
     ):
         raise invalid_descriptor(
-            "run buffer params exceeds the worker buffer pool"
+            "batch buffer params exceeds the worker buffer pool"
         )
 
     if worker_info.components:

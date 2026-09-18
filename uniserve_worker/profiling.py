@@ -408,10 +408,12 @@ def record_failure(
 
 
 def worker_range_name(
-    boundary: str, *, rank: int, run_id: int | None = None
+    boundary: str, *, rank: int, batch_id: int | None = None
 ) -> str:
-    """Build a rank- and run-qualified profiler range name."""
+    """Build a rank- and batch-qualified profiler range name."""
     name = f"uniserve.worker.{boundary} rank={int(rank)}"
     return (
-        f"{name} run={run_id}" if run_id is not None and run_id >= 0 else name
+        f"{name} batch={batch_id}"
+        if batch_id is not None and batch_id >= 0
+        else name
     )

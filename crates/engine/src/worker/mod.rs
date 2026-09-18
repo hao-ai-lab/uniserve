@@ -14,10 +14,10 @@ use process::{PendingRank, RankProcess};
 
 /// Backpressure and terminal failures returned by a WorkerGroup run submission.
 #[derive(Debug, thiserror::Error)]
-pub enum RunSubmitError {
+pub enum BatchSubmitError {
     /// Returns the unaccepted physical submission when the instance has no capacity.
     #[error("worker run queue is full")]
-    WouldBlock(uniserve_worker_ipc::ScheduleBatch),
+    WouldBlock(uniserve_worker_ipc::Batch),
     /// Reports a terminal transport or execution failure.
     #[error(transparent)]
     Failed(anyhow::Error),

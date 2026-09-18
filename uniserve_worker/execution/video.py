@@ -27,10 +27,10 @@ from uniserve_worker.media.mux import (
     require_media_codecs,
 )
 from uniserve_worker.protocol.batch import (
+    Batch,
     DecodeRange,
     DiffusionParams,
     MediaTrack,
-    ScheduleBatch,
     TensorPublication,
 )
 from uniserve_worker.protocol.identity import ComputationId
@@ -571,7 +571,7 @@ def decode_range(
 
 
 def validate_batch(
-    batch: ScheduleBatch, *, postprocessor: VideoPostprocessor | None
+    batch: Batch, *, postprocessor: VideoPostprocessor | None
 ) -> None:
     """Validate video admission requirements before staging state."""
     if postprocessor is None:

@@ -7,7 +7,7 @@ import torch
 
 from tests.python.fixtures.depth_one import (
     ar_params,
-    execution_run,
+    execution_batch,
     finalized_report,
     record_completion,
     root_parent,
@@ -68,8 +68,8 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
             for index, admission in enumerate((first, second))
         )
         parent_report = worker.submit(
-            execution_run(
-                run_id=1, admissions=(first, second), operations=parents
+            execution_batch(
+                batch_id=1, admissions=(first, second), operations=parents
             )
         )
         decodes = tuple(
@@ -97,7 +97,7 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
                 decodes[1],
             )
         decode_report = worker.submit(
-            execution_run(run_id=2, operations=decodes)
+            execution_batch(batch_id=2, operations=decodes)
         )
         successors = tuple(
             token_operation(
@@ -112,7 +112,7 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
         )
         # Queue the dependent work before consuming either parent's host result.
         successor_report = worker.submit(
-            execution_run(run_id=3, operations=successors)
+            execution_batch(batch_id=3, operations=successors)
         )
         finalized_report(worker, parent_report)
         selected = finalized_report(worker, decode_report).completions
@@ -140,8 +140,8 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
         tokens=(3, 4),
     )
     worker.submit(
-        execution_run(
-            run_id=0,
+        execution_batch(
+            batch_id=0,
             admissions=(warm_admission,),
             operations=(warm_operation,),
         )
@@ -159,8 +159,8 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
     )
 
     parent_report = worker.submit(
-        execution_run(
-            run_id=1,
+        execution_batch(
+            batch_id=1,
             admissions=(admission,),
             operations=(predecessor,),
         )
@@ -177,8 +177,8 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
     successor = replace(successor_template, input_token_ids=())
 
     successor_report = worker.submit(
-        execution_run(
-            run_id=2,
+        execution_batch(
+            batch_id=2,
             admissions=(),
             operations=(successor,),
         )
@@ -207,8 +207,8 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
     )
     reports = [
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(operation,),
             )
@@ -216,11 +216,11 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
     ]
     operations = [operation]
 
-    for run_id in range(2, 5):
+    for batch_id in range(2, 5):
         predecessor = operations[-1]
         operation = token_operation(
             admission.request_key,
-            op_id=ComputationId(run_id, 0),
+            op_id=ComputationId(batch_id, 0),
             predecessor=predecessor.op_id,
             mode=ForwardMode.DECODE,
             tokens=(0,),
@@ -228,8 +228,8 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
         )
         reports.append(
             worker.submit(
-                execution_run(
-                    run_id=run_id,
+                execution_batch(
+                    batch_id=batch_id,
                     admissions=(),
                     operations=(operation,),
                 )
@@ -266,19 +266,19 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
     )
     reports = [
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(operation,),
             )
         )
     ]
     operations = [operation]
-    for run_id in range(2, 5):
+    for batch_id in range(2, 5):
         predecessor = operations[-1]
         operation = token_operation(
             admission.request_key,
-            op_id=ComputationId(run_id, 0),
+            op_id=ComputationId(batch_id, 0),
             predecessor=predecessor.op_id,
             mode=ForwardMode.DECODE,
             tokens=(0,),
@@ -286,8 +286,8 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
         )
         reports.append(
             worker.submit(
-                execution_run(
-                    run_id=run_id,
+                execution_batch(
+                    batch_id=batch_id,
                     operations=(operation,),
                 )
             )
@@ -326,8 +326,8 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         ),
     )
     parent_report = worker.submit(
-        execution_run(
-            run_id=1,
+        execution_batch(
+            batch_id=1,
             admissions=(pipelined,),
             operations=(predecessor,),
         )
@@ -346,8 +346,8 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         ),
     )
     successor_report = worker.submit(
-        execution_run(
-            run_id=2,
+        execution_batch(
+            batch_id=2,
             admissions=(),
             operations=(successor,),
         )
@@ -374,8 +374,8 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         ),
     )
     serial_parent_report = serial_worker.submit(
-        execution_run(
-            run_id=11,
+        execution_batch(
+            batch_id=11,
             admissions=(serial,),
             operations=(serial_parent,),
         )
@@ -397,8 +397,8 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         ),
     )
     serial_successor_report = serial_worker.submit(
-        execution_run(
-            run_id=12,
+        execution_batch(
+            batch_id=12,
             admissions=(),
             operations=(serial_successor,),
             commands=(),
@@ -444,8 +444,8 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         ),
     )
     parent_report = worker.submit(
-        execution_run(
-            run_id=1,
+        execution_batch(
+            batch_id=1,
             admissions=(pipelined,),
             operations=(predecessor,),
         )
@@ -464,8 +464,8 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         ),
     )
     successor_report = worker.submit(
-        execution_run(
-            run_id=2,
+        execution_batch(
+            batch_id=2,
             admissions=(),
             operations=(successor,),
         )
@@ -492,8 +492,8 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         ),
     )
     serial_parent_report = serial_worker.submit(
-        execution_run(
-            run_id=11,
+        execution_batch(
+            batch_id=11,
             admissions=(serial,),
             operations=(serial_parent,),
         )
@@ -515,8 +515,8 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         ),
     )
     serial_successor_report = serial_worker.submit(
-        execution_run(
-            run_id=12,
+        execution_batch(
+            batch_id=12,
             admissions=(),
             operations=(serial_successor,),
             commands=(),

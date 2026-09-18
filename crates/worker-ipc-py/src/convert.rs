@@ -16,11 +16,11 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams, TokenLogprob};
 use uniserve_worker_ipc::{
-    ArRequestParams, ArtifactHandle, BatchCommand, BatchOutput, BlockTable, BufferAllocation,
-    BufferId, CachePageAllocation, Computation, ComputationId, DType, DecodeRange,
-    DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, ErrorOperationIdentity, FeatureKind,
-    FinishFlags, ForwardStats, KvTransfer, LatentParams, Locator, MediaOutput, NewRequest,
-    OpStatus, RegistrationAck, RequestKey, RequestKind, RequestOutput, ScheduleBatch,
+    ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable,
+    BufferAllocation, BufferId, CachePageAllocation, Computation, ComputationId, DType,
+    DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, ErrorOperationIdentity,
+    FeatureKind, FinishFlags, ForwardStats, KvTransfer, LatentParams, Locator, MediaOutput,
+    NewRequest, OpStatus, RegistrationAck, RequestKey, RequestKind, RequestOutput,
     ScheduledRequest, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
     TransferHandle, TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerRequest,
     WorkerResponse, WorkerResponseError,
@@ -34,7 +34,7 @@ pub(crate) fn execute_request_to_py<'py>(
     py: Python<'py>,
     request: &WorkerRequest,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let WorkerRequest::Submit { call_id, run } = request else {
+    let WorkerRequest::Submit { call_id, batch } = request else {
         return Err(PyValueError::new_err(
             "native submit conversion requires a submit request",
         ));
@@ -42,18 +42,18 @@ pub(crate) fn execute_request_to_py<'py>(
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "kind"), request_kind_py(py, request.kind()))?;
     dict.set_item(intern!(py, "call_id"), call_id)?;
-    dict.set_item(intern!(py, "run"), run_to_py(py, run)?)?;
+    dict.set_item(intern!(py, "batch"), batch_to_py(py, batch)?)?;
     Ok(dict)
 }
 
 /// Cached handles to the worker's operation types and enum members.
 ///
-/// The serve loop constructs one `ScheduleBatch` object per submission; every hot
+/// The serve loop constructs one `Batch` object per submission; every hot
 /// record (operations, KV allocations, admission/close/release commands) is built
 /// by calling the operation dataclass constructors positionally, so the worker
 /// never re-decodes those records from IPC maps. Rare members (admissions,
 /// input products and allocations) still cross as IPC maps and are decoded by
-/// `native_run` on the Python side.
+/// `native_batch` on the Python side.
 struct NativeRequestTypes {
     operation: Py<PyAny>,
     computation_id: Py<PyAny>,
@@ -72,7 +72,7 @@ struct NativeRequestTypes {
     start: Py<PyAny>,
     finish: Py<PyAny>,
     free: Py<PyAny>,
-    native_run: Py<PyAny>,
+    native_batch: Py<PyAny>,
     dtypes: [Py<PyAny>; 7],
     draw_layouts: [Py<PyAny>; 3],
     forward_modes: [Py<PyAny>; ForwardMode::ALL.len()],
@@ -132,7 +132,7 @@ impl NativeRequestTypes {
             start: class(&batch, "Start")?,
             finish: class(&batch, "Finish")?,
             free: class(&batch, "Free")?,
-            native_run: class(&batch, "native_run")?,
+            native_batch: class(&batch, "native_batch")?,
 
             // Enum members follow the stable Rust discriminant order used by
             // the indexed accessors below.
@@ -540,7 +540,7 @@ impl<'py> NativeRequestConversion<'py> {
 }
 
 /// Constructs one Python run, using typed hot-path objects and mapped rare records.
-fn run_to_py<'py>(py: Python<'py>, run: &ScheduleBatch) -> PyResult<Bound<'py, PyAny>> {
+fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>> {
     let mut context = RequestConversion::new(py);
     let mut native = NativeRequestConversion::new(py)?;
 
@@ -571,12 +571,11 @@ fn run_to_py<'py>(py: Python<'py>, run: &ScheduleBatch) -> PyResult<Bound<'py, P
         tensor_publication_to_py(py, payload, &mut context)
     })?;
 
-    // `native_run` assembles both representations without reparsing typed leaves.
+    // `native_batch` assembles both representations without reparsing typed leaves.
     let arguments = pyo3::types::PyTuple::new(
         py,
         [
             run.batch_id.into_pyobject(py)?.into_any(),
-            run.run_id.into_pyobject(py)?.into_any(),
             run.collective_seq.into_pyobject(py)?.into_any(),
             pyo3::types::PyTuple::new(py, operations)?.into_any(),
             pyo3::types::PyTuple::new(py, block_tables)?.into_any(),
@@ -610,7 +609,7 @@ fn run_to_py<'py>(py: Python<'py>, run: &ScheduleBatch) -> PyResult<Bound<'py, P
             .into_any(),
         ],
     )?;
-    native.types.native_run.bind(py).call1(arguments)
+    native.types.native_batch.bind(py).call1(arguments)
 }
 
 /// Converts a latent-page params into its Python mapping shape.
@@ -1135,7 +1134,6 @@ fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, P
     match kind {
         RequestKind::Info => intern!(py, "info"),
         RequestKind::Submit => intern!(py, "submit"),
-        RequestKind::Poll => intern!(py, "poll"),
         RequestKind::Close => intern!(py, "close"),
     }
 }
@@ -1279,13 +1277,11 @@ fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput> {
     };
     Some(BatchOutput {
         batch_id: u64_of(&get(dict, intern!(py, "batch_id"))?)?,
-        run_id: u64_of(&get(dict, intern!(py, "run_id"))?)?,
         completions: records,
         products: payloads,
         registration,
         worker_exec_us: opt_u64(dict, intern!(py, "worker_exec_us"))?,
         forward_stats,
-        done: bool_of(&get(dict, intern!(py, "done"))?)?,
     })
 }
 
@@ -1891,7 +1887,12 @@ mod tests {
         }
     }
 
-    fn execute_request() -> WorkerRequest {
+    /// One submission per computation.
+    ///
+    /// A batch carries one computation through one component, so the native
+    /// conversion is exercised with a token call, a media call and a KV
+    /// transfer in three batches rather than one mixed submission.
+    fn execute_requests() -> Vec<WorkerRequest> {
         let request_key = RequestKey::new(1, RequestId(2), 1);
         let admission = NewRequest::new(
             request_key,
@@ -2011,7 +2012,7 @@ mod tests {
             input_token_ids: Vec::new(),
             sampling_state: None,
             request_key: media_key,
-            op_id: ComputationId::new(11, 1),
+            op_id: ComputationId::new(12, 0),
             predecessor: Some(ComputationId::new(0, 0)),
             entry: "model".into(),
             code: Computation::Pipeline(PipelineStage::LatentPreparation),
@@ -2025,7 +2026,7 @@ mod tests {
         };
         let latent_params = vec![LatentParams {
             request_key: media_key,
-            op_id: ComputationId::new(11, 1),
+            op_id: ComputationId::new(12, 0),
             page_table: vec![1],
             latent_units: 64,
             height: 768,
@@ -2055,7 +2056,7 @@ mod tests {
             transition_output: None,
 
             request_key: kv_key,
-            op_id: ComputationId::new(11, 2),
+            op_id: ComputationId::new(13, 0),
             predecessor: Some(ComputationId::new(0, 0)),
             entry: "decoder".into(),
             code: Computation::Transfer(TransferMode::KvInstall),
@@ -2065,7 +2066,7 @@ mod tests {
             },
             kv_input: Some(kv_source),
             kv_output: Some(BufferId {
-                producer_op_id: ComputationId::new(11, 2),
+                producer_op_id: ComputationId::new(13, 0),
                 generation: 4,
                 ..kv_source
             }),
@@ -2077,26 +2078,32 @@ mod tests {
             predicate: None,
             rng: None,
         };
-        let mut run = ScheduleBatch::new(
-            11,
-            vec![admission, media_admission],
-            vec![operation, media_operation, kv_operation],
-        );
-        run.kv_inputs = vec![kv_publication(kv_source)];
-        run.block_tables = block_tables;
-        run.new_cache_pages = new_cache_pages;
-        run.forward = forward;
-        run.latent_params = latent_params;
-        let mut request = WorkerRequest::submit(run);
-        request.set_call_id(Some(9));
-        request
+        let mut token_batch = Batch::new(11, vec![admission], vec![operation]);
+        token_batch.block_tables = block_tables;
+        token_batch.new_cache_pages = new_cache_pages;
+        token_batch.forward = forward;
+
+        let mut media_batch = Batch::new(12, vec![media_admission], vec![media_operation]);
+        media_batch.latent_params = latent_params;
+
+        let mut kv_batch = Batch::new(13, Vec::new(), vec![kv_operation]);
+        kv_batch.kv_inputs = vec![kv_publication(kv_source)];
+
+        [token_batch, media_batch, kv_batch]
+            .into_iter()
+            .enumerate()
+            .map(|(index, batch)| {
+                let mut request = WorkerRequest::submit(batch);
+                request.set_call_id(Some(9 + index as u64));
+                request
+            })
+            .collect()
     }
 
     fn result_response() -> WorkerResponse {
         let request_key = RequestKey::new(1, RequestId(2), 1);
         let mut response = WorkerResponse::result(BatchOutput {
-            batch_id: 11,
-            run_id: 11,
+            batch_id: 13,
             completions: vec![RequestOutput {
                 sampled_logprob: Some(-0.25),
                 top_logprobs: vec![TokenLogprob {
@@ -2110,7 +2117,7 @@ mod tests {
                     rank: 19,
                 }]],
                 request_key,
-                op_id: ComputationId::new(11, 0),
+                op_id: ComputationId::new(13, 0),
 
                 status: OpStatus::Ok,
 
@@ -2132,14 +2139,13 @@ mod tests {
             registration: RegistrationAck { visible: true },
             worker_exec_us: Some(12),
             forward_stats: None,
-            done: true,
         });
         let WorkerResponse::Result { result, .. } = &mut response else {
             unreachable!();
         };
         let mut publication = result.completions[0].clone();
         publication.request_key = RequestKey::new(1, RequestId(4), 1);
-        publication.op_id = ComputationId::new(11, 2);
+        publication.op_id = ComputationId::new(13, 1);
         publication.code = Computation::Transfer(TransferMode::KvPublish);
         publication.committed_tokens.clear();
 
@@ -2154,8 +2160,22 @@ mod tests {
             generation: 4,
         }));
         result.completions.push(publication);
-        response.set_call_id(Some(9));
+        response.set_call_id(Some(11));
         response
+    }
+
+    /// A minimal result for a batch whose values this test does not inspect.
+    fn acknowledgement(py: Python<'_>, batch_id: u64) -> Bound<'_, PyAny> {
+        let mut response = WorkerResponse::result(BatchOutput {
+            batch_id,
+            completions: Vec::new(),
+            products: Vec::new(),
+            registration: RegistrationAck { visible: true },
+            worker_exec_us: None,
+            forward_stats: None,
+        });
+        response.set_call_id(Some(9 + batch_id - 11));
+        pythonize(py, &response).unwrap()
     }
 
     #[test]
@@ -2166,10 +2186,13 @@ mod tests {
             .unwrap()
             .as_nanos();
         let service = format!("uniserve/ipc-py-test-{}-{nonce}", std::process::id());
-        let server = crate::PyServer::new(&service, 1 << 20, 2).unwrap();
-        let client = ClientEndpoint::connect(&service, 1 << 20, 2).unwrap();
-        let request = execute_request();
-        let pending = client.send_request(&request).unwrap();
+        let server = crate::PyServer::new(&service, 1 << 20, 4).unwrap();
+        let client = ClientEndpoint::connect(&service, 1 << 20, 4).unwrap();
+        let requests = execute_requests();
+        let pending = requests
+            .iter()
+            .map(|request| client.send_request(request).unwrap())
+            .collect::<Vec<_>>();
         let expected = result_response();
 
         Python::attach(|py| {
@@ -2183,157 +2206,178 @@ mod tests {
                 .unwrap()
                 .call_method1("insert", (0, repo_root.to_str().unwrap()))
                 .unwrap();
-            let native_request = server.recv(py).unwrap();
-            let request_dict = native_request.bind(py).cast::<PyDict>().unwrap();
-            let native_run = request_dict.get_item("run").unwrap().unwrap();
-            assert_eq!(
-                native_run
-                    .getattr("run_id")
-                    .unwrap()
-                    .extract::<u64>()
-                    .unwrap(),
-                11
-            );
-            assert_eq!(native_run.getattr("operations").unwrap().len().unwrap(), 3);
-            assert_eq!(
-                native_run
+            let canonical = py
+                .import("uniserve_worker.protocol.batch")
+                .unwrap()
+                .getattr("Batch")
+                .unwrap();
+            for (index, request) in requests.iter().enumerate() {
+                let native_request = server.recv(py).unwrap();
+                let request_dict = native_request.bind(py).cast::<PyDict>().unwrap();
+                let native_batch = request_dict.get_item("batch").unwrap().unwrap();
+                let WorkerRequest::Submit { batch, .. } = request else {
+                    unreachable!();
+                };
+                assert_eq!(
+                    native_batch
+                        .getattr("batch_id")
+                        .unwrap()
+                        .extract::<u64>()
+                        .unwrap(),
+                    batch.batch_id
+                );
+                assert_eq!(
+                    native_batch.getattr("operations").unwrap().len().unwrap(),
+                    1
+                );
+
+                // The natively constructed batch must be exactly what the
+                // canonical codec decodes from its own IPC form.
+                let round_tripped = canonical
+                    .call_method1(
+                        "from_mapping",
+                        (native_batch.call_method0("to_mapping").unwrap(),),
+                    )
+                    .unwrap();
+                assert!(
+                    round_tripped.eq(&native_batch).unwrap(),
+                    "native batch construction diverged from the canonical codec"
+                );
+
+                let operation = native_batch
                     .getattr("operations")
                     .unwrap()
                     .get_item(0)
-                    .unwrap()
-                    .getattr("input_token_ids")
-                    .unwrap()
-                    .extract::<Vec<u32>>()
-                    .unwrap(),
-                vec![7, 8]
-            );
-            let sampling = native_run
-                .getattr("operations")
-                .unwrap()
-                .get_item(0)
-                .unwrap()
-                .getattr("sampling_state")
-                .unwrap();
-            assert_eq!(
-                sampling
-                    .getattr("allowed_token_ids")
-                    .unwrap()
-                    .extract::<Vec<u32>>()
-                    .unwrap(),
-                Vec::<u32>::new()
-            );
-            assert_eq!(
-                sampling
-                    .getattr("suppressed_token_ids")
-                    .unwrap()
-                    .extract::<Vec<u32>>()
-                    .unwrap(),
-                vec![3, 9]
-            );
-            assert_eq!(
-                sampling
-                    .getattr("finish_token_ids")
-                    .unwrap()
-                    .extract::<Vec<u32>>()
-                    .unwrap(),
-                vec![11]
-            );
-            assert_eq!(
-                sampling
-                    .getattr("transition_token_ids")
-                    .unwrap()
-                    .extract::<Vec<u32>>()
-                    .unwrap(),
-                vec![13, 29]
-            );
-            assert!(
-                sampling
-                    .getattr("force_finish")
-                    .unwrap()
-                    .extract::<bool>()
-                    .unwrap()
-            );
-            let imported_kv = native_run
-                .getattr("kv_inputs")
-                .unwrap()
-                .get_item(0)
-                .unwrap();
-            let imported_mapping = imported_kv.call_method0("to_mapping").unwrap();
-            let WorkerRequest::Submit { run, .. } = &request else {
-                unreachable!();
-            };
-            let expected_source = pythonize(py, &run.kv_inputs[0].source).unwrap();
-            assert!(
-                imported_kv
-                    .getattr("source")
-                    .unwrap()
-                    .call_method0("to_mapping")
-                    .unwrap()
-                    .eq(expected_source)
-                    .unwrap()
-            );
-            let kv_operation = native_run
-                .getattr("operations")
-                .unwrap()
-                .get_item(2)
-                .unwrap();
-            assert!(
-                kv_operation
-                    .getattr("kv_input")
-                    .unwrap()
-                    .eq(imported_kv.getattr("source").unwrap())
-                    .unwrap()
-            );
-            let admissions = native_run.getattr("admissions").unwrap();
-            let media = admissions.get_item(1).unwrap();
-            assert_eq!(
-                media
-                    .getattr("prompt_token_ids")
-                    .unwrap()
-                    .extract::<Vec<u32>>()
-                    .unwrap(),
-                vec![17, 23, 65_537]
-            );
-            // The natively constructed batch must be exactly what the
-            // canonical codec decodes from its own IPC form.
-            let round_tripped = py
-                .import("uniserve_worker.protocol.batch")
-                .unwrap()
-                .getattr("ScheduleBatch")
-                .unwrap()
-                .call_method1(
-                    "from_mapping",
-                    (native_run.call_method0("to_mapping").unwrap(),),
-                )
-                .unwrap();
-            assert!(
-                round_tripped.eq(&native_run).unwrap(),
-                "native batch construction diverged from the canonical codec"
-            );
+                    .unwrap();
+                match index {
+                    // The token call carries host-staged inputs and the
+                    // sampling state the worker reads per call.
+                    0 => {
+                        assert_eq!(
+                            operation
+                                .getattr("input_token_ids")
+                                .unwrap()
+                                .extract::<Vec<u32>>()
+                                .unwrap(),
+                            vec![7, 8]
+                        );
+                        let sampling = operation.getattr("sampling_state").unwrap();
+                        assert_eq!(
+                            sampling
+                                .getattr("allowed_token_ids")
+                                .unwrap()
+                                .extract::<Vec<u32>>()
+                                .unwrap(),
+                            Vec::<u32>::new()
+                        );
+                        assert_eq!(
+                            sampling
+                                .getattr("suppressed_token_ids")
+                                .unwrap()
+                                .extract::<Vec<u32>>()
+                                .unwrap(),
+                            vec![3, 9]
+                        );
+                        assert_eq!(
+                            sampling
+                                .getattr("finish_token_ids")
+                                .unwrap()
+                                .extract::<Vec<u32>>()
+                                .unwrap(),
+                            vec![11]
+                        );
+                        assert_eq!(
+                            sampling
+                                .getattr("transition_token_ids")
+                                .unwrap()
+                                .extract::<Vec<u32>>()
+                                .unwrap(),
+                            vec![13, 29]
+                        );
+                        assert!(
+                            sampling
+                                .getattr("force_finish")
+                                .unwrap()
+                                .extract::<bool>()
+                                .unwrap()
+                        );
+                        server
+                            .respond(py, &acknowledgement(py, batch.batch_id))
+                            .unwrap();
+                    }
+                    // The media call travels with its own admission.
+                    1 => {
+                        let media = native_batch
+                            .getattr("admissions")
+                            .unwrap()
+                            .get_item(0)
+                            .unwrap();
+                        assert_eq!(
+                            media
+                                .getattr("prompt_token_ids")
+                                .unwrap()
+                                .extract::<Vec<u32>>()
+                                .unwrap(),
+                            vec![17, 23, 65_537]
+                        );
+                        server
+                            .respond(py, &acknowledgement(py, batch.batch_id))
+                            .unwrap();
+                    }
+                    // The KV transfer names its imported publication, which
+                    // the response relays back as the installed location.
+                    _ => {
+                        let imported_kv = native_batch
+                            .getattr("kv_inputs")
+                            .unwrap()
+                            .get_item(0)
+                            .unwrap();
+                        let imported_mapping = imported_kv.call_method0("to_mapping").unwrap();
+                        let expected_source = pythonize(py, &batch.kv_inputs[0].source).unwrap();
+                        assert!(
+                            imported_kv
+                                .getattr("source")
+                                .unwrap()
+                                .call_method0("to_mapping")
+                                .unwrap()
+                                .eq(expected_source)
+                                .unwrap()
+                        );
+                        assert!(
+                            operation
+                                .getattr("kv_input")
+                                .unwrap()
+                                .eq(imported_kv.getattr("source").unwrap())
+                                .unwrap()
+                        );
 
-            let response = pythonize(py, &expected).unwrap();
-            // Relay the imported physical metadata through the public result
-            // mapping. The final Rust equality checks every location and extent
-            // after both native directions, not just Python serialization itself.
-            let publication = response
-                .get_item("result")
-                .unwrap()
-                .get_item("completions")
-                .unwrap()
-                .get_item(1)
-                .unwrap();
-            let output_source = publication
-                .get_item("kv_output")
-                .unwrap()
-                .get_item("source")
-                .unwrap();
-            imported_mapping.set_item("source", output_source).unwrap();
-            publication.set_item("kv_output", imported_mapping).unwrap();
-            server.respond(py, &response).unwrap();
+                        let response = pythonize(py, &expected).unwrap();
+                        // Relay the imported physical metadata through the
+                        // public result mapping. The final Rust equality checks
+                        // every location and extent after both native
+                        // directions, not just Python serialization itself.
+                        let publication = response
+                            .get_item("result")
+                            .unwrap()
+                            .get_item("completions")
+                            .unwrap()
+                            .get_item(1)
+                            .unwrap();
+                        let output_source = publication
+                            .get_item("kv_output")
+                            .unwrap()
+                            .get_item("source")
+                            .unwrap();
+                        imported_mapping.set_item("source", output_source).unwrap();
+                        publication.set_item("kv_output", imported_mapping).unwrap();
+                        server.respond(py, &response).unwrap();
+                    }
+                }
+            }
         });
 
         let response = client
-            .recv_response_timeout(&pending, Duration::from_secs(5))
+            .recv_response_timeout(pending.last().unwrap(), Duration::from_secs(5))
             .unwrap()
             .expect("native result response");
         assert_eq!(response.decode_response().unwrap(), expected);

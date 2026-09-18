@@ -94,10 +94,8 @@ pub struct DomainStats {
     pub backpressure_events: AtomicU64,
     /// Cumulative credits recovered after terminal execution failure.
     pub reclaimed_credits: AtomicU64,
-    /// Cumulative physical runs completed in the domain.
-    pub completed_runs: AtomicU64,
-    /// Cumulative runs that overlapped another execution domain.
-    pub co_resident_runs: AtomicU64,
+    /// Cumulative batches completed in the domain.
+    pub completed_batches: AtomicU64,
     /// Cumulative worker queue time, in microseconds.
     pub queue_us: AtomicU64,
     /// Cumulative worker launch time, in microseconds.
@@ -106,8 +104,6 @@ pub struct DomainStats {
     pub device_us: AtomicU64,
     /// Cumulative completion processing time, in microseconds.
     pub completion_us: AtomicU64,
-    /// Cumulative time spent overlapping another domain, in microseconds.
-    pub co_resident_us: AtomicU64,
 }
 
 /// Domain-indexed scheduler accounting shared with the stats reporter.

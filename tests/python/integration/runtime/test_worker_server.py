@@ -11,30 +11,30 @@ import pytest
 
 from tests.python.fixtures.depth_one import (
     ar_params,
-    execution_run,
+    execution_batch,
     root_parent,
     token_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
-from uniserve_worker.protocol.batch import Finish, NewRequest, ScheduleBatch
+from uniserve_worker.protocol.batch import Batch, Finish, NewRequest
 from uniserve_worker.protocol.identity import ComputationId, RequestKey
 from uniserve_worker.protocol.operation import ForwardMode, ScheduledRequest
 
 pytestmark = pytest.mark.integration
 
 
-def _request(call_id: int, run: ScheduleBatch) -> dict[str, object]:
-    return {"kind": "submit", "call_id": call_id, "run": run}
+def _request(call_id: int, batch: Batch) -> dict[str, object]:
+    return {"kind": "submit", "call_id": call_id, "batch": batch}
 
 
 def _token_run(
     *,
     request_id: int,
     op_id: ComputationId,
-    run_id: int,
+    batch_id: int,
     tokens: tuple[int, ...],
-) -> tuple[NewRequest, ScheduledRequest, ScheduleBatch]:
+) -> tuple[NewRequest, ScheduledRequest, Batch]:
     admission = ar_params(request_id, block_ids=(request_id,))
     operation = token_operation(
         admission.request_key,
@@ -46,8 +46,8 @@ def _token_run(
     return (
         admission,
         operation,
-        execution_run(
-            run_id=run_id,
+        execution_batch(
+            batch_id=batch_id,
             admissions=(admission,),
             operations=(operation,),
         ),
@@ -87,7 +87,7 @@ def test_duplicate_submissions_are_rejected_while_the_original_completes(
     _admission, _operation, run = _token_run(
         request_id=11,
         op_id=ComputationId(21, 0),
-        run_id=7,
+        batch_id=7,
         tokens=(8, 9),
     )
     endpoint = QueuedWorkerIpc(
@@ -104,7 +104,6 @@ def test_duplicate_submissions_are_rejected_while_the_original_completes(
 
     responses = _by_call(endpoint)
     assert responses[1]["kind"] == "result"
-    assert responses[1]["result"]["done"]
     for call_id in (2, 3):
         assert responses[call_id]["kind"] == "error"
         assert responses[call_id]["code"] == "InvalidDescriptor"
@@ -116,7 +115,7 @@ def test_failed_submissions_cannot_be_reused_and_allow_shutdown() -> None:
         admission = replace(
             ar_params(91), request_pool_idx=worker.info.request_slots + 1
         )
-        run = execution_run(run_id=1, admissions=(admission,))
+        run = execution_batch(batch_id=1, admissions=(admission,))
         endpoint = QueuedWorkerIpc(
             (
                 _request(1, run),
@@ -136,11 +135,19 @@ def test_failed_submissions_cannot_be_reused_and_allow_shutdown() -> None:
     assert responses[3]["kind"] == "ok"
 
 
-def test_conflicting_run_identity_fails_before_new_admission() -> None:
+def test_a_batch_id_that_does_not_advance_is_refused_before_new_admission() -> (
+    None
+):
+    """`batch_id` is the submission identity and must strictly advance.
+
+    A refused submission applies nothing: neither its admission nor its
+    computations take effect, and the same work still runs once it is
+    submitted under an advancing identity.
+    """
     admission, operation, run = _token_run(
         request_id=12,
         op_id=ComputationId(2, 0),
-        run_id=8,
+        batch_id=8,
         tokens=(4, 5),
     )
     conflicting = token_operation(
@@ -150,27 +157,34 @@ def test_conflicting_run_identity_fails_before_new_admission() -> None:
         mode=ForwardMode.PREFILL,
         tokens=(4, 5, 6),
     )
-    conflicting_run = execution_run(
-        run_id=8,
+    conflicting_run = execution_batch(
+        batch_id=8,
         operations=(conflicting,),
     )
-    next_admission, next_operation, next_run = _token_run(
+    next_admission, next_operation, _superseded = _token_run(
         request_id=13,
         op_id=ComputationId(2, 1),
-        run_id=8,
+        batch_id=8,
         tokens=(7,),
     )
-    mixed_run = execution_run(
-        run_id=8,
+    # Reuses the accepted identity while carrying a new admission.
+    reused_identity_run = execution_batch(
+        batch_id=8,
         admissions=(next_admission,),
         operations=(operation, next_operation),
+    )
+    _, _, advancing_run = _token_run(
+        request_id=13,
+        op_id=ComputationId(3, 1),
+        batch_id=9,
+        tokens=(7,),
     )
     endpoint = QueuedWorkerIpc(
         (
             _request(1, run),
             _request(2, conflicting_run),
-            _request(3, mixed_run),
-            _request(4, replace(next_run, run_id=9, batch_id=2)),
+            _request(3, reused_identity_run),
+            _request(4, advancing_run),
             {"kind": "close", "call_id": 5},
         )
     )
@@ -184,13 +198,12 @@ def test_conflicting_run_identity_fails_before_new_admission() -> None:
     assert responses[2]["code"] == "InvalidDescriptor"
     assert responses[3]["kind"] == "error"
     assert responses[3]["code"] == "InvalidDescriptor"
-    # Rejected work must not admit its request; the independent computation
-    # can still execute in another physical run of the same logical batch.
+    # Rejected work must not admit its request; the same computation still
+    # executes once its batch identity advances.
     result = responses[4]["result"]
-    assert result["batch_id"] == 2
-    assert result["run_id"] == 9
+    assert result["batch_id"] == 3
     assert result["completions"][0]["op_id"] == {
-        "batch_id": 2,
+        "batch_id": 3,
         "request_index": 1,
     }
     assert result["completions"][0]["status"] == "ok"
@@ -224,7 +237,7 @@ def test_unbound_run_failure_closes_worker_at_scope_exit() -> None:
         worker.bind(QueuedWorkerIpc())
     with pytest.raises(RuntimeError, match="closed"):
         worker.submit(
-            execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),))
+            execution_batch(batch_id=1, commands=(Finish(RequestKey(1, 1, 1)),))
         )
     worker.close()
 
@@ -252,7 +265,7 @@ def test_service_is_single_use_and_scope_exit_prevents_reuse() -> None:
             action()
     with pytest.raises(RuntimeError, match="closed"):
         worker.submit(
-            execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),))
+            execution_batch(batch_id=1, commands=(Finish(RequestKey(1, 1, 1)),))
         )
     worker.close()
 
@@ -333,7 +346,7 @@ def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
     assert not endpoint.closed
     with pytest.raises(RuntimeError, match="closed"):
         worker.submit(
-            execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),))
+            execution_batch(batch_id=1, commands=(Finish(RequestKey(1, 1, 1)),))
         )
     if cleanup_failure:
         assert any(
@@ -366,7 +379,9 @@ def test_transport_failure_releases_worker_and_restores_gc(
         assert not endpoint.closed
         with pytest.raises(RuntimeError, match="closed"):
             worker.submit(
-                execution_run(run_id=1, commands=(Finish(RequestKey(1, 1, 1)),))
+                execution_batch(
+                    batch_id=1, commands=(Finish(RequestKey(1, 1, 1)),)
+                )
             )
     finally:
         (gc.enable if was_enabled else gc.disable)()

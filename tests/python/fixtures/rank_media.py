@@ -1,7 +1,6 @@
-"""A real CPU Worker behind deterministic IPC result fragmentation."""
+"""A real CPU Worker whose results carry test-selected media payloads."""
 
 import os
-from collections import deque
 from pathlib import Path
 
 from tests.python.fixtures.depth_one import finalized_report
@@ -26,7 +25,6 @@ def main():
     ) as endpoint:
         register_endpoint(config, service)
         with Worker.from_config(config) as worker:
-            pending = {}
             worker.warmup()
             while True:
                 request = endpoint.recv()
@@ -46,7 +44,7 @@ def main():
                     break
                 if kind == "submit":
                     report = finalized_report(
-                        worker, worker.submit(request["run"])
+                        worker, worker.submit(request["batch"])
                     ).to_mapping()
                     media_case = os.environ.get("UNISERVE_TEST_MEDIA_RESPONSE")
                     media_rank = 1 if media_case == "rank-output" else 0
@@ -71,51 +69,11 @@ def main():
                                 **completion["op_id"],
                                 "request_index": 1000,
                             }
-                    fragments = deque()
-                    if (
-                        config.execution.rank == 0
-                        and len(report["completions"]) > 1
-                    ):
-                        for index, completion in enumerate(
-                            report["completions"]
-                        ):
-                            products = [
-                                product
-                                for product in report["products"]
-                                if product["product"]["request_key"]
-                                == completion["request_key"]
-                                and product["product"]["producer_op_id"]
-                                == completion["op_id"]
-                            ]
-                            fragments.append(
-                                {
-                                    **report,
-                                    "completions": [completion],
-                                    "products": products,
-                                    "done": report["done"]
-                                    and index == len(report["completions"]) - 1,
-                                    "forward_stats": report["forward_stats"]
-                                    if index == 0
-                                    else None,
-                                    "worker_exec_us": report["worker_exec_us"]
-                                    if index == 0
-                                    else None,
-                                }
-                            )
-                    else:
-                        fragments.append(report)
-                    run_id = report["run_id"]
-                    pending[run_id] = fragments
-                elif kind == "poll":
-                    run_id = request["run_id"]
+                    endpoint.respond(
+                        {"kind": "result", "call_id": call_id, "result": report}
+                    )
                 else:
-                    raise ValueError(f"unsupported framing request {kind}")
-                report = pending[run_id].popleft()
-                endpoint.respond(
-                    {"kind": "result", "call_id": call_id, "result": report}
-                )
-                if not pending[run_id]:
-                    del pending[run_id]
+                    raise ValueError(f"unsupported worker request {kind}")
 
 
 if __name__ == "__main__":

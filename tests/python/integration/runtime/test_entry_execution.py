@@ -19,11 +19,11 @@ from uniserve_worker.execution.model_entry import ModelEntry
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.foundation.errors import InputError
 from uniserve_worker.protocol.batch import (
+    Batch,
     BufferAllocation,
     DecodeRange,
     DiffusionParams,
     NewRequest,
-    ScheduleBatch,
     Start,
     TensorPublication,
 )
@@ -275,9 +275,8 @@ def test_text_encoder_operation_publishes_consumable_conditioning(
         bounds=Bounds(),
         outputs=(reference,),
     )
-    run = ScheduleBatch(
+    run = Batch(
         batch_id=1,
-        run_id=1,
         operations=(operation,),
         commands=(
             Start(
@@ -299,11 +298,9 @@ def test_text_encoder_operation_publishes_consumable_conditioning(
 
             started = finalized_report(
                 worker,
-                worker.submit(
-                    ScheduleBatch(batch_id=2, run_id=2, commands=run.commands)
-                ),
+                worker.submit(Batch(batch_id=2, commands=run.commands)),
             )
-            assert started.done and not started.completions
+            assert not started.completions
             run = replace(run, commands=())
         report = finalized_report(worker, worker.submit(run))
         (completion,) = report.completions
@@ -349,9 +346,8 @@ def test_text_encoder_operation_publishes_consumable_conditioning(
             outputs=(copied,),
         )
         prepared = worker.submit(
-            ScheduleBatch(
+            Batch(
                 batch_id=2,
-                run_id=3,
                 collective_seq=3,
                 operations=(consumer,),
                 input_products=(TensorPublication(reference, product.value),),
@@ -488,9 +484,8 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
             diffusion=DiffusionParams(22, 3, 4, 1000),
             prompt_token_ids=(3, 8, 1),
         )
-        run = ScheduleBatch(
+        run = Batch(
             batch_id=1,
-            run_id=1,
             operations=(operation,),
             commands=(Start(admission),),
             buffer_allocations=(

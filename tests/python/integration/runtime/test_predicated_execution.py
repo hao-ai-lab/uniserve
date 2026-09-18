@@ -6,7 +6,7 @@ from dataclasses import replace
 from tests.python.fixtures.depth_one import (
     ar_params,
     diffusion_prepare_operation,
-    execution_run,
+    execution_batch,
     finalized_report,
     kv_publication_operation,
     record_completion,
@@ -52,8 +52,10 @@ def _release_relay_outputs(worker, *operations: ScheduledRequest) -> None:
     finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=max(operation.op_id.batch_id for operation in operations)
+            execution_batch(
+                batch_id=max(
+                    operation.op_id.batch_id for operation in operations
+                )
                 + 1,
                 commands=tuple(
                     Free(output.buffer_id)
@@ -106,8 +108,8 @@ def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> (
     report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(operation,),
             )
@@ -142,8 +144,8 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         tokens=(3, 4),
     )
     parent_report = worker.submit(
-        execution_run(
-            run_id=1,
+        execution_batch(
+            batch_id=1,
             admissions=(admission,),
             operations=(predecessor,),
         )
@@ -158,8 +160,8 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         predicate=continuation,
     )
     successor_report = worker.submit(
-        execution_run(
-            run_id=2,
+        execution_batch(
+            batch_id=2,
             admissions=(),
             operations=(successor,),
         )
@@ -177,8 +179,8 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
     descendant_report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 admissions=(),
                 operations=(descendant,),
             )
@@ -219,8 +221,8 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
     later_completion = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=5,
+            execution_batch(
+                batch_id=5,
                 admissions=(),
                 operations=(later,),
             )
@@ -230,8 +232,8 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
     assert later_completion.position == parent_completion.position + 1
 
     close_report = worker.submit(
-        execution_run(
-            run_id=7,
+        execution_batch(
+            batch_id=7,
             admissions=(),
             operations=(),
             commands=(
@@ -266,8 +268,8 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         tokens=(3, 4),
     )
     initial_report = worker.submit(
-        execution_run(
-            run_id=1,
+        execution_batch(
+            batch_id=1,
             admissions=(admission,),
             operations=(initial,),
         )
@@ -280,8 +282,8 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         predecessor=initial_observation.op_id,
     )
     worker.submit(
-        execution_run(
-            run_id=2,
+        execution_batch(
+            batch_id=2,
             operations=(publication,),
             commands=(),
         )
@@ -295,8 +297,8 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     )
     predecessor = _with_transition_predicate(predecessor, 4_242)
     parent_report = worker.submit(
-        execution_run(
-            run_id=3,
+        execution_batch(
+            batch_id=3,
             operations=(predecessor,),
         )
     )
@@ -309,7 +311,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     )
     candidate = replace(candidate, predicate=transition_predicate)
 
-    candidate_batch = execution_run(run_id=4, operations=(candidate,))
+    candidate_batch = execution_batch(batch_id=4, operations=(candidate,))
     prepared = worker.submit(candidate_batch)
     assert prepared is not None
     deadline = time.monotonic() + 1.0
@@ -348,8 +350,8 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     selected_report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=5,
+            execution_batch(
+                batch_id=5,
                 operations=(selected,),
                 commands=(),
             )
