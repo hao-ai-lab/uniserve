@@ -269,9 +269,12 @@ def test_cuda_vmm_publication_fits_the_existing_device_allocation() -> None:
         events.close()
 
 
-def test_cuda_vmm_retirement_preserves_pending_fanout_and_reclaims_capacity() -> (  # noqa: E501
-    None
-):
+def test_cuda_vmm_serves_a_fanout_and_refuses_a_retired_publication() -> None:
+    """One publication is read by consumers on two devices, then retires.
+
+    A chunk is addressed by offset in the producing device's pool, so each
+    consumer imports the same allocation handle and reads the same bytes.
+    """
     context = mp.get_context("spawn")
     event_pool = EventPool()
     transport = make_transport(
@@ -297,13 +300,8 @@ def test_cuda_vmm_retirement_preserves_pending_fanout_and_reclaims_capacity() ->
             assert channel.poll(60), "CUDA VMM fan-out consumer did not start"
             assert channel.recv() == "ready"
 
-        stream = torch.cuda.Stream(device=0)
-        published = torch.cuda.Event()
-        with torch.cuda.stream(stream):
-            source = torch.arange(1024, dtype=torch.float32, device="cuda:0")
-            torch.cuda._sleep(8_000_000_000)
-            locator = transport.publish(source)
-            published.record(stream)
+        source = torch.arange(1024, dtype=torch.float32, device="cuda:0")
+        locator = transport.publish(source)
         for channel, _process, _device in readers:
             channel.send(locator.to_mapping())
         for channel, _process, _device in readers:
@@ -311,13 +309,8 @@ def test_cuda_vmm_retirement_preserves_pending_fanout_and_reclaims_capacity() ->
                 "CUDA VMM fan-out read did not become consumable"
             )
             assert channel.recv() == "readable"
-        assert not published.query(), (
-            "read tickets waited for producer device completion"
-        )
 
         transport.release(locator)
-        with pytest.raises(WorkerError, match="capacity"):
-            transport.publish(torch.empty(2048, device="cuda:0"))
         for channel, _process, _device in readers:
             channel.send("consume")
         for channel, process, device in readers:
@@ -694,9 +687,48 @@ def test_shm_retirement_preserves_granted_fanout_and_reclaims_capacity(
         events.close()
 
 
-def test_cuda_vmm_retirement_retains_capacity_until_producer_completion() -> (
-    None
-):
+def test_cuda_vmm_publication_is_readable_when_it_returns() -> None:
+    """A published chunk needs no fence to travel with it.
+
+    An interprocess event handle does not reach another host, and imported VMM
+    memory admits no device-side wait on current drivers, so the producer
+    synchronizes after copying into the chunk instead. A consumer that maps the
+    chunk may read it immediately, wherever it runs.
+    """
+    device = torch.device("cuda:0")
+    events = EventPool()
+    transport = make_transport(
+        "cuda_vmm", byte_capacity=1 << 20, ticket_capacity=1, event_pool=events
+    )
+    locator = None
+    try:
+        source = torch.ones(1024, device=device)
+        stream = torch.cuda.Stream(device=device)
+        submitted = torch.cuda.Event()
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(1_000_000_000)
+            locator = transport.publish(source)
+            submitted.record(stream)
+
+        assert submitted.query(), (
+            "publication returned before its copy had landed"
+        )
+        assert not locator.transport.ready_event_handle, (
+            "a pool publication carries a fence a consumer cannot import"
+        )
+    finally:
+        if locator is not None:
+            transport.release(locator)
+        transport.close()
+        events.close()
+
+
+def test_cuda_vmm_retirement_retains_capacity_until_it_completes() -> None:
+    """Byte capacity is held from publication to retirement.
+
+    Capacity bounds what a rank can have published at once, so it is returned
+    when the publication retires rather than when its copy completes.
+    """
     device = torch.device("cuda:0")
     events = EventPool()
     transport = make_transport(
@@ -706,23 +738,12 @@ def test_cuda_vmm_retirement_retains_capacity_until_producer_completion() -> (
     locator = None
     replacement = None
     try:
-        warmup = transport.publish(source)
-        torch.cuda.synchronize(device)
-        transport.release(warmup)
-        stream = torch.cuda.Stream(device=device)
-        completed = torch.cuda.Event()
-        with torch.cuda.stream(stream):
-            torch.cuda._sleep(1_000_000_000)
-            locator = transport.publish(source)
-            completed.record(stream)
-        assert not completed.query(), (
-            "producer completed before the retirement check"
-        )
-        retirement = transport.release(locator)
-        assert retirement is not None and not retirement.done()
+        locator = transport.publish(source)
         with pytest.raises(WorkerError, match="capacity"):
             transport.publish(source)
-        completed.synchronize()
+
+        retirement = transport.release(locator)
+        assert retirement is not None
         events.reap()
         retirement.result(timeout=5)
         replacement = transport.publish(source)
