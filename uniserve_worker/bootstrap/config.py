@@ -331,6 +331,10 @@ class WorkerIpcConfig:
     # which the head derives from the transfer edges. A rank cannot name them
     # itself: it knows its own component, not which component consumes it.
     product_consumers: tuple[int, ...]
+    # Whether any rank that reads this rank's device products is on another
+    # host. An interprocess event carries readiness within a host at no cost to
+    # the producing stream; only a crossing needs a producer synchronize.
+    products_cross_hosts: bool
     max_payload_bytes: int
     queue_depth: int
 
@@ -429,6 +433,7 @@ class WorkerProcessArgs:
                 product_consumers=tuple(
                     int(slot) for slot in namespace.product_consumers
                 ),
+                products_cross_hosts=bool(namespace.products_cross_hosts),
                 max_payload_bytes=int(namespace.ipc_payload_cap),
                 queue_depth=int(namespace.queue_depth),
             ),

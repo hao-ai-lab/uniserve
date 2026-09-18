@@ -808,14 +808,14 @@ impl Locator {
                             }
                         ) == self.shape.first().copied()
                         && tensor_stride.len() == self.shape.len()
-                        // A publication from a device pool is readable when it
-                        // is published, so it carries no fence at all; any
-                        // other publication hands its consumer an event.
-                        && if *acknowledgment_offset < 0 {
-                            ready_event_handle.len() == 64
-                        } else {
-                            ready_event_handle.is_empty()
-                        }
+                        // A publication read only from this host carries the
+                        // event its consumers wait on; one read from another
+                        // host carries no fence, because none would reach
+                        // there. A publication outside the pool is the source
+                        // itself and can only be read behind its own fence.
+                        && (ready_event_handle.len() == 64
+                            || (ready_event_handle.is_empty()
+                                && *acknowledgment_offset >= 0))
                         && tensor_stride.iter().all(|stride| *stride >= 0),
                     "CUDA VMM transfer handle is incomplete"
                 );

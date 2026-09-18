@@ -24,6 +24,7 @@ REQUIRED_FIELDS = (
     "channel_transport",
     "acknowledgment_slot",
     "product_consumers",
+    "products_cross_hosts",
     "worker_id",
     "queue_depth",
     "ipc_payload_cap",
