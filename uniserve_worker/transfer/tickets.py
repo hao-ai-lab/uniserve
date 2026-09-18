@@ -1516,7 +1516,7 @@ class CudaIpcTransport(Transport):
         Capacity is retained until its producer fence retires.
         """
         import torch
-        from uniserve_kernel.peer_memory import empty, export_fd
+        from uniserve_kernel.peer_memory import empty, export_handle
 
         source, shape, offset = _publication_views(tensor, offset)
         spans = source if isinstance(source, tuple) else (source,)
@@ -1546,7 +1546,7 @@ class CudaIpcTransport(Transport):
         descriptor = None
         copied_source = None
         try:
-            exported = export_fd(first)
+            exported = export_handle(first)
             if exported is None:
                 # Arbitrary CUDA tensors retain the same publication behavior.
                 # Materialize only their logical spans, never their enclosing
@@ -1558,7 +1558,7 @@ class CudaIpcTransport(Transport):
                 source = shared
                 spans = (shared,)
                 first = shared
-                exported = export_fd(first)
+                exported = export_handle(first)
                 if exported is None:
                     raise RuntimeError("shared allocation cannot be exported")
             descriptor, storage_size, storage_offset = exported
@@ -1669,7 +1669,7 @@ class CudaIpcTransport(Transport):
         region: tuple[slice, ...] | None,
     ) -> None:
         import torch
-        from uniserve_kernel.peer_memory import import_fd
+        from uniserve_kernel.peer_memory import import_handle
 
         handle = locator.transport
         assert isinstance(handle, CudaIpcTransfer)
@@ -1715,7 +1715,7 @@ class CudaIpcTransport(Transport):
                         )
                     # One mapping owns every span; tensor views share its
                     # deleter.
-                    allocation = import_fd(
+                    allocation = import_handle(
                         prototype,
                         descriptor,
                         handle.storage_size_bytes,

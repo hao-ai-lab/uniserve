@@ -10,7 +10,10 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <tuple>
 #include <vector>
 
@@ -36,13 +39,91 @@ void ensure_current_context(int device) {
   }
 }
 
+// A device's shareable handle type, probed once and cached.
+//
+// A fabric handle is importable from another host inside the fabric domain; a
+// descriptor handle reaches only processes on this one. Fabric is probed first
+// so an instance that can span hosts does, and the result is cached because
+// the probe allocates to establish it: granularity alone does not say whether
+// the driver will export the type.
+CUmemAllocationHandleType shareable_handle_type(int device) {
+  static std::mutex probe_mutex;
+  static std::unordered_map<int, CUmemAllocationHandleType> probed;
+
+  const std::lock_guard<std::mutex> lock(probe_mutex);
+  const auto cached = probed.find(device);
+  if (cached != probed.end()) {
+    return cached->second;
+  }
+
+  const c10::cuda::CUDAGuard guard(device);
+  CUmemAllocationProp properties{};
+  properties.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  properties.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  properties.location.id = device;
+
+  auto usable = [&](CUmemAllocationHandleType type) {
+    properties.requestedHandleTypes = type;
+    size_t granularity = 0;
+    if (cuMemGetAllocationGranularity(&granularity, &properties,
+                                      CU_MEM_ALLOC_GRANULARITY_MINIMUM) !=
+            CUDA_SUCCESS ||
+        granularity == 0) {
+      return false;
+    }
+    CUmemGenericAllocationHandle handle = 0;
+    if (cuMemCreate(&handle, granularity, &properties, 0) != CUDA_SUCCESS) {
+      return false;
+    }
+    cuMemRelease(handle);
+    return true;
+  };
+
+  const auto selected = usable(CU_MEM_HANDLE_TYPE_FABRIC)
+                            ? CU_MEM_HANDLE_TYPE_FABRIC
+                            : CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  probed.emplace(device, selected);
+  return selected;
+}
+
+// Bytes of one exported handle of the given type.
+//
+// A descriptor is an int; a fabric handle is an opaque struct. Both travel as
+// bytes so one publication shape carries either.
+size_t handle_bytes(CUmemAllocationHandleType type) {
+  return type == CU_MEM_HANDLE_TYPE_FABRIC ? sizeof(CUmemFabricHandle)
+                                           : sizeof(int);
+}
+
 CUmemAllocationProp allocation_properties(int device) {
   CUmemAllocationProp properties{};
   properties.type = CU_MEM_ALLOCATION_TYPE_PINNED;
   properties.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
   properties.location.id = device;
-  properties.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  properties.requestedHandleTypes = shareable_handle_type(device);
   return properties;
+}
+
+// Exports one allocation's shareable handle as bytes.
+std::string export_handle_bytes(CUmemGenericAllocationHandle handle, int device) {
+  const auto type = shareable_handle_type(device);
+  std::string exported(handle_bytes(type), '\0');
+  check_cuda(cuMemExportToShareableHandle(exported.data(), handle, type, 0),
+             "export peer allocation handle");
+  return exported;
+}
+
+// Imports one allocation from the bytes a producing rank exported.
+CUmemGenericAllocationHandle import_handle_bytes(const std::string& exported,
+                                                 int device) {
+  const auto type = shareable_handle_type(device);
+  TORCH_CHECK(exported.size() == handle_bytes(type),
+              "peer allocation handle does not match this device's handle type");
+  CUmemGenericAllocationHandle handle = 0;
+  check_cuda(cuMemImportFromShareableHandle(
+                 &handle, const_cast<char*>(exported.data()), type),
+             "import peer allocation handle");
+  return handle;
 }
 
 size_t allocation_granularity(int device) {
@@ -105,13 +186,9 @@ class PeerAllocation {
     }
   }
 
-  int export_fd() const {
+  std::string export_handle() const {
     const c10::cuda::CUDAGuard guard(device_);
-    int descriptor = -1;
-    check_cuda(cuMemExportToShareableHandle(
-                   &descriptor, handle_, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0),
-               "export peer tensor allocation");
-    return descriptor;
+    return export_handle_bytes(handle_, device_);
   }
 
   torch::Tensor map_local() const {
@@ -145,7 +222,7 @@ class PeerAllocation {
         .make_tensor();
   }
 
-  torch::Tensor map_peers(const std::vector<int>& descriptors) const {
+  torch::Tensor map_peers(const std::vector<std::string>& descriptors) const {
     const c10::cuda::CUDAGuard guard(device_);
     TORCH_CHECK(!descriptors.empty() &&
                     bytes_ <= std::numeric_limits<size_t>::max() / descriptors.size() &&
@@ -155,13 +232,8 @@ class PeerAllocation {
     mapping->device = device_;
     mapping->segment_bytes = bytes_;
     mapping->total_bytes = bytes_ * descriptors.size();
-    for (const auto descriptor : descriptors) {
-      CUmemGenericAllocationHandle imported;
-      check_cuda(cuMemImportFromShareableHandle(
-                     &imported, reinterpret_cast<void*>(static_cast<uintptr_t>(descriptor)),
-                     CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
-                 "import peer tensor allocation");
-      mapping->handles.push_back(imported);
+    for (const auto& exported : descriptors) {
+      mapping->handles.push_back(import_handle_bytes(exported, device_));
     }
     check_cuda(cuMemAddressReserve(&mapping->address, mapping->total_bytes,
                                   allocation_granularity(device_), 0, 0),
@@ -196,7 +268,8 @@ class PeerAllocation {
   CUmemGenericAllocationHandle handle_ = 0;
 };
 
-std::optional<std::tuple<int, size_t, size_t>> export_fd(torch::Tensor tensor) {
+std::optional<std::tuple<std::string, size_t, size_t>> export_handle(
+    torch::Tensor tensor) {
   TORCH_CHECK(tensor.is_cuda() && tensor.numel() > 0,
               "shared allocation export requires a nonempty CUDA tensor");
   const c10::cuda::CUDAGuard guard(tensor.get_device());
@@ -213,25 +286,23 @@ std::optional<std::tuple<int, size_t, size_t>> export_fd(torch::Tensor tensor) {
     CUmemAllocationProp properties{};
     check_cuda(cuMemGetAllocationPropertiesFromHandle(&properties, handle),
                 "query shared allocation properties");
-    if (!(properties.requestedHandleTypes & CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)) {
+    const auto device = tensor.get_device();
+    if (!(properties.requestedHandleTypes & shareable_handle_type(device))) {
       cuMemRelease(handle);
       return std::nullopt;
     }
-    int descriptor = -1;
-    check_cuda(cuMemExportToShareableHandle(
-                   &descriptor, handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0),
-               "export shared allocation");
+    auto exported = export_handle_bytes(handle, device);
     cuMemRelease(handle);
     const auto offset = static_cast<const char*>(tensor.data_ptr()) -
         static_cast<const char*>(base);
-    return std::make_tuple(descriptor, tensor.storage().nbytes(), offset);
+    return std::make_tuple(std::move(exported), tensor.storage().nbytes(), offset);
   } catch (...) {
     cuMemRelease(handle);
     throw;
   }
 }
 
-torch::Tensor import_fd(torch::Tensor prototype, int descriptor,
+torch::Tensor import_handle(torch::Tensor prototype, const std::string& exported,
                         size_t allocation_bytes) {
   TORCH_CHECK(prototype.is_cuda() && allocation_bytes > 0 &&
                   allocation_bytes % prototype.element_size() == 0,
@@ -242,15 +313,11 @@ torch::Tensor import_fd(torch::Tensor prototype, int descriptor,
   mapping->device = device;
   mapping->total_bytes = allocation_bytes;
   mapping->segment_bytes = allocation_bytes;
-  CUmemGenericAllocationHandle handle;
-  check_cuda(cuMemImportFromShareableHandle(
-                 &handle, reinterpret_cast<void*>(static_cast<uintptr_t>(descriptor)),
-                 CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
-             "import shared allocation");
-  mapping->handles.push_back(handle);
+  const auto imported = import_handle_bytes(exported, device);
+  mapping->handles.push_back(imported);
   check_cuda(cuMemAddressReserve(&mapping->address, allocation_bytes, 0, 0, 0),
               "reserve shared allocation address range");
-  check_cuda(cuMemMap(mapping->address, allocation_bytes, 0, handle, 0),
+  check_cuda(cuMemMap(mapping->address, allocation_bytes, 0, imported, 0),
               "map shared allocation");
   mapping->mapped_segments = 1;
   CUmemAccessDesc access{};
@@ -385,13 +452,13 @@ void copy_host_device(torch::Tensor destination, torch::Tensor source, uint64_t 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, binding) {
   binding.def("allocation_granularity", &allocation_granularity);
-  binding.def("export_fd", &export_fd);
-  binding.def("import_fd", &import_fd);
+  binding.def("export_handle", &export_handle);
+  binding.def("import_handle", &import_handle);
   binding.def("copy_host_device", &copy_host_device);
   binding.def("record_host_usage", &record_host_usage);
   pybind11::class_<PeerAllocation>(binding, "PeerAllocation")
       .def(pybind11::init<torch::Tensor, std::vector<int64_t>>())
-      .def("export_fd", &PeerAllocation::export_fd)
+      .def("export_handle", &PeerAllocation::export_handle)
       .def("map_local", &PeerAllocation::map_local)
       .def("map_peers", &PeerAllocation::map_peers);
 }
