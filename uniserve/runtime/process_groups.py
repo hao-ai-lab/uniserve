@@ -111,7 +111,7 @@ class ProcessGroups:
         object.__setattr__(result, "_groups", MappingProxyType(groups))
         return result
 
-    def close(self) -> None:
+    def close(self, *, aborted: bool = False) -> None:
         """Destroy owned process groups.
 
         Destroy owned process groups after all communication consumers
@@ -119,14 +119,21 @@ class ProcessGroups:
 
         Attempt every release even if device synchronization or a group teardown
         fails. Component groups retire before the default world they depend on.
+
+        ``aborted`` drops the groups without destroying them, for a rank
+        releasing after a failure. Destroying a group and synchronizing the
+        device both wait on ranks that are still serving, so on that path they
+        would replace a reported failure with a stall. The process that owns
+        the groups is leaving, and its exit releases them.
         """
         actions: list[Callable[[], object]] = []
-        if self.device.type == "cuda":
-            actions.append(partial(torch.cuda.synchronize, self.device))
-        actions.extend(
-            partial(dist.destroy_process_group, group)
-            for group in reversed(self._groups)
-        )
+        if not aborted:
+            if self.device.type == "cuda":
+                actions.append(partial(torch.cuda.synchronize, self.device))
+            actions.extend(
+                partial(dist.destroy_process_group, group)
+                for group in reversed(self._groups)
+            )
         self._groups.clear()
         close_resources(*actions)
 

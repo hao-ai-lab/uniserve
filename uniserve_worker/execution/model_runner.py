@@ -1440,16 +1440,22 @@ class ModelRunner:
                 graphs.clear()
             self._module_graphs.clear()
 
-    def close(self):
+    def close(self, *, aborted: bool = False):
         """Release every owned context, buffer, graph.
 
         and stream exactly once.
+
+        ``aborted`` releases after a failure on this rank. Retiring a
+        communicator is collective and synchronizing waits on the device, and
+        neither returns when the peers are still serving or the device already
+        holds stuck work, so an aborted release does neither.
         """
         if self._closed:
             return
         self._closed = True
 
-        actions = [self.synchronize, self.close_graphs]
+        actions = [] if aborted else [self.synchronize]
+        actions.append(self.close_graphs)
         actions.extend(
             context.close for context in self._module_contexts.values()
         )
@@ -1464,7 +1470,7 @@ class ModelRunner:
         from uniserve.runtime.execution import close_stream_collectives
 
         actions.extend(
-            partial(close_stream_collectives, owner.stream)
+            partial(close_stream_collectives, owner.stream, aborted=aborted)
             for owner in self._module_streams.values()
         )
         # Streams close in reverse creation order so forks retire before

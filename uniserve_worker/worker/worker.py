@@ -155,7 +155,10 @@ class Worker:
         The scope's error is neither suppressed nor replaced.
         """
         try:
-            self.close()
+            # A scope leaving on an error releases without its peers: they are
+            # not leaving with it, and every collective step would wait for
+            # them instead of letting the error reach the caller.
+            self.close(aborted=exc_value is not None)
         except BaseException as cleanup_error:
             if exc_value is None:
                 raise
@@ -1860,19 +1863,28 @@ class Worker:
         self._release_request(request_key.request_id, retained)
         self.requests.retire(request_key.request_id)
 
-    def close(self) -> None:
+    def close(self, *, aborted: bool = False) -> None:
         """Idempotently drain and release owned resources.
 
         Never closes the borrowed IPC endpoint. Every owner is given a
         chance to release even if another release fails. Direct execution
         and service startup are both forbidden after closing.
+
+        ``aborted`` releases after a failure on this rank. A normal release
+        drains the device and retires this rank's communicators and process
+        groups collectively, which the peers complete only when they are
+        releasing too; a rank that fails alone would wait for ranks that are
+        still serving. An aborted release therefore takes only the steps that
+        complete on this rank, so the failure reaches the caller.
         """
         if self._closed:
             return
 
         self._closed = True
 
-        actions: list[Callable[[], object]] = [self.runner.synchronize]
+        actions: list[Callable[[], object]] = []
+        if not aborted:
+            actions.append(self.runner.synchronize)
         if self.profiler is not None:
             actions.append(self.profiler.close)
         actions.append(self._release_service_runs)
@@ -1904,12 +1916,12 @@ class Worker:
                 self.tensor_store.close,
                 self.buffer_pool.close,
                 self.device_events.close,
-                self.runner.close,
+                partial(self.runner.close, aborted=aborted),
                 self.requests.close,
             )
         )
         if self.process_groups is not None:
-            actions.append(self.process_groups.close)
+            actions.append(partial(self.process_groups.close, aborted=aborted))
 
         # Async producers have stopped before callback references are removed.
         actions.append(partial(self.set_completion_wake, None, None))

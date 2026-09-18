@@ -3,10 +3,12 @@
 The communicators bind to Green Context streams.
 """
 
+import time
 from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
@@ -15,9 +17,15 @@ from uniserve.model import TextSize
 from uniserve.nn import ColumnParallelLinear
 from uniserve.nn.attention import AttentionParallelConfig, Ulysses
 from uniserve.runtime import CUDAGraph, ExecutionContext, partition_streams
+from uniserve.runtime.execution import close_stream_collectives
 from uniserve.runtime.process_groups import initialize_process_groups
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
+#: How long the peer keeps its communicator bound while the failing rank
+#: releases. A collective retirement cannot complete within it, so a release
+#: that returns well inside it did not wait for the peer.
+PEER_HOLD_SECONDS = 30.0
 
 
 class _Collectives(nn.Module):
@@ -179,4 +187,68 @@ def test_stream_collectives_preserve_values_and_rank_order_under_capture(
 ):
     mp.spawn(
         _run_collectives, ((tmp_path / "world").as_uri(),), nprocs=2, join=True
+    )
+
+
+@torch.inference_mode()
+def _run_release_after_failure(rank: int, rendezvous: str):
+    """Release a bound communicator on one rank while its peer keeps it.
+
+    Rank 0 stands in for a rank that has failed and is unwinding; rank 1 stands
+    in for a peer that is still serving and will never join a collective
+    retirement.
+    """
+    device = torch.device("cuda", rank)
+    with initialize_process_groups(
+        rank=rank,
+        local_rank=rank,
+        world_size=2,
+        device=device,
+        backend="nccl",
+        init_method=rendezvous,
+    ) as environment:
+        mesh = environment.bind(
+            DeviceMesh(ranks=(0, 1), shape=(2,), axes=("tokens",), rank=rank),
+            device=device,
+        )
+        module = _Collectives(mesh)
+        green = partition_streams(device, (64,))[0]
+        try:
+            with ExecutionContext(module, stream=green.stream) as context:
+                context.prepare(TextSize(4, 1))
+                module(
+                    torch.arange(8, dtype=torch.float32, device=device).view(
+                        2, 4
+                    )
+                )
+            green.stream.synchronize()
+
+            # Both ranks hold a bound communicator before either moves on.
+            dist.barrier()
+
+            if rank == 0:
+                started = time.monotonic()
+                close_stream_collectives(green.stream, aborted=True)
+                elapsed = time.monotonic() - started
+                assert elapsed < PEER_HOLD_SECONDS / 3, (
+                    "releasing after a failure waited for a peer that is "
+                    f"still holding its communicator: {elapsed:.1f}s"
+                )
+            else:
+                # Outlive rank 0's release, so that release cannot be
+                # completed by this rank going away.
+                time.sleep(PEER_HOLD_SECONDS)
+                close_stream_collectives(green.stream, aborted=True)
+        finally:
+            green.close()
+
+
+def test_release_after_failure_does_not_wait_for_a_serving_peer(
+    tmp_path: Path,
+):
+    mp.spawn(
+        _run_release_after_failure,
+        ((tmp_path / "failure").as_uri(),),
+        nprocs=2,
+        join=True,
     )

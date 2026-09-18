@@ -428,6 +428,9 @@ class NcclCommunicator:
         """Destroy the communicator.
 
         Destroy the communicator after its runner has retired all graph use.
+        Destruction is collective: it completes only once every rank of the
+        communicator calls it, so this belongs on a path all of them reach.
+        A rank releasing after a failure calls ``abort`` instead.
         """
         if self._transfer is not None:
             self._transfer.synchronize()
@@ -441,6 +444,30 @@ class NcclCommunicator:
             communicator, self._comm = self._comm.value, c_void_p()
             self._nccl.comm_destroy(communicator)
 
+        self._release_stream()
+
+    def abort(self) -> None:
+        """Release the communicator without waiting for its peers.
+
+        A rank that is unwinding from a failure cannot complete a collective
+        destruction, because the ranks it would wait for may be serving, may
+        have failed elsewhere, or may never call it. An abort completes on this
+        rank alone and fails whatever the communicator had in flight. Nothing
+        here waits on the device either: the work an abort interrupts is
+        exactly the work that may already be stuck.
+        """
+        if self._comm.value:
+            # The abort invalidates the communicator, and with it every window
+            # registered on it, so the windows are dropped rather than
+            # deregistered through a handle that no longer names anything.
+            self._windows.clear()
+            communicator, self._comm = self._comm.value, c_void_p()
+            self._nccl.comm_abort(communicator)
+
+        self._release_stream()
+
+    def _release_stream(self) -> None:
+        """Destroy the communication stream this communicator owns."""
         if self._raw_transfer is not None:
             cuda_status(
                 driver().cuStreamDestroy(self._raw_transfer),
