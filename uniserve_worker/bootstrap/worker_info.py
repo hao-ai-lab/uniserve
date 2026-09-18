@@ -321,7 +321,7 @@ class WorkerInfo:
             or not self.transfer_backends
             or len(set(self.transfer_backends)) != len(self.transfer_backends)
             or any(
-                name not in {"local", "shm", "cuda_vmm"}
+                name not in {"local", "shm", "cuda_vmm", "channel"}
                 for name in self.transfer_backends
             )
         ):

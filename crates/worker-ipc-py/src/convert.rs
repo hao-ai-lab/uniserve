@@ -1037,6 +1037,11 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
             )?;
             dict.set_item(intern!(py, "acknowledgment_offset"), acknowledgment_offset)?;
         }
+        TransferTransport::Channel { endpoint, payload } => {
+            dict.set_item(intern!(py, "transport"), "channel")?;
+            dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
+            dict.set_item(intern!(py, "payload"), PyBytes::new(py, payload))?;
+        }
     }
 
     Ok(dict)
@@ -1556,6 +1561,10 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
             ready_event_handle: bytes_of(&get(dict, intern!(py, "ready_event_handle"))?)?,
             allocation_handle: bytes_of(&get(dict, intern!(py, "allocation_handle"))?)?,
             acknowledgment_offset: i64_of(&get(dict, intern!(py, "acknowledgment_offset"))?)?,
+        },
+        "channel" => TransferTransport::Channel {
+            endpoint: string_of(&get(dict, intern!(py, "endpoint"))?)?,
+            payload: bytes_of(&get(dict, intern!(py, "payload"))?)?,
         },
         _ => return None,
     };

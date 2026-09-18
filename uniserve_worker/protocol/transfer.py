@@ -188,8 +188,27 @@ class CudaVmmTransfer:
             raise invalid_descriptor("CUDA VMM transfer handle is incomplete")
 
 
+@dataclass(frozen=True, slots=True)
+class ChannelTransfer:
+    """Carry a host product's bytes on the rank channel's data path.
+
+    Shared memory names a segment in one host's namespace, so a product whose
+    consumer is on another host travels as bytes: in the producing rank's
+    result, into the head's custody, and out in the consuming rank's batch.
+    """
+
+    endpoint: str
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        """Validate the publishing endpoint and the carried bytes."""
+        # The bytes are the product; a locator without them names nothing.
+        if not self.endpoint or not self.payload:
+            raise invalid_descriptor("channel transfer handle is invalid")
+
+
 TransferTransport: TypeAlias = (
-    LocalTransfer | PosixShmTransfer | CudaVmmTransfer
+    LocalTransfer | PosixShmTransfer | CudaVmmTransfer | ChannelTransfer
 )
 
 
@@ -266,6 +285,11 @@ class Locator:
             transport: TransferTransport = LocalTransfer(
                 endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
                 key=_uint(data.get("key"), f"{where}.key"),
+            )
+        elif kind == "channel":
+            transport = ChannelTransfer(
+                endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
+                payload=_bytes(data.get("payload"), f"{where}.payload"),
             )
         elif kind == "posix_shm":
             transport = PosixShmTransfer(
@@ -351,6 +375,12 @@ class Locator:
                 transport="posix_shm",
                 endpoint=transport.endpoint,
                 name=transport.name,
+            )
+        elif isinstance(transport, ChannelTransfer):
+            output.update(
+                transport="channel",
+                endpoint=transport.endpoint,
+                payload=transport.payload,
             )
         else:
             output.update(

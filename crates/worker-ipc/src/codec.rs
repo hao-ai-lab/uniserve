@@ -2331,6 +2331,17 @@ fn transfer_locator_from_table(value: fbs::Locator<'_>) -> CodecResult<Locator> 
                 .unwrap_or_default(),
             acknowledgment_offset: value.acknowledgment_offset(),
         }
+    } else if value.transport() == fbs::TransferTransportKind::Channel {
+        TransferTransport::Channel {
+            endpoint: value
+                .endpoint()
+                .context("channel locator has no endpoint")?
+                .to_owned(),
+            payload: value
+                .payload()
+                .map(|bytes| bytes.bytes().to_vec())
+                .unwrap_or_default(),
+        }
     } else {
         codec_bail!("unknown transfer transport {}", value.transport().0)
     };
@@ -2491,6 +2502,11 @@ fn transfer_locator_to_fb(value: &Locator) -> fbs::LocatorT {
             output.ready_event_handle = Some(ready_event_handle.clone());
             output.allocation_handle = Some(allocation_handle.clone());
             output.acknowledgment_offset = *acknowledgment_offset;
+        }
+        TransferTransport::Channel { endpoint, payload } => {
+            output.transport = fbs::TransferTransportKind::Channel;
+            output.endpoint = Some(endpoint.clone());
+            output.payload = Some(payload.clone());
         }
     }
 

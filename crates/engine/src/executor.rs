@@ -579,6 +579,12 @@ pub enum TransferBackend {
     Shm,
     /// Publishes device products through CUDA VMM handles.
     CudaVmm,
+    /// Carries a host product's bytes on the rank channel's data path.
+    ///
+    /// Shared memory reaches only one host. A product on this edge travels in
+    /// the producing rank's result and in the consuming rank's batch, so it
+    /// crosses hosts wherever the rank channel does.
+    Channel,
 }
 
 impl TransferBackend {
@@ -588,6 +594,7 @@ impl TransferBackend {
             Self::Local => "local",
             Self::Shm => "shm",
             Self::CudaVmm => "cuda_vmm",
+            Self::Channel => "channel",
         }
     }
 }
@@ -608,6 +615,7 @@ impl FromStr for TransferBackend {
             "local" => Ok(Self::Local),
             "shm" => Ok(Self::Shm),
             "cuda_vmm" => Ok(Self::CudaVmm),
+            "channel" => Ok(Self::Channel),
             _ => Err(TransferConfigError::message(format!(
                 "unsupported transfer backend {value:?}"
             ))),
@@ -1092,6 +1100,15 @@ mod tests {
         assert_eq!(transfer.product_consumers("encoder", 0), vec![0, 1]);
         // A rank with no outgoing edge has no consumer to wait for.
         assert_eq!(transfer.product_consumers("encoder", 1), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn a_channel_edge_is_a_transfer_backend() {
+        // Host products cross hosts on the rank channel, so the mechanism has
+        // to be nameable in a placement's transfer bindings.
+        let transfer = TransferConfig::parse("video_decoder->muxer=channel").unwrap();
+        assert_eq!(transfer.edges[0].transport, TransferBackend::Channel);
+        assert_eq!(TransferBackend::Channel.as_str(), "channel");
     }
 
     #[test]

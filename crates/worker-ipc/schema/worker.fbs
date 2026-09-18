@@ -30,7 +30,7 @@ enum ReqKind : ubyte { Info, Submit, Close }
 
 enum RespKind : ubyte { Info, Result, Ok, Error }
 enum KvGroupKind : ubyte { Full, SlidingWindow }
-enum TransferTransportKind : ubyte { Local, PosixShm, CudaVmm }
+enum TransferTransportKind : ubyte { Local, PosixShm, CudaVmm, Channel }
 
 table U32List { items:[uint]; }
 table TokenBias { token_id:uint; bias:float; }
@@ -436,6 +436,10 @@ table Locator {
   // retired. Negative when the publication carries no header and so retires by
   // its producer's own accounting.
   acknowledgment_offset:long = -1;
+  // A host product's bytes, carried on the rank channel's data path. Shared
+  // memory reaches only one host, so a product whose consumer is elsewhere
+  // travels in the producing rank's result and the consuming rank's batch.
+  payload:[ubyte];
   nbytes:ulong;
   dtype:string;
   shape:[ulong];
