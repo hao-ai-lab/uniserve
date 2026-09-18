@@ -56,17 +56,26 @@ def register_endpoint(config: WorkerProcessArgs, endpoint: str) -> None:
     closes once the head has read it. The endpoint is what the rank actually
     bound, which for a socket is the address rather than the interface it was
     given.
+
+    A socket endpoint accepts on every interface, so what it bound names none
+    of them and the head cannot dial it. This connection is the answer: its
+    local end is an address of this host that the head, at the other end,
+    routes to, so the report names the rank by that address and the port it
+    bound.
     """
     host, _, port = config.ipc.registration_address.rpartition(":")
-    report = {
-        "worker_id": config.worker_id,
-        "rank": int(config.execution.rank),
-        "transport": config.ipc.channel_transport,
-        "endpoint": endpoint,
-    }
     with socket.create_connection(
         (host, int(port)), timeout=REGISTRATION_TIMEOUT_SECONDS
     ) as connection:
+        if config.ipc.channel_transport == SOCKET_CHANNEL:
+            _, bound_port = endpoint.rsplit(":", 1)
+            endpoint = f"{connection.getsockname()[0]}:{bound_port}"
+        report = {
+            "worker_id": config.worker_id,
+            "rank": int(config.execution.rank),
+            "transport": config.ipc.channel_transport,
+            "endpoint": endpoint,
+        }
         connection.sendall(json.dumps(report).encode("utf-8") + b"\n")
 
 

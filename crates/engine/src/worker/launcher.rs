@@ -92,6 +92,27 @@ impl LauncherRegistry {
         &self.address
     }
 
+    /// Returns a host address of this machine that a launcher reached it at.
+    ///
+    /// The head cannot name itself: its placement identity need not resolve on
+    /// another host, and a bound wildcard address names no interface. But a
+    /// launcher connected here from its own host, so the local end of that
+    /// connection is by construction an address of this host that that host
+    /// routes to, and it is what the rendezvous and registration addresses
+    /// this head hands to remote ranks have to be built from.
+    pub(crate) fn reachable_host(&self) -> anyhow::Result<std::net::IpAddr> {
+        let launcher = self
+            .hosts
+            .values()
+            .next()
+            .context("no launcher has presented a reachable head address")?;
+        Ok(launcher
+            .stream
+            .local_addr()
+            .context("reading the head address a launcher reached")?
+            .ip())
+    }
+
     /// Waits until every named host has presented a launcher.
     ///
     /// A host that never presents fails the launch by name rather than leaving

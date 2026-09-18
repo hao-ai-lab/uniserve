@@ -8,7 +8,7 @@
 //! could not have chosen in advance.
 
 use std::io::{BufRead, BufReader};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -44,18 +44,35 @@ pub(crate) struct RankReport {
 ///
 /// The collective store is a TCP store so ranks on different hosts can reach
 /// it; an instance on one host reserves a loopback address and keeps the
-/// semantics it had over a shared directory. The head fixes the address and
+/// semantics it had over a shared directory, and one spanning hosts reserves
+/// an address those hosts can route to. The head fixes the address and
 /// the group's first rank binds the store, because a store bound here could
 /// not be handed to the process that must own it. A port taken between the
 /// reservation and that bind fails the launch at initialization by name
 /// instead of being silently rebound.
-pub(crate) fn reserve_rendezvous(host: Ipv4Addr) -> anyhow::Result<String> {
-    let listener = TcpListener::bind(SocketAddr::from((host, 0)))
+pub(crate) fn reserve_rendezvous(head: Option<IpAddr>) -> anyhow::Result<String> {
+    let (bind, advertise) = interface(head);
+    let listener = TcpListener::bind(SocketAddr::from((bind, 0)))
         .context("reserving the collective rendezvous address")?;
-    let address = listener
+    let port = listener
         .local_addr()
-        .context("reading the collective rendezvous address")?;
-    Ok(format!("tcp://{address}"))
+        .context("reading the collective rendezvous address")?
+        .port();
+    Ok(format!("tcp://{advertise}:{port}"))
+}
+
+/// Returns the interface to bind and the host a descriptor names.
+///
+/// `head` is an address of this host that the other hosts route to, and none
+/// when every rank runs here. A loopback address reaches only the host that
+/// binds it, so an instance spanning hosts binds every interface and names
+/// itself by that routable address; a bound wildcard would name no interface
+/// and a placement identity need not resolve elsewhere.
+fn interface(head: Option<IpAddr>) -> (Ipv4Addr, String) {
+    match head {
+        Some(address) => (Ipv4Addr::UNSPECIFIED, address.to_string()),
+        None => (Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST.to_string()),
+    }
 }
 
 pub(crate) struct RankRegistry {
@@ -64,21 +81,27 @@ pub(crate) struct RankRegistry {
 }
 
 impl RankRegistry {
-    /// Binds a registration address on the loopback interface.
+    /// Binds the address every rank of one group reports its endpoint to.
     ///
-    /// An instance whose ranks all run on the head's host needs no routable
-    /// address; step 7 gives a launcher the head's address instead.
-    pub(crate) fn bind() -> anyhow::Result<Self> {
-        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    /// `head` is an address of this host that the other hosts route to when
+    /// some rank runs elsewhere, and none when every rank runs here: a rank on
+    /// another host cannot reach a loopback address, and one on this host does
+    /// not need a routable one.
+    pub(crate) fn bind(head: Option<IpAddr>) -> anyhow::Result<Self> {
+        let (bind, advertise) = interface(head);
+        let listener = TcpListener::bind(SocketAddr::from((bind, 0)))
             .context("binding the rank registration address")?;
         listener
             .set_nonblocking(true)
             .context("making the rank registration address pollable")?;
-        let address = listener
+        let port = listener
             .local_addr()
             .context("reading the rank registration address")?
-            .to_string();
-        Ok(Self { listener, address })
+            .port();
+        Ok(Self {
+            listener,
+            address: format!("{advertise}:{port}"),
+        })
     }
 
     /// Returns the address ranks connect to, as it travels in the descriptor.
