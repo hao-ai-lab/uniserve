@@ -1,4 +1,4 @@
-"""Bounded local, shared-memory and CUDA IPC product transport.
+"""Bounded local, shared-memory and CUDA VMM product transport.
 
 Backends publish canonical typed locators. A descriptor carries the physical
 handle and readiness fence; asynchronous reads establish access to its bytes.
@@ -33,7 +33,7 @@ from ..foundation.errors import (
 )
 from ..foundation.shared_memory import allocate_shared_memory
 from ..protocol.transfer import (
-    CudaIpcTransfer,
+    CudaVmmTransfer,
     LocalTransfer,
     Locator,
     PosixShmTransfer,
@@ -50,18 +50,18 @@ __all__ = [
     "TransferTicket",
     "LocalTransport",
     "ShmTransport",
-    "CudaIpcTransport",
+    "CudaVmmTransport",
     "TransportKind",
     "TRANSPORTS",
 ]
 
 
 class TransportKind(StrEnum):
-    """Selects in-process, POSIX shared-memory, or CUDA IPC byte transport."""
+    """Selects in-process, POSIX shared-memory, or CUDA VMM byte transport."""
 
     LOCAL = "local"
     SHM = "shm"
-    CUDA_IPC = "cuda_ipc"
+    CUDA_VMM = "cuda_vmm"
 
 
 TRANSPORTS = tuple(kind.value for kind in TransportKind)
@@ -1437,10 +1437,10 @@ class _CudaSource:
             self.retirement.set_result(None)
 
 
-class CudaIpcTransport(Transport):
+class CudaVmmTransport(Transport):
     """CUDA mapping and asynchronous copies protected by reader grants."""
 
-    name = "cuda_ipc"
+    name = "cuda_vmm"
 
     def __init__(
         self,
@@ -1523,7 +1523,7 @@ class CudaIpcTransport(Transport):
         first = spans[0]
         if not first.is_cuda:
             raise invalid_descriptor(
-                "cuda_ipc transport requires a CUDA tensor"
+                "cuda_vmm transport requires a CUDA tensor"
             )
         if any(
             span.untyped_storage().data_ptr()
@@ -1532,7 +1532,7 @@ class CudaIpcTransport(Transport):
             for span in spans
         ):
             raise invalid_descriptor(
-                "CUDA IPC publication spans require one allocation and stride"
+                "CUDA VMM publication spans require one allocation and stride"
             )
         if self._failed_publication is not None:
             raise self._failed_publication[0]
@@ -1579,7 +1579,7 @@ class CudaIpcTransport(Transport):
             )
             locator = Locator(
                 source=self.source,
-                transport=CudaIpcTransfer(
+                transport=CudaVmmTransfer(
                     endpoint=self.endpoint(),
                     publication_id=uuid.uuid4().hex,
                     storage_size_bytes=storage_size,
@@ -1635,15 +1635,15 @@ class CudaIpcTransport(Transport):
     ) -> TransferTicket:
         if locator.source.node != self.source.node:
             raise invalid_descriptor(
-                "CUDA IPC transport requires the source node"
+                "CUDA VMM transport requires the source node"
             )
-        if not isinstance(locator.transport, CudaIpcTransfer):
+        if not isinstance(locator.transport, CudaVmmTransfer):
             raise invalid_descriptor(
-                "CUDA IPC read requires a CUDA IPC locator"
+                "CUDA VMM read requires a CUDA VMM locator"
             )
         if device.type != "cuda":
             raise invalid_descriptor(
-                "CUDA IPC destination must be a CUDA device"
+                "CUDA VMM destination must be a CUDA device"
             )
         target = (
             None
@@ -1672,7 +1672,7 @@ class CudaIpcTransport(Transport):
         from uniserve_kernel.peer_memory import import_handle
 
         handle = locator.transport
-        assert isinstance(handle, CudaIpcTransfer)
+        assert isinstance(handle, CudaVmmTransfer)
         # The grant conveys reader ownership; the allocation handle it used
         # to carry now travels with the publication.
         connection = open_reader(locator)
@@ -1691,7 +1691,7 @@ class CudaIpcTransport(Transport):
                     with _endpoint_lock:
                         owner = _endpoints.get(handle.endpoint)
                     if (
-                        not isinstance(owner, CudaIpcTransport)
+                        not isinstance(owner, CudaVmmTransport)
                         or owner.source != locator.source
                     ):
                         raise invalid_descriptor(
@@ -1712,7 +1712,7 @@ class CudaIpcTransport(Transport):
                         for offset in handle.storage_offsets_bytes
                     ):
                         raise invalid_descriptor(
-                            "CUDA IPC span offset is not element aligned"
+                            "CUDA VMM span offset is not element aligned"
                         )
                     # One mapping owns every span; tensor views share its
                     # deleter.
@@ -1773,9 +1773,9 @@ class CudaIpcTransport(Transport):
     def release(
         self, locator: Locator
     ) -> concurrent.futures.Future[None] | None:
-        if not isinstance(locator.transport, CudaIpcTransfer):
+        if not isinstance(locator.transport, CudaVmmTransfer):
             raise invalid_descriptor(
-                "CUDA IPC release requires a CUDA IPC locator"
+                "CUDA VMM release requires a CUDA VMM locator"
             )
         retirement = self._publications.release(locator)
         if retirement is not None and not retirement.done():
@@ -1827,7 +1827,7 @@ def make_transports(
     constructors: Mapping[str, Callable[..., Transport]] = {
         "local": LocalTransport,
         "shm": ShmTransport,
-        "cuda_ipc": CudaIpcTransport,
+        "cuda_vmm": CudaVmmTransport,
     }
     transports: dict[str, Transport] = {}
     try:

@@ -157,7 +157,7 @@ impl WorkerExecutor {
         };
 
         for edge in &transfer.edges {
-            if edge.transport != crate::executor::TransferBackend::CudaIpc {
+            if edge.transport != crate::executor::TransferBackend::CudaVmm {
                 continue;
             }
             for (source_host, source_fabric) in members(&edge.source_worker.0, edge.source_rank) {
@@ -293,10 +293,10 @@ impl WorkerExecutor {
                             source.endpoint.address_space == destination.endpoint.address_space,
                             "local transfer requires a shared address space"
                         ),
-                        crate::executor::TransferBackend::CudaIpc => anyhow::ensure!(
+                        crate::executor::TransferBackend::CudaVmm => anyhow::ensure!(
                             source.device.starts_with("cuda:")
                                 && destination.device.starts_with("cuda:"),
-                            "CUDA IPC requires CUDA devices on both endpoints"
+                            "CUDA VMM requires CUDA devices on both endpoints"
                         ),
                         crate::executor::TransferBackend::Shm => {}
                     }

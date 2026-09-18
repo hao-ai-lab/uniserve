@@ -37,7 +37,7 @@ def _await_ticket(ticket):
     return ticket.result()
 
 
-@pytest.mark.parametrize("backend", ("local", "shm", "cuda_ipc"))
+@pytest.mark.parametrize("backend", ("local", "shm", "cuda_vmm"))
 def test_transfer_writes_only_the_reserved_destination(backend: str) -> None:
     device = torch.device("cuda:0")
     events = EventPool()
@@ -70,7 +70,7 @@ def test_transfer_writes_only_the_reserved_destination(backend: str) -> None:
         events.close()
 
 
-@pytest.mark.parametrize("backend", ("local", "shm", "cuda_ipc"))
+@pytest.mark.parametrize("backend", ("local", "shm", "cuda_vmm"))
 def test_transfer_scatters_exactly_into_disjoint_page_spans(
     backend: str,
 ) -> None:
@@ -119,7 +119,7 @@ def _read_cuda_publications(channel) -> None:
     torch.cuda.set_device(0)
     event_pool = EventPool()
     transport = make_transport(
-        "cuda_ipc",
+        "cuda_vmm",
         byte_capacity=8 << 20,
         ticket_capacity=2,
         event_pool=event_pool,
@@ -165,12 +165,12 @@ def _read_cuda_publications(channel) -> None:
         channel.close()
 
 
-def test_cuda_ipc_read_does_not_wait_for_consumer_stream() -> None:
+def test_cuda_vmm_read_does_not_wait_for_consumer_stream() -> None:
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     event_pool = EventPool()
     transport = make_transport(
-        "cuda_ipc",
+        "cuda_vmm",
         byte_capacity=8 << 20,
         ticket_capacity=2,
         event_pool=event_pool,
@@ -186,15 +186,15 @@ def test_cuda_ipc_read_does_not_wait_for_consumer_stream() -> None:
         process.start()
         child.close()
         parent.send(warmup.to_mapping())
-        assert parent.poll(60), "CUDA IPC consumer did not become ready"
+        assert parent.poll(60), "CUDA VMM consumer did not become ready"
         assert parent.recv() == "ready"
         parent.send(locator.to_mapping())
-        assert parent.poll(30), "CUDA IPC consumer did not finish its read"
+        assert parent.poll(30), "CUDA VMM consumer did not finish its read"
         asynchronous, correct = parent.recv()
         process.join(30)
         assert process.exitcode == 0
-        assert correct, "CUDA IPC read returned the wrong published value"
-        assert asynchronous, "CUDA IPC fetch waited for the consumer stream"
+        assert correct, "CUDA VMM read returned the wrong published value"
+        assert asynchronous, "CUDA VMM fetch waited for the consumer stream"
     finally:
         if process.is_alive():
             process.terminate()
@@ -211,7 +211,7 @@ def _consume_fanout(channel, device_index: int) -> None:
     torch.cuda.set_device(device)
     event_pool = EventPool()
     transport = make_transport(
-        "cuda_ipc",
+        "cuda_vmm",
         byte_capacity=8 << 20,
         ticket_capacity=2,
         event_pool=event_pool,
@@ -233,7 +233,7 @@ def _consume_fanout(channel, device_index: int) -> None:
         channel.close()
 
 
-def test_cuda_ipc_publication_fits_the_existing_device_allocation() -> None:
+def test_cuda_vmm_publication_fits_the_existing_device_allocation() -> None:
     device = torch.device("cuda:0")
     events = EventPool()
     source = (
@@ -241,7 +241,7 @@ def test_cuda_ipc_publication_fits_the_existing_device_allocation() -> None:
     )
     destination = torch.empty(source.shape, dtype=source.dtype, device=device)
     transport = make_transport(
-        "cuda_ipc",
+        "cuda_vmm",
         byte_capacity=2 * source.numel() * source.element_size(),
         ticket_capacity=1,
         event_pool=events,
@@ -269,13 +269,13 @@ def test_cuda_ipc_publication_fits_the_existing_device_allocation() -> None:
         events.close()
 
 
-def test_cuda_ipc_retirement_preserves_pending_fanout_and_reclaims_capacity() -> (  # noqa: E501
+def test_cuda_vmm_retirement_preserves_pending_fanout_and_reclaims_capacity() -> (  # noqa: E501
     None
 ):
     context = mp.get_context("spawn")
     event_pool = EventPool()
     transport = make_transport(
-        "cuda_ipc", byte_capacity=8192, ticket_capacity=2, event_pool=event_pool
+        "cuda_vmm", byte_capacity=8192, ticket_capacity=2, event_pool=event_pool
     )
     readers = []
     locator = None
@@ -294,7 +294,7 @@ def test_cuda_ipc_retirement_preserves_pending_fanout_and_reclaims_capacity() ->
             child.close()
             readers.append((parent, process, device))
         for channel, _process, _device in readers:
-            assert channel.poll(60), "CUDA IPC fan-out consumer did not start"
+            assert channel.poll(60), "CUDA VMM fan-out consumer did not start"
             assert channel.recv() == "ready"
 
         stream = torch.cuda.Stream(device=0)
@@ -308,7 +308,7 @@ def test_cuda_ipc_retirement_preserves_pending_fanout_and_reclaims_capacity() ->
             channel.send(locator.to_mapping())
         for channel, _process, _device in readers:
             assert channel.poll(30), (
-                "CUDA IPC fan-out read did not become consumable"
+                "CUDA VMM fan-out read did not become consumable"
             )
             assert channel.recv() == "readable"
         assert not published.query(), (
@@ -322,7 +322,7 @@ def test_cuda_ipc_retirement_preserves_pending_fanout_and_reclaims_capacity() ->
             channel.send("consume")
         for channel, process, device in readers:
             assert channel.poll(30), (
-                "CUDA IPC fan-out consumer did not complete"
+                "CUDA VMM fan-out consumer did not complete"
             )
             assert channel.recv() == (True, f"cuda:{device}")
             process.join(30)
@@ -347,10 +347,10 @@ def test_cuda_ipc_retirement_preserves_pending_fanout_and_reclaims_capacity() ->
         event_pool.close()
 
 
-def test_cuda_ipc_rejects_a_changed_registered_view() -> None:
+def test_cuda_vmm_rejects_a_changed_registered_view() -> None:
     event_pool = EventPool()
     transport = make_transport(
-        "cuda_ipc",
+        "cuda_vmm",
         byte_capacity=8 << 20,
         ticket_capacity=2,
         event_pool=event_pool,
@@ -427,7 +427,7 @@ def _serve_unacknowledged_cuda_read(
 
     from uniserve_kernel.peer_memory import empty, export_handle
 
-    from uniserve_worker.protocol.transfer import CudaIpcTransfer
+    from uniserve_worker.protocol.transfer import CudaVmmTransfer
 
     torch.cuda.set_device(0)
     source = empty((1024,), dtype=torch.float32, device=torch.device("cuda:0"))
@@ -446,7 +446,7 @@ def _serve_unacknowledged_cuda_read(
         listener.listen(1)
         locator = Locator(
             source=WorkerEndpoint.local("publisher"),
-            transport=CudaIpcTransfer(
+            transport=CudaVmmTransfer(
                 endpoint=endpoint,
                 publication_id=uuid.uuid4().hex,
                 storage_size_bytes=capacity,
@@ -477,7 +477,7 @@ def _serve_unacknowledged_cuda_read(
     channel.close()
 
 
-def test_cuda_ipc_reports_retirement_failure_after_result_is_consumable() -> (
+def test_cuda_vmm_reports_retirement_failure_after_result_is_consumable() -> (
     None
 ):
     context = mp.get_context("spawn")
@@ -487,20 +487,20 @@ def test_cuda_ipc_reports_retirement_failure_after_result_is_consumable() -> (
     )
     events = EventPool()
     transport = make_transport(
-        "cuda_ipc", byte_capacity=8192, ticket_capacity=1, event_pool=events
+        "cuda_vmm", byte_capacity=8192, ticket_capacity=1, event_pool=events
     )
     retirement_rejected = False
     process.start()
     child.close()
     try:
-        assert parent.poll(60), "CUDA IPC source did not start"
+        assert parent.poll(60), "CUDA VMM source did not start"
         locator = Locator.from_mapping(parent.recv())
         ticket = transport.fetch(locator, device=torch.device("cuda:0"))
         actual = _await_ticket(ticket).cpu()
         torch.testing.assert_close(
             actual, torch.arange(1024, dtype=torch.float32), rtol=0, atol=0
         )
-        assert parent.poll(30), "CUDA IPC reader did not finish copying"
+        assert parent.poll(30), "CUDA VMM reader did not finish copying"
         assert parent.recv() == "released"
         retired = threading.Event()
         ticket.add_retirement_callback(retired.set)
@@ -532,7 +532,7 @@ def test_cuda_ipc_reports_retirement_failure_after_result_is_consumable() -> (
     assert process.exitcode == 0
 
 
-def test_cuda_ipc_reports_import_failure_before_acknowledgement() -> None:
+def test_cuda_vmm_reports_import_failure_before_acknowledgement() -> None:
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     process = context.Process(
@@ -540,13 +540,13 @@ def test_cuda_ipc_reports_import_failure_before_acknowledgement() -> None:
     )
     events = EventPool()
     transport = make_transport(
-        "cuda_ipc", byte_capacity=8192, ticket_capacity=1, event_pool=events
+        "cuda_vmm", byte_capacity=8192, ticket_capacity=1, event_pool=events
     )
     retirement_rejected = False
     process.start()
     child.close()
     try:
-        assert parent.poll(60), "CUDA IPC source did not start"
+        assert parent.poll(60), "CUDA VMM source did not start"
         locator = Locator.from_mapping(parent.recv())
         ticket = transport.fetch(locator, device=torch.device("cuda:0"))
         ready = threading.Event()
@@ -694,13 +694,13 @@ def test_shm_retirement_preserves_granted_fanout_and_reclaims_capacity(
         events.close()
 
 
-def test_cuda_ipc_retirement_retains_capacity_until_producer_completion() -> (
+def test_cuda_vmm_retirement_retains_capacity_until_producer_completion() -> (
     None
 ):
     device = torch.device("cuda:0")
     events = EventPool()
     transport = make_transport(
-        "cuda_ipc", byte_capacity=4096, ticket_capacity=1, event_pool=events
+        "cuda_vmm", byte_capacity=4096, ticket_capacity=1, event_pool=events
     )
     source = torch.ones(1024, device=device)
     locator = None
@@ -975,7 +975,7 @@ def test_cancelled_shard_reads_retain_destination_and_capacity_until_physical_re
         events.close()
 
 
-@pytest.mark.parametrize("backend", ("local", "shm", "cuda_ipc"))
+@pytest.mark.parametrize("backend", ("local", "shm", "cuda_vmm"))
 def test_publication_rejects_changed_producer_identity(backend: str) -> None:
     device = torch.device("cuda:0")
     events = EventPool()

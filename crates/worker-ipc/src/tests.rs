@@ -556,7 +556,7 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
         dims: vec![DimBound::Static(4)],
     };
     for transport in [
-        TransferTransport::CudaIpc {
+        TransferTransport::CudaVmm {
             endpoint: "uniserve-cuda-physical-incarnation".into(),
             publication_id: "0123456789abcdef0123456789abcdef".into(),
             storage_size_bytes: 4096,

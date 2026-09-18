@@ -1004,7 +1004,7 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
             dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
             dict.set_item(intern!(py, "name"), name.as_str())?;
         }
-        TransferTransport::CudaIpc {
+        TransferTransport::CudaVmm {
             endpoint,
             publication_id,
             storage_size_bytes,
@@ -1015,7 +1015,7 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
             ready_event_handle,
             allocation_handle,
         } => {
-            dict.set_item(intern!(py, "transport"), "cuda_ipc")?;
+            dict.set_item(intern!(py, "transport"), "cuda_vmm")?;
             dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
             dict.set_item(intern!(py, "publication_id"), publication_id.as_str())?;
             dict.set_item(intern!(py, "storage_size_bytes"), storage_size_bytes)?;
@@ -1543,7 +1543,7 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
             endpoint: string_of(&get(dict, intern!(py, "endpoint"))?)?,
             name: string_of(&get(dict, intern!(py, "name"))?)?,
         },
-        "cuda_ipc" => TransferTransport::CudaIpc {
+        "cuda_vmm" => TransferTransport::CudaVmm {
             endpoint: string_of(&get(dict, intern!(py, "endpoint"))?)?,
             publication_id: string_of(&get(dict, intern!(py, "publication_id"))?)?,
             storage_size_bytes: u64_of(&get(dict, intern!(py, "storage_size_bytes"))?)?,

@@ -2294,15 +2294,15 @@ fn transfer_locator_from_table(value: fbs::Locator<'_>) -> CodecResult<Locator> 
                 .context("shared-memory transfer name is missing")?
                 .to_owned(),
         }
-    } else if value.transport() == fbs::TransferTransportKind::CudaIpc {
-        TransferTransport::CudaIpc {
+    } else if value.transport() == fbs::TransferTransportKind::CudaVmm {
+        TransferTransport::CudaVmm {
             endpoint: value
                 .endpoint()
-                .context("CUDA IPC endpoint is missing")?
+                .context("CUDA VMM endpoint is missing")?
                 .to_owned(),
             publication_id: value
                 .publication_id()
-                .context("CUDA IPC publication identity is missing")?
+                .context("CUDA VMM publication identity is missing")?
                 .to_owned(),
             storage_size_bytes: value.storage_size_bytes(),
             storage_offsets_bytes: value
@@ -2467,7 +2467,7 @@ fn transfer_locator_to_fb(value: &Locator) -> fbs::LocatorT {
             output.endpoint = Some(endpoint.clone());
             output.name = Some(name.clone());
         }
-        TransferTransport::CudaIpc {
+        TransferTransport::CudaVmm {
             endpoint,
             publication_id,
             storage_size_bytes,
@@ -2478,7 +2478,7 @@ fn transfer_locator_to_fb(value: &Locator) -> fbs::LocatorT {
             ready_event_handle,
             allocation_handle,
         } => {
-            output.transport = fbs::TransferTransportKind::CudaIpc;
+            output.transport = fbs::TransferTransportKind::CudaVmm;
             output.endpoint = Some(endpoint.clone());
             output.publication_id = Some(publication_id.clone());
             output.storage_size_bytes = *storage_size_bytes;

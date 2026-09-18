@@ -1,6 +1,6 @@
 """Logical product coverage delivered through real local and SHM endpoints.
 
-Real CUDA IPC endpoints deliver the coverage as well.
+Real CUDA VMM endpoints deliver the coverage as well.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def _consume(tickets) -> None:
         ("shm", "cpu"),
         ("local", "cuda:0"),
         ("shm", "cuda:0"),
-        ("cuda_ipc", "cuda:0"),
+        ("cuda_vmm", "cuda:0"),
     ),
 )
 @pytest.mark.parametrize("shard_axis", (0, 1))
@@ -326,7 +326,7 @@ def _receive_tensor_shards(channel, backends: tuple[str, ...]) -> None:
 
 
 @pytest.mark.parametrize("fragmented", (False, True))
-@pytest.mark.parametrize("backends", (("cuda_ipc",), ("shm", "cuda_ipc")))
+@pytest.mark.parametrize("backends", (("cuda_vmm",), ("shm", "cuda_vmm")))
 def test_tensor_delivery_gathers_shards_across_processes(
     fragmented: bool, backends: tuple[str, ...]
 ) -> None:
@@ -384,7 +384,7 @@ def test_tensor_delivery_gathers_shards_across_processes(
 def _receive_independent_shards(channel) -> None:
     events = EventPool()
     consumer = make_transport(
-        "cuda_ipc", byte_capacity=12 << 20, ticket_capacity=4, event_pool=events
+        "cuda_vmm", byte_capacity=12 << 20, ticket_capacity=4, event_pool=events
     )
     try:
         tensor = TensorTransfer.from_mapping(channel.recv())
@@ -399,7 +399,7 @@ def _receive_independent_shards(channel) -> None:
             tensor,
             destination,
             bindings={
-                (location.source, "cuda_ipc"): consumer
+                (location.source, "cuda_vmm"): consumer
                 for location in tensor.locations
             },
         )
@@ -431,7 +431,7 @@ def test_sharded_delivery_progresses_during_independent_device_work() -> None:
     parent, child = context.Pipe()
     events = EventPool()
     producer = make_transport(
-        "cuda_ipc", byte_capacity=12 << 20, ticket_capacity=4, event_pool=events
+        "cuda_vmm", byte_capacity=12 << 20, ticket_capacity=4, event_pool=events
     )
     sources = tuple(
         torch.full((1, 1024, 1024), float(index), device="cuda:1")
@@ -539,7 +539,7 @@ def test_read_ticket_capacity_is_shared_across_backends() -> None:
         ("shm", "cpu"),
         ("local", "cuda:0"),
         ("shm", "cuda:0"),
-        ("cuda_ipc", "cuda:0"),
+        ("cuda_vmm", "cuda:0"),
     ),
 )
 def test_fragmented_layer_pages_use_one_read_into_reserved_pages(
@@ -594,7 +594,7 @@ def test_fragmented_layer_pages_use_one_read_into_reserved_pages(
 
 
 @pytest.mark.parametrize(
-    "backend,device", (("local", "cpu"), ("shm", "cpu"), ("cuda_ipc", "cuda:0"))
+    "backend,device", (("local", "cpu"), ("shm", "cpu"), ("cuda_vmm", "cuda:0"))
 )
 @pytest.mark.parametrize("shard_axis", (0, 1))
 @torch.inference_mode()
@@ -786,7 +786,7 @@ def test_shm_allocation_failure_preserves_publication_capacity(
         events.close()
 
 
-@pytest.mark.parametrize("backend", ("shm", "cuda_ipc"))
+@pytest.mark.parametrize("backend", ("shm", "cuda_vmm"))
 def test_transfer_orders_destination_writes_before_its_copy(
     backend: str,
 ) -> None:

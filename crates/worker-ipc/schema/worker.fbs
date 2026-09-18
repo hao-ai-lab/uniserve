@@ -30,7 +30,7 @@ enum ReqKind : ubyte { Info, Submit, Close }
 
 enum RespKind : ubyte { Info, Result, Ok, Error }
 enum KvGroupKind : ubyte { Full, SlidingWindow }
-enum TransferTransportKind : ubyte { Local, PosixShm, CudaIpc }
+enum TransferTransportKind : ubyte { Local, PosixShm, CudaVmm }
 
 table U32List { items:[uint]; }
 table TokenBias { token_id:uint; bias:float; }

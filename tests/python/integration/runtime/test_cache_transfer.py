@@ -237,7 +237,7 @@ def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> (
         ("local", "cpu"),
         ("shm", "cpu"),
         pytest.param("shm", "cuda:0", marks=pytest.mark.gpu),
-        pytest.param("cuda_ipc", "cuda:0", marks=pytest.mark.gpu),
+        pytest.param("cuda_vmm", "cuda:0", marks=pytest.mark.gpu),
     ),
 )
 @pytest.mark.parametrize(
@@ -513,7 +513,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
         table.install(((1, 0, pages, 2 * pool.info.block_size),))
     owners = [pool for pool, table in zip(pools, tables, strict=True)]
     events = [EventPool() for _ in pools]
-    backend = "cuda_ipc" if device.startswith("cuda") else "shm"
+    backend = "cuda_vmm" if device.startswith("cuda") else "shm"
     transports = [
         make_transport(
             backend, byte_capacity=32768, ticket_capacity=32, event_pool=event

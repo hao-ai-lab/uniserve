@@ -297,11 +297,11 @@ class Worker:
                 )
 
             if (
-                "cuda_ipc" in transfer_backends
+                "cuda_vmm" in transfer_backends
                 and torch.device(worker_config.device).type != "cuda"
             ):
                 raise unsupported_setup(
-                    "CUDA IPC requires a CUDA worker device"
+                    "CUDA VMM requires a CUDA worker device"
                 )
 
             self.model = model
