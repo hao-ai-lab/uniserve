@@ -1606,7 +1606,6 @@ def _bind_cache_tables(
             completion_group, operation.request_key.request_id
         )
         main_slot = int(request.request.request_pool_idx)
-        parent_runtime = operations.input_progress(request)
         operation_rows = rows_by_operation.get(
             operations.operation_identity(operation), []
         )
@@ -1623,11 +1622,7 @@ def _bind_cache_tables(
             None,
         )
         if main_descriptor is not None:
-            visible = (
-                0
-                if parent_runtime is None
-                else int(parent_runtime.kv_visible_len)
-            )
+            visible = int(request.projected_progress.kv_visible_len)
             declared = (
                 inputs.seq_lens[main_descriptor]
                 - inputs.query_lens[main_descriptor]
@@ -1758,10 +1753,7 @@ def _stage_input_products(
             request = state.pending_output(
                 completion_group, product.request_key.request_id
             )
-            if (
-                operations.require_progress(request).latent_product is not None
-                or int(operations.require_progress(request).flow_step) != 0
-            ):
+            if int(operations.require_progress(request).flow_step) != 0:
                 raise invalid_descriptor(
                     "latent transfer destination already owns a trajectory"
                 )
@@ -1790,9 +1782,6 @@ def _stage_input_products(
                 width=value.width,
             )
             row.latent_imported = True
-            request.projected_progress = replace(
-                operations.require_progress(request), latent_product=product
-            )
             request.projected_progress = replace(
                 operations.require_progress(request), flow_step=value.step
             )

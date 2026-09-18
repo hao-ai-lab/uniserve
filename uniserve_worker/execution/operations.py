@@ -39,37 +39,22 @@ def require_progress(output: PendingOutput) -> RequestProgress:
     return progress
 
 
-def input_progress(output: PendingOutput) -> RequestProgress | None:
-    """Read the stable predecessor.
-
-    preferring actual acceptance when it is known.
-    """
-    predecessor = output.predecessor
-    if isinstance(predecessor, PendingOutput):
-        return predecessor.accepted_progress or predecessor.projected_progress
-    return predecessor
-
-
 def execution_runtime(
     request: PendingOutput,
     cache: tuple[int, int, int, int] | None,
     *,
     flow_step: int | None = None,
     computed_len: int | None = None,
-) -> RequestProgress | None:
-    """Project actual state consumers without constructing progress for.
+) -> RequestProgress:
+    """Project the coordinates a call's numerical consumers run at.
 
-    stateless work.
+    The call states them; the cache tuple overrides the KV extents when the
+    block tables resolved a different accepted prefix.
     """
     progress = request.projected_progress
-    if progress is None:
-        return None
-    parent = input_progress(request)
-    assert parent is not None
-
     if cache is None:
-        visible = parent.kv_visible_len
-        computed = parent.kv_computed_len
+        visible = progress.kv_visible_len
+        computed = progress.kv_computed_len
     else:
         _slot, _group, visible, _capacity = cache
         computed = visible if computed_len is None else int(computed_len)
@@ -92,10 +77,9 @@ def cache_coordinates(
     accepted prefix and physical token capacity.
     """
     slot = int(request.request.request_pool_idx)
-    # Scheduler columns may reserve the full unobserved verifier prefix.
-    # The request state owns the accepted extent used by numerical consumers.
-    parent = input_progress(request)
-    visible = 0 if parent is None else int(parent.kv_visible_len)
+    # Scheduler columns may reserve the full unobserved verifier prefix. The
+    # call states the accepted extent its numerical consumers run at.
+    visible = int(request.projected_progress.kv_visible_len)
 
     pool = tables
     if pool is None:
