@@ -68,20 +68,24 @@ impl WorkerProcessArgs {
             Some(registry)
         };
         // A group of cooperating ranks rendezvouses at one TCP address for its
-        // entire lifetime. Ranks on one host reach it over loopback, which is
-        // what a shared directory gave them, and ranks on another host reach
-        // the same address over the network.
+        // entire lifetime, and every rank reports its endpoint to one
+        // registration address. Both are loopback where every rank runs here,
+        // which is what a shared directory gave them; where some rank runs
+        // elsewhere both name this host, because a loopback address reaches
+        // only the host that binds it.
+        let head = match launchers.as_ref() {
+            Some(registry) => Some(registry.reachable_host()?),
+            None => None,
+        };
         let rendezvous = if self.ranks.len() > 1 {
-            Some(super::registration::reserve_rendezvous(
-                std::net::Ipv4Addr::LOCALHOST,
-            )?)
+            Some(super::registration::reserve_rendezvous(head)?)
         } else {
             None
         };
         // Ranks name their own channel endpoints and report them here; the
         // engine binds each channel from the report rather than choosing the
         // endpoint before the process exists.
-        let registry = RankRegistry::bind()?;
+        let registry = RankRegistry::bind(head)?;
         let mut ranks = Vec::with_capacity(self.ranks.len());
         for rank in 0..self.ranks.len() {
             let rank_device = &self.ranks[rank].device;
