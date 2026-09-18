@@ -704,11 +704,23 @@ class Worker:
 
         # A rank executes batches in channel order. Requests launch from the
         # head of this queue in the order the channel delivered them, which is
-        # the order the engine dispatched them in, so cooperative ranks launch
-        # their collectives in the same order without a local chain. Only
-        # execution capacity holds the head back.
+        # the order the engine dispatched them in.
         self._pending_requests: dict[int, ServiceRequest] = {}
         self._ready_requests: deque[ServiceRequest] = deque()
+
+        # A component whose calls are collective needs its ranks inside the
+        # same collective, not merely issuing collectives in the same order. A
+        # rank may hold no media unit of a batch and skip it, and depth lets a
+        # rank start the next batch while a peer is still in this one, so one
+        # rank can reach a denoiser's capture_required all-reduce that its
+        # peers have not. Such a rank therefore holds one batch in flight.
+        self._launched_submissions = 0
+        self._collective_component = any(
+            group.size > 1
+            for entry in self.runner.bindings.values()
+            if entry.owns
+            for group in entry.groups
+        ) or (self.sampling_group is not None and self.sampling_group.size > 1)
 
     def _init_run_tracking(self) -> None:
         """Initialize batch tracking state.
@@ -937,6 +949,8 @@ class Worker:
         if pending.released:
             return
         pending.released = True
+        if pending.kind is RequestKind.SUBMIT:
+            self._launched_submissions -= 1
         self._pending_requests.pop(pending.sequence, None)
 
     def _launch_one_ready_request(self) -> bool:
@@ -952,9 +966,9 @@ class Worker:
         # overtake it, which is what lets cooperative ranks launch their
         # collectives in the order the engine dispatched them.
         head = self._ready_requests[0]
-        if (
-            head.kind is RequestKind.SUBMIT
-            and len(self.inflight) >= self.queue_depth
+        if head.kind is RequestKind.SUBMIT and (
+            len(self.inflight) >= self.queue_depth
+            or (self._collective_component and self._launched_submissions)
         ):
             return False
 
@@ -962,6 +976,7 @@ class Worker:
 
         try:
             if pending.kind is RequestKind.SUBMIT:
+                self._launched_submissions += 1
                 self._launch_execute(pending)
             else:
                 self._launch_admin(pending)
@@ -1947,6 +1962,7 @@ class Worker:
 
             self._pending_requests.clear()
             self._ready_requests.clear()
+            self._launched_submissions = 0
             self._executing_batches.clear()
 
             while not self._preparation_ready.empty():
