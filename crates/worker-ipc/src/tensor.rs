@@ -204,6 +204,11 @@ pub enum TransferTransport {
         /// that only reaches the producer's own host.
         #[serde(with = "serde_bytes")]
         allocation_handle: Vec<u8>,
+        /// Byte offset of this publication's acknowledgment header inside the
+        /// exported allocation. A consumer writes its own slot's word there
+        /// once its reads retire, which is how a product retires across hosts.
+        /// Negative when the publication carries no header.
+        acknowledgment_offset: i64,
     },
 }
 

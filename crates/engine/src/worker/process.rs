@@ -240,6 +240,8 @@ impl WorkerProcessArgs {
         publish_backends: &str,
         distributed_init_method: Option<String>,
         channel_transport: &str,
+        acknowledgment_slot: u32,
+        product_consumers: &[u32],
     ) -> anyhow::Result<serde_json::Value> {
         let depth = self.queue_depth.max(1);
         let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
@@ -250,6 +252,10 @@ impl WorkerProcessArgs {
         // a rank on the head's host can offer shared memory, a rank elsewhere
         // cannot, and only the head knows where a rank was placed.
         fields.insert("channel_transport".into(), json!(channel_transport));
+        // A consumer writes its own slot's word in every chunk it reads, and a
+        // producer watches the slots of the ranks that read its products.
+        fields.insert("acknowledgment_slot".into(), json!(acknowledgment_slot));
+        fields.insert("product_consumers".into(), json!(product_consumers));
         fields.insert("queue_depth".into(), json!(depth));
         fields.insert("ipc_payload_cap".into(), json!(max_payload));
         fields.insert("model".into(), json!(self.model));
@@ -443,6 +449,12 @@ impl PendingRank {
 
         // Resolve mechanism ownership from the physical rank's incident edges.
         let (backends, publications) = args.transfer.rank_backends(&args.worker_id, rank);
+        // A rank cannot name the ranks that read what it publishes: it knows
+        // its own component, not which component consumes its products, and a
+        // product is consumed in a later batch than the one producing it. The
+        // edges hold that, so the head states the consumers here.
+        let acknowledgment_slot = args.transfer.acknowledgment_slot(&args.worker_id, rank);
+        let product_consumers = args.transfer.product_consumers(&args.worker_id, rank);
         let names = |backends: &std::collections::BTreeSet<crate::executor::TransferBackend>| {
             backends
                 .iter()
@@ -465,6 +477,8 @@ impl PendingRank {
             &names(&publications),
             distributed_init_method,
             channel_transport,
+            acknowledgment_slot,
+            &product_consumers,
         )?;
         let descriptor_directory = tempfile::Builder::new()
             .prefix("uniserve-worker-launch")

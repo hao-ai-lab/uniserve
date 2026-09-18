@@ -325,6 +325,12 @@ class WorkerIpcConfig:
 
     registration_address: str
     channel_transport: str
+    # This rank's word in every chunk header it reads, unique in the instance.
+    acknowledgment_slot: int
+    # Acknowledgment slots of the ranks that read this rank's device products,
+    # which the head derives from the transfer edges. A rank cannot name them
+    # itself: it knows its own component, not which component consumes it.
+    product_consumers: tuple[int, ...]
     max_payload_bytes: int
     queue_depth: int
 
@@ -419,6 +425,10 @@ class WorkerProcessArgs:
             ipc=WorkerIpcConfig(
                 registration_address=str(namespace.registration_address),
                 channel_transport=str(namespace.channel_transport),
+                acknowledgment_slot=int(namespace.acknowledgment_slot),
+                product_consumers=tuple(
+                    int(slot) for slot in namespace.product_consumers
+                ),
                 max_payload_bytes=int(namespace.ipc_payload_cap),
                 queue_depth=int(namespace.queue_depth),
             ),

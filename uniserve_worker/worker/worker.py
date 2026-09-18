@@ -224,6 +224,8 @@ class Worker:
                 worker_id=config.worker_id,
                 queue_depth=config.ipc.queue_depth,
                 completion_payload_bytes=config.ipc.max_payload_bytes,
+                acknowledgment_slot=config.ipc.acknowledgment_slot,
+                product_consumers=config.ipc.product_consumers,
                 components=config.components,
                 process_groups=distributed,
             )
@@ -247,6 +249,8 @@ class Worker:
         allowed_work_variants: frozenset[CallKind],
         queue_depth: int,
         completion_payload_bytes: int,
+        acknowledgment_slot: int = 0,
+        product_consumers: tuple[int, ...] = (),
         attention: str | None = None,
         transfer_backends: tuple[str, ...] = ("local",),
         publication_backends: tuple[str, ...] = ("local",),
@@ -602,6 +606,8 @@ class Worker:
                 byte_capacity=transfer_byte_capacity,
                 ticket_capacity=arena.transfer_tickets,
                 event_pool=self.device_events,
+                consumers=product_consumers,
+                acknowledgment_slot=acknowledgment_slot,
             )
             for transport in self.transports.values():
                 startup.callback(transport.close)
@@ -1611,6 +1617,11 @@ class Worker:
         Reset happens only after every physical reader has finished.
         """
         self.device_events.reap()
+        # A device product is held until its consumers acknowledge it. They do
+        # so by writing into the chunk they read, which arrives with no local
+        # notification, so the producing rank looks for it here.
+        for transport in self.transports.values():
+            transport.reap()
         if not all(event.query() for event in state.retirement_events):
             return False
 

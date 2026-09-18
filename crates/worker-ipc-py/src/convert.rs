@@ -1014,6 +1014,7 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
             tensor_stride,
             ready_event_handle,
             allocation_handle,
+            acknowledgment_offset,
         } => {
             dict.set_item(intern!(py, "transport"), "cuda_vmm")?;
             dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
@@ -1034,6 +1035,7 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
                 intern!(py, "allocation_handle"),
                 PyBytes::new(py, allocation_handle),
             )?;
+            dict.set_item(intern!(py, "acknowledgment_offset"), acknowledgment_offset)?;
         }
     }
 
@@ -1553,6 +1555,7 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
             tensor_stride: i64_vec(&get(dict, intern!(py, "tensor_stride"))?)?,
             ready_event_handle: bytes_of(&get(dict, intern!(py, "ready_event_handle"))?)?,
             allocation_handle: bytes_of(&get(dict, intern!(py, "allocation_handle"))?)?,
+            acknowledgment_offset: i64_of(&get(dict, intern!(py, "acknowledgment_offset"))?)?,
         },
         _ => return None,
     };
@@ -1721,6 +1724,15 @@ fn str_field<'py>(
     key: &Bound<'py, PyString>,
 ) -> Option<Bound<'py, PyString>> {
     get(dict, key)?.cast_into::<PyString>().ok()
+}
+
+/// Extracts an `i64` while rejecting Python booleans as integers.
+fn i64_of(value: &Bound<'_, PyAny>) -> Option<i64> {
+    // Integer fields reject Python booleans, which are a distinct protocol type.
+    if value.cast::<PyBool>().is_ok() {
+        return None;
+    }
+    value.extract().ok()
 }
 
 /// Extracts a `u64` while rejecting Python booleans as integers.

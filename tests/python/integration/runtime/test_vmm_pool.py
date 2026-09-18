@@ -1,4 +1,4 @@
-"""A publishing rank's bounded VMM pool and its acknowledgment retirement."""
+"""A publishing rank's bounded VMM pool and its acknowledgment header."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from uniserve_worker.transfer.vmm_pool import (
+    ACK_WORD_BYTES,
     HEADER_BYTES,
     PoolExhaustedError,
     VmmPool,
@@ -50,27 +51,51 @@ def test_a_product_that_does_not_fit_is_refused_by_size(pool: VmmPool) -> None:
         pool.reserve(pool.capacity * 2)
 
 
-def test_a_chunk_retires_when_every_named_consumer_acknowledges(
+def test_a_chunk_is_acknowledged_only_by_the_slots_named_for_it(
     pool: VmmPool,
 ) -> None:
-    """Retirement is the consumers' acknowledgments, not a reader connection.
+    """Each consuming rank owns one word, addressed by the slot the head gave.
 
-    A chunk is held while any consumer the component names has not written its
-    word, and the producing rank's sweep returns it once they all have. This is
-    what lets a consumer on another host retire a product the same way one on
-    this host does.
+    Owning a word rather than sharing a counter is what lets a consumer
+    acknowledge with a plain store into the chunk it already mapped, with no
+    cross-process atomic and no connection back to the producer.
     """
     chunk = pool.reserve(4096)
-    pool.await_acknowledgment(chunk, consumers=2)
+    named = (3, 7)
 
-    assert pool.recycle() == 0, "an unacknowledged chunk is held"
+    assert not chunk.acknowledged(named), "an unacknowledged chunk is held"
 
-    chunk.acknowledgments[0] = 1
-    assert pool.recycle() == 0, "a partly acknowledged chunk is held"
+    chunk.acknowledgments[3] = 1
+    assert not chunk.acknowledged(named), "a partly acknowledged chunk is held"
+    # A word outside the named slots is not this product's to acknowledge.
+    chunk.acknowledgments[5] = 1
+    assert not chunk.acknowledged(named), "an unnamed slot does not acknowledge"
 
-    chunk.acknowledgments[1] = 1
-    assert pool.recycle() == 1, "a fully acknowledged chunk returns"
-    assert pool.recycle() == 0, "a returned chunk is not returned twice"
+    chunk.acknowledgments[7] = 1
+    assert chunk.acknowledged(named), "every named slot has acknowledged"
+
+    # A product no other rank reads has nothing to wait for.
+    assert chunk.acknowledged(())
+
+
+def test_a_consumer_addresses_its_word_by_slot_from_the_chunk_offset(
+    pool: VmmPool,
+) -> None:
+    """A consumer locates its word from the offset the publication carries.
+
+    It maps the producer's allocation and knows only the chunk's offset and its
+    own slot, so the header must be addressable by that arithmetic alone.
+    """
+    chunk = pool.reserve(4096)
+    slot = 9
+
+    # The same arithmetic a reading rank performs against its own mapping.
+    word = pool.mapping.view(torch.uint8)[
+        chunk.offset + slot * ACK_WORD_BYTES :
+    ][:ACK_WORD_BYTES].view(torch.int32)
+    word.fill_(1)
+
+    assert chunk.acknowledged((slot,))
 
 
 def test_a_reused_chunk_starts_unacknowledged(pool: VmmPool) -> None:
@@ -87,4 +112,4 @@ def test_a_reused_chunk_starts_unacknowledged(pool: VmmPool) -> None:
     assert reused.offset == first.offset, (
         "the released span is handed out again"
     )
-    assert not reused.acknowledged(1), "a reused chunk starts unacknowledged"
+    assert not reused.acknowledged((0,)), "a reused chunk starts unacknowledged"

@@ -19,6 +19,8 @@ from uniserve_worker.bootstrap.config import WorkerProcessArgs
 DEFAULTS: dict[str, Any] = {
     "registration_address": "127.0.0.1:0",
     "channel_transport": "iceoryx2",
+    "acknowledgment_slot": 0,
+    "product_consumers": [],
     "worker_id": "worker",
     "queue_depth": 2,
     "ipc_payload_cap": 65536,

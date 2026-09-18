@@ -635,6 +635,12 @@ pub struct TransferEdge {
 pub struct TransferConfig {
     /// Explicit directed transfer edges.
     pub edges: Vec<TransferEdge>,
+    /// Rank count of each worker an edge may name.
+    ///
+    /// An edge that omits a rank names every rank of its worker, so counting
+    /// a product's consumers needs the membership the placement gave each.
+    #[serde(default)]
+    pub worker_ranks: std::collections::BTreeMap<String, u32>,
 }
 
 impl TransferConfig {
@@ -648,6 +654,10 @@ impl TransferConfig {
     /// have to cross hosts without fabric handles is refused by name.
     pub fn with_worker_defaults(mut self, workers: &[crate::WorkerConfig]) -> anyhow::Result<Self> {
         crate::WorkerConfig::validate_all(workers)?;
+        for worker in workers {
+            self.worker_ranks
+                .insert(worker.id.0.clone(), worker.ranks.len() as u32);
+        }
         for worker in workers {
             for (source_rank, source) in worker.ranks.iter().enumerate() {
                 for (destination_rank, destination) in worker.ranks.iter().enumerate() {
@@ -720,6 +730,69 @@ impl TransferConfig {
             publications.insert(TransferBackend::Local);
         }
         (backends, publications)
+    }
+
+    /// Counts the ranks that read one rank's device products.
+    ///
+    /// A product's consumers are the destinations of the edges leaving its
+    /// producing rank, which is what component membership resolves to, and
+    /// they are fixed when the placement is. A producing rank cannot derive
+    /// this: it knows which component it belongs to, not which component reads
+    /// what it publishes, and a product is consumed in a later batch than the
+    /// one that produced it. So the head states it at launch.
+    ///
+    /// A rank omitted from an edge names every rank of that worker.
+    pub fn acknowledgment_slot(&self, worker: &str, rank: u32) -> u32 {
+        // Workers are keyed in a BTreeMap, so their order is the same in every
+        // process that derives a slot. Each worker owns a contiguous run of
+        // slots, and a rank takes its offset within that run.
+        let mut base = 0;
+        for (name, ranks) in &self.worker_ranks {
+            if name == worker {
+                return base + rank;
+            }
+            base += ranks;
+        }
+        base + rank
+    }
+
+    /// Acknowledgment slots of the ranks that read this rank's device products.
+    ///
+    /// A product retires when every consumer has written its word in the
+    /// chunk's header, so the producer needs the consumers' identities and not
+    /// merely their number. A rank cannot derive this itself: the mapping lives
+    /// in the transfer edges, which only the head holds.
+    pub fn product_consumers(&self, worker: &str, rank: u32) -> Vec<u32> {
+        let mut slots = std::collections::BTreeSet::new();
+        for edge in &self.edges {
+            if edge.source_worker.0 != worker
+                || !edge.source_rank.is_none_or(|source| source == rank)
+            {
+                continue;
+            }
+            // A self-edge publishes to this rank's own address space, which
+            // needs no acknowledgment from another process.
+            if edge.destination_worker.0 == worker && edge.destination_rank == Some(rank) {
+                continue;
+            }
+            let destination = &edge.destination_worker.0;
+            match edge.destination_rank {
+                Some(consumer) => {
+                    slots.insert(self.acknowledgment_slot(destination, consumer));
+                }
+                // An edge without a rank names every rank of its worker.
+                None => {
+                    let members = self.worker_ranks.get(destination).copied().unwrap_or(0);
+                    for consumer in 0..members {
+                        if destination == worker && consumer == rank {
+                            continue;
+                        }
+                        slots.insert(self.acknowledgment_slot(destination, consumer));
+                    }
+                }
+            }
+        }
+        slots.into_iter().collect()
     }
 
     /// Select explicitly bound locations for a rank before admitting device work.
@@ -842,7 +915,10 @@ impl TransferConfig {
             });
         }
 
-        Ok(Self { edges })
+        Ok(Self {
+            edges,
+            worker_ranks: std::collections::BTreeMap::new(),
+        })
     }
 }
 
@@ -976,6 +1052,47 @@ pub trait Executor: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_producer_watches_the_slots_its_consumers_write() {
+        // A product retires only when the slots the producer watches are the
+        // same slots its consumers write. Both come from this derivation, so
+        // a disagreement would hang retirement or reuse live storage.
+        let mut transfer = TransferConfig {
+            edges: vec![
+                TransferEdge {
+                    source_worker: WorkerId("encoder".to_owned()),
+                    source_rank: Some(0),
+                    destination_worker: WorkerId("decode".to_owned()),
+                    destination_rank: None,
+                    transport: TransferBackend::CudaVmm,
+                },
+                TransferEdge {
+                    source_worker: WorkerId("encoder".to_owned()),
+                    source_rank: Some(0),
+                    destination_worker: WorkerId("encoder".to_owned()),
+                    destination_rank: Some(0),
+                    transport: TransferBackend::Local,
+                },
+            ],
+            worker_ranks: std::collections::BTreeMap::new(),
+        };
+        transfer.worker_ranks.insert("decode".to_owned(), 2);
+        transfer.worker_ranks.insert("encoder".to_owned(), 3);
+
+        // Slots are dense across the instance: workers take contiguous runs in
+        // the order the placement keys them.
+        assert_eq!(transfer.acknowledgment_slot("decode", 0), 0);
+        assert_eq!(transfer.acknowledgment_slot("decode", 1), 1);
+        assert_eq!(transfer.acknowledgment_slot("encoder", 0), 2);
+        assert_eq!(transfer.acknowledgment_slot("encoder", 2), 4);
+
+        // The unranked edge names every decode rank; the self-edge publishes
+        // into the producer's own address space and acknowledges nothing.
+        assert_eq!(transfer.product_consumers("encoder", 0), vec![0, 1]);
+        // A rank with no outgoing edge has no consumer to wait for.
+        assert_eq!(transfer.product_consumers("encoder", 1), Vec::<u32>::new());
+    }
 
     #[test]
     fn transport_map_parses_edges() {
