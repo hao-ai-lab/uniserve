@@ -25,8 +25,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
 use pyo3::wrap_pyfunction;
 use pythonize::{depythonize, pythonize};
+use uniserve_worker_ipc::{RankServer, SHARED_MEMORY_CHANNEL, Wake};
 use uniserve_worker_ipc::{RequestKind, WorkerRequest, WorkerResponse};
-use uniserve_worker_ipc::{ServerEndpoint, WakeSender};
 
 #[pyclass(name = "Server")]
 /// Python-facing owner of one worker-side IPC endpoint.
@@ -37,9 +37,9 @@ struct PyServer {
 
 /// The endpoint may be borrowed by an call; both fields are empty after close.
 struct ServerState {
-    endpoint: Option<ServerEndpoint>,
+    endpoint: Option<RankServer>,
     /// Wake source used by CPU, transfer, and device completion callbacks.
-    completion_wake: Option<WakeSender>,
+    completion_wake: Option<Wake>,
 }
 
 /// Shared eventfd state retained until the last scheduled callback completes.
@@ -124,8 +124,8 @@ fn cuda_runtime() -> Result<&'static CudaRuntime, String> {
 /// Signals worker completion after preceding CUDA stream work finishes.
 unsafe extern "C" fn completion_callback(user_data: *mut c_void) {
     // SAFETY: `schedule_completion_wake` passes ownership of exactly one boxed
-    // `WakeSender` to CUDA, which invokes this callback exactly once.
-    let wake = unsafe { Box::from_raw(user_data.cast::<WakeSender>()) };
+    // `Wake` to CUDA, which invokes this callback exactly once.
+    let wake = unsafe { Box::from_raw(user_data.cast::<Wake>()) };
     wake.wake();
 }
 
@@ -141,7 +141,7 @@ unsafe extern "C" fn stream_signal_callback(user_data: *mut c_void) {
 }
 
 /// Transfers a completion wake to a one-shot CUDA stream callback.
-fn schedule_completion_wake(stream: usize, wake: WakeSender) -> Result<(), String> {
+fn schedule_completion_wake(stream: usize, wake: Wake) -> Result<(), String> {
     let runtime = cuda_runtime()?;
     let user_data = Box::into_raw(Box::new(wake)).cast::<c_void>();
     // SAFETY: `stream` is the native CUDA stream address supplied by PyTorch;
@@ -151,7 +151,7 @@ fn schedule_completion_wake(stream: usize, wake: WakeSender) -> Result<(), Strin
     };
     if status != 0 {
         // SAFETY: CUDA rejected the callback and therefore did not take ownership.
-        drop(unsafe { Box::from_raw(user_data.cast::<WakeSender>()) });
+        drop(unsafe { Box::from_raw(user_data.cast::<Wake>()) });
         return Err(format!(
             "cudaLaunchHostFunc failed with CUDA status {status}"
         ));
@@ -243,10 +243,19 @@ impl PyStreamSignal {
 #[pymethods]
 impl PyServer {
     #[new]
-    #[pyo3(signature = (service_name, max_payload = 1048576, max_inflight = 1))]
-    /// Binds a worker IPC service with bounded payload and inflight capacity.
-    fn new(service_name: &str, max_payload: usize, max_inflight: usize) -> PyResult<Self> {
-        let inner = ServerEndpoint::bind(service_name, max_payload, max_inflight)
+    #[pyo3(signature = (service_name, max_payload = 1048576, max_inflight = 1, transport = SHARED_MEMORY_CHANNEL))]
+    /// Binds this rank's channel with bounded payload and inflight capacity.
+    ///
+    /// `transport` is the mechanism the placement calls for: a rank on the
+    /// head's host serves shared memory, and a rank elsewhere serves a socket,
+    /// where `service_name` is the host to bind rather than a service.
+    fn new(
+        service_name: &str,
+        max_payload: usize,
+        max_inflight: usize,
+        transport: &str,
+    ) -> PyResult<Self> {
+        let inner = RankServer::bind(transport, service_name, max_payload, max_inflight)
             .map_err(|err| py_runtime(format!("failed to bind IPC service: {err:#}")))?;
         let completion_wake = inner.completion_wake();
         Ok(Self {
@@ -284,6 +293,22 @@ impl PyServer {
             );
         }
         Ok(())
+    }
+
+    /// Returns the endpoint the head binds, which the rank reports.
+    ///
+    /// A shared-memory endpoint is the service it was given; a socket endpoint
+    /// is the address its bind produced, which the caller could not know.
+    fn endpoint(&self, service: &str) -> PyResult<String> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| py_runtime("IPC server mutex poisoned"))?;
+        state
+            .endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.endpoint(service))
+            .ok_or_else(|| py_runtime("IPC server endpoint is already in use"))
     }
 
     /// Releases the service after its caller has stopped all endpoint calls.
@@ -362,6 +387,9 @@ impl PyServer {
     fn wait_incoming(&self, py: Python<'_>, timeout_us: u64) -> PyResult<()> {
         let endpoint = self.take_endpoint()?;
         let (endpoint, result) = py.detach(move || {
+            // A socket endpoint accepts and reads through this call, so the
+            // owned endpoint is mutable while the GIL is released.
+            let mut endpoint = endpoint;
             let result = endpoint.wait_incoming(std::time::Duration::from_micros(timeout_us));
             (endpoint, result)
         });
@@ -418,7 +446,7 @@ fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyA
 
 impl PyServer {
     /// Takes exclusive endpoint ownership for an call that releases the GIL.
-    fn take_endpoint(&self) -> PyResult<ServerEndpoint> {
+    fn take_endpoint(&self) -> PyResult<RankServer> {
         let mut guard = self
             .inner
             .lock()
@@ -433,7 +461,7 @@ impl PyServer {
     }
 
     /// Restores endpoint ownership after a GIL-free call.
-    fn replace_endpoint(&self, endpoint: ServerEndpoint) -> PyResult<()> {
+    fn replace_endpoint(&self, endpoint: RankServer) -> PyResult<()> {
         let mut guard = self
             .inner
             .lock()
@@ -443,7 +471,7 @@ impl PyServer {
     }
 
     /// Borrows a wake source independently of a pending receive call.
-    fn completion_wake(&self) -> PyResult<WakeSender> {
+    fn completion_wake(&self) -> PyResult<Wake> {
         let state = self
             .inner
             .lock()

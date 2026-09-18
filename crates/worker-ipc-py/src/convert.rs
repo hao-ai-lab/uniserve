@@ -2169,7 +2169,13 @@ mod tests {
             .unwrap()
             .as_nanos();
         let service = format!("uniserve/ipc-py-test-{}-{nonce}", std::process::id());
-        let server = crate::PyServer::new(&service, 1 << 20, 4).unwrap();
+        let server = crate::PyServer::new(
+            &service,
+            1 << 20,
+            4,
+            uniserve_worker_ipc::SHARED_MEMORY_CHANNEL,
+        )
+        .unwrap();
         let client = ClientEndpoint::connect(&service, 1 << 20, 4).unwrap();
         let requests = execute_requests();
         let pending = requests

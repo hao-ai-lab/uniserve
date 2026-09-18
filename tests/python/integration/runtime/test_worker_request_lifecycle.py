@@ -454,9 +454,7 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
         ),
     )
     assert closed_report.completions[0].status is CallStatus.ERROR
-    assert (
-        closed_report.completions[0].error_code is ErrorCode.INVALID_CALL
-    )
+    assert closed_report.completions[0].error_code is ErrorCode.INVALID_CALL
 
     active_decode = token_call(
         active_admission.request_key,
@@ -582,9 +580,7 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
         ),
     )
     assert retired_report.completions[0].status is CallStatus.ERROR
-    assert (
-        retired_report.completions[0].error_code is ErrorCode.INVALID_CALL
-    )
+    assert retired_report.completions[0].error_code is ErrorCode.INVALID_CALL
     worker.close()
 
 

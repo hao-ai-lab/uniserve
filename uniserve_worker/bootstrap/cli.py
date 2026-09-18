@@ -21,6 +21,7 @@ from .config import WorkerProcessArgs
 # violation rather than something to paper over with a local default.
 REQUIRED_FIELDS = (
     "registration_address",
+    "channel_transport",
     "worker_id",
     "queue_depth",
     "ipc_payload_cap",
