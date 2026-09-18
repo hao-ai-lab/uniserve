@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import concurrent.futures
 import ctypes
+import logging
 import mmap
 import os
 import queue
 import selectors
 import socket
 import threading
+import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -25,6 +27,7 @@ from itertools import groupby, repeat
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from uniserve import _slices
+from uniserve.profiling import profile_range
 from uniserve.runtime import EventPool
 
 from ..foundation.errors import (
@@ -45,6 +48,8 @@ from ..protocol.transfer import (
 from .endpoint import PublicationEndpoint, finish_reader, open_reader
 from .layout import region_view, validate_destination
 from .vmm_pool import ACK_WORD_BYTES, PoolChunk, PoolExhaustedError, VmmPool
+
+_LOG = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import torch
@@ -1533,6 +1538,18 @@ class ChannelTransport(Transport):
             name="uniserve-channel-read",
             event_pool=event_pool,
         )
+        # What carrying a product on the channel costs this rank. A publication
+        # blocks on its own stream and then copies the bytes out, and both are
+        # on the batch's critical path, so each is counted separately from the
+        # payload they move.
+        self._published = 0
+        self._payload_bytes = 0
+        self._largest_payload = 0
+        self._synchronize_seconds = 0.0
+        self._longest_synchronize = 0.0
+        self._copy_seconds = 0.0
+        self._fetched = 0
+        self._fetch_seconds = 0.0
 
     def endpoint(self) -> str:
         return self._endpoint
@@ -1562,7 +1579,25 @@ class ChannelTransport(Transport):
             for target, value in _copy_pairs(source, packed):
                 target.copy_(value)
             if first.is_cuda:
-                torch.cuda.current_stream(first.device).synchronize()
+                # The producer waits here for its own writes: the bytes leave
+                # with the result, so nothing downstream can fence them. This
+                # is the publication's synchronize cost.
+                started = time.perf_counter()
+                with profile_range("channel_publish_synchronize"):
+                    torch.cuda.current_stream(first.device).synchronize()
+                waited = time.perf_counter() - started
+                self._synchronize_seconds += waited
+                self._longest_synchronize = max(
+                    self._longest_synchronize, waited
+                )
+
+            started = time.perf_counter()
+            with profile_range("channel_publish_payload"):
+                payload = bytes(packed.flatten().view(torch.uint8).numpy())
+            self._copy_seconds += time.perf_counter() - started
+            self._published += 1
+            self._payload_bytes += nbytes
+            self._largest_payload = max(self._largest_payload, nbytes)
 
             return Locator(
                 source=self.source,
@@ -1570,7 +1605,7 @@ class ChannelTransport(Transport):
                     endpoint=self._endpoint,
                     # A byte view, so a dtype NumPy does not model travels as
                     # readily as one it does.
-                    payload=bytes(packed.flatten().view(torch.uint8).numpy()),
+                    payload=payload,
                 ),
                 nbytes=nbytes,
                 dtype=_dtype_to_str(first.dtype),
@@ -1598,9 +1633,13 @@ class ChannelTransport(Transport):
         if not isinstance(handle, ChannelTransfer):
             raise invalid_descriptor("channel read requires a channel locator")
         target = _read_destination(locator, device, destination, region)
-        carried = torch.frombuffer(
-            bytearray(handle.payload), dtype=_dtype_from_str(locator.dtype)
-        ).reshape(locator.shape)
+        started = time.perf_counter()
+        with profile_range("channel_fetch_payload"):
+            carried = torch.frombuffer(
+                bytearray(handle.payload), dtype=_dtype_from_str(locator.dtype)
+            ).reshape(locator.shape)
+        self._fetch_seconds += time.perf_counter() - started
+        self._fetched += 1
         if region is not None:
             if not _slices.within(region, locator.shape):
                 raise invalid_descriptor(
@@ -1650,6 +1689,26 @@ class ChannelTransport(Transport):
         return handle
 
     def close(self) -> None:
+        """Report what the channel cost this rank, then release its reads."""
+        if self._published or self._fetched:
+            mean = (
+                self._payload_bytes // self._published if self._published else 0
+            )
+            _LOG.info(
+                "channel transport retired: published=%d payload_total=%d "
+                "payload_mean=%d payload_max=%d synchronize_ms_total=%.3f "
+                "synchronize_ms_max=%.3f copy_ms_total=%.3f fetched=%d "
+                "fetch_ms_total=%.3f",
+                self._published,
+                self._payload_bytes,
+                mean,
+                self._largest_payload,
+                self._synchronize_seconds * 1e3,
+                self._longest_synchronize * 1e3,
+                self._copy_seconds * 1e3,
+                self._fetched,
+                self._fetch_seconds * 1e3,
+            )
         self._reads.close()
 
 
@@ -1697,6 +1756,16 @@ class CudaVmmTransport(Transport):
         # Whether a publication has to state readiness without an interprocess
         # event, which only a consumer on another host requires.
         self._cross_host_consumers = bool(cross_host_consumers)
+        # What publishing costs this rank. A crossing publication drains the
+        # producer's stream, because a consumer on another host can wait on no
+        # fence this rank records, and that wait is on the batch's critical
+        # path. The payloads are counted with it, since the cost of a crossing
+        # is only interpretable against what it carries.
+        self._published = 0
+        self._payload_bytes = 0
+        self._largest_payload = 0
+        self._synchronize_seconds = 0.0
+        self._longest_synchronize = 0.0
         # Publications whose fence has drained but whose consumers have not all
         # acknowledged. Their chunks are held until reap() finds them settled.
         self._unacknowledged: list[_CudaSource] = []
@@ -1901,7 +1970,17 @@ class CudaVmmTransport(Transport):
             # instead, and the publication carries no fence at all.
             interprocess = not self._cross_host_consumers
             if not interprocess:
-                torch.cuda.current_stream(first.device).synchronize()
+                started = time.perf_counter()
+                with profile_range("vmm_publish_synchronize"):
+                    torch.cuda.current_stream(first.device).synchronize()
+                waited = time.perf_counter() - started
+                self._synchronize_seconds += waited
+                self._longest_synchronize = max(
+                    self._longest_synchronize, waited
+                )
+            self._published += 1
+            self._payload_bytes += nbytes
+            self._largest_payload = max(self._largest_payload, nbytes)
             event = self._events.acquire(
                 first.device, interprocess=interprocess
             )
@@ -2191,6 +2270,21 @@ class CudaVmmTransport(Transport):
         return retirement
 
     def close(self) -> None:
+        if self._published:
+            _LOG.info(
+                "cuda_vmm transport retired: published=%d crossing=%s "
+                "payload_total=%d payload_mean=%d payload_max=%d "
+                "synchronize_ms_total=%.3f synchronize_ms_max=%.3f "
+                "synchronize_ms_mean=%.3f",
+                self._published,
+                self._cross_host_consumers,
+                self._payload_bytes,
+                self._payload_bytes // self._published,
+                self._largest_payload,
+                self._synchronize_seconds * 1e3,
+                self._longest_synchronize * 1e3,
+                self._synchronize_seconds * 1e3 / self._published,
+            )
         try:
             self._reads.close()
         finally:
