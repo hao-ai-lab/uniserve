@@ -48,15 +48,14 @@ impl WorkerProcessArgs {
                 self.host
             );
         }
-        // Local ranks share a unique filesystem rendezvous for their entire
-        // lifetime. Probing and releasing a TCP port cannot reserve it for the
-        // Python store that starts after process creation.
+        // A group of cooperating ranks rendezvouses at one TCP address for its
+        // entire lifetime. Ranks on one host reach it over loopback, which is
+        // what a shared directory gave them, and ranks on another host reach
+        // the same address over the network.
         let rendezvous = if self.ranks.len() > 1 {
-            Some(Arc::new(
-                tempfile::Builder::new()
-                    .prefix("uniserve-rendezvous-")
-                    .tempdir()?,
-            ))
+            Some(super::registration::reserve_rendezvous(
+                std::net::Ipv4Addr::LOCALHOST,
+            )?)
         } else {
             None
         };

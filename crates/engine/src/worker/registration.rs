@@ -40,6 +40,24 @@ pub(crate) struct RankReport {
 }
 
 /// The head's registration address for one worker group's ranks.
+/// Reserves the address a worker group's ranks rendezvous at.
+///
+/// The collective store is a TCP store so ranks on different hosts can reach
+/// it; an instance on one host reserves a loopback address and keeps the
+/// semantics it had over a shared directory. The head fixes the address and
+/// the group's first rank binds the store, because a store bound here could
+/// not be handed to the process that must own it. A port taken between the
+/// reservation and that bind fails the launch at initialization by name
+/// instead of being silently rebound.
+pub(crate) fn reserve_rendezvous(host: Ipv4Addr) -> anyhow::Result<String> {
+    let listener = TcpListener::bind(SocketAddr::from((host, 0)))
+        .context("reserving the collective rendezvous address")?;
+    let address = listener
+        .local_addr()
+        .context("reading the collective rendezvous address")?;
+    Ok(format!("tcp://{address}"))
+}
+
 pub(crate) struct RankRegistry {
     listener: TcpListener,
     address: String,
