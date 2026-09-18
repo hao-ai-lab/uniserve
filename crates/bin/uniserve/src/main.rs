@@ -110,11 +110,18 @@ async fn async_main(cli: Cli) -> Result<()> {
             // that choice sizes the queue, batch and IPC slot budgets.
             let is_media =
                 uniserve_server::profile::assets::is_media_checkpoint(&args.runtime.model).await;
-            let settings = args.runtime.engine_settings(is_media);
+            // The model states which components it owns and how each one
+            // partitions; this process places its ranks across the hosts.
+            let entries = args.runtime.declared_entries()?;
+            let settings = args.runtime.engine_settings(is_media, &entries);
             info!(model = %args.runtime.model,
                 workers = ?settings.workers, resident_requests = settings.max_num_seqs,
                 python = %args.runtime.worker_python.display(), "resolved deployment");
-            uniserve_server::serve(args.to_uniserve_config(is_media), shutdown_signal()).await
+            uniserve_server::serve(
+                args.to_uniserve_config(is_media, entries),
+                shutdown_signal(),
+            )
+            .await
         }
     }
 }
