@@ -82,7 +82,7 @@ class CUDAStream:
     def wait(self, producer: torch.cuda.Stream) -> None:
         """Order this stream after a producer.
 
-        Order this stream after a producer without allocating per-operation
+        Order this stream after a producer without allocating per-call
         events.
         """
         if int(producer.cuda_stream) == int(self.stream.cuda_stream):
@@ -362,7 +362,7 @@ def _green_from_resources(
 
 
 def _green_resource(cu: Any, green: Any) -> Any:
-    """Extract the green-partition handle returned by a CUDA split operation."""
+    """Extract the green-partition handle returned by a CUDA split call."""
     return cuda_value(
         cu.cuGreenCtxGetDevResource(
             green, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM

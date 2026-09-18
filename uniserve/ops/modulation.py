@@ -1,7 +1,7 @@
 """Indexed RMS modulation and gated residuals.
 
 Statistics and affine expressions accumulate in FP32. Providers may fuse
-operations and choose their reduction order; outputs use the activation dtype
+calls and choose their reduction order; outputs use the activation dtype
 or carry a per-row E4M3 dequantization scale. Row indices select modulation
 parameters whose leading stride may include other parameter groups.
 """

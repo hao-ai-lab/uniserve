@@ -91,7 +91,7 @@ class BlockFill:
         field.
         """
         if self._cuda:
-            # A public cache operation follows its backing device even when
+            # A public cache call follows its backing device even when
             # the calling thread currently has another CUDA device selected.
             with torch.cuda.device(self.tensors[0].device):
                 _fill_kernel[(sum(self.tiles), stop - start)](

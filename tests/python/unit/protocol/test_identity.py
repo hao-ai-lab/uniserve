@@ -8,7 +8,7 @@ from dataclasses import replace
 
 from uniserve_worker.protocol.identity import (
     BufferId,
-    ComputationId,
+    CallId,
     RequestKey,
 )
 from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
@@ -16,14 +16,14 @@ from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
 
 def test_buffer_lookup_preserves_identity_across_reconstruction_and_versions():
     reference = TensorRef(
-        RequestKey(2, 7, 3), ComputationId(11, 4), 0, 5, DType.I64, ShapeBound()
+        RequestKey(2, 7, 3), CallId(11, 4), 0, 5, DType.I64, ShapeBound()
     )
     entries = {reference.buffer_id: "value"}
     wire = reference.to_mapping()
     restored = (
         TensorRef.from_mapping(wire),
         TensorRef.from_mapping(
-            dict(wire, producer_op_id=reference.producer_op_id)
+            dict(wire, producer_call_id=reference.producer_call_id)
         ),
         pickle.loads(pickle.dumps(reference)),
         replace(reference),
@@ -38,7 +38,7 @@ def test_buffer_lookup_preserves_identity_across_reconstruction_and_versions():
         replace(reference, output_index=1),
         replace(
             reference,
-            producer_op_id=replace(reference.producer_op_id, batch_id=12),
+            producer_call_id=replace(reference.producer_call_id, batch_id=12),
         ),
         replace(
             reference,
@@ -53,12 +53,12 @@ def test_buffer_lookup_preserves_identity_across_reconstruction_and_versions():
 
 
 def test_computation_order_and_lookup_follow_batch_and_request_coordinates():
-    first = ComputationId(9, 1)
-    second = ComputationId(9, 2)
-    third = ComputationId(10, 0)
+    first = CallId(9, 1)
+    second = CallId(9, 2)
+    third = CallId(10, 0)
     entries = {second: "second", first: "first", third: "third"}
     reconstructed = [
-        ComputationId.from_mapping(item.to_mapping())
+        CallId.from_mapping(item.to_mapping())
         for item in (third, first, second)
     ]
     assert [entries[item] for item in sorted(reconstructed)] == [

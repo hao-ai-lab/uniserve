@@ -3,7 +3,7 @@
 use thiserror::Error;
 use thiserror_ext::Macro;
 
-/// Result alias for tool parser operations.
+/// Result alias for tool parser calls.
 pub type Result<T> = std::result::Result<T, ToolParserError>;
 
 /// Errors produced while creating or running tool parsers.

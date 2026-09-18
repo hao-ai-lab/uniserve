@@ -611,7 +611,7 @@ impl ImageEncoderInput {
             .unwrap_or(capacity);
         if tokens == 0 {
             return Err(GenerationResourceError::UnboundedImageKv {
-                operation: self.encoder.as_str(),
+                call: self.encoder.as_str(),
             });
         }
         Ok(tokens)
@@ -619,7 +619,7 @@ impl ImageEncoderInput {
 }
 
 impl ImageIngestStep {
-    /// Returns the stable operation name used by resource diagnostics.
+    /// Returns the stable call name used by resource diagnostics.
     fn as_str(self) -> &'static str {
         match self {
             Self::VaeEncode => "vae_encode",
@@ -632,10 +632,10 @@ impl ImageIngestStep {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GenerationResourceError {
     /// A worker-selected image KV length has no declared or loaded maximum.
-    #[error("{operation} has a worker-selected KV length but the runtime declares no bound")]
+    #[error("{call} has a worker-selected KV length but the runtime declares no bound")]
     UnboundedImageKv {
-        /// Encoder operation missing a bound.
-        operation: &'static str,
+        /// Encoder call missing a bound.
+        call: &'static str,
     },
     /// Image generation requires a runtime resource maximum that is zero.
     #[error("image generation requires the runtime to declare {resource}")]
@@ -1137,7 +1137,7 @@ mod tests {
         assert_eq!(
             request.validate_resources(&limits),
             Err(GenerationResourceError::UnboundedImageKv {
-                operation: "vit_encode",
+                call: "vit_encode",
             })
         );
 

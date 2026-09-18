@@ -397,12 +397,12 @@ def record_failure(
     )
     log(
         "worker request %r failed: %s "
-        "[code=%s request_id=%s op_id=%s operation=%s]",
+        "[code=%s request_id=%s call_id=%s call=%s]",
         raw_kind,
         error.message,
         error.code,
         error.req_id,
-        error.op_id,
+        error.call_id,
         error.op_kind,
     )
 

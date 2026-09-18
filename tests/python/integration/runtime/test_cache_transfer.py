@@ -15,7 +15,7 @@ from uniserve.runtime import EventPool
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.identity import (
     BufferId,
-    ComputationId,
+    CallId,
     RequestKey,
 )
 from uniserve_worker.protocol.transfer import (
@@ -122,12 +122,12 @@ def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
         events.close()
 
 
-def _buffer(operation: int) -> BufferId:
+def _buffer(call: int) -> BufferId:
     return BufferId(
         owner=RequestKey(1, 1, 1),
-        producer_op_id=ComputationId(operation, 0),
+        producer_call_id=CallId(call, 0),
         output_index=0,
-        generation=operation,
+        generation=call,
     )
 
 
@@ -180,7 +180,7 @@ def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> (
                         request_epoch=source.owner.request_epoch + 1,
                     ),
                 ),
-                replace(source, producer_op_id=ComputationId(2, 0)),
+                replace(source, producer_call_id=CallId(2, 0)),
                 replace(source, output_index=1),
             ):
                 with pytest.raises(WorkerError, match="source identity"):
@@ -204,7 +204,7 @@ def test_kv_publications_require_exact_sources_and_isolate_request_epochs() -> (
                 initialized_pages=(),
                 transports={},
             )
-            installed = replace(source, producer_op_id=ComputationId(3, 0))
+            installed = replace(source, producer_call_id=CallId(3, 0))
             result = publications.install(
                 request_pool_idx=1,
                 group_id=0,
@@ -303,7 +303,7 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
     writes = []
     base = None
     try:
-        for operation, (start, values) in enumerate(
+        for call, (start, values) in enumerate(
             ((0, prefix), (3, suffix)), start=1
         ):
             tensor = torch.tensor(
@@ -317,8 +317,8 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                     value=-tensor * 2**layer / 2,
                 )
             extent = start + len(values)
-            source = _buffer(operation)
-            installed = _buffer(100 + operation)
+            source = _buffer(call)
+            installed = _buffer(100 + call)
             if device.startswith("cuda"):
                 torch.cuda.synchronize(device)
             publication = publications[0].publish(
@@ -533,8 +533,8 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
     writes = []
     base = None
     try:
-        for operation, (start, extent) in enumerate(((0, 3), (3, 6)), start=1):
-            source = _buffer(operation)
+        for call, (start, extent) in enumerate(((0, 3), (3, 6)), start=1):
+            source = _buffer(call)
             shards = []
             for pool, owner, transport in zip(
                 pools[:source_count],
@@ -603,7 +603,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                 )
                 writes.append((pool, write))
                 write.completion.result(timeout=30)
-                installed = _buffer(100 + operation)
+                installed = _buffer(100 + call)
                 value = owner.install(
                     request_pool_idx=1,
                     group_id=0,
@@ -696,9 +696,9 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
                 key=values[:2, : pools[index].info.num_kv_heads],
                 value=-values[:2, : pools[index].info.num_kv_heads],
             )
-        for operation, source_index, extent in ((1, 0, 2), (2, 1, 4)):
-            source = _buffer(operation)
-            if operation == 2:
+        for call, source_index, extent in ((1, 0, 2), (2, 1, 4)):
+            source = _buffer(call)
+            if call == 2:
                 pools[1].cache.state(pools[1].layers[0]).write(
                     (1,), start=2, key=values[2:], value=-values[2:]
                 )
@@ -722,12 +722,12 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
                 group_id=0,
                 page_ids=(1,),
                 allocated_length=4,
-                initialized_pages=(1,) if operation == 1 else (),
+                initialized_pages=(1,) if call == 1 else (),
                 transports={"local": transports[2]},
             )
             writes.append(write)
             write.completion.result(timeout=10)
-            installed = _buffer(100 + operation)
+            installed = _buffer(100 + call)
             result = owners[2].install(
                 request_pool_idx=1,
                 group_id=0,
@@ -746,7 +746,7 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
             torch.testing.assert_close(
                 value, -values[:extent, :2], rtol=0, atol=0
             )
-            if operation == 1:
+            if call == 1:
                 # A replica publishes the same buffer identity with a wider
                 # quantization group before producing the next suffix.
                 other = source

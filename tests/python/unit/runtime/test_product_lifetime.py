@@ -20,17 +20,17 @@ from uniserve_worker.protocol.batch import (
     LatentParams,
     NewRequest,
 )
-from uniserve_worker.protocol.identity import (
-    BufferId,
-    ComputationId,
-    RequestKey,
-)
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
     Bounds,
+    Call,
     CallCoordinates,
     ImageParams,
     PipelineStage,
-    ScheduledRequest,
+)
+from uniserve_worker.protocol.identity import (
+    BufferId,
+    CallId,
+    RequestKey,
 )
 from uniserve_worker.protocol.tensor import (
     DType,
@@ -73,14 +73,14 @@ def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() 
 def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
     reference = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=ComputationId(1, 0),
+        producer_call_id=CallId(1, 0),
         output_index=0,
         generation=1,
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(32),)),
     )
-    second = replace(reference, producer_op_id=ComputationId(2, 0))
-    third = replace(reference, producer_op_id=ComputationId(3, 0))
+    second = replace(reference, producer_call_id=CallId(2, 0))
+    third = replace(reference, producer_call_id=CallId(3, 0))
     buffers = BufferPool(byte_capacity=512, devices=("cpu",), compact=True)
     first_binding = buffers.bind(
         reference,
@@ -186,7 +186,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
         # Releasing another product of this request does not retire its KV
         # computation. The execution fence still protects page reuse above.
         assert cache.retirement_ready(
-            buffers=(BufferId(request, ComputationId(2, 0), 0, 2),)
+            buffers=(BufferId(request, CallId(2, 0), 0, 2),)
         )
 
         source = cache.cache.state(cache.layers[0]).transfer_blocks(
@@ -218,7 +218,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
             stream.synchronize()
         events.reap()
         # Device completion must make pages reusable even when the host has
-        # not read or abandoned the operation's output report.
+        # not read or abandoned the call's output report.
         assert cache.retirement_ready(requests=(request,))
         if not abandoned:
             assert output.ready()
@@ -272,7 +272,7 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
     )
     buffer = BufferId(
         owner=RequestKey(1, 1, 1),
-        producer_op_id=ComputationId(1, 0),
+        producer_call_id=CallId(1, 0),
         output_index=0,
         generation=1,
     )
@@ -301,7 +301,7 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
             )
 
         # Appending touches the remaining token of the same page and the next
-        # page. Neither operation changes the retained prefix's logical value.
+        # page. Neither call changes the retained prefix's logical value.
         suffix = torch.full((5, 1, 4), 7.0)
         pool.require_writable(pages, group=0, start=3, length=suffix.shape[0])
         pool.cache.state(pool.layers[0]).write(
@@ -383,7 +383,7 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(
     )
     product = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=ComputationId(1, 0),
+        producer_call_id=CallId(1, 0),
         output_index=0,
         generation=1,
         dtype=DType.F32,
@@ -414,7 +414,7 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(
         store.release_requests(
             (product.request_key,), retained=frozenset((product.buffer_id,))
         )
-        read = store.consume(product, consumer_op_id=ComputationId(2, 0))
+        read = store.consume(product, consumer_call_id=CallId(2, 0))
         store.release_buffers((product.buffer_id,))
         with pytest.raises(WorkerError):
             reserve(
@@ -458,14 +458,14 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
     )
     first = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=ComputationId(1, 0),
+        producer_call_id=CallId(1, 0),
         output_index=0,
         generation=1,
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(1),)),
     )
     second = replace(first, output_index=1)
-    consumer = ComputationId(2, 0)
+    consumer = CallId(2, 0)
 
     def reserve(references):
         return store.bind_outputs(
@@ -489,15 +489,15 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
         # A batch containing an unfinished producer exposes neither product.
         for reference in (first, second):
             with pytest.raises(WorkerError):
-                store.consume(reference, consumer_op_id=consumer)
+                store.consume(reference, consumer_call_id=consumer)
         store.publish_write(writes[1], torch.tensor([7.0]))
         store.commit_writes(writes)
         for reference, expected in ((first, 3.0), (second, 7.0)):
             with pytest.raises(WorkerError):
                 store.consume(
-                    replace(reference, generation=2), consumer_op_id=consumer
+                    replace(reference, generation=2), consumer_call_id=consumer
                 )
-            read = store.consume(reference, consumer_op_id=consumer)
+            read = store.consume(reference, consumer_call_id=consumer)
             torch.testing.assert_close(
                 read.tensor, torch.tensor([expected]), rtol=0, atol=0
             )
@@ -511,8 +511,8 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
         store.publish_write(write, torch.tensor([11.0]))
         store.commit_writes((write,))
         with pytest.raises(WorkerError):
-            store.consume(first, consumer_op_id=consumer)
-        read = store.consume(replacement, consumer_op_id=consumer)
+            store.consume(first, consumer_call_id=consumer)
+        read = store.consume(replacement, consumer_call_id=consumer)
         torch.testing.assert_close(
             read.tensor, torch.tensor([11.0]), rtol=0, atol=0
         )
@@ -533,7 +533,7 @@ def test_tensor_publication_enforces_its_logical_region_and_representation() -> 
     )
     reference = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=ComputationId(1, 0),
+        producer_call_id=CallId(1, 0),
         output_index=0,
         generation=1,
         dtype=DType.F32,
@@ -562,7 +562,7 @@ def test_tensor_publication_enforces_its_logical_region_and_representation() -> 
             store.publish_write(write, expected.reshape(3, 2))
         store.publish_write(write, expected)
         store.commit_writes((write,))
-        read = store.consume(reference, consumer_op_id=ComputationId(2, 0))
+        read = store.consume(reference, consumer_call_id=CallId(2, 0))
         assert read.region == region
         torch.testing.assert_close(read.tensor, expected, rtol=0, atol=0)
         store.complete_reads((read,))
@@ -587,7 +587,7 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
     )
     product = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=ComputationId(2, 0),
+        producer_call_id=CallId(2, 0),
         output_index=0,
         generation=3,
         dtype=DType.F32,
@@ -658,7 +658,7 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
 
 @pytest.fixture
 def latent_output():
-    """Prepare real operation outputs.
+    """Prepare real call outputs.
 
     The outputs are used by the public latent commit interface.
     """
@@ -668,10 +668,10 @@ def latent_output():
     def create(slot, pages, units, height, width):
         requests = RequestPool(max_request_pool_size=slot)
         key = RequestKey(1, slot, 1)
-        operation = ScheduledRequest(
+        call = Call(
             request_key=key,
-            op_id=ComputationId(1, 0),
-            predecessor=ComputationId(0, 0),
+            call_id=CallId(1, 0),
+            predecessor=CallId(0, 0),
             coordinates=CallCoordinates(),
             kind=PipelineStage.LATENT_PREPARATION,
             bounds=Bounds(),
@@ -684,9 +684,9 @@ def latent_output():
             )
         )
         buffer = OutputBuffer(1, token_capacity=1, event_pool=events)
-        (output,) = requests.create_outputs((operation,), (slot,), buffer)
+        (output,) = requests.create_outputs((call,), (slot,), buffer)
         output.latent_params = LatentParams(
-            key, operation.op_id, pages, units, height, width, 0, 0
+            key, call.call_id, pages, units, height, width, 0, 0
         )
         output.latent_generation = 1
         outputs.append(output)
@@ -717,7 +717,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
     )
     product = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=ComputationId(1, 0),
+        producer_call_id=CallId(1, 0),
         output_index=0,
         generation=1,
         dtype=DType.F32,
@@ -887,7 +887,7 @@ def test_failed_latent_publication_retains_its_pages_without_poisoning_other_req
     )
     product = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=ComputationId(1, 0),
+        producer_call_id=CallId(1, 0),
         output_index=0,
         generation=1,
         dtype=DType.F32,
@@ -1031,7 +1031,7 @@ def test_latent_staging_preserves_live_trajectories(latent_output) -> None:
             pool.stage(((1,),), (4,), occupied=(first, second))
 
         # Both consumers run after both inputs were staged. Their original
-        # values and page order must survive staging an independent operation.
+        # values and page order must survive staging an independent call.
         pool.initialize(1, first, latent_units=7)
         pool.initialize(2, second, latent_units=7)
         updates = (
@@ -1079,7 +1079,7 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
     transport = make_transport(
         "local", byte_capacity=4096, ticket_capacity=4, event_pool=events
     )
-    source = BufferId(RequestKey(1, 1, 1), ComputationId(1, 0), 0, 1)
+    source = BufferId(RequestKey(1, 1, 1), CallId(1, 0), 0, 1)
     state = pool.cache.state(pool.layers[0])
     prefix = torch.tensor([[[1.0, 0.111]]])
     scale = torch.tensor(1.0) / 448

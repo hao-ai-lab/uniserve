@@ -240,18 +240,18 @@ impl Scheduler {
         }
     }
 
-    /// Applies one completed operation to its request and emits observable output.
+    /// Applies one completed call to its request and emits observable output.
     ///
     /// Each phase applies its accepted progress so a worker completion cannot advance
     /// a request through an unrelated generation stage.
     pub(super) fn resolve(
         &mut self,
         id: RequestId,
-        operation: ScheduledRequest,
+        call: Call,
         mut record: uniserve_worker_ipc::RequestOutput,
         media: Option<&SharedMedia>,
     ) {
-        let operation_variant = operation.code;
+        let call_variant = call.code;
 
         // Prompt scores share the completion but precede its phase transition.
         if !record.prompt_logprobs.is_empty() {
@@ -259,21 +259,21 @@ impl Scheduler {
             self.resolve_prompt_logprobs(id, positions);
         }
 
-        if operation_variant == Computation::Forward(ForwardMode::Decode) {
+        if call_variant == CallKind::Forward(ForwardMode::Decode) {
             return self.resolve_decode_text(id, record);
         }
 
-        match operation_variant {
-            Computation::Forward(ForwardMode::Prefill) => {
+        match call_variant {
+            CallKind::Forward(ForwardMode::Prefill) => {
                 self.activate_request_tables(id);
 
-                // State-ingest and feedback operations use autoregressive extension
+                // State-ingest and feedback calls use autoregressive extension
                 // transport while retaining their own completion transitions.
                 match (
-                    consumes_image_features(&operation),
-                    is_feedback_computation(&operation),
+                    consumes_image_features(&call),
+                    is_feedback_computation(&call),
                 ) {
-                    (false, _) if !is_prompt_extend(&operation) => return,
+                    (false, _) if !is_prompt_extend(&call) => return,
                     (true, false) => {
                         let is_final_step = self
                             .running
@@ -514,14 +514,14 @@ impl Scheduler {
                     self.begin_image(id);
                 }
             }
-            Computation::Pipeline(PipelineStage::Denoising) => {
+            CallKind::Pipeline(PipelineStage::Denoising) => {
                 // Publish every newly committed step exactly once, including steps
                 // coalesced into a single worker completion.
                 let (image_id, h, w, steps, prev_sd) = {
                     let st = self.running.get_mut(&id).unwrap();
                     let prev = record
                         .num_completed_steps
-                        .saturating_sub(operation.bounds.max_tokens)
+                        .saturating_sub(call.bounds.max_tokens)
                         .min(u32::from(u16::MAX)) as u16;
                     (
                         st.image_id,
@@ -557,13 +557,13 @@ impl Scheduler {
                 // The host planner enters commit after the configured step count;
                 // worker completion flags do not determine diffusion termination.
             }
-            Computation::Pipeline(
+            CallKind::Pipeline(
                 PipelineStage::VideoDecoding
                 | PipelineStage::AudioDecoding
                 | PipelineStage::AudioEncoding
                 | PipelineStage::Muxing,
             ) => {}
-            Computation::Pipeline(PipelineStage::ImageDecoding) => {
+            CallKind::Pipeline(PipelineStage::ImageDecoding) => {
                 // Commit becomes visible before optional feedback state is prepared.
                 let image_id = self.running.get(&id).map_or(0, |st| st.image_id);
                 self.emit(id, EngineCoreOutput::ImageCommit { image_id });
@@ -592,7 +592,7 @@ impl Scheduler {
                         return self.finish(id, FinishReason::Error);
                     };
 
-                    let source_product = operation.image_output.clone();
+                    let source_product = call.image_output.clone();
 
                     if feedback_source == uniserve_core::FeedbackSource::DeviceProduct
                         && source_product.is_none()
@@ -626,9 +626,9 @@ impl Scheduler {
                     self.finish(id, FinishReason::ImageDone);
                 }
             }
-            Computation::Pipeline(PipelineStage::VisionEncoding)
-            | Computation::Pipeline(PipelineStage::LatentEncoding) => {
-                match is_feedback_computation(&operation) {
+            CallKind::Pipeline(PipelineStage::VisionEncoding)
+            | CallKind::Pipeline(PipelineStage::LatentEncoding) => {
+                match is_feedback_computation(&call) {
                     false => {
                         let encoder_cache_key = self.running.get(&id).and_then(|state| {
                             let image = state
@@ -645,7 +645,7 @@ impl Scheduler {
                                 )
                             })
                         });
-                        let Some(feature) = operation.encoder_output.clone() else {
+                        let Some(feature) = call.encoder_output.clone() else {
                             return self.finish(id, FinishReason::Error);
                         };
 
@@ -711,7 +711,7 @@ impl Scheduler {
                         }
                     }
                     true => {
-                        let Some(feature) = operation.encoder_output.clone() else {
+                        let Some(feature) = call.encoder_output.clone() else {
                             return self.finish(id, FinishReason::Error);
                         };
 
@@ -723,14 +723,14 @@ impl Scheduler {
                     }
                 }
             }
-            Computation::Pipeline(PipelineStage::TextEncoding)
-            | Computation::Forward(ForwardMode::Decode)
-            | Computation::Forward(ForwardMode::Verify)
-            | Computation::Pipeline(PipelineStage::LatentPreparation)
-            | Computation::Pipeline(PipelineStage::VideoEncoding)
-            | Computation::Transfer(TransferMode::Tensor)
-            | Computation::Transfer(TransferMode::KvPublish)
-            | Computation::Transfer(TransferMode::KvInstall) => {}
+            CallKind::Pipeline(PipelineStage::TextEncoding)
+            | CallKind::Forward(ForwardMode::Decode)
+            | CallKind::Forward(ForwardMode::Verify)
+            | CallKind::Pipeline(PipelineStage::LatentPreparation)
+            | CallKind::Pipeline(PipelineStage::VideoEncoding)
+            | CallKind::Transfer(TransferMode::Tensor)
+            | CallKind::Transfer(TransferMode::KvPublish)
+            | CallKind::Transfer(TransferMode::KvInstall) => {}
         }
     }
 
@@ -837,7 +837,7 @@ impl Scheduler {
     /// Begins the image.
     pub(super) fn begin_image(&mut self, id: RequestId) {
         self.record_gen_trigger_for_replay(id);
-        let has_unresolved_descendants = self.has_pending_operations(id);
+        let has_unresolved_descendants = self.has_pending_calls(id);
         if let Some(st) = self.running.get_mut(&id) {
             st.speculative_chain_invalidated |= has_unresolved_descendants;
 
@@ -1032,7 +1032,7 @@ impl Scheduler {
                 .running
                 .get(&id)
                 .is_some_and(|state| !state.output.decoder_boundaries.is_empty());
-        if !self.has_pending_operations(id) && !decoder_pending {
+        if !self.has_pending_calls(id) && !decoder_pending {
             self.finish_with(id, reason, stop_reason);
             return;
         }
@@ -1049,7 +1049,7 @@ impl Scheduler {
 
     /// Applies a deferred finish once no in-flight work or decoder decision remains.
     pub(super) fn finish_pending_if_idle(&mut self, id: RequestId) {
-        if self.has_pending_operations(id)
+        if self.has_pending_calls(id)
             || self
                 .running
                 .get(&id)

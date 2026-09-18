@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from uniserve.runtime import EventPoolError
 
 if TYPE_CHECKING:
-    from uniserve_worker.protocol.identity import ComputationId
+    from uniserve_worker.protocol.identity import CallId
 
 __all__ = [
     "WorkerErrorCode",
@@ -30,7 +30,7 @@ __all__ = [
     "should_capture_trace",
     "invalid_descriptor",
     "unsupported_setup",
-    "unsupported_operation",
+    "unsupported_call",
     "resource_error",
 ]
 
@@ -41,7 +41,7 @@ class WorkerErrorCode(StrEnum):
     Members are strings because the IPC reply carries their names.
     """
 
-    UNSUPPORTED_OPERATION = "UnsupportedOperation"
+    UNSUPPORTED_CALL = "UnsupportedCall"
     UNSUPPORTED_CONTROL = "UnsupportedControl"
     INVALID_DESCRIPTOR = "InvalidDescriptor"
     UNSUPPORTED_SETUP = "UnsupportedSetup"
@@ -58,7 +58,7 @@ class ErrorPolicy(NamedTuple):
     """Define the handling policy for an error class.
 
     Fatal errors leave the worker unsafe for further requests and require host
-    teardown; non-fatal errors fail only the offending request or operation.
+    teardown; non-fatal errors fail only the offending request or call.
     ``capture_trace`` marks errors whose log record includes a stack trace.
     """
 
@@ -71,7 +71,7 @@ class ErrorPolicy(NamedTuple):
 _DEFAULT_POLICY = ErrorPolicy(fatal=False, capture_trace=False)
 
 _POLICY: dict[WorkerErrorCode, ErrorPolicy] = {
-    WorkerErrorCode.UNSUPPORTED_OPERATION: ErrorPolicy(False, False),
+    WorkerErrorCode.UNSUPPORTED_CALL: ErrorPolicy(False, False),
     WorkerErrorCode.UNSUPPORTED_CONTROL: ErrorPolicy(False, False),
     WorkerErrorCode.INVALID_DESCRIPTOR: ErrorPolicy(False, False),
     WorkerErrorCode.UNSUPPORTED_SETUP: ErrorPolicy(False, False),
@@ -105,11 +105,11 @@ class WorkerError(Exception):
     message: str
     fatal: bool = False
     req_id: int | None = None
-    op_id: ComputationId | None = None
+    call_id: CallId | None = None
     op_kind: str | None = None
     phase: str | None = None
     route: str | None = None
-    operations: tuple[tuple[int, int, int, ComputationId], ...] = ()
+    calls: tuple[tuple[int, int, int, CallId], ...] = ()
     details: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -122,11 +122,11 @@ class WorkerError(Exception):
     def to_mapping(self) -> dict[str, Any]:
         """Serialize the stable error code, message, and fatal flag.
 
-        Optional operation context is serialized as well.
+        Optional call context is serialized as well.
         """
         # Only the fields modeled on the Rust WorkerResponse cross the IPC
         # boundary.
-        # Richer context (req_id, op_id, op_kind, details) stays local
+        # Richer context (req_id, call_id, op_kind, details) stays local
         # for logging and metrics.
         return {
             "kind": "error",
@@ -135,21 +135,21 @@ class WorkerError(Exception):
             "fatal": bool(self.fatal),
             "phase": self.phase,
             "route": self.route,
-            "operations": [
+            "calls": [
                 {
                     "request_key": {
                         "engine_id": engine_id,
                         "request_id": request_id,
                         "request_epoch": request_epoch,
                     },
-                    "op_id": op_id.to_mapping(),
+                    "call_id": call_id.to_mapping(),
                 }
                 for (
                     engine_id,
                     request_id,
                     request_epoch,
-                    op_id,
-                ) in self.operations
+                    call_id,
+                ) in self.calls
             ],
         }
 
@@ -249,13 +249,13 @@ def _looks_like_fatal_cuda(lowered_msg: str) -> bool:
     return any(tok in lowered_msg for tok in _FATAL_CUDA_TEXT_TOKENS)
 
 
-def unsupported_operation(kind: str, req_id: int | None = None) -> WorkerError:
-    """Create a classified error for an unavailable operation kind.
+def unsupported_call(kind: str, req_id: int | None = None) -> WorkerError:
+    """Create a classified error for an unavailable call kind.
 
-    The operation kind is unavailable on this worker.
+    The call kind is unavailable on this worker.
     """
     return _make(
-        WorkerErrorCode.UNSUPPORTED_OPERATION,
+        WorkerErrorCode.UNSUPPORTED_CALL,
         f"op kind {kind!r} is not supported by this worker",
         req_id=req_id,
         op_kind=kind,
@@ -306,9 +306,9 @@ _CLASSIFY_RULES: list[tuple[Any, WorkerErrorCode]] = [
     ),
     (
         lambda exc, lowered: isinstance(exc, NotImplementedError),
-        WorkerErrorCode.UNSUPPORTED_OPERATION,
+        WorkerErrorCode.UNSUPPORTED_CALL,
     ),
-    # malformed operation or descriptor decoded from IPC
+    # malformed call or descriptor decoded from IPC
     (
         lambda exc, lowered: isinstance(
             exc, (KeyError, IndexError, TypeError, ValueError)

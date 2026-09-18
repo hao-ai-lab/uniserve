@@ -43,7 +43,7 @@ python examples/text_logits.py \
   --output /path/to/logits.pt
 ```
 
-The saved dictionary contains CPU `input_ids` shaped `[tokens]` and `logits` shaped `[tokens, vocabulary]`. Each row predicts the token following that prompt position. The input is raw text without chat-template framing. `Logits.gather()` joins vocabulary shards and removes vocabulary padding; sampling is a separate application operation.
+The saved dictionary contains CPU `input_ids` shaped `[tokens]` and `logits` shaped `[tokens, vocabulary]`. Each row predicts the token following that prompt position. The input is raw text without chat-template framing. `Logits.gather()` joins vocabulary shards and removes vocabulary padding; sampling is a separate application call.
 
 `TextInput` supplies token IDs, positions, attention inputs and optional embedding replacements or expert routes. `TextSize(num_tokens, batch_size)` bounds one numerical call. `PagedInput.from_blocks` describes query lengths, prefix lengths and logical-to-physical block IDs. Physical block zero is valid. A write index of `-1` skips that token's cache update; `write_indices=None` makes the entire call read-only.
 
@@ -83,7 +83,7 @@ with ExecutionContext(model, cache=cache) as execution:
         retained = result.clone()
 ```
 
-The caller completes readers before replaying a graph or replacing its backing. Captured outputs borrow graph storage; copy results that must survive replay. `capture(..., restore=...)` restores caller-owned mutable inputs after capture when the numerical operation updates them. Cross-device graphs retain caller-provided CUDA memory pools for their additional devices. Graphs retire before their execution contexts and pools.
+The caller completes readers before replaying a graph or replacing its backing. Captured outputs borrow graph storage; copy results that must survive replay. `capture(..., restore=...)` restores caller-owned mutable inputs after capture when the numerical call updates them. Cross-device graphs retain caller-provided CUDA memory pools for their additional devices. Graphs retire before their execution contexts and pools.
 
 Components with numerical storage requirements expose `state_buffers(size)`, `constant_buffers(size)` and `workspace_buffers(size)`. These queries return `BufferConfig` values. `TensorBuffers.allocate` creates backing and `view` lends typed tensors. `ExecutionContext.prepare` prepares constants and workspace, or borrows explicitly supplied `TensorBuffers`; the caller allocates persistent state separately. Re-preparing replaces the context's previous resources after their final readers finish.
 

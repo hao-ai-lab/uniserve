@@ -25,60 +25,60 @@ fn ctrl() -> SpecialTokenIds {
 #[test]
 fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
     use uniserve_core::GenerationFeatures;
-    use uniserve_worker_ipc::Computation;
+    use uniserve_worker_ipc::CallKind;
 
     let image_path = vec![
-        Computation::Pipeline(PipelineStage::LatentPreparation),
-        Computation::Pipeline(PipelineStage::Denoising),
-        Computation::Pipeline(PipelineStage::ImageDecoding),
+        CallKind::Pipeline(PipelineStage::LatentPreparation),
+        CallKind::Pipeline(PipelineStage::Denoising),
+        CallKind::Pipeline(PipelineStage::ImageDecoding),
     ];
     let cases = [
         (
-            vec![Computation::Pipeline(PipelineStage::VisionEncoding)],
+            vec![CallKind::Pipeline(PipelineStage::VisionEncoding)],
             GenerationFeatures::VISION_ENCODE,
         ),
         (
-            vec![Computation::Pipeline(PipelineStage::LatentEncoding)],
+            vec![CallKind::Pipeline(PipelineStage::LatentEncoding)],
             GenerationFeatures::LATENT_ENCODE,
         ),
         (
             vec![
-                Computation::Pipeline(PipelineStage::VisionEncoding),
-                Computation::Pipeline(PipelineStage::LatentEncoding),
+                CallKind::Pipeline(PipelineStage::VisionEncoding),
+                CallKind::Pipeline(PipelineStage::LatentEncoding),
             ],
             GenerationFeatures::VISION_ENCODE | GenerationFeatures::LATENT_ENCODE,
         ),
         (image_path, GenerationFeatures::IMAGE_GENERATION),
         (
             vec![
-                Computation::Pipeline(PipelineStage::Denoising),
-                Computation::Pipeline(PipelineStage::ImageDecoding),
+                CallKind::Pipeline(PipelineStage::Denoising),
+                CallKind::Pipeline(PipelineStage::ImageDecoding),
             ],
             GenerationFeatures::empty(),
         ),
         (
             vec![
-                Computation::Pipeline(PipelineStage::LatentPreparation),
-                Computation::Pipeline(PipelineStage::ImageDecoding),
+                CallKind::Pipeline(PipelineStage::LatentPreparation),
+                CallKind::Pipeline(PipelineStage::ImageDecoding),
             ],
             GenerationFeatures::empty(),
         ),
         (
             vec![
-                Computation::Pipeline(PipelineStage::LatentPreparation),
-                Computation::Pipeline(PipelineStage::Denoising),
-                Computation::Pipeline(PipelineStage::VideoDecoding),
+                CallKind::Pipeline(PipelineStage::LatentPreparation),
+                CallKind::Pipeline(PipelineStage::Denoising),
+                CallKind::Pipeline(PipelineStage::VideoDecoding),
             ],
             GenerationFeatures::empty(),
         ),
     ];
-    for (operations, expected) in cases {
+    for (calls, expected) in cases {
         let mut sim = SimEngine::new();
         sim.mut_info_for_test().supported_ops = vec![
-            Computation::Forward(ForwardMode::Prefill),
-            Computation::Forward(ForwardMode::Decode),
+            CallKind::Forward(ForwardMode::Prefill),
+            CallKind::Forward(ForwardMode::Decode),
         ];
-        sim.mut_info_for_test().supported_ops.extend(operations);
+        sim.mut_info_for_test().supported_ops.extend(calls);
         let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
         assert_eq!(
             scheduler.generation_limits().features,
@@ -470,7 +470,7 @@ fn queue_depth_is_token_identical() {
 }
 
 #[test]
-fn operation_window_metrics_record_the_full_lifecycle() {
+fn call_window_metrics_record_the_full_lifecycle() {
     let mut sim = SimEngine::new();
     sim.set_queue_depth(2);
     sim.set_text_len(6);
@@ -507,17 +507,17 @@ fn operation_window_metrics_record_the_full_lifecycle() {
         &scheduler.stats.domains.flow,
     ]
     .into_iter()
-    .filter(|domain| domain.launched_operations.load(Ordering::Relaxed) > 0)
+    .filter(|domain| domain.launched_calls.load(Ordering::Relaxed) > 0)
     .collect::<Vec<_>>();
     assert!(!active_domains.is_empty(), "domain launches recorded");
     for domain in &active_domains {
         assert_eq!(domain.active_credits.load(Ordering::Relaxed), 0);
         assert_eq!(
-            domain.launched_operations.load(Ordering::Relaxed),
-            domain.completed_operations.load(Ordering::Relaxed)
+            domain.launched_calls.load(Ordering::Relaxed),
+            domain.completed_calls.load(Ordering::Relaxed)
         );
         assert_eq!(
-            domain.launched_operations.load(Ordering::Relaxed),
+            domain.launched_calls.load(Ordering::Relaxed),
             domain.reclaimed_credits.load(Ordering::Relaxed)
         );
         assert!(domain.completed_batches.load(Ordering::Relaxed) > 0);
@@ -527,13 +527,13 @@ fn operation_window_metrics_record_the_full_lifecycle() {
     let decoded_active = snapshot
         .domain_stats
         .iter()
-        .filter(|domain| domain.launched_operations > 0)
+        .filter(|domain| domain.launched_calls > 0)
         .collect::<Vec<_>>();
     assert_eq!(decoded_active.len(), active_domains.len());
     assert!(decoded_active.iter().all(|domain| {
         domain.active_credits == 0
-            && domain.launched_operations == domain.completed_operations
-            && domain.launched_operations == domain.reclaimed_credits
+            && domain.launched_calls == domain.completed_calls
+            && domain.launched_calls == domain.reclaimed_credits
     }));
 }
 

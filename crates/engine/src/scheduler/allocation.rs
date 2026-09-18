@@ -59,7 +59,7 @@ impl Scheduler {
             .collect();
         buffers.sort_unstable_by_key(|buffer| {
             (
-                buffer.producer_op_id,
+                buffer.producer_call_id,
                 buffer.output_index,
                 buffer.generation,
             )

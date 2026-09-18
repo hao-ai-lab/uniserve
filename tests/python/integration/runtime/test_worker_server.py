@@ -13,60 +13,60 @@ from tests.python.fixtures.depth_one import (
     ar_params,
     execution_batch,
     root_parent,
-    token_operation,
+    token_call,
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from uniserve_worker.protocol.batch import Batch, Finish, NewRequest
-from uniserve_worker.protocol.identity import ComputationId, RequestKey
-from uniserve_worker.protocol.operation import ForwardMode, ScheduledRequest
+from uniserve_worker.protocol.call import Call, ForwardMode
+from uniserve_worker.protocol.identity import CallId, RequestKey
 
 pytestmark = pytest.mark.integration
 
 
-def _request(call_id: int, batch: Batch) -> dict[str, object]:
-    return {"kind": "submit", "call_id": call_id, "batch": batch}
+def _request(message_id: int, batch: Batch) -> dict[str, object]:
+    return {"kind": "submit", "message_id": message_id, "batch": batch}
 
 
 def _token_run(
     *,
     request_id: int,
-    op_id: ComputationId,
+    call_id: CallId,
     batch_id: int,
     tokens: tuple[int, ...],
-) -> tuple[NewRequest, ScheduledRequest, Batch]:
+) -> tuple[NewRequest, Call, Batch]:
     admission = ar_params(request_id, block_ids=(request_id,))
-    operation = token_operation(
+    call = token_call(
         admission.request_key,
-        op_id=op_id,
+        call_id=call_id,
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=tokens,
     )
     return (
         admission,
-        operation,
+        call,
         execution_batch(
             batch_id=batch_id,
             admissions=(admission,),
-            operations=(operation,),
+            calls=(call,),
         ),
     )
 
 
 def _by_call(endpoint: QueuedWorkerIpc) -> dict[int, dict[str, object]]:
     return {
-        int(response["call_id"]): response
+        int(response["message_id"]): response
         for response in endpoint.responses
-        if response.get("call_id") is not None
+        if response.get("message_id") is not None
     }
 
 
 def test_info_request_is_served_before_close() -> None:
     endpoint = QueuedWorkerIpc(
         (
-            {"kind": "info", "call_id": 1},
-            {"kind": "close", "call_id": 2},
+            {"kind": "info", "message_id": 1},
+            {"kind": "close", "message_id": 2},
         )
     )
     with execution_worker(queue_depth=1) as worker:
@@ -76,7 +76,7 @@ def test_info_request_is_served_before_close() -> None:
     responses = _by_call(endpoint)
     assert responses[1]["kind"] == "info"
     assert responses[1]["info"] == worker.info.to_mapping()
-    assert [response["call_id"] for response in endpoint.responses] == [1, 2]
+    assert [response["message_id"] for response in endpoint.responses] == [1, 2]
     assert responses[2]["kind"] == "ok"
 
 
@@ -84,9 +84,9 @@ def test_info_request_is_served_before_close() -> None:
 def test_duplicate_submissions_are_rejected_while_the_original_completes(
     queue_depth,
 ) -> None:
-    _admission, _operation, run = _token_run(
+    _admission, _call, run = _token_run(
         request_id=11,
-        op_id=ComputationId(21, 0),
+        call_id=CallId(21, 0),
         batch_id=7,
         tokens=(8, 9),
     )
@@ -95,7 +95,7 @@ def test_duplicate_submissions_are_rejected_while_the_original_completes(
             _request(1, run),
             _request(2, run),
             _request(3, run),
-            {"kind": "close", "call_id": 4},
+            {"kind": "close", "message_id": 4},
         )
     )
     with execution_worker(queue_depth=queue_depth) as worker:
@@ -104,9 +104,9 @@ def test_duplicate_submissions_are_rejected_while_the_original_completes(
 
     responses = _by_call(endpoint)
     assert responses[1]["kind"] == "result"
-    for call_id in (2, 3):
-        assert responses[call_id]["kind"] == "error"
-        assert responses[call_id]["code"] == "InvalidDescriptor"
+    for message_id in (2, 3):
+        assert responses[message_id]["kind"] == "error"
+        assert responses[message_id]["code"] == "InvalidDescriptor"
     assert responses[4]["kind"] == "ok"
 
 
@@ -120,18 +120,22 @@ def test_failed_submissions_cannot_be_reused_and_allow_shutdown() -> None:
             (
                 _request(1, run),
                 _request(2, run),
-                {"kind": "close", "call_id": 3},
+                {"kind": "close", "message_id": 3},
             )
         )
         worker.bind(endpoint).run()
 
     responses = _by_call(endpoint)
-    for call_id in (1, 2):
-        response = responses[call_id]
+    for message_id in (1, 2):
+        response = responses[message_id]
         assert response["kind"] == "error"
         assert response["code"] == "InvalidDescriptor"
         assert response["fatal"] is False
-    assert [response["call_id"] for response in endpoint.responses] == [1, 2, 3]
+    assert [response["message_id"] for response in endpoint.responses] == [
+        1,
+        2,
+        3,
+    ]
     assert responses[3]["kind"] == "ok"
 
 
@@ -141,29 +145,29 @@ def test_a_batch_id_that_does_not_advance_is_refused_before_new_admission() -> (
     """`batch_id` is the submission identity and must strictly advance.
 
     A refused submission applies nothing: neither its admission nor its
-    computations take effect, and the same work still runs once it is
+    call_kinds take effect, and the same work still runs once it is
     submitted under an advancing identity.
     """
-    admission, operation, run = _token_run(
+    admission, call, run = _token_run(
         request_id=12,
-        op_id=ComputationId(2, 0),
+        call_id=CallId(2, 0),
         batch_id=8,
         tokens=(4, 5),
     )
-    conflicting = token_operation(
+    conflicting = token_call(
         admission.request_key,
-        op_id=ComputationId(2, 0),
+        call_id=CallId(2, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(4, 5, 6),
     )
     conflicting_run = execution_batch(
         batch_id=8,
-        operations=(conflicting,),
+        calls=(conflicting,),
     )
-    next_admission, next_operation, _superseded = _token_run(
+    next_admission, next_call, _superseded = _token_run(
         request_id=13,
-        op_id=ComputationId(2, 1),
+        call_id=CallId(2, 1),
         batch_id=8,
         tokens=(7,),
     )
@@ -171,11 +175,11 @@ def test_a_batch_id_that_does_not_advance_is_refused_before_new_admission() -> (
     reused_identity_run = execution_batch(
         batch_id=8,
         admissions=(next_admission,),
-        operations=(operation, next_operation),
+        calls=(call, next_call),
     )
     _, _, advancing_run = _token_run(
         request_id=13,
-        op_id=ComputationId(3, 1),
+        call_id=CallId(3, 1),
         batch_id=9,
         tokens=(7,),
     )
@@ -185,7 +189,7 @@ def test_a_batch_id_that_does_not_advance_is_refused_before_new_admission() -> (
             _request(2, conflicting_run),
             _request(3, reused_identity_run),
             _request(4, advancing_run),
-            {"kind": "close", "call_id": 5},
+            {"kind": "close", "message_id": 5},
         )
     )
     with execution_worker(queue_depth=3) as worker:
@@ -202,7 +206,7 @@ def test_a_batch_id_that_does_not_advance_is_refused_before_new_admission() -> (
     # executes once its batch identity advances.
     result = responses[4]["result"]
     assert result["batch_id"] == 3
-    assert result["completions"][0]["op_id"] == {
+    assert result["completions"][0]["call_id"] == {
         "batch_id": 3,
         "request_index": 1,
     }
@@ -211,8 +215,8 @@ def test_a_batch_id_that_does_not_advance_is_refused_before_new_admission() -> (
 
 
 def test_rebinding_rejects_both_same_and_different_endpoints() -> None:
-    endpoint = QueuedWorkerIpc(({"kind": "close", "call_id": 1},))
-    other = QueuedWorkerIpc(({"kind": "info", "call_id": 2},))
+    endpoint = QueuedWorkerIpc(({"kind": "close", "message_id": 1},))
+    other = QueuedWorkerIpc(({"kind": "info", "message_id": 2},))
     worker = execution_worker()
     try:
         assert worker.bind(endpoint) is worker
@@ -220,8 +224,8 @@ def test_rebinding_rejects_both_same_and_different_endpoints() -> None:
             with pytest.raises(RuntimeError, match="already.*bound"):
                 worker.bind(candidate)
         worker.run()
-        assert endpoint.responses[0]["call_id"] == 1
-        assert other.try_recv() == {"kind": "info", "call_id": 2}
+        assert endpoint.responses[0]["message_id"] == 1
+        assert other.try_recv() == {"kind": "info", "message_id": 2}
         assert not endpoint.closed
         assert not other.closed
     finally:
@@ -302,7 +306,7 @@ def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
             "65536",
             "--max-batch-tokens",
             "256",
-            "--max-batch-operations",
+            "--max-batch-calls",
             "2",
             "--device",
             "cpu",
@@ -312,7 +316,7 @@ def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
             "4096",
         ]
     )
-    request = {"kind": "info", "call_id": 1}
+    request = {"kind": "info", "message_id": 1}
     endpoint = QueuedWorkerIpc((request,))
     failure = RuntimeError("numerical backend unavailable")
 
@@ -402,7 +406,7 @@ def test_successful_manual_warmup_is_retained_by_run(monkeypatch) -> None:
         # execution-only caller has successfully warmed up the worker.
         monkeypatch.setattr(torch.inference_mode, "__enter__", unavailable)
         endpoint = QueuedWorkerIpc(
-            ({"kind": "info", "call_id": 1}, {"kind": "close"})
+            ({"kind": "info", "message_id": 1}, {"kind": "close"})
         )
         worker.bind(endpoint).run()
         assert endpoint.responses[0]["kind"] == "info"
@@ -440,7 +444,7 @@ def test_normal_shutdown_reports_cleanup_failure_and_restores_gc(
     import concurrent.futures
     import gc
 
-    endpoint = QueuedWorkerIpc(({"kind": "close", "call_id": 1},))
+    endpoint = QueuedWorkerIpc(({"kind": "close", "message_id": 1},))
     worker = execution_worker().bind(endpoint)
     shutdown = concurrent.futures.ThreadPoolExecutor.shutdown
     failure = OSError("executor shutdown failed")
@@ -461,7 +465,7 @@ def test_normal_shutdown_reports_cleanup_failure_and_restores_gc(
         assert caught.value is failure
         assert gc.isenabled() == gc_enabled
         assert endpoint.responses[0]["kind"] == "ok"
-        assert endpoint.responses[0]["call_id"] == 1
+        assert endpoint.responses[0]["message_id"] == 1
         assert not endpoint.closed
         with pytest.raises(RuntimeError, match="closed"):
             worker.run()

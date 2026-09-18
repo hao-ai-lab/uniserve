@@ -1,4 +1,4 @@
-"""Logical tensor descriptions used by worker computations."""
+"""Logical tensor descriptions used by worker call kinds."""
 
 from __future__ import annotations
 
@@ -201,7 +201,7 @@ class TensorRef:
     """Identifies tensor storage independently of its role in a computation."""
 
     request_key: identity.RequestKey
-    producer_op_id: identity.ComputationId
+    producer_call_id: identity.CallId
     output_index: int
     generation: int
     dtype: DType
@@ -229,7 +229,7 @@ class TensorRef:
         if buffer_id is None:
             buffer_id = identity.BufferId(
                 owner=self.request_key,
-                producer_op_id=self.producer_op_id,
+                producer_call_id=self.producer_call_id,
                 output_index=self.output_index,
                 generation=self.generation,
             )
@@ -257,8 +257,8 @@ class TensorRef:
             request_key=identity.RequestKey.from_mapping(
                 data.get("request_key"), f"{where}.request_key"
             ),
-            producer_op_id=identity.ComputationId.from_mapping(
-                data.get("producer_op_id"), f"{where}.producer_op_id"
+            producer_call_id=identity.CallId.from_mapping(
+                data.get("producer_call_id"), f"{where}.producer_call_id"
             ),
             output_index=_uint(
                 data.get("output_index"), f"{where}.output_index"
@@ -274,7 +274,7 @@ class TensorRef:
         """Serialize the complete logical product description for IPC."""
         return {
             "request_key": self.request_key.to_mapping(),
-            "producer_op_id": self.producer_op_id.to_mapping(),
+            "producer_call_id": self.producer_call_id.to_mapping(),
             "output_index": self.output_index,
             "generation": self.generation,
             "dtype": self.dtype.value,
@@ -355,11 +355,11 @@ def _fast_tensor_ref(value: object) -> TensorRef | None:
     if request_key is None:
         return None
 
-    producer_op_id = value.get("producer_op_id")
+    producer_call_id = value.get("producer_call_id")
     output_index = value.get("output_index")
     generation = value.get("generation")
     if not (
-        isinstance(producer_op_id, identity.ComputationId)
+        isinstance(producer_call_id, identity.CallId)
         and type(output_index) is int
         and output_index >= 0
         and type(generation) is int
@@ -382,7 +382,7 @@ def _fast_tensor_ref(value: object) -> TensorRef | None:
     reference = object.__new__(TensorRef)
     set_field = object.__setattr__
     set_field(reference, "request_key", request_key)
-    set_field(reference, "producer_op_id", producer_op_id)
+    set_field(reference, "producer_call_id", producer_call_id)
     set_field(reference, "output_index", output_index)
     set_field(reference, "generation", generation)
     set_field(reference, "dtype", dtype)

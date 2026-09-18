@@ -16,7 +16,7 @@ def rescale_(
     """Preserve decoded values on growing blocks.
 
     Including logical-dtype rounding. Scale tensors are read-only during
-    this operation. The caller commits new scales after re-encoding, on
+    this call. The caller commits new scales after re-encoding, on
     the same stream, then writes incoming values.
     """
     if values.is_cuda:

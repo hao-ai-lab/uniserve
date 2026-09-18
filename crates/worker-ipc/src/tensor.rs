@@ -92,8 +92,8 @@ impl ShapeBound {
 pub struct TensorRef {
     /// Request lineage that owns the value.
     pub request_key: RequestKey,
-    /// Operation that declares the value.
-    pub producer_op_id: ComputationId,
+    /// Call that declares the value.
+    pub producer_call_id: CallId,
     /// Position in the producer's output list.
     pub output_index: u16,
     /// Nonzero allocation generation preventing identity reuse.
@@ -104,13 +104,13 @@ pub struct TensorRef {
     pub shape_bound: ShapeBound,
 }
 
-/// Stable identity for one cross-operation buffer, independent of its physical representation.
+/// Stable identity for one cross-call buffer, independent of its physical representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BufferId {
     /// Request lineage that owns the buffer.
     pub owner: RequestKey,
-    /// Operation that first declares the buffer.
-    pub producer_op_id: ComputationId,
+    /// Call that first declares the buffer.
+    pub producer_call_id: CallId,
     /// Position in the producer's output list.
     pub output_index: u16,
     /// Nonzero allocation generation preventing identity reuse.
@@ -130,7 +130,7 @@ impl TensorRef {
     pub const fn buffer_id(&self) -> BufferId {
         BufferId {
             owner: self.request_key,
-            producer_op_id: self.producer_op_id,
+            producer_call_id: self.producer_call_id,
             output_index: self.output_index,
             generation: self.generation,
         }
@@ -157,7 +157,7 @@ impl TensorRef {
 /// carries no semantic lineage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RegistrationAck {
-    /// Whether the submitted registration is visible to subsequent operations.
+    /// Whether the submitted registration is visible to subsequent calls.
     pub visible: bool,
 }
 

@@ -5,7 +5,7 @@ enum PipelineStage : ubyte { None, VisionEncoding, LatentEncoding, TextEncoding,
 enum TransferMode : ubyte { None, Tensor, KvPublish, KvInstall }
 
 // Exactly one field is non-None. This is a compact wire encoding of the Rust sum.
-struct Computation {
+struct CallKind {
   forward_mode:ForwardMode;
   stage:PipelineStage;
   transfer:TransferMode;
@@ -14,10 +14,10 @@ struct Computation {
 enum DType : ubyte { U8, I32, I64, F16, BF16, F32, I16 }
 enum FeatureKind : ubyte { Vision, Latent }
 
-enum OpStatus : ubyte { Ok, Predicated, Error }
+enum CallStatus : ubyte { Ok, Predicated, Error }
 
 enum ErrorCode : ubyte {
-  InvalidOperation,
+  InvalidCall,
   ResourceExhausted,
   ComputeError,
   Cancelled,
@@ -147,7 +147,7 @@ table WorkerInfo {
   world_size:uint = 1;
   configuration_id:string;
   components:[EntryInfo];
-  supported_ops:[Computation];
+  supported_ops:[CallKind];
   queue_depth:uint;
   max_batch_ops:uint;
   max_batch_tokens:uint;
@@ -164,7 +164,7 @@ table WorkerInfo {
   host_lane_capacity:uint = 1;
 }
 
-// Request identities and operation records.
+// Request identities and call records.
 
 table RequestKey {
   engine_id:ulong;
@@ -172,14 +172,14 @@ table RequestKey {
   request_epoch:ulong;
 }
 
-struct ComputationId {
+struct CallId {
   batch_id:ulong;
   request_index:uint;
 }
 
 table BufferId {
   owner:RequestKey;
-  producer_op_id:ComputationId;
+  producer_call_id:CallId;
   output_index:ushort;
   generation:uint;
 }
@@ -206,7 +206,7 @@ table SamplingState {
 }
 
 // The coordinates a call carries so a rank does not derive them from the
-// operations that preceded it. The engine holds the request state they come
+// calls that preceded it. The engine holds the request state they come
 // from; the rank asserts its own ledger agrees.
 table CallCoordinates {
   logical_position:uint;
@@ -215,13 +215,13 @@ table CallCoordinates {
   flow_step:uint;
 }
 
-table ScheduledRequest {
+table Call {
   request_key:RequestKey;
-  op_id:ComputationId;
-  predecessor:ComputationId;
+  call_id:CallId;
+  predecessor:CallId;
   coordinates:CallCoordinates;
   entry:string (required);
-  code:Computation (required);
+  code:CallKind (required);
   max_tokens:uint;
   max_kv_pages:uint;
   max_latent_bytes:ulong;
@@ -264,7 +264,7 @@ table CachePageAllocation {
 
 table LatentParams {
   request_key:RequestKey;
-  op_id:ComputationId;
+  call_id:CallId;
   // Both are empty/zero when fixed request tensors own the trajectory.
   page_table:[uint];
   latent_units:uint;
@@ -277,7 +277,7 @@ table LatentParams {
 
 table DecodeRange {
   request_key:RequestKey;
-  op_id:ComputationId;
+  call_id:CallId;
   cursor:uint;
   max_units:uint;
 }
@@ -324,12 +324,12 @@ table PositionLogprobs { entries:[TokenLogprob]; }
 
 table RequestOutput {
   request_key:RequestKey;
-  op_id:ComputationId;
-  status:OpStatus;
+  call_id:CallId;
+  status:CallStatus;
   product_generations:[uint];
   error_code:ErrorCode = null;
   timing_counters:TimingCounters;
-  code:Computation (required);
+  code:CallKind (required);
   position:uint;
   kv_visible_len:uint;
   kv_computed_len:uint;
@@ -387,11 +387,11 @@ table Batch {
   // Strictly increasing in each worker's Submit order.
   batch_id:ulong;
   collective_seq:ulong;
-  operations:[ScheduledRequest];
+  calls:[Call];
   block_tables:[BlockTable];
   new_cache_pages:[CachePageAllocation];
   // Aligned model inputs; sequence lengths describe valid prefixes, not capacity.
-  forward_operation_indices:[uint];
+  forward_call_indices:[uint];
   request_pool_indices:[uint];
   // Cached prefix plus current query, including non-persistent query rows.
   seq_lens:[uint];
@@ -520,18 +520,18 @@ table ForwardStats {
 
 table WorkerRequest {
   kind:ReqKind;
-  call_id:ulong = null;
+  message_id:ulong = null;
   batch:Batch;
 }
 
-table ErrorOperationIdentity {
+table ErrorCallIdentity {
   request_key:RequestKey;
-  op_id:ComputationId;
+  call_id:CallId;
 }
 
 table WorkerResponse {
   kind:RespKind;
-  call_id:ulong = null;
+  message_id:ulong = null;
   info:WorkerInfo;
   result:BatchOutput;
   message:string;
@@ -539,7 +539,7 @@ table WorkerResponse {
   fatal:bool = null;
   phase:string;
   route:string;
-  operations:[ErrorOperationIdentity];
+  calls:[ErrorCallIdentity];
 }
 
 root_type WorkerRequest;

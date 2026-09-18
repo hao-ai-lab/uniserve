@@ -1,20 +1,20 @@
-"""Schedule dependency frontiers and dispatch ready worker operations."""
+"""Schedule dependency frontiers and dispatch ready worker calls."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
-from uniserve_worker.execution import operations
+from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch_state import BatchState
-from uniserve_worker.execution.operations import _predicated_outcome
+from uniserve_worker.execution.calls import _predicated_outcome
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
+    Call,
+    CallStatus,
     ForwardMode,
-    OpStatus,
     PipelineStage,
-    ScheduledRequest,
     TransferMode,
 )
 
@@ -62,52 +62,50 @@ def execute_groups(
     tokenizer: PreTrainedTokenizerBase | None,
     config: WorkerConfig,
 ) -> tuple[dict[int, tuple[PendingOutput, ...]], dict[int, BaseException]]:
-    """Execute active operations across completion groups and align outcomes.
+    """Execute active calls across completion groups and align outcomes.
 
     with original completion group order.
     """
     for completion_group in completion_groups:
         active = tuple(
-            operation
-            for operation in state.group_operations(completion_group)
+            call
+            for call in state.group_calls(completion_group)
             if state.pending_output(
-                completion_group, operation.request_key.request_id
+                completion_group, call.request_key.request_id
             ).status
-            is not OpStatus.PREDICATED
+            is not CallStatus.PREDICATED
         )
         with state.group_scope(completion_group):
             for device in dict.fromkeys(
                 device
-                for operation in active
-                for device in model_runner.operation_devices(operation)
+                for call in active
+                for device in model_runner.call_devices(call)
             ):
                 state.group_buffers[completion_group].begin_device(device)
 
     grouped: list[list[PendingOutput | None]] = [
-        [None] * len(state.group_operations(completion_group))
+        [None] * len(state.group_calls(completion_group))
         for completion_group in completion_groups
     ]
-    scheduled: list[tuple[ScheduledRequest, int]] = []
+    scheduled: list[tuple[Call, int]] = []
     locations: list[tuple[int, int]] = []
 
     for group_index, completion_group in enumerate(completion_groups):
-        for operation_index, operation in enumerate(
-            state.group_operations(completion_group)
-        ):
+        for call_index, call in enumerate(state.group_calls(completion_group)):
             if (
                 state.pending_output(
-                    completion_group, operation.request_key.request_id
+                    completion_group, call.request_key.request_id
                 ).status
-                is OpStatus.PREDICATED
+                is CallStatus.PREDICATED
             ):
-                grouped[group_index][operation_index] = _predicated_outcome(
-                    operation, completion_group, state=state
+                grouped[group_index][call_index] = _predicated_outcome(
+                    call, completion_group, state=state
                 )
                 continue
-            locations.append((group_index, operation_index))
-            scheduled.append((operation, completion_group))
+            locations.append((group_index, call_index))
+            scheduled.append((call, completion_group))
 
-    completed, errors = _execute_operations(
+    completed, errors = _execute_calls(
         tuple(scheduled),
         kv_cache=kv_cache,
         tensor_store=tensor_store,
@@ -126,8 +124,8 @@ def execute_groups(
     )
 
     for index, outcome in completed.items():
-        group_index, operation_index = locations[index]
-        grouped[group_index][operation_index] = outcome
+        group_index, call_index = locations[index]
+        grouped[group_index][call_index] = outcome
 
     outcomes: dict[int, tuple[PendingOutput, ...]] = {}
     for completion_group, group_outcomes in zip(
@@ -138,7 +136,7 @@ def execute_groups(
             continue
         if any(outcome is None for outcome in group_outcomes):
             raise RuntimeError(
-                "successful completion group did not resolve every operation"
+                "successful completion group did not resolve every call"
             )
         outcomes[group_id] = tuple(
             cast(PendingOutput, outcome) for outcome in group_outcomes
@@ -148,7 +146,7 @@ def execute_groups(
 
 def _execute_ready_actions(
     frontier: tuple[int, ...],
-    scheduled: tuple[tuple[ScheduledRequest, int], ...],
+    scheduled: tuple[tuple[Call, int], ...],
     outcomes: dict[int, PendingOutput],
     errors: dict[int, BaseException],
     *,
@@ -168,15 +166,15 @@ def _execute_ready_actions(
     from . import encode, flow, transfer, video
 
     for index in frontier:
-        operation, completion_group = scheduled[index]
+        call, completion_group = scheduled[index]
         if index in outcomes or completion_group in errors:
             continue
 
         try:
             with state.group_scope(completion_group):
-                if isinstance(operation.kind, TransferMode):
+                if isinstance(call.kind, TransferMode):
                     result = transfer.execute(
-                        operation,
+                        call,
                         completion_group,
                         kv_cache=kv_cache,
                         tensor_store=tensor_store,
@@ -187,11 +185,11 @@ def _execute_ready_actions(
                         state=state,
                     )
                 elif (
-                    operation.kind is PipelineStage.LATENT_PREPARATION
+                    call.kind is PipelineStage.LATENT_PREPARATION
                     and latent_pool is not None
                 ):
                     result = flow.prepare_latent(
-                        operation,
+                        call,
                         completion_group,
                         kv_cache=kv_cache,
                         worker_info=worker_info,
@@ -202,9 +200,9 @@ def _execute_ready_actions(
                         config=config,
                         state=state,
                     )
-                elif operation.kind is PipelineStage.TEXT_ENCODING:
+                elif call.kind is PipelineStage.TEXT_ENCODING:
                     result = encode.text(
-                        operation,
+                        call,
                         completion_group,
                         tensor_store=tensor_store,
                         publication_transports=publication_transports,
@@ -213,7 +211,7 @@ def _execute_ready_actions(
                     )
                 elif model_runner.video_postprocessor is not None:
                     result = video.execute(
-                        operation,
+                        call,
                         completion_group,
                         tensor_store=tensor_store,
                         media_mux=media_mux,
@@ -223,16 +221,14 @@ def _execute_ready_actions(
                         state=state,
                     )
                 else:
-                    raise invalid_descriptor(
-                        f"unsupported operation {operation.kind!r}"
-                    )
+                    raise invalid_descriptor(f"unsupported call {call.kind!r}")
             outcomes[index] = result
         except BaseException as error:
             errors[completion_group] = error
 
 
-def _execute_operations(
-    scheduled: tuple[tuple[ScheduledRequest, int], ...],
+def _execute_calls(
+    scheduled: tuple[tuple[Call, int], ...],
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
@@ -251,20 +247,16 @@ def _execute_operations(
 ) -> tuple[dict[int, PendingOutput], dict[int, BaseException]]:
     """Execute product dependency frontiers with direct numerical algorithms.
 
-    Each index addresses an original operation. Only completed products unlock
+    Each index addresses an original call. Only completed products unlock
     successors; an error suppresses its completion group while independent
     groups continue. CFG prefixes precede their homogeneous denoiser calls.
     """
     producers = {
         buffer: index
-        for index, (operation, _scope) in enumerate(scheduled)
+        for index, (call, _scope) in enumerate(scheduled)
         for buffer in (
-            *(output.buffer_id for output in operation.tensor_outputs()),
-            *(
-                (operation.kv_output,)
-                if operation.kv_output is not None
-                else ()
-            ),
+            *(output.buffer_id for output in call.tensor_outputs()),
+            *((call.kv_output,) if call.kv_output is not None else ()),
         )
     }
 
@@ -275,19 +267,12 @@ def _execute_operations(
         return index not in outcomes and scheduled[index][1] not in errors
 
     def ready(index: int) -> bool:
-        operation = scheduled[index][0]
+        call = scheduled[index][0]
         return all(
             producer in outcomes
             for buffer in (
-                *(
-                    reference.buffer_id
-                    for reference in operation.tensor_inputs()
-                ),
-                *(
-                    (operation.kv_input,)
-                    if operation.kv_input is not None
-                    else ()
-                ),
+                *(reference.buffer_id for reference in call.tensor_inputs()),
+                *((call.kv_input,) if call.kv_input is not None else ()),
             )
             if (producer := producers.get(buffer)) is not None
         )
@@ -300,13 +285,12 @@ def _execute_operations(
         )
         if not frontier:
             blocked = tuple(
-                operations.operation_identity(operation)
-                for index, (operation, _scope) in enumerate(scheduled)
+                calls.call_identity(call)
+                for index, (call, _scope) in enumerate(scheduled)
                 if live(index)
             )
             raise RuntimeError(
-                f"operation products contain an unresolved dependency: "
-                f"{blocked!r}"
+                f"call products contain an unresolved dependency: {blocked!r}"
             )
 
         numerical = tuple(

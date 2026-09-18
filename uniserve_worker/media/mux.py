@@ -20,7 +20,7 @@ import numpy as np
 from uniserve.media.video import Config
 
 from ..foundation.errors import invalid_descriptor
-from ..protocol.identity import ComputationId, RequestKey
+from ..protocol.identity import CallId, RequestKey
 from ..protocol.output import MediaOutput, PosixShmArtifact
 from .storage import publish_media_bytes
 
@@ -336,13 +336,13 @@ class MediaEncoder:
         output: OutputBuffer,
         reservation: HostTask,
         ring_lease: MediaLease,
-        operation_id: ComputationId,
+        call_id: CallId,
     ) -> HostTask:
         """Schedule one media unit's encode from a captured output-ring slot."""
         height, width = config.height, config.width
 
         def encode() -> bytes:
-            # The bytes become this operation's product when it completes; the
+            # The bytes become this call's product when it completes; the
             # encoded length is not known until here.
             pixels = frames.numpy().reshape(-1, height, width, 3)
             return encode_video_unit(config, pixels)
@@ -355,8 +355,8 @@ class MediaEncoder:
             release=ring_lease.release,
             profile_name=(
                 f"uniserve.host.encode request={_key_label(request_key)} "
-                f"step={operation_id.batch_id} "
-                f"op={operation_id.request_index} "
+                f"step={call_id.batch_id} "
+                f"op={call_id.request_index} "
                 f"kind=video unit={unit_index} rank={self.rank}"
             ),
         )
@@ -408,7 +408,7 @@ class MediaMux:
         output: OutputBuffer,
         reservation: HostTask,
         ring_lease: MediaLease,
-        operation_id: ComputationId,
+        call_id: CallId,
     ) -> HostTask:
         """Schedule the audio track's encode from a captured ring slot."""
         session = self._sessions.get(request_key)
@@ -434,8 +434,8 @@ class MediaMux:
             release=ring_lease.release,
             profile_name=(
                 f"uniserve.host.encode request={_key_label(request_key)} "
-                f"step={operation_id.batch_id} "
-                f"op={operation_id.request_index} "
+                f"step={call_id.batch_id} "
+                f"op={call_id.request_index} "
                 f"kind=audio rank={self.rank}"
             ),
         )
@@ -447,7 +447,7 @@ class MediaMux:
         request_key: RequestKey,
         units: tuple[bytes, ...],
         reservation: HostTask,
-        operation_id: ComputationId,
+        call_id: CallId,
     ) -> HostTask:
         """Schedule assembly of the artifact from every encoded track."""
         session = self._sessions.get(request_key)
@@ -476,8 +476,8 @@ class MediaMux:
             release=None,
             profile_name=(
                 f"uniserve.host.mux request={_key_label(request_key)} "
-                f"step={operation_id.batch_id} "
-                f"op={operation_id.request_index} "
+                f"step={call_id.batch_id} "
+                f"op={call_id.request_index} "
                 f"kind=artifact rank={self.rank}"
             ),
         )

@@ -35,19 +35,19 @@ pub enum WorkerRequest {
     /// Queries worker identity and capabilities.
     Info {
         /// Optional request-response correlation identity.
-        call_id: Option<u64>,
+        message_id: Option<u64>,
     },
     /// Submits a batch.
     Submit {
         /// Optional request-response correlation identity.
-        call_id: Option<u64>,
+        message_id: Option<u64>,
         /// Fully lowered batch.
         batch: Batch,
     },
     /// Requests orderly worker shutdown.
     Close {
         /// Optional request-response correlation identity.
-        call_id: Option<u64>,
+        message_id: Option<u64>,
     },
 }
 
@@ -62,10 +62,10 @@ impl WorkerRequest {
     }
 
     /// Returns the optional call correlation identifier.
-    pub const fn call_id(&self) -> Option<u64> {
+    pub const fn message_id(&self) -> Option<u64> {
         match self {
-            Self::Info { call_id } | Self::Submit { call_id, .. } | Self::Close { call_id } => {
-                *call_id
+            Self::Info { message_id } | Self::Submit { message_id, .. } | Self::Close { message_id } => {
+                *message_id
             }
         }
     }
@@ -73,8 +73,8 @@ impl WorkerRequest {
     /// Replaces the call correlation identifier.
     pub fn set_call_id(&mut self, value: Option<u64>) {
         match self {
-            Self::Info { call_id } | Self::Submit { call_id, .. } | Self::Close { call_id } => {
-                *call_id = value
+            Self::Info { message_id } | Self::Submit { message_id, .. } | Self::Close { message_id } => {
+                *message_id = value
             }
         }
     }
@@ -89,18 +89,18 @@ impl WorkerRequest {
 
     /// Constructs a worker-capability request.
     pub fn info() -> Self {
-        Self::Info { call_id: None }
+        Self::Info { message_id: None }
     }
     /// Constructs a batch-submission request.
     pub fn submit(batch: Batch) -> Self {
         Self::Submit {
-            call_id: None,
+            message_id: None,
             batch,
         }
     }
     /// Constructs a worker-shutdown request.
     pub fn close() -> Self {
-        Self::Close { call_id: None }
+        Self::Close { message_id: None }
     }
 }
 
@@ -118,16 +118,16 @@ pub enum ResponseKind {
     Error,
 }
 
-/// Request and operation identity attached to a worker error.
+/// Request and call identity attached to a worker error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ErrorOperationIdentity {
-    /// Request lineage owning the failed operation.
+pub struct ErrorCallIdentity {
+    /// Request lineage owning the failed call.
     pub request_key: RequestKey,
-    /// Failed operation identity.
-    pub op_id: ComputationId,
+    /// Failed call identity.
+    pub call_id: CallId,
 }
 
-/// Structured worker failure with optional operation identities.
+/// Structured worker failure with optional call identities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerResponseError {
     /// Human-readable failure description.
@@ -140,8 +140,8 @@ pub struct WorkerResponseError {
     pub phase: Option<String>,
     /// Optional execution route that failed.
     pub route: Option<String>,
-    /// Operations affected by the failure.
-    pub operations: Vec<ErrorOperationIdentity>,
+    /// Calls affected by the failure.
+    pub calls: Vec<ErrorCallIdentity>,
 }
 
 /// Worker-to-host response envelope.
@@ -151,26 +151,26 @@ pub enum WorkerResponse {
     /// Returns worker identity and capabilities.
     Info {
         /// Optional request-response correlation identity.
-        call_id: Option<u64>,
+        message_id: Option<u64>,
         /// Loaded worker capabilities.
         info: WorkerInfo,
     },
     /// Returns partial or terminal run progress.
     Result {
         /// Optional request-response correlation identity.
-        call_id: Option<u64>,
+        message_id: Option<u64>,
         /// Physical run result.
         result: BatchOutput,
     },
     /// Acknowledges a successful control request.
     Ok {
         /// Optional request-response correlation identity.
-        call_id: Option<u64>,
+        message_id: Option<u64>,
     },
     /// Returns a structured worker failure.
     Error {
         /// Optional request-response correlation identity.
-        call_id: Option<u64>,
+        message_id: Option<u64>,
         /// Structured failure details.
         error: WorkerResponseError,
     },
@@ -188,22 +188,22 @@ impl WorkerResponse {
     }
 
     /// Returns the optional call correlation identifier.
-    pub const fn call_id(&self) -> Option<u64> {
+    pub const fn message_id(&self) -> Option<u64> {
         match self {
-            Self::Info { call_id, .. }
-            | Self::Result { call_id, .. }
-            | Self::Ok { call_id }
-            | Self::Error { call_id, .. } => *call_id,
+            Self::Info { message_id, .. }
+            | Self::Result { message_id, .. }
+            | Self::Ok { message_id }
+            | Self::Error { message_id, .. } => *message_id,
         }
     }
 
     /// Replaces the call correlation identifier.
     pub fn set_call_id(&mut self, value: Option<u64>) {
         match self {
-            Self::Info { call_id, .. }
-            | Self::Result { call_id, .. }
-            | Self::Ok { call_id }
-            | Self::Error { call_id, .. } => *call_id = value,
+            Self::Info { message_id, .. }
+            | Self::Result { message_id, .. }
+            | Self::Ok { message_id }
+            | Self::Error { message_id, .. } => *message_id = value,
         }
     }
 
@@ -218,7 +218,7 @@ impl WorkerResponse {
     /// Constructs a worker-capability response.
     pub fn info(info: WorkerInfo) -> Self {
         Self::Info {
-            call_id: None,
+            message_id: None,
             info,
         }
     }
@@ -226,20 +226,20 @@ impl WorkerResponse {
     /// Constructs a run-result response.
     pub fn result(result: BatchOutput) -> Self {
         Self::Result {
-            call_id: None,
+            message_id: None,
             result,
         }
     }
 
     /// Constructs an acknowledgment response.
     pub fn ok() -> Self {
-        Self::Ok { call_id: None }
+        Self::Ok { message_id: None }
     }
 
     /// Constructs a structured worker-error response.
     pub fn error(error: WorkerResponseError) -> Self {
         Self::Error {
-            call_id: None,
+            message_id: None,
             error,
         }
     }

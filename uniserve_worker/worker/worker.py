@@ -33,12 +33,12 @@ from uniserve_worker.profiling import (
     record_failure,
     worker_range_name,
 )
+from uniserve_worker.protocol.call import CallKind
 from uniserve_worker.protocol.identity import (
     BufferId,
-    ComputationId,
+    CallId,
     RequestKey,
 )
-from uniserve_worker.protocol.operation import Computation
 
 from ..bootstrap.capacity import (
     check_startup_memory,
@@ -100,23 +100,23 @@ _IPC_WAIT_TIMEOUT_US = 60_000_000
 
 def _input_producers(
     batch: Batch,
-) -> set[tuple[RequestKey, ComputationId]]:
+) -> set[tuple[RequestKey, CallId]]:
     """Identify producers requiring extended visibility.
 
     Their values must remain visible until input acquisition.
     """
     sources = {
-        (reference.request_key, reference.producer_op_id)
-        for operation in batch.operations
+        (reference.request_key, reference.producer_call_id)
+        for call in batch.calls
         for reference in (
-            *operation.tensor_inputs(),
-            *(() if operation.predicate is None else (operation.predicate,)),
+            *call.tensor_inputs(),
+            *(() if call.predicate is None else (call.predicate,)),
         )
     }
     sources.update(
-        (operation.kv_input.owner, operation.kv_input.producer_op_id)
-        for operation in batch.operations
-        if operation.kv_input is not None
+        (call.kv_input.owner, call.kv_input.producer_call_id)
+        for call in batch.calls
+        if call.kv_input is not None
     )
     return sources
 
@@ -244,7 +244,7 @@ class Worker:
         worker_config: WorkerConfig,
         sampling_group: Communicator | None,
         tokenizer: Any | None,
-        allowed_work_variants: frozenset[Computation],
+        allowed_work_variants: frozenset[CallKind],
         queue_depth: int,
         completion_payload_bytes: int,
         attention: str | None = None,
@@ -621,7 +621,7 @@ class Worker:
                     kv_cache=self.kv_cache,
                     latent_pool=self.latent_pool,
                     decode_predicates=self.decode_state.predicates,
-                    max_operations=int(info.max_batch_ops),
+                    max_calls=int(info.max_batch_ops),
                     request_slots=int(info.request_slots),
                     max_tokens=int(info.max_batch_tokens),
                     latent_capacity_units=int(info.latent_capacity_units),
@@ -632,7 +632,7 @@ class Worker:
                     max_inflight=int(queue_depth),
                 )
 
-            # Operation handlers borrow the resources owned by this rank.
+            # Call handlers borrow the resources owned by this rank.
             from ..execution.video import create_media_resources
 
             self.media_mux, self.media_buffers = (
@@ -863,7 +863,7 @@ class Worker:
             # sequence position until all earlier responses have drained.
             if kind is RequestKind.CLOSE:
                 self._admission_closed = True
-                self._shutdown_response = messages.with_call_id(
+                self._shutdown_response = messages.with_message_id(
                     self._dispatch(request), request
                 )
                 return sequence
@@ -984,7 +984,7 @@ class Worker:
             PendingResponse(
                 pending.sequence,
                 pending.requests,
-                messages.with_call_id(response, pending.request),
+                messages.with_message_id(response, pending.request),
             )
         )
 
@@ -1006,9 +1006,9 @@ class Worker:
         """
         try:
             unsupported = tuple(
-                operation.kind
-                for operation in batch.batch.operations
-                if not self.supports_computation(operation.kind)
+                call.kind
+                for call in batch.batch.calls
+                if not self.supports_computation(call.kind)
             )
             if unsupported:
                 names = sorted({value.value for value in unsupported})
@@ -1066,7 +1066,7 @@ class Worker:
                 outputs = tuple(batch.outputs[index] for index in indexes)
                 if any(value is None for value in outputs):
                     raise RuntimeError(
-                        "launched batch is missing an operation output"
+                        "launched batch is missing an call output"
                     )
                 if any(
                     isinstance(value, PendingOutput) and not value.ready()
@@ -1139,7 +1139,7 @@ class Worker:
         pending = PendingResponse(
             request.sequence,
             request.requests | batch.request_ids,
-            messages.with_call_id(
+            messages.with_message_id(
                 messages.response(ResponseKind.RESULT), request.request
             ),
             batch,
@@ -1358,7 +1358,7 @@ class Worker:
         batch = state.batch
         # Cooperative ranks launch computation in the same order. Preparation
         # and host completion may overlap; neither retains old batch identities.
-        if self.worker_config.world_size > 1 and batch.operations:
+        if self.worker_config.world_size > 1 and batch.calls:
             if batch.collective_seq <= self._last_collective_seq:
                 raise invalid_descriptor("collective sequence does not advance")
             self._last_collective_seq = batch.collective_seq
@@ -1388,29 +1388,29 @@ class Worker:
         consumed = _input_producers(batch)
         self._release_predecessors(
             tuple(
-                (operation.request_key, operation.predecessor)
-                for operation in batch.operations
-                if operation.predecessor is not None
-                and operation.predecessor.batch_id > 0
-                and (operation.request_key, operation.predecessor) in consumed
+                (call.request_key, call.predecessor)
+                for call in batch.calls
+                if call.predecessor is not None
+                and call.predecessor.batch_id > 0
+                and (call.request_key, call.predecessor) in consumed
             )
         )
 
         self.tensor_store.release_buffers(
             tuple(
                 predicate.buffer_id
-                for operation in batch.operations
-                if (predicate := operation.predicate) is not None
+                for call in batch.calls
+                if (predicate := call.predicate) is not None
                 and (
-                    operation.predecessor is None
-                    or predicate.producer_op_id != operation.predecessor
+                    call.predecessor is None
+                    or predicate.producer_call_id != call.predecessor
                 )
             )
         )
         state.launched = True
         self._retire_commands(state)
 
-    def supports_computation(self, kind: Computation) -> bool:
+    def supports_computation(self, kind: CallKind) -> bool:
         """Return whether this worker can execute this computation."""
         return kind in self.info.supported_ops
 
@@ -1435,12 +1435,11 @@ class Worker:
         consumed = _input_producers(batch)
         self._release_predecessors(
             tuple(
-                (operation.request_key, operation.predecessor)
-                for operation in batch.operations
-                if operation.predecessor is not None
-                and operation.predecessor.batch_id > 0
-                and (operation.request_key, operation.predecessor)
-                not in consumed
+                (call.request_key, call.predecessor)
+                for call in batch.calls
+                if call.predecessor is not None
+                and call.predecessor.batch_id > 0
+                and (call.request_key, call.predecessor) not in consumed
             )
         )
         self._release_commands(batch)
@@ -1730,15 +1729,15 @@ class Worker:
             self.latent_pool.release_buffers(buffers)
 
     def _release_predecessors(
-        self, predecessors: tuple[tuple[RequestKey, ComputationId], ...]
+        self, predecessors: tuple[tuple[RequestKey, CallId], ...]
     ) -> None:
         """Revoke predecessor outputs.
 
         Revocation happens after every declared consumer has acquired them.
         """
-        self.tensor_store.release_operations(predecessors)
+        self.tensor_store.release_calls(predecessors)
         if self.kv_cache is not None:
-            released = self.kv_cache.release_operations(predecessors)
+            released = self.kv_cache.release_calls(predecessors)
             self.kv_cache.release_buffers(released)
 
     def _release_commands(self, batch: Batch) -> None:

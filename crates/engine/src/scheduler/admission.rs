@@ -101,7 +101,7 @@ impl Scheduler {
             allocations: None,
             flow_prefix: None,
             request_epoch: self.next_request_epoch,
-            last_state_op_id: ComputationId::default(),
+            last_state_call_id: CallId::default(),
             latest_token: None,
             speculative_chain_invalidated: false,
             phase: Phase::Prefill,
@@ -175,7 +175,7 @@ impl Scheduler {
         ] {
             let entry = self.info.pipeline_components.get(&role)?;
             let (_, bound, info) = self
-                .entry_candidates(Computation::Pipeline(role), entry)
+                .entry_candidates(CallKind::Pipeline(role), entry)
                 .next()?;
             let component = info
                 .components
@@ -279,7 +279,7 @@ impl Scheduler {
             let sampling = submission.request.sampling;
             if self.info.pipeline_components.iter().any(|(stage, entry)| {
                 !self
-                    .entry_candidates(Computation::Pipeline(*stage), entry)
+                    .entry_candidates(CallKind::Pipeline(*stage), entry)
                     .any(|(worker, _, _)| self.executor.is_ready(worker))
             }) {
                 self.waiting_media.insert(id, submission);
@@ -335,7 +335,7 @@ impl Scheduler {
                 submission.request.sampling,
             )
             .expect("validated media admission");
-            let root = ComputationId::new(0, 0);
+            let root = CallId::new(0, 0);
             self.running_media.insert(
                 id,
                 MediaFlowState {
@@ -486,7 +486,7 @@ impl Scheduler {
             .running
             .iter()
             .filter(|(id, state)| {
-                state.terminal_intent.is_terminal() && !self.has_pending_operations(**id)
+                state.terminal_intent.is_terminal() && !self.has_pending_calls(**id)
             })
             .map(|(id, state)| (*id, state.terminal_intent.clone()))
             .collect();
@@ -505,7 +505,7 @@ impl Scheduler {
                 self.media_state(*id)
                     .filter(|state| {
                         state.terminal_intent.is_terminal()
-                            && !self.has_pending_operations(state.request.request_id)
+                            && !self.has_pending_calls(state.request.request_id)
                     })
                     .map(|state| (state.request.request_id, state.terminal_intent.clone()))
             })
@@ -649,7 +649,7 @@ impl Scheduler {
         state: &RequestState,
     ) -> Option<((crate::WorkerId, String), crate::kv::PrefixHit)> {
         let cache = self.cache();
-        self.worker_candidates(Computation::Forward(ForwardMode::Prefill))
+        self.worker_candidates(CallKind::Forward(ForwardMode::Prefill))
             .filter(|(worker, _, _)| self.executor.is_ready(worker))
             .map(|(worker, entry, info)| {
                 let hit = cache.coordinator.probe_prefix(

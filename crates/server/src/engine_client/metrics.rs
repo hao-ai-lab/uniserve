@@ -71,13 +71,13 @@ pub fn record_scheduler_stats(
             .get_or_create(&domain_labels)
             .set(domain.peak_credits);
         for (kind, value) in [
-            ("launched", domain.launched_operations),
-            ("completed", domain.completed_operations),
-            ("predicated", domain.predicated_operations),
-            ("error", domain.error_operations),
+            ("launched", domain.launched_calls),
+            ("completed", domain.completed_calls),
+            ("predicated", domain.predicated_calls),
+            ("error", domain.error_calls),
         ] {
             metrics
-                .scheduler_domain_operations
+                .scheduler_domain_calls
                 .get_or_create(&EngineDomainKindLabels {
                     model_name: model_name.clone(),
                     engine,
@@ -362,9 +362,9 @@ mod tests {
                 domain: "decode".to_string(),
                 active_credits: 2,
                 peak_credits: 5,
-                launched_operations: 7,
-                completed_operations: 6,
-                error_operations: 1,
+                launched_calls: 7,
+                completed_calls: 6,
+                error_calls: 1,
                 backpressure_events: 3,
                 reclaimed_credits: 6,
                 completed_batches: 4,
@@ -384,7 +384,7 @@ mod tests {
                 && line.ends_with(" 2")
         }));
         assert!(rendered.lines().any(|line| {
-            line.starts_with("uniserve:scheduler_domain_operations_total")
+            line.starts_with("uniserve:scheduler_domain_calls_total")
                 && line.contains("domain=\"decode\"")
                 && line.contains("kind=\"error\"")
                 && line.ends_with(" 1")

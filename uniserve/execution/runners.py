@@ -194,7 +194,7 @@ class DenoisingRunner(
         state: Mapping[str, torch.Tensor],
     ) -> Mapping[str, tuple[torch.Tensor, ...]]:
         self.inputs = inputs
-        operation = DenoisingStep(
+        call = DenoisingStep(
             self.model,
             inputs,
             schedules,
@@ -202,7 +202,7 @@ class DenoisingRunner(
             self.context.constants,
             self.context.workspace,
         )
-        return self._run(operation)
+        return self._run(call)
 
 
 class ImageRunner(ModelRunner[ImageDecoder, image.Config]):

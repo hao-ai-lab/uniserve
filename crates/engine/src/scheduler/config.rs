@@ -1,6 +1,6 @@
 //! Scheduling policy and configured queue and batch limits.
 
-/// Default maximum operations admitted to one batch.
+/// Default maximum calls admitted to one batch.
 pub const DEFAULT_MAX_BATCH: usize = 128;
 /// Default token budget for one scheduled batch.
 pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
@@ -33,7 +33,7 @@ pub enum SchedulingPolicy {
 pub struct SchedulerConfig {
     /// Waiting-queue ordering policy.
     pub policy: SchedulingPolicy,
-    /// Maximum operations submitted in one batch.
+    /// Maximum calls submitted in one batch.
     pub max_batch: usize,
     /// Maximum text tokens represented in one batch.
     pub max_num_batched_tokens: usize,

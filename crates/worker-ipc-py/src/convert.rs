@@ -17,11 +17,11 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams, TokenLogprob};
 use uniserve_worker_ipc::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable,
-    BufferAllocation, BufferId, CachePageAllocation, Computation, ComputationId, DType,
-    DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, ErrorOperationIdentity,
+    BufferAllocation, BufferId, CachePageAllocation, CallKind, CallId, DType,
+    DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, ErrorCallIdentity,
     FeatureKind, FinishFlags, ForwardStats, KvTransfer, LatentParams, Locator, MediaOutput,
-    NewRequest, OpStatus, RegistrationAck, RequestKey, RequestKind, RequestOutput,
-    ScheduledRequest, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
+    NewRequest, CallStatus, RegistrationAck, RequestKey, RequestKind, RequestOutput,
+    Call, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
     TransferHandle, TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerRequest,
     WorkerResponse, WorkerResponseError,
 };
@@ -34,28 +34,28 @@ pub(crate) fn execute_request_to_py<'py>(
     py: Python<'py>,
     request: &WorkerRequest,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let WorkerRequest::Submit { call_id, batch } = request else {
+    let WorkerRequest::Submit { message_id, batch } = request else {
         return Err(PyValueError::new_err(
             "native submit conversion requires a submit request",
         ));
     };
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "kind"), request_kind_py(py, request.kind()))?;
-    dict.set_item(intern!(py, "call_id"), call_id)?;
+    dict.set_item(intern!(py, "message_id"), message_id)?;
     dict.set_item(intern!(py, "batch"), batch_to_py(py, batch)?)?;
     Ok(dict)
 }
 
-/// Cached handles to the worker's operation types and enum members.
+/// Cached handles to the worker's call types and enum members.
 ///
 /// The serve loop constructs one `Batch` object per submission; every hot
-/// record (operations, KV allocations, admission/close/release commands) is built
-/// by calling the operation dataclass constructors positionally, so the worker
+/// record (calls, KV allocations, admission/close/release commands) is built
+/// by calling the call dataclass constructors positionally, so the worker
 /// never re-decodes those records from IPC maps. Rare members (admissions,
 /// input products and allocations) still cross as IPC maps and are decoded by
 /// `native_batch` on the Python side.
 struct NativeRequestTypes {
-    operation: Py<PyAny>,
+    call: Py<PyAny>,
     computation_id: Py<PyAny>,
     request_key: Py<PyAny>,
     tensor_ref: Py<PyAny>,
@@ -107,7 +107,7 @@ impl NativeRequestTypes {
         // imported from the protocol module that owns it at the current Python
         // package structure.
         let batch = py.import("uniserve_worker.protocol.batch")?;
-        let operation = py.import("uniserve_worker.protocol.operation")?;
+        let call = py.import("uniserve_worker.protocol.call")?;
         let identity = py.import("uniserve_worker.protocol.identity")?;
         let tensor = py.import("uniserve_worker.protocol.tensor")?;
         let class = |module: &Bound<'_, PyModule>, name: &str| -> PyResult<Py<PyAny>> {
@@ -115,18 +115,18 @@ impl NativeRequestTypes {
         };
 
         Ok(Self {
-            operation: class(&operation, "ScheduledRequest")?,
-            computation_id: class(&identity, "ComputationId")?,
+            call: class(&call, "Call")?,
+            computation_id: class(&identity, "CallId")?,
             request_key: class(&identity, "RequestKey")?,
             tensor_ref: class(&tensor, "TensorRef")?,
             buffer_id: class(&identity, "BufferId")?,
             shape_bound: class(&tensor, "ShapeBound")?,
             static_dim: class(&tensor, "StaticDim")?,
             device_dim: class(&tensor, "DeviceDim")?,
-            bounds: class(&operation, "Bounds")?,
-            call_coordinates: class(&operation, "CallCoordinates")?,
-            rng: class(&operation, "Rng")?,
-            sampling_state: class(&operation, "SamplingState")?,
+            bounds: class(&call, "Bounds")?,
+            call_coordinates: class(&call, "CallCoordinates")?,
+            rng: class(&call, "Rng")?,
+            sampling_state: class(&call, "SamplingState")?,
             block_table: class(&batch, "BlockTable")?,
             cache_page_allocation: class(&batch, "CachePageAllocation")?,
             start: class(&batch, "Start")?,
@@ -142,22 +142,22 @@ impl NativeRequestTypes {
                 ["u8", "i32", "i64", "f16", "bf16", "f32", "i16"],
             )?,
             draw_layouts: enum_members(
-                &operation,
+                &call,
                 "DrawLayout",
                 ["target_sampling", "speculative_proposal", "flow_noise"],
             )?,
             forward_modes: enum_members(
-                &operation,
+                &call,
                 "ForwardMode",
                 ForwardMode::ALL.map(ForwardMode::as_str),
             )?,
             pipeline_stages: enum_members(
-                &operation,
+                &call,
                 "PipelineStage",
                 PipelineStage::ALL.map(PipelineStage::as_str),
             )?,
             transfer_modes: enum_members(
-                &operation,
+                &call,
                 "TransferMode",
                 TransferMode::ALL.map(TransferMode::as_str),
             )?,
@@ -174,11 +174,11 @@ impl NativeRequestTypes {
     }
 
     /// Returns the Python enum member for a physical run kind.
-    fn kind<'py>(&self, py: Python<'py>, kind: Computation) -> Bound<'py, PyAny> {
+    fn kind<'py>(&self, py: Python<'py>, kind: CallKind) -> Bound<'py, PyAny> {
         let member = match kind {
-            Computation::Forward(mode) => &self.forward_modes[mode as usize],
-            Computation::Pipeline(stage) => &self.pipeline_stages[stage as usize],
-            Computation::Transfer(mode) => &self.transfer_modes[mode as usize],
+            CallKind::Forward(mode) => &self.forward_modes[mode as usize],
+            CallKind::Pipeline(stage) => &self.pipeline_stages[stage as usize],
+            CallKind::Transfer(mode) => &self.transfer_modes[mode as usize],
         };
         member.bind(py).clone()
     }
@@ -204,7 +204,7 @@ struct NativeRequestConversion<'py> {
     py: Python<'py>,
     types: &'static NativeRequestTypes,
     request_keys: HashMap<RequestKey, Py<PyAny>>,
-    computation_ids: HashMap<ComputationId, Py<PyAny>>,
+    computation_ids: HashMap<CallId, Py<PyAny>>,
     shape_bounds: HashMap<ShapeBound, Py<PyAny>>,
 }
 
@@ -221,7 +221,7 @@ impl<'py> NativeRequestConversion<'py> {
     }
 
     /// Shares repeated producer and predecessor coordinates within the physical batch.
-    fn computation_id(&mut self, id: ComputationId) -> PyResult<Bound<'py, PyAny>> {
+    fn computation_id(&mut self, id: CallId) -> PyResult<Bound<'py, PyAny>> {
         if let Some(value) = self.computation_ids.get(&id) {
             return Ok(value.bind(self.py).clone());
         }
@@ -277,7 +277,7 @@ impl<'py> NativeRequestConversion<'py> {
         let shape_bound = self.shape_bound(&product.shape_bound)?;
         self.types.tensor_ref.bind(self.py).call1((
             request_key,
-            self.computation_id(product.producer_op_id)?,
+            self.computation_id(product.producer_call_id)?,
             product.output_index,
             product.generation,
             self.types.dtype(self.py, product.dtype),
@@ -290,53 +290,53 @@ impl<'py> NativeRequestConversion<'py> {
         let owner = self.request_key(buffer.owner)?;
         self.types.buffer_id.bind(self.py).call1((
             owner,
-            self.computation_id(buffer.producer_op_id)?,
+            self.computation_id(buffer.producer_call_id)?,
             buffer.output_index,
             buffer.generation,
         ))
     }
 
-    /// Constructs a typed Python operation from its computation fields.
-    fn operation(&mut self, operation: &ScheduledRequest) -> PyResult<Bound<'py, PyAny>> {
+    /// Constructs a typed Python call from its computation fields.
+    fn call(&mut self, call: &Call) -> PyResult<Bound<'py, PyAny>> {
         // Resolve identity, lineage, resource bounds, and product references
-        // before constructing the operation.
-        let request_key = self.request_key(operation.request_key)?;
-        let predecessor = operation
+        // before constructing the call.
+        let request_key = self.request_key(call.request_key)?;
+        let predecessor = call
             .predecessor
             .map(|id| self.computation_id(id))
             .transpose()?;
         let coordinates = self.types.call_coordinates.bind(self.py).call1((
-            operation.coordinates.logical_position,
-            operation.coordinates.kv_visible_len,
-            operation.coordinates.kv_computed_len,
-            operation.coordinates.flow_step,
+            call.coordinates.logical_position,
+            call.coordinates.kv_visible_len,
+            call.coordinates.kv_computed_len,
+            call.coordinates.flow_step,
         ))?;
         let bounds = self.types.bounds.bind(self.py).call1((
-            operation.bounds.max_tokens,
-            operation.bounds.max_kv_pages,
-            operation.bounds.max_latent_bytes,
-            operation.bounds.max_completion_bytes,
-            operation.bounds.max_transfer_bytes,
+            call.bounds.max_tokens,
+            call.bounds.max_kv_pages,
+            call.bounds.max_latent_bytes,
+            call.bounds.max_completion_bytes,
+            call.bounds.max_transfer_bytes,
         ))?;
-        let inputs = operation
+        let inputs = call
             .inputs
             .as_slice()
             .iter()
             .map(|product| self.tensor_ref(product))
             .collect::<PyResult<Vec<_>>>()?;
-        let outputs = operation
+        let outputs = call
             .outputs
             .as_slice()
             .iter()
             .map(|product| self.tensor_ref(product))
             .collect::<PyResult<Vec<_>>>()?;
-        let predicate = operation
+        let predicate = call
             .predicate
             .as_ref()
             .as_ref()
             .map(|predicate| self.tensor_ref(predicate))
             .transpose()?;
-        let rng = operation
+        let rng = call
             .rng
             .as_ref()
             .map(|rng| {
@@ -354,7 +354,7 @@ impl<'py> NativeRequestConversion<'py> {
             .transpose()?;
 
         let py = self.py;
-        let sampling_state = operation
+        let sampling_state = call
             .sampling_state
             .as_ref()
             .map(|state| {
@@ -376,75 +376,75 @@ impl<'py> NativeRequestConversion<'py> {
             py,
             [
                 request_key.into_any(),
-                self.computation_id(operation.op_id)?,
+                self.computation_id(call.call_id)?,
                 predecessor.into_pyobject(py)?.into_any(),
                 coordinates.into_any(),
-                self.types.kind(py, operation.code),
+                self.types.kind(py, call.code),
                 bounds.into_any(),
-                operation.entry.clone().into_pyobject(py)?.into_any(),
+                call.entry.clone().into_pyobject(py)?.into_any(),
                 pyo3::types::PyTuple::new(py, inputs)?.into_any(),
                 pyo3::types::PyTuple::new(py, outputs)?.into_any(),
-                operation
+                call
                     .token_input
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                operation
+                call
                     .token_output
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                operation
+                call
                     .vision_input
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                operation
+                call
                     .latent_feature_input
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                operation
+                call
                     .encoder_output
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                operation
+                call
                     .latent_input
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                operation
+                call
                     .latent_output
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                operation
+                call
                     .image_input
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                operation
+                call
                     .image_output
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                operation
+                call
                     .completion_output
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                operation
+                call
                     .transition_output
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
@@ -458,25 +458,25 @@ impl<'py> NativeRequestConversion<'py> {
                 sampling_state
                     .map(Bound::into_any)
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                pyo3::types::PyTuple::new(py, &operation.input_token_ids)?.into_any(),
-                operation
+                pyo3::types::PyTuple::new(py, &call.input_token_ids)?.into_any(),
+                call
                     .input_image
                     .as_deref()
                     .into_pyobject(py)?
                     .into_any(),
-                operation
+                call
                     .kv_input
                     .map(|buffer| self.buffer_id(buffer))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                operation
+                call
                     .kv_output
                     .map(|buffer| self.buffer_id(buffer))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
             ],
         )?;
-        self.types.operation.bind(py).call1(arguments)
+        self.types.call.bind(py).call1(arguments)
     }
 
     /// Constructs a typed Python KV block table.
@@ -545,10 +545,10 @@ fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>>
     let mut native = NativeRequestConversion::new(py)?;
 
     // Materialize the execution-critical records as Python model instances.
-    let operations = run
-        .operations
+    let calls = run
+        .calls
         .iter()
-        .map(|operation| native.operation(operation))
+        .map(|call| native.call(call))
         .collect::<PyResult<Vec<_>>>()?;
     let block_tables = run
         .block_tables
@@ -577,11 +577,11 @@ fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>>
         [
             run.batch_id.into_pyobject(py)?.into_any(),
             run.collective_seq.into_pyobject(py)?.into_any(),
-            pyo3::types::PyTuple::new(py, operations)?.into_any(),
+            pyo3::types::PyTuple::new(py, calls)?.into_any(),
             pyo3::types::PyTuple::new(py, block_tables)?.into_any(),
             pyo3::types::PyTuple::new(py, new_cache_pages)?.into_any(),
             (
-                pyo3::types::PyTuple::new(py, &run.forward.operation_indices)?,
+                pyo3::types::PyTuple::new(py, &run.forward.call_indices)?,
                 pyo3::types::PyTuple::new(py, &run.forward.request_pool_indices)?,
                 pyo3::types::PyTuple::new(py, &run.forward.seq_lens)?,
                 pyo3::types::PyTuple::new(py, &run.forward.query_lens)?,
@@ -624,8 +624,8 @@ fn latent_params_to_py<'py>(
         context.request_key(params.request_key)?,
     )?;
     dict.set_item(
-        intern!(py, "op_id"),
-        computation_id_to_py(py, params.op_id)?,
+        intern!(py, "call_id"),
+        computation_id_to_py(py, params.call_id)?,
     )?;
     dict.set_item(intern!(py, "page_table"), u32_list(py, &params.page_table)?)?;
     dict.set_item(intern!(py, "latent_units"), params.latent_units)?;
@@ -648,8 +648,8 @@ fn decode_range_to_py<'py>(
         context.request_key(params.request_key)?,
     )?;
     dict.set_item(
-        intern!(py, "op_id"),
-        computation_id_to_py(py, params.op_id)?,
+        intern!(py, "call_id"),
+        computation_id_to_py(py, params.call_id)?,
     )?;
     dict.set_item(intern!(py, "cursor"), params.cursor)?;
     dict.set_item(intern!(py, "max_units"), params.max_units)?;
@@ -667,8 +667,8 @@ fn buffer_allocation_to_py<'py>(
     let buffer = PyDict::new(py);
     buffer.set_item(intern!(py, "owner"), context.request_key(id.owner)?)?;
     buffer.set_item(
-        intern!(py, "producer_op_id"),
-        computation_id_to_py(py, id.producer_op_id)?,
+        intern!(py, "producer_call_id"),
+        computation_id_to_py(py, id.producer_call_id)?,
     )?;
     buffer.set_item(intern!(py, "output_index"), id.output_index)?;
     buffer.set_item(intern!(py, "generation"), id.generation)?;
@@ -934,8 +934,8 @@ fn tensor_ref_to_py<'py>(
         context.request_key(product.request_key)?,
     )?;
     dict.set_item(
-        intern!(py, "producer_op_id"),
-        computation_id_to_py(py, product.producer_op_id)?,
+        intern!(py, "producer_call_id"),
+        computation_id_to_py(py, product.producer_call_id)?,
     )?;
     dict.set_item(intern!(py, "output_index"), product.output_index)?;
     dict.set_item(intern!(py, "generation"), product.generation)?;
@@ -1064,8 +1064,8 @@ fn buffer_id_mapping_to_py<'py>(
     owner.set_item("request_epoch", buffer.owner.request_epoch)?;
     dict.set_item("owner", owner)?;
     dict.set_item(
-        "producer_op_id",
-        computation_id_to_py(py, buffer.producer_op_id)?,
+        "producer_call_id",
+        computation_id_to_py(py, buffer.producer_call_id)?,
     )?;
     dict.set_item("output_index", buffer.output_index)?;
     dict.set_item("generation", buffer.generation)?;
@@ -1204,7 +1204,7 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
     }
     // Decode the required result before checking that no error fields carry data.
     let report = run_result_from_py(&get(dict, intern!(py, "result"))?)?;
-    let identities = error_operations_from_py(dict)?;
+    let identities = error_calls_from_py(dict)?;
     if !identities.is_empty()
         || opt_string(dict, intern!(py, "message"))?.is_some()
         || opt_string(dict, intern!(py, "code"))?.is_some()
@@ -1215,7 +1215,7 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
         return None;
     }
     Some(WorkerResponse::Result {
-        call_id: opt_u64(dict, intern!(py, "call_id"))?,
+        message_id: opt_u64(dict, intern!(py, "message_id"))?,
         result: report,
     })
 }
@@ -1232,16 +1232,16 @@ fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerRe
             return None;
         }
     }
-    let identities = error_operations_from_py(dict)?;
+    let identities = error_calls_from_py(dict)?;
     Some(WorkerResponse::Error {
-        call_id: opt_u64(dict, intern!(py, "call_id"))?,
+        message_id: opt_u64(dict, intern!(py, "message_id"))?,
         error: WorkerResponseError {
             message: string_of(&get(dict, intern!(py, "message"))?)?,
             code: opt_string(dict, intern!(py, "code"))?,
             fatal: bool_of(&get(dict, intern!(py, "fatal"))?)?,
             phase: opt_string(dict, intern!(py, "phase"))?,
             route: opt_string(dict, intern!(py, "route"))?,
-            operations: identities,
+            calls: identities,
         },
     })
 }
@@ -1403,15 +1403,15 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
     // data so invalid enum spellings fail the whole record.
     let status = str_field(dict, intern!(py, "status"))?;
     let status = match status.to_str().ok()? {
-        "ok" => OpStatus::Ok,
-        "predicated" => OpStatus::Predicated,
-        "error" => OpStatus::Error,
+        "ok" => CallStatus::Ok,
+        "predicated" => CallStatus::Predicated,
+        "error" => CallStatus::Error,
         _ => return None,
     };
     let error_code = match get(dict, intern!(py, "error_code"))? {
         value if value.is_none() => None,
         value => Some(match value.cast::<PyString>().ok()?.to_str().ok()? {
-            "invalid_operation" => ErrorCode::InvalidOperation,
+            "invalid_call" => ErrorCode::InvalidCall,
             "resource_exhausted" => ErrorCode::ResourceExhausted,
             "compute_error" => ErrorCode::ComputeError,
             "cancelled" => ErrorCode::Cancelled,
@@ -1473,14 +1473,14 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
             .map(|position| token_logprobs_from_py(&position.ok()?))
             .collect::<Option<Vec<_>>>()?,
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
-        op_id: computation_id_from_py(&get(dict, intern!(py, "op_id"))?)?,
+        call_id: computation_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
         status,
         product_generations: u32_vec(&get(dict, intern!(py, "product_generations"))?)?,
         error_code,
         timing_counters,
         code: {
             let name = string_of(&get(dict, intern!(py, "code"))?)?;
-            Computation::ALL
+            CallKind::ALL
                 .into_iter()
                 .find(|code| code.as_str() == name)?
         },
@@ -1593,7 +1593,7 @@ fn buffer_id_mapping_from_py(value: &Bound<'_, PyAny>) -> Option<BufferId> {
     let dict = value.cast::<PyDict>().ok()?;
     Some(BufferId {
         owner: request_key_from_py(&get(dict, intern!(py, "owner"))?)?,
-        producer_op_id: computation_id_from_py(&get(dict, intern!(py, "producer_op_id"))?)?,
+        producer_call_id: computation_id_from_py(&get(dict, intern!(py, "producer_call_id"))?)?,
         output_index: u16_of(&get(dict, intern!(py, "output_index"))?)?,
         generation: u32_of(&get(dict, intern!(py, "generation"))?)?,
     })
@@ -1641,7 +1641,7 @@ fn tensor_ref_from_py(value: &Bound<'_, PyAny>) -> Option<TensorRef> {
     }
     Some(TensorRef {
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
-        producer_op_id: computation_id_from_py(&get(dict, intern!(py, "producer_op_id"))?)?,
+        producer_call_id: computation_id_from_py(&get(dict, intern!(py, "producer_call_id"))?)?,
         output_index: u16_of(&get(dict, intern!(py, "output_index"))?)?,
         generation: u32_of(&get(dict, intern!(py, "generation"))?)?,
         dtype,
@@ -1659,16 +1659,16 @@ fn feature_kind_from_py(value: &Bound<'_, PyAny>) -> Option<FeatureKind> {
 }
 
 /// Decodes both coordinates of a computation's logical identity.
-fn computation_id_from_py(value: &Bound<'_, PyAny>) -> Option<ComputationId> {
+fn computation_id_from_py(value: &Bound<'_, PyAny>) -> Option<CallId> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
-    Some(ComputationId::new(
+    Some(CallId::new(
         u64_of(&get(dict, intern!(py, "batch_id"))?)?,
         u32_of(&get(dict, intern!(py, "request_index"))?)?,
     ))
 }
 
-fn computation_id_to_py(py: Python<'_>, id: ComputationId) -> PyResult<Bound<'_, PyDict>> {
+fn computation_id_to_py(py: Python<'_>, id: CallId) -> PyResult<Bound<'_, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "batch_id"), id.batch_id)?;
     dict.set_item(intern!(py, "request_index"), id.request_index)?;
@@ -1686,29 +1686,29 @@ fn request_key_from_py(value: &Bound<'_, PyAny>) -> Option<RequestKey> {
     })
 }
 
-/// Decodes one request and operation identity attached to an error.
-fn error_operation_from_py(value: &Bound<'_, PyAny>) -> Option<ErrorOperationIdentity> {
+/// Decodes one request and call identity attached to an error.
+fn error_call_from_py(value: &Bound<'_, PyAny>) -> Option<ErrorCallIdentity> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
-    Some(ErrorOperationIdentity {
+    Some(ErrorCallIdentity {
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
-        op_id: computation_id_from_py(&get(dict, intern!(py, "op_id"))?)?,
+        call_id: computation_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
     })
 }
 
-/// Decodes an optional ordered list of operation identities attached to an error.
-fn error_operations_from_py(dict: &Bound<'_, PyDict>) -> Option<Vec<ErrorOperationIdentity>> {
+/// Decodes an optional ordered list of call identities attached to an error.
+fn error_calls_from_py(dict: &Bound<'_, PyDict>) -> Option<Vec<ErrorCallIdentity>> {
     let py = dict.py();
-    let Some(operations) = dict.get_item(intern!(py, "operations")).ok()? else {
+    let Some(calls) = dict.get_item(intern!(py, "calls")).ok()? else {
         return Some(Vec::new());
     };
-    if operations.is_none() {
+    if calls.is_none() {
         return Some(Vec::new());
     }
-    let operations = operations.cast::<PyList>().ok()?;
-    let mut identities = Vec::with_capacity(operations.len());
-    for item in operations.iter() {
-        identities.push(error_operation_from_py(&item)?);
+    let calls = calls.cast::<PyList>().ok()?;
+    let mut identities = Vec::with_capacity(calls.len());
+    for item in calls.iter() {
+        identities.push(error_call_from_py(&item)?);
     }
     Some(identities)
 }
@@ -1912,13 +1912,13 @@ mod tests {
         .unwrap();
         let token = TensorRef {
             request_key,
-            producer_op_id: ComputationId::new(11, 0),
+            producer_call_id: CallId::new(11, 0),
             output_index: 0,
             generation: 5,
             dtype: DType::I64,
             shape_bound: ShapeBound::default(),
         };
-        let operation = ScheduledRequest {
+        let call = Call {
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
 
@@ -1945,10 +1945,10 @@ mod tests {
                 force_finish: true,
             }),
             request_key,
-            op_id: ComputationId::new(11, 0),
-            predecessor: Some(ComputationId::new(0, 0)),
+            call_id: CallId::new(11, 0),
+            predecessor: Some(CallId::new(0, 0)),
             entry: "model".into(),
-            code: Computation::Forward(ForwardMode::Prefill),
+            code: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
                 max_tokens: 2,
                 max_kv_pages: 1,
@@ -1971,7 +1971,7 @@ mod tests {
             page_ids: vec![BlockId(1)],
         }];
         let forward = uniserve_worker_ipc::ForwardBatch {
-            operation_indices: vec![0],
+            call_indices: vec![0],
             request_pool_indices: vec![1],
             seq_lens: vec![2],
             query_lens: vec![2],
@@ -1991,7 +1991,7 @@ mod tests {
             },
         )
         .unwrap();
-        let media_operation = ScheduledRequest {
+        let media_call = Call {
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
 
@@ -2012,10 +2012,10 @@ mod tests {
             input_token_ids: Vec::new(),
             sampling_state: None,
             request_key: media_key,
-            op_id: ComputationId::new(12, 0),
-            predecessor: Some(ComputationId::new(0, 0)),
+            call_id: CallId::new(12, 0),
+            predecessor: Some(CallId::new(0, 0)),
             entry: "model".into(),
-            code: Computation::Pipeline(PipelineStage::LatentPreparation),
+            code: CallKind::Pipeline(PipelineStage::LatentPreparation),
             bounds: Bounds {
                 ..Bounds::default()
             },
@@ -2026,7 +2026,7 @@ mod tests {
         };
         let latent_params = vec![LatentParams {
             request_key: media_key,
-            op_id: ComputationId::new(12, 0),
+            call_id: CallId::new(12, 0),
             page_table: vec![1],
             latent_units: 64,
             height: 768,
@@ -2037,11 +2037,11 @@ mod tests {
         let kv_key = RequestKey::new(1, RequestId(4), 1);
         let kv_source = BufferId {
             owner: kv_key,
-            producer_op_id: ComputationId::new(10, 0),
+            producer_call_id: CallId::new(10, 0),
             output_index: 0,
             generation: 3,
         };
-        let kv_operation = ScheduledRequest {
+        let kv_call = Call {
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
             token_output: None,
@@ -2056,17 +2056,17 @@ mod tests {
             transition_output: None,
 
             request_key: kv_key,
-            op_id: ComputationId::new(13, 0),
-            predecessor: Some(ComputationId::new(0, 0)),
+            call_id: CallId::new(13, 0),
+            predecessor: Some(CallId::new(0, 0)),
             entry: "decoder".into(),
-            code: Computation::Transfer(TransferMode::KvInstall),
+            code: CallKind::Transfer(TransferMode::KvInstall),
             bounds: Bounds {
                 max_transfer_bytes: 32,
                 ..Bounds::default()
             },
             kv_input: Some(kv_source),
             kv_output: Some(BufferId {
-                producer_op_id: ComputationId::new(13, 0),
+                producer_call_id: CallId::new(13, 0),
                 generation: 4,
                 ..kv_source
             }),
@@ -2078,15 +2078,15 @@ mod tests {
             predicate: None,
             rng: None,
         };
-        let mut token_batch = Batch::new(11, vec![admission], vec![operation]);
+        let mut token_batch = Batch::new(11, vec![admission], vec![call]);
         token_batch.block_tables = block_tables;
         token_batch.new_cache_pages = new_cache_pages;
         token_batch.forward = forward;
 
-        let mut media_batch = Batch::new(12, vec![media_admission], vec![media_operation]);
+        let mut media_batch = Batch::new(12, vec![media_admission], vec![media_call]);
         media_batch.latent_params = latent_params;
 
-        let mut kv_batch = Batch::new(13, Vec::new(), vec![kv_operation]);
+        let mut kv_batch = Batch::new(13, Vec::new(), vec![kv_call]);
         kv_batch.kv_inputs = vec![kv_publication(kv_source)];
 
         [token_batch, media_batch, kv_batch]
@@ -2117,14 +2117,14 @@ mod tests {
                     rank: 19,
                 }]],
                 request_key,
-                op_id: ComputationId::new(13, 0),
+                call_id: CallId::new(13, 0),
 
-                status: OpStatus::Ok,
+                status: CallStatus::Ok,
 
                 product_generations: vec![5],
                 error_code: None,
                 timing_counters: TimingCounters::default(),
-                code: Computation::Forward(ForwardMode::Decode),
+                code: CallKind::Forward(ForwardMode::Decode),
                 position: 2,
                 kv_visible_len: 2,
                 num_completed_steps: 0,
@@ -2145,8 +2145,8 @@ mod tests {
         };
         let mut publication = result.completions[0].clone();
         publication.request_key = RequestKey::new(1, RequestId(4), 1);
-        publication.op_id = ComputationId::new(13, 1);
-        publication.code = Computation::Transfer(TransferMode::KvPublish);
+        publication.call_id = CallId::new(13, 1);
+        publication.code = CallKind::Transfer(TransferMode::KvPublish);
         publication.committed_tokens.clear();
 
         publication.sampled_logprob = None;
@@ -2155,7 +2155,7 @@ mod tests {
         publication.product_generations.clear();
         publication.kv_output = Some(kv_publication(BufferId {
             owner: publication.request_key,
-            producer_op_id: publication.op_id,
+            producer_call_id: publication.call_id,
             output_index: 0,
             generation: 4,
         }));
@@ -2227,7 +2227,7 @@ mod tests {
                     batch.batch_id
                 );
                 assert_eq!(
-                    native_batch.getattr("operations").unwrap().len().unwrap(),
+                    native_batch.getattr("calls").unwrap().len().unwrap(),
                     1
                 );
 
@@ -2244,8 +2244,8 @@ mod tests {
                     "native batch construction diverged from the canonical codec"
                 );
 
-                let operation = native_batch
-                    .getattr("operations")
+                let call = native_batch
+                    .getattr("calls")
                     .unwrap()
                     .get_item(0)
                     .unwrap();
@@ -2254,14 +2254,14 @@ mod tests {
                     // sampling state the worker reads per call.
                     0 => {
                         assert_eq!(
-                            operation
+                            call
                                 .getattr("input_token_ids")
                                 .unwrap()
                                 .extract::<Vec<u32>>()
                                 .unwrap(),
                             vec![7, 8]
                         );
-                        let sampling = operation.getattr("sampling_state").unwrap();
+                        let sampling = call.getattr("sampling_state").unwrap();
                         assert_eq!(
                             sampling
                                 .getattr("allowed_token_ids")
@@ -2344,7 +2344,7 @@ mod tests {
                                 .unwrap()
                         );
                         assert!(
-                            operation
+                            call
                                 .getattr("kv_input")
                                 .unwrap()
                                 .eq(imported_kv.getattr("source").unwrap())

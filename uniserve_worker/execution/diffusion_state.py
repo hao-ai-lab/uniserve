@@ -18,9 +18,9 @@ from ..foundation.errors import invalid_descriptor
 class ImageState:
     """Retain numerical schedules and conditioning for one admitted image.
 
-    Solver samples borrow the pending operation's latent staging and are not
+    Solver samples borrow the pending call's latent staging and are not
     retained here. Accepted progress and product generations belong to the
-    request and latent pool; physical prefix coordinates refresh per operation.
+    request and latent pool; physical prefix coordinates refresh per call.
     """
 
     size: Config

@@ -367,7 +367,7 @@ def _sample_task_group(
     and capture outputs.
     """
     # Flatten task-local candidate rows into one sampling matrix while retaining
-    # offsets needed to restore one selected result per operation.
+    # offsets needed to restore one selected result per call.
     device = tasks[0].logits.device
     vocab = int(tasks[0].logits.shape[1])
     offsets: list[int] = []
@@ -688,7 +688,7 @@ def _sampled_transition_values(
 
     numerical row views.
     """
-    # Only operations declaring a transition product participate; indexes keep
+    # Only calls declaring a transition product participate; indexes keep
     # their token and eligibility rows aligned after filtering.
     selected = tuple(
         (index, task)

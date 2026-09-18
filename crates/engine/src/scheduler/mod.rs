@@ -9,7 +9,7 @@
 //! resident request remains in place when capacity prevents relocation.
 //!
 //! Static worker state crosses the boundary once in [`NewRequest`]; subsequent
-//! operations carry only step-specific deltas.
+//! calls carry only step-specific deltas.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -70,8 +70,8 @@ use uniserve_core::{BlockId, ImageIngestStep, encoder_cache_key};
 use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
 use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
-    CachePageAllocation, Computation, ComputationId, DType, DecodeRange, DimBound, ForwardBatch,
-    ForwardStats, LatentParams, NewRequest, OpStatus, RequestKey, SamplingState, ScheduledRequest,
+    CachePageAllocation, CallKind, CallId, DType, DecodeRange, DimBound, ForwardBatch,
+    ForwardStats, LatentParams, NewRequest, CallStatus, RequestKey, SamplingState, Call,
     ShapeBound, TensorRef, TimingCounters, UmmRequestParams, WorkerInfo,
 };
 
@@ -141,8 +141,8 @@ pub(crate) struct RequestState {
     flow_prefix: Option<FlowPrefixState>,
     /// Admission generation used to reject results from prior request lifetimes.
     pub(crate) request_epoch: u64,
-    /// Most recent accepted state-producing operation.
-    pub(crate) last_state_op_id: ComputationId,
+    /// Most recent accepted state-producing call.
+    pub(crate) last_state_call_id: CallId,
     /// Last device token retained until a consumer is registered.
     pub(crate) latest_token: Option<TensorRef>,
     /// A false device predicate invalidated the unresolved successor chain.
@@ -390,7 +390,7 @@ struct MediaFlowState {
     audio_encoded: bool,
     muxing_scheduled: bool,
     muxed: bool,
-    predecessor: ComputationId,
+    predecessor: CallId,
     terminal_intent: TerminalIntent,
     artifact: Option<ArtifactEvent>,
 }
@@ -519,8 +519,8 @@ pub struct Scheduler {
     num_pending_transfers: usize,
     batch_id: u64,
     next_arrival_seq: u64,
-    pending_operations: HashMap<RequestId, VecDeque<InflightOp>>,
-    pending_completions: HashMap<RequestId, BTreeMap<ComputationId, PendingCompletion>>,
+    pending_calls: HashMap<RequestId, VecDeque<InflightOp>>,
+    pending_completions: HashMap<RequestId, BTreeMap<CallId, PendingCompletion>>,
     pending_finishes: HashMap<RequestId, PendingFinish>,
     pending_batches: HashMap<u64, PendingBatch>,
     denoise_step_burst: u16,
@@ -540,7 +540,7 @@ pub struct Scheduler {
     /// the control loop exits and the host converts this into engine-dead.
     fatal: bool,
     trace_sink: Option<crate::scheduler::bench_trace::RuntimeTraceSink>,
-    /// Largest number of operations observed in one submitted batch.
+    /// Largest number of calls observed in one submitted batch.
     pub peak_ops_in_batch: usize,
     /// Shared scheduler counters and latency accumulators.
     pub stats: Arc<SchedulerStats>,
@@ -626,38 +626,38 @@ fn finish_token_ids(request: &GenerationRequest, eos: &[u32]) -> Vec<u32> {
     finish_token_ids
 }
 
-/// Returns the operation batch classification.
-fn batch_kind(operation_variant: Computation) -> BatchKind {
-    match operation_variant {
-        Computation::Forward(ForwardMode::Prefill)
-        | Computation::Pipeline(PipelineStage::TextEncoding)
-        | Computation::Pipeline(PipelineStage::VisionEncoding)
-        | Computation::Pipeline(PipelineStage::LatentEncoding) => BatchKind::Prefill,
-        Computation::Forward(ForwardMode::Decode) | Computation::Forward(ForwardMode::Verify) => {
+/// Returns the call batch classification.
+fn batch_kind(call_variant: CallKind) -> BatchKind {
+    match call_variant {
+        CallKind::Forward(ForwardMode::Prefill)
+        | CallKind::Pipeline(PipelineStage::TextEncoding)
+        | CallKind::Pipeline(PipelineStage::VisionEncoding)
+        | CallKind::Pipeline(PipelineStage::LatentEncoding) => BatchKind::Prefill,
+        CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
             BatchKind::Decode
         }
-        Computation::Pipeline(PipelineStage::Denoising)
-        | Computation::Pipeline(PipelineStage::VideoDecoding)
-        | Computation::Pipeline(PipelineStage::LatentPreparation)
-        | Computation::Pipeline(
+        CallKind::Pipeline(PipelineStage::Denoising)
+        | CallKind::Pipeline(PipelineStage::VideoDecoding)
+        | CallKind::Pipeline(PipelineStage::LatentPreparation)
+        | CallKind::Pipeline(
             PipelineStage::VideoEncoding
             | PipelineStage::AudioEncoding
             | PipelineStage::AudioDecoding
             | PipelineStage::Muxing,
         )
-        | Computation::Pipeline(PipelineStage::ImageDecoding)
-        | Computation::Transfer(TransferMode::Tensor)
-        | Computation::Transfer(TransferMode::KvPublish)
-        | Computation::Transfer(TransferMode::KvInstall) => BatchKind::Media,
+        | CallKind::Pipeline(PipelineStage::ImageDecoding)
+        | CallKind::Transfer(TransferMode::Tensor)
+        | CallKind::Transfer(TransferMode::KvPublish)
+        | CallKind::Transfer(TransferMode::KvInstall) => BatchKind::Media,
     }
 }
 
 /// Returns the scheduling priority for a completion.
-fn completion_priority(operation_variant: Computation) -> u8 {
-    match operation_variant {
-        Computation::Pipeline(PipelineStage::Denoising)
-        | Computation::Pipeline(PipelineStage::ImageDecoding)
-        | Computation::Transfer(TransferMode::KvInstall) => 0,
+fn completion_priority(call_variant: CallKind) -> u8 {
+    match call_variant {
+        CallKind::Pipeline(PipelineStage::Denoising)
+        | CallKind::Pipeline(PipelineStage::ImageDecoding)
+        | CallKind::Transfer(TransferMode::KvInstall) => 0,
         _ => 1,
     }
 }
@@ -714,36 +714,36 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 }
 
 /// Computes the event capacity required before scheduling one transition.
-fn operation_output_bound(code: Computation, bounds: &uniserve_worker_ipc::Bounds) -> usize {
+fn call_output_bound(code: CallKind, bounds: &uniserve_worker_ipc::Bounds) -> usize {
     match code {
-        Computation::Forward(ForwardMode::Verify) => (bounds.max_tokens as usize)
+        CallKind::Forward(ForwardMode::Verify) => (bounds.max_tokens as usize)
             .saturating_mul(2)
             .saturating_add(2),
-        Computation::Forward(ForwardMode::Prefill) | Computation::Forward(ForwardMode::Decode) => 4,
-        Computation::Pipeline(PipelineStage::Denoising) => {
+        CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,
+        CallKind::Pipeline(PipelineStage::Denoising) => {
             (bounds.max_tokens as usize).saturating_add(2)
         }
-        Computation::Pipeline(PipelineStage::VideoDecoding) => 2,
-        Computation::Pipeline(PipelineStage::ImageDecoding) => 3,
+        CallKind::Pipeline(PipelineStage::VideoDecoding) => 2,
+        CallKind::Pipeline(PipelineStage::ImageDecoding) => 3,
         _ => 2,
     }
 }
 
-/// Records the operation in the optional benchmark trace.
-fn operation_trace(operation: &ScheduledRequest) -> serde_json::Value {
-    let parent_kind = match operation.predecessor {
-        Some(_) => "operation",
+/// Records the call in the optional benchmark trace.
+fn call_trace(call: &Call) -> serde_json::Value {
+    let parent_kind = match call.predecessor {
+        Some(_) => "call",
         None => "none",
     };
     json!({
-        "kind": operation.code.as_str(),
+        "kind": call.code.as_str(),
             "parent_kind": parent_kind,
-        "predicated": operation.predicate.as_ref().is_some(),
-        "inputs": operation.tensor_inputs().count(),
-        "outputs": operation.tensor_outputs().count(),
-        "max_tokens": operation.bounds.max_tokens,
-        "max_kv_pages": operation.bounds.max_kv_pages,
-        "output_event_bound": operation_output_bound(operation.code, &operation.bounds),
+        "predicated": call.predicate.as_ref().is_some(),
+        "inputs": call.tensor_inputs().count(),
+        "outputs": call.tensor_outputs().count(),
+        "max_tokens": call.bounds.max_tokens,
+        "max_kv_pages": call.bounds.max_kv_pages,
+        "output_event_bound": call_output_bound(call.code, &call.bounds),
     })
 }
 
