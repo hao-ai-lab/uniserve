@@ -128,75 +128,6 @@ pub struct WorkerExecutor {
 }
 
 impl WorkerExecutor {
-    /// Bind ready instances with independent queues and their physical wake descriptors.
-    /// Refuses a transfer edge whose endpoints cannot reach each other.
-    ///
-    /// A device handle crosses hosts only where the producing device exports a
-    /// fabric handle and the consuming device can import one. Shared memory
-    /// names a segment in one host's namespace and crosses no host at all.
-    /// Either edge would fail on its first publication, so it is refused at
-    /// startup naming both endpoints instead.
-    fn refuse_unreachable_edges(
-        workers: &[(WorkerId, WorkerGroup)],
-        transfer: &TransferConfig,
-    ) -> anyhow::Result<()> {
-        let reach = workers
-            .iter()
-            .map(|(id, group)| (id.0.as_str(), group.rank_fabric_reach()))
-            .collect::<HashMap<_, _>>();
-
-        // A rank omitted from an edge names every rank of that worker.
-        let members = |worker: &str, rank: Option<u32>| -> Vec<(String, bool)> {
-            let Some(ranks) = reach.get(worker) else {
-                return Vec::new();
-            };
-            match rank {
-                Some(rank) => ranks.get(rank as usize).cloned().into_iter().collect(),
-                None => ranks.clone(),
-            }
-        };
-
-        for edge in &transfer.edges {
-            let device = match edge.transport {
-                crate::executor::TransferBackend::CudaVmm => true,
-                crate::executor::TransferBackend::Shm => false,
-                // A local edge stays inside one rank's address space.
-                crate::executor::TransferBackend::Local => continue,
-            };
-            for (source_host, source_fabric) in members(&edge.source_worker.0, edge.source_rank) {
-                for (destination_host, destination_fabric) in
-                    members(&edge.destination_worker.0, edge.destination_rank)
-                {
-                    if source_host == destination_host {
-                        continue;
-                    }
-                    anyhow::ensure!(
-                        device,
-                        "transfer edge from worker {} on host {source_host} to worker {} on host \
-                         {destination_host} crosses hosts over shared memory, which names a \
-                         segment in one host's namespace",
-                        edge.source_worker.0,
-                        edge.destination_worker.0,
-                    );
-                    let unreachable = if source_fabric {
-                        &destination_host
-                    } else {
-                        &source_host
-                    };
-                    anyhow::ensure!(
-                        source_fabric && destination_fabric,
-                        "transfer edge from worker {} on host {source_host} to worker {} on host \
-                         {destination_host} crosses hosts, and the device on host {unreachable} \
-                         exports a process descriptor the other host cannot import",
-                        edge.source_worker.0,
-                        edge.destination_worker.0,
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub fn try_new(
         workers: Vec<(WorkerId, WorkerGroup)>,
         transfer: TransferConfig,
@@ -218,8 +149,6 @@ impl WorkerExecutor {
             "WorkerExecutor supports at most {} workers",
             u64::BITS
         );
-
-        Self::refuse_unreachable_edges(&workers, &transfer)?;
 
         let mut routing = HashMap::new();
         for (index, (id, executor)) in workers.iter().enumerate() {
@@ -295,21 +224,55 @@ impl WorkerExecutor {
                                 .any(|name| name == backend),
                         "physical edge requires an uninitialized transfer backend {backend}"
                     );
-                    anyhow::ensure!(
-                        source.endpoint.node == destination.endpoint.node,
-                        "{backend} requires endpoints on the same node"
-                    );
+                    // Each mechanism decides for itself how far it reaches.
+                    // An edge it cannot serve would fail on its first
+                    // publication, so it is refused here by name instead.
+                    let (source_host, destination_host) =
+                        (&source.endpoint.node, &destination.endpoint.node);
+                    let crosses_hosts = source_host != destination_host;
                     match edge.transport {
                         crate::executor::TransferBackend::Local => anyhow::ensure!(
                             source.endpoint.address_space == destination.endpoint.address_space,
                             "local transfer requires a shared address space"
                         ),
-                        crate::executor::TransferBackend::CudaVmm => anyhow::ensure!(
-                            source.device.starts_with("cuda:")
-                                && destination.device.starts_with("cuda:"),
-                            "CUDA VMM requires CUDA devices on both endpoints"
+                        crate::executor::TransferBackend::CudaVmm => {
+                            anyhow::ensure!(
+                                source.device.starts_with("cuda:")
+                                    && destination.device.starts_with("cuda:"),
+                                "CUDA VMM requires CUDA devices on both endpoints"
+                            );
+                            // A device handle crosses hosts only where the
+                            // producing device exports a fabric handle and the
+                            // consuming device can import one.
+                            if crosses_hosts {
+                                let unreachable = if source.fabric_handles {
+                                    destination_host
+                                } else {
+                                    source_host
+                                };
+                                anyhow::ensure!(
+                                    source.fabric_handles && destination.fabric_handles,
+                                    "transfer edge from worker {} on host {source_host} to \
+                                     worker {} on host {destination_host} crosses hosts, and \
+                                     the device on host {unreachable} exports a process \
+                                     descriptor the other host cannot import",
+                                    edge.source_worker.0,
+                                    edge.destination_worker.0,
+                                );
+                            }
+                        }
+                        // Shared memory names a segment in one host's namespace.
+                        crate::executor::TransferBackend::Shm => anyhow::ensure!(
+                            !crosses_hosts,
+                            "transfer edge from worker {} on host {source_host} to worker {} \
+                             on host {destination_host} crosses hosts over shared memory, \
+                             which names a segment in one host's namespace",
+                            edge.source_worker.0,
+                            edge.destination_worker.0,
                         ),
-                        crate::executor::TransferBackend::Shm => {}
+                        // A product on the rank channel reaches wherever the
+                        // channel does, which is every host of the instance.
+                        crate::executor::TransferBackend::Channel => {}
                     }
                 }
             }
