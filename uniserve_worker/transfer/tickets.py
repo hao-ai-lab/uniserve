@@ -41,6 +41,7 @@ from ..protocol.transfer import (
 )
 from .endpoint import PublicationEndpoint, finish_reader, open_reader
 from .layout import region_view, validate_destination
+from .vmm_pool import PoolExhaustedError, VmmPool
 
 if TYPE_CHECKING:
     import torch
@@ -1464,6 +1465,11 @@ class CudaVmmTransport(Transport):
             | None
         ) = None
         self._bytes = capacity
+        # One bounded pool per device, reserved when that device first
+        # publishes, so a rank reserves nothing on a device it never
+        # publishes from. The pool is bounded by this rank's transfer byte
+        # budget, which is what that budget already governs.
+        self._pools: dict[str, VmmPool] = {}
         self._publications = PublicationEndpoint[_CudaSource](
             reader_capacity=capacity.ticket_capacity,
             publication_capacity=256,
@@ -1504,6 +1510,15 @@ class CudaVmmTransport(Transport):
     def _drain(self, source: _CudaSource) -> None:
         source.event.synchronize()
         self._events.reap()
+
+    def _pool(self, device: torch.device) -> VmmPool:
+        """Return this device's pool, reserving it on first publication."""
+        key = str(device)
+        pool = self._pools.get(key)
+        if pool is None:
+            pool = VmmPool(device, capacity_bytes=self._bytes.capacity)
+            self._pools[key] = pool
+        return pool
 
     def publish(
         self,
@@ -1546,22 +1561,47 @@ class CudaVmmTransport(Transport):
         descriptor = None
         copied_source = None
         try:
-            exported = export_handle(first)
-            if exported is None:
-                # Arbitrary CUDA tensors retain the same publication behavior.
-                # Materialize only their logical spans, never their enclosing
-                # allocator segment. Shared worker arenas export directly.
-                shared = empty(shape, dtype=first.dtype, device=first.device)
+            # A publication is a chunk of this device's pool, so the handle a
+            # consumer imports is the pool's, exported once at reservation,
+            # and the offset locates the chunk inside it. Only their logical
+            # spans are materialized, never an enclosing allocator segment.
+            pool = self._pool(first.device)
+            chunk = None
+            try:
+                chunk = pool.reserve(_nbytes(tensor))
+            except PoolExhaustedError:
+                # A product the pool cannot hold keeps its own allocation
+                # rather than failing the publication.
+                pass
+            if chunk is not None:
+                shared = chunk.storage.view(first.dtype).view(shape)
                 for target, value in _copy_pairs(source, shared):
                     target.copy_(value, non_blocking=True)
                 copied_source = source
                 source = shared
                 spans = (shared,)
                 first = shared
+                descriptor = pool.handle
+                storage_size = pool.capacity
+                storage_offset = chunk.offset
+            else:
                 exported = export_handle(first)
                 if exported is None:
-                    raise RuntimeError("shared allocation cannot be exported")
-            descriptor, storage_size, storage_offset = exported
+                    shared = empty(
+                        shape, dtype=first.dtype, device=first.device
+                    )
+                    for target, value in _copy_pairs(source, shared):
+                        target.copy_(value, non_blocking=True)
+                    copied_source = source
+                    source = shared
+                    spans = (shared,)
+                    first = shared
+                    exported = export_handle(first)
+                    if exported is None:
+                        raise RuntimeError(
+                            "shared allocation cannot be exported"
+                        )
+                descriptor, storage_size, storage_offset = exported
             event = self._events.acquire(first.device, interprocess=True)
             self._events.retain(event, first.device)
             self._events.record(event, first.device)
