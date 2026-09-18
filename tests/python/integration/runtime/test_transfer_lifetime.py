@@ -687,18 +687,22 @@ def test_shm_retirement_preserves_granted_fanout_and_reclaims_capacity(
         events.close()
 
 
-def test_cuda_vmm_publication_is_readable_when_it_returns() -> None:
-    """A published chunk needs no fence to travel with it.
+def test_cuda_vmm_publication_read_from_another_host_carries_no_fence() -> None:
+    """A chunk whose readers are elsewhere is readable when it is published.
 
     An interprocess event handle does not reach another host, and imported VMM
     memory admits no device-side wait on current drivers, so the producer
-    synchronizes after copying into the chunk instead. A consumer that maps the
-    chunk may read it immediately, wherever it runs.
+    synchronizes after copying into the chunk instead and the publication
+    carries nothing for a consumer to wait on.
     """
     device = torch.device("cuda:0")
     events = EventPool()
     transport = make_transport(
-        "cuda_vmm", byte_capacity=1 << 20, ticket_capacity=1, event_pool=events
+        "cuda_vmm",
+        byte_capacity=1 << 20,
+        ticket_capacity=1,
+        event_pool=events,
+        cross_host_consumers=True,
     )
     locator = None
     try:
@@ -715,6 +719,42 @@ def test_cuda_vmm_publication_is_readable_when_it_returns() -> None:
         )
         assert not locator.transport.ready_event_handle, (
             "a pool publication carries a fence a consumer cannot import"
+        )
+    finally:
+        if locator is not None:
+            transport.release(locator)
+        transport.close()
+        events.close()
+
+
+def test_cuda_vmm_publication_read_on_this_host_does_not_stall_its_producer() -> (
+    None
+):
+    """Readiness within a host is an event, which costs the producer nothing.
+
+    Every consumer on this host can wait on an interprocess event, so a
+    publication hands them one rather than draining the producing stream. A
+    synchronize here would be a bubble the placement does not require, and on
+    a single-host instance every publication would pay it.
+    """
+    device = torch.device("cuda:0")
+    events = EventPool()
+    transport = make_transport(
+        "cuda_vmm", byte_capacity=1 << 20, ticket_capacity=1, event_pool=events
+    )
+    locator = None
+    try:
+        source = torch.ones(1024, device=device)
+        stream = torch.cuda.Stream(device=device)
+        submitted = torch.cuda.Event()
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(1_000_000_000)
+            locator = transport.publish(source)
+            submitted.record(stream)
+
+        assert not submitted.query(), "publication drained the producing stream"
+        assert len(locator.transport.ready_event_handle) == 64, (
+            "a publication read on this host carries the fence to wait on"
         )
     finally:
         if locator is not None:

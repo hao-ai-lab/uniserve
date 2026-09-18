@@ -242,6 +242,7 @@ impl WorkerProcessArgs {
         channel_transport: &str,
         acknowledgment_slot: u32,
         product_consumers: &[u32],
+        products_cross_hosts: bool,
     ) -> anyhow::Result<serde_json::Value> {
         let depth = self.queue_depth.max(1);
         let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
@@ -256,6 +257,10 @@ impl WorkerProcessArgs {
         // producer watches the slots of the ranks that read its products.
         fields.insert("acknowledgment_slot".into(), json!(acknowledgment_slot));
         fields.insert("product_consumers".into(), json!(product_consumers));
+        // Readiness is a producer synchronize only where an interprocess event
+        // cannot carry it, which is exactly where a consumer is on another
+        // host. Only the placement knows that.
+        fields.insert("products_cross_hosts".into(), json!(products_cross_hosts));
         fields.insert("queue_depth".into(), json!(depth));
         fields.insert("ipc_payload_cap".into(), json!(max_payload));
         fields.insert("model".into(), json!(self.model));
@@ -455,6 +460,7 @@ impl PendingRank {
         // edges hold that, so the head states the consumers here.
         let acknowledgment_slot = args.transfer.acknowledgment_slot(&args.worker_id, rank);
         let product_consumers = args.transfer.product_consumers(&args.worker_id, rank);
+        let products_cross_hosts = args.transfer.products_cross_hosts(&args.worker_id, rank);
         let names = |backends: &std::collections::BTreeSet<crate::executor::TransferBackend>| {
             backends
                 .iter()
@@ -479,6 +485,7 @@ impl PendingRank {
             channel_transport,
             acknowledgment_slot,
             &product_consumers,
+            products_cross_hosts,
         )?;
         let descriptor_directory = tempfile::Builder::new()
             .prefix("uniserve-worker-launch")

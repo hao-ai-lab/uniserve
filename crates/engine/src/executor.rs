@@ -649,6 +649,13 @@ pub struct TransferConfig {
     /// a product's consumers needs the membership the placement gave each.
     #[serde(default)]
     pub worker_ranks: std::collections::BTreeMap<String, u32>,
+    /// Host of each rank of each worker an edge may name.
+    ///
+    /// A publication's readiness mechanism depends on where it is read: an
+    /// interprocess event reaches another process on this host and no further.
+    /// Only the placement knows where a consumer runs.
+    #[serde(default)]
+    pub worker_hosts: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl TransferConfig {
@@ -665,6 +672,10 @@ impl TransferConfig {
         for worker in workers {
             self.worker_ranks
                 .insert(worker.id.0.clone(), worker.ranks.len() as u32);
+            self.worker_hosts.insert(
+                worker.id.0.clone(),
+                worker.ranks.iter().map(|rank| rank.node.clone()).collect(),
+            );
         }
         for worker in workers {
             for (source_rank, source) in worker.ranks.iter().enumerate() {
@@ -764,12 +775,53 @@ impl TransferConfig {
         base + rank
     }
 
-    /// Acknowledgment slots of the ranks that read this rank's device products.
+    /// Whether any rank that reads this rank's products is on another host.
     ///
     /// A product retires when every consumer has written its word in the
     /// chunk's header, so the producer needs the consumers' identities and not
-    /// merely their number. A rank cannot derive this itself: the mapping lives
-    /// in the transfer edges, which only the head holds.
+    /// merely their number. A rank cannot derive either this or that: the
+    /// mapping lives in the transfer edges, which only the head holds.
+    pub fn products_cross_hosts(&self, worker: &str, rank: u32) -> bool {
+        // Readiness is a producer synchronize only where it has to be. Within
+        // a host an interprocess event carries it at no cost to the producing
+        // stream, and stalling the producer for a consumer that could have
+        // waited on the device is a bubble the placement does not require.
+        let host = |name: &str, rank: u32| -> Option<&String> {
+            self.worker_hosts
+                .get(name)
+                .and_then(|hosts| hosts.get(rank as usize))
+        };
+        let Some(source_host) = host(worker, rank) else {
+            // An unplaced producer cannot be shown to stay on one host.
+            return true;
+        };
+        for edge in &self.edges {
+            if edge.source_worker.0 != worker
+                || !edge.source_rank.is_none_or(|source| source == rank)
+            {
+                continue;
+            }
+            let destination = &edge.destination_worker.0;
+            let members = || match edge.destination_rank {
+                Some(consumer) => consumer..consumer + 1,
+                None => 0..self.worker_ranks.get(destination).copied().unwrap_or(0),
+            };
+            for consumer in members() {
+                if destination == worker && consumer == rank {
+                    continue;
+                }
+                match host(destination, consumer) {
+                    Some(consumer_host) if consumer_host == source_host => {}
+                    // A consumer elsewhere, or one the placement does not
+                    // name, cannot be assumed to share this host.
+                    _ => return true,
+                }
+            }
+        }
+        false
+    }
+
+    /// Acknowledgment slots of the ranks that read this rank's device products.
     pub fn product_consumers(&self, worker: &str, rank: u32) -> Vec<u32> {
         let mut slots = std::collections::BTreeSet::new();
         for edge in &self.edges {
@@ -926,6 +978,7 @@ impl TransferConfig {
         Ok(Self {
             edges,
             worker_ranks: std::collections::BTreeMap::new(),
+            worker_hosts: std::collections::BTreeMap::new(),
         })
     }
 }

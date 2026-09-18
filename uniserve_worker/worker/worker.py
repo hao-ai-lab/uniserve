@@ -226,6 +226,7 @@ class Worker:
                 completion_payload_bytes=config.ipc.max_payload_bytes,
                 acknowledgment_slot=config.ipc.acknowledgment_slot,
                 product_consumers=config.ipc.product_consumers,
+                products_cross_hosts=config.ipc.products_cross_hosts,
                 components=config.components,
                 process_groups=distributed,
             )
@@ -251,6 +252,7 @@ class Worker:
         completion_payload_bytes: int,
         acknowledgment_slot: int = 0,
         product_consumers: tuple[int, ...] = (),
+        products_cross_hosts: bool = False,
         attention: str | None = None,
         transfer_backends: tuple[str, ...] = ("local",),
         publication_backends: tuple[str, ...] = ("local",),
@@ -608,6 +610,7 @@ class Worker:
                 event_pool=self.device_events,
                 consumers=product_consumers,
                 acknowledgment_slot=acknowledgment_slot,
+                cross_host_consumers=products_cross_hosts,
             )
             for transport in self.transports.values():
                 startup.callback(transport.close)

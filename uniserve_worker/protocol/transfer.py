@@ -173,14 +173,17 @@ class CudaVmmTransfer:
             )
             or any(length < 1 for length in self.span_lengths)
             or any(stride < 0 for stride in self.tensor_stride)
-            # A publication from a device pool is readable when it is
-            # published, so it carries no fence; any other length is not a
-            # handle a consumer can import.
+            # A publication read only from this host carries the event its
+            # consumers wait on. One read from another host carries no fence,
+            # because none would reach there; it was made readable before it
+            # was published. Any other length is not a handle to import.
+            or len(self.ready_event_handle) not in (0, 64)
+            # A publication outside the pool is the source itself, so it can
+            # only be read behind its producer's fence.
             or (
                 self.acknowledgment_offset < 0
                 and len(self.ready_event_handle) != 64
             )
-            or (self.acknowledgment_offset >= 0 and self.ready_event_handle)
             # A fabric handle is 64 bytes and a process descriptor is 4; any
             # other length is not a handle this rank can import.
             or len(self.allocation_handle) not in (4, 64)

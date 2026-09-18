@@ -2279,6 +2279,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "channel_transport": "iceoryx2",
     "acknowledgment_slot": 0,
     "product_consumers": [],
+    "products_cross_hosts": false,
     "worker_id": "worker",
     "queue_depth": 2,
     "ipc_payload_cap": 1048576,
