@@ -129,6 +129,63 @@ pub struct WorkerExecutor {
 
 impl WorkerExecutor {
     /// Bind ready instances with independent queues and their physical wake descriptors.
+    /// Refuses a device transfer edge whose endpoints cannot reach each other.
+    ///
+    /// A device handle crosses hosts only where the producing device exports a
+    /// fabric handle and the consuming device can import one. An edge between
+    /// ranks on different hosts whose devices export process descriptors would
+    /// fail on its first publication, so it is refused at startup naming both
+    /// endpoints instead.
+    fn refuse_unreachable_edges(
+        workers: &[(WorkerId, WorkerGroup)],
+        transfer: &TransferConfig,
+    ) -> anyhow::Result<()> {
+        let reach = workers
+            .iter()
+            .map(|(id, group)| (id.0.as_str(), group.rank_fabric_reach()))
+            .collect::<HashMap<_, _>>();
+
+        // A rank omitted from an edge names every rank of that worker.
+        let members = |worker: &str, rank: Option<u32>| -> Vec<(String, bool)> {
+            let Some(ranks) = reach.get(worker) else {
+                return Vec::new();
+            };
+            match rank {
+                Some(rank) => ranks.get(rank as usize).cloned().into_iter().collect(),
+                None => ranks.clone(),
+            }
+        };
+
+        for edge in &transfer.edges {
+            if edge.transport != crate::executor::TransferBackend::CudaIpc {
+                continue;
+            }
+            for (source_host, source_fabric) in members(&edge.source_worker.0, edge.source_rank) {
+                for (destination_host, destination_fabric) in
+                    members(&edge.destination_worker.0, edge.destination_rank)
+                {
+                    if source_host == destination_host {
+                        continue;
+                    }
+                    let unreachable = if source_fabric {
+                        &destination_host
+                    } else {
+                        &source_host
+                    };
+                    anyhow::ensure!(
+                        source_fabric && destination_fabric,
+                        "transfer edge from worker {} on host {source_host} to worker {} on host \
+                         {destination_host} crosses hosts, and the device on host {unreachable} \
+                         exports a process descriptor the other host cannot import",
+                        edge.source_worker.0,
+                        edge.destination_worker.0,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn try_new(
         workers: Vec<(WorkerId, WorkerGroup)>,
         transfer: TransferConfig,
@@ -150,6 +207,8 @@ impl WorkerExecutor {
             "WorkerExecutor supports at most {} workers",
             u64::BITS
         );
+
+        Self::refuse_unreachable_edges(&workers, &transfer)?;
 
         let mut routing = HashMap::new();
         for (index, (id, executor)) in workers.iter().enumerate() {

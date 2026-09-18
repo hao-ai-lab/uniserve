@@ -65,6 +65,16 @@ def empty(
     return storage[:elements].view(shape)
 
 
+def exports_fabric_handles(device: int) -> bool:
+    """Report whether this device exports a handle another host can import.
+
+    A fabric handle crosses hosts inside the fabric domain; a process
+    descriptor reaches only the host that created it, so an instance whose
+    devices export descriptors cannot place a transfer edge across hosts.
+    """
+    return _extension().exports_fabric_handles(device)
+
+
 def export_handle(tensor: torch.Tensor) -> tuple[bytes, int, int] | None:
     """Export shared storage as a shareable handle, byte capacity and offset.
 

@@ -159,6 +159,13 @@ pub struct WorkerInfo {
     pub device: String,
     /// Physical transfer mechanisms initialized by this rank.
     pub transfer_backends: Vec<String>,
+    /// Whether this rank's device exports a fabric allocation handle.
+    ///
+    /// A fabric handle is importable from another host inside the fabric
+    /// domain; a descriptor handle reaches only the host that created it, so
+    /// this is what decides whether a transfer edge may cross hosts.
+    #[serde(default)]
+    pub fabric_handles: bool,
     /// Number of physical members in this Worker.
     pub world_size: u32,
     /// Stable identity of the expanded component configuration.
@@ -359,6 +366,7 @@ impl Default for WorkerInfo {
             model_name: "model".to_owned(),
             pipeline_components: Default::default(),
             num_inference_steps: 0,
+            fabric_handles: false,
             endpoint: WorkerEndpoint {
                 worker_id: "worker".into(),
                 rank: 0,

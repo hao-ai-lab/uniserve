@@ -81,6 +81,22 @@ class WorkerLayout:
     model_dtype: str
 
 
+def _exports_fabric_handles(device: object) -> bool:
+    """Report whether this rank's device exports a handle another host imports.
+
+    A rank without a CUDA device publishes nothing across a device transport,
+    so it reports no fabric capability rather than probing one it cannot use.
+    """
+    import torch
+
+    resolved = torch.device(str(device))
+    if resolved.type != "cuda":
+        return False
+    from uniserve_kernel.peer_memory import exports_fabric_handles
+
+    return exports_fabric_handles(resolved.index or 0)
+
+
 def configuration_identity(
     model: nn.Module,
     worker_config: WorkerConfig,
@@ -239,6 +255,7 @@ def build_worker_layout(
             code for code in CALL_KINDS if code in supported_ops
         ),
         transfer_backends=transfer_backends,
+        fabric_handles=_exports_fabric_handles(worker_config.device),
         max_batch_ops=max_calls,
         max_batch_tokens=max_tokens,
         encoder_cache_entries=layout.encoder_cache_entries,
