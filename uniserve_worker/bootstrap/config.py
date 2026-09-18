@@ -324,6 +324,7 @@ class WorkerIpcConfig:
     """
 
     registration_address: str
+    channel_transport: str
     max_payload_bytes: int
     queue_depth: int
 
@@ -417,6 +418,7 @@ class WorkerProcessArgs:
             supported_ops=supported_ops,
             ipc=WorkerIpcConfig(
                 registration_address=str(namespace.registration_address),
+                channel_transport=str(namespace.channel_transport),
                 max_payload_bytes=int(namespace.ipc_payload_cap),
                 queue_depth=int(namespace.queue_depth),
             ),

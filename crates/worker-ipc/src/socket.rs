@@ -368,6 +368,8 @@ pub struct SocketServer {
     bound: usize,
     /// The address the engine connects to, as it travels in the registration.
     address: String,
+    /// Descriptor this rank's own completion callbacks fire on.
+    local: LocalWake,
 }
 
 impl SocketServer {
@@ -391,12 +393,55 @@ impl SocketServer {
             reader: FrameReader::new(),
             bound,
             address,
+            local: LocalWake::new()?,
         })
+    }
+
+    /// Returns the sender this rank's completion callbacks fire.
+    ///
+    /// A device, transfer or host-lane completion is raised inside the rank,
+    /// so it wakes the rank's own service loop and never reaches the engine.
+    pub fn completion_wake(&self) -> Arc<dyn Fn() + Send + Sync> {
+        self.local.sender()
     }
 
     /// Returns the address the engine connects to.
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    /// Accepts the engine's connection if one is waiting, without blocking.
+    ///
+    /// A rank reports its address and then serves; the engine connects once,
+    /// some time later. The rank notices that arrival on its next receive
+    /// rather than stopping to wait for it.
+    pub fn accept_if_pending(&mut self) -> IpcResult<()> {
+        if self.stream.is_some() {
+            return Ok(());
+        }
+        let Some(listener) = self.listener.as_ref() else {
+            return Ok(());
+        };
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| IpcError::Transport(format!("polling for a rank channel: {error}")))?;
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_nodelay(true)
+                    .map_err(|error| IpcError::Transport(format!("disabling Nagle: {error}")))?;
+                stream.set_nonblocking(true).map_err(|error| {
+                    IpcError::Transport(format!("making a rank channel pollable: {error}"))
+                })?;
+                self.stream = Some(stream);
+                self.listener = None;
+                Ok(())
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(()),
+            Err(error) => Err(IpcError::Transport(format!(
+                "accepting a rank channel: {error}"
+            ))),
+        }
     }
 
     /// Accepts the engine's connection, waiting up to the deadline.
@@ -452,11 +497,11 @@ impl SocketServer {
         Ok(self.reader.ready.pop_front())
     }
 
-    /// Waits until a request is readable or the deadline passes.
+    /// Waits until a request is readable, a completion fires, or time passes.
     pub fn wait_incoming(&mut self, timeout: Duration) -> IpcResult<()> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if !self.reader.ready.is_empty() {
+            if !self.reader.ready.is_empty() || self.local.take() {
                 return Ok(());
             }
             if let Some(stream) = self.stream.as_mut() {

@@ -238,12 +238,17 @@ impl WorkerProcessArgs {
         transfer_backends: &str,
         publish_backends: &str,
         distributed_init_method: Option<String>,
+        channel_transport: &str,
     ) -> anyhow::Result<serde_json::Value> {
         let depth = self.queue_depth.max(1);
         let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
         let mut fields = serde_json::Map::new();
         fields.insert("worker_id".into(), json!(self.worker_id));
         fields.insert("registration_address".into(), json!(registration));
+        // The placement decides the mechanism and the rank names the endpoint:
+        // a rank on the head's host can offer shared memory, a rank elsewhere
+        // cannot, and only the head knows where a rank was placed.
+        fields.insert("channel_transport".into(), json!(channel_transport));
         fields.insert("queue_depth".into(), json!(depth));
         fields.insert("ipc_payload_cap".into(), json!(max_payload));
         fields.insert("model".into(), json!(self.model));
@@ -426,6 +431,7 @@ impl PendingRank {
         rank: u32,
         world_size: u32,
         rendezvous: Option<String>,
+        channel_transport: &str,
         components: &std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         registration: &str,
@@ -456,6 +462,7 @@ impl PendingRank {
             &names(&backends),
             &names(&publications),
             distributed_init_method,
+            channel_transport,
         )?;
         let descriptor_directory = tempfile::Builder::new()
             .prefix("uniserve-worker-launch")

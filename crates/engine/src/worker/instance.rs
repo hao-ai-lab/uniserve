@@ -72,6 +72,13 @@ impl WorkerProcessArgs {
                 rank as u32,
                 self.ranks.len() as u32,
                 rendezvous.clone(),
+                // A rank on the head's host can offer shared memory; a rank
+                // placed elsewhere has none to offer and serves a socket.
+                if self.ranks[rank].node == self.host {
+                    uniserve_worker_ipc::SHARED_MEMORY_CHANNEL
+                } else {
+                    uniserve_worker_ipc::SOCKET_CHANNEL
+                },
                 &self.entries,
                 cancel.clone(),
                 registry.address(),

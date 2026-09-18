@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 # so this only has to cover the head accepting an already-bound connection.
 REGISTRATION_TIMEOUT_SECONDS = 60
 
+# A socket endpoint binds every interface so a rank on another host can be
+# reached; the port is chosen by the system and reported once it exists.
+SOCKET_BIND_INTERFACE = "0.0.0.0"
+SOCKET_CHANNEL = "tcp"
+
 try:
     from .._uniserve_ipc import Server as WorkerIpcEndpoint
     from .._uniserve_ipc import service_name
@@ -31,10 +36,14 @@ except (
 def endpoint_name(config: WorkerProcessArgs) -> str:
     """Name this rank's channel endpoint.
 
-    The rank owns the name because only the rank knows which mechanism it can
-    offer; a rank on the head's host offers a shared-memory service. The name
-    is distinct across ranks and across successive launches of one rank.
+    The placement decides the mechanism and the rank names the endpoint. A
+    shared-memory endpoint is named by a service distinct across ranks and
+    across successive launches of one rank; a socket endpoint is named by the
+    address it binds, so the rank offers the interface to bind on and reports
+    the address that binding produced.
     """
+    if config.ipc.channel_transport == SOCKET_CHANNEL:
+        return SOCKET_BIND_INTERFACE
     return service_name(
         f"{os.getpid()}_{config.execution.rank}_{secrets.token_hex(8)}"
     )
@@ -44,13 +53,15 @@ def register_endpoint(config: WorkerProcessArgs, endpoint: str) -> None:
     """Report this rank's bound endpoint to the head's registration address.
 
     One JSON line carries the report; the connection carries nothing else and
-    closes once the head has read it.
+    closes once the head has read it. The endpoint is what the rank actually
+    bound, which for a socket is the address rather than the interface it was
+    given.
     """
     host, _, port = config.ipc.registration_address.rpartition(":")
     report = {
         "worker_id": config.worker_id,
         "rank": int(config.execution.rank),
-        "transport": "iceoryx2",
+        "transport": config.ipc.channel_transport,
         "endpoint": endpoint,
     }
     with socket.create_connection(
@@ -68,10 +79,12 @@ def run_worker(config: WorkerProcessArgs) -> None:
         endpoint_service,
         max_payload=config.ipc.max_payload_bytes,
         max_inflight=config.ipc.queue_depth,
+        transport=config.ipc.channel_transport,
     ) as endpoint:
         # The endpoint exists before it is named to anyone, so the head can
-        # bind its side as soon as it reads the report.
-        register_endpoint(config, endpoint_service)
+        # bind its side as soon as it reads the report. A socket reports the
+        # address it bound rather than the interface it was given.
+        register_endpoint(config, endpoint.endpoint(endpoint_service))
         with Worker.from_config(config) as worker:
             worker.bind(endpoint)
             logger.info(

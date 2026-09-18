@@ -4101,6 +4101,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "uniserve-host"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "uniserve-ipc-py"
 version = "0.2.0"
 dependencies = [

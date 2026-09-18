@@ -76,7 +76,9 @@ pub mod schema {
     include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
 }
 
-pub use channel::{Outstanding, RankChannel, SHARED_MEMORY_CHANNEL, SOCKET_CHANNEL, Wake};
+pub use channel::{
+    Outstanding, RankChannel, RankServer, SHARED_MEMORY_CHANNEL, SOCKET_CHANNEL, Wake,
+};
 pub use iceoryx::{
     ClientEndpoint, DEFAULT_SERVICE_PREFIX, EVT_COMMAND, EVT_COMPLETION, EVT_DEATH, EVT_REQUEST,
     EVT_RESULT, Frame, Header, IPC_VERSION, IpcError, IpcResult, Pending, ServerEndpoint,
