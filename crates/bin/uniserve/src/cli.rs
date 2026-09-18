@@ -3,7 +3,7 @@
 //! The parser exposes the serving command and lowers its model, scheduler,
 //! worker, and HTTP options into the typed server configuration.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -13,7 +13,7 @@ use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use uniserve_core::{KvCacheDtype, ModelDtype};
 use uniserve_engine::{
-    AttentionBackend, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
+    AttentionBackend, ComponentConfig, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
     FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
@@ -97,7 +97,11 @@ pub(crate) struct ServeArgs {
 impl ServeArgs {
     /// Builds the UniServe-native server config, binding the HTTP listener
     /// directly.
-    pub(crate) fn to_uniserve_config(&self, is_media: bool) -> Config {
+    pub(crate) fn to_uniserve_config(
+        &self,
+        is_media: bool,
+        entries: BTreeMap<String, ComponentConfig>,
+    ) -> Config {
         let listener_mode = match &self.uds {
             Some(path) => HttpListenerMode::BindUnix { path: path.clone() },
             None => HttpListenerMode::BindTcp {
@@ -105,7 +109,9 @@ impl ServeArgs {
                 port: self.port,
             },
         };
-        self.runtime.clone().into_config(listener_mode, is_media)
+        self.runtime
+            .clone()
+            .into_config(listener_mode, is_media, entries)
     }
 }
 
@@ -273,7 +279,40 @@ impl SharedRuntimeArgs {
         hosts
     }
 
-    pub(crate) fn engine_settings(&self, is_media: bool) -> EngineSettings {
+    /// Asks the model being served which computation entries it declares.
+    ///
+    /// A model states which components it owns and how each one partitions;
+    /// this process places ranks and names none of them. The model package
+    /// answers without loading the model, so the query costs a process start.
+    pub(crate) fn declared_entries(&self) -> anyhow::Result<BTreeMap<String, ComponentConfig>> {
+        use anyhow::Context as _;
+
+        let output = std::process::Command::new(&self.worker_python)
+            .args(["-m", "uniserve_models.placement", "--model"])
+            .arg(&self.model)
+            .args(["--ranks", &self.worker_ranks.to_string()])
+            .output()
+            .with_context(|| {
+                format!(
+                    "asking {} for the entries {} declares",
+                    self.worker_python.display(),
+                    self.model
+                )
+            })?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{} declares no placement: {}",
+            self.model,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        serde_json::from_slice(&output.stdout).context("reading the entries the model declared")
+    }
+
+    pub(crate) fn engine_settings(
+        &self,
+        is_media: bool,
+        entries: &BTreeMap<String, ComponentConfig>,
+    ) -> EngineSettings {
         let mut worker_process = self.worker_process.to_args();
         worker_process.host = self.host_identity.clone();
         worker_process.python = self.worker_python.clone();
@@ -314,12 +353,13 @@ impl SharedRuntimeArgs {
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
             workers: self.workers.clone().map(Vec::from).unwrap_or_else(|| {
-                let hosts = self.placement_hosts();
-                vec![if is_media {
-                    WorkerConfig::h3(&hosts, &self.device, self.worker_ranks, queue_depth)
-                } else {
-                    WorkerConfig::model(&hosts, &self.device, self.worker_ranks, queue_depth)
-                }]
+                vec![WorkerConfig::placed(
+                    &self.placement_hosts(),
+                    &self.device,
+                    self.worker_ranks,
+                    queue_depth,
+                    entries.clone(),
+                )]
             }),
             transfer: self.transfer.clone().unwrap_or_default(),
             worker_process,
@@ -327,8 +367,13 @@ impl SharedRuntimeArgs {
     }
 
     /// Builds the OpenAI-server config for the in-process UniServe engine.
-    fn into_config(self, listener_mode: HttpListenerMode, is_media: bool) -> Config {
-        let engine = self.engine_settings(is_media);
+    fn into_config(
+        self,
+        listener_mode: HttpListenerMode,
+        is_media: bool,
+        entries: BTreeMap<String, ComponentConfig>,
+    ) -> Config {
+        let engine = self.engine_settings(is_media, &entries);
         let model = self.resolved_model();
         let api_key = self.configured_api_key();
         let request_timeout = self.request_timeout.map(Duration::from_secs);

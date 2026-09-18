@@ -22,9 +22,11 @@ use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats, SchedulingPolicy};
 use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
 use anyhow::Context as _;
+#[cfg(test)]
+use uniserve_core::ComponentDistribution;
 use uniserve_core::{
-    CommandWaker, ComponentConfig, ComponentDistribution, GenerationLimits, ModelDtype,
-    ParallelConfig, Request, RequestId, RuntimeFamily, SequenceParallel,
+    CommandWaker, ComponentConfig, GenerationLimits, ModelDtype, ParallelConfig, Request,
+    RequestId, RuntimeFamily,
 };
 use uniserve_worker_ipc::WorkerInfo;
 
@@ -125,12 +127,40 @@ impl WorkerConfig {
     }
 
     /// Expands the single-instance CLI shorthand into explicit device membership
-    /// across the named hosts.
+    /// across the named hosts, carrying the entries the model declared.
     ///
     /// Ranks are assigned in blocks, so the lowest ranks stay on the first
     /// host, and each host numbers its devices from zero. A placement on one
     /// host is the same arithmetic with one block.
-    pub fn model(hosts: &[String], device: &str, rank_count: usize, queue_depth: usize) -> Self {
+    ///
+    /// Which components exist and how each one partitions is the model's to
+    /// state, so `entries` arrives already resolved for this rank count. This
+    /// assigns rank identity and nothing else.
+    /// One component parallel over every rank.
+    ///
+    /// This is the whole placement a single-component model declares, and the
+    /// one a default or a simulation needs. A model with several components
+    /// states its own.
+    pub fn single_entry(name: &str, rank_count: usize) -> BTreeMap<String, ComponentConfig> {
+        BTreeMap::from([(
+            name.into(),
+            ComponentConfig::parallel(
+                (0..rank_count).collect(),
+                ParallelConfig {
+                    tensor_parallel_size: rank_count,
+                    ..Default::default()
+                },
+            ),
+        )])
+    }
+
+    pub fn placed(
+        hosts: &[String],
+        device: &str,
+        rank_count: usize,
+        queue_depth: usize,
+        entries: BTreeMap<String, ComponentConfig>,
+    ) -> Self {
         // A host takes its share of the ranks, and the first hosts take the
         // remainder, so a count that does not divide evenly still places every
         // rank and keeps each host's block contiguous.
@@ -151,73 +181,12 @@ impl WorkerConfig {
                 });
             }
         }
-        let ranks = placement;
         Self {
             id: WorkerId("model".into()),
-            ranks,
-            entries: BTreeMap::from([(
-                "model".into(),
-                ComponentConfig::parallel(
-                    (0..rank_count).collect(),
-                    ParallelConfig {
-                        tensor_parallel_size: rank_count,
-                        ..Default::default()
-                    },
-                ),
-            )]),
+            ranks: placement,
+            entries,
             queue_depth,
         }
-    }
-
-    /// Resolves the explicit device budget into the established H3 Ulysses params.
-    pub fn h3(hosts: &[String], device: &str, rank_count: usize, queue_depth: usize) -> Self {
-        let mut worker = Self::model(hosts, device, rank_count, queue_depth);
-        let ranks: Vec<_> = (0..rank_count).collect();
-        let denoiser = ParallelConfig {
-            sequence_parallel: SequenceParallel::Ulysses {
-                ulysses_degree: ranks.len(),
-            },
-            ..ParallelConfig::default()
-        };
-        let encoder = ParallelConfig {
-            tensor_parallel_size: ranks.len(),
-            ..ParallelConfig::default()
-        };
-        worker.entries = BTreeMap::from([
-            (
-                "denoiser".into(),
-                ComponentConfig::parallel(ranks.clone(), denoiser),
-            ),
-            (
-                "text_encoder".into(),
-                ComponentConfig::parallel(ranks.clone(), encoder),
-            ),
-            (
-                "video_decoder".into(),
-                ComponentConfig {
-                    ranks: ranks.clone(),
-                    parallel_config: ParallelConfig::default(),
-                    distribution: Some(ComponentDistribution::TemporalUnits),
-                    units_per_rank: 1,
-                },
-            ),
-            (
-                "audio_decoder".into(),
-                ComponentConfig {
-                    ranks: ranks.clone(),
-                    parallel_config: ParallelConfig::default(),
-                    distribution: Some(ComponentDistribution::TemporalUnits),
-                    units_per_rank: 1,
-                },
-            ),
-            (
-                // The muxer assembles encoded media units into the artifact and
-                // owns no numerical method, so it is placed alone.
-                "muxer".into(),
-                ComponentConfig::parallel(vec![0], ParallelConfig::default()),
-            ),
-        ]);
-        worker
     }
 }
 
@@ -269,7 +238,14 @@ impl EngineConfig {
     pub fn sim(model: impl Into<String>) -> Self {
         let worker_process = WorkerProcessArgs {
             model: model.into(),
-            ranks: WorkerConfig::model(&["localhost".to_owned()], "cpu", 1, 2).ranks,
+            ranks: WorkerConfig::placed(
+                &["localhost".to_owned()],
+                "cpu",
+                1,
+                2,
+                WorkerConfig::single_entry("model", 1),
+            )
+            .ranks,
             block_size: 64,
             queue_depth: 2,
             max_batch_calls: DEFAULT_MAX_BATCH as u32,
@@ -286,7 +262,13 @@ impl EngineConfig {
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: 8192,
-            workers: vec![WorkerConfig::model(&["localhost".to_owned()], "cpu", 1, 2)],
+            workers: vec![WorkerConfig::placed(
+                &["localhost".to_owned()],
+                "cpu",
+                1,
+                2,
+                WorkerConfig::single_entry("model", 1),
+            )],
             transfer: TransferConfig::default(),
             worker_process,
             // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
@@ -542,14 +524,40 @@ impl Drop for EngineCore {
 mod tests {
     use super::*;
 
+    /// Entries covering the shapes a placement must validate: one component
+    /// parallel over every rank, one dividing its output into units, and one
+    /// placed alone.
+    fn mixed_entries(rank_count: usize) -> BTreeMap<String, ComponentConfig> {
+        let members: Vec<_> = (0..rank_count).collect();
+        let mut entries = WorkerConfig::single_entry("parallel", rank_count);
+        entries.insert(
+            "divided".into(),
+            ComponentConfig {
+                ranks: members,
+                parallel_config: ParallelConfig::default(),
+                distribution: Some(ComponentDistribution::TemporalUnits),
+                units_per_rank: 1,
+            },
+        );
+        entries.insert(
+            "alone".into(),
+            ComponentConfig::parallel(vec![0], ParallelConfig::default()),
+        );
+        entries
+    }
+
     #[test]
     fn static_components_validate_their_own_parallel_members() -> anyhow::Result<()> {
         let mut workers = Vec::new();
-        for (name, degree) in [("text_encoder", 1), ("denoiser", 4), ("video_decoder", 2)] {
-            let mut worker = WorkerConfig::model(&["localhost".to_owned()], "cuda", degree, 2);
+        for (name, degree) in [("first", 1), ("second", 4), ("third", 2)] {
+            let mut worker = WorkerConfig::placed(
+                &["localhost".to_owned()],
+                "cuda",
+                degree,
+                2,
+                WorkerConfig::single_entry(name, degree),
+            );
             worker.id = WorkerId(name.into());
-            let entry = worker.entries.remove("model").unwrap();
-            worker.entries.insert(name.into(), entry);
             workers.push(worker);
         }
         WorkerConfig::validate_all(&workers)?;
@@ -565,7 +573,7 @@ mod tests {
         // the lowest ranks must stay on the first host and each host must
         // number its own devices from zero.
         let hosts = ["rank-0".to_owned(), "rank-1".to_owned()];
-        let worker = WorkerConfig::h3(&hosts, "cuda", 8, 2);
+        let worker = WorkerConfig::placed(&hosts, "cuda", 8, 2, mixed_entries(8));
 
         let placement: Vec<_> = worker
             .ranks
@@ -587,16 +595,16 @@ mod tests {
         );
         assert!(worker.validate().is_ok());
 
-        // Every component spans all eight ranks but the muxer, which assembles
-        // on rank zero and so stays on the head's host.
-        for entry in ["denoiser", "text_encoder", "video_decoder", "audio_decoder"] {
+        // A component the model spans over the instance keeps all eight ranks,
+        // and one it places alone stays on rank zero, which is the head's host.
+        for entry in ["parallel", "divided"] {
             assert_eq!(
                 worker.entries[entry].ranks.len(),
                 8,
                 "{entry} spans the instance"
             );
         }
-        assert_eq!(worker.entries["muxer"].ranks, vec![0]);
+        assert_eq!(worker.entries["alone"].ranks, vec![0]);
     }
 
     #[test]
@@ -604,7 +612,8 @@ mod tests {
         // The first hosts take the remainder, which keeps each host's block
         // contiguous and rank zero on the head's host.
         let hosts = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
-        let worker = WorkerConfig::model(&hosts, "cuda", 8, 2);
+        let worker =
+            WorkerConfig::placed(&hosts, "cuda", 8, 2, WorkerConfig::single_entry("model", 8));
 
         let nodes: Vec<_> = worker.ranks.iter().map(|rank| rank.node.as_str()).collect();
         assert_eq!(nodes, vec!["a", "a", "a", "b", "b", "b", "c", "c"]);
@@ -613,17 +622,24 @@ mod tests {
 
     #[test]
     fn entry_geometry_uses_unique_ordered_rank_members() {
-        let mut worker = WorkerConfig::h3(&["localhost".to_owned()], "cuda", 4, 2);
+        let mut worker =
+            WorkerConfig::placed(&["localhost".to_owned()], "cuda", 4, 2, mixed_entries(4));
         assert!(worker.validate().is_ok());
-        worker.entries.get_mut("denoiser").unwrap().ranks.swap(0, 3);
+        worker.entries.get_mut("parallel").unwrap().ranks.swap(0, 3);
         assert!(worker.validate().is_ok());
-        worker.entries.get_mut("denoiser").unwrap().ranks[1] = 3;
+        worker.entries.get_mut("parallel").unwrap().ranks[1] = 3;
         assert!(worker.validate().is_err());
     }
 
     #[test]
     fn static_bindings_reject_duplicate_identities_and_entry_owners() {
-        let worker = WorkerConfig::model(&["localhost".to_owned()], "cuda", 1, 2);
+        let worker = WorkerConfig::placed(
+            &["localhost".to_owned()],
+            "cuda",
+            1,
+            2,
+            WorkerConfig::single_entry("model", 1),
+        );
         let mut other = worker.clone();
         assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
         other.id = WorkerId("other".into());
