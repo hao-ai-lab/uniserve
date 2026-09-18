@@ -150,6 +150,20 @@ impl Scheduler {
         progressed
     }
 
+    /// Returns whether any rank queue can still accept a batch.
+    ///
+    /// `queue_depth` bounds the batches in flight on one rank, not across the
+    /// instance: a batch carries one computation to one component, so a media
+    /// pass occupies a slot on each component it touches rather than a single
+    /// shared slot. Assembling stops once every rank queue is full.
+    fn a_rank_queue_admits(&self) -> bool {
+        self.executor
+            .info()
+            .workers
+            .iter()
+            .any(|(worker, _)| self.executor.has_capacity(worker))
+    }
+
     /// Registers the computations and command receipts owned by one scheduled batch.
     pub(super) fn register_pending_batch(&mut self, batch: &ExecutionBatch, started: Instant) {
         self.pending_batches.insert(
@@ -262,7 +276,7 @@ impl Scheduler {
         loop {
             self.admit();
             self.admit_media();
-            if self.pending_batches.len() >= self.info.queue_depth.max(1) as usize {
+            if !self.a_rank_queue_admits() {
                 break;
             }
             let batches = self.schedule_batches();
@@ -278,7 +292,7 @@ impl Scheduler {
         }
         while self.pending_submissions.is_empty()
             && !self.pending_commands.is_empty()
-            && self.pending_batches.len() < self.info.queue_depth.max(1) as usize
+            && self.a_rank_queue_admits()
         {
             let commands = self.take_commands(|_| true);
             if commands.is_empty() {
