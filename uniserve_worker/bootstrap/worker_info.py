@@ -278,6 +278,10 @@ class WorkerInfo:
     components: tuple[EntryInfo, ...] = ()
     device: str = "cpu"
     transfer_backends: tuple[str, ...] = ("local",)
+    # Whether this rank's device exports a handle another host can import.
+    # A descriptor handle reaches only this host, so the engine refuses a
+    # transfer edge that would have to cross one.
+    fabric_handles: bool = False
     pipeline_components: dict[PipelineStage, str] = field(default_factory=dict)
     num_inference_steps: int = 0
 
@@ -432,6 +436,7 @@ class WorkerInfo:
                     data.get("transfer_backends"), f"{where}.transfer_backends"
                 )
             ),
+            fabric_handles=bool(data.get("fabric_handles", False)),
             world_size=_uint(data.get("world_size"), f"{where}.world_size"),
             supported_ops=tuple(
                 computation(item, f"{where}.supported_ops[{index}]")
@@ -492,6 +497,7 @@ class WorkerInfo:
             "endpoint": self.endpoint.to_mapping(),
             "device": self.device,
             "transfer_backends": list(self.transfer_backends),
+            "fabric_handles": self.fabric_handles,
             "world_size": self.world_size,
             "configuration_id": self.configuration_id,
             "components": [

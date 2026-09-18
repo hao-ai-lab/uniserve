@@ -1225,6 +1225,21 @@ impl WorkerGroup {
     }
 
     /// Returns metadata for the physical worker.
+    /// Returns each rank's host and whether its device exports a fabric handle.
+    ///
+    /// A transfer edge crosses hosts when its endpoints report different hosts,
+    /// and it can only do so if both devices export a handle the other host can
+    /// import.
+    pub fn rank_fabric_reach(&self) -> Vec<(String, bool)> {
+        self.workers
+            .iter()
+            .map(|rank| {
+                let info = rank.info();
+                (info.endpoint.node.clone(), info.fabric_handles)
+            })
+            .collect()
+    }
+
     pub fn info(&self) -> &WorkerInfo {
         &self.info
     }

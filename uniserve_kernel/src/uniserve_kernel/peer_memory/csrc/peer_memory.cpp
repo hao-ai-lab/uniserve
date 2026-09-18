@@ -95,6 +95,12 @@ size_t handle_bytes(CUmemAllocationHandleType type) {
                                            : sizeof(int);
 }
 
+// Reports whether this device's probed handle type is importable from
+// another host, which is what decides if a transfer edge may cross one.
+bool exports_fabric_handles(int device) {
+  return shareable_handle_type(device) == CU_MEM_HANDLE_TYPE_FABRIC;
+}
+
 CUmemAllocationProp allocation_properties(int device) {
   CUmemAllocationProp properties{};
   properties.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -455,6 +461,7 @@ void copy_host_device(torch::Tensor destination, torch::Tensor source, uint64_t 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, binding) {
   binding.def("allocation_granularity", &allocation_granularity);
+  binding.def("exports_fabric_handles", &exports_fabric_handles);
   binding.def("export_handle", &export_handle);
   binding.def("import_handle", &import_handle);
   binding.def("copy_host_device", &copy_host_device);

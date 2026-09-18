@@ -144,6 +144,10 @@ table WorkerInfo {
   endpoint:WorkerEndpoint;
   device:string;
   transfer_backends:[string];
+  // Whether this rank's device exports a fabric handle. A descriptor handle
+  // reaches only this host, so an edge that must cross one is refused at
+  // startup rather than failing on its first publication.
+  fabric_handles:bool = false;
   world_size:uint = 1;
   configuration_id:string;
   components:[EntryInfo];
