@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gc
 import logging
-from bisect import insort
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
@@ -703,21 +702,13 @@ class Worker:
         self._admission_closed = False
         self._shutdown_response: dict[str, Any] | None = None
 
-        # Ready requests follow submission order; dependencies and capacity can
-        # hold one request while unrelated ready work continues.
+        # A rank executes batches in channel order. Requests launch from the
+        # head of this queue in the order the channel delivered them, which is
+        # the order the engine dispatched them in, so cooperative ranks launch
+        # their collectives in the same order without a local chain. Only
+        # execution capacity holds the head back.
         self._pending_requests: dict[int, ServiceRequest] = {}
-        self._request_tails: dict[int, ServiceRequest] = {}
-        self._ready_requests: list[ServiceRequest] = []
-
-        # Collective participants must observe the host's submission order even
-        # when their local dependency chains become ready at different times.
-        self._collective_submission_tail: ServiceRequest | None = None
-        self._preserve_collective_order = any(
-            group.size > 1
-            for entry in self.runner.bindings.values()
-            if entry.owns
-            for group in entry.groups
-        ) or (self.sampling_group is not None and self.sampling_group.size > 1)
+        self._ready_requests: deque[ServiceRequest] = deque()
 
     def _init_run_tracking(self) -> None:
         """Initialize batch tracking state.
@@ -922,8 +913,6 @@ class Worker:
 
                 requests = messages.batch_requests(batch)
 
-            # Each request identifier forms a FIFO dependency chain. Multi-key
-            # work waits once per distinct predecessor to avoid double counts.
             pending = ServiceRequest(
                 sequence=sequence,
                 request=request,
@@ -931,36 +920,8 @@ class Worker:
                 kind=kind,
                 batch=batch,
             )
-
-            predecessors = {
-                id(predecessor): predecessor
-                for request_id in requests
-                if (predecessor := self._request_tails.get(request_id))
-                is not None
-            }
-            # Component participants can finish the same operation at
-            # different times. Preserve the host's cooperative submission
-            # order even when a later, independent request has already
-            # satisfied its own lineage. Release at successor visibility
-            # keeps device and CPU completion overlap under the existing
-            # execution credits.
-            if kind is RequestKind.SUBMIT and self._preserve_collective_order:
-                if self._collective_submission_tail is not None:
-                    predecessors[id(self._collective_submission_tail)] = (
-                        self._collective_submission_tail
-                    )
-                self._collective_submission_tail = pending
-
-            pending.dependencies = len(predecessors)
-            for predecessor in predecessors.values():
-                predecessor.successors.append(pending)
-
-            for request_id in requests:
-                self._request_tails[request_id] = pending
-
             self._pending_requests[sequence] = pending
-            if pending.dependencies == 0:
-                self._enqueue(pending)
+            self._ready_requests.append(pending)
         except BaseException as error:
             # Parse and admission failures enter the same ordered response queue
             # as successfully launched requests.
@@ -971,53 +932,33 @@ class Worker:
             )
         return sequence
 
-    def _enqueue(self, pending: ServiceRequest) -> None:
-        """Insert dependency-ready work in the caller's submission order."""
-        insort(
-            self._ready_requests, pending, key=lambda request: request.sequence
-        )
-
     def _release(self, pending: ServiceRequest) -> None:
-        """Release one completed request.
-
-        Wakes successors whose dependencies reach zero.
-        """
+        """Retire one launched request from the admitted set."""
         if pending.released:
             return
         pending.released = True
-
         self._pending_requests.pop(pending.sequence, None)
-        if self._collective_submission_tail is pending:
-            self._collective_submission_tail = None
-
-        for request in pending.requests:
-            if self._request_tails.get(request) is pending:
-                del self._request_tails[request]
-
-        for successor in pending.successors:
-            successor.dependencies -= 1
-            if successor.dependencies == 0:
-                self._enqueue(successor)
-        pending.successors.clear()
 
     def _launch_one_ready_request(self) -> bool:
         """Select and launch one dependency-ready request.
 
         Handles administrative and execution requests.
         """
-        execution_full = len(self.inflight) >= self.queue_depth
-        position = next(
-            (
-                index
-                for index, request in enumerate(self._ready_requests)
-                if request.kind is not RequestKind.SUBMIT or not execution_full
-            ),
-            None,
-        )
-        if position is None:
+        if not self._ready_requests:
             return False
 
-        pending = self._ready_requests.pop(position)
+        # Channel order is execution order, so only the head launches. A batch
+        # that cannot start yet holds the queue rather than letting a later one
+        # overtake it, which is what lets cooperative ranks launch their
+        # collectives in the order the engine dispatched them.
+        head = self._ready_requests[0]
+        if (
+            head.kind is RequestKind.SUBMIT
+            and len(self.inflight) >= self.queue_depth
+        ):
+            return False
+
+        pending = self._ready_requests.popleft()
 
         try:
             if pending.kind is RequestKind.SUBMIT:
@@ -1163,11 +1104,10 @@ class Worker:
             self._fail_run(batch, error, context="completion materialization")
 
     def _notify_batch(self, batch: BatchState) -> None:
-        """Release submission dependencies and wake its waiting IPC response."""
-        if batch.successors_ready:
-            submission = self._batch_submissions.pop(batch.batch_id, None)
-            if submission is not None:
-                self._release(submission)
+        """Retire the batch's submission and wake its waiting IPC response."""
+        submission = self._batch_submissions.pop(batch.batch_id, None)
+        if submission is not None:
+            self._release(submission)
         self._batch_ready(batch)
 
     def _fail_run(
@@ -2011,9 +1951,7 @@ class Worker:
             self._waiting_responses.clear()
 
             self._pending_requests.clear()
-            self._request_tails.clear()
             self._ready_requests.clear()
-            self._collective_submission_tail = None
             self._executing_batches.clear()
 
             while not self._preparation_ready.empty():
