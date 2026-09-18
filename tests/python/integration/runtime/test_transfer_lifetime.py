@@ -422,11 +422,10 @@ def _serve_unacknowledged_cuda_read(
 
     The rejection happens after the copy finishes.
     """
-    import os
     import socket
     import uuid
 
-    from uniserve_kernel.peer_memory import empty, export_fd
+    from uniserve_kernel.peer_memory import empty, export_handle
 
     from uniserve_worker.protocol.transfer import CudaIpcTransfer
 
@@ -435,10 +434,12 @@ def _serve_unacknowledged_cuda_read(
     source.copy_(torch.arange(1024, dtype=torch.float32, device="cuda:0"))
     event = torch.cuda.Event(interprocess=True)
     event.record()
-    descriptor, capacity, offset = export_fd(source)
+    exported, capacity, offset = export_handle(source)
     if invalid_handle:
-        os.close(descriptor)
-        descriptor = os.open(os.devnull, os.O_RDONLY)
+        # A handle of the right length that names no allocation: the consumer
+        # imports from the publication, so this is what an unusable handle is
+        # now, where it used to be a descriptor pointing somewhere else.
+        exported = bytes(len(exported))
     endpoint = f"uniserve-test-read-{uuid.uuid4().hex}"
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
         listener.bind("\0" + endpoint)
@@ -454,6 +455,7 @@ def _serve_unacknowledged_cuda_read(
                 span_counts=(1,),
                 tensor_stride=tuple(source.stride()),
                 ready_event_handle=event.ipc_handle(),
+                allocation_handle=exported,
             ),
             nbytes=source.numel() * source.element_size(),
             dtype="float32",
@@ -465,25 +467,13 @@ def _serve_unacknowledged_cuda_read(
         connection, _address = listener.accept()
         with connection:
             assert len(connection.recv(128)) == 64
-            import array
-
-            connection.sendmsg(
-                (b"G",),
-                (
-                    (
-                        socket.SOL_SOCKET,
-                        socket.SCM_RIGHTS,
-                        array.array("i", (descriptor,)),
-                    ),
-                ),
-            )
+            connection.sendall(b"G")
             assert connection.recv(1) == b"A"
             channel.send("released")
             assert channel.recv() == "reject"
             connection.sendall(b"E")
         # Keep the allocation alive until the receiver has observed retirement.
         assert channel.recv() == "close"
-    os.close(descriptor)
     channel.close()
 
 

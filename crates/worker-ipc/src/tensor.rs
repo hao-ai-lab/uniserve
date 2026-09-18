@@ -198,6 +198,12 @@ pub enum TransferTransport {
         /// Opaque CUDA event handle signaling publication readiness.
         #[serde(with = "serde_bytes")]
         ready_event_handle: Vec<u8>,
+        /// The producing rank's shareable allocation handle, of the type its
+        /// device was probed for. A fabric handle is importable from another
+        /// host, so it travels here rather than through a descriptor grant
+        /// that only reaches the producer's own host.
+        #[serde(with = "serde_bytes")]
+        allocation_handle: Vec<u8>,
     },
 }
 

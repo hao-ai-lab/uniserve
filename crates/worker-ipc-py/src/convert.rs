@@ -1013,6 +1013,7 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
             span_counts,
             tensor_stride,
             ready_event_handle,
+            allocation_handle,
         } => {
             dict.set_item(intern!(py, "transport"), "cuda_ipc")?;
             dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
@@ -1028,6 +1029,10 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
             dict.set_item(
                 intern!(py, "ready_event_handle"),
                 PyBytes::new(py, ready_event_handle),
+            )?;
+            dict.set_item(
+                intern!(py, "allocation_handle"),
+                PyBytes::new(py, allocation_handle),
             )?;
         }
     }
@@ -1547,6 +1552,7 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
             span_counts: u32_vec(&get(dict, intern!(py, "span_counts"))?)?,
             tensor_stride: i64_vec(&get(dict, intern!(py, "tensor_stride"))?)?,
             ready_event_handle: bytes_of(&get(dict, intern!(py, "ready_event_handle"))?)?,
+            allocation_handle: bytes_of(&get(dict, intern!(py, "allocation_handle"))?)?,
         },
         _ => return None,
     };
