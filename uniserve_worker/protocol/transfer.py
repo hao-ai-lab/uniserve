@@ -130,7 +130,7 @@ class PosixShmTransfer:
 
 
 @dataclass(frozen=True, slots=True)
-class CudaIpcTransfer:
+class CudaVmmTransfer:
     """Identify an immutable CUDA allocation and its reader-lease endpoint.
 
     Byte offsets locate ordered first-axis spans sharing the tensor strides.
@@ -173,11 +173,11 @@ class CudaIpcTransfer:
             # other length is not a handle this rank can import.
             or len(self.allocation_handle) not in (4, 64)
         ):
-            raise invalid_descriptor("CUDA IPC transfer handle is incomplete")
+            raise invalid_descriptor("CUDA VMM transfer handle is incomplete")
 
 
 TransferTransport: TypeAlias = (
-    LocalTransfer | PosixShmTransfer | CudaIpcTransfer
+    LocalTransfer | PosixShmTransfer | CudaVmmTransfer
 )
 
 
@@ -203,7 +203,7 @@ class Locator:
             return "local"
         if isinstance(self.transport, PosixShmTransfer):
             return "shm"
-        return "cuda_ipc"
+        return "cuda_vmm"
 
     def __post_init__(self) -> None:
         """Validate tensor shape and handle kind.
@@ -222,7 +222,7 @@ class Locator:
             raise invalid_descriptor(
                 "transfer locator has invalid tensor bounds"
             )
-        if isinstance(self.transport, CudaIpcTransfer) and (
+        if isinstance(self.transport, CudaVmmTransfer) and (
             len(self.transport.tensor_stride) != len(self.shape)
             or sum(
                 length * count
@@ -235,7 +235,7 @@ class Locator:
             != self.shape[0]
         ):
             raise invalid_descriptor(
-                "CUDA IPC physical spans do not match its shape"
+                "CUDA VMM physical spans do not match its shape"
             )
 
     @classmethod
@@ -260,8 +260,8 @@ class Locator:
                 endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
                 name=_str(data.get("name"), f"{where}.name"),
             )
-        elif kind == "cuda_ipc":
-            transport = CudaIpcTransfer(
+        elif kind == "cuda_vmm":
+            transport = CudaVmmTransfer(
                 endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
                 publication_id=_str(
                     data.get("publication_id"), f"{where}.publication_id"
@@ -338,7 +338,7 @@ class Locator:
             )
         else:
             output.update(
-                transport="cuda_ipc",
+                transport="cuda_vmm",
                 endpoint=transport.endpoint,
                 publication_id=transport.publication_id,
                 storage_size_bytes=transport.storage_size_bytes,

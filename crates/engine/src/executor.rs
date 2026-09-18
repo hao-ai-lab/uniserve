@@ -577,8 +577,8 @@ pub enum TransferBackend {
     Local,
     /// Publishes products through POSIX shared memory.
     Shm,
-    /// Publishes device products through CUDA IPC handles.
-    CudaIpc,
+    /// Publishes device products through CUDA VMM handles.
+    CudaVmm,
 }
 
 impl TransferBackend {
@@ -587,7 +587,7 @@ impl TransferBackend {
         match self {
             Self::Local => "local",
             Self::Shm => "shm",
-            Self::CudaIpc => "cuda_ipc",
+            Self::CudaVmm => "cuda_vmm",
         }
     }
 }
@@ -607,7 +607,7 @@ impl FromStr for TransferBackend {
         match value {
             "local" => Ok(Self::Local),
             "shm" => Ok(Self::Shm),
-            "cuda_ipc" => Ok(Self::CudaIpc),
+            "cuda_vmm" => Ok(Self::CudaVmm),
             _ => Err(TransferConfigError::message(format!(
                 "unsupported transfer backend {value:?}"
             ))),
@@ -641,9 +641,11 @@ impl TransferConfig {
     /// Binds missing intra-Worker edges from the configured physical endpoints.
     ///
     /// Each rank is a separate process. Its self-edge uses local storage; CUDA
-    /// peers on one node use CUDA IPC, and host-accessible pairs use shared
-    /// memory. Explicit bindings take precedence. Initialized endpoint and
-    /// backend capabilities are validated before the executor accepts work.
+    /// peers use CUDA VMM, which reaches another host where both devices export
+    /// a fabric handle; and host-accessible pairs use shared memory. Explicit
+    /// bindings take precedence. Initialized endpoint and backend capabilities
+    /// are validated before the executor accepts work, and an edge that would
+    /// have to cross hosts without fabric handles is refused by name.
     pub fn with_worker_defaults(mut self, workers: &[crate::WorkerConfig]) -> anyhow::Result<Self> {
         crate::WorkerConfig::validate_all(workers)?;
         for worker in workers {
@@ -670,7 +672,7 @@ impl TransferConfig {
                     } else if source.device.starts_with("cuda:")
                         && destination.device.starts_with("cuda:")
                     {
-                        TransferBackend::CudaIpc
+                        TransferBackend::CudaVmm
                     } else {
                         TransferBackend::Shm
                     };
@@ -766,8 +768,8 @@ impl TransferConfig {
                         Some(TransferBackend::Shm),
                         TransferTransport::PosixShm { .. }
                     ) | (
-                        Some(TransferBackend::CudaIpc),
-                        TransferTransport::CudaIpc { .. }
+                        Some(TransferBackend::CudaVmm),
+                        TransferTransport::CudaVmm { .. }
                     )
                 )
             });
@@ -977,7 +979,7 @@ mod tests {
 
     #[test]
     fn transport_map_parses_edges() {
-        let t = TransferConfig::parse("encoder->prefill=cuda_ipc,prefill->decode=shm").unwrap();
+        let t = TransferConfig::parse("encoder->prefill=cuda_vmm,prefill->decode=shm").unwrap();
         assert_eq!(
             t.edges[0],
             TransferEdge {
@@ -985,21 +987,21 @@ mod tests {
                 source_rank: None,
                 destination_worker: WorkerId("prefill".to_owned()),
                 destination_rank: None,
-                transport: TransferBackend::CudaIpc,
+                transport: TransferBackend::CudaVmm,
             }
         );
         assert_eq!(t.edges[1].transport, TransferBackend::Shm);
         assert!(TransferConfig::parse("bad-entry").is_err());
         assert!(TransferConfig::parse("prefill->decode=tcp").is_err());
-        assert!(TransferConfig::parse("prefill->decode=shm,prefill->decode=cuda_ipc").is_err());
+        assert!(TransferConfig::parse("prefill->decode=shm,prefill->decode=cuda_vmm").is_err());
         let split =
-            TransferConfig::parse("encoder:0->denoiser:0=shm,encoder:0->denoiser:1=cuda_ipc")
+            TransferConfig::parse("encoder:0->denoiser:0=shm,encoder:0->denoiser:1=cuda_vmm")
                 .unwrap();
         assert_eq!(split.edges[1].source_rank, Some(0));
         assert_eq!(split.edges[1].destination_rank, Some(1));
         assert!(TransferConfig::parse("encoder:x->denoiser=shm").is_err());
         assert!(
-            TransferConfig::parse("encoder->denoiser=shm,encoder:0->denoiser:1=cuda_ipc").is_err()
+            TransferConfig::parse("encoder->denoiser=shm,encoder:0->denoiser:1=cuda_vmm").is_err()
         );
     }
 }

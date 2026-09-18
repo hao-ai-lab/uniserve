@@ -231,7 +231,7 @@ pub struct EngineConfig {
     /// Static computation entries and physical rank membership.
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
-    /// `encoder->prefill=shm,prefill->decode=cuda_ipc`. Participating worker
+    /// `encoder->prefill=shm,prefill->decode=cuda_vmm`. Participating worker
     /// ranks receive the selected transport. Intra-WorkerGroup defaults are resolved
     /// once from rank node/device coordinates before process launch.
     pub transfer: TransferConfig,
