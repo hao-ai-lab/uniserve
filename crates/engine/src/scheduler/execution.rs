@@ -70,10 +70,7 @@ impl Scheduler {
     }
 
     /// Binds planned work to its configured entry and records request residency.
-    pub(super) fn select_worker(
-        &mut self,
-        call: &Call,
-    ) -> (crate::WorkerId, String) {
+    pub(super) fn select_worker(&mut self, call: &Call) -> (crate::WorkerId, String) {
         let (id, bound_entry) = if call.entry == "model" {
             self.worker_target(call.request_key, call.code)
         } else {
@@ -667,10 +664,8 @@ impl Scheduler {
         // so a rank receives it as a single homogeneous group. Stages keep the
         // order in which their first call was selected.
         let mut stage_order = Vec::new();
-        let mut stage_batches: HashMap<
-            PipelineStage,
-            (u64, Vec<(Call, RequestPlacement)>),
-        > = HashMap::new();
+        let mut stage_batches: HashMap<PipelineStage, (u64, Vec<(Call, RequestPlacement)>)> =
+            HashMap::new();
         for (_, stage) in &candidates {
             if !stage_batches.contains_key(stage) {
                 stage_batches.insert(*stage, (self.next_batch_id(), Vec::new()));
@@ -730,10 +725,7 @@ impl Scheduler {
             let predicate = if stateful {
                 self.pending_calls
                     .get(&id)
-                    .and_then(|ops| {
-                        ops.iter()
-                            .find(|op| op.call.call_id == state.predecessor)
-                    })
+                    .and_then(|ops| ops.iter().find(|op| op.call.call_id == state.predecessor))
                     .and_then(|op| op.call.completion_output.as_ref())
                     .cloned()
             } else {
@@ -885,10 +877,9 @@ impl Scheduler {
                 PipelineStage::VideoDecoding => {
                     let range = decode.as_ref().expect("video decode has an input range");
                     state.num_scheduled_decode_chunks += range.max_units;
-                    state.video_segments.insert(
-                        range.cursor,
-                        (range.max_units, call.outputs[0].clone()),
-                    );
+                    state
+                        .video_segments
+                        .insert(range.cursor, (range.max_units, call.outputs[0].clone()));
                 }
                 PipelineStage::AudioDecoding => {
                     state.audio_decoding_scheduled = true;
@@ -897,10 +888,9 @@ impl Scheduler {
                 PipelineStage::VideoEncoding => {
                     let range = decode.as_ref().expect("video write has an input range");
                     state.num_scheduled_video_chunks += range.max_units;
-                    state.encoded_segments.insert(
-                        range.cursor,
-                        (range.max_units, call.outputs[0].clone()),
-                    );
+                    state
+                        .encoded_segments
+                        .insert(range.cursor, (range.max_units, call.outputs[0].clone()));
                 }
                 PipelineStage::AudioEncoding => state.audio_encoding_scheduled = true,
                 PipelineStage::Muxing => state.muxing_scheduled = true,
@@ -1075,11 +1065,7 @@ impl Scheduler {
                 .filter(|pending| is_prompt_extend(&pending.call))
                 .fold(state.num_computed_prompt_tokens, |count, pending| {
                     count.saturating_add(
-                        pending
-                            .call
-                            .input_token_ids
-                            .len()
-                            .min(u32::MAX as usize) as u32,
+                        pending.call.input_token_ids.len().min(u32::MAX as usize) as u32
                     )
                 }),
         )
@@ -1102,9 +1088,7 @@ impl Scheduler {
                     logical = logical.saturating_add(count);
                     physical = physical.saturating_add(count);
                 }
-                CallKind::Forward(ForwardMode::Prefill)
-                    if consumes_image_features(call) =>
-                {
+                CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     physical = physical.saturating_add(call.bounds.max_tokens);
                     if is_feedback_computation(call) {
                         feedback_index += 1;
@@ -1124,8 +1108,7 @@ impl Scheduler {
                     }
                 }
                 CallKind::Forward(ForwardMode::Prefill) => physical = physical.saturating_add(1),
-                CallKind::Forward(ForwardMode::Decode)
-                | CallKind::Forward(ForwardMode::Verify) => {
+                CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                     logical = logical.saturating_add(1);
                     physical = physical.saturating_add(1);
                 }
@@ -1174,9 +1157,11 @@ impl Scheduler {
                 CallKind::Pipeline(
                     PipelineStage::LatentPreparation | PipelineStage::ImageDecoding,
                 ) => 0,
-                CallKind::Pipeline(PipelineStage::Denoising) => steps.saturating_add(
-                    pending.call.bounds.max_tokens.min(u32::from(u16::MAX)) as u16,
-                ),
+                CallKind::Pipeline(PipelineStage::Denoising) => {
+                    steps.saturating_add(
+                        pending.call.bounds.max_tokens.min(u32::from(u16::MAX)) as u16
+                    )
+                }
                 _ => steps,
             },
         ))
@@ -1207,12 +1192,7 @@ impl Scheduler {
     pub(super) fn kv_conditioning(&self, id: RequestId) -> Option<uniserve_worker_ipc::BufferId> {
         self.pending_calls
             .get(&id)
-            .and_then(|pending| {
-                pending
-                    .iter()
-                    .rev()
-                    .find_map(|item| item.call.kv_output)
-            })
+            .and_then(|pending| pending.iter().rev().find_map(|item| item.call.kv_output))
             .or_else(|| {
                 self.running
                     .get(&id)
@@ -1237,20 +1217,14 @@ impl Scheduler {
     /// request progress when no computation remains. No request state is replayed.
     pub(super) fn next_generation_phase(&self, id: RequestId) -> Option<Phase> {
         let state = self.running.get(&id)?;
-        let pending = self
-            .pending_calls
-            .get(&id)
-            .and_then(|queue| queue.back());
+        let pending = self.pending_calls.get(&id).and_then(|queue| queue.back());
         let phase = match pending.map(|pending| &pending.call) {
             Some(call) => match call.code {
-                CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => {
+                CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => Phase::Prefill,
+                CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                     Phase::Prefill
                 }
-                CallKind::Forward(ForwardMode::Decode)
-                | CallKind::Forward(ForwardMode::Verify) => Phase::Prefill,
-                CallKind::Forward(ForwardMode::Prefill)
-                    if consumes_image_features(call) =>
-                {
+                CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     if is_feedback_computation(call) {
                         if self.scheduled_feedback(id)?.0 == 0 {
                             Phase::DecodeUnd
@@ -1507,12 +1481,8 @@ impl Scheduler {
                     .get(self.scheduled_feedback(id)?.0)?
                     .encoder
                 {
-                    ImageIngestStep::VaeEncode => {
-                        CallKind::Pipeline(PipelineStage::LatentEncoding)
-                    }
-                    ImageIngestStep::VitEncode => {
-                        CallKind::Pipeline(PipelineStage::VisionEncoding)
-                    }
+                    ImageIngestStep::VaeEncode => CallKind::Pipeline(PipelineStage::LatentEncoding),
+                    ImageIngestStep::VitEncode => CallKind::Pipeline(PipelineStage::VisionEncoding),
                 }
             }
             Phase::Encode | Phase::IngestState => return None,
@@ -1594,9 +1564,7 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .map(|pending| {
-                call_output_bound(pending.call.code, &pending.call.bounds)
-            })
+            .map(|pending| call_output_bound(pending.call.code, &pending.call.bounds))
             .sum::<usize>();
         available
             .saturating_sub(reserved)
@@ -1608,8 +1576,7 @@ impl Scheduler {
     pub(super) fn next_output_bound(&self, id: RequestId) -> usize {
         match self.peek_next_call_variant(id) {
             Some(
-                CallKind::Forward(ForwardMode::Prefill)
-                | CallKind::Forward(ForwardMode::Decode),
+                CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode),
             ) => 4,
             Some(CallKind::Pipeline(PipelineStage::Denoising)) => {
                 usize::from(self.denoise_step_burst).saturating_add(2)
@@ -1695,10 +1662,7 @@ impl Scheduler {
         let stats = self.stats.domains.get(computation);
         let active = stats.active_credits.load(Ordering::Relaxed);
         if active == 0 {
-            tracing::error!(
-                ?computation,
-                "domain call credit accounting underflowed"
-            );
+            tracing::error!(?computation, "domain call credit accounting underflowed");
             return;
         }
         stats.active_credits.fetch_sub(1, Ordering::Relaxed);
@@ -1725,8 +1689,7 @@ impl Scheduler {
         let call_id = record.call_id;
         let known = self.pending_calls.get(&id).is_some_and(|queue| {
             queue.iter().any(|inflight| {
-                inflight.call.request_key == record.request_key
-                    && inflight.call.call_id == call_id
+                inflight.call.request_key == record.request_key && inflight.call.call_id == call_id
             })
         });
         let duplicate = self
@@ -1741,9 +1704,8 @@ impl Scheduler {
                 "call_id": call_id,
             }));
             if let Some(state) = self.media_state_mut(id) {
-                state.terminal_intent = TerminalIntent::Failure(
-                    "worker returned an unknown media call".to_string(),
-                );
+                state.terminal_intent =
+                    TerminalIntent::Failure("worker returned an unknown media call".to_string());
             } else if self.running.contains_key(&id) {
                 self.finish(id, FinishReason::Error);
             }
@@ -2225,8 +2187,7 @@ impl Scheduler {
                 } = completion;
                 let id = record.request_key.request_id;
                 let call_id = record.call_id;
-                let Some((call, input, started)) =
-                    self.pop_inflight(record.request_key, call_id)
+                let Some((call, input, started)) = self.pop_inflight(record.request_key, call_id)
                 else {
                     self.trace_record(json!({
                         "event": "unknown_result_call_id",
@@ -2356,9 +2317,14 @@ impl Scheduler {
                     let completion_has_device_consumer =
                         self.pending_calls.get(&id).is_some_and(|queue| {
                             queue.iter().any(|inflight| {
-                                inflight.call.predicate.as_ref().as_ref().is_some_and(
-                                    |predicate| predicate.producer_call_id == call.call_id,
-                                )
+                                inflight
+                                    .call
+                                    .predicate
+                                    .as_ref()
+                                    .as_ref()
+                                    .is_some_and(|predicate| {
+                                        predicate.producer_call_id == call.call_id
+                                    })
                             })
                         });
                     if !completion_has_device_consumer {
@@ -2434,8 +2400,7 @@ impl Scheduler {
 
                 // Reclaim resources whose lifetime ends at this transition before
                 // making its public output eligible for resolution.
-                let free_flow_prefix = call_variant
-                    == CallKind::Pipeline(PipelineStage::Denoising)
+                let free_flow_prefix = call_variant == CallKind::Pipeline(PipelineStage::Denoising)
                     && record.status == CallStatus::Ok
                     && self.running.get(&id).is_some_and(|state| {
                         record.num_completed_steps >= u32::from(state.req.image.steps)
@@ -2460,8 +2425,7 @@ impl Scheduler {
                     CallKind::Pipeline(PipelineStage::Denoising)
                         | CallKind::Pipeline(PipelineStage::ImageDecoding)
                 ) {
-                    let consumed_latents =
-                        call.latent_input.iter().cloned().collect::<Vec<_>>();
+                    let consumed_latents = call.latent_input.iter().cloned().collect::<Vec<_>>();
                     if !consumed_latents.is_empty() {
                         self.free_buffers(
                             consumed_latents
@@ -2502,8 +2466,7 @@ impl Scheduler {
             // Resolve semantic effects in lifecycle priority and stable arrival
             // order, independent of the executor's physical completion order.
             to_resolve.sort_by_key(|(priority, seq_index, ..)| (*priority, *seq_index));
-            for (_priority, _seq_index, id, call, record, media, public_tokens_before) in
-                to_resolve
+            for (_priority, _seq_index, id, call, record, media, public_tokens_before) in to_resolve
             {
                 let token_call = matches!(
                     call.code,

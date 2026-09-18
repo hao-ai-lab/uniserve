@@ -12,7 +12,7 @@ mod imp {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread::JoinHandle;
 
-    use uniserve_worker_ipc::WakeSender;
+    use uniserve_worker_ipc::Wake;
 
     /// How long each `poll()` blocks before re-checking the stop flag, bounding
     /// how long teardown waits to join this thread when the worker is still
@@ -26,11 +26,7 @@ mod imp {
 
     impl DeathWatcher {
         /// Starts a pidfd watcher that wakes the engine when the child exits.
-        pub(crate) fn spawn(
-            pid: u32,
-            wake: WakeSender,
-            startup_abort: Arc<AtomicBool>,
-        ) -> Option<Self> {
+        pub(crate) fn spawn(pid: u32, wake: Wake, startup_abort: Arc<AtomicBool>) -> Option<Self> {
             // SAFETY: `pidfd_open` receives the PID of the child just spawned. A
             // negative return leaves liveness monitoring to the caller's probe.
             let pidfd = unsafe {
@@ -54,7 +50,7 @@ mod imp {
     }
 
     /// Polls the process descriptor until exit or an explicit watcher stop.
-    fn run(pidfd: libc::c_int, stop: &AtomicBool, wake: &WakeSender, startup_abort: &AtomicBool) {
+    fn run(pidfd: libc::c_int, stop: &AtomicBool, wake: &Wake, startup_abort: &AtomicBool) {
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -100,7 +96,7 @@ mod imp {
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
-    use uniserve_worker_ipc::WakeSender;
+    use uniserve_worker_ipc::Wake;
 
     pub(crate) struct DeathWatcher;
 
@@ -108,7 +104,7 @@ mod imp {
         /// Spawns a watcher that reports unexpected worker termination.
         pub(crate) fn spawn(
             _pid: u32,
-            _wake: WakeSender,
+            _wake: Wake,
             _startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         ) -> Option<Self> {
             // No pidfd equivalent off Linux; death is caught by the bounded

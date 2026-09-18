@@ -34,7 +34,7 @@ pub enum IpcError {
     /// Payload encoding, decoding, or semantic validation failed.
     #[error(transparent)]
     Codec(#[from] CodecError),
-    /// Shared-memory transport setup or call failed.
+    /// A rank channel's setup or one of its calls failed.
     #[error("worker IPC error: {0}")]
     Transport(String),
 }

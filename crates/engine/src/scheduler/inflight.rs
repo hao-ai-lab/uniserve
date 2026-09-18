@@ -94,8 +94,8 @@ impl Scheduler {
             };
             for (index, inflight) in queue.iter().enumerate() {
                 let call = &inflight.call;
-                let independent = matches!(inflight.input, InflightInput::Media { .. })
-                    && !call.advances_state();
+                let independent =
+                    matches!(inflight.input, InflightInput::Media { .. }) && !call.advances_state();
                 if index > 0 && !independent {
                     continue;
                 }

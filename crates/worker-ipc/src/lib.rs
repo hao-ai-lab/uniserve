@@ -64,9 +64,10 @@ macro_rules! ensure_valid {
     };
 }
 
+/// Shared-memory request-response endpoints and wake events.
+pub mod channel;
 /// FlatBuffers encoding and decoding for protocol messages.
 pub mod codec;
-/// Shared-memory request-response endpoints and wake events.
 pub mod iceoryx;
 pub mod socket;
 #[allow(missing_docs, warnings)]
@@ -75,12 +76,14 @@ pub mod schema {
     include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
 }
 
+pub use channel::{Outstanding, RankChannel, SHARED_MEMORY_CHANNEL, SOCKET_CHANNEL, Wake};
 pub use iceoryx::{
     ClientEndpoint, DEFAULT_SERVICE_PREFIX, EVT_COMMAND, EVT_COMPLETION, EVT_DEATH, EVT_REQUEST,
     EVT_RESULT, Frame, Header, IPC_VERSION, IpcError, IpcResult, Pending, ServerEndpoint,
     WakeEvents, WakeSender, header_for_request, header_for_response, is_supported_ipc_version,
     service_name,
 };
+pub use socket::{SocketClient, SocketServer};
 
 mod call;
 mod info;

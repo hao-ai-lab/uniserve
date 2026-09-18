@@ -1136,9 +1136,7 @@ mod tests {
         limits.max_vit_grid_tokens = 0;
         assert_eq!(
             request.validate_resources(&limits),
-            Err(GenerationResourceError::UnboundedImageKv {
-                call: "vit_encode",
-            })
+            Err(GenerationResourceError::UnboundedImageKv { call: "vit_encode" })
         );
 
         let mut limits = runtime_limits();

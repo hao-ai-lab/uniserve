@@ -14,9 +14,14 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::iceoryx::{Frame, Header, IpcError, IpcResult, WakeEvents};
+use crate::codec::encode_request;
+use crate::iceoryx::{Frame, Header, IpcError, IpcResult, WakeEvents, header_for_request};
+use crate::request::WorkerRequest;
 
 /// Bytes of one encoded frame header.
 const HEADER_BYTES: usize = 32;
@@ -162,6 +167,62 @@ fn write_frame(stream: &mut TcpStream, header: &Header, payload: &[u8]) -> IpcRe
         .map_err(|error| IpcError::Transport(format!("flushing a rank channel: {error}")))
 }
 
+/// A local wake: one descriptor this process both fires and polls.
+///
+/// A command and a worker death are raised inside the engine, so a socket
+/// channel raises them here rather than carrying them to the rank and back.
+struct LocalWake {
+    reader: UnixStream,
+    writer: UnixStream,
+    /// Cleared when the reader drains, so repeated wakes coalesce.
+    pending: Arc<AtomicBool>,
+}
+
+impl LocalWake {
+    fn new() -> IpcResult<Self> {
+        let (reader, writer) = UnixStream::pair()
+            .map_err(|error| IpcError::Transport(format!("creating a local wake: {error}")))?;
+        reader.set_nonblocking(true).map_err(|error| {
+            IpcError::Transport(format!("making a local wake pollable: {error}"))
+        })?;
+        writer.set_nonblocking(true).map_err(|error| {
+            IpcError::Transport(format!("making a local wake pollable: {error}"))
+        })?;
+        Ok(Self {
+            reader,
+            writer,
+            pending: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Returns a sender that fires this wake from any thread.
+    fn sender(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let writer = match self.writer.try_clone() {
+            Ok(writer) => writer,
+            // A wake that cannot be cloned is one the engine will not fire;
+            // liveness then falls to the caller's bounded probe.
+            Err(_) => return Arc::new(|| {}),
+        };
+        let pending = Arc::clone(&self.pending);
+        Arc::new(move || {
+            if pending.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            // A shared reference writes because a wake fires from arbitrary
+            // frontend and watcher threads.
+            let _ = (&writer).write(&[1]);
+        })
+    }
+
+    /// Drains the descriptor and reports whether it had fired.
+    fn take(&mut self) -> bool {
+        let fired = self.pending.swap(false, Ordering::AcqRel);
+        let mut sink = [0u8; 64];
+        while self.reader.read(&mut sink).is_ok_and(|read| read > 0) {}
+        fired
+    }
+}
+
 /// The engine's end of a socket rank channel.
 pub struct SocketClient {
     stream: TcpStream,
@@ -172,6 +233,8 @@ pub struct SocketClient {
     bound: usize,
     /// Set when the rank closed its end.
     closed: bool,
+    /// Descriptor the engine's own command and death wakes fire on.
+    local: LocalWake,
 }
 
 impl SocketClient {
@@ -194,7 +257,25 @@ impl SocketClient {
             inbox: HashMap::new(),
             bound,
             closed: false,
+            local: LocalWake::new()?,
         })
+    }
+
+    /// Returns the sender a worker-death watcher fires.
+    pub fn death_wake(&self) -> Arc<dyn Fn() + Send + Sync> {
+        self.local.sender()
+    }
+
+    /// Returns the descriptor the engine's own wakes fire on.
+    pub fn local_wake_fd(&self) -> RawFd {
+        self.local.reader.as_raw_fd()
+    }
+
+    /// Encodes and sends one request, returning the identity of its response.
+    pub fn send_request(&mut self, request: &WorkerRequest) -> IpcResult<u64> {
+        let header = header_for_request(request);
+        let payload = encode_request(request)?;
+        self.send_raw(header, &payload)
     }
 
     /// Returns the descriptor that becomes readable when a result arrives.
@@ -217,16 +298,31 @@ impl SocketClient {
         Ok(self.inbox.remove(&message_id))
     }
 
+    /// Waits for one outstanding response until the deadline passes.
+    pub fn recv_response_timeout(
+        &mut self,
+        message_id: u64,
+        timeout: Duration,
+    ) -> IpcResult<Option<Frame>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(frame) = self.try_recv_response(message_id)? {
+                return Ok(Some(frame));
+            }
+            if self.closed || Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+
     /// Waits until one of this channel's wake sources fires or the deadline passes.
     pub fn wait_wake(&mut self, timeout: Duration) -> IpcResult<WakeEvents> {
         let deadline = Instant::now() + timeout;
         loop {
-            self.pump()?;
-            if !self.inbox.is_empty() {
-                return Ok(WakeEvents {
-                    result: true,
-                    ..WakeEvents::default()
-                });
+            let wakes = self.drain_wakes()?;
+            if wakes.any() {
+                return Ok(wakes);
             }
             if self.closed || Instant::now() >= deadline {
                 return Ok(WakeEvents::default());
@@ -236,11 +332,18 @@ impl SocketClient {
     }
 
     /// Reports the wakes already observed without waiting.
+    ///
+    /// A local wake cannot say whether it was a command or a worker death, so
+    /// it reports both and the engine checks each. Both checks are cheap and a
+    /// missed one would stall the tick that the wake exists to start.
     pub fn drain_wakes(&mut self) -> IpcResult<WakeEvents> {
         self.pump()?;
+        let local = self.local.take();
         Ok(WakeEvents {
             result: !self.inbox.is_empty(),
-            ..WakeEvents::default()
+            command: local,
+            death: local,
+            other: false,
         })
     }
 

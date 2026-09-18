@@ -17,13 +17,13 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams, TokenLogprob};
 use uniserve_worker_ipc::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable,
-    BufferAllocation, BufferId, CachePageAllocation, CallKind, CallId, DType,
-    DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, ErrorCallIdentity,
+    BufferAllocation, BufferId, CachePageAllocation, Call, CallId, CallKind, CallStatus, DType,
+    DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCallIdentity, ErrorCode,
     FeatureKind, FinishFlags, ForwardStats, KvTransfer, LatentParams, Locator, MediaOutput,
-    NewRequest, CallStatus, RegistrationAck, RequestKey, RequestKind, RequestOutput,
-    Call, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
-    TransferHandle, TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerRequest,
-    WorkerResponse, WorkerResponseError,
+    NewRequest, RegistrationAck, RequestKey, RequestKind, RequestOutput, ShapeBound,
+    TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle,
+    TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerRequest, WorkerResponse,
+    WorkerResponseError,
 };
 
 #[cfg(test)]
@@ -384,68 +384,57 @@ impl<'py> NativeRequestConversion<'py> {
                 call.entry.clone().into_pyobject(py)?.into_any(),
                 pyo3::types::PyTuple::new(py, inputs)?.into_any(),
                 pyo3::types::PyTuple::new(py, outputs)?.into_any(),
-                call
-                    .token_input
+                call.token_input
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call
-                    .token_output
+                call.token_output
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call
-                    .vision_input
+                call.vision_input
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call
-                    .latent_feature_input
+                call.latent_feature_input
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call
-                    .encoder_output
+                call.encoder_output
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call
-                    .latent_input
+                call.latent_input
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call
-                    .latent_output
+                call.latent_output
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call
-                    .image_input
+                call.image_input
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call
-                    .image_output
+                call.image_output
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call
-                    .completion_output
+                call.completion_output
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call
-                    .transition_output
+                call.transition_output
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
@@ -459,18 +448,12 @@ impl<'py> NativeRequestConversion<'py> {
                     .map(Bound::into_any)
                     .unwrap_or_else(|| py.None().into_bound(py)),
                 pyo3::types::PyTuple::new(py, &call.input_token_ids)?.into_any(),
-                call
-                    .input_image
-                    .as_deref()
-                    .into_pyobject(py)?
-                    .into_any(),
-                call
-                    .kv_input
+                call.input_image.as_deref().into_pyobject(py)?.into_any(),
+                call.kv_input
                     .map(|buffer| self.buffer_id(buffer))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call
-                    .kv_output
+                call.kv_output
                     .map(|buffer| self.buffer_id(buffer))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
@@ -2226,10 +2209,7 @@ mod tests {
                         .unwrap(),
                     batch.batch_id
                 );
-                assert_eq!(
-                    native_batch.getattr("calls").unwrap().len().unwrap(),
-                    1
-                );
+                assert_eq!(native_batch.getattr("calls").unwrap().len().unwrap(), 1);
 
                 // The natively constructed batch must be exactly what the
                 // canonical codec decodes from its own IPC form.
@@ -2244,18 +2224,13 @@ mod tests {
                     "native batch construction diverged from the canonical codec"
                 );
 
-                let call = native_batch
-                    .getattr("calls")
-                    .unwrap()
-                    .get_item(0)
-                    .unwrap();
+                let call = native_batch.getattr("calls").unwrap().get_item(0).unwrap();
                 match index {
                     // The token call carries host-staged inputs and the
                     // sampling state the worker reads per call.
                     0 => {
                         assert_eq!(
-                            call
-                                .getattr("input_token_ids")
+                            call.getattr("input_token_ids")
                                 .unwrap()
                                 .extract::<Vec<u32>>()
                                 .unwrap(),
@@ -2344,8 +2319,7 @@ mod tests {
                                 .unwrap()
                         );
                         assert!(
-                            call
-                                .getattr("kv_input")
+                            call.getattr("kv_input")
                                 .unwrap()
                                 .eq(imported_kv.getattr("source").unwrap())
                                 .unwrap()

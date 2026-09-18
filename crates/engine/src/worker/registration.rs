@@ -24,7 +24,7 @@ const ACCEPT_INTERVAL: Duration = Duration::from_millis(20);
 /// Deadline for one accepted connection to deliver its report line.
 const REPORT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// The channel mechanism a rank on the head's host offers.
-const SHARED_MEMORY_CHANNEL: &str = "iceoryx2";
+use uniserve_worker_ipc::{SHARED_MEMORY_CHANNEL, SOCKET_CHANNEL};
 
 /// One rank's report of the channel endpoint the engine connects to.
 #[derive(Debug, Deserialize)]
@@ -145,10 +145,14 @@ impl RankRegistry {
                 "rank registration names worker {} instead of {worker_id}",
                 report.worker_id
             );
-            // One channel mechanism exists today; a rank that offers another
-            // is refused by name rather than bound with the wrong transport.
+            // A rank on the head's host offers shared memory and a rank
+            // elsewhere offers a socket. Any other mechanism is refused by
+            // name rather than bound with the wrong transport.
             anyhow::ensure!(
-                report.transport == SHARED_MEMORY_CHANNEL,
+                matches!(
+                    report.transport.as_str(),
+                    SHARED_MEMORY_CHANNEL | SOCKET_CHANNEL
+                ),
                 "rank {} offers the unsupported channel transport {}",
                 report.rank,
                 report.transport

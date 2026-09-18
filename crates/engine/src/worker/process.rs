@@ -14,7 +14,13 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uniserve_worker_ipc::{Batch, WorkerInfo, WorkerRequest, WorkerResponse};
-use uniserve_worker_ipc::{ClientEndpoint, Frame, Pending};
+use uniserve_worker_ipc::{Frame, Outstanding, RankChannel};
+
+/// How long the head waits for a rank's socket channel to accept.
+///
+/// A rank binds its address before it registers, so this covers accepting an
+/// already-bound connection rather than waiting for the rank to start.
+const CHANNEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 use crate::worker::WorkerProcessArgs;
 use crate::worker::death_watch::DeathWatcher;
@@ -296,10 +302,7 @@ impl WorkerProcessArgs {
             json!(self.attention_backend.as_name()),
         );
         fields.insert("block_size".into(), json!(self.block_size));
-        fields.insert(
-            "max_batch_calls".into(),
-            json!(self.max_batch_calls),
-        );
+        fields.insert("max_batch_calls".into(), json!(self.max_batch_calls));
         fields.insert("max_batch_tokens".into(), json!(self.max_batch_tokens));
         fields.insert("max_model_len".into(), json!(self.max_model_len));
         fields.insert("max_video_seconds".into(), json!(self.max_video_seconds));
@@ -353,7 +356,7 @@ impl WorkerProcessArgs {
 
 /// Single-process worker executor over iceoryx2 IPC.
 pub(super) struct RankProcess {
-    client: ClientEndpoint,
+    client: RankChannel,
     info: WorkerInfo,
     startup_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     child: Child,
@@ -398,7 +401,7 @@ pub(super) struct PendingRank {
 
 struct PendingRecord {
     kind: OutstandingKind,
-    pending: Pending,
+    pending: Outstanding,
 }
 
 /// Releases the consumed request.
@@ -533,17 +536,29 @@ impl PendingRank {
         }
     }
 
-    /// Binds this rank's channel to the endpoint the rank reported.
-    pub(crate) fn adopt(mut self, endpoint: &str) -> anyhow::Result<RankProcess> {
+    /// Binds this rank's channel to the endpoint and mechanism the rank reported.
+    pub(crate) fn adopt(mut self, transport: &str, endpoint: &str) -> anyhow::Result<RankProcess> {
         let rank = self.rank;
         let world_size = self.world_size;
         let depth = self.depth;
         // The process stays owned here until the channel exists, so a failed
         // connection terminates the rank instead of orphaning it.
-        let client = ClientEndpoint::connect(endpoint, self.max_payload, depth)
-            .with_context(|| format!("connecting to the channel rank {rank} reported"))?;
-        // The endpoint is the rank's choice, so the head records what it bound.
-        tracing::info!(rank, endpoint, "bound rank channel from its registration");
+        let client = RankChannel::connect(
+            transport,
+            endpoint,
+            self.max_payload,
+            depth,
+            CHANNEL_CONNECT_TIMEOUT,
+        )
+        .with_context(|| format!("connecting to the channel rank {rank} reported"))?;
+        // The mechanism and endpoint are the rank's choice, so the head records
+        // what it bound.
+        tracing::info!(
+            rank,
+            transport,
+            endpoint,
+            "bound rank channel from its registration"
+        );
         let child = self
             .child
             .take()
@@ -694,7 +709,7 @@ impl RankProcess {
         &mut self,
         req: &WorkerRequest,
         context: &str,
-    ) -> anyhow::Result<Pending> {
+    ) -> anyhow::Result<Outstanding> {
         self.send_request_with_timeout(req, context, WORKER_SEND_TIMEOUT)
     }
 
@@ -704,11 +719,11 @@ impl RankProcess {
         req: &WorkerRequest,
         context: &str,
         timeout: Duration,
-    ) -> anyhow::Result<Pending> {
+    ) -> anyhow::Result<Outstanding> {
         let deadline = Instant::now() + timeout;
         loop {
             let pending = self.client.send_request_attempt(req)?;
-            if pending.number_of_server_connections() > 0 {
+            if self.client.is_connected(&pending) {
                 return Ok(pending);
             }
             drop(pending);
@@ -721,7 +736,11 @@ impl RankProcess {
     }
 
     /// Waits for one startup response while checking child liveness and reporting progress.
-    fn wait_pending_response(&mut self, pending: &Pending, context: &str) -> anyhow::Result<Frame> {
+    fn wait_pending_response(
+        &mut self,
+        pending: &Outstanding,
+        context: &str,
+    ) -> anyhow::Result<Frame> {
         let started = Instant::now();
         let mut last_log = started;
         let mut last_worker_check = started;
@@ -771,7 +790,12 @@ impl RankProcess {
     }
 
     /// Acquires output storage before validating response correlation.
-    fn route(&mut self, message_id: u64, kind: OutstandingKind, frame: Frame) -> anyhow::Result<()> {
+    fn route(
+        &mut self,
+        message_id: u64,
+        kind: OutstandingKind,
+        frame: Frame,
+    ) -> anyhow::Result<()> {
         let OutstandingKind::Batch { batch_id } = kind;
         let response = frame.decode_response()?;
         let echoed = response.message_id();
@@ -822,9 +846,13 @@ impl RankProcess {
         Ok(())
     }
 
-    /// Returns the file descriptor that signals worker progress.
-    pub(crate) fn progress_fd(&self) -> i32 {
-        self.client.wake_file_descriptor()
+    /// Returns the descriptors that signal this rank's progress.
+    ///
+    /// A shared-memory channel multiplexes every wake onto one listener; a
+    /// socket channel carries only results and raises the engine's own wakes
+    /// on a second descriptor.
+    pub(crate) fn progress_fds(&self) -> Vec<i32> {
+        self.client.progress_fds()
     }
 }
 

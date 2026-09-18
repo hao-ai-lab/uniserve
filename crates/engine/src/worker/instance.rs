@@ -101,7 +101,7 @@ impl WorkerProcessArgs {
                     pending.rank(),
                     report.rank
                 );
-                pending.adopt(&report.endpoint)
+                pending.adopt(&report.transport, &report.endpoint)
             })
             .collect()
     }
@@ -209,7 +209,7 @@ impl WorkerGroup {
         process_args: WorkerProcessArgs,
         mut workers: Vec<RankProcess>,
     ) -> anyhow::Result<Self> {
-        let progress_fds = workers.iter().map(RankProcess::progress_fd).collect();
+        let progress_fds = workers.iter().flat_map(RankProcess::progress_fds).collect();
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
         let world_size =
@@ -359,7 +359,9 @@ impl WorkerGroup {
                         );
                         for identity in identities {
                             let completed = progress.calls.get_mut(&identity).ok_or_else(|| {
-                                anyhow::anyhow!("rank {rank} returned an unplanned call for batch {batch_id}")
+                                anyhow::anyhow!(
+                                    "rank {rank} returned an unplanned call for batch {batch_id}"
+                                )
                             })?;
                             anyhow::ensure!(
                                 !*completed,
@@ -454,7 +456,7 @@ impl WorkerGroup {
                 worker.check_worker("WorkerGroup readiness")?;
                 worker.set_startup_cancel(None);
             }
-            let descriptors = workers.iter().map(RankProcess::progress_fd).collect();
+            let descriptors = workers.iter().flat_map(RankProcess::progress_fds).collect();
             self.install_replacement(workers, descriptors);
             Ok(())
         })();
@@ -515,20 +517,15 @@ impl WorkerGroup {
             .ranks
             .iter()
             .filter_map(|(&rank, result)| {
-                (call_ids.is_empty()
-                    || call_ids
-                        .iter()
-                        .all(|id| result.calls.contains_key(id)))
-                .then_some(rank)
+                (call_ids.is_empty() || call_ids.iter().all(|id| result.calls.contains_key(id)))
+                    .then_some(rank)
             })
             .collect::<Vec<_>>();
         let batch = &pending.batch;
-        let mut out =
-            take_rank_calls(&mut self.buffers[output_rank], batch, &call_ids, true)?;
+        let mut out = take_rank_calls(&mut self.buffers[output_rank], batch, &call_ids, true)?;
         validate_and_order_rank_report(batch, &mut out, output_rank)?;
         for rank in participants.into_iter().filter(|rank| *rank != output_rank) {
-            let mut report =
-                take_rank_calls(&mut self.buffers[rank], batch, &call_ids, false)?;
+            let mut report = take_rank_calls(&mut self.buffers[rank], batch, &call_ids, false)?;
             validate_and_order_rank_report(batch, &mut report, rank)?;
             merge_rank_report(batch, &mut out, &report, rank)?;
         }
@@ -599,10 +596,7 @@ impl WorkerGroup {
                 .collect::<Vec<_>>();
             if pending.ranks.values().any(|result| {
                 result.error.is_none()
-                    && result
-                        .calls
-                        .keys()
-                        .any(|id| pending.remaining.contains(id))
+                    && result.calls.keys().any(|id| pending.remaining.contains(id))
             }) {
                 let details = errors
                     .iter()
@@ -706,8 +700,7 @@ impl WorkerGroup {
                             pending.contains(id)
                                 && self.call_members(batch_id, *id) == members
                                 && batch.calls.iter().any(|candidate| {
-                                    call_identity(candidate.request_key, candidate.call_id)
-                                        == *id
+                                    call_identity(candidate.request_key, candidate.call_id) == *id
                                         && candidate.entry == call.entry
                                 })
                                 && members.iter().all(|rank| {
@@ -817,11 +810,7 @@ fn rank_projection(
         let inputs = projection
             .calls
             .iter()
-            .flat_map(|call| {
-                call
-                    .tensor_inputs()
-                    .chain(call.predicate.as_ref())
-            })
+            .flat_map(|call| call.tensor_inputs().chain(call.predicate.as_ref()))
             .collect::<HashSet<_>>();
         projection
             .input_products
@@ -972,10 +961,8 @@ fn merge_rank_report(
             batch
                 .calls
                 .iter()
-                .any(
-                    |call| call.request_key == canonical.output.request_key
-                        && call.call_id == canonical.output.call_id
-                ),
+                .any(|call| call.request_key == canonical.output.request_key
+                    && call.call_id == canonical.output.call_id),
             "rank join received an unplanned call for batch {batch_id}"
         );
         if let Err(error) = merge_completion_record(canonical, actual) {
@@ -1019,9 +1006,7 @@ fn validate_and_order_rank_report(
         batch.batch_id
     );
     let report_count = report.results.len();
-    let returned = report_call_ids(report)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let returned = report_call_ids(report).into_iter().collect::<BTreeSet<_>>();
     let mut ordered = Vec::with_capacity(report_count);
     for planned in &batch.calls {
         let identity = call_identity(planned.request_key, planned.call_id);
@@ -1052,9 +1037,7 @@ fn validate_and_order_rank_report(
             "predicated call published a tensor"
         );
         if planned.code
-            == uniserve_worker_ipc::CallKind::Transfer(
-                uniserve_worker_ipc::TransferMode::KvPublish,
-            )
+            == uniserve_worker_ipc::CallKind::Transfer(uniserve_worker_ipc::TransferMode::KvPublish)
             && completion.output.status == uniserve_worker_ipc::CallStatus::Ok
         {
             let publication = completion
@@ -1188,9 +1171,7 @@ impl WorkerGroup {
     }
 
     /// Exposes accepted calls whose required ranks have not returned their result.
-    pub(crate) fn inflight_calls(
-        &self,
-    ) -> impl Iterator<Item = &uniserve_worker_ipc::Call> {
+    pub(crate) fn inflight_calls(&self) -> impl Iterator<Item = &uniserve_worker_ipc::Call> {
         self.pending_batches.values().flat_map(|pending| {
             pending.batch.calls.iter().filter(|call| {
                 pending
@@ -1263,12 +1244,7 @@ impl WorkerGroup {
                         calls: batch
                             .calls
                             .iter()
-                            .map(|call| {
-                                (
-                                    call_identity(call.request_key, call.call_id),
-                                    false,
-                                )
-                            })
+                            .map(|call| (call_identity(call.request_key, call.call_id), false))
                             .collect(),
                         complete: false,
                         error: None,
