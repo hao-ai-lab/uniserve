@@ -34,6 +34,7 @@ from ..foundation.errors import (
 )
 from ..foundation.shared_memory import allocate_shared_memory
 from ..protocol.transfer import (
+    ChannelTransfer,
     CudaVmmTransfer,
     LocalTransfer,
     Locator,
@@ -59,11 +60,12 @@ __all__ = [
 
 
 class TransportKind(StrEnum):
-    """Selects in-process, POSIX shared-memory, or CUDA VMM byte transport."""
+    """Selects in-process, shared-memory, device, or rank-channel transport."""
 
     LOCAL = "local"
     SHM = "shm"
     CUDA_VMM = "cuda_vmm"
+    CHANNEL = "channel"
 
 
 TRANSPORTS = tuple(kind.value for kind in TransportKind)
@@ -1494,6 +1496,162 @@ class _CudaSource:
             self.retirement.set_result(None)
 
 
+class ChannelTransport(Transport):
+    """Host products carried on the rank channel's data path.
+
+    Shared memory names a segment in one host's namespace, so it cannot serve
+    a consumer on another host. This transport puts the product's bytes in its
+    locator instead: they travel in the producing rank's result, into the
+    head's custody, and out in the consuming rank's batch, reaching wherever
+    the rank channel does.
+
+    The producing rank owns nothing after publication. The bytes are copied out
+    of its storage while it publishes, so the source is its own again as soon
+    as the locator exists, and the head releases its copy when the buffer is
+    freed. That is what the acknowledgment discipline reduces to when the head
+    is the intermediary: it already holds the product exactly as long as some
+    consumer may still be given it.
+    """
+
+    name = "channel"
+
+    def __init__(
+        self,
+        *,
+        capacity: TransferCapacity,
+        event_pool: EventPool,
+        source: WorkerEndpoint | None = None,
+    ) -> None:
+        self._bytes = capacity
+        self._events = event_pool
+        self.source = source or WorkerEndpoint.local()
+        self._endpoint = f"uniserve-channel-{uuid.uuid4().hex}"
+        self._reads = _BoundedTransferPool(
+            workers=1,
+            capacity=capacity,
+            name="uniserve-channel-read",
+            event_pool=event_pool,
+        )
+
+    def endpoint(self) -> str:
+        return self._endpoint
+
+    def set_completion_wake(self, wake: Any) -> None:
+        self._reads.set_completion_wake(wake)
+
+    def publish(
+        self,
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
+        *,
+        offset: tuple[int, ...] | None = None,
+    ) -> Locator:
+        """Copy the product into a locator that carries it."""
+        import torch
+
+        source, shape, offset = _publication_views(tensor, offset)
+        spans = source if isinstance(source, tuple) else (source,)
+        first = spans[0]
+        nbytes = _nbytes(source)
+        self._bytes.acquire(nbytes)
+        try:
+            # One contiguous host buffer in physical tensor order. A device
+            # product is staged through it, which is the same crossing a host
+            # product would make to reach any consumer off this device.
+            packed = torch.empty(shape, dtype=first.dtype, device="cpu")
+            for target, value in _copy_pairs(source, packed):
+                target.copy_(value)
+            if first.is_cuda:
+                torch.cuda.current_stream(first.device).synchronize()
+
+            return Locator(
+                source=self.source,
+                transport=ChannelTransfer(
+                    endpoint=self._endpoint,
+                    # A byte view, so a dtype NumPy does not model travels as
+                    # readily as one it does.
+                    payload=bytes(packed.flatten().view(torch.uint8).numpy()),
+                ),
+                nbytes=nbytes,
+                dtype=_dtype_to_str(first.dtype),
+                shape=shape,
+                offset=offset,
+                device=str(first.device),
+            )
+        finally:
+            # The staging buffer is the only thing this rank held: the bytes
+            # are in the locator by now, and the source is its own again.
+            self._bytes.release(nbytes)
+
+    def fetch(
+        self,
+        locator: Locator,
+        *,
+        device: torch.device,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+        region: tuple[slice, ...] | None = None,
+    ) -> TransferTicket:
+        """Copy the locator's own bytes into a reserved destination."""
+        import torch
+
+        handle = locator.transport
+        if not isinstance(handle, ChannelTransfer):
+            raise invalid_descriptor("channel read requires a channel locator")
+        target = _read_destination(locator, device, destination, region)
+        carried = torch.frombuffer(
+            bytearray(handle.payload), dtype=_dtype_from_str(locator.dtype)
+        ).reshape(locator.shape)
+        if region is not None:
+            if not _slices.within(region, locator.shape):
+                raise invalid_descriptor(
+                    "read region exceeds the published view"
+                )
+            carried = region_view(carried, region)
+        return self._reads.submit(
+            self._reads.copy,
+            carried,
+            target,
+            None,
+            nbytes=locator.nbytes,
+            destination=target,
+        )
+
+    def release(
+        self, locator: Locator
+    ) -> concurrent.futures.Future[None] | None:
+        """Revoke a publication the rank no longer owns anything of."""
+        self._require_own(locator)
+        return None
+
+    def publication_retirement(
+        self, locator: Locator
+    ) -> concurrent.futures.Future[None]:
+        """Expose completion, which publication itself established.
+
+        The product was copied out of the rank's storage while it published,
+        so there is nothing left to wait for and the source is reusable at
+        once. The head holds the bytes from here, until the buffer is freed.
+        """
+        self._require_own(locator)
+        settled: concurrent.futures.Future[None] = concurrent.futures.Future()
+        settled.set_result(None)
+        return settled
+
+    def _require_own(self, locator: Locator) -> ChannelTransfer:
+        """Return this endpoint's handle, or refuse another's."""
+        handle = locator.transport
+        if (
+            not isinstance(handle, ChannelTransfer)
+            or handle.endpoint != self._endpoint
+        ):
+            raise invalid_descriptor(
+                "channel publication belongs to another endpoint"
+            )
+        return handle
+
+    def close(self) -> None:
+        self._reads.close()
+
+
 class CudaVmmTransport(Transport):
     """CUDA mapping and asynchronous copies protected by reader grants."""
 
@@ -2047,6 +2205,7 @@ def make_transports(
         "local": LocalTransport,
         "shm": ShmTransport,
         "cuda_vmm": CudaVmmTransport,
+        "channel": ChannelTransport,
     }
     transports: dict[str, Transport] = {}
     try:

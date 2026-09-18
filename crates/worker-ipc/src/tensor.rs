@@ -210,6 +210,19 @@ pub enum TransferTransport {
         /// Negative when the publication carries no header.
         acknowledgment_offset: i64,
     },
+    /// A host product carried on the rank channel's data path.
+    ///
+    /// Shared memory names a segment in one host's namespace, so a product
+    /// whose consumer is on another host travels as bytes: in the producing
+    /// rank's result, into the head's custody, and out in the consuming rank's
+    /// batch. The head releases its copy when the buffer is freed.
+    Channel {
+        /// Publishing address-space incarnation, for diagnostics and identity.
+        endpoint: String,
+        /// The product's bytes in physical tensor order.
+        #[serde(with = "serde_bytes")]
+        payload: Vec<u8>,
+    },
 }
 
 /// One transport-native reference with explicit tensor bounds. Transport handles
@@ -604,6 +617,10 @@ fn transfer_encoded_size(tensors: &[TensorTransfer]) -> usize {
                     .saturating_add(8usize.saturating_mul(storage_offsets_bytes.len()))
                     .saturating_add(12usize.saturating_mul(span_lengths.len()))
                     .saturating_add(64),
+                TransferTransport::Channel { endpoint, payload } => endpoint
+                    .len()
+                    .saturating_add(payload.len())
+                    .saturating_add(16),
             };
             size = size.saturating_add(native);
         }
@@ -765,6 +782,7 @@ impl Locator {
                 span_counts,
                 tensor_stride,
                 ready_event_handle,
+                acknowledgment_offset,
                 ..
             } => {
                 ensure_valid!(
@@ -790,7 +808,14 @@ impl Locator {
                             }
                         ) == self.shape.first().copied()
                         && tensor_stride.len() == self.shape.len()
-                        && ready_event_handle.len() == 64
+                        // A publication from a device pool is readable when it
+                        // is published, so it carries no fence at all; any
+                        // other publication hands its consumer an event.
+                        && if *acknowledgment_offset < 0 {
+                            ready_event_handle.len() == 64
+                        } else {
+                            ready_event_handle.is_empty()
+                        }
                         && tensor_stride.iter().all(|stride| *stride >= 0),
                     "CUDA VMM transfer handle is incomplete"
                 );
@@ -799,6 +824,15 @@ impl Locator {
                 ensure_valid!(
                     opaque_bytes <= MAX_TRANSFER_HANDLE_BYTES,
                     "CUDA VMM transfer handles exceed their byte bound"
+                );
+            }
+            TransferTransport::Channel { endpoint, payload } => {
+                ensure_valid!(!endpoint.is_empty(), "channel transfer endpoint is empty");
+                // The bytes are the product; a locator without them names
+                // nothing a consumer could read.
+                ensure_valid!(
+                    payload.len() as u64 == self.nbytes,
+                    "channel transfer payload disagrees with its product"
                 );
             }
         }
