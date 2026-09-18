@@ -663,10 +663,12 @@ impl TransferConfig {
     ///
     /// Each rank is a separate process. Its self-edge uses local storage; CUDA
     /// peers use CUDA VMM, which reaches another host where both devices export
-    /// a fabric handle; and host-accessible pairs use shared memory. Explicit
-    /// bindings take precedence. Initialized endpoint and backend capabilities
-    /// are validated before the executor accepts work, and an edge that would
-    /// have to cross hosts without fabric handles is refused by name.
+    /// a fabric handle; a host-accessible pair on one host uses shared memory,
+    /// and one spanning hosts uses the rank channel, because a shared-memory
+    /// segment is named in one host's namespace. Explicit bindings take
+    /// precedence. Initialized endpoint and backend capabilities are validated
+    /// before the executor accepts work, and an edge that would have to cross
+    /// hosts without fabric handles is refused by name.
     pub fn with_worker_defaults(mut self, workers: &[crate::WorkerConfig]) -> anyhow::Result<Self> {
         crate::WorkerConfig::validate_all(workers)?;
         for worker in workers {
@@ -692,18 +694,22 @@ impl TransferConfig {
                     }) {
                         continue;
                     }
-                    anyhow::ensure!(
-                        source.node == destination.node,
-                        "cross-node Worker edges require an explicit supported transport"
-                    );
                     let transport = if source_rank == destination_rank {
                         TransferBackend::Local
                     } else if source.device.starts_with("cuda:")
                         && destination.device.starts_with("cuda:")
                     {
+                        // A fabric handle reaches another host; where the
+                        // devices export a process descriptor instead, the
+                        // physical edge check refuses this edge by name.
                         TransferBackend::CudaVmm
-                    } else {
+                    } else if source.node == destination.node {
                         TransferBackend::Shm
+                    } else {
+                        // A shared-memory segment is named in one host's
+                        // namespace, so a host product that leaves its host
+                        // travels on the rank channel's data path.
+                        TransferBackend::Channel
                     };
                     self.edges.push(TransferEdge {
                         source_worker: worker.id.clone(),

@@ -376,7 +376,11 @@ pub(super) struct RankProcess {
     client: RankChannel,
     info: WorkerInfo,
     startup_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    child: Child,
+    /// The rank's process, when this engine started it. A rank placed on
+    /// another host is started by that host's launcher and its process is
+    /// never visible here; its liveness is its channel connection, which the
+    /// launcher closes when it terminates the rank.
+    child: Option<Child>,
     /// The collective rendezvous address this group's ranks share.
     _rendezvous: Option<String>,
     /// Retains the launch descriptor until the worker has read it.
@@ -615,10 +619,7 @@ impl PendingRank {
             endpoint,
             "bound rank channel from its registration"
         );
-        let child = self
-            .child
-            .take()
-            .expect("an unadopted rank retains its process");
+        let child = self.child.take();
         let launch_descriptor = self
             .launch_descriptor
             .take()
@@ -629,8 +630,12 @@ impl PendingRank {
             .expect("an unadopted rank retains its startup cancellation");
         let rendezvous = self.rendezvous.take();
         let components = std::mem::take(&mut self.components);
-        let death_watcher =
-            DeathWatcher::spawn(child.id(), client.death_wake(), startup_abort.clone());
+        // A watcher observes a process identifier, so only a rank this engine
+        // started has one. A rank elsewhere falls to the bounded liveness
+        // probe, which reads its channel rather than its process.
+        let death_watcher = child.as_ref().and_then(|child| {
+            DeathWatcher::spawn(child.id(), client.death_wake(), startup_abort.clone())
+        });
         Ok(RankProcess {
             client,
             info: WorkerInfo::default(),
@@ -739,8 +744,13 @@ impl RankProcess {
     pub(crate) fn terminate(&mut self) {
         self.shutdown_sent = true;
         self.death_watcher.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // A rank this engine started is terminated here. A rank elsewhere is
+        // terminated by its launcher when this head's connection closes, which
+        // is the liveness contract the launcher was given.
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         self.pending.clear();
         self.ready.clear();
     }
@@ -754,8 +764,10 @@ impl RankProcess {
         {
             bail!("worker startup cancelled during {context}");
         }
-        if let Some(status) = self.child.try_wait()? {
-            bail!("worker process exited during {context}: {status}");
+        if let Some(child) = self.child.as_mut() {
+            if let Some(status) = child.try_wait()? {
+                bail!("worker process exited during {context}: {status}");
+            }
         }
         Ok(())
     }
@@ -1003,7 +1015,9 @@ impl RankProcess {
         // Stop the death watcher before we intentionally tear the worker down,
         // so its exit does not fire a spurious death wake during shutdown.
         let _ = self.death_watcher.take();
-        let exited = matches!(self.child.try_wait(), Ok(Some(_)));
+        // A rank started elsewhere is never observed to have exited here, so
+        // shutdown drains its channel as it would a live local rank.
+        let exited = matches!(self.child.as_mut().map(Child::try_wait), Some(Ok(Some(_))));
         if !exited {
             // Bound response draining so shutdown can advance to graceful termination
             // and, if necessary, forced process cleanup.
@@ -1028,7 +1042,7 @@ impl RankProcess {
                     Err(_) => break,
                 }
             }
-            if matches!(self.child.try_wait(), Ok(None)) {
+            if !matches!(self.child.as_mut().map(Child::try_wait), Some(Ok(Some(_)))) {
                 let message_id = self.alloc_call_id();
                 let mut req = WorkerRequest::close();
                 req.set_call_id(Some(message_id));
@@ -1040,15 +1054,15 @@ impl RankProcess {
             }
         }
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match self.child.try_wait() {
+        while let Some(child) = self.child.as_mut() {
+            match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 _ => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
+                    let _ = child.kill();
+                    let _ = child.wait();
                     break;
                 }
             }
