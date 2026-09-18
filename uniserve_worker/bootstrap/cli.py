@@ -22,6 +22,8 @@ from .config import WorkerProcessArgs
 REQUIRED_FIELDS = (
     "registration_address",
     "channel_transport",
+    "acknowledgment_slot",
+    "product_consumers",
     "worker_id",
     "queue_depth",
     "ipc_payload_cap",

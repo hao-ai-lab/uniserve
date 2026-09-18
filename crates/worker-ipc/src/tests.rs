@@ -566,6 +566,7 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
             tensor_stride: vec![2],
             ready_event_handle: vec![9; 64],
             allocation_handle: vec![7; 64],
+            acknowledgment_offset: -1,
         },
         TransferTransport::PosixShm {
             endpoint: "uniserve-shm-physical-incarnation".into(),

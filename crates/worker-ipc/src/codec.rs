@@ -2329,6 +2329,7 @@ fn transfer_locator_from_table(value: fbs::Locator<'_>) -> CodecResult<Locator> 
                 .allocation_handle()
                 .map(|bytes| bytes.bytes().to_vec())
                 .unwrap_or_default(),
+            acknowledgment_offset: value.acknowledgment_offset(),
         }
     } else {
         codec_bail!("unknown transfer transport {}", value.transport().0)
@@ -2477,6 +2478,7 @@ fn transfer_locator_to_fb(value: &Locator) -> fbs::LocatorT {
             tensor_stride,
             ready_event_handle,
             allocation_handle,
+            acknowledgment_offset,
         } => {
             output.transport = fbs::TransferTransportKind::CudaVmm;
             output.endpoint = Some(endpoint.clone());
@@ -2488,6 +2490,7 @@ fn transfer_locator_to_fb(value: &Locator) -> fbs::LocatorT {
             output.tensor_stride = Some(tensor_stride.clone());
             output.ready_event_handle = Some(ready_event_handle.clone());
             output.allocation_handle = Some(allocation_handle.clone());
+            output.acknowledgment_offset = *acknowledgment_offset;
         }
     }
 

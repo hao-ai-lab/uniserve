@@ -12,6 +12,10 @@ lives. And a publishing rank no longer needs its PyTorch allocator segments to
 be exportable, which is what the ``expandable_segments:False`` constraint
 existed to guarantee.
 
+A chunk carries its own acknowledgment header but does not track who owes an
+acknowledgment: that belongs to the publication the chunk backs, which the
+device transport owns and retires.
+
 A product that does not fit the pool falls back to host transport for that
 product, and the exhaustion is reported once rather than per publication.
 """
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -27,25 +32,25 @@ import torch
 _LOG = logging.getLogger(__name__)
 
 
-#: Bytes of one consumer's acknowledgment word.
+#: Bytes of one rank's acknowledgment word.
 ACK_WORD_BYTES = 4
-#: Consumers one chunk header can acknowledge.
+#: Acknowledgment slots one chunk header carries.
 #:
-#: A component's membership bounds how many ranks read one product, and this
-#: is well above any placement the plan describes, so a header costs one word
-#: per possible consumer rather than a page.
-MAX_CONSUMERS = 64
+#: Every rank of an instance owns one slot, assigned by the head, and writes
+#: that slot's word in each chunk it reads. Giving a rank its own word removes
+#: any need for cross-process atomics, at one word per rank rather than a page.
+MAX_ACKNOWLEDGMENT_SLOTS = 64
 #: Bytes reserved at the head of every chunk for its acknowledgments.
-HEADER_BYTES = ACK_WORD_BYTES * MAX_CONSUMERS
+HEADER_BYTES = ACK_WORD_BYTES * MAX_ACKNOWLEDGMENT_SLOTS
 
 
 @dataclass(frozen=True, slots=True)
 class PoolChunk:
     """One publication's span of its device's pool.
 
-    The chunk begins with one acknowledgment word per possible consumer. A
-    consumer writes its word when its reads retire, and the producing rank's
-    recycler returns the chunk once every consumer the component names has
+    The chunk begins with one acknowledgment word per instance rank. A consumer
+    writes the word of its own slot when its reads retire, and the producing
+    rank returns the chunk once every consumer named for its products has
     acknowledged. That is what lets a product retire without a reader-grant
     connection, which a Unix socket could not carry to another host.
     """
@@ -58,14 +63,18 @@ class PoolChunk:
     storage: torch.Tensor
     #: Byte offset of the payload within the pool, which a consumer reads from.
     payload_offset: int
-    #: Acknowledgment words, one per possible consumer.
+    #: Acknowledgment words, indexed by the writing rank's slot.
     acknowledgments: torch.Tensor
 
-    def acknowledged(self, consumers: int) -> bool:
-        """Report whether every named consumer has acknowledged this chunk."""
-        if consumers <= 0:
+    def acknowledged(self, slots: Sequence[int]) -> bool:
+        """Report whether every named consumer slot has acknowledged this chunk.
+
+        A product with no remote consumer is acknowledged on publication: no
+        other rank reads it, so nothing can be waiting to retire it.
+        """
+        if not slots:
             return True
-        return bool(self.acknowledgments[:consumers].all().item())
+        return bool(self.acknowledgments[list(slots)].all().item())
 
 
 class PoolExhaustedError(Exception):
@@ -99,10 +108,6 @@ class VmmPool:
         self._lock = threading.Lock()
         # Offsets handed out and not yet released, by offset.
         self._live: dict[int, int] = {}
-        # Chunks published and not yet acknowledged by every named consumer,
-        # with the consumer count the component's membership gave each.
-        self._awaiting: dict[int, PoolChunk] = {}
-        self._consumers: dict[int, int] = {}
         self._watermark = 0
         self._reported_exhaustion = False
 
@@ -110,6 +115,15 @@ class VmmPool:
     def handle(self) -> bytes:
         """Return the pool's shareable handle, exported once at reservation."""
         return self._handle
+
+    @property
+    def mapping(self) -> torch.Tensor:
+        """Return this rank's flat byte view of the whole pool.
+
+        A consumer maps the same allocation from the pool's handle, so offsets
+        into this view are the offsets a publication carries.
+        """
+        return self._storage
 
     @property
     def capacity(self) -> int:
@@ -159,40 +173,9 @@ class VmmPool:
                 acknowledgments=acknowledgments,
             )
 
-    def recycle(self) -> int:
-        """Return every chunk whose named consumers have all acknowledged.
-
-        The producing rank sweeps here rather than waiting on a per-reader
-        connection, so a consumer on another host retires a chunk the same way
-        one on this host does: by writing its word in the chunk it mapped.
-
-        Returns how many chunks were returned.
-        """
-        with self._lock:
-            ready = [
-                chunk
-                for chunk in self._awaiting.values()
-                if chunk.acknowledged(self._consumers.get(chunk.offset, 0))
-            ]
-        for chunk in ready:
-            self.release(chunk)
-        return len(ready)
-
-    def await_acknowledgment(self, chunk: PoolChunk, consumers: int) -> None:
-        """Hold one chunk until this many consumers have acknowledged it.
-
-        The count comes from the component's membership, which is what names
-        the ranks that read a product.
-        """
-        with self._lock:
-            self._awaiting[chunk.offset] = chunk
-            self._consumers[chunk.offset] = consumers
-
     def release(self, chunk: PoolChunk) -> None:
         """Return one chunk's span to the pool."""
         with self._lock:
-            self._awaiting.pop(chunk.offset, None)
-            self._consumers.pop(chunk.offset, None)
             if self._live.pop(chunk.offset, None) is None:
                 return
             if not self._live:
