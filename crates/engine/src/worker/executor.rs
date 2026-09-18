@@ -129,13 +129,13 @@ pub struct WorkerExecutor {
 
 impl WorkerExecutor {
     /// Bind ready instances with independent queues and their physical wake descriptors.
-    /// Refuses a device transfer edge whose endpoints cannot reach each other.
+    /// Refuses a transfer edge whose endpoints cannot reach each other.
     ///
     /// A device handle crosses hosts only where the producing device exports a
-    /// fabric handle and the consuming device can import one. An edge between
-    /// ranks on different hosts whose devices export process descriptors would
-    /// fail on its first publication, so it is refused at startup naming both
-    /// endpoints instead.
+    /// fabric handle and the consuming device can import one. Shared memory
+    /// names a segment in one host's namespace and crosses no host at all.
+    /// Either edge would fail on its first publication, so it is refused at
+    /// startup naming both endpoints instead.
     fn refuse_unreachable_edges(
         workers: &[(WorkerId, WorkerGroup)],
         transfer: &TransferConfig,
@@ -157,9 +157,12 @@ impl WorkerExecutor {
         };
 
         for edge in &transfer.edges {
-            if edge.transport != crate::executor::TransferBackend::CudaVmm {
-                continue;
-            }
+            let device = match edge.transport {
+                crate::executor::TransferBackend::CudaVmm => true,
+                crate::executor::TransferBackend::Shm => false,
+                // A local edge stays inside one rank's address space.
+                crate::executor::TransferBackend::Local => continue,
+            };
             for (source_host, source_fabric) in members(&edge.source_worker.0, edge.source_rank) {
                 for (destination_host, destination_fabric) in
                     members(&edge.destination_worker.0, edge.destination_rank)
@@ -167,6 +170,14 @@ impl WorkerExecutor {
                     if source_host == destination_host {
                         continue;
                     }
+                    anyhow::ensure!(
+                        device,
+                        "transfer edge from worker {} on host {source_host} to worker {} on host \
+                         {destination_host} crosses hosts over shared memory, which names a \
+                         segment in one host's namespace",
+                        edge.source_worker.0,
+                        edge.destination_worker.0,
+                    );
                     let unreachable = if source_fabric {
                         &destination_host
                     } else {
@@ -786,45 +797,33 @@ impl WorkerExecutor {
         Ok(true)
     }
 
-    /// Dispatches queued worker runs whose collective and capacity constraints are satisfied.
+    /// Dispatches each worker's queued runs in order, as far as they are ready.
+    ///
+    /// Batch ids are dispatched in order, so a rank sees a strictly increasing
+    /// subsequence and cooperative ranks launch their collectives in the same
+    /// order. A queue therefore holds at its head: a submission whose product
+    /// dependencies are not yet published cannot have their locators bound, and
+    /// dispatching the submission behind it would hand the rank a batch out of
+    /// order, which a rank that launches strictly in channel order refuses.
     fn dispatch_ready(&mut self) -> anyhow::Result<()> {
         loop {
             let mut progressed = false;
             for worker_index in 0..self.workers.len() {
-                let mut blocked_requests = HashSet::new();
-                let position =
-                    self.worker_submissions[worker_index]
-                        .iter()
-                        .position(|submission| {
-                            let requests = submission
-                                .batch
-                                .requests
-                                .iter()
-                                .map(|(op, _)| op.request_key)
-                                .chain(
-                                    submission
-                                        .batch
-                                        .commands
-                                        .iter()
-                                        .map(|command| command.request_key()),
-                                )
-                                .collect::<HashSet<_>>();
-                            let ready = requests.is_disjoint(&blocked_requests)
-                                && submission.dependencies.iter().all(|buffer| {
-                                    self.transfer_products.contains_key(buffer)
-                                        || self.kv_transfers.contains_key(buffer)
-                                });
-                            blocked_requests.extend(requests);
-                            ready
-                        });
-                let Some(position) = position else {
+                let Some(head) = self.worker_submissions[worker_index].front() else {
                     continue;
                 };
+                let ready = head.dependencies.iter().all(|buffer| {
+                    self.transfer_products.contains_key(buffer)
+                        || self.kv_transfers.contains_key(buffer)
+                });
+                if !ready {
+                    continue;
+                }
                 let submission = self.worker_submissions[worker_index]
-                    .remove(position)
+                    .pop_front()
                     .ok_or_else(|| anyhow::anyhow!("ready worker submission disappeared"))?;
                 if !self.submit_worker(worker_index, &submission)? {
-                    self.worker_submissions[worker_index].insert(position, submission);
+                    self.worker_submissions[worker_index].push_front(submission);
                     continue;
                 }
                 progressed = true;

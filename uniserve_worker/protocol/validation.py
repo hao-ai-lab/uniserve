@@ -87,6 +87,15 @@ def _uint(value: object, where: str) -> int:
     return value
 
 
+def _int(value: object, where: str) -> int:
+    """Decode a signed integer wire field while rejecting booleans."""
+    if type(value) is int:
+        return value
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise invalid_descriptor(f"{where} must be an integer")
+    return int(value)
+
+
 def _optional_uint(value: object, where: str) -> int | None:
     """Decode an optional non-negative integer wire field."""
     return None if value is None else _uint(value, where)

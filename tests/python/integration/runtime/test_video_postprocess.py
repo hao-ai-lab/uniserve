@@ -33,6 +33,9 @@ def test_video_postprocess_replay_uses_current_overlap_and_pixels():
     overlap = torch.ones((1, 3, 2, 2, 3), dtype=torch.float16, device=device)
     saved_overlap = overlap.clone()
     pixels = torch.empty((5, 2, 3, 3), dtype=torch.uint8, device=device)
+    # The ring exchange writes each rank's incoming overlap here. One rank
+    # holding every media unit still receives its own tail through the wrap.
+    incoming = torch.zeros((1, 3, 2, 2, 3), dtype=torch.float16, device=device)
     constants = {
         "pixel_mean": torch.zeros((1, 3, 1, 1, 1), device=device),
         "pixel_std": torch.ones((1, 3, 1, 1, 1), device=device),
@@ -54,7 +57,10 @@ def test_video_postprocess_replay_uses_current_overlap_and_pixels():
             num_frames=(8,),
             state={"video_overlap": overlap},
             constants=constants,
-            workspace={"rgb_frames": pixels},
+            workspace={
+                "rgb_frames": pixels,
+                "overlap_exchange": incoming,
+            },
         )
         return result
 
