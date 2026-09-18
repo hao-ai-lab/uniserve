@@ -1838,19 +1838,16 @@ class CudaVmmTransport(Transport):
         descriptor = None
         copied_source = None
         try:
-            # Where a product is read decides how it is published. A consumer
-            # on this host waits on an event and closes a reader grant, so the
-            # product is published where it lies: that copies nothing, and it
-            # is what lets a publication name a row whose bytes arrive later.
-            # An encoded media unit is published with the batch that reserves
-            # its row and filled when the encode completes, so a snapshot taken
+            # Storage that can be exported where it lies is published where
+            # it lies, wherever it is read. That copies nothing, and it is
+            # what lets a publication name a row whose bytes arrive later: an
+            # encoded media unit is published with the batch that reserves its
+            # row and filled when the encode completes, so a snapshot taken
             # now would carry whatever the row held before the encoder wrote
-            # it. A consumer on another host has neither mechanism, and both of
-            # the ones it does have — readiness before publication, and an
-            # acknowledgment header — belong to a pool chunk.
-            exported = (
-                None if self._cross_host_consumers else export_handle(first)
-            )
+            # it. Where the device exports a fabric handle, the handle this
+            # produces reaches another host too; what does not reach is the
+            # fence, and that is settled below.
+            exported = export_handle(first)
             pool = None
             chunk = None
             if exported is None:
@@ -1881,13 +1878,6 @@ class CudaVmmTransport(Transport):
                 # A consumer reads the payload, which follows the chunk's
                 # acknowledgment words, so the offset names the payload.
                 storage_offset = chunk.payload_offset
-                if self._cross_host_consumers:
-                    # A consumer on another host can wait on nothing this rank
-                    # records: an event handle is host-local, and imported VMM
-                    # memory admits no device-side wait on current drivers. So
-                    # readiness is this synchronize, and the producer pays a
-                    # stall the crossing genuinely requires.
-                    torch.cuda.current_stream(first.device).synchronize()
             else:
                 # A product too large for the pool takes its own exportable
                 # allocation, as every product did before the pool existed.
@@ -1903,10 +1893,14 @@ class CudaVmmTransport(Transport):
                     raise RuntimeError("shared allocation cannot be exported")
                 descriptor, storage_size, storage_offset = exported
             # A publication hands its consumers an event wherever one can
-            # reach them, which is every consumer on this host. Only a chunk
-            # whose readers are elsewhere was made readable by the synchronize
-            # above and so carries no fence at all.
-            interprocess = chunk is None or not self._cross_host_consumers
+            # reach them, which is every consumer on this host. A consumer
+            # elsewhere can wait on nothing this rank records: an event handle
+            # is host-local, and imported VMM memory admits no device-side
+            # wait on current drivers. So the producer drains its stream
+            # instead, and the publication carries no fence at all.
+            interprocess = not self._cross_host_consumers
+            if not interprocess:
+                torch.cuda.current_stream(first.device).synchronize()
             event = self._events.acquire(
                 first.device, interprocess=interprocess
             )
