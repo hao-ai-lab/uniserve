@@ -70,10 +70,19 @@ def _stream_collectives(stream) -> dict:
     return bindings
 
 
-def close_stream_collectives(stream) -> None:
-    """Release every binding established on one stream."""
+def close_stream_collectives(stream, *, aborted: bool = False) -> None:
+    """Release every binding established on one stream.
+
+    Retiring a communicator normally is collective, so ``aborted`` releases
+    each binding on this rank alone instead. A caller unwinding from a failure
+    passes it: the ranks a collective retirement would wait for are still
+    serving, and waiting for them never returns.
+    """
     for binding in _STREAM_COLLECTIVES.pop(stream, {}).values():
-        binding.close()
+        if aborted:
+            binding.abort()
+        else:
+            binding.close()
 
 
 def _communicators(module):
