@@ -105,7 +105,6 @@ class CacheManager:
         ] = {}
 
         self.exports: dict[BufferId, ExportLocations] = {}
-        self.export_releases: dict[BufferId, tuple[Future[None], ...]] = {}
         self._sources: dict[BufferId, CacheExport] = {}
 
         self._executions: dict[Future[None], CacheAccess] = {}
@@ -311,7 +310,7 @@ class CacheManager:
         read.
         """
         selected = tuple(buffers)
-        release_exports(self.exports, self.export_releases, selected)
+        release_exports(self.exports, selected)
         self.imports.release(selected)
 
         for buffer in selected:
@@ -455,7 +454,6 @@ class CacheManager:
             )
 
         self.exports.clear()
-        self.export_releases.clear()
         self.block_tables.close()
         self._publications.clear()
         self._destination_bases.clear()
