@@ -551,10 +551,7 @@ impl Call {
                 predecessor.batch_id != 0 || predecessor.request_index == 0,
                 "admission predecessor must use index zero"
             );
-            ensure_valid!(
-                predecessor < self.call_id,
-                "predecessor must precede call"
-            );
+            ensure_valid!(predecessor < self.call_id, "predecessor must precede call");
         }
         ensure_valid!(
             self.input_token_ids.len() <= self.bounds.max_tokens as usize,
@@ -613,9 +610,7 @@ impl Call {
         let consumes_kv = matches!(
             self.code,
             CallKind::Transfer(TransferMode::KvInstall)
-                | CallKind::Pipeline(
-                    PipelineStage::LatentPreparation | PipelineStage::Denoising
-                )
+                | CallKind::Pipeline(PipelineStage::LatentPreparation | PipelineStage::Denoising)
         );
         if let Some(input) = self.kv_input {
             input.validate()?;
@@ -841,7 +836,10 @@ pub struct RequestOutput {
 impl RequestOutput {
     /// Validates completion identity, status, accepted lengths, and product generations.
     pub fn validate(&self) -> ValidationResult<()> {
-        ensure_valid!(self.call_id.batch_id > 0, "completion call id must be positive");
+        ensure_valid!(
+            self.call_id.batch_id > 0,
+            "completion call id must be positive"
+        );
         if let Some(publication) = &self.kv_output {
             publication.validate()?;
             ensure_valid!(
@@ -1193,10 +1191,7 @@ impl ForwardBatch {
     pub fn select(&self, calls: &[usize]) -> Self {
         let mut selected = Self::default();
         for (row, index) in self.call_indices.iter().enumerate() {
-            if let Some(local) = calls
-                .iter()
-                .position(|call| *call == *index as usize)
-            {
+            if let Some(local) = calls.iter().position(|call| *call == *index as usize) {
                 selected.push(
                     local as u32,
                     self.request_pool_indices[row],
@@ -1373,11 +1368,7 @@ pub struct Batch {
 
 impl Batch {
     /// Constructs a run with admissions and calls using default metadata.
-    pub fn new(
-        batch_id: u64,
-        admissions: Vec<NewRequest>,
-        calls: Vec<Call>,
-    ) -> Self {
+    pub fn new(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>) -> Self {
         Self {
             batch_id,
             collective_seq: batch_id.max(1),
@@ -1577,18 +1568,14 @@ impl Batch {
             // media units as its component has ranks, and one round covers
             // them all, so an audio decode range starts at the first unit.
             ensure_valid!(
-                !matches!(
-                    call.code,
-                    CallKind::Pipeline(PipelineStage::AudioDecoding)
-                ) || (params.cursor == 0 && params.max_units >= 1),
+                !matches!(call.code, CallKind::Pipeline(PipelineStage::AudioDecoding))
+                    || (params.cursor == 0 && params.max_units >= 1),
                 "audio decode range must start at the first media unit"
             );
             // Audio encoding consumes the assembled track as one host call.
             ensure_valid!(
-                !matches!(
-                    call.code,
-                    CallKind::Pipeline(PipelineStage::AudioEncoding)
-                ) || (params.cursor == 0 && params.max_units == 1),
+                !matches!(call.code, CallKind::Pipeline(PipelineStage::AudioEncoding))
+                    || (params.cursor == 0 && params.max_units == 1),
                 "audio encode range must address its single sample stream"
             );
         }
@@ -1699,8 +1686,7 @@ impl Batch {
         let declared_inputs = self
             .calls()
             .flat_map(|call| {
-                call
-                    .tensor_inputs()
+                call.tensor_inputs()
                     .chain(call.predicate.as_ref().into_iter())
             })
             .collect::<HashSet<_>>();

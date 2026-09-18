@@ -261,15 +261,9 @@ fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
     assert!(invalid_parent.validate().is_err());
 }
 
-fn batch_with_calls(
-    batch_id: u64,
-    admissions: Vec<NewRequest>,
-    calls: Vec<Call>,
-) -> Batch {
+fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>) -> Batch {
     // Calls name the batch they belong to.
-    let batch_id = calls
-        .first()
-        .map_or(batch_id, |call| call.call_id.batch_id);
+    let batch_id = calls.first().map_or(batch_id, |call| call.call_id.batch_id);
     let mut run = Batch::new(batch_id, admissions, calls);
     run.collective_seq = batch_id.max(1);
     let mut next_buffer_offset = 0_u64;
@@ -321,9 +315,7 @@ fn batch_with_calls(
                 height: 1,
                 width: 1,
                 start_step: 0,
-                step_count: u32::from(
-                    call.code == CallKind::Pipeline(PipelineStage::Denoising),
-                ),
+                step_count: u32::from(call.code == CallKind::Pipeline(PipelineStage::Denoising)),
             });
         }
         if matches!(
@@ -371,11 +363,7 @@ fn every_work_variant_round_trips_through_ipc() {
     let variants = CallKind::ALL;
     for (index, work) in variants.into_iter().enumerate() {
         let call = call_for(work, CallId::new(100 + index as u64, 0));
-        let batch = execute_round_trip(batch_with_calls(
-            1,
-            Vec::new(),
-            vec![call.clone()],
-        ));
+        let batch = execute_round_trip(batch_with_calls(1, Vec::new(), vec![call.clone()]));
         assert_eq!(batch.calls().next().unwrap(), &call);
     }
 }
@@ -405,14 +393,7 @@ fn decoder_requires_one_concrete_computation() {
     ];
     for code in invalid {
         let mut malformed = frame.clone();
-        malformed
-            .batch
-            .as_mut()
-            .unwrap()
-            .calls
-            .as_mut()
-            .unwrap()[0]
-            .code = code;
+        malformed.batch.as_mut().unwrap().calls.as_mut().unwrap()[0].code = code;
         let mut builder = flatbuffers::FlatBufferBuilder::new();
         let root = malformed.pack(&mut builder);
         builder.finish(root, None);
@@ -431,22 +412,13 @@ fn every_computation_variant_round_trips_in_its_own_batch() {
 
 #[test]
 fn a_batch_carries_one_computation_through_one_entry() {
-    let decode = call_for(
-        CallKind::Forward(ForwardMode::Decode),
-        CallId::new(1, 0),
-    );
-    let prefill = call_for(
-        CallKind::Forward(ForwardMode::Prefill),
-        CallId::new(1, 1),
-    );
+    let decode = call_for(CallKind::Forward(ForwardMode::Decode), CallId::new(1, 0));
+    let prefill = call_for(CallKind::Forward(ForwardMode::Prefill), CallId::new(1, 1));
     let mixed = batch_with_calls(1, Vec::new(), vec![decode.clone(), prefill]);
     let error = mixed.validate().unwrap_err().to_string();
     assert!(error.contains("mixes call kinds or entries"), "{error}");
 
-    let mut other_entry = call_for(
-        CallKind::Forward(ForwardMode::Decode),
-        CallId::new(1, 1),
-    );
+    let mut other_entry = call_for(CallKind::Forward(ForwardMode::Decode), CallId::new(1, 1));
     other_entry.entry = "encoder".into();
     let split = batch_with_calls(1, Vec::new(), vec![decode, other_entry]);
     let error = split.validate().unwrap_err().to_string();
@@ -473,13 +445,7 @@ fn decoder_requires_every_call_to_state_its_coordinates() {
     );
 
     let mut uncontained = frame;
-    uncontained
-        .batch
-        .as_mut()
-        .unwrap()
-        .calls
-        .as_mut()
-        .unwrap()[0]
+    uncontained.batch.as_mut().unwrap().calls.as_mut().unwrap()[0]
         .coordinates
         .as_mut()
         .unwrap()
@@ -1008,9 +974,7 @@ fn validation_allows_shared_encoder_features_and_rejects_foreign_lineage_state()
     call.vision_input = Some(feature);
     call.validate().unwrap();
 
-    call
-        .inputs
-        .push(call.vision_input.take().unwrap());
+    call.inputs.push(call.vision_input.take().unwrap());
     assert!(call.validate().is_err());
 }
 
@@ -1103,8 +1067,7 @@ fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
         let mut invalid = call.clone();
         invalid.code = code;
         invalid.input_image = image;
-        let request =
-            WorkerRequest::submit(batch_with_calls(1, vec![admission()], vec![invalid]));
+        let request = WorkerRequest::submit(batch_with_calls(1, vec![admission()], vec![invalid]));
         assert!(encode_request(&request).is_err());
     }
 }
@@ -1367,14 +1330,12 @@ fn comprehensive_batches() -> Vec<Batch> {
             transition_output: None,
 
             input_image: None,
-            kv_input: (kind == CallKind::Transfer(TransferMode::KvInstall)).then_some(
-                BufferId {
-                    owner: key,
-                    producer_call_id: CallId::new(2, 0),
-                    output_index: 0,
-                    generation: 1,
-                },
-            ),
+            kv_input: (kind == CallKind::Transfer(TransferMode::KvInstall)).then_some(BufferId {
+                owner: key,
+                producer_call_id: CallId::new(2, 0),
+                output_index: 0,
+                generation: 1,
+            }),
             kv_output: matches!(
                 kind,
                 CallKind::Transfer(TransferMode::KvPublish | TransferMode::KvInstall)
@@ -1434,11 +1395,7 @@ fn comprehensive_batches() -> Vec<Batch> {
         } else {
             Vec::new()
         };
-        batches.push(batch_with_calls(
-            42 + index as u64,
-            admissions,
-            calls,
-        ));
+        batches.push(batch_with_calls(42 + index as u64, admissions, calls));
     }
     // The pass's retirement rides on its last batch, so no earlier call loses
     // state it still reads.
@@ -1642,7 +1599,9 @@ fn response_fixtures() -> Vec<WorkerResponse> {
             message_id: Some(17),
             result: full_run_result(),
         },
-        WorkerResponse::Ok { message_id: Some(17) },
+        WorkerResponse::Ok {
+            message_id: Some(17),
+        },
         WorkerResponse::Error {
             message_id: Some(17),
             error: WorkerResponseError {

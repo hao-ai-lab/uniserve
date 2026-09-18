@@ -8,14 +8,14 @@ use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RequestId, SamplingParam
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds,
-    BufferAllocation, BufferId, CachePageAllocation, CallCoordinates, CallKind, CallId,
-    DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode,
-    ErrorCallIdentity, FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats,
-    KvCacheInfo, KvTransfer, LatentParams, Locator, MediaOutput, NewRequest, CallStatus,
+    BufferAllocation, BufferId, CachePageAllocation, Call, CallCoordinates, CallId, CallKind,
+    CallStatus, DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout,
+    ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
+    ForwardStats, KvCacheInfo, KvTransfer, LatentParams, Locator, MediaOutput, NewRequest,
     PipelineStage, RegistrationAck, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
-    SamplingState, Call, ShapeBound, TensorPublication, TensorRef, TensorTransfer,
-    TimingCounters, TransferHandle, TransferMode, TransferTransport, UmmRequestParams,
-    WorkerEndpoint, WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
+    SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
+    TransferHandle, TransferMode, TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerInfo,
+    WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 /// Result type returned by FlatBuffers codec calls.
@@ -519,10 +519,7 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
         coordinates: coordinates_from_table(call.coordinates())?,
         input_image: call.input_image().map(std::sync::Arc::from),
         kv_input: call.kv_input().map(buffer_id_from_table).transpose()?,
-        kv_output: call
-            .kv_output()
-            .map(buffer_id_from_table)
-            .transpose()?,
+        kv_output: call.kv_output().map(buffer_id_from_table).transpose()?,
         input_token_ids: call
             .input_token_ids()
             .map(|ids| ids.iter().collect())
@@ -577,18 +574,9 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             })
             .transpose()?
             .unwrap_or_default(),
-        token_input: call
-            .token_input()
-            .map(tensor_ref_from_table)
-            .transpose()?,
-        token_output: call
-            .token_output()
-            .map(tensor_ref_from_table)
-            .transpose()?,
-        vision_input: call
-            .vision_input()
-            .map(tensor_ref_from_table)
-            .transpose()?,
+        token_input: call.token_input().map(tensor_ref_from_table).transpose()?,
+        token_output: call.token_output().map(tensor_ref_from_table).transpose()?,
+        vision_input: call.vision_input().map(tensor_ref_from_table).transpose()?,
         latent_feature_input: call
             .latent_feature_input()
             .map(tensor_ref_from_table)
@@ -597,22 +585,13 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             .encoder_output()
             .map(tensor_ref_from_table)
             .transpose()?,
-        latent_input: call
-            .latent_input()
-            .map(tensor_ref_from_table)
-            .transpose()?,
+        latent_input: call.latent_input().map(tensor_ref_from_table).transpose()?,
         latent_output: call
             .latent_output()
             .map(tensor_ref_from_table)
             .transpose()?,
-        image_input: call
-            .image_input()
-            .map(tensor_ref_from_table)
-            .transpose()?,
-        image_output: call
-            .image_output()
-            .map(tensor_ref_from_table)
-            .transpose()?,
+        image_input: call.image_input().map(tensor_ref_from_table).transpose()?,
+        image_output: call.image_output().map(tensor_ref_from_table).transpose()?,
         completion_output: call
             .completion_output()
             .map(tensor_ref_from_table)
@@ -621,10 +600,7 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             .transition_output()
             .map(tensor_ref_from_table)
             .transpose()?,
-        predicate: call
-            .predicate()
-            .map(tensor_ref_from_table)
-            .transpose()?,
+        predicate: call.predicate().map(tensor_ref_from_table).transpose()?,
         rng: call.rng().map(rng_from_table).transpose()?,
     };
     call.validate()?;
@@ -898,14 +874,9 @@ fn tensor_publication_from_table(
 }
 
 /// Decodes the request and call identity attached to a worker error.
-fn error_call_from_table(
-    call: fbs::ErrorCallIdentity<'_>,
-) -> CodecResult<ErrorCallIdentity> {
+fn error_call_from_table(call: fbs::ErrorCallIdentity<'_>) -> CodecResult<ErrorCallIdentity> {
     Ok(ErrorCallIdentity {
-        request_key: request_key_from_table(
-            call.request_key(),
-            "error call.request_key",
-        )?,
+        request_key: request_key_from_table(call.request_key(), "error call.request_key")?,
         call_id: computation_id_from_fb(call.call_id())?,
     })
 }
@@ -1444,15 +1415,13 @@ fn call_to_fb(call: &Call) -> CodecResult<fbs::CallT> {
         max_completion_bytes: call.bounds.max_completion_bytes,
         max_transfer_bytes: call.bounds.max_transfer_bytes,
         inputs: Some(
-            call
-                .inputs
+            call.inputs
                 .iter()
                 .map(tensor_ref_to_fb)
                 .collect::<CodecResult<_>>()?,
         ),
         outputs: Some(
-            call
-                .outputs
+            call.outputs
                 .iter()
                 .map(tensor_ref_to_fb)
                 .collect::<CodecResult<_>>()?,
@@ -2294,13 +2263,9 @@ fn computation_from_fb(value: &fbs::CallKind) -> CodecResult<CallKind> {
             value.forward_mode(),
         )?))
     } else if value.stage() != fbs::PipelineStage::None {
-        Ok(CallKind::Pipeline(pipeline_stage_from_fb(
-            value.stage(),
-        )?))
+        Ok(CallKind::Pipeline(pipeline_stage_from_fb(value.stage())?))
     } else {
-        Ok(CallKind::Transfer(transfer_mode_from_fb(
-            value.transfer(),
-        )?))
+        Ok(CallKind::Transfer(transfer_mode_from_fb(value.transfer())?))
     }
 }
 

@@ -64,18 +64,18 @@ impl WorkerRequest {
     /// Returns the optional call correlation identifier.
     pub const fn message_id(&self) -> Option<u64> {
         match self {
-            Self::Info { message_id } | Self::Submit { message_id, .. } | Self::Close { message_id } => {
-                *message_id
-            }
+            Self::Info { message_id }
+            | Self::Submit { message_id, .. }
+            | Self::Close { message_id } => *message_id,
         }
     }
 
     /// Replaces the call correlation identifier.
     pub fn set_call_id(&mut self, value: Option<u64>) {
         match self {
-            Self::Info { message_id } | Self::Submit { message_id, .. } | Self::Close { message_id } => {
-                *message_id = value
-            }
+            Self::Info { message_id }
+            | Self::Submit { message_id, .. }
+            | Self::Close { message_id } => *message_id = value,
         }
     }
 

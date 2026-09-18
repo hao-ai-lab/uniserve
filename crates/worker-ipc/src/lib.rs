@@ -68,6 +68,7 @@ macro_rules! ensure_valid {
 pub mod codec;
 /// Shared-memory request-response endpoints and wake events.
 pub mod iceoryx;
+pub mod socket;
 #[allow(missing_docs, warnings)]
 /// FlatBuffers bindings generated from the worker protocol schema.
 pub mod schema {
@@ -81,13 +82,13 @@ pub use iceoryx::{
     service_name,
 };
 
-mod info;
 mod call;
+mod info;
 mod request;
 mod tensor;
 
-pub use info::*;
 pub use call::*;
+pub use info::*;
 pub use request::*;
 pub use tensor::*;
 #[cfg(test)]
