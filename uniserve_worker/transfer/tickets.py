@@ -1838,19 +1838,31 @@ class CudaVmmTransport(Transport):
         descriptor = None
         copied_source = None
         try:
-            # A publication is a chunk of this device's pool, so the handle a
-            # consumer imports is the pool's, exported once at reservation,
-            # and the offset locates the chunk inside it. Only their logical
-            # spans are materialized, never an enclosing allocator segment.
-            pool = self._pool(first.device)
+            # Storage that can be exported where it lies is published where
+            # it lies. That copies nothing, and it is what lets a publication
+            # name a row whose bytes arrive later: an encoded media unit is
+            # published with the batch that reserves its row and filled when
+            # the encode completes, so a snapshot taken now would carry
+            # whatever the row held before the encoder wrote it.
+            exported = export_handle(first)
+            pool = None
             chunk = None
-            try:
-                chunk = pool.reserve(_nbytes(tensor))
-            except PoolExhaustedError:
-                # A product the pool cannot hold keeps its own allocation
-                # rather than failing the publication.
-                pass
-            if chunk is not None:
+            if exported is None:
+                # Otherwise the product is materialized in this device's pool,
+                # whose one handle a consumer imports once however many
+                # products it reads from that device. Only the publication's
+                # logical spans are materialized, never an enclosing allocator
+                # segment.
+                pool = self._pool(first.device)
+                try:
+                    chunk = pool.reserve(_nbytes(tensor))
+                except PoolExhaustedError:
+                    # A product the pool cannot hold keeps its own allocation
+                    # rather than failing the publication.
+                    pass
+            if exported is not None:
+                descriptor, storage_size, storage_offset = exported
+            elif chunk is not None:
                 shared = chunk.storage.view(first.dtype).view(shape)
                 for target, value in _copy_pairs(source, shared):
                     target.copy_(value, non_blocking=True)
@@ -1871,22 +1883,18 @@ class CudaVmmTransport(Transport):
                     # stall the crossing genuinely requires.
                     torch.cuda.current_stream(first.device).synchronize()
             else:
+                # A product too large for the pool takes its own exportable
+                # allocation, as every product did before the pool existed.
+                shared = empty(shape, dtype=first.dtype, device=first.device)
+                for target, value in _copy_pairs(source, shared):
+                    target.copy_(value, non_blocking=True)
+                copied_source = source
+                source = shared
+                spans = (shared,)
+                first = shared
                 exported = export_handle(first)
                 if exported is None:
-                    shared = empty(
-                        shape, dtype=first.dtype, device=first.device
-                    )
-                    for target, value in _copy_pairs(source, shared):
-                        target.copy_(value, non_blocking=True)
-                    copied_source = source
-                    source = shared
-                    spans = (shared,)
-                    first = shared
-                    exported = export_handle(first)
-                    if exported is None:
-                        raise RuntimeError(
-                            "shared allocation cannot be exported"
-                        )
+                    raise RuntimeError("shared allocation cannot be exported")
                 descriptor, storage_size, storage_offset = exported
             # A publication hands its consumers an event wherever one can
             # reach them, which is every consumer on this host. Only a chunk

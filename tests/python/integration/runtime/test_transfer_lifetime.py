@@ -727,7 +727,7 @@ def test_cuda_vmm_publication_read_from_another_host_carries_no_fence() -> None:
         events.close()
 
 
-def test_cuda_vmm_publication_read_on_this_host_does_not_stall_its_producer() -> (
+def test_cuda_vmm_publication_on_this_host_does_not_stall_its_producer() -> (
     None
 ):
     """Readiness within a host is an event, which costs the producer nothing.
@@ -1152,5 +1152,84 @@ def test_cuda_vmm_source_retires_before_its_consumers_acknowledge() -> None:
         # No consumer wrote its word, yet the source is the producer's again.
         retirement.result(timeout=5)
     finally:
+        transport.close()
+        events.close()
+
+
+def _read_late_filled_publication(channel) -> None:
+    """External consumer reading only once the producer says it is filled."""
+    device = torch.device("cuda:1")
+    torch.cuda.set_device(device)
+    event_pool = EventPool()
+    transport = make_transport(
+        "cuda_vmm",
+        byte_capacity=8 << 20,
+        ticket_capacity=2,
+        event_pool=event_pool,
+    )
+    try:
+        channel.send("ready")
+        locator = Locator.from_mapping(channel.recv())
+        assert channel.recv() == "filled"
+        value = _await_ticket(transport.fetch(locator, device=device))
+        channel.send(bool(torch.equal(value.cpu(), torch.full((256,), 7.0))))
+    finally:
+        transport.close()
+        event_pool.close()
+        channel.close()
+
+
+def test_cuda_vmm_publishes_a_row_whose_bytes_arrive_later() -> None:
+    """A publication may name storage its producer has not written yet.
+
+    An encoded media unit is published with the batch that reserves its row and
+    filled when the encode completes; the engine schedules its consumer only
+    after that. Publishing therefore has to name the row rather than snapshot
+    it, or the consumer reads whatever the row held beforehand.
+    """
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe()
+    events = EventPool()
+    transport = make_transport(
+        "cuda_vmm", byte_capacity=8 << 20, ticket_capacity=2, event_pool=events
+    )
+    process = context.Process(
+        target=_read_late_filled_publication, args=(child,)
+    )
+    locator = None
+    try:
+        process.start()
+        child.close()
+        assert parent.poll(60), "late-fill consumer did not start"
+        assert parent.recv() == "ready"
+
+        # The row lives in the worker's exportable arena, as a reserved media
+        # unit row does; that is what lets it be published where it lies.
+        from uniserve_kernel.peer_memory import empty
+
+        row = empty((256,), dtype=torch.float32, device=torch.device("cuda:0"))
+        row.zero_()
+        locator = transport.publish(row)
+        parent.send(locator.to_mapping())
+
+        # The producer writes the row after it is published, as the encode
+        # round does, and only then admits the read.
+        row.fill_(7.0)
+        torch.cuda.synchronize(0)
+        parent.send("filled")
+
+        assert parent.poll(60), "late-fill consumer did not finish"
+        assert parent.recv() is True, (
+            "the consumer read the row as it was before the producer wrote it"
+        )
+        process.join(30)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(30)
+        parent.close()
+        if locator is not None:
+            transport.release(locator)
         transport.close()
         events.close()
