@@ -340,7 +340,6 @@ class TensorStore:
             TensorRecord | list[TensorRecord],
         ] = {}
         self.exports: dict[BufferId, ExportLocations] = {}
-        self.export_releases: dict[BufferId, tuple[Future[None], ...]] = {}
         self._next_binding_id = 1
         self._lock = RLock()
 
@@ -381,7 +380,6 @@ class TensorStore:
         """
         with self._lock:
             self.exports.clear()
-            self.export_releases.clear()
             self._imports.clear()
             self._products.clear()
             self._writes.clear()
@@ -1660,7 +1658,7 @@ class TensorStore:
         leases.
         """
         selected = set(buffers)
-        release_exports(self.exports, self.export_releases, selected)
+        release_exports(self.exports, selected)
         if not selected:
             return
         with self._lock:

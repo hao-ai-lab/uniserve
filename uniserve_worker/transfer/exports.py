@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from concurrent.futures import Future
 
 from ..protocol.identity import BufferId, RequestKey
 from ..protocol.transfer import Locator
@@ -46,46 +45,28 @@ def retiring_exports(
 
 def release_exports(
     exports: Mapping[BufferId, ExportLocations],
-    retirements: dict[BufferId, tuple[Future[None], ...]],
     buffers: Iterable[BufferId],
-) -> tuple[Future[None], ...]:
-    """Revoke acquisition and retain the exact physical retirement futures.
+) -> None:
+    """Revoke acquisition of the named buffers' registrations.
 
-    Storage records can outlive request state. Keep registrations and futures
-    together in the storage owner until every already admitted reader retires.
-    Remote locators from imports are never inserted into this directory.
+    Revocation rejects new readers. The publication's physical retirement runs
+    on the owning transport: a device chunk returns to its pool once every
+    consumer has acknowledged it, and the storage owner refuses to reclaim a
+    write while any publication it retained is still live. Remote locators from
+    imports are never inserted into this directory.
     """
-    pending: list[Future[None]] = []
     for buffer in buffers:
         locations = exports.get(buffer)
         if locations is None:
             continue
-        # Retirement futures are recorded once per buffer so repeated releases
-        # observe the exact same physical completion, never a fresh revocation.
-        if buffer not in retirements:
-            retirements[buffer] = tuple(
-                future
-                for transport, locator in locations
-                if (future := transport.release(locator)) is not None
-            )
-        pending.extend(retirements[buffer])
-    return tuple(pending)
+        for transport, locator in locations:
+            transport.release(locator)
 
 
 def forget_exports(
     exports: dict[BufferId, ExportLocations],
-    retirements: dict[BufferId, tuple[Future[None], ...]],
     buffers: Iterable[BufferId],
 ) -> None:
-    """Forget only registrations whose physical release succeeded."""
+    """Forget the named buffers' registrations after their revocation."""
     for buffer in buffers:
-        if buffer not in exports:
-            continue
-        futures = retirements.get(buffer)
-        if futures is None or any(not future.done() for future in futures):
-            raise RuntimeError("transport registration has not retired")
-        # Propagate any retirement failure before dropping the registration.
-        for future in futures:
-            future.result()
-        del exports[buffer]
-        del retirements[buffer]
+        exports.pop(buffer, None)

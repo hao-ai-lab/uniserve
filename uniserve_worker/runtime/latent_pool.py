@@ -144,7 +144,6 @@ class LatentPool:
         self._slot_pages: list[tuple[int, ...]] = [() for _ in range(rows)]
         self._imports: dict[int, LatentImport] = {}
         self.exports: dict[BufferId, ExportLocations] = {}
-        self.export_releases: dict[BufferId, tuple[Future[None], ...]] = {}
         self._sources: dict[BufferId, LatentExport] = {}
         self._retiring_slots: set[int] = set()
 
@@ -463,7 +462,7 @@ class LatentPool:
 
         publication.
         """
-        release_exports(self.exports, self.export_releases, buffers)
+        release_exports(self.exports, buffers)
         for buffer in buffers:
             source = self._sources.get(buffer)
             if source is not None:
@@ -878,7 +877,6 @@ class LatentPool:
             )
 
         self.exports.clear()
-        self.export_releases.clear()
         # Drop device allocations while keeping each attribute well-typed.
         for name, dtype in (
             ("storage", self.dtype),

@@ -1565,13 +1565,12 @@ class Worker:
                 store.exports, buffers=freed, requests=closed, retained=retained
             )
         )
-        releases = tuple(
-            future
-            for store in stores
-            for future in release_exports(
-                store.exports, store.export_releases, selected
-            )
-        )
+        # Revoking a publication ends new grants. Its physical retirement is
+        # the storage owner's to observe: a write is not reclaimed while any
+        # publication it retained is live, so retirement needs no second wait
+        # on the same futures.
+        for store in stores:
+            release_exports(store.exports, selected)
 
         if self.latent_pool is not None:
             self.latent_pool.release_buffers(selected)
@@ -1579,17 +1578,11 @@ class Worker:
             self.kv_cache.imports.cancel_requests(closed, retained=retained)
             self.kv_cache.release_buffers(selected)
 
-        wake = self._completion_wake
-        if wake is not None:
-            for future in releases:
-                future.add_done_callback(lambda _future: wake())
-
         state.retirement_requests = closed
         state.retirement_local_requests = local_closed
         state.retirement_buffers = freed
         state.retained_buffers = retained
         state.retirement_exports = selected
-        state.retirement_releases = releases
         # Finish includes request-state writes issued after output capture.
         state.retirement_events = (
             self._record_retirement_events() if closed else ()
@@ -1654,18 +1647,9 @@ class Worker:
             buffers=freed, requests=closed, retained=retained
         ):
             return False
-        for future in state.retirement_releases:
-            if not future.done():
-                return False
-            future.result()
-
         for store in (self.tensor_store, self.kv_cache, self.latent_pool):
             if store is not None:
-                forget_exports(
-                    store.exports,
-                    store.export_releases,
-                    state.retirement_exports,
-                )
+                forget_exports(store.exports, state.retirement_exports)
         for key in state.retirement_local_requests:
             self.retire_request(key, retained=retained)
 

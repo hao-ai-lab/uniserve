@@ -112,7 +112,6 @@ class BatchState:
     retirement_buffers: frozenset[BufferId] = frozenset()
     retained_buffers: frozenset[BufferId] = frozenset()
     retirement_exports: tuple[BufferId, ...] = ()
-    retirement_releases: tuple[Future[None], ...] = ()
     retirement_events: tuple[torch.cuda.Event, ...] = ()
     retirement_cleaned: bool = False
 

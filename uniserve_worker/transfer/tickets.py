@@ -1459,8 +1459,8 @@ class _CudaSource:
     def acknowledged(self) -> bool:
         """Report whether every consumer of this publication has acknowledged.
 
-        A publication that holds no pool chunk has no header to acknowledge, so
-        its storage is the producer's to reclaim as soon as its fence drains.
+        A publication that holds no pool chunk has no header to acknowledge:
+        its consumers close a reader grant instead.
         """
         if self.chunk is None:
             return True
@@ -1468,11 +1468,12 @@ class _CudaSource:
 
     def events_released(self) -> None:
         # A shareable handle is bytes the publication carried, not a process
-        # descriptor this rank owns, so nothing is closed here. The chunk is
-        # released only here, after its consumers acknowledged and the
-        # producer's own fence drained.
-        if self.pool is not None and self.chunk is not None:
-            self.pool.release(self.chunk)
+        # descriptor this rank owns, so nothing is closed here.
+        #
+        # This ends the source's lifetime, not the chunk's. A pool publication
+        # was copied into its chunk, so the source is the producer's to reuse
+        # as soon as its own fence drains, however long consumers keep reading
+        # the chunk. The chunk returns separately, once they acknowledge it.
         self.capacity.release(self.nbytes)
         if self.retirement is not None:
             self.retirement.set_result(None)
@@ -1554,18 +1555,18 @@ class CudaVmmTransport(Transport):
         retirement: concurrent.futures.Future[None] | None = None,
     ) -> None:
         source.retirement = retirement
-        if not source.acknowledged():
-            # A consumer may still be reading this chunk. Retiring the
-            # publication ends its grants, not its readers, so the chunk is
-            # held until every named slot has written its word.
+        if source.chunk is not None:
+            # A consumer may still be reading this chunk, and it will say so by
+            # writing its word rather than by closing a connection. The chunk
+            # is held until then, which does not hold the source: that was
+            # copied into the chunk and is released below.
             self._unacknowledged.append(source)
-            return
         self._events.defer_release(
             (source.event,), source, completed=source.events_released
         )
 
     def reap(self) -> None:
-        """Release publications whose consumers have finished acknowledging.
+        """Return chunks whose consumers have finished acknowledging.
 
         The producing rank sweeps here rather than waiting on a per-reader
         connection, so a consumer on another host retires a product the same
@@ -1579,9 +1580,8 @@ class CudaVmmTransport(Transport):
         ]
         for source in settled:
             self._unacknowledged.remove(source)
-            self._events.defer_release(
-                (source.event,), source, completed=source.events_released
-            )
+            if source.pool is not None and source.chunk is not None:
+                source.pool.release(source.chunk)
 
     def _drain(self, source: _CudaSource) -> None:
         source.event.synchronize()
@@ -1943,6 +1943,11 @@ class CudaVmmTransport(Transport):
             self._reads.close()
         finally:
             self._publications.close()
+            # Consumers of this rank's remaining chunks are gone with it, so
+            # their acknowledgments will never arrive. The pools are released
+            # whole, which is what closing the transport means for them.
+            self._unacknowledged.clear()
+            self._pools.clear()
             with _endpoint_lock:
                 _endpoints.pop(self.endpoint(), None)
         if self._failed_publication is not None:

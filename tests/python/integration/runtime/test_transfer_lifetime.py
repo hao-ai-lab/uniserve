@@ -1060,3 +1060,36 @@ def test_local_delivery_between_workers_retains_the_publisher_until_consumption(
         producer.close()
         consumer_events.close()
         producer_events.close()
+
+
+def test_cuda_vmm_source_retires_before_its_consumers_acknowledge() -> None:
+    """A published source is reusable as soon as its own producer fence drains.
+
+    Publishing copies the product into a pool chunk, so the source and the
+    chunk have separate lifetimes. Holding the source until consumers finished
+    reading would stall the producing rank's slot reset behind a rank that has
+    not yet run the batch that reads the product.
+    """
+    device = torch.device("cuda:0")
+    events = EventPool()
+    # A consumer that never acknowledges: the chunk stays out of the pool.
+    transport = make_transport(
+        "cuda_vmm",
+        byte_capacity=1 << 20,
+        ticket_capacity=2,
+        event_pool=events,
+        consumers=(1,),
+    )
+    source = torch.ones(1024, device=device)
+    try:
+        locator = transport.publish(source)
+        torch.cuda.synchronize(device)
+
+        retirement = transport.release(locator)
+        assert retirement is not None
+        events.reap()
+        # No consumer wrote its word, yet the source is the producer's again.
+        retirement.result(timeout=5)
+    finally:
+        transport.close()
+        events.close()
