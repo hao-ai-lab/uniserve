@@ -1665,6 +1665,7 @@ class CudaVmmTransport(Transport):
         source: WorkerEndpoint | None = None,
         consumers: Sequence[int] = (),
         acknowledgment_slot: int = 0,
+        cross_host_consumers: bool = False,
     ) -> None:
         from uniserve_kernel.peer_memory import _extension
 
@@ -1692,6 +1693,9 @@ class CudaVmmTransport(Transport):
         self._consumers = tuple(int(slot) for slot in consumers)
         # This rank's own word in every chunk header it reads.
         self._acknowledgment_slot = int(acknowledgment_slot)
+        # Whether a publication has to state readiness without an interprocess
+        # event, which only a consumer on another host requires.
+        self._cross_host_consumers = bool(cross_host_consumers)
         # Publications whose fence has drained but whose consumers have not all
         # acknowledged. Their chunks are held until reap() finds them settled.
         self._unacknowledged: list[_CudaSource] = []
@@ -1859,12 +1863,13 @@ class CudaVmmTransport(Transport):
                 # A consumer reads the payload, which follows the chunk's
                 # acknowledgment words, so the offset names the payload.
                 storage_offset = chunk.payload_offset
-                # Readiness is this synchronize, not an interprocess event: an
-                # event handle is host-local, and imported VMM memory admits no
-                # device-side wait on current drivers. Once the copy has
-                # landed, the chunk is readable by any consumer that maps it,
-                # on this host or another.
-                torch.cuda.current_stream(first.device).synchronize()
+                if self._cross_host_consumers:
+                    # A consumer on another host can wait on nothing this rank
+                    # records: an event handle is host-local, and imported VMM
+                    # memory admits no device-side wait on current drivers. So
+                    # readiness is this synchronize, and the producer pays a
+                    # stall the crossing genuinely requires.
+                    torch.cuda.current_stream(first.device).synchronize()
             else:
                 exported = export_handle(first)
                 if exported is None:
@@ -1883,10 +1888,11 @@ class CudaVmmTransport(Transport):
                             "shared allocation cannot be exported"
                         )
                 descriptor, storage_size, storage_offset = exported
-            # A pool publication is already readable, so its fence is this
-            # rank's own and never leaves the process. An in-place publication
-            # exports the source itself and still hands consumers an event.
-            interprocess = chunk is None
+            # A publication hands its consumers an event wherever one can
+            # reach them, which is every consumer on this host. Only a chunk
+            # whose readers are elsewhere was made readable by the synchronize
+            # above and so carries no fence at all.
+            interprocess = chunk is None or not self._cross_host_consumers
             event = self._events.acquire(
                 first.device, interprocess=interprocess
             )
@@ -2178,6 +2184,7 @@ def make_transports(
     source: WorkerEndpoint | None = None,
     consumers: Sequence[int] = (),
     acknowledgment_slot: int = 0,
+    cross_host_consumers: bool = False,
 ) -> dict[str, Transport]:
     """Construct configured backends against one rank resource budget.
 
@@ -2185,7 +2192,8 @@ def make_transports(
     rank's device products, which the head derives from the transfer edges. A
     device transport holds a published chunk until every one of them has
     acknowledged it. `acknowledgment_slot` is this rank's own word, which it
-    writes in every chunk it reads.
+    writes in every chunk it reads. `cross_host_consumers` says whether any of
+    them is on another host, which decides how a publication states readiness.
     """
     if not names or len(set(names)) != len(names):
         raise invalid_descriptor(
@@ -2218,6 +2226,7 @@ def make_transports(
             if name == "cuda_vmm":
                 arguments["consumers"] = consumers
                 arguments["acknowledgment_slot"] = acknowledgment_slot
+                arguments["cross_host_consumers"] = cross_host_consumers
             transports[name] = constructors[name](**arguments)
     except BaseException:
         for transport in transports.values():

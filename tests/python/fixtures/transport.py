@@ -27,6 +27,7 @@ def make_transport(
     source: WorkerEndpoint | None = None,
     consumers: Sequence[int] = (),
     acknowledgment_slot: int = 0,
+    cross_host_consumers: bool = False,
 ) -> Transport:
     """Construct one bounded physical backend for a standalone endpoint."""
     return make_transports(
@@ -37,4 +38,5 @@ def make_transport(
         source=source,
         consumers=consumers,
         acknowledgment_slot=acknowledgment_slot,
+        cross_host_consumers=cross_host_consumers,
     )[str(name)]
