@@ -42,7 +42,7 @@ def test_expert_devices_reject_inconsistent_rank_or_repeated_devices(
 @pytest.mark.parametrize(
     "allocator", ("expandable_segments:True", "backend:cudaMallocAsync")
 )
-def test_cuda_ipc_publication_rejects_nonexportable_allocations(
+def test_cuda_vmm_publication_rejects_nonexportable_allocations(
     monkeypatch, allocator: str, tmp_path
 ) -> None:
     monkeypatch.setenv("PYTORCH_ALLOC_CONF", allocator)
@@ -53,8 +53,8 @@ def test_cuda_ipc_publication_rejects_nonexportable_allocations(
             model="model",
             max_batch_tokens=8192,
             device="cuda:0",
-            transfer_backends="shm,cuda_ipc",
-            publish_backends="shm,cuda_ipc",
+            transfer_backends="shm,cuda_vmm",
+            publish_backends="shm,cuda_vmm",
         )
 
 

@@ -180,7 +180,7 @@ pub enum TransferTransport {
         name: String,
     },
     /// CUDA publication whose granted reader receives a physical-allocation descriptor.
-    CudaIpc {
+    CudaVmm {
         /// Publishing worker endpoint.
         endpoint: String,
         /// Stable publication identity.
@@ -583,7 +583,7 @@ fn transfer_encoded_size(tensors: &[TensorTransfer]) -> usize {
                 TransferTransport::PosixShm { endpoint, name } => {
                     endpoint.len().saturating_add(name.len()).saturating_add(16)
                 }
-                TransferTransport::CudaIpc {
+                TransferTransport::CudaVmm {
                     endpoint,
                     publication_id,
                     ready_event_handle,
@@ -751,7 +751,7 @@ impl Locator {
                 );
                 ensure_valid!(!name.is_empty(), "shared-memory transfer name is empty");
             }
-            TransferTransport::CudaIpc {
+            TransferTransport::CudaVmm {
                 endpoint,
                 publication_id,
                 storage_size_bytes,
@@ -787,13 +787,13 @@ impl Locator {
                         && tensor_stride.len() == self.shape.len()
                         && ready_event_handle.len() == 64
                         && tensor_stride.iter().all(|stride| *stride >= 0),
-                    "CUDA IPC transfer handle is incomplete"
+                    "CUDA VMM transfer handle is incomplete"
                 );
                 let opaque_bytes = ready_event_handle.len();
 
                 ensure_valid!(
                     opaque_bytes <= MAX_TRANSFER_HANDLE_BYTES,
-                    "CUDA IPC transfer handles exceed their byte bound"
+                    "CUDA VMM transfer handles exceed their byte bound"
                 );
             }
         }

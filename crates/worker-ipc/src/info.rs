@@ -239,7 +239,7 @@ impl WorkerInfo {
                 && self
                     .transfer_backends
                     .iter()
-                    .all(|name| matches!(name.as_str(), "local" | "shm" | "cuda_ipc"))
+                    .all(|name| matches!(name.as_str(), "local" | "shm" | "cuda_vmm"))
                 && self.transfer_backends.iter().collect::<HashSet<_>>().len()
                     == self.transfer_backends.len(),
             "worker physical transfer capabilities are incomplete"

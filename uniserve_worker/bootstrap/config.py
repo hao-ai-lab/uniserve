@@ -391,10 +391,10 @@ class WorkerProcessArgs:
 
         if not set(publication_backends).issubset(backends):
             raise ValueError("publication backends must be bound transports")
-        if "cuda_ipc" in backends and not device.startswith("cuda:"):
-            raise ValueError("CUDA IPC requires a CUDA worker device")
+        if "cuda_vmm" in backends and not device.startswith("cuda:"):
+            raise ValueError("CUDA VMM requires a CUDA worker device")
 
-        # CUDA IPC shares pointers into the caching allocator's segments, which
+        # CUDA VMM shares pointers into the caching allocator's segments, which
         # only works for natively reserved, non-expandable allocations.
         allocator = (
             (
@@ -404,12 +404,12 @@ class WorkerProcessArgs:
             .replace(" ", "")
             .lower()
         )
-        if "cuda_ipc" in publication_backends and (
+        if "cuda_vmm" in publication_backends and (
             "expandable_segments:true" in allocator
             or "backend:cudamallocasync" in allocator
         ):
             raise ValueError(
-                "CUDA IPC publication requires native nonexpandable "
+                "CUDA VMM publication requires native nonexpandable "
                 "CUDA allocations"
             )
 
@@ -620,8 +620,8 @@ def _parse_transfer_backends(value: object) -> tuple[str, ...]:
     backends = tuple(part.strip() for part in str(value).split(","))
     if not backends or len(set(backends)) != len(backends):
         raise ValueError("transfer backends must be nonempty and unique")
-    if any(name not in {"local", "shm", "cuda_ipc"} for name in backends):
-        raise ValueError("transfer backends must name local, shm, or cuda_ipc")
+    if any(name not in {"local", "shm", "cuda_vmm"} for name in backends):
+        raise ValueError("transfer backends must name local, shm, or cuda_vmm")
     return backends
 
 

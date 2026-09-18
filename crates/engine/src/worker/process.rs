@@ -492,13 +492,13 @@ impl PendingRank {
             .env("WORLD_SIZE", world_size.to_string())
             .env("LOCAL_RANK", local_rank.to_string())
             .env("LOCAL_WORLD_SIZE", local_world_size.to_string());
-        // CUDA IPC exports cudaMalloc allocations. Expandable VMM segments
+        // CUDA VMM exports cudaMalloc allocations. Expandable VMM segments
         // cannot supply its memory handles; other ranks retain expandable
         // allocation to accommodate varying serving shapes.
         if std::env::var_os("PYTORCH_ALLOC_CONF").is_none()
             && std::env::var_os("PYTORCH_CUDA_ALLOC_CONF").is_none()
         {
-            let allocation = if publications.contains(&crate::executor::TransferBackend::CudaIpc) {
+            let allocation = if publications.contains(&crate::executor::TransferBackend::CudaVmm) {
                 "expandable_segments:False"
             } else {
                 "expandable_segments:True"

@@ -263,7 +263,7 @@ def test_component_bindings_release_cancelled_requests(
         json.dumps(workers),
         "--transfer",
         ",".join(
-            f"{source}->{destination}=cuda_ipc"
+            f"{source}->{destination}=cuda_vmm"
             for source, destination in sorted(edges)
         ),
         "--queue-depth",

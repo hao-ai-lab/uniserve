@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Generic, TypeVar
 
 from ..foundation.errors import invalid_descriptor, resource_error
-from ..protocol.transfer import CudaIpcTransfer, Locator, PosixShmTransfer
+from ..protocol.transfer import CudaVmmTransfer, Locator, PosixShmTransfer
 
 Source = TypeVar("Source")
 
@@ -33,7 +33,7 @@ def locator_digest(locator: Locator) -> bytes:
 def publication_key(locator: Locator) -> bytes:
     """Return the fixed-width source key carried by the reader protocol."""
     handle = locator.transport
-    if isinstance(handle, CudaIpcTransfer):
+    if isinstance(handle, CudaVmmTransfer):
         return handle.publication_id.encode("ascii")
     if isinstance(handle, PosixShmTransfer):
         return hashlib.sha256(handle.name.encode("utf-8")).digest()
@@ -56,7 +56,7 @@ def open_reader(locator: Locator) -> socket.socket:
     the producer's own host.
     """
     handle = locator.transport
-    if not isinstance(handle, (CudaIpcTransfer, PosixShmTransfer)):
+    if not isinstance(handle, (CudaVmmTransfer, PosixShmTransfer)):
         raise invalid_descriptor("process read requires a shared transport")
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     try:
