@@ -1325,7 +1325,7 @@ class ShmTransport(Transport):
             raise invalid_descriptor(
                 "shared-memory read requires a shared-memory locator"
             )
-        connection, _descriptor = open_reader(locator)
+        connection = open_reader(locator)
         failure: BaseException | None = None
         try:
             ticket._require_active()
@@ -1425,12 +1425,13 @@ class _CudaSource:
     event: torch.cuda.Event
     nbytes: int
     capacity: TransferCapacity
-    descriptor: int
+    handle: bytes
     copied_source: torch.Tensor | tuple[torch.Tensor, ...] | None = None
     retirement: concurrent.futures.Future[None] | None = None
 
     def events_released(self) -> None:
-        os.close(self.descriptor)
+        # A shareable handle is bytes the publication carried, not a process
+        # descriptor this rank owns, so nothing is closed here.
         self.capacity.release(self.nbytes)
         if self.retirement is not None:
             self.retirement.set_result(None)
@@ -1468,7 +1469,6 @@ class CudaIpcTransport(Transport):
             publication_capacity=256,
             reclaim=self._reclaim,
             drain=self._drain,
-            descriptor=lambda source: source.descriptor,
         )
         self._reads = _BoundedTransferPool(
             workers=2,
@@ -1591,6 +1591,10 @@ class CudaIpcTransport(Transport):
                     span_counts=tuple(count for _, count in length_runs),
                     tensor_stride=tuple(first.stride()),
                     ready_event_handle=bytes(event.ipc_handle()),
+                    # The allocation handle travels with the publication so a
+                    # consumer imports it directly. A fabric handle reaches
+                    # another host, which a descriptor grant cannot.
+                    allocation_handle=descriptor,
                 ),
                 nbytes=nbytes,
                 dtype=_dtype_to_str(first.dtype),
@@ -1604,10 +1608,6 @@ class CudaIpcTransport(Transport):
             if publication is not None:
                 self._reclaim(publication)
             else:
-                # No reader can own an unregistered descriptor. Its allocation
-                # remains retained separately if producer draining fails.
-                if descriptor is not None:
-                    os.close(descriptor)
                 try:
                     # No usable producer fence exists on this failure path.
                     # Keep its allocation and quota if draining also fails.
@@ -1673,8 +1673,9 @@ class CudaIpcTransport(Transport):
 
         handle = locator.transport
         assert isinstance(handle, CudaIpcTransfer)
-        connection, descriptor = open_reader(locator)
-        assert descriptor is not None
+        # The grant conveys reader ownership; the allocation handle it used
+        # to carry now travels with the publication.
+        connection = open_reader(locator)
         mapped = None
         event = None
         failure: BaseException | None = None
@@ -1715,9 +1716,12 @@ class CudaIpcTransport(Transport):
                         )
                     # One mapping owns every span; tensor views share its
                     # deleter.
+                    # The publication carries the shareable handle, so the
+                    # consumer imports it directly rather than being granted a
+                    # descriptor that only reaches the producer's own host.
                     allocation = import_handle(
                         prototype,
-                        descriptor,
+                        handle.allocation_handle,
                         handle.storage_size_bytes,
                     )
                     lengths = (
@@ -1764,7 +1768,6 @@ class CudaIpcTransport(Transport):
                             raise failure from cleanup_error
                         raise
             finally:
-                os.close(descriptor)
                 connection.close()
 
     def release(
