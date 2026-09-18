@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from ..bootstrap.worker_info import RequestKind, ResponseKind
@@ -150,18 +150,13 @@ def finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
 
 @dataclass(slots=True)
 class ServiceRequest:
-    """Track one decoded IPC request.
-
-    Covers its dependencies, successors, batch, and release state.
-    """
+    """Track one decoded IPC request, its batch and its release state."""
 
     sequence: int
     request: dict[str, Any]
     requests: frozenset[int]
     kind: RequestKind
     batch: Batch | None = None
-    dependencies: int = 0
-    successors: list[ServiceRequest] = field(default_factory=list)
     released: bool = False
 
 
