@@ -2265,6 +2265,7 @@ fn rank_group_args(
 fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     const TEMPLATE: &str = r#"{
     "registration_address": "__REGISTRATION__",
+    "channel_transport": "iceoryx2",
     "worker_id": "worker",
     "queue_depth": 2,
     "ipc_payload_cap": 1048576,

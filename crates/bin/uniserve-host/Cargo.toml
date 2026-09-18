@@ -1,0 +1,18 @@
+[package]
+name = "uniserve-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "uniserve-host"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

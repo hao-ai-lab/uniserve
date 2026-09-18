@@ -420,9 +420,7 @@ class ModelRunner:
                 stream
                 for lane, stream in self._lane_streams
                 if stream.device == binding.device
-                and (
-                    lane is None or entry_kinds.intersection(lane.call_kinds)
-                )
+                and (lane is None or entry_kinds.intersection(lane.call_kinds))
             )
             if len(parents) > 1:
                 raise InputError(
@@ -1360,8 +1358,7 @@ class ModelRunner:
                         self, entry, entry.input_buffers, forward, shapes
                     )
                 elif (
-                    phase == "decode"
-                    and ForwardMode.DECODE in entry.call_kinds
+                    phase == "decode" and ForwardMode.DECODE in entry.call_kinds
                 ):
                     prepare_decode(self, entry, entry.input_buffers, forward)
                 elif (
