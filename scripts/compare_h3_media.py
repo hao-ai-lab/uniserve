@@ -22,6 +22,73 @@ POINTS = (
     "minimax-h3-15s-10k",
 )
 
+#: Qualification bounds, as (metric, direction, bound) with "min" meaning the
+#: metric must be at least the bound and "max" at most.
+#:
+#: The video bounds are the ones declared for media unit division, measured on
+#: a real H3 output whose frames entering both encoders were identical, so they
+#: bound the distance a changed GOP structure introduces. A configuration that
+#: changes only how a reduction is ordered across ranks re-encodes nothing and
+#: alters no encoder parameter, so its distance is strictly smaller and these
+#: are an upper bound on it. They are deliberately loose for that use: they
+#: fail a defect that alters decoded pixels, not one that merely reorders a
+#: sum, and the measured values travel with the verdict so a regression inside
+#: them stays visible.
+#:
+#: The audio bounds admit the same reordering. Unit decoding with a halo is
+#: exact, so a halo defect moves the log-mel error by orders of magnitude
+#: rather than by the last bits of a reduction.
+THRESHOLDS = {
+    "video": (
+        ("psnr_db", "min", 35.0),
+        ("rgb_nrmse", "max", 0.018),
+        ("ssim_mean", "min", 0.93),
+        ("ssim_min", "min", 0.90),
+        ("lpips_alex_mean", "max", 0.055),
+        ("lpips_alex_max", "max", 0.090),
+    ),
+    "audio": (
+        ("snr_db", "min", 40.0),
+        ("correlation", "min", 0.999),
+        ("log_mel_l1_db", "max", 0.50),
+        ("log_mel_cosine", "min", 0.999),
+    ),
+}
+
+
+def _qualify(comparison: dict) -> dict:
+    """Judge one candidate's measurements against the declared bounds.
+
+    Returns each bound with the value it saw and whether it held, plus the
+    overall verdict. A metric the comparison did not produce — audio SNR is
+    absent when the tracks are bit-identical — holds trivially, because
+    identity is the strongest form of every bound here.
+    """
+    checks = []
+    for track, bounds in THRESHOLDS.items():
+        measured = comparison[track]
+        for metric, direction, bound in bounds:
+            value = measured.get(metric)
+            held = (
+                True
+                if value is None
+                else (value >= bound if direction == "min" else value <= bound)
+            )
+            checks.append(
+                {
+                    "track": track,
+                    "metric": metric,
+                    "direction": direction,
+                    "bound": bound,
+                    "measured": value,
+                    "held": held,
+                }
+            )
+    return {
+        "qualified": all(check["held"] for check in checks),
+        "checks": checks,
+    }
+
 
 def _sample(root: Path, point: str) -> Path:
     paths = sorted((root / point / "samples").glob("*.mp4"))
@@ -256,6 +323,17 @@ def main() -> int:
                 "same benchmark point, prompt, and seed; first deterministic "
                 "measured sample"
             ),
+            "thresholds": (
+                "declared in this script before the run; see THRESHOLDS for "
+                "each bound and its derivation"
+            ),
+        },
+        "thresholds": {
+            track: [
+                {"metric": metric, "direction": direction, "bound": bound}
+                for metric, direction, bound in bounds
+            ]
+            for track, bounds in THRESHOLDS.items()
         },
         "reference": {
             "label": args.reference_label,
@@ -268,13 +346,15 @@ def main() -> int:
         comparisons = {}
         for label, root in args.candidate:
             candidate = _sample(root, point)
-            comparisons[label] = {
+            comparison = {
                 "sample": str(candidate),
                 "sample_sha256": _sha256(candidate),
                 "latency": _latency(root, point),
                 "video": compare_video(reference, candidate, perceptual),
                 "audio": compare_audio(reference, candidate),
             }
+            comparison["qualification"] = _qualify(comparison)
+            comparisons[label] = comparison
         result["points"][point] = {
             "reference_sample": str(reference),
             "reference_sample_sha256": _sha256(reference),
@@ -282,9 +362,18 @@ def main() -> int:
             "candidates": comparisons,
         }
 
+    qualified = all(
+        candidate["qualification"]["qualified"]
+        for entry in result["points"].values()
+        for candidate in entry["candidates"].values()
+    )
+    result["qualified"] = qualified
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-    return 0
+    # The exit status is the verdict, so a qualification run fails its caller
+    # rather than leaving the judgement to whoever reads the report.
+    return 0 if qualified else 1
 
 
 if __name__ == "__main__":

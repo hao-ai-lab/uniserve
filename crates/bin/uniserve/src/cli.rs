@@ -156,6 +156,12 @@ pub(crate) struct SharedRuntimeArgs {
     /// engine owns exactly the ranks whose placement node matches.
     #[arg(long = "host-identity", default_value = "localhost")]
     pub host_identity: String,
+    /// Hosts the shorthand spreads `--worker-ranks` across, in order, starting
+    /// with this instance's own. Ranks are assigned in blocks so the lowest
+    /// ranks stay on the head's host, and each host numbers its devices from
+    /// zero. Omitted, every rank is placed on this host.
+    #[arg(long = "worker-hosts", value_delimiter = ',')]
+    pub worker_hosts: Vec<String>,
     /// Explicit Python worker launch/runtime arguments.
     #[command(flatten)]
     pub worker_process: WorkerProcessOptions,
@@ -251,6 +257,22 @@ impl SharedRuntimeArgs {
     ///
     /// `is_media` comes from the checkpoint itself; video deployments size their
     /// queue, batch and IPC slots differently from token deployments.
+    /// Returns the hosts the shorthand places ranks on, head's host first.
+    ///
+    /// Section 7's eight-device configuration spans two hosts, and its muxer
+    /// sits on rank zero of the head's host, so the head's own identity leads
+    /// the list whether or not `--worker-hosts` repeats it.
+    fn placement_hosts(&self) -> Vec<String> {
+        let mut hosts = vec![self.host_identity.clone()];
+        hosts.extend(
+            self.worker_hosts
+                .iter()
+                .filter(|host| !host.is_empty() && **host != self.host_identity)
+                .cloned(),
+        );
+        hosts
+    }
+
     pub(crate) fn engine_settings(&self, is_media: bool) -> EngineSettings {
         let mut worker_process = self.worker_process.to_args();
         worker_process.host = self.host_identity.clone();
@@ -292,20 +314,11 @@ impl SharedRuntimeArgs {
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
             workers: self.workers.clone().map(Vec::from).unwrap_or_else(|| {
+                let hosts = self.placement_hosts();
                 vec![if is_media {
-                    WorkerConfig::h3(
-                        &self.host_identity,
-                        &self.device,
-                        self.worker_ranks,
-                        queue_depth,
-                    )
+                    WorkerConfig::h3(&hosts, &self.device, self.worker_ranks, queue_depth)
                 } else {
-                    WorkerConfig::model(
-                        &self.host_identity,
-                        &self.device,
-                        self.worker_ranks,
-                        queue_depth,
-                    )
+                    WorkerConfig::model(&hosts, &self.device, self.worker_ranks, queue_depth)
                 }]
             }),
             transfer: self.transfer.clone().unwrap_or_default(),

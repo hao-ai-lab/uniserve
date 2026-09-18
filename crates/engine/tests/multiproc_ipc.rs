@@ -999,7 +999,12 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
         ..Default::default()
     };
     config.max_batch = QUEUE_DEPTH * 8;
-    config.workers = vec![WorkerConfig::model("localhost", "cpu", WORLD_SIZE, 2)];
+    config.workers = vec![WorkerConfig::model(
+        &["localhost".to_owned()],
+        "cpu",
+        WORLD_SIZE,
+        2,
+    )];
     config.worker_process = rank_group_args(128 << 10, 128 << 10);
     let engine = {
         let _launch_guard = CHILD_LAUNCH_ENV_LOCK
@@ -1479,8 +1484,8 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     let mut executor = WorkerGroup::spawn(WorkerProcessArgs {
         python: worker,
         model: String::new(),
-        ranks: WorkerConfig::model("localhost", "cpu", WORLD_SIZE, 2).ranks,
-        entries: WorkerConfig::model("localhost", "cpu", WORLD_SIZE, 2).entries,
+        ranks: WorkerConfig::model(&["localhost".to_owned()], "cpu", WORLD_SIZE, 2).ranks,
+        entries: WorkerConfig::model(&["localhost".to_owned()], "cpu", WORLD_SIZE, 2).entries,
         queue_depth: QUEUE_DEPTH,
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
@@ -1671,7 +1676,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
     let spawn = |worker_id: &str, depth| -> anyhow::Result<WorkerGroup> {
         let mut args = rank_group_args(1 << 20, 8 << 20);
-        let binding = WorkerConfig::model("localhost", "cpu", 1, depth);
+        let binding = WorkerConfig::model(&["localhost".to_owned()], "cpu", 1, depth);
         args.ranks = binding.ranks.clone();
         args.entries = binding.entries;
         args.queue_depth = depth;
@@ -2249,8 +2254,8 @@ fn rank_group_args(
     WorkerProcessArgs {
         python: worker,
         model: String::new(),
-        ranks: WorkerConfig::model("localhost", "cpu", WORLD_SIZE, 2).ranks,
-        entries: WorkerConfig::model("localhost", "cpu", WORLD_SIZE, 2).entries,
+        ranks: WorkerConfig::model(&["localhost".to_owned()], "cpu", WORLD_SIZE, 2).ranks,
+        entries: WorkerConfig::model(&["localhost".to_owned()], "cpu", WORLD_SIZE, 2).entries,
         queue_depth: QUEUE_DEPTH,
         req_slot_cap: request_slot_capacity,
         resp_slot_cap: response_slot_capacity,
@@ -2659,7 +2664,7 @@ fn start_shm_readers(
 /// rank placed anywhere else is refused by name rather than launched here.
 #[test]
 fn placement_binds_ranks_to_the_engine_host_by_name() {
-    let named = WorkerConfig::model("compute-0", "cpu", WORLD_SIZE, 2);
+    let named = WorkerConfig::model(&["compute-0".to_owned()], "cpu", WORLD_SIZE, 2);
     assert!(
         named.ranks.iter().all(|rank| rank.node == "compute-0"),
         "the placement shorthand must place ranks on the host it is given"
@@ -2673,7 +2678,7 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
         python: worker_python(),
         model: String::new(),
         host: "compute-0".into(),
-        ranks: WorkerConfig::model("compute-1", "cpu", WORLD_SIZE, 2).ranks,
+        ranks: WorkerConfig::model(&["compute-1".to_owned()], "cpu", WORLD_SIZE, 2).ranks,
         entries: named.entries.clone(),
         stub: true,
         launcher_timeout: std::time::Duration::from_secs(2),
