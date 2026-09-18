@@ -532,9 +532,6 @@ points = [
     "sensenova-uniserve-i2t-c32",
     "sensenova-uniserve-t2i-c32",
     "sensenova-uniserve-interleave-c4",
-    "bagel-uniserve-sharegpt-r16",
-    "bagel-uniserve-i2t-c32",
-    "bagel-uniserve-t2i-c32",
 ]
 
 [suites.serving-runtime]
