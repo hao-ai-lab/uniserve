@@ -706,7 +706,12 @@ def test_cuda_vmm_publication_read_from_another_host_carries_no_fence() -> None:
     )
     locator = None
     try:
-        source = torch.ones(1024, device=device)
+        # Exportable storage, so the publication is the source itself: a
+        # crossing decides the fence, not where the product is materialized.
+        from uniserve_kernel.peer_memory import empty
+
+        source = empty((1024,), dtype=torch.float32, device=device)
+        source.fill_(1.0)
         stream = torch.cuda.Stream(device=device)
         submitted = torch.cuda.Event()
         with torch.cuda.stream(stream):

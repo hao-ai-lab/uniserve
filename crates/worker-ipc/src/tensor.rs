@@ -782,7 +782,6 @@ impl Locator {
                 span_counts,
                 tensor_stride,
                 ready_event_handle,
-                acknowledgment_offset,
                 ..
             } => {
                 ensure_valid!(
@@ -811,11 +810,10 @@ impl Locator {
                         // A publication read only from this host carries the
                         // event its consumers wait on; one read from another
                         // host carries no fence, because none would reach
-                        // there. A publication outside the pool is the source
-                        // itself and can only be read behind its own fence.
+                        // there, and its producer drained its stream before
+                        // publishing instead.
                         && (ready_event_handle.len() == 64
-                            || (ready_event_handle.is_empty()
-                                && *acknowledgment_offset >= 0))
+                            || ready_event_handle.is_empty())
                         && tensor_stride.iter().all(|stride| *stride >= 0),
                     "CUDA VMM transfer handle is incomplete"
                 );
