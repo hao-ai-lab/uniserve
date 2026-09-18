@@ -463,26 +463,6 @@ class BatchState:
         if visible:
             self.visible_groups.add(group)
 
-    @property
-    def successors_ready(self) -> bool:
-        """Report actual successor visibility independently of host payload.
-
-        readiness.
-        """
-        return self.complete or (
-            self.launched
-            and bool(self.outputs)
-            and all(
-                group in self.accepted_groups
-                or all(
-                    isinstance(output := self.outputs[index], PendingOutput)
-                    and output.successors_ready
-                    for index in indexes
-                )
-                for group, indexes in self.output_groups.items()
-            )
-        )
-
     def ready(self) -> bool:
         """Query whether the batch's single result can be delivered."""
         if self.result_sent:
