@@ -9,8 +9,8 @@ use uniserve_worker_ipc::{CallCoordinates, ForwardMode, PipelineStage, TransferM
 
 use uniserve_core::{GenerationRequest, ImageIngestStep, RequestId, SamplingParams};
 use uniserve_worker_ipc::{
-    Bounds, BufferId, CallKind, CallId, DType, DimBound, DrawLayout, CallStatus,
-    RequestKey, RequestOutput, Rng, SamplingState, Call, ShapeBound, TensorRef,
+    Bounds, BufferId, Call, CallId, CallKind, CallStatus, DType, DimBound, DrawLayout, RequestKey,
+    RequestOutput, Rng, SamplingState, ShapeBound, TensorRef,
 };
 
 use crate::scheduler::image_artifact::png_artifact_dims_b64;
@@ -221,8 +221,7 @@ impl super::RequestState {
                 self.phase = GenerationPhase::PublishKv;
                 self.replayable = false;
             }
-            CallKind::Forward(ForwardMode::Decode)
-            | CallKind::Forward(ForwardMode::Verify) => {
+            CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                 let count = record.committed_tokens.len().max(1).min(u32::MAX as usize) as u32;
                 self.logical_position = self.logical_position.saturating_add(count);
                 self.kv_visible_len = self.kv_visible_len.saturating_add(count);
@@ -598,12 +597,11 @@ fn finish_plan(
         .map(TensorRef::max_bytes)
         .max()
         .unwrap_or(0);
-    let image_completion_bytes =
-        if call.code == CallKind::Pipeline(PipelineStage::ImageDecoding) {
-            png_base64_bound(request.image.width, request.image.height)?
-        } else {
-            0
-        };
+    let image_completion_bytes = if call.code == CallKind::Pipeline(PipelineStage::ImageDecoding) {
+        png_base64_bound(request.image.width, request.image.height)?
+    } else {
+        0
+    };
     let logprob_bytes = if call.token_output.is_some() {
         logprob_result_bytes(&request.sampling, prompt_positions)?.unwrap_or(0)
     } else {
@@ -682,11 +680,7 @@ pub(super) fn register_call(
         .tensor_outputs()
         .filter(|product| product.generation == 0)
         .count()
-        + usize::from(
-            call
-                .kv_output
-                .is_some_and(|output| output.generation == 0),
-        );
+        + usize::from(call.kv_output.is_some_and(|output| output.generation == 0));
     let first_generation = (*next_product_generation).max(1);
     if required_generations > 0 {
         let last_generation = first_generation
@@ -919,8 +913,8 @@ pub(crate) fn validate_generation_result(
     }
     // Prefill's sampling coordinate is its exclusive prompt-token end, so
     // the first input can be identified even while a cancelled request drains.
-    let prompt_tokens =
-        (is_prompt_extend(call) && request.sampling.prompt_logprobs_requested()).then(|| {
+    let prompt_tokens = (is_prompt_extend(call) && request.sampling.prompt_logprobs_requested())
+        .then(|| {
             &call.input_token_ids[usize::from(
                 call.rng.as_ref().is_some_and(|rng| {
                     rng.semantic_index_base == call.input_token_ids.len() as u64

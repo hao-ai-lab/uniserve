@@ -70,9 +70,9 @@ use uniserve_core::{BlockId, ImageIngestStep, encoder_cache_key};
 use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
 use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
-    CachePageAllocation, CallKind, CallId, DType, DecodeRange, DimBound, ForwardBatch,
-    ForwardStats, LatentParams, NewRequest, CallStatus, RequestKey, SamplingState, Call,
-    ShapeBound, TensorRef, TimingCounters, UmmRequestParams, WorkerInfo,
+    CachePageAllocation, Call, CallId, CallKind, CallStatus, DType, DecodeRange, DimBound,
+    ForwardBatch, ForwardStats, LatentParams, NewRequest, RequestKey, SamplingState, ShapeBound,
+    TensorRef, TimingCounters, UmmRequestParams, WorkerInfo,
 };
 
 use crate::executor::WorkerFailure;

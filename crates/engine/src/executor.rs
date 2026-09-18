@@ -16,9 +16,9 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use uniserve_worker_ipc::{
-    Batch, BatchCommand, BatchOutput, BlockTable, BufferAllocation, CachePageAllocation,
-    CallKind, CallId, DecodeRange, ForwardBatch, LatentParams, NewRequest, RequestKey,
-    Call, TensorPublication, WorkerInfo,
+    Batch, BatchCommand, BatchOutput, BlockTable, BufferAllocation, CachePageAllocation, Call,
+    CallId, CallKind, DecodeRange, ForwardBatch, LatentParams, NewRequest, RequestKey,
+    TensorPublication, WorkerInfo,
 };
 
 /// Physical placement selected by the scheduler for a computation.
@@ -129,10 +129,7 @@ impl ExecutionBatch {
             );
             requests.insert(call.request_key);
             WorkerId::new(placement.worker.0.clone())?;
-            anyhow::ensure!(
-                !call.entry.is_empty(),
-                "call requires a computation entry"
-            );
+            anyhow::ensure!(!call.entry.is_empty(), "call requires a computation entry");
             anyhow::ensure!(
                 identities.insert(call.call_id),
                 "logical batch repeats an call identity"
@@ -161,8 +158,7 @@ impl ExecutionBatch {
             for buffer in &placement.buffers {
                 buffer.validate()?;
                 anyhow::ensure!(
-                    call
-                        .buffer_outputs()
+                    call.buffer_outputs()
                         .any(|output| output.buffer_id() == buffer.buffer),
                     "logical call carries a buffer execution for another output"
                 );

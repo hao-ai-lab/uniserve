@@ -148,9 +148,7 @@ impl SchedulerStatsReporter {
                     predicated_calls: current
                         .predicated_calls
                         .saturating_sub(previous.predicated_calls),
-                    error_calls: current
-                        .error_calls
-                        .saturating_sub(previous.error_calls),
+                    error_calls: current.error_calls.saturating_sub(previous.error_calls),
                     backpressure_events: current
                         .backpressure_events
                         .saturating_sub(previous.backpressure_events),

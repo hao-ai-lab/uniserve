@@ -15,7 +15,7 @@ use crate::executor::{
 use anyhow::Context;
 use uniserve_core::CommandWaker;
 use uniserve_worker_ipc::{
-    BatchCommand, BufferAllocation, BufferId, KvTransfer, NewRequest, RequestKey, Call,
+    BatchCommand, BufferAllocation, BufferId, Call, KvTransfer, NewRequest, RequestKey,
     TensorPublication,
 };
 
@@ -362,9 +362,14 @@ impl WorkerExecutor {
             }
         }
         for pending_batch in self.pending.values() {
-            requests.extend(pending_batch.calls.iter().filter_map(
-                |((request, _), worker)| (lost && worker.worker == index).then_some(*request),
-            ));
+            requests.extend(
+                pending_batch
+                    .calls
+                    .iter()
+                    .filter_map(|((request, _), worker)| {
+                        (lost && worker.worker == index).then_some(*request)
+                    }),
+            );
         }
         // Abandoning an unstarted producer also invalidates its future buffers.
         // Already running work on another instance keeps its real completion path.
@@ -372,20 +377,14 @@ impl WorkerExecutor {
             let before = (requests.len(), buffers.len());
             for (_, worker) in &self.workers {
                 for call in worker.inflight_calls() {
-                    if call
-                        .input_buffers()
-                        .any(|buffer| buffers.contains(&buffer))
-                    {
+                    if call.input_buffers().any(|buffer| buffers.contains(&buffer)) {
                         requests.insert(call.request_key);
                     }
                 }
             }
             for submission in self.worker_submissions.iter().flatten() {
                 for (call, _) in &submission.batch.requests {
-                    if call
-                        .input_buffers()
-                        .any(|buffer| buffers.contains(&buffer))
-                    {
+                    if call.input_buffers().any(|buffer| buffers.contains(&buffer)) {
                         requests.insert(call.request_key);
                     }
                     if requests.contains(&call.request_key) {
@@ -426,17 +425,12 @@ impl WorkerExecutor {
             if lost || failed_run == Some(*batch_id) {
                 pending_batch.submitted_workers.remove(&index);
             }
-            retired.extend(
-                pending_batch
-                    .calls
-                    .iter()
-                    .filter_map(|(identity, worker)| {
-                        ((lost || (worker.submitted && failed_run == Some(*batch_id)))
-                            && worker.worker == index
-                            && !worker.completed)
-                            .then_some((*batch_id, identity.0, identity.1))
-                    }),
-            );
+            retired.extend(pending_batch.calls.iter().filter_map(|(identity, worker)| {
+                ((lost || (worker.submitted && failed_run == Some(*batch_id)))
+                    && worker.worker == index
+                    && !worker.completed)
+                    .then_some((*batch_id, identity.0, identity.1))
+            }));
             for worker_index in 0..self.workers.len() {
                 let running = pending_batch.submitted_workers.contains(&worker_index);
                 let queued = self.worker_submissions[worker_index]
@@ -468,10 +462,7 @@ impl WorkerExecutor {
                 "completed call cannot be abandoned"
             );
             anyhow::ensure!(
-                pending_batch
-                    .calls
-                    .remove(&(request, call))
-                    .is_some(),
+                pending_batch.calls.remove(&(request, call)).is_some(),
                 "abandoned call is not pending"
             );
             loss.retired.push((batch_id, request, call));
@@ -556,9 +547,7 @@ impl WorkerExecutor {
                 self.pending
                     .values()
                     .flat_map(|pending_batch| pending_batch.calls.iter())
-                    .filter_map(|((key, _), call)| {
-                        (*key == request).then_some(call.worker)
-                    }),
+                    .filter_map(|((key, _), call)| (*key == request).then_some(call.worker)),
             )
             .chain(
                 self.buffer_workers
@@ -864,9 +853,7 @@ impl WorkerExecutor {
                 pending_batch
                     .calls
                     .values()
-                    .all(|call| call.worker != worker_index
-                        || !call.submitted
-                        || call.completed),
+                    .all(|call| call.worker != worker_index || !call.submitted || call.completed),
                 "worker {worker_index} ended batch {batch_id} before every call completed"
             );
             let queued = self.worker_submissions[worker_index]
@@ -925,10 +912,7 @@ impl WorkerExecutor {
             return Err(WorkerFailure {
                 worker_id: self.workers[worker_index].0.clone(),
                 endpoints: Vec::new(),
-                requests: failed_calls
-                    .iter()
-                    .map(|(request, _)| *request)
-                    .collect(),
+                requests: failed_calls.iter().map(|(request, _)| *request).collect(),
                 retired: Vec::new(),
                 buffers: failed_buffers,
                 execution: None,
@@ -948,11 +932,7 @@ impl WorkerExecutor {
             .context("result has no pending batch")?;
         let done = pending.expected_workers == 0;
         anyhow::ensure!(
-            !done
-                || pending
-                    .calls
-                    .values()
-                    .all(|call| call.completed),
+            !done || pending.calls.values().all(|call| call.completed),
             "worker execution finished without every planned call"
         );
         let mut result = logical_result(report, done, &pending.commands);
@@ -1122,10 +1102,7 @@ impl Executor for WorkerExecutor {
                 );
                 let entries = &self.workers[call_worker].1.info().components;
                 anyhow::ensure!(
-                    entries.is_empty()
-                        || entries
-                            .iter()
-                            .any(|binding| binding.name == call.entry),
+                    entries.is_empty() || entries.iter().any(|binding| binding.name == call.entry),
                     "call targets unloaded entry {}",
                     call.entry
                 );
@@ -1208,8 +1185,7 @@ impl Executor for WorkerExecutor {
                 }
             }
             for (call, _) in &batch.requests {
-                let consumer_worker =
-                    call_routes[&(call.request_key, call.call_id)].worker;
+                let consumer_worker = call_routes[&(call.request_key, call.call_id)].worker;
                 for input in call.input_buffers() {
                     self.buffer_workers
                         .entry(input)

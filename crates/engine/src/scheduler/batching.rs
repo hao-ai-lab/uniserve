@@ -46,13 +46,9 @@ impl Scheduler {
     }
 
     /// Reserves persistent buffers, latent pages, and transfer capacity for one computation.
-    fn reserve_generation_resources(
-        &mut self,
-        call: &Call,
-    ) -> Option<Vec<Allocation>> {
+    fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<Allocation>> {
         let id = call.request_key.request_id;
-        if call.code == CallKind::Pipeline(PipelineStage::Denoising)
-            && !self.ensure_flow_prefix(id)
+        if call.code == CallKind::Pipeline(PipelineStage::Denoising) && !self.ensure_flow_prefix(id)
         {
             return None;
         }
@@ -483,12 +479,8 @@ impl Scheduler {
                     .get(st.feedback_encoder_index)?
                     .encoder
                 {
-                    ImageIngestStep::VaeEncode => {
-                        CallKind::Pipeline(PipelineStage::LatentEncoding)
-                    }
-                    ImageIngestStep::VitEncode => {
-                        CallKind::Pipeline(PipelineStage::VisionEncoding)
-                    }
+                    ImageIngestStep::VaeEncode => CallKind::Pipeline(PipelineStage::LatentEncoding),
+                    ImageIngestStep::VitEncode => CallKind::Pipeline(PipelineStage::VisionEncoding),
                 }
             }
             Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
@@ -514,16 +506,11 @@ impl Scheduler {
                 .worker_registered
                 .then(|| (state.request_epoch, state.latest_token.clone()))
         }) else {
-            tracing::error!(
-                request_id = request_id.0,
-                "planned call lost its request"
-            );
+            tracing::error!(request_id = request_id.0, "planned call lost its request");
             self.fatal = true;
             return None;
         };
-        if self.has_pending_calls(request_id)
-            && !self.can_queue_successor(request_id, call.code)
-        {
+        if self.has_pending_calls(request_id) && !self.can_queue_successor(request_id, call.code) {
             tracing::error!(
                 request_id = request_id.0,
                 "scheduler attempted to issue an unsafe projected successor"
@@ -599,13 +586,12 @@ impl Scheduler {
                     1
                 },
             }),
-            CallKind::Forward(ForwardMode::Decode)
-            | CallKind::Forward(ForwardMode::Verify) => Some(KvLengths { visible, input: 1 }),
+            CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
+                Some(KvLengths { visible, input: 1 })
+            }
             CallKind::Transfer(TransferMode::KvPublish)
             | CallKind::Pipeline(PipelineStage::LatentPreparation)
-            | CallKind::Pipeline(PipelineStage::Denoising) => {
-                Some(KvLengths { visible, input: 0 })
-            }
+            | CallKind::Pipeline(PipelineStage::Denoising) => Some(KvLengths { visible, input: 0 }),
             _ => None,
         };
         let start_step = match call.code {
@@ -817,13 +803,7 @@ impl Scheduler {
                 }
                 let prefix_len = state.req.negative_prompt_token_ids.len() as u32;
                 if prefix_len > 0 && !prefix.diffusion_finalized {
-                    call_forward.push(
-                        0,
-                        prefix.request_pool_idx(),
-                        prefix_len,
-                        prefix_len,
-                        true,
-                    );
+                    call_forward.push(0, prefix.request_pool_idx(), prefix_len, prefix_len, true);
                 }
                 alternative = Some((prefix.request_pool_idx(), prefix_len));
             }
@@ -833,13 +813,7 @@ impl Scheduler {
                 } else {
                     alternative.unwrap_or((main_slot, conditioning_tokens))
                 };
-                call_forward.push(
-                    0,
-                    request_pool_index,
-                    seq_len + query_len,
-                    query_len,
-                    false,
-                );
+                call_forward.push(0, request_pool_index, seq_len + query_len, query_len, false);
             }
         }
 
@@ -1072,10 +1046,7 @@ impl Scheduler {
     pub(super) fn plan_computation(
         &mut self,
         id: RequestId,
-        build: impl FnOnce(
-            &Self,
-            &GenerationRequest,
-        ) -> Result<Call, generation::PlanningError>,
+        build: impl FnOnce(&Self, &GenerationRequest) -> Result<Call, generation::PlanningError>,
     ) -> Option<Call> {
         let planned = build(self, &self.running.get(&id)?.req);
         match planned {
