@@ -1238,3 +1238,41 @@ def test_cuda_vmm_publishes_a_row_whose_bytes_arrive_later() -> None:
             transport.release(locator)
         transport.close()
         events.close()
+
+
+def test_cuda_vmm_refuses_a_descriptor_handle_from_another_host() -> None:
+    """A device product crosses hosts as a fabric handle and not otherwise.
+
+    A process descriptor names an allocation only within the host that
+    exported it, so a consumer elsewhere is told that rather than being left
+    to fail inside the driver. A fabric handle carries no such restriction,
+    which is what lets a rank read a product produced on another machine.
+    """
+    from dataclasses import replace
+
+    device = torch.device("cuda:0")
+    events = EventPool()
+    transport = make_transport(
+        "cuda_vmm", byte_capacity=1 << 20, ticket_capacity=1, event_pool=events
+    )
+    locator = None
+    try:
+        locator = transport.publish(torch.ones(256, device=device))
+        elsewhere = replace(
+            locator, source=replace(locator.source, node="another-host")
+        )
+
+        handle = elsewhere.transport
+        if len(handle.allocation_handle) == 64:
+            # This device exports fabric handles, so the crossing is allowed
+            # and the read fails for want of a live producer there instead.
+            with pytest.raises(WorkerError):
+                _await_ticket(transport.fetch(elsewhere, device=device))
+        else:
+            with pytest.raises(WorkerError, match="fabric handle"):
+                _await_ticket(transport.fetch(elsewhere, device=device))
+    finally:
+        if locator is not None:
+            transport.release(locator)
+        transport.close()
+        events.close()

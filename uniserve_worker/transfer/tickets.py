@@ -34,6 +34,7 @@ from ..foundation.errors import (
 )
 from ..foundation.shared_memory import allocate_shared_memory
 from ..protocol.transfer import (
+    FABRIC_HANDLE_BYTES,
     ChannelTransfer,
     CudaVmmTransfer,
     LocalTransfer,
@@ -1993,13 +1994,20 @@ class CudaVmmTransport(Transport):
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
         region: tuple[slice, ...] | None = None,
     ) -> TransferTicket:
-        if locator.source.node != self.source.node:
-            raise invalid_descriptor(
-                "CUDA VMM transport requires the source node"
-            )
         if not isinstance(locator.transport, CudaVmmTransfer):
             raise invalid_descriptor(
                 "CUDA VMM read requires a CUDA VMM locator"
+            )
+        # A device product reaches another host as a fabric handle and not as
+        # a process descriptor, which names an allocation only within the host
+        # that exported it. The head refuses an edge whose devices cannot
+        # export one, so this is the rank restating what it was given.
+        if (
+            locator.source.node != self.source.node
+            and len(locator.transport.allocation_handle) != FABRIC_HANDLE_BYTES
+        ):
+            raise invalid_descriptor(
+                "a device product crosses hosts only as a fabric handle"
             )
         if device.type != "cuda":
             raise invalid_descriptor(
