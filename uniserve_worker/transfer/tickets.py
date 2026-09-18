@@ -1838,13 +1838,19 @@ class CudaVmmTransport(Transport):
         descriptor = None
         copied_source = None
         try:
-            # Storage that can be exported where it lies is published where
-            # it lies. That copies nothing, and it is what lets a publication
-            # name a row whose bytes arrive later: an encoded media unit is
-            # published with the batch that reserves its row and filled when
-            # the encode completes, so a snapshot taken now would carry
-            # whatever the row held before the encoder wrote it.
-            exported = export_handle(first)
+            # Where a product is read decides how it is published. A consumer
+            # on this host waits on an event and closes a reader grant, so the
+            # product is published where it lies: that copies nothing, and it
+            # is what lets a publication name a row whose bytes arrive later.
+            # An encoded media unit is published with the batch that reserves
+            # its row and filled when the encode completes, so a snapshot taken
+            # now would carry whatever the row held before the encoder wrote
+            # it. A consumer on another host has neither mechanism, and both of
+            # the ones it does have — readiness before publication, and an
+            # acknowledgment header — belong to a pool chunk.
+            exported = (
+                None if self._cross_host_consumers else export_handle(first)
+            )
             pool = None
             chunk = None
             if exported is None:
