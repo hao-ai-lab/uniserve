@@ -247,7 +247,7 @@ class EagerSiluAndMul(Operator):
         super().__init__("eager", "silu_and_mul")
 
     def can_run(self, req: SiluAndMulReq) -> bool:
-        """Accept any request; tensor operations enforce shape compatibility."""
+        """Accept any request; tensor calls enforce shape compatibility."""
         del req
         return True
 

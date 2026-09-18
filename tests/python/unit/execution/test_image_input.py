@@ -15,7 +15,7 @@ from uniserve.processing import (
     TowerTransform,
 )
 from uniserve_worker.execution.image_input import prepare_image
-from uniserve_worker.protocol.operation import PipelineStage
+from uniserve_worker.protocol.call import PipelineStage
 
 
 @pytest.mark.parametrize("normalization", ("signed_unit", "imagenet"))

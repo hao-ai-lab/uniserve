@@ -114,7 +114,7 @@ pub enum ComponentDistribution {
     TemporalUnits,
 }
 
-/// Computation entry members index the ordered ranks of a Worker instance.
+/// CallKind entry members index the ordered ranks of a Worker instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentConfig {

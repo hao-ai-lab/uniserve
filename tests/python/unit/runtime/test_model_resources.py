@@ -21,7 +21,7 @@ from uniserve_worker.bootstrap.capacity import (
 from uniserve_worker.bootstrap.config import ComponentConfig
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.protocol.operation import ForwardMode, PipelineStage
+from uniserve_worker.protocol.call import ForwardMode, PipelineStage
 
 TEST_MODEL = Model()
 TEST_WORKER_CONFIG = stub_worker_config(64, max_batch_tokens=8192)
@@ -295,7 +295,7 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     from tests.python.fixtures.encoding import Model as EncodedModel
     from uniserve_worker.config import WorkerConfig
     from uniserve_worker.protocol.batch import BufferAllocation
-    from uniserve_worker.protocol.identity import ComputationId, RequestKey
+    from uniserve_worker.protocol.identity import CallId, RequestKey
     from uniserve_worker.protocol.tensor import StaticDim, TensorRef
     from uniserve_worker.runtime.buffer_pool import BufferPool
 
@@ -315,7 +315,7 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     offset = 0
     try:
         for request_id in range(1, info.request_slots + 1):
-            for op_id, entry in enumerate(info.components, start=1):
+            for call_id, entry in enumerate(info.components, start=1):
                 output = entry.outputs[0]
                 shape = tuple(
                     dim.extent if isinstance(dim, StaticDim) else dim.bound
@@ -323,7 +323,7 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
                 )
                 product = TensorRef(
                     RequestKey(1, request_id, 1),
-                    ComputationId(op_id, 0),
+                    CallId(call_id, 0),
                     0,
                     1,
                     output.dtype,
@@ -338,8 +338,8 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
                     dtype=torch.float32,
                     shape=shape,
                 )
-                binding.tensor.fill_(request_id * 10 + op_id)
-                bindings.append((binding, request_id * 10 + op_id))
+                binding.tensor.fill_(request_id * 10 + call_id)
+                bindings.append((binding, request_id * 10 + call_id))
                 offset += ((product.max_bytes + 255) // 256) * 256
         for binding, expected in bindings:
             torch.testing.assert_close(
@@ -391,7 +391,7 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
     from uniserve_worker.bootstrap.capacity import local_product_storage_bytes
     from uniserve_worker.bootstrap.config import ComponentConfig
     from uniserve_worker.execution.model_entry import ModelEntry
-    from uniserve_worker.protocol.operation import PipelineStage
+    from uniserve_worker.protocol.call import PipelineStage
     from uniserve_worker.protocol.tensor import (
         DeviceDim,
         DType,

@@ -1,4 +1,4 @@
-"""Worker backing for scheduler-placed cross-operation buffers."""
+"""Worker backing for scheduler-placed cross-call buffers."""
 
 from __future__ import annotations
 

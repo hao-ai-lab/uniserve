@@ -63,7 +63,7 @@ def _reject_invalid_copy(rank, targets):
 @pytest.mark.parametrize("targets", ((1, 3), (1, 1)))
 def test_block_copy_replay_rejects_invalid_or_repeated_targets(targets):
     # CUDA assertions have process-wide consequences. Isolate malformed
-    # replay inputs while exercising the actual public device operation.
+    # replay inputs while exercising the actual public device call.
     mp.spawn(_reject_invalid_copy, args=(targets,), nprocs=1, join=True)
 
 

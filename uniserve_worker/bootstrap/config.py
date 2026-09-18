@@ -10,8 +10,8 @@ from dataclasses import dataclass, fields
 from math import prod
 
 from uniserve.loading import Config as IOConfig
-from uniserve_worker.protocol.operation import (
-    Computation,
+from uniserve_worker.protocol.call import (
+    CallKind,
     ForwardMode,
     PipelineStage,
     TransferMode,
@@ -20,9 +20,9 @@ from uniserve_worker.protocol.operation import (
 from ..config import WorkerConfig, worker_config_from_namespace
 
 # These launch selectors assign capabilities to a worker pool. A media
-# selector includes both tracks; submitted computations still identify the
+# selector includes both tracks; submitted call kinds still identify the
 # concrete stage.
-SUPPORTED_OP_GROUPS: dict[str, tuple[Computation, ...]] = {
+SUPPORTED_CALL_GROUPS: dict[str, tuple[CallKind, ...]] = {
     "ar_extend": (ForwardMode.PREFILL,),
     "ar_decode": (ForwardMode.DECODE,),
     "ar_verify": (ForwardMode.VERIFY,),
@@ -349,7 +349,7 @@ class WorkerProcessArgs:
     """Aggregates the validated launch configuration for one worker rank."""
 
     worker_id: str
-    supported_ops: frozenset[Computation]
+    supported_ops: frozenset[CallKind]
     ipc: WorkerIpcConfig
     local_rank: int
     distributed_backend: str | None
@@ -455,7 +455,7 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
     """
     positive_fields = {
         "--block-size": namespace.block_size,
-        "--max-batch-operations": namespace.max_batch_operations,
+        "--max-batch-calls": namespace.max_batch_calls,
         "--max-batch-tokens": namespace.max_batch_tokens,
         "--queue-depth": namespace.queue_depth,
         "--ipc-payload-cap": namespace.ipc_payload_cap,
@@ -501,33 +501,31 @@ def _load_config(namespace: argparse.Namespace) -> IOConfig:
     )
 
 
-def _parse_supported_ops(value: object) -> frozenset[Computation]:
-    """Resolve launch capability selectors to concrete computations.
+def _parse_supported_ops(value: object) -> frozenset[CallKind]:
+    """Resolve launch capability selectors to concrete call_kinds.
 
     The capability group names are a worker-side vocabulary that the launching
     side does not model, so it narrows the set only when it has a reason to.
     An absent selector therefore means every group this worker implements.
     """
     if value is None:
-        value = ",".join(SUPPORTED_OP_GROUPS)
+        value = ",".join(SUPPORTED_CALL_GROUPS)
     names = tuple(
         part.strip() for part in str(value).split(",") if part.strip()
     )
     if not names:
-        raise ValueError("supported operations must list at least one group")
+        raise ValueError("supported calls must list at least one group")
     try:
-        operations = tuple(
-            operation
-            for name in names
-            for operation in SUPPORTED_OP_GROUPS[name]
+        calls = tuple(
+            call for name in names for call in SUPPORTED_CALL_GROUPS[name]
         )
     except KeyError as error:
         raise ValueError(
-            f"unknown operation in supported operations {value!r}"
+            f"unknown call in supported calls {value!r}"
         ) from error
-    if len(set(operations)) != len(operations):
-        raise ValueError("--supported-ops contains duplicate operations")
-    return frozenset(operations)
+    if len(set(calls)) != len(calls):
+        raise ValueError("--supported-ops contains duplicate calls")
+    return frozenset(calls)
 
 
 def _parse_mesh(

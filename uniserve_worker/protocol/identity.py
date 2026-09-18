@@ -10,7 +10,7 @@ from .validation import _map, _nonnegative, _uint
 
 
 @dataclass(frozen=True, slots=True, order=True)
-class ComputationId:
+class CallId:
     """Logical batch and selection ordinal.
 
     Independent of physical worker packing.
@@ -50,7 +50,7 @@ class ComputationId:
     @classmethod
     def from_mapping(
         cls, value: object, where: str = "computation_id"
-    ) -> ComputationId:
+    ) -> CallId:
         """Parse a batch and request-ordinal pair.
 
         Passes through live instances.
@@ -127,10 +127,10 @@ class RequestKey:
 
 @dataclass(frozen=True, slots=True)
 class BufferId:
-    """Identifies a versioned operation output buffer and its owning request."""
+    """Identifies a versioned call output buffer and its owning request."""
 
     owner: RequestKey
-    producer_op_id: ComputationId
+    producer_call_id: CallId
     output_index: int
     generation: int
 
@@ -139,7 +139,7 @@ class BufferId:
     )
 
     def __post_init__(self) -> None:
-        """Validate the owning request, operation identifier, and version."""
+        """Validate the owning request, call identifier, and version."""
         if self.generation < 1:
             raise invalid_descriptor("buffer id has no logical generation")
 
@@ -150,7 +150,7 @@ class BufferId:
             value = hash(
                 (
                     self.owner,
-                    self.producer_op_id,
+                    self.producer_call_id,
                     self.output_index,
                     self.generation,
                 )
@@ -164,8 +164,8 @@ class BufferId:
         data = _map(value, where)
         return cls(
             owner=RequestKey.from_mapping(data.get("owner"), f"{where}.owner"),
-            producer_op_id=ComputationId.from_mapping(
-                data.get("producer_op_id"), f"{where}.producer_op_id"
+            producer_call_id=CallId.from_mapping(
+                data.get("producer_call_id"), f"{where}.producer_call_id"
             ),
             output_index=_uint(
                 data.get("output_index"), f"{where}.output_index"
@@ -180,7 +180,7 @@ class BufferId:
         """
         return {
             "owner": self.owner.to_mapping(),
-            "producer_op_id": self.producer_op_id.to_mapping(),
+            "producer_call_id": self.producer_call_id.to_mapping(),
             "output_index": self.output_index,
             "generation": self.generation,
         }

@@ -1,4 +1,4 @@
-//! Submission of explicitly targeted operations to WorkerGroup instances.
+//! Submission of explicitly targeted calls to WorkerGroup instances.
 //!
 //! Each destination has independent bounded capacity. Ready work may bypass
 //! unrelated blocked requests while preserving a request's command order.
@@ -15,16 +15,16 @@ use crate::executor::{
 use anyhow::Context;
 use uniserve_core::CommandWaker;
 use uniserve_worker_ipc::{
-    BatchCommand, BufferAllocation, BufferId, KvTransfer, NewRequest, RequestKey, ScheduledRequest,
+    BatchCommand, BufferAllocation, BufferId, KvTransfer, NewRequest, RequestKey, Call,
     TensorPublication,
 };
 
-/// One operation's expected worker and result family until its batch retires.
-struct PendingOperation {
+/// One call's expected worker and result family until its batch retires.
+struct PendingCall {
     worker: usize,
     /// Whether the batch carrying this computation has been dispatched.
     submitted: bool,
-    kind: uniserve_worker_ipc::Computation,
+    kind: uniserve_worker_ipc::CallKind,
     completed: bool,
 }
 
@@ -33,7 +33,7 @@ struct PendingBatch {
     /// Workers this batch is dispatched to and has not yet returned from.
     submitted_workers: HashSet<usize>,
     expected_workers: u64,
-    operations: HashMap<(RequestKey, uniserve_worker_ipc::ComputationId), PendingOperation>,
+    calls: HashMap<(RequestKey, uniserve_worker_ipc::CallId), PendingCall>,
     commands: Vec<BatchCommand>,
     command_outcomes: HashMap<u32, CommandOutcome>,
 }
@@ -67,15 +67,15 @@ impl WorkerSubmission {
     /// in its queue until they resolve.
     fn build(
         batch_id: u64,
-        operations: Vec<(ScheduledRequest, RequestPlacement)>,
+        calls: Vec<(Call, RequestPlacement)>,
         commands: Vec<BatchCommand>,
         inputs: Vec<TensorPublication>,
         kv_inputs: Vec<KvTransfer>,
         dependencies: Vec<BufferId>,
     ) -> Self {
-        let consumed = operations
+        let consumed = calls
             .iter()
-            .flat_map(|(operation, _)| operation.input_buffers())
+            .flat_map(|(call, _)| call.input_buffers())
             .collect::<HashSet<_>>();
         let input_transfers = inputs
             .into_iter()
@@ -85,7 +85,7 @@ impl WorkerSubmission {
             .into_iter()
             .filter(|product| consumed.contains(product))
             .collect();
-        let mut batch = ExecutionBatch::new(batch_id, operations, commands, input_transfers);
+        let mut batch = ExecutionBatch::new(batch_id, calls, commands, input_transfers);
         batch.kv_inputs = kv_inputs
             .into_iter()
             .filter(|publication| consumed.contains(&publication.source))
@@ -103,7 +103,7 @@ struct BufferRoute {
     entry: String,
 }
 
-/// Dispatch targeted operations and track their independently completed results.
+/// Dispatch targeted calls and track their independently completed results.
 pub struct WorkerExecutor {
     routing: HashMap<WorkerId, usize>,
     workers: Vec<(WorkerId, WorkerGroup)>,
@@ -315,9 +315,9 @@ impl WorkerExecutor {
                     .is_some_and(|pending_batch| pending_batch.submitted_workers.contains(&index))
             });
         let mut retired = loss.retired.iter().copied().collect::<HashSet<_>>();
-        let failed_operations = retired
+        let failed_calls = retired
             .iter()
-            .map(|(_, request, operation)| (*request, *operation))
+            .map(|(_, request, call)| (*request, *call))
             .collect::<HashSet<_>>();
         let mut requests = loss.requests.iter().copied().collect::<HashSet<_>>();
         let mut buffers = loss.buffers.iter().cloned().collect::<HashSet<_>>();
@@ -356,13 +356,13 @@ impl WorkerExecutor {
                 && route.worker_index == index
                 && !self.transfer_products.contains_key(buffer)
                 && !self.kv_transfers.contains_key(buffer))
-                || failed_operations.contains(&(buffer.owner, buffer.producer_op_id))
+                || failed_calls.contains(&(buffer.owner, buffer.producer_call_id))
             {
                 buffers.insert(*buffer);
             }
         }
         for pending_batch in self.pending.values() {
-            requests.extend(pending_batch.operations.iter().filter_map(
+            requests.extend(pending_batch.calls.iter().filter_map(
                 |((request, _), worker)| (lost && worker.worker == index).then_some(*request),
             ));
         }
@@ -371,25 +371,25 @@ impl WorkerExecutor {
         loop {
             let before = (requests.len(), buffers.len());
             for (_, worker) in &self.workers {
-                for operation in worker.inflight_operations() {
-                    if operation
+                for call in worker.inflight_calls() {
+                    if call
                         .input_buffers()
                         .any(|buffer| buffers.contains(&buffer))
                     {
-                        requests.insert(operation.request_key);
+                        requests.insert(call.request_key);
                     }
                 }
             }
             for submission in self.worker_submissions.iter().flatten() {
-                for (operation, _) in &submission.batch.requests {
-                    if operation
+                for (call, _) in &submission.batch.requests {
+                    if call
                         .input_buffers()
                         .any(|buffer| buffers.contains(&buffer))
                     {
-                        requests.insert(operation.request_key);
+                        requests.insert(call.request_key);
                     }
-                    if requests.contains(&operation.request_key) {
-                        buffers.extend(operation.output_buffers());
+                    if requests.contains(&call.request_key) {
+                        buffers.extend(call.output_buffers());
                     }
                 }
             }
@@ -401,8 +401,8 @@ impl WorkerExecutor {
             let mut active = VecDeque::new();
             for mut submission in queue.drain(..) {
                 let batch_id = submission.batch.id;
-                for (operation, _) in submission.batch.retire_requests(&requests) {
-                    retired.insert((batch_id, operation.request_key, operation.op_id));
+                for (call, _) in submission.batch.retire_requests(&requests) {
+                    retired.insert((batch_id, call.request_key, call.call_id));
                 }
                 let inputs = submission
                     .batch
@@ -428,7 +428,7 @@ impl WorkerExecutor {
             }
             retired.extend(
                 pending_batch
-                    .operations
+                    .calls
                     .iter()
                     .filter_map(|(identity, worker)| {
                         ((lost || (worker.submitted && failed_run == Some(*batch_id)))
@@ -455,26 +455,26 @@ impl WorkerExecutor {
             }
         }
         loss.retired.clear();
-        for (batch_id, request, operation) in retired {
+        for (batch_id, request, call) in retired {
             let pending_batch = self
                 .pending
                 .get_mut(&batch_id)
-                .context("retired operation has no pending batch")?;
+                .context("retired call has no pending batch")?;
             anyhow::ensure!(
                 pending_batch
-                    .operations
-                    .get(&(request, operation))
-                    .is_some_and(|operation| !operation.completed),
-                "completed operation cannot be abandoned"
+                    .calls
+                    .get(&(request, call))
+                    .is_some_and(|call| !call.completed),
+                "completed call cannot be abandoned"
             );
             anyhow::ensure!(
                 pending_batch
-                    .operations
-                    .remove(&(request, operation))
+                    .calls
+                    .remove(&(request, call))
                     .is_some(),
-                "abandoned operation is not pending"
+                "abandoned call is not pending"
             );
-            loss.retired.push((batch_id, request, operation));
+            loss.retired.push((batch_id, request, call));
         }
         if lost {
             self.admitted_workers.retain(|(worker, _)| *worker != index);
@@ -521,24 +521,24 @@ impl WorkerExecutor {
         Ok(())
     }
 
-    /// Partitions new-request admissions by the workers used by their first operations.
+    /// Partitions new-request admissions by the workers used by their first calls.
     fn admissions_for(
         &self,
         worker_index: usize,
-        operations: &[(ScheduledRequest, RequestPlacement)],
+        calls: &[(Call, RequestPlacement)],
     ) -> anyhow::Result<Vec<NewRequest>> {
         let mut admissions = Vec::new();
-        for (operation, _) in operations {
+        for (call, _) in calls {
             if self
                 .admitted_workers
-                .contains(&(worker_index, operation.request_key))
+                .contains(&(worker_index, call.request_key))
             {
                 continue;
             }
-            let admission = self.admissions.get(&operation.request_key).ok_or_else(|| {
+            let admission = self.admissions.get(&call.request_key).ok_or_else(|| {
                 anyhow::anyhow!(
                     "worker {worker_index} has no admission for request {:?}",
-                    operation.request_key
+                    call.request_key
                 )
             })?;
             admissions.push(admission.clone());
@@ -555,9 +555,9 @@ impl WorkerExecutor {
             .chain(
                 self.pending
                     .values()
-                    .flat_map(|pending_batch| pending_batch.operations.iter())
-                    .filter_map(|((key, _), operation)| {
-                        (*key == request).then_some(operation.worker)
+                    .flat_map(|pending_batch| pending_batch.calls.iter())
+                    .filter_map(|((key, _), call)| {
+                        (*key == request).then_some(call.worker)
                     }),
             )
             .chain(
@@ -666,9 +666,9 @@ impl WorkerExecutor {
         for dependency in &submission.dependencies {
             if !self.transfer_products.contains_key(dependency)
                 || !wire
-                    .operations
+                    .calls
                     .iter()
-                    .flat_map(|operation| operation.buffer_inputs())
+                    .flat_map(|call| call.buffer_inputs())
                     .any(|tensor| tensor.buffer_id() == *dependency)
             {
                 continue;
@@ -726,10 +726,10 @@ impl WorkerExecutor {
             .get_mut(&batch.id)
             .context("submitted batch is not pending")?;
         pending.submitted_workers.insert(worker_index);
-        for (operation, _) in &batch.requests {
+        for (call, _) in &batch.requests {
             pending
-                .operations
-                .get_mut(&(operation.request_key, operation.op_id))
+                .calls
+                .get_mut(&(call.request_key, call.call_id))
                 .context("submitted computation is not pending")?
                 .submitted = true;
         }
@@ -816,16 +816,16 @@ impl WorkerExecutor {
     /// Routes a worker result into its worker aggregate and publishes transferable products.
     fn route_result(&mut self, worker_index: usize, report: WorkerResult) -> anyhow::Result<()> {
         let mut report = report;
-        let failed_operations = report
+        let failed_calls = report
             .results
             .iter()
-            .filter(|completion| completion.output.status == uniserve_worker_ipc::OpStatus::Error)
-            .map(|completion| (completion.output.request_key, completion.output.op_id))
+            .filter(|completion| completion.output.status == uniserve_worker_ipc::CallStatus::Error)
+            .map(|completion| (completion.output.request_key, completion.output.call_id))
             .collect::<HashSet<_>>();
         let failed_buffers = self
             .buffer_routes
             .keys()
-            .filter(|product| failed_operations.contains(&(product.owner, product.producer_op_id)))
+            .filter(|product| failed_calls.contains(&(product.owner, product.producer_call_id)))
             .cloned()
             .collect();
         let batch_id = report.batch_id;
@@ -844,29 +844,29 @@ impl WorkerExecutor {
                 "worker {worker_index} returned a duplicate or unexpected result for batch {batch_id}"
             );
             for completion in &report.results {
-                let identity = (completion.output.request_key, completion.output.op_id);
-                let operation = pending_batch
-                    .operations
+                let identity = (completion.output.request_key, completion.output.call_id);
+                let call = pending_batch
+                    .calls
                     .get_mut(&identity)
-                    .context("worker returned an unknown operation")?;
+                    .context("worker returned an unknown call")?;
                 anyhow::ensure!(
-                    operation.worker == worker_index && operation.submitted && !operation.completed,
-                    "worker {worker_index} returned a duplicate or unexpected operation for batch {batch_id}"
+                    call.worker == worker_index && call.submitted && !call.completed,
+                    "worker {worker_index} returned a duplicate or unexpected call for batch {batch_id}"
                 );
                 anyhow::ensure!(
-                    completion.output.code == operation.kind,
-                    "worker returned a computation code that disagrees with its operation"
+                    completion.output.code == call.kind,
+                    "worker returned a computation code that disagrees with its call"
                 );
-                operation.completed = true;
+                call.completed = true;
             }
             // A batch returns one result, so its every call completes with it.
             anyhow::ensure!(
                 pending_batch
-                    .operations
+                    .calls
                     .values()
-                    .all(|operation| operation.worker != worker_index
-                        || !operation.submitted
-                        || operation.completed),
+                    .all(|call| call.worker != worker_index
+                        || !call.submitted
+                        || call.completed),
                 "worker {worker_index} ended batch {batch_id} before every call completed"
             );
             let queued = self.worker_submissions[worker_index]
@@ -919,27 +919,27 @@ impl WorkerExecutor {
             }
         }
         self.publish_result(report)?;
-        if !failed_operations.is_empty() {
+        if !failed_calls.is_empty() {
             // Keep the actual failed completion and all accepted independent work.
             // Future consumers cannot become ready when their producer has failed.
             return Err(WorkerFailure {
                 worker_id: self.workers[worker_index].0.clone(),
                 endpoints: Vec::new(),
-                requests: failed_operations
+                requests: failed_calls
                     .iter()
                     .map(|(request, _)| *request)
                     .collect(),
                 retired: Vec::new(),
                 buffers: failed_buffers,
                 execution: None,
-                message: "operation failed before its dependent work could complete".into(),
+                message: "call failed before its dependent work could complete".into(),
             }
             .into());
         }
         self.dispatch_ready()
     }
 
-    /// Publishes ready operations immediately; only lifecycle receipts wait for all workers.
+    /// Publishes ready calls immediately; only lifecycle receipts wait for all workers.
     fn publish_result(&mut self, report: WorkerResult) -> anyhow::Result<()> {
         let batch_id = report.batch_id;
         let pending = self
@@ -950,10 +950,10 @@ impl WorkerExecutor {
         anyhow::ensure!(
             !done
                 || pending
-                    .operations
+                    .calls
                     .values()
-                    .all(|operation| operation.completed),
-            "worker execution finished without every planned operation"
+                    .all(|call| call.completed),
+            "worker execution finished without every planned call"
         );
         let mut result = logical_result(report, done, &pending.commands);
         for receipt in &mut result.command_results {
@@ -1092,7 +1092,7 @@ impl Executor for WorkerExecutor {
         let submit_result = (|| -> anyhow::Result<()> {
             let mut worker_ops = (0..self.workers.len())
                 .map(|_| Vec::new())
-                .collect::<Vec<Vec<(ScheduledRequest, RequestPlacement)>>>();
+                .collect::<Vec<Vec<(Call, RequestPlacement)>>>();
             let mut worker_inputs = (0..self.workers.len())
                 .map(|_| Vec::new())
                 .collect::<Vec<Vec<TensorPublication>>>();
@@ -1101,38 +1101,38 @@ impl Executor for WorkerExecutor {
             let mut worker_dependencies = (0..self.workers.len())
                 .map(|_| Vec::new())
                 .collect::<Vec<Vec<BufferId>>>();
-            let mut operation_routes = HashMap::with_capacity(batch.requests.len());
+            let mut call_routes = HashMap::with_capacity(batch.requests.len());
             let mut input_routes = HashMap::new();
-            for (operation, placement) in &batch.requests {
-                let variant = operation.code;
-                let operation_worker =
+            for (call, placement) in &batch.requests {
+                let variant = call.code;
+                let call_worker =
                     self.routing
                         .get(&placement.worker)
                         .copied()
                         .ok_or_else(|| {
-                            anyhow::anyhow!("operation targets unknown worker {}", placement.worker)
+                            anyhow::anyhow!("call targets unknown worker {}", placement.worker)
                         })?;
                 anyhow::ensure!(
-                    self.workers[operation_worker]
+                    self.workers[call_worker]
                         .1
                         .info()
                         .supported_ops
                         .contains(&variant),
-                    "target worker does not support operation {variant:?}"
+                    "target worker does not support call {variant:?}"
                 );
-                let entries = &self.workers[operation_worker].1.info().components;
+                let entries = &self.workers[call_worker].1.info().components;
                 anyhow::ensure!(
                     entries.is_empty()
                         || entries
                             .iter()
-                            .any(|binding| binding.name == operation.entry),
-                    "operation targets unloaded entry {}",
-                    operation.entry
+                            .any(|binding| binding.name == call.entry),
+                    "call targets unloaded entry {}",
+                    call.entry
                 );
-                for output in operation.output_buffers() {
+                for output in call.output_buffers() {
                     let route = BufferRoute {
-                        worker_index: operation_worker,
-                        entry: operation.entry.clone(),
+                        worker_index: call_worker,
+                        entry: call.entry.clone(),
                     };
                     if let Some(existing) = self.buffer_routes.get(&output) {
                         anyhow::ensure!(
@@ -1148,9 +1148,9 @@ impl Executor for WorkerExecutor {
                     self.buffer_workers
                         .entry(output)
                         .or_default()
-                        .insert(operation_worker);
+                        .insert(call_worker);
                 }
-                for output in operation.buffer_outputs() {
+                for output in call.buffer_outputs() {
                     let params = placement
                         .buffers
                         .iter()
@@ -1169,20 +1169,20 @@ impl Executor for WorkerExecutor {
                         );
                     }
                 }
-                operation_routes.insert(
-                    (operation.request_key, operation.op_id),
-                    PendingOperation {
-                        worker: operation_worker,
+                call_routes.insert(
+                    (call.request_key, call.call_id),
+                    PendingCall {
+                        worker: call_worker,
                         submitted: false,
-                        kind: operation.code,
+                        kind: call.code,
                         completed: false,
                     },
                 );
-                for input in operation.input_buffers() {
+                for input in call.input_buffers() {
                     input_routes
                         .entry(input)
                         .or_insert_with(HashSet::new)
-                        .insert(operation_worker);
+                        .insert(call_worker);
                 }
             }
             for payload in &batch.input_transfers {
@@ -1207,10 +1207,10 @@ impl Executor for WorkerExecutor {
                     worker_kv_inputs[worker_index].push(publication.clone());
                 }
             }
-            for (operation, _) in &batch.requests {
+            for (call, _) in &batch.requests {
                 let consumer_worker =
-                    operation_routes[&(operation.request_key, operation.op_id)].worker;
-                for input in operation.input_buffers() {
+                    call_routes[&(call.request_key, call.call_id)].worker;
+                for input in call.input_buffers() {
                     self.buffer_workers
                         .entry(input)
                         .or_default()
@@ -1229,7 +1229,7 @@ impl Executor for WorkerExecutor {
                         continue;
                     };
                     if producer.worker_index == consumer_worker
-                        && self.shares_product_storage(producer, &operation.entry)
+                        && self.shares_product_storage(producer, &call.entry)
                     {
                         continue;
                     }
@@ -1248,9 +1248,9 @@ impl Executor for WorkerExecutor {
                 }
             }
 
-            for (operation, placement) in batch.requests {
-                let worker = operation_routes[&(operation.request_key, operation.op_id)].worker;
-                worker_ops[worker].push((operation, placement));
+            for (call, placement) in batch.requests {
+                let worker = call_routes[&(call.request_key, call.call_id)].worker;
+                worker_ops[worker].push((call, placement));
             }
 
             let mut worker_commands = (0..self.workers.len())
@@ -1298,7 +1298,7 @@ impl Executor for WorkerExecutor {
                     continue;
                 }
                 expected_workers |= Self::worker_bit(worker_index);
-                // Keep operation-owned resources together while dependencies wait.
+                // Keep call-owned resources together while dependencies wait.
                 // Rank indices and collective order are derived at physical submission.
                 self.worker_submissions[worker_index].push_back(WorkerSubmission::build(
                     batch_id,
@@ -1314,7 +1314,7 @@ impl Executor for WorkerExecutor {
                 PendingBatch {
                     submitted_workers: HashSet::new(),
                     expected_workers,
-                    operations: operation_routes,
+                    calls: call_routes,
                     commands: batch
                         .commands
                         .iter()

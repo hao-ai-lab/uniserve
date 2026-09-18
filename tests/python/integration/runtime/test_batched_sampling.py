@@ -23,23 +23,23 @@ from tests.python.fixtures.depth_one import (
     record_completion,
     root_parent,
     stamp_batch,
-    token_operation,
+    token_call,
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
 from uniserve.sampling import SamplingParams
 from uniserve_models.stub import STUB_IMG_START_TOKEN_ID
 from uniserve_worker.protocol.batch import GenerationParams, NewRequest
-from uniserve_worker.protocol.identity import ComputationId
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
+    Call,
+    CallStatus,
     DrawLayout,
     ErrorCode,
     ForwardMode,
-    OpStatus,
     Rng,
     SamplingState,
-    ScheduledRequest,
 )
+from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.protocol.output import BatchOutput
 
 pytestmark = pytest.mark.integration
@@ -54,9 +54,9 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
         block_ids=(3,),
         sampling=replace(sampling, return_logprobs=True, n_logprobs=2),
     )
-    first_op = token_operation(
+    first_op = token_call(
         first.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(first),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -66,9 +66,9 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
             draw_layout=DrawLayout.TARGET_SAMPLING,
         ),
     )
-    second_op = token_operation(
+    second_op = token_call(
         second.request_key,
-        op_id=ComputationId(1, 1),
+        call_id=CallId(1, 1),
         predecessor=root_parent(second),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -86,7 +86,7 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
             execution_batch(
                 batch_id=1,
                 admissions=(first, second),
-                operations=(first_op, second_op),
+                calls=(first_op, second_op),
             )
         ),
     )
@@ -103,7 +103,7 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
 def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
     with execution_worker(device=device) as worker:
         # The middle request asks for scores. Compatible sampling rows
-        # therefore remain interleaved in operation order, with distinct
+        # therefore remain interleaved in call order, with distinct
         # tokens in every row.
         admissions = (
             ar_params(21, block_ids=(0,)),
@@ -115,11 +115,11 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
             ar_params(23, block_ids=(2,)),
         )
         prompt_ends = (4, 5, 6)
-        primed: list[tuple[ScheduledRequest, BatchOutput]] = []
+        primed: list[tuple[Call, BatchOutput]] = []
         for index, admission in enumerate(admissions):
-            extend = token_operation(
+            extend = token_call(
                 admission.request_key,
-                op_id=ComputationId(1 + index, 0),
+                call_id=CallId(1 + index, 0),
                 predecessor=root_parent(admission),
                 mode=ForwardMode.PREFILL,
                 tokens=(3, prompt_ends[index]),
@@ -131,7 +131,7 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
                     execution_batch(
                         batch_id=1 + index,
                         admissions=(admission,),
-                        operations=(extend,),
+                        calls=(extend,),
                     )
                 ),
             )
@@ -153,15 +153,15 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
             zip(admissions, primed, strict=True)
         ):
             observation = record_completion(extend, report)
-            operation = token_operation(
+            call = token_call(
                 admission.request_key,
-                op_id=ComputationId(4, index),
-                predecessor=observation.op_id,
+                call_id=CallId(4, index),
+                predecessor=observation.call_id,
                 mode=ForwardMode.DECODE,
                 tokens=(expected_successor(prompt_ends[index]),),
                 logprobs=index == 1,
             )
-            decode_ops.append(operation)
+            decode_ops.append(call)
 
             commits.append(observation)
         result = finalized_report(
@@ -170,7 +170,7 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
                 execution_batch(
                     batch_id=9,
                     admissions=(),
-                    operations=tuple(decode_ops),
+                    calls=tuple(decode_ops),
                     commands=tuple(commits),
                 )
             ),
@@ -208,16 +208,16 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> (
             second_base.generation, finish_token_ids=(expected,)
         ),
     )
-    first_op = token_operation(
+    first_op = token_call(
         first.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(first),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    second_op = token_operation(
+    second_op = token_call(
         second.request_key,
-        op_id=ComputationId(1, 1),
+        call_id=CallId(1, 1),
         predecessor=root_parent(second),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -229,7 +229,7 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> (
             execution_batch(
                 batch_id=1,
                 admissions=(first, second),
-                operations=(first_op, second_op),
+                calls=(first_op, second_op),
             )
         ),
     )
@@ -253,9 +253,9 @@ def test_verify_commits_every_accepted_position() -> None:
     )
     # Prime the request, then carry its selected token explicitly with the
     # draft.
-    extend = token_operation(
+    extend = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -267,16 +267,16 @@ def test_verify_commits_every_accepted_position() -> None:
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(extend,),
+                calls=(extend,),
                 input_products=(),
             )
         ),
     )
     observation = record_completion(extend, prime)
-    verify = token_operation(
+    verify = token_call(
         admission.request_key,
-        op_id=ComputationId(2, 0),
-        predecessor=observation.op_id,
+        call_id=CallId(2, 0),
+        predecessor=observation.call_id,
         mode=ForwardMode.VERIFY,
         tokens=(1000, 1001, STUB_IMG_START_TOKEN_ID),
         logprobs=True,
@@ -287,7 +287,7 @@ def test_verify_commits_every_accepted_position() -> None:
             execution_batch(
                 batch_id=2,
                 admissions=(),
-                operations=(verify,),
+                calls=(verify,),
                 commands=(),
             )
         ),
@@ -315,9 +315,9 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
 ) -> None:
     worker = execution_worker(device=device, queue_depth=2)
     admission = ar_params(5, block_ids=(4,))
-    extend = token_operation(
+    extend = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -328,27 +328,27 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(extend,),
+                calls=(extend,),
             )
         ),
     )
     observation = record_completion(extend, prime)
-    verify = token_operation(
+    verify = token_call(
         admission.request_key,
-        op_id=ComputationId(2, 0),
-        predecessor=observation.op_id,
+        call_id=CallId(2, 0),
+        predecessor=observation.call_id,
         mode=ForwardMode.VERIFY,
         tokens=(prime.completions[0].committed_tokens[0], 900, 901),
     )
 
     result = finalized_report(
-        worker, worker.submit(execution_batch(batch_id=2, operations=(verify,)))
+        worker, worker.submit(execution_batch(batch_id=2, calls=(verify,)))
     )
     successor = replace(
-        token_operation(
+        token_call(
             admission.request_key,
-            op_id=ComputationId(3, 0),
-            predecessor=verify.op_id,
+            call_id=CallId(3, 0),
+            predecessor=verify.call_id,
             mode=ForwardMode.DECODE,
             tokens=(0,),
             predicate=verify.token_output,
@@ -360,7 +360,7 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
     successor_batch = stamp_batch(
         worker,
         replace(
-            execution_batch(batch_id=3, operations=(successor,)),
+            execution_batch(batch_id=3, calls=(successor,)),
             seq_lens=(
                 len(extend.input_token_ids) + len(verify.input_token_ids) + 1,
             ),
@@ -375,7 +375,7 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
     assert completion.kv_computed_len == 5
     assert completion.kv_visible_len == 3
 
-    assert following.completions[0].status is OpStatus.OK
+    assert following.completions[0].status is CallStatus.OK
     assert following.completions[0].committed_tokens == (
         expected_successor(completion.committed_tokens[0]),
     )
@@ -394,9 +394,9 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> (
             cast(GenerationParams, base.generation), finish_token_ids=(1001,)
         ),
     )
-    extend = token_operation(
+    extend = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -407,15 +407,15 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> (
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(extend,),
+                calls=(extend,),
             )
         ),
     )
     observation = record_completion(extend, prime)
-    verify = token_operation(
+    verify = token_call(
         admission.request_key,
-        op_id=ComputationId(2, 0),
-        predecessor=observation.op_id,
+        call_id=CallId(2, 0),
+        predecessor=observation.call_id,
         mode=ForwardMode.VERIFY,
         tokens=(1000, 1001),
     )
@@ -426,7 +426,7 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> (
             execution_batch(
                 batch_id=2,
                 admissions=(),
-                operations=(verify,),
+                calls=(verify,),
                 commands=(),
             )
         ),
@@ -445,9 +445,9 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
             return_prompt_logprobs=True, n_prompt_logprobs=2
         ),
     )
-    first = token_operation(
+    first = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -459,15 +459,15 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(first,),
+                calls=(first,),
             )
         ),
     )
     observation = record_completion(first, first_result)
-    second = token_operation(
+    second = token_call(
         admission.request_key,
-        op_id=ComputationId(2, 0),
-        predecessor=observation.op_id,
+        call_id=CallId(2, 0),
+        predecessor=observation.call_id,
         mode=ForwardMode.PREFILL,
         tokens=(5, 6),
         logprobs=True,
@@ -478,7 +478,7 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
             execution_batch(
                 batch_id=2,
                 admissions=(),
-                operations=(second,),
+                calls=(second,),
                 commands=(),
             )
         ),
@@ -503,9 +503,9 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
     sampling = SamplingParams(return_prompt_logprobs=True, n_prompt_logprobs=2)
     admission = ar_params(32, block_ids=(8,), sampling=sampling)
     worker = execution_worker()
-    first = token_operation(
+    first = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -517,15 +517,15 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(first,),
+                calls=(first,),
             )
         ),
     )
     observation = record_completion(first, first_result)
-    invalid = token_operation(
+    invalid = token_call(
         admission.request_key,
-        op_id=ComputationId(2, 0),
-        predecessor=observation.op_id,
+        call_id=CallId(2, 0),
+        predecessor=observation.call_id,
         mode=ForwardMode.PREFILL,
         tokens=(5, 6),
         logprobs=True,
@@ -538,18 +538,18 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         worker.submit(
             execution_batch(
                 batch_id=2,
-                operations=(invalid,),
+                calls=(invalid,),
                 commands=(),
             )
         ),
     )
-    assert failed.completions[0].status is OpStatus.ERROR
-    assert failed.completions[0].error_code is ErrorCode.INVALID_OPERATION
+    assert failed.completions[0].status is CallStatus.ERROR
+    assert failed.completions[0].error_code is ErrorCode.INVALID_CALL
 
-    continued = token_operation(
+    continued = token_call(
         admission.request_key,
-        op_id=ComputationId(3, 0),
-        predecessor=observation.op_id,
+        call_id=CallId(3, 0),
+        predecessor=observation.call_id,
         mode=ForwardMode.PREFILL,
         tokens=(7, 8),
         logprobs=True,
@@ -559,15 +559,15 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         worker.submit(
             execution_batch(
                 batch_id=3,
-                operations=(continued,),
+                calls=(continued,),
             )
         ),
     )
 
     oracle = execution_worker()
-    oracle_first = token_operation(
+    oracle_first = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -579,15 +579,15 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(oracle_first,),
+                calls=(oracle_first,),
             )
         ),
     )
     oracle_observation = record_completion(oracle_first, oracle_result)
-    oracle_continued = token_operation(
+    oracle_continued = token_call(
         admission.request_key,
-        op_id=ComputationId(3, 0),
-        predecessor=oracle_observation.op_id,
+        call_id=CallId(3, 0),
+        predecessor=oracle_observation.call_id,
         mode=ForwardMode.PREFILL,
         tokens=(7, 8),
         logprobs=True,
@@ -597,7 +597,7 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         oracle.submit(
             execution_batch(
                 batch_id=3,
-                operations=(oracle_continued,),
+                calls=(oracle_continued,),
                 commands=(),
             )
         ),
@@ -610,18 +610,18 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
     assert recovered_output.prompt_logprobs == expected_output.prompt_logprobs
 
 
-def test_worker_samples_with_the_operation_branch_state() -> None:
+def test_worker_samples_with_the_call_branch_state() -> None:
     worker = execution_worker()
     admission = ar_params(41, block_ids=(9,))
-    operation = token_operation(
+    call = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    operation = replace(
-        operation,
+    call = replace(
+        call,
         sampling_state=SamplingState(allowed_token_ids=(7,)),
     )
 
@@ -631,7 +631,7 @@ def test_worker_samples_with_the_operation_branch_state() -> None:
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(operation,),
+                calls=(call,),
             )
         ),
     )
@@ -650,9 +650,9 @@ def test_forced_token_schedule_overrides_selection() -> None:
             forced_token_ids=(7,),
         ),
     )
-    operation = token_operation(
+    call = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -664,7 +664,7 @@ def test_forced_token_schedule_overrides_selection() -> None:
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(operation,),
+                calls=(call,),
             )
         ),
     )
@@ -675,15 +675,15 @@ def test_forced_token_schedule_overrides_selection() -> None:
 def test_all_masked_branch_state_produces_an_error_completion() -> None:
     worker = execution_worker()
     admission = ar_params(42, block_ids=(10,))
-    operation = token_operation(
+    call = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    operation = replace(
-        operation,
+    call = replace(
+        call,
         sampling_state=SamplingState(allowed_token_ids=()),
     )
 
@@ -693,12 +693,12 @@ def test_all_masked_branch_state_produces_an_error_completion() -> None:
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(operation,),
+                calls=(call,),
             )
         ),
     )
 
     completion = result.completions[0]
-    assert completion.status is OpStatus.ERROR
-    assert completion.error_code is ErrorCode.INVALID_OPERATION
+    assert completion.status is CallStatus.ERROR
+    assert completion.error_code is ErrorCode.INVALID_CALL
     assert completion.committed_tokens == ()

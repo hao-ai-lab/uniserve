@@ -7,9 +7,9 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
     VIDEO_STAGES,
-    Computation,
+    CallKind,
     ForwardMode,
     PipelineStage,
     computation,
@@ -261,7 +261,7 @@ class WorkerInfo:
     model_name: str
     endpoint: WorkerEndpoint
     world_size: int
-    supported_ops: tuple[Computation, ...]
+    supported_ops: tuple[CallKind, ...]
     queue_depth: int
     max_batch_ops: int
     max_batch_tokens: int
@@ -282,7 +282,7 @@ class WorkerInfo:
     num_inference_steps: int = 0
 
     def output_rank(self, entry: str) -> int:
-        """Resolve the host publication owner from the operation's entry.
+        """Resolve the host publication owner from the call's entry.
 
         Cooperative numerical outputs may reside on different stages. Host
         products belong to the entry's first member, matching the rank-report
@@ -380,7 +380,7 @@ class WorkerInfo:
                 for stage, component in self.pipeline_components.items()
             ):
                 raise invalid_descriptor(
-                    "pipeline component uses an unsupported operation"
+                    "pipeline component uses an unsupported call"
                 )
 
         has_latent_geometry = bool(self.latent_page_units or self.latent_pages)

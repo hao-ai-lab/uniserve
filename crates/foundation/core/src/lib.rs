@@ -153,12 +153,12 @@ pub struct TraceId(pub u64);
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
-pub struct ComputationId {
+pub struct CallId {
     pub batch_id: u64,
     pub request_index: u32,
 }
 
-impl ComputationId {
+impl CallId {
     pub const fn new(batch_id: u64, request_index: u32) -> Self {
         Self {
             batch_id,
@@ -351,7 +351,7 @@ pub struct SamplingParams {
     /// Typical-sampling mass cutoff over the locally-typical set (1.0 == no-op).
     #[serde(default = "default_typical_p")]
     pub typical_p: f32,
-    /// Forced-decoding schedule: point `i` of an operation's span is forced to
+    /// Forced-decoding schedule: point `i` of an call's span is forced to
     /// `forced_token_ids[i]` when present, overriding stochastic selection.
     #[serde(default)]
     pub forced_token_ids: Vec<u32>,
@@ -821,7 +821,7 @@ impl Default for ImageParams {
     }
 }
 
-/// Classifier-free-guidance configuration attached to image-generation operations.
+/// Classifier-free-guidance configuration attached to image-generation calls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CfgParams {
     /// Number of active guidance branches in `1..=3`.

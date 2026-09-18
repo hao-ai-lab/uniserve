@@ -8,8 +8,8 @@ import pytest
 
 from tests.python.fixtures.launch import worker_args
 from uniserve_worker.bootstrap.launch import WorkerIpcEndpoint, run_worker
-from uniserve_worker.protocol.identity import ComputationId
-from uniserve_worker.protocol.operation import ForwardMode
+from uniserve_worker.protocol.call import ForwardMode
+from uniserve_worker.protocol.identity import CallId
 
 pytestmark = pytest.mark.integration
 
@@ -102,7 +102,7 @@ def _stub_config(directory, *, rank=0, world_size=1, init_method=None):
         directory,
         ipc_payload_cap=65536,
         max_batch_tokens=256,
-        max_batch_operations=2,
+        max_batch_calls=2,
         device="cpu",
         no_model=True,
         allow_stub=True,
@@ -220,11 +220,11 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
         execution_batch,
         finalized_report,
         root_parent,
-        token_operation,
+        token_call,
     )
     from tests.python.fixtures.execution_worker import execution_worker
     from uniserve_worker.config import LaneConfig, WorkerConfig
-    from uniserve_worker.protocol.operation import COMPUTATIONS, OpStatus
+    from uniserve_worker.protocol.call import CALL_KINDS, CallStatus
 
     policy = WorkerConfig(
         prefill_cuda_graph=False,
@@ -236,7 +236,7 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
                 88,
                 tuple(
                     kind
-                    for kind in COMPUTATIONS
+                    for kind in CALL_KINDS
                     if kind not in {ForwardMode.DECODE, ForwardMode.VERIFY}
                 ),
             ),
@@ -277,9 +277,9 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
 
     with execution_worker(device="cuda:0", execution=policy) as worker:
         admission = ar_params(1, block_ids=(0,))
-        operation = token_operation(
+        call = token_call(
             admission.request_key,
-            op_id=ComputationId(1, 0),
+            call_id=CallId(1, 0),
             predecessor=root_parent(admission),
             mode=ForwardMode.PREFILL,
             tokens=(3, 4),
@@ -290,9 +290,9 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
                 execution_batch(
                     batch_id=1,
                     admissions=(admission,),
-                    operations=(operation,),
+                    calls=(call,),
                 )
             ),
         )
-        assert result.completions[0].status is OpStatus.OK
+        assert result.completions[0].status is CallStatus.OK
         assert result.completions[0].committed_tokens

@@ -430,7 +430,7 @@ class EagerRmsNorm(Operator):
         super().__init__("eager", "rms_norm")
 
     def can_run(self, req: RmsNormReq) -> bool:
-        """Accept every request handled by PyTorch tensor operations."""
+        """Accept every request handled by PyTorch tensor calls."""
         del req
         return True
 
@@ -536,7 +536,7 @@ class EagerAddRmsNorm(Operator):
         super().__init__("eager", "add_rms_norm")
 
     def can_run(self, req: AddRmsNormReq) -> bool:
-        """Accept every request handled by PyTorch tensor operations."""
+        """Accept every request handled by PyTorch tensor calls."""
         del req
         return True
 

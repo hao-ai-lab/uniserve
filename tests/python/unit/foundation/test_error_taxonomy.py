@@ -10,7 +10,7 @@ from uniserve_worker.foundation.errors import (
     WorkerErrorCode,
     classify,
 )
-from uniserve_worker.protocol.identity import ComputationId
+from uniserve_worker.protocol.identity import CallId
 
 pytestmark = pytest.mark.unit
 
@@ -120,11 +120,11 @@ def test_to_mapping_emits_canonical_error_context():
         message="CUDA out of memory",
         fatal=False,
         req_id=42,
-        op_id=ComputationId(7, 0),
+        call_id=CallId(7, 0),
         op_kind="decode_und",
         phase="run",
         route="language",
-        operations=((5, 42, 3, ComputationId(7, 0)),),
+        calls=((5, 42, 3, CallId(7, 0)),),
         details={"device": 0},
     )
 
@@ -136,13 +136,13 @@ def test_to_mapping_emits_canonical_error_context():
     assert snapshot["fatal"] is False
     assert snapshot["phase"] == "run"
     assert snapshot["route"] == "language"
-    assert snapshot["operations"] == [
+    assert snapshot["calls"] == [
         {
             "request_key": {
                 "engine_id": 5,
                 "request_id": 42,
                 "request_epoch": 3,
             },
-            "op_id": {"batch_id": 7, "request_index": 0},
+            "call_id": {"batch_id": 7, "request_index": 0},
         }
     ]

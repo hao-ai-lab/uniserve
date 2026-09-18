@@ -15,9 +15,9 @@ from uniserve.runtime.backends.attention.flashinfer import (
     Config as FlashInferConfig,
 )
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.protocol.operation import (
-    COMPUTATIONS,
-    Computation,
+from uniserve_worker.protocol.call import (
+    CALL_KINDS,
+    CallKind,
     ForwardMode,
     PipelineStage,
     TransferMode,
@@ -206,9 +206,9 @@ def graph_memory_budget_bytes(total_device_bytes: int) -> int:
 
 
 # JSON lane selectors resolve at startup. Execution binds concrete
-# computations, so independent pipeline stages never acquire a second
+# call kinds, so independent pipeline stages never acquire a second
 # scheduling classification.
-LANE_COMPUTATION_GROUPS: dict[str, tuple[Computation, ...]] = {
+LANE_COMPUTATION_GROUPS: dict[str, tuple[CallKind, ...]] = {
     "prefill": (
         ForwardMode.PREFILL,
         PipelineStage.VISION_ENCODING,
@@ -232,38 +232,38 @@ LANE_COMPUTATION_GROUPS: dict[str, tuple[Computation, ...]] = {
 
 @dataclass(frozen=True, slots=True)
 class LaneConfig:
-    """Assigns computations and SM budget to one execution lane.
+    """Assigns call_kinds and SM budget to one execution lane.
 
     Also assigns optional capacity overrides to the lane.
     """
 
     lane_id: str
     sm_budget: int
-    computations: tuple[Computation, ...]
+    call_kinds: tuple[CallKind, ...]
     kv_capacity_tokens: int | None = None
     latent_capacity_units: int | None = None
-    max_batch_operations: int | None = None
+    max_batch_calls: int | None = None
     max_batch_tokens: int | None = None
     max_inflight: int | None = None
 
     def __post_init__(self) -> None:
-        """Validate lane computations and validate SM and capacity overrides."""
+        """Validate lane call kinds and validate SM and capacity overrides."""
         if not self.lane_id or any(
             character.isspace() for character in self.lane_id
         ):
             raise ValueError("lane id must be a non-empty token")
         if int(self.sm_budget) < 1:
             raise ValueError("lane SM budget must be positive")
-        if not self.computations or len(set(self.computations)) != len(
-            self.computations
+        if not self.call_kinds or len(set(self.call_kinds)) != len(
+            self.call_kinds
         ):
-            raise ValueError("lane computations must be non-empty and unique")
-        if any(kind not in COMPUTATIONS for kind in self.computations):
-            raise ValueError("lane must bind concrete computations")
+            raise ValueError("lane call kinds must be non-empty and unique")
+        if any(kind not in CALL_KINDS for kind in self.call_kinds):
+            raise ValueError("lane must bind concrete call kinds")
         for name in (
             "kv_capacity_tokens",
             "latent_capacity_units",
-            "max_batch_operations",
+            "max_batch_calls",
             "max_batch_tokens",
             "max_inflight",
         ):
@@ -287,7 +287,7 @@ class WorkerConfig:
     block_size: int = 64
     kv_token_capacity: int | None = None
     attention_backend: str | None = None
-    max_batch_operations: int = 1024
+    max_batch_calls: int = 1024
     max_batch_tokens: int = 8192
     max_sequence_tokens: int = 16384
     max_video_seconds: float = 15.0
@@ -338,7 +338,7 @@ class WorkerConfig:
             )
         if (
             self.block_size < 1
-            or self.max_batch_operations < 1
+            or self.max_batch_calls < 1
             or self.max_batch_tokens < 1
             or self.max_sequence_tokens < 1
             or self.max_request_pool_size < 1
@@ -382,7 +382,7 @@ def worker_config_from_namespace(
         world_size=int(namespace.world_size),
         generation_device=generation_device,
         block_size=int(namespace.block_size),
-        max_batch_operations=int(namespace.max_batch_operations),
+        max_batch_calls=int(namespace.max_batch_calls),
         max_batch_tokens=int(namespace.max_batch_tokens),
         max_sequence_tokens=int(namespace.max_model_len),
         max_video_seconds=float(namespace.max_video_seconds),
@@ -565,7 +565,7 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
             "domains",
             "kv_capacity_tokens",
             "latent_capacity_units",
-            "max_batch_operations",
+            "max_batch_calls",
             "max_batch_tokens",
             "max_inflight",
         }
@@ -590,7 +590,7 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
             LaneConfig(
                 lane_id=str(data.get("lane_id", "")),
                 sm_budget=int(data.get("sm_budget", 0)),
-                computations=tuple(
+                call_kinds=tuple(
                     kind
                     for name in domains
                     for kind in LANE_COMPUTATION_GROUPS[name]
@@ -601,9 +601,7 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
                 latent_capacity_units=_json_optional_int(
                     data, "latent_capacity_units"
                 ),
-                max_batch_operations=_json_optional_int(
-                    data, "max_batch_operations"
-                ),
+                max_batch_calls=_json_optional_int(data, "max_batch_calls"),
                 max_batch_tokens=_json_optional_int(data, "max_batch_tokens"),
                 max_inflight=_json_optional_int(data, "max_inflight"),
             )
@@ -613,9 +611,9 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
     # distinct, so scheduling classification stays unambiguous.
     if len({lane.lane_id for lane in result}) != len(result):
         raise ValueError("lane ids must be unique")
-    computations = tuple(kind for lane in result for kind in lane.computations)
-    if len(set(computations)) != len(computations):
-        raise ValueError("computations must have one execution lane binding")
+    call_kinds = tuple(kind for lane in result for kind in lane.call_kinds)
+    if len(set(call_kinds)) != len(call_kinds):
+        raise ValueError("call kinds must have one execution lane binding")
     return tuple(result)
 
 

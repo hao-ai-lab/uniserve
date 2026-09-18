@@ -20,7 +20,7 @@ class Encoder(nn.Module, Generic[InputT]):
     """Stack equal-shaped feature samples and restore their original order.
 
     The network preserves its leading sample dimension. It must apply token
-    operations independently within each sample, as ordinary batched modules do.
+    calls independently within each sample, as ordinary batched modules do.
     """
 
     def __init__(self, network: nn.Module):

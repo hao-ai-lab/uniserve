@@ -17,7 +17,7 @@ pub(crate) struct ImageArtifactMetadata {
 
 /// Parses image dimensions from a base64 PNG's IHDR header, decoding only the
 /// base64 prefix. The response path validates artifact dimensions per
-/// final image operation; decoding the entire multi-megabyte frame there costs hundreds
+/// final image call; decoding the entire multi-megabyte frame there costs hundreds
 /// of milliseconds per image, while the header carries the dimensions in the
 /// first 24 bytes.
 pub(crate) fn png_artifact_dims_b64(pixels_png_b64: &str) -> Option<(u32, u32)> {

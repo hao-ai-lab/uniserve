@@ -5,7 +5,7 @@
 //! worker wake service reports submitted requests. Separate directions prevent
 //! broadcast notifications from accumulating on the sender's listener.
 //!
-//! Callers supply operation or liveness deadlines to all waits.
+//! Callers supply call or liveness deadlines to all waits.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

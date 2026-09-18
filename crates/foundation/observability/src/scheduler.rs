@@ -164,34 +164,34 @@ pub struct SchedulerMetrics {
         help = "Maximum queue wait in microseconds observed by the scheduler."
     )]
     pub scheduler_queue_wait_max_us: Family<EngineLabels, U64Gauge>,
-    /// Active operation credits grouped by execution domain.
+    /// Active call credits grouped by execution domain.
     #[metric(
         name = "uniserve:scheduler_domain_active_credits",
-        help = "Current scheduler operation credits in use by execution domain."
+        help = "Current scheduler call credits in use by execution domain."
     )]
     pub scheduler_domain_active_credits: Family<EngineDomainLabels, U64Gauge>,
-    /// Peak active operation credits grouped by execution domain.
+    /// Peak active call credits grouped by execution domain.
     #[metric(
         name = "uniserve:scheduler_domain_peak_credits",
-        help = "Maximum scheduler operation credits observed in use by execution domain."
+        help = "Maximum scheduler call credits observed in use by execution domain."
     )]
     pub scheduler_domain_peak_credits: Family<EngineDomainLabels, U64Gauge>,
-    /// Operation lifecycle events grouped by domain and outcome.
+    /// Call lifecycle events grouped by domain and outcome.
     #[metric(
-        name = "uniserve:scheduler_domain_operations",
-        help = "Scheduler operation events by execution domain and kind: launched, completed, predicated, or error."
+        name = "uniserve:scheduler_domain_calls",
+        help = "Scheduler call events by execution domain and kind: launched, completed, predicated, or error."
     )]
-    pub scheduler_domain_operations: Family<EngineDomainKindLabels, U64Counter>,
+    pub scheduler_domain_calls: Family<EngineDomainKindLabels, U64Counter>,
     /// Non-blocking resource-pressure events grouped by domain.
     #[metric(
         name = "uniserve:scheduler_domain_backpressure",
         help = "Nonblocking scheduler resource-pressure events by execution domain."
     )]
     pub scheduler_domain_backpressure: Family<EngineDomainLabels, U64Counter>,
-    /// Reclaimed operation credits grouped by domain.
+    /// Reclaimed call credits grouped by domain.
     #[metric(
         name = "uniserve:scheduler_domain_reclaimed_credits",
-        help = "Scheduler operation credits reclaimed by execution domain."
+        help = "Scheduler call credits reclaimed by execution domain."
     )]
     pub scheduler_domain_reclaimed_credits: Family<EngineDomainLabels, U64Counter>,
     /// Completed batches grouped by domain.
@@ -245,10 +245,10 @@ pub struct SchedulerMetrics {
         help = "Worker forward dispatches by CUDA-graph runtime mode."
     )]
     pub worker_cuda_graph_runtime_mode_counts: Family<EngineModeLabels, U64Counter>,
-    /// Forward operations grouped by runtime mode.
+    /// Forward calls grouped by runtime mode.
     #[metric(
         name = "uniserve:worker_forward_mode_counts",
-        help = "Worker forward operations by forward mode."
+        help = "Worker forward calls by forward mode."
     )]
     pub worker_forward_mode_counts: Family<EngineModeLabels, U64Counter>,
     /// Forward tokens grouped by runtime mode.
@@ -424,10 +424,10 @@ pub struct SchedulerMetrics {
     pub batch_timing_count: Family<EngineLabels, U64Counter>,
 
     // Per-engine performance / MFU counters.
-    /// Estimated floating-point operations per GPU.
+    /// Estimated floating-point calls per GPU.
     #[metric(
         name = "uniserve:estimated_flops_per_gpu",
-        help = "Estimated number of floating point operations per GPU (for Model Flops Utilization calculations)."
+        help = "Estimated number of floating point calls per GPU (for Model Flops Utilization calculations)."
     )]
     pub estimated_flops_per_gpu: Family<EngineLabels, U64Counter>,
     /// Estimated memory bytes read per GPU.

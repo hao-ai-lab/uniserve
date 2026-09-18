@@ -21,7 +21,7 @@ from uniserve.processing import (
     StrideResize,
 )
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.protocol.operation import PipelineStage
+from uniserve_worker.protocol.call import PipelineStage
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)

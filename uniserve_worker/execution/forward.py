@@ -12,7 +12,7 @@ import torch
 
 from uniserve.diffusion import Branch
 from uniserve.tensors import OutputLayout
-from uniserve_worker.execution import operations
+from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch_state import BatchState
 from uniserve_worker.execution.image_input import PreparedImage
 from uniserve_worker.execution.output import PendingOutput
@@ -21,10 +21,10 @@ from uniserve_worker.execution.sample import broadcast_selection
 from uniserve_worker.execution.sample import sample as _sample_task_batch
 from uniserve_worker.foundation.errors import classify, invalid_descriptor
 from uniserve_worker.profiling import record_component
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
+    Call,
     ForwardMode,
     PipelineStage,
-    ScheduledRequest,
 )
 
 from .diffusion_state import ImageState
@@ -63,7 +63,7 @@ SampleCandidate = tuple[
 
 def forward_values(
     model_runner: ModelRunner,
-    inputs: tuple[tuple[ForwardRow, ScheduledRequest, int], ...],
+    inputs: tuple[tuple[ForwardRow, Call, int], ...],
     *,
     state: BatchState,
     errors: dict[int, BaseException],
@@ -77,13 +77,13 @@ def forward_values(
 
     statistics.
     """
-    for row, _operation, completion_group in inputs:
+    for row, _call, completion_group in inputs:
         state.group_buffers[completion_group].register_device(
-            model_runner.operation_devices(_operation)[1]
+            model_runner.call_devices(_call)[1]
         )
 
     outputs = model_runner.forward(
-        tuple((row, operation) for row, operation, _scope in inputs),
+        tuple((row, call) for row, call, _scope in inputs),
         cache=cache,
         tables=tables,
         states=states,
@@ -146,7 +146,7 @@ def forward_values(
 
 def _publish_sample_groups(
     samples: Mapping[int, list[SampleCandidate]],
-    scheduled: tuple[tuple[ScheduledRequest, int], ...],
+    scheduled: tuple[tuple[Call, int], ...],
     outcomes: dict[int, PendingOutput],
     errors: dict[int, BaseException],
     *,
@@ -243,7 +243,7 @@ def _publish_sample_groups(
 
 def initialize_trajectories(
     numerical: tuple[int, ...],
-    scheduled: tuple[tuple[ScheduledRequest, int], ...],
+    scheduled: tuple[tuple[Call, int], ...],
     outcomes: dict[int, PendingOutput],
     errors: dict[int, BaseException],
     *,
@@ -258,9 +258,9 @@ def initialize_trajectories(
 
     trajectories: dict[int, ImageState] = {}
     for index in numerical:
-        operation, completion_group = scheduled[index]
+        call, completion_group = scheduled[index]
         if (
-            operation.kind is not PipelineStage.DENOISING
+            call.kind is not PipelineStage.DENOISING
             or index in outcomes
             or completion_group in errors
         ):
@@ -268,7 +268,7 @@ def initialize_trajectories(
 
         try:
             trajectories[index] = flow.initialize(
-                operation,
+                call,
                 completion_group,
                 kv_cache=kv_cache,
                 latent_pool=latent_pool,
@@ -281,14 +281,14 @@ def initialize_trajectories(
 
     step_count = 1
     for index in trajectories:
-        operation, completion_group = scheduled[index]
+        call, completion_group = scheduled[index]
         request = state.pending_output(
-            completion_group, operation.request_key.request_id
+            completion_group, call.request_key.request_id
         )
         params = request.input_latent_params
         if params is None:
             raise invalid_descriptor(
-                "diffusion operation has no staged latent parameters"
+                "diffusion call has no staged latent parameters"
             )
         step_count = max(step_count, int(params.step_count))
 
@@ -298,7 +298,7 @@ def initialize_trajectories(
 def prepare_diffusion_step(
     offset: int,
     trajectories: dict[int, ImageState],
-    scheduled: tuple[tuple[ScheduledRequest, int], ...],
+    scheduled: tuple[tuple[Call, int], ...],
     outcomes: dict[int, PendingOutput],
     errors: dict[int, BaseException],
     *,
@@ -320,25 +320,25 @@ def prepare_diffusion_step(
     prefixes: list[tuple[int, Branch, ForwardRow]] = []
 
     for index, trajectory in trajectories.items():
-        operation, completion_group = scheduled[index]
+        call, completion_group = scheduled[index]
         if index in outcomes or completion_group in errors:
             continue
 
         row = state.pending_output(
-            completion_group, operation.request_key.request_id
+            completion_group, call.request_key.request_id
         )
         params = row.input_latent_params
         staging = row.latent_staging
         if params is None or staging is None:
             raise invalid_descriptor(
-                "trajectory operation has no staged latent inputs"
+                "trajectory call has no staged latent inputs"
             )
         if offset >= int(params.step_count):
             continue
 
         try:
             guide, timestep, next_timestep, prefix_rows = flow.prepare_step(
-                operation,
+                call,
                 completion_group,
                 trajectory,
                 int(params.start_step) + offset,
@@ -379,7 +379,7 @@ def prepare_diffusion_step(
     for (index, branch, task), numerical_result in zip(
         active_prefixes, values, strict=True
     ):
-        operation, completion_group = scheduled[index]
+        call, completion_group = scheduled[index]
         if (
             index in outcomes
             or completion_group in errors
@@ -393,7 +393,7 @@ def prepare_diffusion_step(
                 task,
                 task.query_tokens,
                 state.pending_output(
-                    completion_group, operation.request_key.request_id
+                    completion_group, call.request_key.request_id
                 ),
                 publish_runtime=False,
                 request_tables=request_tables,
@@ -419,7 +419,7 @@ def prepare_forward_rows(
         int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]
     ],
     trajectories: Mapping[int, ImageState],
-    scheduled: tuple[tuple[ScheduledRequest, int], ...],
+    scheduled: tuple[tuple[Call, int], ...],
     outcomes: dict[int, PendingOutput],
     errors: dict[int, BaseException],
     *,
@@ -437,7 +437,7 @@ def prepare_forward_rows(
     images: dict[int, PreparedImage] = {}
 
     for index in numerical:
-        operation, completion_group = scheduled[index]
+        call, completion_group = scheduled[index]
         if (
             index in outcomes
             or completion_group in errors
@@ -451,13 +451,13 @@ def prepare_forward_rows(
                     continue
                 guide, timestep, _next_timestep = step_inputs[index]
                 row = state.pending_output(
-                    completion_group, operation.request_key.request_id
+                    completion_group, call.request_key.request_id
                 )
                 params = row.input_latent_params
                 staging = row.latent_staging
                 if params is None or staging is None:
                     raise invalid_descriptor(
-                        "trajectory operation has no staged latent inputs"
+                        "trajectory call has no staged latent inputs"
                     )
 
                 rows = flow.flow_rows(
@@ -467,15 +467,15 @@ def prepare_forward_rows(
                     guide,
                     timestep,
                     conditioning_position=int(
-                        operations.require_progress(row).logical_position
+                        calls.require_progress(row).logical_position
                     ),
-                    device=model_runner.operation_devices(operation)[1],
+                    device=model_runner.call_devices(call)[1],
                 )
                 forward.extend((index, task) for task in rows)
-            elif isinstance(operation.kind, ForwardMode):
+            elif isinstance(call.kind, ForwardMode):
                 build_started = time.perf_counter_ns()
                 task = token.prepare_forward(
-                    operation,
+                    call,
                     completion_group,
                     tensor_store=tensor_store,
                     request_tables=request_tables,
@@ -489,12 +489,12 @@ def prepare_forward_rows(
                     build_started,
                 )
                 forward.append((index, task))
-            elif operation.kind in {
+            elif call.kind in {
                 PipelineStage.VISION_ENCODING,
                 PipelineStage.LATENT_ENCODING,
             }:
                 prepared = encode.prepare_features(
-                    operation,
+                    call,
                     completion_group,
                     tensor_store=tensor_store,
                     model_runner=model_runner,
@@ -505,13 +505,13 @@ def prepare_forward_rows(
                     (
                         index,
                         encode.encode_row(
-                            cast(PipelineStage, operation.kind), prepared
+                            cast(PipelineStage, call.kind), prepared
                         ),
                     )
                 )
-            elif operation.latent_input is None:
+            elif call.latent_input is None:
                 outcomes[index] = encode.diffusion_finalize_frames(
-                    operation,
+                    call,
                     completion_group,
                     tensor_store=tensor_store,
                     model_runner=model_runner,
@@ -521,20 +521,20 @@ def prepare_forward_rows(
                 if latent_pool is None:
                     raise RuntimeError("image decoding requires a latent pool")
                 latent = encode.materialization_latent(
-                    operation,
+                    call,
                     completion_group,
                     latent_pool=latent_pool,
                     model_runner=model_runner,
                     state=state,
                 )
                 row = state.pending_output(
-                    completion_group, operation.request_key.request_id
+                    completion_group, call.request_key.request_id
                 )
                 params = row.input_latent_params
                 staging = row.latent_staging
                 if params is None or staging is None:
                     raise invalid_descriptor(
-                        "trajectory operation has no staged latent inputs"
+                        "trajectory call has no staged latent inputs"
                     )
 
                 forward.append(
@@ -566,7 +566,7 @@ def publish_forward_values(
     values: tuple[ForwardValue | None, ...],
     images: Mapping[int, PreparedImage],
     trajectories: Mapping[int, ImageState],
-    scheduled: tuple[tuple[ScheduledRequest, int], ...],
+    scheduled: tuple[tuple[Call, int], ...],
     outcomes: dict[int, PendingOutput],
     errors: dict[int, BaseException],
     *,
@@ -587,7 +587,7 @@ def publish_forward_values(
     samples: dict[int, list[SampleCandidate]] = defaultdict(list)
 
     for (index, task), numerical_result in zip(forward, values, strict=True):
-        operation, completion_group = scheduled[index]
+        call, completion_group = scheduled[index]
         if (
             index in outcomes
             or completion_group in errors
@@ -599,10 +599,10 @@ def publish_forward_values(
         try:
             if index in trajectories:
                 predictions[index].append(value)
-            elif isinstance(operation.kind, ForwardMode):
+            elif isinstance(call.kind, ForwardMode):
                 if graph_sample is not None:
                     request = state.pending_output(
-                        completion_group, operation.request_key.request_id
+                        completion_group, call.request_key.request_id
                     )
                     token.commit_kv(
                         task,
@@ -617,7 +617,7 @@ def publish_forward_values(
                     )
                 else:
                     selection = token.prepare_sampling(
-                        operation,
+                        call,
                         completion_group,
                         task,
                         value,
@@ -636,7 +636,7 @@ def publish_forward_values(
                         )
             elif index in images:
                 outcomes[index] = encode.publish_features(
-                    operation,
+                    call,
                     completion_group,
                     images[index],
                     value,
@@ -652,7 +652,7 @@ def publish_forward_values(
                         "image decoder must declare its numerical range"
                     )
                 outcomes[index] = encode.publish_image(
-                    operation,
+                    call,
                     completion_group,
                     value.detach(),
                     layout.value_range,
@@ -684,7 +684,7 @@ def integrate_predictions(
     ],
     trajectories: Mapping[int, ImageState],
     offset: int,
-    scheduled: tuple[tuple[ScheduledRequest, int], ...],
+    scheduled: tuple[tuple[Call, int], ...],
     outcomes: dict[int, PendingOutput],
     errors: dict[int, BaseException],
     *,
@@ -703,24 +703,24 @@ def integrate_predictions(
     from . import flow
 
     for index, values in predictions.items():
-        operation, completion_group = scheduled[index]
+        call, completion_group = scheduled[index]
         if index in outcomes or completion_group in errors:
             continue
 
         try:
             guide, timestep, next_timestep = step_inputs[index]
             row = state.pending_output(
-                completion_group, operation.request_key.request_id
+                completion_group, call.request_key.request_id
             )
             params = row.input_latent_params
             staging = row.latent_staging
             if params is None or staging is None:
                 raise invalid_descriptor(
-                    "trajectory operation has no staged latent inputs"
+                    "trajectory call has no staged latent inputs"
                 )
 
             # The solver updates only the model-visible portion of this
-            # operation's staging, preserving page padding.
+            # call's staging, preserving page padding.
             flow.integrate(
                 flow.require_inputs(model_runner),
                 trajectories[index],
@@ -732,7 +732,7 @@ def integrate_predictions(
             )
             if offset + 1 == int(params.step_count):
                 outcomes[index] = flow.finish(
-                    operation,
+                    call,
                     completion_group,
                     trajectories[index],
                     worker_info=worker_info,

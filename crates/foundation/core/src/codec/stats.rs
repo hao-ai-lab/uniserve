@@ -84,7 +84,7 @@ pub struct DebugPerfStats {
 /// Estimated compute and memory traffic for one worker update.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PerfStats {
-    /// Estimated floating point operations per GPU.
+    /// Estimated floating point calls per GPU.
     pub num_flops_per_gpu: u64,
     /// Estimated bytes read from memory per GPU.
     pub num_read_bytes_per_gpu: u64,
@@ -244,7 +244,7 @@ impl ForwardStats {
 
 /// Per-domain scheduler accounting for one stats update.
 ///
-/// Operation, run, pressure, reclaim, and time fields are interval
+/// Call, run, pressure, reclaim, and time fields are interval
 /// deltas. Credit fields are gauges. Device and co-residency time describe the
 /// full interval visible to the named domain; values from co-resident domains
 /// therefore must not be summed to estimate aggregate GPU busy time.
@@ -258,18 +258,18 @@ pub struct DomainSchedulerStats {
     /// Highest active-credit count in the interval.
     #[serde(default)]
     pub peak_credits: u64,
-    /// Operations launched in the interval.
+    /// Calls launched in the interval.
     #[serde(default)]
-    pub launched_operations: u64,
-    /// Operations completed in the interval.
+    pub launched_calls: u64,
+    /// Calls completed in the interval.
     #[serde(default)]
-    pub completed_operations: u64,
-    /// Operations skipped by a false predicate.
+    pub completed_calls: u64,
+    /// Calls skipped by a false predicate.
     #[serde(default)]
-    pub predicated_operations: u64,
-    /// Operations completed with an error.
+    pub predicated_calls: u64,
+    /// Calls completed with an error.
     #[serde(default)]
-    pub error_operations: u64,
+    pub error_calls: u64,
     /// Submission attempts rejected by executor backpressure.
     #[serde(default)]
     pub backpressure_events: u64,

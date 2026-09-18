@@ -10,7 +10,7 @@ from typing import TypeAlias
 from uniserve import sampling
 
 from ..foundation.errors import invalid_descriptor
-from . import identity, operation, tensor, transfer
+from . import call, identity, tensor, transfer
 from .validation import (
     _bool,
     _map,
@@ -26,7 +26,7 @@ from .validation import (
 def native_batch(
     batch_id: int,
     collective_seq: int,
-    operations: tuple[operation.ScheduledRequest, ...],
+    calls: tuple[call.Call, ...],
     block_tables: tuple[BlockTable, ...],
     new_cache_pages: tuple[CachePageAllocation, ...],
     forward_inputs: tuple[
@@ -54,10 +54,10 @@ def native_batch(
     set_field = object.__setattr__
     set_field(batch, "batch_id", batch_id)
     set_field(batch, "collective_seq", collective_seq)
-    set_field(batch, "operations", operations)
+    set_field(batch, "calls", calls)
     set_field(batch, "block_tables", block_tables)
     set_field(batch, "new_cache_pages", new_cache_pages)
-    set_field(batch, "forward_operation_indices", forward_inputs[0])
+    set_field(batch, "forward_call_indices", forward_inputs[0])
     set_field(batch, "request_pool_indices", forward_inputs[1])
     set_field(batch, "seq_lens", forward_inputs[2])
     set_field(batch, "query_lens", forward_inputs[3])
@@ -288,7 +288,7 @@ class GenerationParams:
         """
         data = _map(value, where)
         return cls(
-            sampling=operation._sampling_params_from_mapping(
+            sampling=call._sampling_params_from_mapping(
                 data.get("sampling", {}), f"{where}.sampling"
             ),
             negative_token_ids=_uints(
@@ -309,7 +309,7 @@ class GenerationParams:
         Produces the admission wire mapping.
         """
         return {
-            "sampling": operation._sampling_params_to_mapping(self.sampling),
+            "sampling": call._sampling_params_to_mapping(self.sampling),
             "negative_token_ids": list(self.negative_token_ids),
             "finish_token_ids": list(self.finish_token_ids),
             "initial_position": self.initial_position,
@@ -372,7 +372,7 @@ class NewRequest:
     request_pool_idx: int
     # Exactly one of the three runtime-family parameter sets must be present.
     generation: GenerationParams | None = None
-    image: operation.ImageParams | None = None
+    image: call.ImageParams | None = None
     diffusion: DiffusionParams | None = None
     # Prompt tokens; required (non-empty) for diffusion requests.
     prompt_token_ids: tuple[int, ...] = ()
@@ -425,7 +425,7 @@ class NewRequest:
             image=(
                 None
                 if image_data is None
-                else operation.ImageParams.from_mapping(
+                else call.ImageParams.from_mapping(
                     _map(image_data, f"{where}.umm").get("image", {}),
                     f"{where}.umm.image",
                 )
@@ -509,7 +509,7 @@ class BlockTable:
                 else _uint(raw, f"{where}.{name}")
             )
 
-        page_ids = operation._fast_uints(data.get("page_ids", ()))
+        page_ids = call._fast_uints(data.get("page_ids", ()))
         if page_ids is None:
             page_ids = _uints(data.get("page_ids", ()), f"{where}.page_ids")
         fields = (
@@ -575,7 +575,7 @@ class CachePageAllocation:
                 else _uint(raw, f"{where}.{name}")
             )
 
-        page_ids = operation._fast_uints(data.get("page_ids", ()))
+        page_ids = call._fast_uints(data.get("page_ids", ()))
         if page_ids is None:
             page_ids = _uints(data.get("page_ids", ()), f"{where}.page_ids")
         fields = (
@@ -595,8 +595,8 @@ class CachePageAllocation:
 
 
 def _validate_forward_inputs(
-    operation_count: int,
-    operation_indices: tuple[int, ...],
+    call_count: int,
+    call_indices: tuple[int, ...],
     request_pool_indices: tuple[int, ...],
     seq_lens: tuple[int, ...],
     query_lens: tuple[int, ...],
@@ -606,16 +606,14 @@ def _validate_forward_inputs(
 
     Validation happens before lane preparation indexes their columns.
     """
-    rows = len(operation_indices)
+    rows = len(call_indices)
     if any(
         len(column) != rows
         for column in (request_pool_indices, seq_lens, query_lens, write_kv)
     ):
         raise invalid_descriptor("forward input columns have different lengths")
-    if any(
-        index < 0 or index >= operation_count for index in operation_indices
-    ):
-        raise invalid_descriptor("forward operation index is outside its batch")
+    if any(index < 0 or index >= call_count for index in call_indices):
+        raise invalid_descriptor("forward call index is outside its batch")
     if any(slot < 1 for slot in request_pool_indices):
         raise invalid_descriptor(
             "forward input carries the reserved request slot"
@@ -634,7 +632,7 @@ class LatentParams:
     """
 
     request_key: identity.RequestKey
-    op_id: identity.ComputationId
+    call_id: identity.CallId
     # 1-based physical pages backing paged latent storage; empty iff
     # latent_units is zero.
     page_table: tuple[int, ...]
@@ -648,14 +646,12 @@ class LatentParams:
     step_count: int
 
     def __post_init__(self) -> None:
-        """Validate the operation identity and raster shape.
+        """Validate the call identity and raster shape.
 
         Also validates page-table/unit consistency.
         """
-        if self.op_id.batch_id < 1:
-            raise invalid_descriptor(
-                "latent params operation id must be positive"
-            )
+        if self.call_id.batch_id < 1:
+            raise invalid_descriptor("latent params call id must be positive")
         if min(self.height, self.width) < 1 or self.latent_units < 0:
             raise invalid_descriptor("latent dimensions must be positive")
         if (
@@ -681,8 +677,8 @@ class LatentParams:
             request_key=identity.RequestKey.from_mapping(
                 data.get("request_key"), f"{where}.request_key"
             ),
-            op_id=identity.ComputationId.from_mapping(
-                data.get("op_id"), f"{where}.op_id"
+            call_id=identity.CallId.from_mapping(
+                data.get("call_id"), f"{where}.call_id"
             ),
             page_table=_uints(
                 data.get("page_table", ()), f"{where}.page_table"
@@ -700,7 +696,7 @@ class LatentParams:
         """Serialize a physical latent trajectory params for lane execution."""
         return {
             "request_key": self.request_key.to_mapping(),
-            "op_id": self.op_id.to_mapping(),
+            "call_id": self.call_id.to_mapping(),
             "page_table": list(self.page_table),
             "latent_units": self.latent_units,
             "height": self.height,
@@ -711,7 +707,7 @@ class LatentParams:
 
 
 class MediaTrack(StrEnum):
-    """Independent media stream addressed by a bounded operation."""
+    """Independent media stream addressed by a bounded call."""
 
     VIDEO = "video"
     AUDIO = "audio"
@@ -722,15 +718,15 @@ class DecodeRange:
     """Selects a bounded temporal range for a concrete media computation."""
 
     request_key: identity.RequestKey
-    op_id: identity.ComputationId
+    call_id: identity.CallId
     # Position (in media units) at which reconstruction resumes.
     cursor: int
-    # Maximum media units this operation may emit.
+    # Maximum media units this call may emit.
     max_units: int
 
     def __post_init__(self) -> None:
-        """Validate the operation identity, cursor, and unit bound."""
-        if self.op_id.batch_id < 1 or self.max_units < 1:
+        """Validate the call identity, cursor, and unit bound."""
+        if self.call_id.batch_id < 1 or self.max_units < 1:
             raise invalid_descriptor(
                 "decode params identity and unit bound must be positive"
             )
@@ -742,15 +738,15 @@ class DecodeRange:
     ) -> DecodeRange:
         """Parse the reconstruction cursor and bounded unit count.
 
-        Parses parameters for one operation.
+        Parses parameters for one call.
         """
         data = _map(value, where)
         return cls(
             request_key=identity.RequestKey.from_mapping(
                 data.get("request_key"), f"{where}.request_key"
             ),
-            op_id=identity.ComputationId.from_mapping(
-                data.get("op_id"), f"{where}.op_id"
+            call_id=identity.CallId.from_mapping(
+                data.get("call_id"), f"{where}.call_id"
             ),
             cursor=_uint(data.get("cursor"), f"{where}.cursor"),
             max_units=_uint(data.get("max_units"), f"{where}.max_units"),
@@ -760,7 +756,7 @@ class DecodeRange:
         """Serialize a media reconstruction params for lane execution."""
         return {
             "request_key": self.request_key.to_mapping(),
-            "op_id": self.op_id.to_mapping(),
+            "call_id": self.call_id.to_mapping(),
             "cursor": self.cursor,
             "max_units": self.max_units,
         }
@@ -816,13 +812,13 @@ class BufferAllocation:
 
 
 def _validate_buffer_allocations(
-    operations: Sequence[operation.ScheduledRequest],
+    calls: Sequence[call.Call],
     parameters: Sequence[BufferAllocation],
     where: str,
 ) -> None:
     """Validate persistent-buffer parameters.
 
-    Validation checks producing operations and shape bounds.
+    Validation checks producing calls and shape bounds.
     """
     by_id: dict[identity.BufferId, BufferAllocation] = {}
     spans: list[tuple[int, int]] = []
@@ -838,12 +834,12 @@ def _validate_buffer_allocations(
     if any(left[1] > right[0] for left, right in zip(spans, spans[1:])):
         raise invalid_descriptor(f"{where} buffer parameters overlap")
 
-    for scheduled in operations:
+    for scheduled in calls:
         for output in scheduled.buffer_outputs():
             output_allocation = by_id.get(output.buffer_id)
             if output_allocation is None:
                 raise invalid_descriptor(
-                    "persistent operation output has no buffer params"
+                    "persistent call output has no buffer params"
                 )
             if output_allocation.bytes < output.max_bytes:
                 raise invalid_descriptor(
@@ -860,13 +856,13 @@ class Batch:
     # Monotonic sequence number ordering collective communication across
     # workers.
     collective_seq: int = 1
-    operations: tuple[operation.ScheduledRequest, ...] = ()
+    calls: tuple[call.Call, ...] = ()
     block_tables: tuple[BlockTable, ...] = ()
     new_cache_pages: tuple[CachePageAllocation, ...] = ()
 
     # Columnar model-forward inputs: one row per forward, all columns the same
     # length. seq_lens counts total tokens per row, query_lens the new tokens.
-    forward_operation_indices: tuple[int, ...] = ()
+    forward_call_indices: tuple[int, ...] = ()
     request_pool_indices: tuple[int, ...] = ()
     seq_lens: tuple[int, ...] = ()
     query_lens: tuple[int, ...] = ()
@@ -880,7 +876,7 @@ class Batch:
     kv_inputs: tuple[transfer.KvTransfer, ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate batch identity and lifecycle-operation consistency."""
+        """Validate batch identity and lifecycle-call consistency."""
         self.validate()
 
     @property
@@ -896,30 +892,29 @@ class Batch:
         )
 
     def validate(self) -> None:
-        """Enforce batch identity, command ordering, and operation counts.
+        """Enforce batch identity, command ordering, and call counts.
 
         Also enforces token bounds.
         """
-        if not self.operations and not self.commands:
+        if not self.calls and not self.commands:
             raise invalid_descriptor(
-                "a submission batch must carry at least one operation or "
-                "command"
+                "a submission batch must carry at least one call or command"
             )
         if self.collective_seq < 1:
             raise invalid_descriptor(
                 "batch collective sequence must be positive"
             )
         _validate_forward_inputs(
-            len(self.operations),
-            self.forward_operation_indices,
+            len(self.calls),
+            self.forward_call_indices,
             self.request_pool_indices,
             self.seq_lens,
             self.query_lens,
             self.write_kv,
         )
         # Every computation belongs to this logical batch, with unique
-        # computation identities and at most one operation per request.
-        computation_ids = [operation.op_id for operation in self.operations]
+        # computation identities and at most one call per request.
+        computation_ids = [call.call_id for call in self.calls]
         if any(
             identity.batch_id != self.batch_id for identity in computation_ids
         ):
@@ -930,20 +925,18 @@ class Batch:
             raise invalid_descriptor(
                 "a submission batch repeats a computation identity"
             )
-        request_keys = [operation.request_key for operation in self.operations]
+        request_keys = [call.request_key for call in self.calls]
         if len(set(request_keys)) != len(request_keys):
             raise invalid_descriptor(
-                "a submission batch carries multiple operations for one request"
+                "a submission batch carries multiple calls for one request"
             )
         # A batch is one numerical call on one component: every call in it
         # performs the same computation through the same entry, so the rank
         # executes it as a single homogeneous group and returns one result.
-        calls = {
-            (operation.kind, operation.entry) for operation in self.operations
-        }
+        calls = {(call.kind, call.entry) for call in self.calls}
         if len(calls) > 1:
             raise invalid_descriptor(
-                "a submission batch mixes computations or entries"
+                "a submission batch mixes call kinds or entries"
             )
         admitted = [admission.request_key for admission in self.admissions]
         if len(set(admitted)) != len(admitted):
@@ -971,12 +964,12 @@ class Batch:
                 )
             identities[command_key] = command
 
-        # Every input product payload must feed a declared operation input or
+        # Every input product payload must feed a declared call input or
         # predicate, exactly once.
         declared_inputs = {
             product
-            for operation in self.operations
-            for product in (*operation.tensor_inputs(), operation.predicate)
+            for call in self.calls
+            for product in (*call.tensor_inputs(), call.predicate)
             if product is not None
         }
         supplied_inputs: set[tensor.TensorRef] = set()
@@ -984,7 +977,7 @@ class Batch:
             product = payload.product
             if product not in declared_inputs:
                 raise invalid_descriptor(
-                    "an input product payload is not declared by any operation"
+                    "an input product payload is not declared by any call"
                 )
             if product in supplied_inputs:
                 raise invalid_descriptor(
@@ -992,8 +985,8 @@ class Batch:
                 )
             supplied_inputs.add(product)
 
-        # Each KV transfer installs into exactly one operation and must fit
-        # that operation's transfer-byte bound.
+        # Each KV transfer installs into exactly one call and must fit
+        # that call's transfer-byte bound.
         sources: set[identity.BufferId] = set()
         for publication in self.kv_inputs:
             publication.encoded_size_bound()
@@ -1001,13 +994,13 @@ class Batch:
                 raise invalid_descriptor("batch repeats a KV input")
             sources.add(publication.source)
             consumers = tuple(
-                operation
-                for operation in self.operations
-                if operation.kv_input == publication.source
+                call
+                for call in self.calls
+                if call.kv_input == publication.source
             )
             if (
                 len(consumers) != 1
-                or consumers[0].kind is not operation.TransferMode.KV_INSTALL
+                or consumers[0].kind is not call.TransferMode.KV_INSTALL
             ):
                 raise invalid_descriptor(
                     "KV transfer requires one installation consumer"
@@ -1020,7 +1013,7 @@ class Batch:
                     "KV input exceeds its installation transfer-byte bound"
                 )
         _validate_buffer_allocations(
-            self.operations, self.buffer_allocations, "batch"
+            self.calls, self.buffer_allocations, "batch"
         )
 
     @classmethod
@@ -1032,12 +1025,10 @@ class Batch:
         data = _map(value, "execute batch")
         batch_id = _uint(data.get("batch_id"), "execute batch.batch_id")
 
-        operations = tuple(
-            operation.ScheduledRequest.from_mapping(
-                item, f"execute batch.operations[{index}]"
-            )
+        calls = tuple(
+            call.Call.from_mapping(item, f"execute batch.calls[{index}]")
             for index, item in enumerate(
-                _seq(data.get("operations", ()), "execute batch.operations")
+                _seq(data.get("calls", ()), "execute batch.calls")
             )
         )
         commands = tuple(
@@ -1066,7 +1057,7 @@ class Batch:
             collective_seq=_uint(
                 data.get("collective_seq"), "execute batch.collective_seq"
             ),
-            operations=operations,
+            calls=calls,
             block_tables=tuple(
                 BlockTable.from_mapping(
                     item, f"execute batch.block_tables[{index}]"
@@ -1089,9 +1080,9 @@ class Batch:
                     )
                 )
             ),
-            forward_operation_indices=_uints(
-                data.get("forward_operation_indices", ()),
-                "forward inputs.forward_operation_indices",
+            forward_call_indices=_uints(
+                data.get("forward_call_indices", ()),
+                "forward inputs.forward_call_indices",
             ),
             request_pool_indices=_uints(
                 data.get("request_pool_indices", ()),
@@ -1158,12 +1149,12 @@ class Batch:
         return {
             "batch_id": self.batch_id,
             "collective_seq": self.collective_seq,
-            "operations": [value.to_mapping() for value in self.operations],
+            "calls": [value.to_mapping() for value in self.calls],
             "block_tables": [value.to_mapping() for value in self.block_tables],
             "new_cache_pages": [
                 value.to_mapping() for value in self.new_cache_pages
             ],
-            "forward_operation_indices": list(self.forward_operation_indices),
+            "forward_call_indices": list(self.forward_call_indices),
             "request_pool_indices": list(self.request_pool_indices),
             "seq_lens": list(self.seq_lens),
             "query_lens": list(self.query_lens),

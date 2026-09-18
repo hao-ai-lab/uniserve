@@ -7,7 +7,7 @@ use uniserve_worker_ipc::PipelineStage;
 pub(super) enum InflightInput {
     Generation {
         /// Physical KV start and exact token contribution, when known, from the
-        /// submitted image-extension input. The operation carries its capacity.
+        /// submitted image-extension input. The call carries its capacity.
         image_kv: Option<(u32, Option<u32>)>,
         /// Actual latent input step; cancellation can stop accepted progress
         /// while later submitted intervals still need result validation.
@@ -19,14 +19,14 @@ pub(super) enum InflightInput {
     },
 }
 
-/// Submitted operation and timing state awaiting completion.
+/// Submitted call and timing state awaiting completion.
 pub(super) struct InflightOp {
-    pub(super) operation: ScheduledRequest,
+    pub(super) call: Call,
     pub(super) input: InflightInput,
     pub(super) started: Instant,
 }
 
-/// Completion held until earlier request operations are applied.
+/// Completion held until earlier request calls are applied.
 pub(super) struct PendingCompletion {
     pub(super) record: uniserve_worker_ipc::RequestOutput,
     /// Claimed media storage stays alive while its result waits or is discarded.
@@ -34,7 +34,7 @@ pub(super) struct PendingCompletion {
     pub(super) arrival_seq: u64,
 }
 
-/// Terminal event held until outstanding operations are reconciled.
+/// Terminal event held until outstanding calls are reconciled.
 pub(super) struct PendingFinish {
     pub(super) reason: FinishReason,
     pub(super) stop_reason: Option<uniserve_core::StopReason>,
@@ -44,7 +44,7 @@ pub(super) struct PendingFinish {
 /// Partial results consume identities without releasing the batch's queue credit.
 pub(super) struct PendingBatch {
     pub(super) started: Instant,
-    pub(super) operations: HashSet<(RequestKey, ComputationId)>,
+    pub(super) calls: HashSet<(RequestKey, CallId)>,
     pub(super) commands: Vec<BatchCommand>,
     pub(super) worker_exec_us: u64,
     pub(super) prefill: bool,
@@ -64,68 +64,68 @@ impl Scheduler {
         arrival
     }
 
-    /// Whether the request still owns a submitted operation.
-    pub(super) fn has_pending_operations(&self, id: RequestId) -> bool {
-        self.pending_operations
+    /// Whether the request still owns a submitted call.
+    pub(super) fn has_pending_calls(&self, id: RequestId) -> bool {
+        self.pending_calls
             .get(&id)
             .is_some_and(|queue| !queue.is_empty())
     }
 
-    /// Number of submitted operations still owned by the request.
-    pub(super) fn num_pending_operations(&self, id: RequestId) -> usize {
-        self.pending_operations.get(&id).map_or(0, VecDeque::len)
+    /// Number of submitted calls still owned by the request.
+    pub(super) fn num_pending_calls(&self, id: RequestId) -> usize {
+        self.pending_calls.get(&id).map_or(0, VecDeque::len)
     }
 
-    /// Returns whether any in-flight operation performs denoising.
+    /// Returns whether any in-flight call performs denoising.
     pub(super) fn has_pending_denoising(&self) -> bool {
-        self.pending_operations
+        self.pending_calls
             .values()
             .flatten()
-            .any(|op| op.operation.code == Computation::Pipeline(PipelineStage::Denoising))
+            .any(|op| op.call.code == CallKind::Pipeline(PipelineStage::Denoising))
     }
 
-    /// Stateful operations retain request order. Pure media branches complete
+    /// Stateful calls retain request order. Pure media branches complete
     /// independently once their actual input producers have resolved.
     pub(super) fn take_ready_completions(&mut self) -> Vec<PendingCompletion> {
         let mut ready = Vec::new();
         for (id, pending) in &self.pending_completions {
-            let Some(queue) = self.pending_operations.get(id) else {
+            let Some(queue) = self.pending_calls.get(id) else {
                 continue;
             };
             for (index, inflight) in queue.iter().enumerate() {
-                let operation = &inflight.operation;
+                let call = &inflight.call;
                 let independent = matches!(inflight.input, InflightInput::Media { .. })
-                    && !operation.advances_state();
+                    && !call.advances_state();
                 if index > 0 && !independent {
                     continue;
                 }
                 if independent
-                    && operation.tensor_inputs().any(|input| {
+                    && call.tensor_inputs().any(|input| {
                         queue
                             .iter()
-                            .any(|producer| producer.operation.op_id == input.producer_op_id)
+                            .any(|producer| producer.call.call_id == input.producer_call_id)
                     })
                 {
                     continue;
                 }
-                if let Some(completion) = pending.get(&operation.op_id) {
+                if let Some(completion) = pending.get(&call.call_id) {
                     ready.push((
-                        completion_priority(operation.code),
+                        completion_priority(call.code),
                         completion.arrival_seq,
                         *id,
-                        operation.op_id,
+                        call.call_id,
                     ));
                 }
             }
         }
         ready.sort_unstable_by_key(|(priority, arrival, ..)| (*priority, *arrival));
         let mut completions = Vec::with_capacity(ready.len());
-        for (_, _, id, op_id) in ready {
+        for (_, _, id, call_id) in ready {
             let pending = self
                 .pending_completions
                 .get_mut(&id)
                 .expect("selected completion exists");
-            completions.push(pending.remove(&op_id).expect("selected operation exists"));
+            completions.push(pending.remove(&call_id).expect("selected call exists"));
             if pending.is_empty() {
                 self.pending_completions.remove(&id);
             }
@@ -133,62 +133,62 @@ impl Scheduler {
         completions
     }
 
-    /// Removes a selected operation and releases its transfer reservation.
-    pub(super) fn pop_pending_operation(
+    /// Removes a selected call and releases its transfer reservation.
+    pub(super) fn pop_pending_call(
         &mut self,
         request_key: RequestKey,
-        op_id: ComputationId,
+        call_id: CallId,
     ) -> Option<InflightOp> {
         let id = request_key.request_id;
-        let queue = self.pending_operations.get_mut(&id)?;
+        let queue = self.pending_calls.get_mut(&id)?;
         let index = queue.iter().position(|inflight| {
-            inflight.operation.request_key == request_key && inflight.operation.op_id == op_id
+            inflight.call.request_key == request_key && inflight.call.call_id == call_id
         })?;
         let selected = &queue[index];
-        if op_id.batch_id == 0
+        if call_id.batch_id == 0
             || (index > 0
                 && !(matches!(selected.input, InflightInput::Media { .. })
-                    && !selected.operation.advances_state()))
+                    && !selected.call.advances_state()))
         {
             return None;
         }
-        let inflight = queue.remove(index).expect("selected operation exists");
-        if inflight.operation.bounds.max_transfer_bytes > 0 {
+        let inflight = queue.remove(index).expect("selected call exists");
+        if inflight.call.bounds.max_transfer_bytes > 0 {
             self.num_pending_transfers = self
                 .num_pending_transfers
                 .checked_sub(1)
                 .expect("completed transfer owns a reservation");
         }
         if queue.is_empty() {
-            self.pending_operations.remove(&id);
+            self.pending_calls.remove(&id);
         }
         Some(inflight)
     }
 
-    /// Removes failed operations from the in-flight registry.
-    pub(super) fn retire_operation(
+    /// Removes failed calls from the in-flight registry.
+    pub(super) fn retire_call(
         &mut self,
         batch_id: u64,
         request: RequestKey,
-        op: ComputationId,
+        op: CallId,
     ) -> Option<InflightOp> {
         if !self
             .pending_batches
             .get_mut(&batch_id)?
-            .operations
+            .calls
             .remove(&(request, op))
         {
             return None;
         }
-        let queue = self.pending_operations.get_mut(&request.request_id)?;
+        let queue = self.pending_calls.get_mut(&request.request_id)?;
         let position = queue.iter().position(|inflight| {
-            inflight.operation.request_key == request && inflight.operation.op_id == op
+            inflight.call.request_key == request && inflight.call.call_id == op
         })?;
         let inflight = queue.remove(position)?;
         if queue.is_empty() {
-            self.pending_operations.remove(&request.request_id);
+            self.pending_calls.remove(&request.request_id);
         }
-        if inflight.operation.bounds.max_transfer_bytes > 0 {
+        if inflight.call.bounds.max_transfer_bytes > 0 {
             self.num_pending_transfers = self
                 .num_pending_transfers
                 .checked_sub(1)
@@ -197,15 +197,15 @@ impl Scheduler {
         Some(inflight)
     }
 
-    /// Removes failed operations from the in-flight registry.
-    pub(super) fn clear_failed_operations(&mut self) -> (Vec<RequestId>, Vec<BatchCommand>) {
-        let ids = self.pending_operations.keys().copied().collect();
+    /// Removes failed calls from the in-flight registry.
+    pub(super) fn clear_failed_calls(&mut self) -> (Vec<RequestId>, Vec<BatchCommand>) {
+        let ids = self.pending_calls.keys().copied().collect();
         let commands = self
             .pending_batches
             .drain()
             .flat_map(|(_, batch)| batch.commands)
             .collect();
-        self.pending_operations.clear();
+        self.pending_calls.clear();
         self.num_pending_transfers = 0;
         self.pending_completions.clear();
         (ids, commands)

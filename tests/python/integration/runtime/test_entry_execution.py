@@ -27,15 +27,15 @@ from uniserve_worker.protocol.batch import (
     Start,
     TensorPublication,
 )
-from uniserve_worker.protocol.identity import ComputationId, RequestKey
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
     Bounds,
+    Call,
     CallCoordinates,
-    OpStatus,
+    CallStatus,
     PipelineStage,
-    ScheduledRequest,
     TransferMode,
 )
+from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.tensor import (
     DeviceDim,
     DType,
@@ -99,7 +99,7 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
     )
     try:
         interval = DecodeRange(
-            RequestKey(1, 0, 0), ComputationId(1, 0), cursor=2, max_units=units
+            RequestKey(1, 0, 0), CallId(1, 0), cursor=2, max_units=units
         )
         result = runner.output_layout(
             "reconstruction", 0, SimpleNamespace(num_frames=50), interval, 1
@@ -230,7 +230,7 @@ def test_conditioning_executes_only_on_its_declared_pipeline_stage(rank):
         pytest.param("green", marks=pytest.mark.gpu),
     ),
 )
-def test_text_encoder_operation_publishes_consumable_conditioning(
+def test_text_encoder_call_publishes_consumable_conditioning(
     separate_start, execution_device
 ):
     device = "cpu" if execution_device == "cpu" else "cuda:0"
@@ -259,15 +259,15 @@ def test_text_encoder_operation_publishes_consumable_conditioning(
     prompt = (3, 8, 1)
     reference = TensorRef(
         key,
-        ComputationId(1, 0),
+        CallId(1, 0),
         0,
         1,
         DType.F32,
         ShapeBound((StaticDim(3), StaticDim(4))),
     )
-    operation = ScheduledRequest(
+    call = Call(
         request_key=key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=None,
         coordinates=CallCoordinates(),
         kind=PipelineStage.TEXT_ENCODING,
@@ -277,7 +277,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(
     )
     run = Batch(
         batch_id=1,
-        operations=(operation,),
+        calls=(call,),
         commands=(
             Start(
                 NewRequest(
@@ -304,8 +304,8 @@ def test_text_encoder_operation_publishes_consumable_conditioning(
             run = replace(run, commands=())
         report = finalized_report(worker, worker.submit(run))
         (completion,) = report.completions
-        assert completion.status is OpStatus.OK
-        assert completion.op_id == operation.op_id
+        assert completion.status is CallStatus.OK
+        assert completion.call_id == call.call_id
         (product,) = report.products
         assert product.product == reference
 
@@ -333,10 +333,10 @@ def test_text_encoder_operation_publishes_consumable_conditioning(
         )
         from dataclasses import replace
 
-        copied = replace(reference, producer_op_id=ComputationId(2, 0))
-        consumer = ScheduledRequest(
+        copied = replace(reference, producer_call_id=CallId(2, 0))
+        consumer = Call(
             request_key=key,
-            op_id=ComputationId(2, 0),
+            call_id=CallId(2, 0),
             predecessor=None,
             coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
@@ -349,7 +349,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(
             Batch(
                 batch_id=2,
                 collective_seq=3,
-                operations=(consumer,),
+                calls=(consumer,),
                 input_products=(TensorPublication(reference, product.value),),
                 buffer_allocations=(
                     BufferAllocation(
@@ -364,7 +364,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(
         assert ready.wait(5)
         prepared = finalized_report(worker, prepared)
         result = prepared
-        assert result.completions[0].status is OpStatus.OK
+        assert result.completions[0].status is CallStatus.OK
         copied_value = result.products[0].value.tensor
         tickets = fetch_tensor(
             copied_value,
@@ -464,13 +464,13 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
         components=components,
         bindings=_encoder_bindings(model, components),
     ) as worker:
-        key, op = RequestKey(1, 1, 1), ComputationId(1, 0)
+        key, op = RequestKey(1, 1, 1), CallId(1, 0)
         output = TensorRef(
             key, op, 0, 1, dtype, ShapeBound((StaticDim(rows), StaticDim(4)))
         )
-        operation = ScheduledRequest(
+        call = Call(
             request_key=key,
-            op_id=op,
+            call_id=op,
             predecessor=None,
             coordinates=CallCoordinates(),
             kind=PipelineStage.TEXT_ENCODING,
@@ -486,12 +486,12 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
         )
         run = Batch(
             batch_id=1,
-            operations=(operation,),
+            calls=(call,),
             commands=(Start(admission),),
             buffer_allocations=(
                 BufferAllocation(output.buffer_id, 0, output.max_bytes),
             ),
         )
         result = finalized_report(worker, worker.submit(run))
-        assert result.completions[0].status is OpStatus.ERROR
+        assert result.completions[0].status is CallStatus.ERROR
         assert not result.products

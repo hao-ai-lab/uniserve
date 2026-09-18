@@ -1,8 +1,8 @@
 //! Versioned scheduler-to-worker protocol and shared-memory transport.
 //!
-//! [`NewRequest`] admits static state, [`Batch`] submits planned operations, and
+//! [`NewRequest`] admits static state, [`Batch`] submits planned calls, and
 //! [`BatchOutput`] returns completions and products. [`WorkerInfo`] describes a
-//! loaded worker before execution begins. Numeric request, operation, point,
+//! loaded worker before execution begins. Numeric request, call, point,
 //! and generation identities remain stable across serialization.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use uniserve_core::{
     BlockId, ImageParams, KvCacheDtype, KvCacheGroup, RequestId, SamplingParams, TokenLogprob,
 };
-pub use uniserve_core::{ComputationId, ForwardStats};
+pub use uniserve_core::{CallId, ForwardStats};
 
 /// Result type for semantic worker-message validation.
 pub type ValidationResult<T> = std::result::Result<T, ValidationError>;
@@ -82,12 +82,12 @@ pub use iceoryx::{
 };
 
 mod info;
-mod operation;
+mod call;
 mod request;
 mod tensor;
 
 pub use info::*;
-pub use operation::*;
+pub use call::*;
 pub use request::*;
 pub use tensor::*;
 #[cfg(test)]

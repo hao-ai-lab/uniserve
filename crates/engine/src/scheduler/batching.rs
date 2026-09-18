@@ -1,7 +1,7 @@
-//! Batch selection, operation planning, and physical params assembly.
+//! Batch selection, call planning, and physical params assembly.
 //!
 //! Each pass selects a compatible execution lane, applies sequence and token
-//! budgets, and emits at most one planned operation per eligible request.
+//! budgets, and emits at most one planned call per eligible request.
 
 use super::*;
 use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
@@ -14,7 +14,7 @@ fn decode_capacity_target(pos: usize, spec_len: usize) -> usize {
 impl Scheduler {
     /// Assembles one scheduling-step batch in priority order.
     ///
-    /// Each request contributes at most one operation, prefill chunks consume only
+    /// Each request contributes at most one call, prefill chunks consume only
     /// the remaining token budget, and first dispatch carries typed admission.
     pub(super) fn assemble(&mut self) -> Vec<ExecutionBatch> {
         let ids = self.assembly_order();
@@ -29,34 +29,34 @@ impl Scheduler {
     }
 
     /// Charges actual token work, including each denoising step and CFG branch.
-    fn computation_token_cost(&self, operation: &ScheduledRequest) -> usize {
-        match operation.code {
-            Computation::Pipeline(PipelineStage::Denoising) => {
-                let Some(state) = self.running.get(&operation.request_key.request_id) else {
+    fn computation_token_cost(&self, call: &Call) -> usize {
+        match call.code {
+            CallKind::Pipeline(PipelineStage::Denoising) => {
+                let Some(state) = self.running.get(&call.request_key.request_id) else {
                     return 0;
                 };
                 usize::try_from(self.worker_image_latent_units_for(state).max(1))
                     .unwrap_or(usize::MAX)
                     .saturating_mul(usize::from(state.req.image.cfg_branch_count().max(1)))
-                    .saturating_mul(operation.bounds.max_tokens.max(1) as usize)
+                    .saturating_mul(call.bounds.max_tokens.max(1) as usize)
             }
-            Computation::Forward(ForwardMode::Verify) => 1 + operation.input_token_ids.len(),
-            _ => operation.bounds.max_tokens as usize,
+            CallKind::Forward(ForwardMode::Verify) => 1 + call.input_token_ids.len(),
+            _ => call.bounds.max_tokens as usize,
         }
     }
 
     /// Reserves persistent buffers, latent pages, and transfer capacity for one computation.
     fn reserve_generation_resources(
         &mut self,
-        operation: &ScheduledRequest,
+        call: &Call,
     ) -> Option<Vec<Allocation>> {
-        let id = operation.request_key.request_id;
-        if operation.code == Computation::Pipeline(PipelineStage::Denoising)
+        let id = call.request_key.request_id;
+        if call.code == CallKind::Pipeline(PipelineStage::Denoising)
             && !self.ensure_flow_prefix(id)
         {
             return None;
         }
-        let uses_transfer = operation.bounds.max_transfer_bytes > 0;
+        let uses_transfer = call.bounds.max_transfer_bytes > 0;
         if uses_transfer && self.num_pending_transfers >= self.transfer_capacity {
             return None;
         }
@@ -67,11 +67,11 @@ impl Scheduler {
         let Some(request_key) = request_key else {
             return None;
         };
-        if self.worker_target(request_key, operation.code).is_none() {
+        if self.worker_target(request_key, call.code).is_none() {
             return None;
         }
         let mut buffer_allocations = Vec::new();
-        for bytes in operation.buffer_outputs().map(TensorRef::max_bytes) {
+        for bytes in call.buffer_outputs().map(TensorRef::max_bytes) {
             let allocation = match self.buffer_pool.allocate(request_key, bytes, 256) {
                 Ok(allocation) => allocation,
                 Err(_) => {
@@ -87,9 +87,9 @@ impl Scheduler {
             buffer_allocations.push(allocation);
         }
         if matches!(
-            operation.code,
-            Computation::Pipeline(PipelineStage::LatentPreparation)
-                | Computation::Pipeline(PipelineStage::Denoising)
+            call.code,
+            CallKind::Pipeline(PipelineStage::LatentPreparation)
+                | CallKind::Pipeline(PipelineStage::Denoising)
         ) && self.worker_tracks_image_latent()
         {
             let latent_units = self
@@ -123,7 +123,7 @@ impl Scheduler {
         Some(buffer_allocations)
     }
 
-    /// Selects compatible computations within one lane's token and sequence budgets.
+    /// Selects compatible call kinds within one lane's token and sequence budgets.
     pub(super) fn assemble_batch(
         &mut self,
         ids: &[RequestId],
@@ -134,8 +134,8 @@ impl Scheduler {
         // entry a call binds to follows from its computation, so the two
         // together name one group. Computations keep the order in which their
         // first call was selected.
-        let mut code_order: Vec<Computation> = Vec::new();
-        let mut code_batches: HashMap<Computation, ExecutionBatch> = HashMap::new();
+        let mut code_order: Vec<CallKind> = Vec::new();
+        let mut code_batches: HashMap<CallKind, ExecutionBatch> = HashMap::new();
         let submit_at = Instant::now();
         // The per-step token budget is the binding limit; individual prefill
         // chunks are clipped to its remaining capacity.
@@ -170,20 +170,20 @@ impl Scheduler {
             if cancelled {
                 continue;
             }
-            let next_type = self.peek_next_operation_variant(id);
+            let next_type = self.peek_next_call_variant(id);
             // A decode pass may co-schedule text prefill rows. They are
-            // dispatched as their own batch, so the two computations remain
+            // dispatched as their own batch, so the two call kinds remain
             // separate numerical calls.
             let mut mixed_prefill = false;
-            if let (Some(target), Some(operation_variant)) = (lane, next_type)
+            if let (Some(target), Some(call_variant)) = (lane, next_type)
                 && {
-                    let candidate_lane = batch_kind(operation_variant);
+                    let candidate_lane = batch_kind(call_variant);
                     matches!(candidate_lane, BatchKind::Prefill | BatchKind::Decode)
                         && candidate_lane != target
                 }
             {
                 mixed_prefill = target == BatchKind::Decode
-                    && operation_variant == Computation::Forward(ForwardMode::Prefill)
+                    && call_variant == CallKind::Forward(ForwardMode::Prefill)
                     && mixed_left > 0
                     && self.running.get(&id).is_some_and(|st| {
                         st.is_replayable_text() && !st.req.sampling.prompt_logprobs_requested()
@@ -192,12 +192,12 @@ impl Scheduler {
                     continue;
                 }
             }
-            if next_type == Some(Computation::Pipeline(PipelineStage::Denoising))
+            if next_type == Some(CallKind::Pipeline(PipelineStage::Denoising))
                 && (denoise_occupies_decode_pipeline || !self.flow_prefix_is_schedulable(id))
             {
                 continue;
             }
-            // Build one operation when its exact resident resources fit.
+            // Build one call when its exact resident resources fit.
             let op_budget = if mixed_prefill {
                 budget.min(mixed_left)
             } else {
@@ -218,7 +218,7 @@ impl Scheduler {
                     }
                     tracing::debug!(
                         request_id = id.0,
-                        "operation registration is paused by physical resource pressure"
+                        "call registration is paused by physical resource pressure"
                     );
                     continue;
                 };
@@ -233,7 +233,7 @@ impl Scheduler {
                 }
                 let request_index = u32::try_from(code_batches[&code].requests.len())
                     .expect("selected request count fits the IPC index");
-                op.op_id = ComputationId::new(code_batches[&code].id, request_index);
+                op.call_id = CallId::new(code_batches[&code].id, request_index);
                 op.coordinates = self
                     .projected_coordinates(id)
                     .expect("scheduled request retains its running state");
@@ -264,7 +264,7 @@ impl Scheduler {
                     )
                     .expect("validated request produces a valid admission");
                     // Admission is the first request-state dependency.
-                    st.last_state_op_id = ComputationId::default();
+                    st.last_state_call_id = CallId::default();
                     st.latest_token = None;
                     code_batches
                         .get_mut(&code)
@@ -276,7 +276,7 @@ impl Scheduler {
                 let mut batch = code_batches
                     .remove(&code)
                     .expect("computation batch exists");
-                let prepared = self.prepare_generation_operation(
+                let prepared = self.prepare_generation_call(
                     op,
                     reserved_buffers,
                     admitted,
@@ -314,7 +314,7 @@ impl Scheduler {
             let requests = code_order
                 .iter()
                 .flat_map(|code| code_batches[code].requests.iter())
-                .map(|(operation, _)| operation.request_key.request_id)
+                .map(|(call, _)| call.request_key.request_id)
                 .collect::<HashSet<_>>();
             self.take_commands(|command| {
                 requests.contains(&command.request_key().request_id)
@@ -353,13 +353,13 @@ impl Scheduler {
             {
                 continue;
             }
-            let Some(operation_type) = self.peek_next_operation_variant(id) else {
+            let Some(call_type) = self.peek_next_call_variant(id) else {
                 continue;
             };
-            match batch_kind(operation_type) {
+            match batch_kind(call_type) {
                 BatchKind::Decode => {
                     if self.can_schedule_next(id) {
-                        if self.has_pending_operations(id) {
+                        if self.has_pending_calls(id) {
                             projected_decode_ready = true;
                         } else {
                             committed_decode_ready = true;
@@ -406,20 +406,20 @@ impl Scheduler {
 
     /// Returns the scheduling priority used during batch assembly.
     pub(super) fn assembly_priority(&self, id: RequestId) -> u8 {
-        match self.peek_next_operation_variant(id) {
+        match self.peek_next_call_variant(id) {
             Some(
-                Computation::Pipeline(PipelineStage::TextEncoding)
-                | Computation::Pipeline(PipelineStage::VisionEncoding)
-                | Computation::Pipeline(PipelineStage::LatentEncoding)
-                | Computation::Forward(ForwardMode::Prefill),
+                CallKind::Pipeline(PipelineStage::TextEncoding)
+                | CallKind::Pipeline(PipelineStage::VisionEncoding)
+                | CallKind::Pipeline(PipelineStage::LatentEncoding)
+                | CallKind::Forward(ForwardMode::Prefill),
             ) => 0,
             Some(
-                Computation::Forward(ForwardMode::Decode)
-                | Computation::Forward(ForwardMode::Verify)
-                | Computation::Pipeline(PipelineStage::ImageDecoding)
-                | Computation::Transfer(TransferMode::KvInstall),
+                CallKind::Forward(ForwardMode::Decode)
+                | CallKind::Forward(ForwardMode::Verify)
+                | CallKind::Pipeline(PipelineStage::ImageDecoding)
+                | CallKind::Transfer(TransferMode::KvInstall),
             ) => 1,
-            Some(Computation::Pipeline(
+            Some(CallKind::Pipeline(
                 PipelineStage::Denoising
                 | PipelineStage::VideoDecoding
                 | PipelineStage::AudioDecoding
@@ -428,16 +428,16 @@ impl Scheduler {
                 | PipelineStage::Muxing,
             )) => 2,
             Some(
-                Computation::Pipeline(PipelineStage::LatentPreparation)
-                | Computation::Transfer(TransferMode::Tensor)
-                | Computation::Transfer(TransferMode::KvPublish),
+                CallKind::Pipeline(PipelineStage::LatentPreparation)
+                | CallKind::Transfer(TransferMode::Tensor)
+                | CallKind::Transfer(TransferMode::KvPublish),
             )
             | None => 3,
         }
     }
 
-    /// Determines the next operation kind without mutating request or resource state.
-    pub(super) fn peek_next_operation_variant(&self, id: RequestId) -> Option<Computation> {
+    /// Determines the next call kind without mutating request or resource state.
+    pub(super) fn peek_next_call_variant(&self, id: RequestId) -> Option<CallKind> {
         let st = self.running.get(&id)?;
         if st.image_reservation_pending {
             return None;
@@ -455,26 +455,26 @@ impl Scheduler {
                 .is_some_and(|item| Some(item.position) == self.num_scheduled_prompt_tokens(id))
         {
             return st.pending_image_step().map(|step| match step {
-                ImageIngestStep::VaeEncode => Computation::Pipeline(PipelineStage::LatentEncoding),
-                ImageIngestStep::VitEncode => Computation::Pipeline(PipelineStage::VisionEncoding),
+                ImageIngestStep::VaeEncode => CallKind::Pipeline(PipelineStage::LatentEncoding),
+                ImageIngestStep::VitEncode => CallKind::Pipeline(PipelineStage::VisionEncoding),
             });
         }
         Some(match st.phase {
             Phase::Encode => match st.pending_image_step()? {
-                ImageIngestStep::VaeEncode => Computation::Pipeline(PipelineStage::LatentEncoding),
-                ImageIngestStep::VitEncode => Computation::Pipeline(PipelineStage::VisionEncoding),
+                ImageIngestStep::VaeEncode => CallKind::Pipeline(PipelineStage::LatentEncoding),
+                ImageIngestStep::VitEncode => CallKind::Pipeline(PipelineStage::VisionEncoding),
             },
-            Phase::IngestState => Computation::Forward(ForwardMode::Prefill),
-            Phase::Prefill => Computation::Forward(ForwardMode::Prefill),
-            Phase::DecodeUnd => Computation::Forward(ForwardMode::Decode),
-            Phase::CloseKv => Computation::Forward(ForwardMode::Prefill),
-            Phase::PublishKv => Computation::Transfer(TransferMode::KvPublish),
-            Phase::PrepareGen => Computation::Pipeline(PipelineStage::LatentPreparation),
+            Phase::IngestState => CallKind::Forward(ForwardMode::Prefill),
+            Phase::Prefill => CallKind::Forward(ForwardMode::Prefill),
+            Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
+            Phase::CloseKv => CallKind::Forward(ForwardMode::Prefill),
+            Phase::PublishKv => CallKind::Transfer(TransferMode::KvPublish),
+            Phase::PrepareGen => CallKind::Pipeline(PipelineStage::LatentPreparation),
             Phase::DenoiseGen if st.num_completed_denoise_steps >= st.req.image.steps => {
-                Computation::Pipeline(PipelineStage::ImageDecoding)
+                CallKind::Pipeline(PipelineStage::ImageDecoding)
             }
-            Phase::DenoiseGen => Computation::Pipeline(PipelineStage::Denoising),
-            Phase::CommitGen => Computation::Pipeline(PipelineStage::ImageDecoding),
+            Phase::DenoiseGen => CallKind::Pipeline(PipelineStage::Denoising),
+            Phase::CommitGen => CallKind::Pipeline(PipelineStage::ImageDecoding),
             Phase::FeedbackEncode => {
                 let feedback = &st.req.image_generation;
                 feedback.feedback_source.as_ref()?;
@@ -484,28 +484,28 @@ impl Scheduler {
                     .encoder
                 {
                     ImageIngestStep::VaeEncode => {
-                        Computation::Pipeline(PipelineStage::LatentEncoding)
+                        CallKind::Pipeline(PipelineStage::LatentEncoding)
                     }
                     ImageIngestStep::VitEncode => {
-                        Computation::Pipeline(PipelineStage::VisionEncoding)
+                        CallKind::Pipeline(PipelineStage::VisionEncoding)
                     }
                 }
             }
-            Phase::FeedbackState => Computation::Forward(ForwardMode::Prefill),
+            Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
         })
     }
 
     /// Registers one selected computation with its allocated physical inputs and outputs.
-    fn prepare_generation_operation(
+    fn prepare_generation_call(
         &mut self,
-        mut operation: ScheduledRequest,
+        mut call: Call,
         reserved_buffers: Vec<Allocation>,
         admitted: bool,
         planned_us: u64,
         submit_at: Instant,
         batch: &mut ExecutionBatch,
     ) -> Option<()> {
-        let request_id = operation.request_key.request_id;
+        let request_id = call.request_key.request_id;
 
         // Planning may queue successors speculatively, but registration still
         // requires the request epoch and exact resident predecessor.
@@ -516,13 +516,13 @@ impl Scheduler {
         }) else {
             tracing::error!(
                 request_id = request_id.0,
-                "planned operation lost its request"
+                "planned call lost its request"
             );
             self.fatal = true;
             return None;
         };
-        if self.has_pending_operations(request_id)
-            && !self.can_queue_successor(request_id, operation.code)
+        if self.has_pending_calls(request_id)
+            && !self.can_queue_successor(request_id, call.code)
         {
             tracing::error!(
                 request_id = request_id.0,
@@ -534,10 +534,10 @@ impl Scheduler {
 
         let request_key = RequestKey::new(self.engine_id, request_id, request_epoch);
         // A device successor consumes the token or completion tensor of
-        // either its in-flight predecessor or the latest resolved operation.
-        // The first operation and host-observed transitions use the latest
-        // accepted operation identity.
-        let projected_successor = self.has_pending_operations(request_id);
+        // either its in-flight predecessor or the latest resolved call.
+        // The first call and host-observed transitions use the latest
+        // accepted call identity.
+        let projected_successor = self.has_pending_calls(request_id);
         let reusable_device_token =
             if !projected_successor && self.can_reuse_resolved_token_product(request_id) {
                 latest_token
@@ -554,26 +554,26 @@ impl Scheduler {
                 return None;
             };
             let Some(predecessor) = self
-                .pending_operations
+                .pending_calls
                 .get(&request_id)
                 .and_then(|queue| queue.back())
-                .map(|op| &op.operation)
+                .map(|op| &op.call)
             else {
                 tracing::error!(
                     request_id = request_id.0,
-                    "projected successor lost its predecessor operation"
+                    "projected successor lost its predecessor call"
                 );
                 self.fatal = true;
                 return None;
             };
-            let predicate = if operation.code == Computation::Forward(ForwardMode::Decode) {
+            let predicate = if call.code == CallKind::Forward(ForwardMode::Decode) {
                 predecessor.token_output.clone()
             } else {
                 predecessor.completion_output.clone()
             };
             (parent, predicate)
         } else if let Some(parent) = reusable_device_token {
-            (parent.producer_op_id, Some(parent))
+            (parent.producer_call_id, Some(parent))
         } else {
             let Some(parent) = self.state_predecessor(request_id) else {
                 self.fatal = true;
@@ -582,46 +582,46 @@ impl Scheduler {
             (parent, None)
         };
 
-        operation.predicate = predicate;
+        call.predicate = predicate;
         // KV descriptors include complete tables only on admission or growth;
         // fresh-page lists identify storage the worker must initialize now.
         // Freeze physical inputs before registering this computation as pending.
         // Accepted progress may stop on cancellation while these inputs still drain.
         let (_, visible) = self.scheduled_token_lengths(request_id)?;
-        let kv_lengths = match operation.code {
-            Computation::Forward(ForwardMode::Prefill) => Some(KvLengths {
+        let kv_lengths = match call.code {
+            CallKind::Forward(ForwardMode::Prefill) => Some(KvLengths {
                 visible,
-                input: if is_prompt_extend(&operation) {
-                    operation.input_token_ids.len().min(u32::MAX as usize) as u32
-                } else if consumes_image_features(&operation) {
-                    operation.bounds.max_tokens
+                input: if is_prompt_extend(&call) {
+                    call.input_token_ids.len().min(u32::MAX as usize) as u32
+                } else if consumes_image_features(&call) {
+                    call.bounds.max_tokens
                 } else {
                     1
                 },
             }),
-            Computation::Forward(ForwardMode::Decode)
-            | Computation::Forward(ForwardMode::Verify) => Some(KvLengths { visible, input: 1 }),
-            Computation::Transfer(TransferMode::KvPublish)
-            | Computation::Pipeline(PipelineStage::LatentPreparation)
-            | Computation::Pipeline(PipelineStage::Denoising) => {
+            CallKind::Forward(ForwardMode::Decode)
+            | CallKind::Forward(ForwardMode::Verify) => Some(KvLengths { visible, input: 1 }),
+            CallKind::Transfer(TransferMode::KvPublish)
+            | CallKind::Pipeline(PipelineStage::LatentPreparation)
+            | CallKind::Pipeline(PipelineStage::Denoising) => {
                 Some(KvLengths { visible, input: 0 })
             }
             _ => None,
         };
-        let start_step = match operation.code {
-            Computation::Pipeline(PipelineStage::LatentPreparation) => Some(0),
-            Computation::Pipeline(PipelineStage::Denoising) => {
+        let start_step = match call.code {
+            CallKind::Pipeline(PipelineStage::LatentPreparation) => Some(0),
+            CallKind::Pipeline(PipelineStage::Denoising) => {
                 self.num_scheduled_denoise_steps(request_id).map(u32::from)
             }
-            Computation::Pipeline(PipelineStage::ImageDecoding) => self
+            CallKind::Pipeline(PipelineStage::ImageDecoding) => self
                 .running
                 .get(&request_id)
                 .map(|state| u32::from(state.req.image.steps)),
             _ => None,
         };
-        let num_image_kv_tokens = if consumes_image_features(&operation) {
+        let num_image_kv_tokens = if consumes_image_features(&call) {
             let state = self.running.get(&request_id)?;
-            let encoder = if is_feedback_computation(&operation) {
+            let encoder = if is_feedback_computation(&call) {
                 state
                     .req
                     .image_generation
@@ -639,10 +639,10 @@ impl Scheduler {
         } else {
             None
         };
-        let new_page_count = operation.bounds.max_kv_pages as usize;
-        let mut operation_block_tables = Vec::new();
-        let mut operation_new_cache_pages = Vec::new();
-        let mut operation_forward = ForwardBatch::default();
+        let new_page_count = call.bounds.max_kv_pages as usize;
+        let mut call_block_tables = Vec::new();
+        let mut call_new_cache_pages = Vec::new();
+        let mut call_forward = ForwardBatch::default();
         if let Some(lengths) = kv_lengths {
             let table_changed = admitted || new_page_count > 0;
             for group_id in 0..self.cache().block_pool.num_groups() {
@@ -658,7 +658,7 @@ impl Scheduler {
                     .map(|state| state.request_pool_idx())
                     .expect("registered request has a live slot");
                 if table_changed {
-                    operation_block_tables.push(IpcBlockTable {
+                    call_block_tables.push(IpcBlockTable {
                         request_pool_idx,
                         group_id: group_id as u32,
                         allocated_tokens: u32::try_from(
@@ -690,7 +690,7 @@ impl Scheduler {
                     Vec::new()
                 };
                 if !fresh_pages.is_empty() {
-                    operation_new_cache_pages.push(CachePageAllocation {
+                    call_new_cache_pages.push(CachePageAllocation {
                         request_pool_idx,
                         group_id: group_id as u32,
                         page_ids: fresh_pages,
@@ -698,7 +698,7 @@ impl Scheduler {
                 }
             }
             if lengths.input > 0 {
-                operation_forward.push(
+                call_forward.push(
                     0,
                     self.running
                         .get(&request_id)
@@ -711,8 +711,8 @@ impl Scheduler {
             }
         }
 
-        if let Err(error) = generation::register_operation(
-            &mut operation,
+        if let Err(error) = generation::register_call(
+            &mut call,
             request_key,
             parent,
             &mut self.next_product_generation,
@@ -732,7 +732,7 @@ impl Scheduler {
 
         // Persistent product buffers transfer ownership from the local
         // reservation into request state using the minted product identities.
-        let persistent_outputs = operation
+        let persistent_outputs = call
             .buffer_outputs()
             .map(TensorRef::buffer_id)
             .collect::<Vec<_>>();
@@ -742,13 +742,13 @@ impl Scheduler {
             }
             tracing::error!(
                 request_id = request_id.0,
-                "registered operation changed its persistent buffer set"
+                "registered call changed its persistent buffer set"
             );
             self.fatal = true;
-            self.fail_all_running("registered operation changed its persistent buffer set");
+            self.fail_all_running("registered call changed its persistent buffer set");
             return None;
         }
-        let mut operation_buffers = Vec::with_capacity(reserved_buffers.len());
+        let mut call_buffers = Vec::with_capacity(reserved_buffers.len());
         let Some(state) = self.running.get_mut(&request_id) else {
             for allocation in reserved_buffers {
                 self.free_allocation(allocation);
@@ -763,7 +763,7 @@ impl Scheduler {
             };
             let replaced = state.allocations_mut().buffers.insert(buffer, allocation);
             debug_assert!(replaced.is_none(), "buffer identity was reused");
-            operation_buffers.push(BufferAllocation {
+            call_buffers.push(BufferAllocation {
                 buffer,
                 offset,
                 bytes,
@@ -772,7 +772,7 @@ impl Scheduler {
 
         // Diffusion rows include the positive branch and any negative CFG
         // branch, each bound to its own request-state row.
-        if operation.code == Computation::Pipeline(PipelineStage::Denoising) {
+        if call.code == CallKind::Pipeline(PipelineStage::Denoising) {
             let conditioning_tokens = kv_lengths
                 .expect("denoising declares its conditioning KV range")
                 .visible;
@@ -798,7 +798,7 @@ impl Scheduler {
                     .unwrap_or_default();
                 if !prefix.diffusion_finalized || !prefix.new_pages.is_empty() {
                     for table in prefix.block_tables() {
-                        operation_block_tables.push(IpcBlockTable {
+                        call_block_tables.push(IpcBlockTable {
                             request_pool_idx: prefix.request_pool_idx(),
                             group_id: table.group_id() as u32,
                             page_ids: table.page_ids(),
@@ -808,7 +808,7 @@ impl Scheduler {
                 }
                 for (group_id, pages) in std::mem::take(&mut prefix.new_pages) {
                     if !pages.is_empty() {
-                        operation_new_cache_pages.push(CachePageAllocation {
+                        call_new_cache_pages.push(CachePageAllocation {
                             request_pool_idx: prefix.request_pool_idx(),
                             group_id,
                             page_ids: pages,
@@ -817,7 +817,7 @@ impl Scheduler {
                 }
                 let prefix_len = state.req.negative_prompt_token_ids.len() as u32;
                 if prefix_len > 0 && !prefix.diffusion_finalized {
-                    operation_forward.push(
+                    call_forward.push(
                         0,
                         prefix.request_pool_idx(),
                         prefix_len,
@@ -833,7 +833,7 @@ impl Scheduler {
                 } else {
                     alternative.unwrap_or((main_slot, conditioning_tokens))
                 };
-                operation_forward.push(
+                call_forward.push(
                     0,
                     request_pool_index,
                     seq_len + query_len,
@@ -846,12 +846,12 @@ impl Scheduler {
         let mut latent = None;
 
         // Latent allocations describe the request-owned page table and the
-        // exact denoising interval executed by this operation.
+        // exact denoising interval executed by this call.
         if matches!(
-            operation.code,
-            Computation::Pipeline(PipelineStage::LatentPreparation)
-                | Computation::Pipeline(PipelineStage::Denoising)
-        ) || operation.latent_input.is_some()
+            call.code,
+            CallKind::Pipeline(PipelineStage::LatentPreparation)
+                | CallKind::Pipeline(PipelineStage::Denoising)
+        ) || call.latent_input.is_some()
         {
             let Some(state) = self.running.get(&request_id) else {
                 self.fatal = true;
@@ -870,20 +870,20 @@ impl Scheduler {
             let Some(start_step) = start_step else {
                 tracing::error!(
                     request_id = request_id.0,
-                    operation = operation.code.as_str(),
-                    "latent operation has no submitted step"
+                    call = call.code.as_str(),
+                    "latent call has no submitted step"
                 );
                 self.fatal = true;
                 return None;
             };
-            let step_count = if operation.code == Computation::Pipeline(PipelineStage::Denoising) {
-                operation.bounds.max_tokens
+            let step_count = if call.code == CallKind::Pipeline(PipelineStage::Denoising) {
+                call.bounds.max_tokens
             } else {
                 0
             };
             latent = Some(LatentParams {
-                request_key: operation.request_key,
-                op_id: operation.op_id,
+                request_key: call.request_key,
+                call_id: call.call_id,
                 page_table,
                 latent_units: latent_units.min(u64::from(u32::MAX)) as u32,
                 height: state.req.image.height,
@@ -893,14 +893,14 @@ impl Scheduler {
             });
         }
 
-        let (worker, entry) = self.select_worker(&operation);
-        operation.entry = entry;
+        let (worker, entry) = self.select_worker(&call);
+        call.entry = entry;
 
         let submitted_us = uniserve_core::now_monotonic_us();
         self.register_inflight(
-            operation.clone(),
+            call.clone(),
             InflightInput::Generation {
-                image_kv: if consumes_image_features(&operation) {
+                image_kv: if consumes_image_features(&call) {
                     let lengths = kv_lengths.expect("image extension declares its KV input range");
                     Some((lengths.visible, num_image_kv_tokens))
                 } else {
@@ -912,15 +912,15 @@ impl Scheduler {
             submitted_us.saturating_sub(planned_us),
         );
         batch.requests.push((
-            operation,
+            call,
             RequestPlacement {
                 worker,
-                block_tables: operation_block_tables,
-                new_cache_pages: operation_new_cache_pages,
-                forward: operation_forward,
+                block_tables: call_block_tables,
+                new_cache_pages: call_new_cache_pages,
+                forward: call_forward,
                 latent,
                 decode: None,
-                buffers: operation_buffers,
+                buffers: call_buffers,
             },
         ));
         if let Some(st) = self.running.get_mut(&request_id) {
@@ -963,11 +963,11 @@ impl Scheduler {
             let trace_ops = batch
                 .requests
                 .iter()
-                .map(|(operation, placement)| {
+                .map(|(call, placement)| {
                     json!({
-                        "request_id": operation.request_key.request_id.0,
-                        "op_id": operation.op_id,
-                        "operation": operation_trace(operation),
+                        "request_id": call.request_key.request_id.0,
+                        "call_id": call.call_id,
+                        "call": call_trace(call),
                         "forward": placement.forward,
                         "latent": placement.latent,
                     })
@@ -978,7 +978,7 @@ impl Scheduler {
                 "at_s": now(),
                 "batch_id": batch.id,
                 "batch_size": batch.requests.len(),
-                "request_ids": batch.requests.iter().map(|(operation, _)| operation.request_key.request_id.0).collect::<Vec<_>>(),
+                "request_ids": batch.requests.iter().map(|(call, _)| call.request_key.request_id.0).collect::<Vec<_>>(),
                 "admitted_request_ids": batch.admissions().map(|request| request.request_key.request_id.0).collect::<Vec<_>>(),
                 "commands": batch.commands,
                 "ops": trace_ops,
@@ -1075,28 +1075,28 @@ impl Scheduler {
         build: impl FnOnce(
             &Self,
             &GenerationRequest,
-        ) -> Result<ScheduledRequest, generation::PlanningError>,
-    ) -> Option<ScheduledRequest> {
+        ) -> Result<Call, generation::PlanningError>,
+    ) -> Option<Call> {
         let planned = build(self, &self.running.get(&id)?.req);
         match planned {
-            Ok(mut operation) => {
+            Ok(mut call) => {
                 if matches!(
-                    operation.code,
-                    Computation::Forward(ForwardMode::Prefill)
-                        | Computation::Forward(ForwardMode::Decode)
-                        | Computation::Forward(ForwardMode::Verify)
+                    call.code,
+                    CallKind::Forward(ForwardMode::Prefill)
+                        | CallKind::Forward(ForwardMode::Decode)
+                        | CallKind::Forward(ForwardMode::Verify)
                 ) {
                     // The KV owner keeps page identities. The scheduled record
                     // only needs the number of fresh pages for dispatch and drain.
                     let state = self.running.get_mut(&id)?;
                     let allocated = state.block_tables()[0].len();
-                    operation.bounds.max_kv_pages = allocated
+                    call.bounds.max_kv_pages = allocated
                         .saturating_sub(state.num_kv_blocks_sent)
                         .min(u32::MAX as usize)
                         as u32;
                     state.num_kv_blocks_sent = allocated;
                 }
-                Some(operation)
+                Some(call)
             }
             Err(error) => {
                 tracing::error!(request_id = id.0, ?error, "generation planning failed");
@@ -1111,7 +1111,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         budget: usize,
-    ) -> Option<ScheduledRequest> {
+    ) -> Option<Call> {
         let (logical_position, kv_visible_len) = self.scheduled_token_lengths(id)?;
         let context_pending = self.running.get(&id).is_some_and(|st| {
             self.num_scheduled_prompt_tokens(id)
@@ -1150,12 +1150,12 @@ impl Scheduler {
                 })
             }
             Phase::DecodeUnd => {
-                let projected_successor = self.has_pending_operations(id);
+                let projected_successor = self.has_pending_calls(id);
                 // Stage minimum-token and force-finish constraints at the
                 // successor's scheduled token position. Device predicates
                 // prevent an inactive descendant from accepting that position.
                 let projected = if projected_successor {
-                    self.num_pending_operations(id)
+                    self.num_pending_calls(id)
                 } else {
                     0
                 };
@@ -1229,7 +1229,7 @@ impl Scheduler {
                 let denoise_step_count = self.denoise_step_burst.max(1).min(remaining);
                 let conditioning = self.kv_conditioning(id)?;
                 let latent = self
-                    .pending_output(id, |operation| operation.latent_output.as_ref())
+                    .pending_output(id, |call| call.latent_output.as_ref())
                     .or(self.running.get(&id)?.image_latent.as_ref())
                     .cloned()?;
                 self.plan_computation(id, |scheduler, request| {
@@ -1245,7 +1245,7 @@ impl Scheduler {
             }
             Phase::CommitGen => {
                 let latent = self
-                    .pending_output(id, |operation| operation.latent_output.as_ref())
+                    .pending_output(id, |call| call.latent_output.as_ref())
                     .or(self.running.get(&id)?.image_latent.as_ref())
                     .cloned()?;
                 self.plan_computation(id, |_scheduler, request| {
@@ -1261,7 +1261,7 @@ impl Scheduler {
                 let source = (feedback.feedback_source
                     == Some(uniserve_core::FeedbackSource::DeviceProduct))
                 .then(|| {
-                    self.pending_output(id, |operation| operation.image_output.as_ref())
+                    self.pending_output(id, |call| call.image_output.as_ref())
                         .or(st.feedback_source.as_ref())
                         .cloned()
                 })
@@ -1291,7 +1291,7 @@ impl Scheduler {
                 let logical_positions = feedback.num_feedback_positions;
                 let encoder_input = *feedback.feedback_encoders.get(step_index)?;
                 let feature = self
-                    .pending_output(id, |operation| operation.encoder_output.as_ref())
+                    .pending_output(id, |call| call.encoder_output.as_ref())
                     .or(st.feedback_features.as_ref())
                     .cloned();
                 let sample_continuation = is_final_step && feedback.sample_feedback_continuation;
@@ -1329,7 +1329,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         budget: usize,
-    ) -> Option<ScheduledRequest> {
+    ) -> Option<Call> {
         let cursor = self.num_scheduled_prompt_tokens(id)? as usize;
         let (_, kv_visible_len) = self.scheduled_token_lengths(id)?;
 

@@ -122,7 +122,7 @@ def test_native_attention_matches_declared_visibility(
                     native(q, k, v, batch, scale=0.125, out=actual)
                 graph.replay()
             # Compare the already committed cache so the reference invocation
-            # does not perform a second write for the same numerical operation.
+            # does not perform a second write for the same numerical call.
             reference_batch = (
                 replace(batch, write_indices=None)
                 if representation == "paged"

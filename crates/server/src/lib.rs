@@ -72,7 +72,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         queue_depth = config.engine.worker_process.queue_depth,
         "starting UniServe Rust engine"
     );
-    let max_batch_operations = u32::try_from(
+    let max_batch_calls = u32::try_from(
         config
             .engine
             .max_batch
@@ -85,7 +85,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let worker_process = WorkerProcessArgs {
         model: config.model.clone(),
         req_slot_cap: request_slot_capacity,
-        max_batch_operations,
+        max_batch_calls,
         max_batch_tokens,
         max_model_len: effective_max_model_len,
         max_video_seconds: config.engine.max_video_seconds,

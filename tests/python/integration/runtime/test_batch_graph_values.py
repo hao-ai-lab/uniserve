@@ -354,13 +354,13 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
     from uniserve_worker.execution.model_runner import ModelRunner
     from uniserve_worker.execution.rows import ForwardRow
     from uniserve_worker.execution.sampling import TokenSelection
-    from uniserve_worker.protocol.identity import ComputationId, RequestKey
-    from uniserve_worker.protocol.operation import (
+    from uniserve_worker.protocol.call import (
         Bounds,
+        Call,
         CallCoordinates,
         ForwardMode,
-        ScheduledRequest,
     )
+    from uniserve_worker.protocol.identity import CallId, RequestKey
 
     reference = _save_checkpoint(tmp_path)
     model = models.load_model(
@@ -373,7 +373,7 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
         model_dtype="bfloat16",
         block_size=16,
         max_request_pool_size=2,
-        max_batch_operations=2,
+        max_batch_calls=2,
         max_batch_tokens=32,
         max_sequence_tokens=32,
         prefill_cuda_graph=True,
@@ -397,7 +397,7 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
             kv_cache=manager,
             latent_pool=None,
             decode_predicates=predicates,
-            max_operations=2,
+            max_calls=2,
             request_slots=2,
             max_tokens=32,
             latent_capacity_units=0,
@@ -410,7 +410,7 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
         manager.block_tables.install(((1, 0, (4, 5), 32), (2, 0, (6, 7), 32)))
         sequences = ((3, 7, 2, 9), (2, 5, 8))
         for mode in (ForwardMode.PREFILL, ForwardMode.DECODE):
-            rows, operations = [], []
+            rows, calls = [], []
             for index, sequence in enumerate(sequences):
                 prefix = 0 if mode is ForwardMode.PREFILL else len(sequence) - 1
                 tokens = (
@@ -433,10 +433,10 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
                         decode_predicate_tagged=mode is ForwardMode.DECODE,
                     )
                 )
-                operations.append(
-                    ScheduledRequest(
+                calls.append(
+                    Call(
                         RequestKey(1, index, 0),
-                        ComputationId(1, index),
+                        CallId(1, index),
                         None,
                         CallCoordinates(),
                         mode,
@@ -445,7 +445,7 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
                 )
             result = runner.run_forward_group(
                 tuple(rows),
-                operations=tuple(operations),
+                calls=tuple(calls),
                 cache=manager,
                 tables=manager.block_tables,
                 states=None,
@@ -469,7 +469,7 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
 @torch.inference_mode()
 def test_loaded_worker_warmup_retires_its_request_resources(tmp_path):
     from uniserve.distributed import Communicator
-    from uniserve_worker.bootstrap.components import supported_operations
+    from uniserve_worker.bootstrap.components import supported_calls
     from uniserve_worker.worker import Worker
 
     _save_checkpoint(tmp_path)
@@ -481,7 +481,7 @@ def test_loaded_worker_warmup_retires_its_request_resources(tmp_path):
         block_size=16,
         kv_token_capacity=128,
         max_sequence_tokens=32,
-        max_batch_operations=2,
+        max_batch_calls=2,
         max_batch_tokens=32,
         max_request_pool_size=2,
         prefill_cuda_graph=True,
@@ -493,7 +493,7 @@ def test_loaded_worker_warmup_retires_its_request_resources(tmp_path):
         worker_config=config,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_work_variants=supported_operations(model),
+        allowed_work_variants=supported_calls(model),
         queue_depth=2,
         completion_payload_bytes=1 << 16,
     ) as worker:

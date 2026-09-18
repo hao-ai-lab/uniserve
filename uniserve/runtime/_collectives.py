@@ -185,7 +185,7 @@ class NcclCommunicator:
             self._pending = None
         return self._comm.value, self._stream.cuda_stream
 
-    def _start(self, operation, *args) -> _CollectiveWork:
+    def _start(self, call, *args) -> _CollectiveWork:
         """Launch on the transfer stream.
 
         Launch on the transfer stream after the computation stream's inputs.
@@ -193,7 +193,7 @@ class NcclCommunicator:
         self._transfer.wait_stream(self._stream)
         completed = torch.cuda.Event()
         try:
-            operation(*args)
+            call(*args)
         except BaseException:
             # Join the partial launch back so the computation stream never
             # overtakes a failed transfer's still-running kernel.

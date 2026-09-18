@@ -8,10 +8,10 @@ from typing import TypeAlias
 import torch
 
 from uniserve_worker.execution.sampling import TokenSelection
-from uniserve_worker.protocol.identity import ComputationId, RequestKey
-from uniserve_worker.protocol.operation import ForwardMode, PipelineStage
+from uniserve_worker.protocol.call import ForwardMode, PipelineStage
+from uniserve_worker.protocol.identity import CallId, RequestKey
 
-OperationIdentity: TypeAlias = tuple[RequestKey, ComputationId]
+CallIdentity: TypeAlias = tuple[RequestKey, CallId]
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,5 +63,5 @@ class ForwardRow:
 
 __all__ = [
     "ForwardRow",
-    "OperationIdentity",
+    "CallIdentity",
 ]

@@ -16,7 +16,7 @@ from uniserve.runtime import EventPool
 from uniserve.runtime.device import canonical_device
 from uniserve_worker.protocol.identity import (
     BufferId,
-    ComputationId,
+    CallId,
     RequestKey,
 )
 
@@ -92,8 +92,8 @@ def _invariant(message: str) -> WorkerError:
 
 
 # Logical product identity: (engine, request, epoch, producer op, output index).
-_ReferenceKey = tuple[int, int, int, ComputationId, int]
-_OperationKey = tuple[RequestKey, ComputationId]
+_ReferenceKey = tuple[int, int, int, CallId, int]
+_CallKey = tuple[RequestKey, CallId]
 _SlotStorageKey = tuple[str, tuple[int, ...], torch.dtype]
 
 
@@ -107,7 +107,7 @@ def _reference_key(reference: TensorRef) -> _ReferenceKey:
         int(key.engine_id),
         int(key.request_id),
         int(key.request_epoch),
-        reference.producer_op_id,
+        reference.producer_call_id,
         int(reference.output_index),
     )
 
@@ -145,7 +145,7 @@ class RelaySlot:
     tensor: torch.Tensor | None = None
     shape: tuple[int, ...] | None = None
     dtype: torch.dtype | None = None
-    relay_lane: tuple[str, int, RequestKey, ComputationId, int] | None = None
+    relay_lane: tuple[str, int, RequestKey, CallId, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,7 +233,7 @@ class TensorRead:
     """
 
     tensor: torch.Tensor
-    consumer_op_id: ComputationId | None
+    consumer_call_id: CallId | None
     _write: TensorRecord = field(repr=False, compare=False)
     region: tuple[slice, ...] | None = None
     metadata: ImageMetadata | FeatureMetadata | None = None
@@ -324,8 +324,8 @@ class TensorStore:
         self._relay_slots: dict[
             tuple[str, int, int], dict[tuple[torch.dtype, int], RelaySlot]
         ] = {}
-        self._relay_operation_lanes: dict[
-            tuple[str, int, RequestKey, ComputationId], int
+        self._relay_call_lanes: dict[
+            tuple[str, int, RequestKey, CallId], int
         ] = {}
 
         # Both reserved and committed products retain their logical identity
@@ -335,8 +335,8 @@ class TensorStore:
         self._products: dict[_ReferenceKey, TensorRecord] = {}
         self._writes: dict[int, TensorRecord] = {}
         self._imports: dict[_ReferenceKey, TensorImport] = {}
-        self._operation_writes: dict[
-            _OperationKey,
+        self._call_writes: dict[
+            _CallKey,
             TensorRecord | list[TensorRecord],
         ] = {}
         self.exports: dict[BufferId, ExportLocations] = {}
@@ -385,10 +385,10 @@ class TensorStore:
             self._imports.clear()
             self._products.clear()
             self._writes.clear()
-            self._operation_writes.clear()
+            self._call_writes.clear()
             self._relay_arenas.clear()
             self._relay_slots.clear()
-            self._relay_operation_lanes.clear()
+            self._relay_call_lanes.clear()
             self._allocated_bytes = 0
 
     @staticmethod
@@ -648,11 +648,9 @@ class TensorStore:
         if self.request_capacity < 1 or self.relay_depth < 1:
             raise resource_error("worker has no request-relay arena")
 
-        # Number each output within its (device, request slot, operation,
+        # Number each output within its (device, request slot, call,
         # dtype) field group before touching shared relay state.
-        fields: dict[
-            tuple[str, int, RequestKey, ComputationId, torch.dtype], int
-        ] = {}
+        fields: dict[tuple[str, int, RequestKey, CallId, torch.dtype], int] = {}
         requested_rows = []
         for reference, raw_device in bindings:
             device = canonical_device(raw_device)
@@ -662,7 +660,7 @@ class TensorStore:
                 str(device),
                 request_slot,
                 reference.request_key,
-                reference.producer_op_id,
+                reference.producer_call_id,
                 dtype,
             )
             field = fields.get(field_key, 0)
@@ -716,21 +714,19 @@ class TensorStore:
                         "request-relay output is already registered"
                     )
 
-            # Keep one operation on one lane: reuse its established lane, or
+            # Keep one call on one lane: reuse its established lane, or
             # take the first lane whose fields all have no bound owner.
-            operation_lanes: dict[
-                tuple[str, int, RequestKey, ComputationId], int
-            ] = {}
+            call_lanes: dict[tuple[str, int, RequestKey, CallId], int] = {}
             for reference, device, request_slot, _dtype, _field in requested:
-                operation = (
+                call = (
                     str(device),
                     request_slot,
                     reference.request_key,
-                    reference.producer_op_id,
+                    reference.producer_call_id,
                 )
-                lane = self._relay_operation_lanes.get(operation)
+                lane = self._relay_call_lanes.get(call)
                 if lane is None:
-                    lane = operation_lanes.get(operation)
+                    lane = call_lanes.get(call)
                 if lane is None:
                     lane = next(
                         (
@@ -746,30 +742,28 @@ class TensorStore:
                         raise resource_error(
                             "request-relay unresolved window is exhausted"
                         )
-                operation_lanes[operation] = lane
+                call_lanes[call] = lane
 
             writes: list[TensorRecord] = []
-            installed_operations: set[
-                tuple[str, int, RequestKey, ComputationId]
-            ] = set()
+            installed_calls: set[tuple[str, int, RequestKey, CallId]] = set()
             try:
                 for (reference, device, request_slot, dtype, field), key in zip(
                     requested, keys, strict=True
                 ):
-                    operation = (
+                    call = (
                         str(device),
                         request_slot,
                         reference.request_key,
-                        reference.producer_op_id,
+                        reference.producer_call_id,
                     )
-                    lane = operation_lanes[operation]
+                    lane = call_lanes[call]
                     slot = self._relay_slot_locked(
                         device,
                         request_slot,
                         lane,
                         dtype,
                         field,
-                        operation,
+                        call,
                     )
                     if slot.owner is not None:
                         raise _invariant(
@@ -794,16 +788,16 @@ class TensorStore:
                     slot.owner = write.binding_id
                     self._writes[write.binding_id] = write
                     self._products[key] = write
-                    self._relay_operation_lanes[operation] = lane
-                    installed_operations.add(operation)
+                    self._relay_call_lanes[call] = lane
+                    installed_calls.add(call)
                     writes.append(write)
             except BaseException:
                 for write in reversed(writes):
                     self._writes.pop(write.binding_id)
                     self._products.pop(_reference_key(write.reference))
                     self._release_storage_locked(write)
-                for operation in installed_operations:
-                    self._release_relay_operation_locked(operation)
+                for call in installed_calls:
+                    self._release_relay_call_locked(call)
                 raise
             return tuple(writes)
 
@@ -813,7 +807,7 @@ class TensorStore:
         request_slot: int,
         lane: int,
     ) -> bool:
-        """Return whether a request relay lane has no bound operation."""
+        """Return whether a request relay lane has no bound call."""
         fields = self._relay_slots.get((device_name, request_slot, lane))
         return fields is None or all(
             slot.owner is None for slot in fields.values()
@@ -826,7 +820,7 @@ class TensorStore:
         lane: int,
         dtype: torch.dtype,
         field: int,
-        operation: tuple[str, int, RequestKey, ComputationId],
+        call: tuple[str, int, RequestKey, CallId],
     ) -> RelaySlot:
         """Resolve or create one stable scalar relay slot inside.
 
@@ -869,26 +863,26 @@ class TensorStore:
             )
             fields[key] = slot
 
-        if slot.relay_lane is not None and slot.relay_lane[:4] != operation:
+        if slot.relay_lane is not None and slot.relay_lane[:4] != call:
             raise _invariant(
-                "request-relay slot retained a conflicting operation identity"
+                "request-relay slot retained a conflicting call identity"
             )
-        slot.relay_lane = (*operation, lane)
+        slot.relay_lane = (*call, lane)
         return slot
 
-    def _release_relay_operation_locked(
+    def _release_relay_call_locked(
         self,
-        operation: tuple[str, int, RequestKey, ComputationId],
+        call: tuple[str, int, RequestKey, CallId],
     ) -> None:
         """Release the stable relay-lane association for one completed.
 
-        operation.
+        call.
         """
-        lane = self._relay_operation_lanes.get(operation)
+        lane = self._relay_call_lanes.get(call)
         if lane is None:
             return
-        if self._relay_lane_free_locked(operation[0], operation[1], lane):
-            self._relay_operation_lanes.pop(operation, None)
+        if self._relay_lane_free_locked(call[0], call[1], lane):
+            self._relay_call_lanes.pop(call, None)
 
     def bind_output_groups(
         self,
@@ -1105,7 +1099,7 @@ class TensorStore:
             )
 
         source = flat.to(dtype=first.dtype)
-        # Keep the scalar batch in one native copy operation. CUDA can scatter
+        # Keep the scalar batch in one native copy call. CUDA can scatter
         # these independent destinations together; other device combinations
         # retain PyTorch's ordinary copy and non-blocking semantics.
         torch._foreach_copy_(
@@ -1186,19 +1180,19 @@ class TensorStore:
         self,
         reference: TensorRef,
         *,
-        consumer_op_id: ComputationId,
+        consumer_call_id: CallId,
         device: torch.device | str | None = None,
     ) -> TensorRead:
         """Acquire a generation-safe read of a published product on.
 
         the consumer device.
         """
-        return self.consume_batch(((reference, consumer_op_id, device),))[0]
+        return self.consume_batch(((reference, consumer_call_id, device),))[0]
 
     def consume_batch(
         self,
         requests: tuple[
-            tuple[TensorRef, ComputationId, torch.device | str | None],
+            tuple[TensorRef, CallId, torch.device | str | None],
             ...,
         ],
         *,
@@ -1215,9 +1209,9 @@ class TensorStore:
             target_name = str(shared_target)
             with self._lock:
                 shared_resolved: list[
-                    tuple[TensorRecord, torch.Tensor, ComputationId]
+                    tuple[TensorRecord, torch.Tensor, CallId]
                 ] = []
-                for reference, consumer_op_id, requested_device in requests:
+                for reference, consumer_call_id, requested_device in requests:
                     entry = self._require_locked(reference)
                     if entry.released:
                         raise invalid_descriptor(
@@ -1252,7 +1246,7 @@ class TensorStore:
                             entry.actual_shape
                         )
                     )
-                    shared_resolved.append((entry, tensor, consumer_op_id))
+                    shared_resolved.append((entry, tensor, consumer_call_id))
 
                 if shared_target.type == "cuda":
                     first_event = shared_resolved[0][0].producer_event
@@ -1279,7 +1273,11 @@ class TensorStore:
                         # one once.
                         shared_waited: set[int] = set()
                         stream = torch.cuda.current_stream(shared_target)
-                        for entry, _tensor, _consumer_op_id in shared_resolved:
+                        for (
+                            entry,
+                            _tensor,
+                            _consumer_call_id,
+                        ) in shared_resolved:
                             event = entry.producer_event
                             if event is None:
                                 raise _invariant(
@@ -1291,24 +1289,24 @@ class TensorStore:
                             stream.wait_event(event)
                             shared_waited.add(identity)
 
-                for entry, _tensor, _consumer_op_id in shared_resolved:
+                for entry, _tensor, _consumer_call_id in shared_resolved:
                     entry.readers += 1
                 return tuple(
                     TensorRead(
                         tensor=tensor,
-                        consumer_op_id=consumer_op_id,
+                        consumer_call_id=consumer_call_id,
                         _write=entry,
                         region=entry.region,
                         metadata=entry.metadata,
                     )
-                    for entry, tensor, consumer_op_id in shared_resolved
+                    for entry, tensor, consumer_call_id in shared_resolved
                 )
         assert shared_target is None
         with self._lock:
             resolved: list[
-                tuple[TensorRecord, torch.Tensor, torch.device, ComputationId]
+                tuple[TensorRecord, torch.Tensor, torch.device, CallId]
             ] = []
-            for reference, consumer_op_id, requested_device in requests:
+            for reference, consumer_call_id, requested_device in requests:
                 entry = self._require_locked(reference)
                 if entry.released:
                     raise invalid_descriptor(
@@ -1338,9 +1336,9 @@ class TensorStore:
                     raise invalid_descriptor(
                         "device product consumer names a different device"
                     )
-                resolved.append((entry, tensor, target, consumer_op_id))
+                resolved.append((entry, tensor, target, consumer_call_id))
 
-            first_entry, _tensor, first_target, _consumer_op_id = resolved[0]
+            first_entry, _tensor, first_target, _consumer_call_id = resolved[0]
             if first_target.type == "cuda":
                 first_event = first_entry.producer_event
                 if first_event is None:
@@ -1350,20 +1348,20 @@ class TensorStore:
                 if all(
                     target == first_target
                     and entry.producer_event is first_event
-                    for entry, _tensor, target, _consumer_op_id in resolved
+                    for entry, _tensor, target, _consumer_call_id in resolved
                 ):
                     # One device and one producer event: wait once, unless the
                     # consumer already runs on the producer stream.
                     stream = torch.cuda.current_stream(first_target)
                     if any(
                         entry.producer_stream != int(stream.cuda_stream)
-                        for entry, _tensor, _target, _consumer_op_id in resolved
+                        for entry, _tensor, _target, _consumer in resolved
                     ):
                         stream.wait_event(first_event)
                 else:
                     # Mixed devices or events: wait each (device, event) once.
                     waited: set[tuple[str, int]] = set()
-                    for entry, _tensor, target, _consumer_op_id in resolved:
+                    for entry, _tensor, target, _consumer_call_id in resolved:
                         if target.type != "cuda":
                             continue
                         event = entry.producer_event
@@ -1378,12 +1376,12 @@ class TensorStore:
                         waited.add(event_identity)
 
             reads = []
-            for entry, tensor, _target, consumer_op_id in resolved:
+            for entry, tensor, _target, consumer_call_id in resolved:
                 entry.readers += 1
                 reads.append(
                     TensorRead(
                         tensor=tensor,
-                        consumer_op_id=consumer_op_id,
+                        consumer_call_id=consumer_call_id,
                         _write=entry,
                         region=entry.region,
                         metadata=entry.metadata,
@@ -1448,7 +1446,7 @@ class TensorStore:
         declared_target = None if device is None else canonical_device(device)
         with self._lock:
             # Pairwise fast path: when every read pairs with the write its own
-            # consumer operation produced on the same stream, that write's
+            # consumer call produced on the same stream, that write's
             # producer event already fences the read. Any mismatch breaks out
             # to the per-stream fence path below.
             if len(after_writes) == len(reads):
@@ -1469,8 +1467,8 @@ class TensorStore:
                     event = completion.producer_event
                     if (
                         read.tensor.device != target
-                        or completion.reference.producer_op_id
-                        != read.consumer_op_id
+                        or completion.reference.producer_call_id
+                        != read.consumer_call_id
                         or (
                             target.type == "cuda"
                             and (
@@ -1511,14 +1509,14 @@ class TensorStore:
                     return
 
             # Fallback: prefer a producer event recorded by the read's own
-            # consumer operation when it matches the current stream; record a
+            # consumer call when it matches the current stream; record a
             # fresh event for anything else.
-            write_fences: dict[ComputationId, TensorRecord] = {}
+            write_fences: dict[CallId, TensorRecord] = {}
             for write in after_writes:
                 entry = self._require_write_locked(write)
                 if not entry.producer_recorded:
                     continue
-                write_fences.setdefault(entry.reference.producer_op_id, entry)
+                write_fences.setdefault(entry.reference.producer_call_id, entry)
             if declared_target is not None:
                 target = declared_target
                 entries = []
@@ -1538,8 +1536,8 @@ class TensorStore:
                     for read, entry in entries:
                         completion_fence = (
                             None
-                            if read.consumer_op_id is None
-                            else write_fences.get(read.consumer_op_id)
+                            if read.consumer_call_id is None
+                            else write_fences.get(read.consumer_call_id)
                         )
                         if (
                             completion_fence is not None
@@ -1590,8 +1588,8 @@ class TensorStore:
                 for read, entry in entries:
                     completion_fence = (
                         None
-                        if read.consumer_op_id is None
-                        else write_fences.get(read.consumer_op_id)
+                        if read.consumer_call_id is None
+                        else write_fences.get(read.consumer_call_id)
                     )
                     if (
                         completion_fence is not None
@@ -1612,36 +1610,32 @@ class TensorStore:
                     for entry in pending:
                         self._append_reader_event_locked(entry, event, target)
 
-    def release_operations(
+    def release_calls(
         self,
-        releases: Iterable[tuple[RequestKey, ComputationId]],
+        releases: Iterable[tuple[RequestKey, CallId]],
     ) -> None:
-        """Release all product ownership associated with completed operation.
+        """Release all product ownership associated with completed call.
 
         identities.
         """
         with self._lock:
-            for request_key, raw_op_id in releases:
-                op_id = raw_op_id
-                operation_key = (request_key, op_id)
-                operation_writes = self._operation_writes.pop(
-                    operation_key, None
-                )
+            for request_key, raw_call_id in releases:
+                call_id = raw_call_id
+                call_key = (request_key, call_id)
+                call_writes = self._call_writes.pop(call_key, None)
                 entries = list(
-                    operation_writes
-                    if isinstance(operation_writes, list)
-                    else (
-                        () if operation_writes is None else (operation_writes,)
-                    )
+                    call_writes
+                    if isinstance(call_writes, list)
+                    else (() if call_writes is None else (call_writes,))
                 )
 
-                # A committed product not indexed under its operation is still
+                # A committed product not indexed under its call is still
                 # reachable through its logical identity at output index zero.
                 direct_key = (
                     int(request_key.engine_id),
                     int(request_key.request_id),
                     int(request_key.request_epoch),
-                    op_id,
+                    call_id,
                     0,
                 )
                 direct = self._products.get(direct_key)
@@ -2084,22 +2078,22 @@ class TensorStore:
                         "device-product publication lost its reserved identity"
                     )
 
-            # Index each committed product under its operation so it can be
-            # released by operation identity later.
+            # Index each committed product under its call so it can be
+            # released by call identity later.
             for entry in entries:
                 entry.committed = True
-                operation_key = (
+                call_key = (
                     entry.reference.request_key,
-                    entry.reference.producer_op_id,
+                    entry.reference.producer_call_id,
                 )
-                operation_writes = self._operation_writes.get(operation_key)
-                if operation_writes is None:
-                    self._operation_writes[operation_key] = entry
-                elif isinstance(operation_writes, list):
-                    operation_writes.append(entry)
+                call_writes = self._call_writes.get(call_key)
+                if call_writes is None:
+                    self._call_writes[call_key] = entry
+                elif isinstance(call_writes, list):
+                    call_writes.append(entry)
                 else:
-                    self._operation_writes[operation_key] = [
-                        operation_writes,
+                    self._call_writes[call_key] = [
+                        call_writes,
                         entry,
                     ]
                 entry._indexed = True
@@ -2142,18 +2136,18 @@ class TensorStore:
             slot.owner = None
             association = slot.relay_lane
             if association is not None:
-                operation = association[:4]
-                self._release_relay_operation_locked(operation)
-                # Once the operation loses its lane, clear the association on
+                call = association[:4]
+                self._release_relay_call_locked(call)
+                # Once the call loses its lane, clear the association on
                 # every field so the lane becomes fully reusable.
-                if operation not in self._relay_operation_lanes:
+                if call not in self._relay_call_lanes:
                     fields = self._relay_slots[
                         (association[0], association[1], association[4])
                     ]
                     for candidate in fields.values():
                         if (
                             candidate.relay_lane is not None
-                            and candidate.relay_lane[:4] == operation
+                            and candidate.relay_lane[:4] == call
                         ):
                             candidate.relay_lane = None
         elif entry.buffer_binding is not None:
@@ -2169,27 +2163,25 @@ class TensorStore:
         if not entry._indexed:
             return
         reference = entry.reference
-        operation_key = (
+        call_key = (
             reference.request_key,
-            reference.producer_op_id,
+            reference.producer_call_id,
         )
-        operation_writes = self._operation_writes.get(operation_key)
-        if operation_writes is entry:
-            self._operation_writes.pop(operation_key, None)
-        elif isinstance(operation_writes, list):
+        call_writes = self._call_writes.get(call_key)
+        if call_writes is entry:
+            self._call_writes.pop(call_key, None)
+        elif isinstance(call_writes, list):
             # The index stores a bare entry for one product and a list for
             # several; collapse back to a bare entry when one remains.
             remaining = [
-                candidate
-                for candidate in operation_writes
-                if candidate is not entry
+                candidate for candidate in call_writes if candidate is not entry
             ]
             if not remaining:
-                self._operation_writes.pop(operation_key, None)
+                self._call_writes.pop(call_key, None)
             elif len(remaining) == 1:
-                self._operation_writes[operation_key] = remaining[0]
-            elif len(remaining) != len(operation_writes):
-                self._operation_writes[operation_key] = remaining
+                self._call_writes[call_key] = remaining[0]
+            elif len(remaining) != len(call_writes):
+                self._call_writes[call_key] = remaining
         entry._indexed = False
 
     def _producer_event_locked(

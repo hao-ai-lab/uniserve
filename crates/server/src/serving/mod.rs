@@ -124,7 +124,7 @@ impl From<ServeRequestId> for String {
 
 /// Boxed asynchronous stream of serving events.
 pub type RequestOutputStream = Pin<Box<dyn Stream<Item = Result<RequestOutput>> + Send>>;
-/// Result type returned by serving-runtime operations.
+/// Result type returned by serving-runtime calls.
 pub type Result<T> = std::result::Result<T, ServeError>;
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
@@ -649,7 +649,7 @@ impl ServingRuntime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Caller-visible reason for aborting a live request.
 pub enum AbortReason {
-    /// The request owner cancelled its operation.
+    /// The request owner cancelled its call.
     OwnerCancelled,
     /// An administrative control aborted the request.
     Admin,

@@ -70,7 +70,7 @@ pub enum Error {
     Gateway(#[from] GatewayError),
 }
 
-/// Result type returned by text serving operations.
+/// Result type returned by text serving calls.
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl From<crate::profile::tokenizer::TokenizerError> for Error {

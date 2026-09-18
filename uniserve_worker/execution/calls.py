@@ -1,4 +1,4 @@
-"""ScheduledRequest identities and scalar bounds derived from logical execution.
+"""Call identities and scalar bounds derived from logical execution.
 
 state.
 """
@@ -12,30 +12,30 @@ from uniserve_worker.foundation.errors import (
     invalid_descriptor,
     unsupported_setup,
 )
-from uniserve_worker.protocol.operation import OpStatus, ScheduledRequest
+from uniserve_worker.protocol.call import Call, CallStatus
 from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.runtime.block_tables import BlockTables
 from uniserve_worker.runtime.request import RequestProgress
 
 from .batch_state import BatchState
-from .rows import OperationIdentity
+from .rows import CallIdentity
 
 
-def output_generations(operation: ScheduledRequest) -> tuple[int, ...]:
+def output_generations(call: Call) -> tuple[int, ...]:
     """List logical generations in descriptor output order."""
     return tuple(
-        int(reference.generation) for reference in operation.tensor_outputs()
+        int(reference.generation) for reference in call.tensor_outputs()
     )
 
 
 def require_progress(output: PendingOutput) -> RequestProgress:
     """Require real request progress for a state-consuming numerical.
 
-    operation.
+    call.
     """
     progress = output.projected_progress
     if progress is None:
-        raise invalid_descriptor("operation does not consume request progress")
+        raise invalid_descriptor("call does not consume request progress")
     return progress
 
 
@@ -83,27 +83,27 @@ def cache_coordinates(
 
     pool = tables
     if pool is None:
-        raise unsupported_setup("operation requires request-to-token storage")
+        raise unsupported_setup("call requires request-to-token storage")
     pool.pages(slot, group_id)
     capacity = pool.allocated_length(slot)
 
     if visible > capacity:
         raise invalid_descriptor(
-            "operation visibility exceeds scheduler block table"
+            "call visibility exceeds scheduler block table"
         )
     return slot, int(group_id), visible, capacity
 
 
-def operation_identity(operation: ScheduledRequest) -> OperationIdentity:
+def call_identity(call: Call) -> CallIdentity:
     """Form the completion group-local identity from request generation and.
 
-    operation id.
+    call id.
     """
-    return operation.request_key, operation.op_id
+    return call.request_key, call.call_id
 
 
 def _predicated_outcome(
-    operation: ScheduledRequest,
+    call: Call,
     completion_group: int,
     *,
     state: BatchState,
@@ -113,9 +113,9 @@ def _predicated_outcome(
     generations.
     """
     request = state.pending_output(
-        completion_group, operation.request_key.request_id
+        completion_group, call.request_key.request_id
     )
-    request.status = OpStatus.PREDICATED
+    request.status = CallStatus.PREDICATED
     request.projected_progress = execution_runtime(request, None)
     request.finish_flags = FinishFlags()
     request.product_generations = ()
