@@ -1375,7 +1375,11 @@ class Worker:
         # and host completion may overlap; neither retains old batch identities.
         if self.worker_config.world_size > 1 and batch.calls:
             if batch.collective_seq <= self._last_collective_seq:
-                raise invalid_descriptor("collective sequence does not advance")
+                raise invalid_descriptor(
+                    f"collective sequence does not advance: batch "
+                    f"{batch.batch_id} carries {batch.collective_seq} after "
+                    f"{self._last_collective_seq}"
+                )
             self._last_collective_seq = batch.collective_seq
 
         execute_batch(
