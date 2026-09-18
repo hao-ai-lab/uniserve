@@ -289,32 +289,22 @@ def test_close_releases_borrowed_endpoint_references() -> None:
 @pytest.mark.parametrize("cleanup_failure", (False, True))
 @pytest.mark.parametrize("entrypoint", ("run", "warmup"))
 def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
-    monkeypatch, cleanup_failure: bool, entrypoint: str
+    monkeypatch, tmp_path, cleanup_failure: bool, entrypoint: str
 ) -> None:
     import concurrent.futures
 
     import torch
 
-    from uniserve_worker.bootstrap.cli import parse_worker_args
+    from tests.python.fixtures.launch import worker_args
     from uniserve_worker.worker import Worker
 
-    config = parse_worker_args(
-        [
-            "--service-name",
-            "startup-failure",
-            "--ipc-payload-cap",
-            "65536",
-            "--max-batch-tokens",
-            "256",
-            "--max-batch-calls",
-            "2",
-            "--device",
-            "cpu",
-            "--no-model",
-            "--allow-stub",
-            "--kv-token-capacity",
-            "4096",
-        ]
+    config = worker_args(
+        tmp_path,
+        max_batch_tokens=256,
+        max_batch_calls=2,
+        no_model=True,
+        allow_stub=True,
+        kv_token_capacity=4096,
     )
     request = {"kind": "info", "message_id": 1}
     endpoint = QueuedWorkerIpc((request,))

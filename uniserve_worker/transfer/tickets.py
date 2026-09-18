@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import cache
 from itertools import groupby, repeat
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -267,6 +268,14 @@ _endpoints: weakref.WeakValueDictionary[str, Transport] = (
     weakref.WeakValueDictionary()
 )
 _endpoint_lock = threading.Lock()
+
+
+@cache
+def _acknowledged_word() -> torch.Tensor:
+    """Return the pinned host word a consumer writes to acknowledge a chunk."""
+    import torch
+
+    return torch.ones(1, dtype=torch.int32).pin_memory()
 
 
 class TransferTicket:
@@ -707,7 +716,7 @@ class _BoundedTransferPool:
             for target, value in pairs:
                 target.copy_(value)
             if acknowledgment is not None:
-                acknowledgment.fill_(1)
+                acknowledgment.copy_(_acknowledged_word())
             ticket._complete(destination)
             return
 
@@ -738,7 +747,13 @@ class _BoundedTransferPool:
                     else:
                         target.copy_(value, non_blocking=True)
                 if acknowledgment is not None:
-                    acknowledgment.fill_(1)
+                    # A pinned host word makes this a memcpy on the read
+                    # stream. Filling the word would launch a kernel, and the
+                    # first launch of one in a process pays CUDA module
+                    # loading, which a one-word acknowledgment should not.
+                    acknowledgment.copy_(
+                        _acknowledged_word(), non_blocking=True
+                    )
                 completed = self._events.acquire(device)
                 self._events.record(completed, device)
 
@@ -1555,12 +1570,16 @@ class CudaVmmTransport(Transport):
         retirement: concurrent.futures.Future[None] | None = None,
     ) -> None:
         source.retirement = retirement
-        if source.chunk is not None:
-            # A consumer may still be reading this chunk, and it will say so by
-            # writing its word rather than by closing a connection. The chunk
-            # is held until then, which does not hold the source: that was
-            # copied into the chunk and is released below.
-            self._unacknowledged.append(source)
+        if source.chunk is not None and source.pool is not None:
+            if source.consumers:
+                # A consumer may still be reading this chunk, and it will say
+                # so by writing its word rather than by closing a connection.
+                # Holding the chunk until then does not hold the source: that
+                # was copied into the chunk and is released below.
+                self._unacknowledged.append(source)
+            else:
+                # No other rank reads this product, so nothing can be waiting.
+                source.pool.release(source.chunk)
         self._events.defer_release(
             (source.event,), source, completed=source.events_released
         )
@@ -1573,15 +1592,35 @@ class CudaVmmTransport(Transport):
         way one on this host does: by writing its slot's word in the chunk it
         mapped.
         """
-        if not self._unacknowledged:
-            return
-        settled = [
-            source for source in self._unacknowledged if source.acknowledged()
+        import torch
+
+        held = [
+            (source, source.pool, source.chunk)
+            for source in self._unacknowledged
+            if source.pool is not None and source.chunk is not None
         ]
-        for source in settled:
-            self._unacknowledged.remove(source)
-            if source.pool is not None and source.chunk is not None:
-                source.pool.release(source.chunk)
+        if not held:
+            return
+        # Every held chunk's words are read in one transfer. Asking each chunk
+        # separately would put one device-to-host synchronize per held
+        # publication into every retirement pass.
+        watched = [
+            chunk.acknowledgments[list(source.consumers)]
+            for source, _, chunk in held
+        ]
+        acknowledged = (
+            torch.cat(watched).cpu().split([len(words) for words in watched])
+        )
+
+        waiting = []
+        for (source, pool, chunk), words in zip(
+            held, acknowledged, strict=True
+        ):
+            if bool(words.all()):
+                pool.release(chunk)
+            else:
+                waiting.append(source)
+        self._unacknowledged = waiting
 
     def _drain(self, source: _CudaSource) -> None:
         source.event.synchronize()
@@ -1662,6 +1701,12 @@ class CudaVmmTransport(Transport):
                 # A consumer reads the payload, which follows the chunk's
                 # acknowledgment words, so the offset names the payload.
                 storage_offset = chunk.payload_offset
+                # Readiness is this synchronize, not an interprocess event: an
+                # event handle is host-local, and imported VMM memory admits no
+                # device-side wait on current drivers. Once the copy has
+                # landed, the chunk is readable by any consumer that maps it,
+                # on this host or another.
+                torch.cuda.current_stream(first.device).synchronize()
             else:
                 exported = export_handle(first)
                 if exported is None:
@@ -1680,7 +1725,13 @@ class CudaVmmTransport(Transport):
                             "shared allocation cannot be exported"
                         )
                 descriptor, storage_size, storage_offset = exported
-            event = self._events.acquire(first.device, interprocess=True)
+            # A pool publication is already readable, so its fence is this
+            # rank's own and never leaves the process. An in-place publication
+            # exports the source itself and still hands consumers an event.
+            interprocess = chunk is None
+            event = self._events.acquire(
+                first.device, interprocess=interprocess
+            )
             self._events.retain(event, first.device)
             self._events.record(event, first.device)
             # The chunk returns to its pool once every rank the head named has
@@ -1720,7 +1771,9 @@ class CudaVmmTransport(Transport):
                     span_lengths=tuple(length for length, _ in length_runs),
                     span_counts=tuple(count for _, count in length_runs),
                     tensor_stride=tuple(first.stride()),
-                    ready_event_handle=bytes(event.ipc_handle()),
+                    ready_event_handle=(
+                        bytes(event.ipc_handle()) if interprocess else b""
+                    ),
                     # The allocation handle travels with the publication so a
                     # consumer imports it directly. A fabric handle reaches
                     # another host, which a descriptor grant cannot.
@@ -1888,9 +1941,13 @@ class CudaVmmTransport(Transport):
                             + self._acknowledgment_slot * ACK_WORD_BYTES :
                         ][:ACK_WORD_BYTES].view(torch.int32)
                     del allocation
-                    event = torch.cuda.Event.from_ipc_handle(
-                        device, handle.ready_event_handle
-                    )
+                    # A pool publication was made readable by the producer's
+                    # own synchronize; only an in-place one carries a fence,
+                    # and that fence reaches this rank only on its own host.
+                    if handle.ready_event_handle:
+                        event = torch.cuda.Event.from_ipc_handle(
+                            device, handle.ready_event_handle
+                        )
                 if region is not None:
                     mapped = region_view(mapped, region)
                 self._reads.copy(

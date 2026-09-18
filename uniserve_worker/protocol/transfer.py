@@ -10,7 +10,7 @@ from typing import TypeAlias
 
 from ..foundation.errors import invalid_descriptor
 from . import identity
-from .validation import _bytes, _ints, _map, _seq, _str, _uint, _uints
+from .validation import _bytes, _int, _ints, _map, _seq, _str, _uint, _uints
 
 MAX_TRANSFER_HANDLE_BYTES = 64 * 1024
 
@@ -173,7 +173,14 @@ class CudaVmmTransfer:
             )
             or any(length < 1 for length in self.span_lengths)
             or any(stride < 0 for stride in self.tensor_stride)
-            or len(self.ready_event_handle) != 64
+            # A publication from a device pool is readable when it is
+            # published, so it carries no fence; any other length is not a
+            # handle a consumer can import.
+            or (
+                self.acknowledgment_offset < 0
+                and len(self.ready_event_handle) != 64
+            )
+            or (self.acknowledgment_offset >= 0 and self.ready_event_handle)
             # A fabric handle is 64 bytes and a process descriptor is 4; any
             # other length is not a handle this rank can import.
             or len(self.allocation_handle) not in (4, 64)
@@ -298,6 +305,10 @@ class Locator:
                     data.get("allocation_handle"),
                     f"{where}.allocation_handle",
                 ),
+                acknowledgment_offset=_int(
+                    data.get("acknowledgment_offset"),
+                    f"{where}.acknowledgment_offset",
+                ),
             )
         else:
             raise invalid_descriptor(f"{where}.transport is invalid")
@@ -353,6 +364,7 @@ class Locator:
                 tensor_stride=list(transport.tensor_stride),
                 ready_event_handle=transport.ready_event_handle,
                 allocation_handle=transport.allocation_handle,
+                acknowledgment_offset=transport.acknowledgment_offset,
             )
         return output
 
