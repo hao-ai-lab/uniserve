@@ -17,7 +17,7 @@ from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import BufferAllocation
-from uniserve_worker.protocol.identity import ComputationId, RequestKey
+from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.tensor import (
     DeviceDim,
     DType,
@@ -85,7 +85,7 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
     offsets = [(0, 0), (3, 0) if shard_axis == 0 else (0, 4)]
     reference = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=ComputationId(1, 0),
+        producer_call_id=CallId(1, 0),
         output_index=0,
         generation=1,
         dtype=DType.F32,
@@ -621,7 +621,7 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
     )
     reference = TensorRef(
         RequestKey(1, 1, 1),
-        ComputationId(1, 0),
+        CallId(1, 0),
         0,
         1,
         DType.F32,
@@ -655,7 +655,7 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
         store.publish_write(write, resident, metadata=metadata)
         store.commit_writes((write,))
         earlier = store.consume(
-            reference, consumer_op_id=ComputationId(2, 0), device=device
+            reference, consumer_call_id=CallId(2, 0), device=device
         )
         for _ in range(2):
             imports.append(
@@ -675,7 +675,7 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
         store.complete_import(imports[1])
         store.complete_reads((imports[1],))
         complete = store.consume(
-            reference, consumer_op_id=ComputationId(3, 0), device=device
+            reference, consumer_call_id=CallId(3, 0), device=device
         )
         assert earlier.region == region and complete.region is None
         torch.testing.assert_close(earlier.tensor, resident, rtol=0, atol=0)
@@ -720,7 +720,7 @@ def test_full_region_publishes_complete_bounded_tensor() -> None:
     expected = torch.arange(48, dtype=torch.float32).reshape(6, 8)
     reference = TensorRef(
         RequestKey(1, 1, 1),
-        ComputationId(1, 0),
+        CallId(1, 0),
         0,
         1,
         DType.F32,
@@ -739,7 +739,7 @@ def test_full_region_publishes_complete_bounded_tensor() -> None:
         store.publish_write(write, expected)
         store.commit_writes((write,))
         read = store.consume(
-            reference, consumer_op_id=ComputationId(2, 0), device="cpu"
+            reference, consumer_call_id=CallId(2, 0), device="cpu"
         )
         assert read.region is None
         torch.testing.assert_close(read.tensor, expected, rtol=0, atol=0)

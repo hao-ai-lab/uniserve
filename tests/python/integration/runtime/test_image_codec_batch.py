@@ -12,13 +12,13 @@ from uniserve_worker.bootstrap.capacity import input_buffer_config
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.execution.rows import ForwardRow
-from uniserve_worker.protocol.identity import ComputationId, RequestKey
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
     Bounds,
+    Call,
     CallCoordinates,
     PipelineStage,
-    ScheduledRequest,
 )
+from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.runtime.cache_manager import CacheManager
 from uniserve_worker.runtime.latent_pool import LatentPool
 
@@ -35,7 +35,7 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
         model_dtype="float32",
         block_size=16,
         max_sequence_tokens=32,
-        max_batch_operations=3,
+        max_batch_calls=3,
         max_request_pool_size=3,
         max_batch_tokens=64,
         graph_policy="off",
@@ -66,7 +66,7 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
             kv_cache=manager,
             latent_pool=latents,
             decode_predicates=torch.tensor([False, True, True, True]),
-            max_operations=3,
+            max_calls=3,
             request_slots=3,
             max_tokens=64,
             latent_capacity_units=16,
@@ -123,10 +123,10 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
 
 
 def _run(runner, manager, rows):
-    operations = tuple(
-        ScheduledRequest(
+    calls = tuple(
+        Call(
             RequestKey(1, index, 0),
-            ComputationId(1, 0),
+            CallId(1, 0),
             None,
             CallCoordinates(),
             row.forward_mode,
@@ -137,7 +137,7 @@ def _run(runner, manager, rows):
     return (
         runner.run_forward_group(
             rows,
-            operations=operations,
+            calls=calls,
             cache=manager,
             tables=manager.block_tables,
             states=None,

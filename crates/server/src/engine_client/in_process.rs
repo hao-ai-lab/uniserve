@@ -113,7 +113,7 @@ impl EngineClient {
         self.core.info().denoise_steps()
     }
 
-    /// Returns whether the worker supports token sampling operations.
+    /// Returns whether the worker supports token sampling calls.
     pub fn supports_token_sampling(&self) -> bool {
         self.core.supports_token_sampling()
     }

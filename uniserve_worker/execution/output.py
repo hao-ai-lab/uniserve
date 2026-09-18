@@ -17,12 +17,12 @@ import torch
 from uniserve.runtime import EventPool
 from uniserve.runtime.device import canonical_device
 from uniserve.runtime.resources import close_resources
+from uniserve_worker.protocol.call import CallKind
 from uniserve_worker.protocol.identity import (
     BufferId,
-    ComputationId,
+    CallId,
     RequestKey,
 )
-from uniserve_worker.protocol.operation import Computation
 
 from ..foundation.errors import (
     WorkerError,
@@ -33,7 +33,7 @@ from ..media.buffers import MediaLease
 from ..media.storage import publish_media_bytes
 from ..profiling import timing_events_enabled
 from ..protocol.batch import LatentParams, TensorPublication
-from ..protocol.operation import ErrorCode, OpStatus, ScheduledRequest
+from ..protocol.call import Call, CallStatus, ErrorCode
 from ..protocol.output import (
     FinishFlags,
     MediaOutput,
@@ -57,12 +57,12 @@ __all__ = [
     "OutputPool",
 ]
 
-# The sampler packs one operation's completion column as four consecutive
+# The sampler packs one call's completion column as four consecutive
 # row-major fields: [valid | active | token | accepted], each `count` wide.
 # `valid` marks a usable sampling distribution, `active` the resolved device
 # predicate, `token` the selected token, and `accepted` the speculative
 # acceptance count.
-_SAMPLING_FIELDS_PER_OPERATION: Final[int] = 4
+_SAMPLING_FIELDS_PER_CALL: Final[int] = 4
 _next_buffer_generation = 1
 
 
@@ -130,7 +130,7 @@ class OutputBuffer:
         capacity = int(token_capacity)
         if count < 1:
             raise ValueError(
-                "a pinned output buffer must contain at least one operation row"
+                "a pinned output buffer must contain at least one call row"
             )
         if capacity < count:
             raise resource_error(
@@ -890,8 +890,8 @@ class _InvalidSamplingDistribution(RuntimeError):  # noqa: N818  # deliberate ta
     pass
 
 
-class _PredicatedOperation(RuntimeError):  # noqa: N818  # deliberate taxonomy name
-    """Marks an operation suppressed by its resolved device predicate."""
+class _PredicatedCall(RuntimeError):  # noqa: N818  # deliberate taxonomy name
+    """Marks an call suppressed by its resolved device predicate."""
 
     pass
 
@@ -900,7 +900,7 @@ def capture_logprobs(
     details: LogprobValues | None,
     output: OutputBuffer,
 ) -> dict[int, tuple[int, int, int]]:
-    """Store one packed score column and return its operation row ranges."""
+    """Store one packed score column and return its call row ranges."""
     if details is None:
         return {}
     packed, rows, counts, requested_ids, max_count, max_requested = details
@@ -930,8 +930,8 @@ def capture_samples(
     details: dict[int, dict[int, tuple[int, int, int]]] = {}
     for sample, request in zip(samples, requests, strict=True):
         metadata = sample.batch.completion
-        count = int(metadata.numel()) // _SAMPLING_FIELDS_PER_OPERATION
-        if metadata.numel() != count * _SAMPLING_FIELDS_PER_OPERATION or not (
+        count = int(metadata.numel()) // _SAMPLING_FIELDS_PER_CALL
+        if metadata.numel() != count * _SAMPLING_FIELDS_PER_CALL or not (
             0 <= sample.index < count
         ):
             raise RuntimeError("sampling completion vectors do not align")
@@ -968,10 +968,10 @@ def sampled_tokens(record: PendingOutput) -> tuple[int, ...]:
         values = record._buffer.read_tokens(offset, extent)
         record._sampling_values = values
     # Field layout of the packed sampling column is documented at
-    # _SAMPLING_FIELDS_PER_OPERATION.
-    count = extent // _SAMPLING_FIELDS_PER_OPERATION
+    # _SAMPLING_FIELDS_PER_CALL.
+    count = extent // _SAMPLING_FIELDS_PER_CALL
     if not bool(values[count + index]):
-        raise _PredicatedOperation("operation predicate selected no state")
+        raise _PredicatedCall("call predicate selected no state")
     if not bool(values[index]):
         raise _InvalidSamplingDistribution(
             "sampling policy produced an invalid distribution"
@@ -1091,7 +1091,7 @@ def decode_logprobs(
 
 
 class PendingOutput:
-    """One operation's stable predecessor, projected progress.
+    """One call's stable predecessor, projected progress.
 
     and eventual output.
 
@@ -1102,27 +1102,27 @@ class PendingOutput:
 
     def __init__(
         self,
-        operation: ScheduledRequest,
+        call: Call,
         request: RequestState,
         buffer: OutputBuffer,
         row: int,
     ) -> None:
-        self.operation = operation
+        self.call = call
         self.request = request
         # The call states the coordinates it runs at, so the rank reads them
         # rather than deriving them from a predecessor's record. The device
         # state a previous call left behind stays with the request.
         self.projected_progress: RequestProgress = RequestProgress(
-            logical_position=operation.coordinates.logical_position,
+            logical_position=call.coordinates.logical_position,
             rng_counter=request.rng_counter,
-            flow_step=operation.coordinates.flow_step,
-            kv_visible_len=operation.coordinates.kv_visible_len,
-            kv_computed_len=operation.coordinates.kv_computed_len,
+            flow_step=call.coordinates.flow_step,
+            kv_visible_len=call.coordinates.kv_visible_len,
+            kv_computed_len=call.coordinates.kv_computed_len,
             prompt_logits_ready=request.prompt_logits_ready,
         )
         self.accepted_progress: RequestProgress | None = None
 
-        self.status = OpStatus.OK
+        self.status = CallStatus.OK
         self.committed_tokens: tuple[int, ...] = ()
         self.sampling_range: tuple[int, int, int] | None = None
         self._sampling_values: tuple[int, ...] | None = None
@@ -1170,7 +1170,7 @@ class PendingOutput:
         self.products: tuple[TensorPublication, ...] = ()
         # A product whose bytes a host task produces is published with its
         # batch and filled when the task completes. Its consumer is scheduled
-        # only after this operation completes, so the bytes are in place before
+        # only after this call completes, so the bytes are in place before
         # any rank can read them.
         self.encoded_unit_row: torch.Tensor | None = None
 
@@ -1242,15 +1242,15 @@ class PendingOutput:
 
     @property
     def request_key(self) -> RequestKey:
-        return self.operation.request_key
+        return self.call.request_key
 
     @property
-    def op_id(self) -> ComputationId:
-        return self.operation.op_id
+    def call_id(self) -> CallId:
+        return self.call.call_id
 
     @property
-    def kind(self) -> Computation:
-        return self.operation.kind
+    def kind(self) -> CallKind:
+        return self.call.kind
 
     def ready(self) -> bool:
         """Query host output readiness without changing request acceptance."""
@@ -1279,7 +1279,7 @@ class PendingOutput:
         error_code = self.error_code
         runtime = self.projected_progress
         tokens = self.committed_tokens
-        suppressed = status is OpStatus.PREDICATED
+        suppressed = status is CallStatus.PREDICATED
         if not suppressed:
             try:
                 for task in self.completion_tasks:
@@ -1321,23 +1321,23 @@ class PendingOutput:
             except Exception:
                 logger.exception(
                     "completion materialization failed: request=%s "
-                    "operation=%s computation=%s",
+                    "call=%s computation=%s",
                     self.request_key,
-                    self.op_id,
+                    self.call_id,
                     self.kind,
                 )
-                status = OpStatus.ERROR
+                status = CallStatus.ERROR
                 error_code = ErrorCode.COMPUTE_ERROR
                 suppressed = True
             else:
                 try:
                     tokens = sampled_tokens(self)
-                except _PredicatedOperation:
-                    status = OpStatus.PREDICATED
+                except _PredicatedCall:
+                    status = CallStatus.PREDICATED
                     suppressed = True
                 except _InvalidSamplingDistribution:
-                    status = OpStatus.ERROR
-                    error_code = ErrorCode.INVALID_OPERATION
+                    status = CallStatus.ERROR
+                    error_code = ErrorCode.INVALID_CALL
                     suppressed = True
                 else:
                     if self.sampling_range is not None:
@@ -1368,7 +1368,7 @@ class PendingOutput:
                                 rng_counter=self.base_rng_counter + accepted,
                                 kv_visible_len=visible,
                             )
-        if status is OpStatus.PREDICATED:
+        if status is CallStatus.PREDICATED:
             runtime = accepted_parent
             error_code = None
         if suppressed:
@@ -1393,7 +1393,7 @@ class PendingOutput:
         )
         concrete = RequestOutput(
             request_key=self.request_key,
-            op_id=self.op_id,
+            call_id=self.call_id,
             status=status,
             product_generations=() if suppressed else self.product_generations,
             error_code=error_code,
@@ -1421,12 +1421,12 @@ class PendingOutput:
             media_output=self._media_output,
             kv_output=None if suppressed else self.kv_output,
         )
-        # Ordinary successful operations accept the immutable projection itself;
+        # Ordinary successful calls accept the immutable projection itself;
         # failures keep their predecessor and verification uses its resolved
         # span.
         self.accepted_progress = (
             accepted_parent
-            if status in (OpStatus.PREDICATED, OpStatus.ERROR)
+            if status in (CallStatus.PREDICATED, CallStatus.ERROR)
             else runtime
         )
 

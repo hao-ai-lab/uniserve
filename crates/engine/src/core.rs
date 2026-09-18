@@ -257,7 +257,7 @@ impl EngineConfig {
             ranks: WorkerConfig::model("localhost", "cpu", 1, 2).ranks,
             block_size: 64,
             queue_depth: 2,
-            max_batch_operations: DEFAULT_MAX_BATCH as u32,
+            max_batch_calls: DEFAULT_MAX_BATCH as u32,
             max_batch_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS as u32,
             ..WorkerProcessArgs::default()
         };
@@ -448,8 +448,8 @@ impl EngineCore {
         self.info.supported_ops.iter().any(|mode| {
             matches!(
                 mode,
-                uniserve_worker_ipc::Computation::Forward(ForwardMode::Decode)
-                    | uniserve_worker_ipc::Computation::Forward(ForwardMode::Verify)
+                uniserve_worker_ipc::CallKind::Forward(ForwardMode::Decode)
+                    | uniserve_worker_ipc::CallKind::Forward(ForwardMode::Verify)
             )
         })
     }

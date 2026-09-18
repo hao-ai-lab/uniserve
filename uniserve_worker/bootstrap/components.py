@@ -25,8 +25,8 @@ from uniserve.nn.vae import PatchAutoencoder
 
 from ..execution.model_entry import Call, ModelEntry
 from ..foundation.errors import unsupported_setup
-from ..protocol.operation import (
-    Computation,
+from ..protocol.call import (
+    CallKind,
     ForwardMode,
     PipelineStage,
     TransferMode,
@@ -37,48 +37,48 @@ from .config import ComponentConfig
 # artifact on its host lane. It owns no numerical method, so the worker declares
 # it rather than the model, which declares numerical components only.
 MUXER_COMPONENT = "muxer"
-MUXER_COMPUTATIONS = frozenset(
+MUXER_CALL_KINDS = frozenset(
     {PipelineStage.AUDIO_ENCODING, PipelineStage.MUXING}
 )
 
 
-def call_operations(calls: Iterable[Call]) -> frozenset[Computation]:
-    """Resolve computation from capability type and method.
+def call_kinds(calls: Iterable[Call]) -> frozenset[CallKind]:
+    """Resolve the call kinds a capability's type and method can execute.
 
-    The computation follows the declared numerical method.
+    The kind follows the declared numerical method.
     """
-    operations: set[Computation] = set()
+    kinds: set[CallKind] = set()
     for call in calls:
         module, method = call.module, call.entry.method
         if isinstance(module, CausalLM) and method == "forward":
-            operations.update(
+            kinds.update(
                 (ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY)
             )
         elif isinstance(module, Denoiser) and method == "forward":
-            operations.update(
+            kinds.update(
                 (PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING)
             )
         elif isinstance(module, VideoPostprocessor) and method == "forward":
             # The post-processor converts one media unit to RGB on the rank that
             # decoded it; encoding that unit is the host half of the same call.
-            operations.add(PipelineStage.VIDEO_ENCODING)
+            kinds.add(PipelineStage.VIDEO_ENCODING)
         elif method == "encode":
             if isinstance(module, TextEncoder):
-                operations.add(PipelineStage.TEXT_ENCODING)
+                kinds.add(PipelineStage.TEXT_ENCODING)
             elif isinstance(module, PatchEncoder):
-                operations.add(PipelineStage.VISION_ENCODING)
+                kinds.add(PipelineStage.VISION_ENCODING)
             elif isinstance(module, PatchAutoencoder):
-                operations.add(PipelineStage.LATENT_ENCODING)
+                kinds.add(PipelineStage.LATENT_ENCODING)
             elif isinstance(module, Encoder):
-                operations.add(PipelineStage.LATENT_PREPARATION)
+                kinds.add(PipelineStage.LATENT_PREPARATION)
         elif method == "decode":
             if isinstance(module, ImageDecoder):
-                operations.add(PipelineStage.IMAGE_DECODING)
+                kinds.add(PipelineStage.IMAGE_DECODING)
             elif isinstance(module, VideoDecoder):
-                operations.add(PipelineStage.VIDEO_DECODING)
+                kinds.add(PipelineStage.VIDEO_DECODING)
             elif isinstance(module, AudioDecoder):
-                operations.add(PipelineStage.AUDIO_DECODING)
-    return frozenset(operations)
+                kinds.add(PipelineStage.AUDIO_DECODING)
+    return frozenset(kinds)
 
 
 def describe_components(
@@ -145,7 +145,7 @@ def describe_components(
                     f"component {path!r} has no callable {method!r}"
                 )
             call = Call(path, module, replace(point, method=method))
-            if not call_operations((call,)) and not (
+            if not call_kinds((call,)) and not (
                 isinstance(module, CausalLM)
                 and method in {"embed_input_ids", "compute_logits"}
             ):
@@ -165,16 +165,16 @@ def describe_components(
     return described
 
 
-def supported_operations(model: nn.Module) -> frozenset[Computation]:
-    """Collect every computation and transfer mode the model can serve."""
+def supported_calls(model: nn.Module) -> frozenset[CallKind]:
+    """Collect every call kind and transfer mode the model can serve."""
     components = describe_components(model)
-    calls = tuple(call for calls in components.values() for call in calls)
-    operations = {TransferMode.TENSOR, *call_operations(calls)}
+    calls = tuple(call for items in components.values() for call in items)
+    kinds = {TransferMode.TENSOR, *call_kinds(calls)}
     if MUXER_COMPONENT in components:
-        operations.update(MUXER_COMPUTATIONS)
+        kinds.update(MUXER_CALL_KINDS)
     if any(isinstance(call.module, CausalLM) for call in calls):
-        operations.update((TransferMode.KV_PUBLISH, TransferMode.KV_INSTALL))
-    return frozenset(operations)
+        kinds.update((TransferMode.KV_PUBLISH, TransferMode.KV_INSTALL))
+    return frozenset(kinds)
 
 
 def media_components(model: nn.Module) -> dict[PipelineStage, str]:
@@ -200,10 +200,10 @@ def media_components(model: nn.Module) -> dict[PipelineStage, str]:
 
     routes = {}
     for name, calls in components.items():
-        owned = call_operations(calls) & stages
+        owned = call_kinds(calls) & stages
         if name == MUXER_COMPONENT:
             # The muxer's stages are host tasks with no numerical owner.
-            owned = MUXER_COMPUTATIONS
+            owned = MUXER_CALL_KINDS
         for stage in owned:
             if stage in routes:
                 raise unsupported_setup(
@@ -327,10 +327,8 @@ def bind_components(
             calls.append(replace(call, groups=tuple(groups.values())))
 
         binding.calls = tuple(calls)
-        binding.computations = tuple(
-            MUXER_COMPUTATIONS
-            if name == MUXER_COMPONENT
-            else call_operations(calls)
+        binding.call_kinds = tuple(
+            MUXER_CALL_KINDS if name == MUXER_COMPONENT else call_kinds(calls)
         )
         # A module that reconstructs media units borrows the ring of ranks
         # holding consecutive ones, the way a parallel module borrows its mesh.

@@ -88,7 +88,7 @@ def prepare(state, key, value, batch, *, lengths, offsets):
     """Read live sequence columns and commit this call's optional cache write.
 
     Dense contiguous backing can share a launch with metadata generation.
-    Other numerical representations use the state's ordinary write operation.
+    Other numerical representations use the state's ordinary write call.
     The outputs borrow context workspace and are valid until its next use.
     """
     indices = batch.write_indices

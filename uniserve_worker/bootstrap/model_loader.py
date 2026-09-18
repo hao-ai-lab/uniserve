@@ -329,7 +329,7 @@ def loaded_worker_config(
 ) -> WorkerConfig:
     """Resolve media request slots from the worker's publication lifetime."""
     if any(isinstance(module, VideoDecoder) for module in model.modules()):
-        state_slots = min(config.max_batch_operations, queue_depth // 3)
+        state_slots = min(config.max_batch_calls, queue_depth // 3)
         if state_slots < 2:
             raise unsupported_setup(
                 "resident media execution requires two slots with "
@@ -339,7 +339,7 @@ def loaded_worker_config(
             config,
             kv_token_capacity=None,
             attention_backend=None,
-            max_batch_operations=state_slots,
+            max_batch_calls=state_slots,
             max_batch_tokens=state_slots,
             max_request_pool_size=state_slots,
             min_request_pool_size=2,

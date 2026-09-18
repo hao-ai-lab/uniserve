@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tests.python.fixtures.launch import worker_args
-from uniserve_worker.protocol.operation import ForwardMode, PipelineStage
+from uniserve_worker.protocol.call import ForwardMode, PipelineStage
 
 pytestmark = pytest.mark.unit
 
@@ -76,11 +76,11 @@ def test_engine_batch_capacity_reaches_worker_resources(tmp_path) -> None:
         ipc_payload_cap=65536,
         model="model",
         device="cpu",
-        max_batch_operations=128,
+        max_batch_calls=128,
         max_batch_tokens=16384,
     )
 
-    assert config.execution.max_batch_operations == 128
+    assert config.execution.max_batch_calls == 128
     assert config.execution.max_batch_tokens == 16384
 
 
@@ -142,7 +142,7 @@ def test_execution_lanes_are_typed_and_domain_disjoint(tmp_path) -> None:
         ("decode", 64),
         ("compute", 88),
     )
-    assert config.execution.lanes[0].computations == (
+    assert config.execution.lanes[0].call_kinds == (
         ForwardMode.DECODE,
         ForwardMode.VERIFY,
     )

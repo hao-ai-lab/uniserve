@@ -586,7 +586,7 @@ class _BoundedTransferPool:
 
     def submit(
         self,
-        operation: Any,
+        call: Any,
         *args: Any,
         nbytes: int,
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
@@ -628,7 +628,7 @@ class _BoundedTransferPool:
                 # Inference mode is thread-local. Destinations reserved by an
                 # inference caller retain that behavior on transport threads.
                 with torch.inference_mode():
-                    operation(ticket, *args)
+                    call(ticket, *args)
             except BaseException as error:
                 late = ticket._fail(error)
                 if late or ticket._unretired:
@@ -805,7 +805,7 @@ class LocalTransport(Transport):
     def publication_retirement(
         self, locator: Locator
     ) -> concurrent.futures.Future[None]:
-        """Retain the allocation ownership shared by local operations.
+        """Retain the allocation ownership shared by local calls.
 
         Local copies and borrowed views use the same ownership.
         """

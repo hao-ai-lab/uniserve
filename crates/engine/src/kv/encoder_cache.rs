@@ -132,7 +132,7 @@ impl EncoderCacheManager {
     }
 
     /// Removes the least-recently-used unpinned entry so its worker buffer can
-    /// be freed before a replacement encoder operation is admitted.
+    /// be freed before a replacement encoder call is admitted.
     pub(crate) fn evict_one(&mut self) -> Option<TensorRef> {
         let (_, victim) = self.evictable.pop_first()?;
         let entry = self
@@ -275,12 +275,12 @@ impl EncoderCacheManager {
 mod tests {
     use super::*;
     use uniserve_core::RequestId;
-    use uniserve_worker_ipc::{ComputationId, DType, RequestKey, ShapeBound};
+    use uniserve_worker_ipc::{CallId, DType, RequestKey, ShapeBound};
 
     fn product(generation: u32) -> TensorRef {
         TensorRef {
             request_key: RequestKey::new(7, RequestId(u64::from(generation)), 3),
-            producer_op_id: ComputationId::new(u64::from(generation), 0),
+            producer_call_id: CallId::new(u64::from(generation), 0),
             output_index: 0,
             generation,
             dtype: DType::BF16,

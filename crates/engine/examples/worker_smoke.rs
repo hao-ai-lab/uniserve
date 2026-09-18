@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
         resp_slot_cap: 8 << 20,
         kv_token_capacity: None,
         block_size: 256,
-        max_batch_operations: 32,
+        max_batch_calls: 32,
         max_batch_tokens: 8192,
         attention_backend: AttentionBackend::Auto,
         transfer: Default::default(),

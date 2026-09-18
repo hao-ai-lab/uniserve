@@ -1,28 +1,28 @@
-//! Generation lifecycle state and worker-operation planning.
+//! Generation lifecycle state and worker-call planning.
 //!
 //! A request advances through context ingestion, understanding decode, image
 //! generation, optional feedback, and terminal publication. Every planned
-//! output is named by request epoch, producer operation, point, and generation.
+//! output is named by request epoch, producer call, point, and generation.
 
 use std::collections::HashSet;
 use uniserve_worker_ipc::{CallCoordinates, ForwardMode, PipelineStage, TransferMode};
 
 use uniserve_core::{GenerationRequest, ImageIngestStep, RequestId, SamplingParams};
 use uniserve_worker_ipc::{
-    Bounds, BufferId, Computation, ComputationId, DType, DimBound, DrawLayout, OpStatus,
-    RequestKey, RequestOutput, Rng, SamplingState, ScheduledRequest, ShapeBound, TensorRef,
+    Bounds, BufferId, CallKind, CallId, DType, DimBound, DrawLayout, CallStatus,
+    RequestKey, RequestOutput, Rng, SamplingState, Call, ShapeBound, TensorRef,
 };
 
 use crate::scheduler::image_artifact::png_artifact_dims_b64;
 
-/// Builds an unstamped product reference for a planned operation output. The
-/// owning `request_key` and `producer_op_id` are placeholder until
-/// [`register_operation`] stamps the real identity. The shape
+/// Builds an unstamped product reference for a planned call output. The
+/// owning `request_key` and `producer_call_id` are placeholder until
+/// [`register_call`] stamps the real identity. The shape
 /// bound is empty (it carries identity, not a device geometry).
 fn output_tensor(output_index: u16, dtype: DType) -> TensorRef {
     TensorRef {
         request_key: RequestKey::new(0, RequestId(0), 0),
-        producer_op_id: ComputationId::new(0, 0),
+        producer_call_id: CallId::new(0, 0),
         output_index,
         generation: 0,
         dtype,
@@ -132,27 +132,27 @@ pub(crate) enum GenerationPhase {
 }
 
 /// Image extension consumes an encoder feature rather than token inputs.
-pub(super) fn consumes_image_features(operation: &ScheduledRequest) -> bool {
-    operation.code == Computation::Forward(ForwardMode::Prefill)
-        && (operation.vision_input.is_some() || operation.latent_feature_input.is_some())
+pub(super) fn consumes_image_features(call: &Call) -> bool {
+    call.code == CallKind::Forward(ForwardMode::Prefill)
+        && (call.vision_input.is_some() || call.latent_feature_input.is_some())
 }
 
 /// Feedback encoders and KV writes produce a predicate for their device successor.
 /// Input-image encoding has no such successor until its host result is accepted.
-pub(super) fn is_feedback_computation(operation: &ScheduledRequest) -> bool {
+pub(super) fn is_feedback_computation(call: &Call) -> bool {
     (matches!(
-        operation.code,
-        Computation::Pipeline(PipelineStage::VisionEncoding)
-            | Computation::Pipeline(PipelineStage::LatentEncoding)
-    ) || consumes_image_features(operation))
-        && operation.completion_output.is_some()
+        call.code,
+        CallKind::Pipeline(PipelineStage::VisionEncoding)
+            | CallKind::Pipeline(PipelineStage::LatentEncoding)
+    ) || consumes_image_features(call))
+        && call.completion_output.is_some()
 }
 
 /// Prompt extension samples a token and has no image-feature input.
-pub(super) fn is_prompt_extend(operation: &ScheduledRequest) -> bool {
-    operation.code == Computation::Forward(ForwardMode::Prefill)
-        && !consumes_image_features(operation)
-        && operation.token_output.is_some()
+pub(super) fn is_prompt_extend(call: &Call) -> bool {
+    call.code == CallKind::Forward(ForwardMode::Prefill)
+        && !consumes_image_features(call)
+        && call.token_output.is_some()
 }
 
 impl super::RequestState {
@@ -160,31 +160,31 @@ impl super::RequestState {
     /// consumed once before this update; inactive successors never reach it.
     pub(crate) fn process_generation_result(
         &mut self,
-        operation: &ScheduledRequest,
+        call: &Call,
         record: &RequestOutput,
     ) -> Result<(), GenerationResultError> {
-        if operation.op_id.batch_id == 0 {
-            return Err(GenerationResultError::MissingOperationId);
+        if call.call_id.batch_id == 0 {
+            return Err(GenerationResultError::MissingCallId);
         }
-        if record.status == OpStatus::Predicated {
+        if record.status == CallStatus::Predicated {
             return Ok(());
         }
-        if matches!(operation.code, Computation::Forward(_)) {
+        if matches!(call.code, CallKind::Forward(_)) {
             // A forward reports the extent it initialized, which a verifier
             // leaves above the prefix it accepted.
             self.kv_computed_len = record.kv_computed_len;
         }
-        match operation.code {
-            Computation::Forward(ForwardMode::Prefill) if is_prompt_extend(operation) => {
-                let count = operation.input_token_ids.len().min(u32::MAX as usize) as u32;
+        match call.code {
+            CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => {
+                let count = call.input_token_ids.len().min(u32::MAX as usize) as u32;
                 self.num_computed_prompt_tokens =
                     self.num_computed_prompt_tokens.saturating_add(count);
                 self.logical_position = self.logical_position.saturating_add(count);
                 self.kv_visible_len = self.kv_visible_len.saturating_add(count);
             }
-            Computation::Forward(ForwardMode::Prefill) if consumes_image_features(operation) => {
+            CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                 self.kv_visible_len = record.kv_visible_len;
-                if is_feedback_computation(operation) {
+                if is_feedback_computation(call) {
                     self.feedback_encoder_index = self.feedback_encoder_index.saturating_add(1);
                     self.feedback_features = None;
                     if self.feedback_encoder_index
@@ -216,28 +216,28 @@ impl super::RequestState {
                     }
                 }
             }
-            Computation::Forward(ForwardMode::Prefill) => {
+            CallKind::Forward(ForwardMode::Prefill) => {
                 self.kv_visible_len = record.kv_visible_len;
                 self.phase = GenerationPhase::PublishKv;
                 self.replayable = false;
             }
-            Computation::Forward(ForwardMode::Decode)
-            | Computation::Forward(ForwardMode::Verify) => {
+            CallKind::Forward(ForwardMode::Decode)
+            | CallKind::Forward(ForwardMode::Verify) => {
                 let count = record.committed_tokens.len().max(1).min(u32::MAX as usize) as u32;
                 self.logical_position = self.logical_position.saturating_add(count);
                 self.kv_visible_len = self.kv_visible_len.saturating_add(count);
             }
-            Computation::Transfer(TransferMode::KvPublish) => {
-                self.image_conditioning = operation.kv_output;
+            CallKind::Transfer(TransferMode::KvPublish) => {
+                self.image_conditioning = call.kv_output;
                 self.phase = GenerationPhase::PrepareGen;
             }
-            Computation::Pipeline(PipelineStage::LatentPreparation)
-            | Computation::Pipeline(PipelineStage::Denoising) => {
-                self.image_latent = operation.latent_output.clone();
+            CallKind::Pipeline(PipelineStage::LatentPreparation)
+            | CallKind::Pipeline(PipelineStage::Denoising) => {
+                self.image_latent = call.latent_output.clone();
                 if self.image_latent.is_none() {
                     return Err(GenerationResultError::MissingLatentProduct);
                 }
-                if operation.code == Computation::Pipeline(PipelineStage::LatentPreparation) {
+                if call.code == CallKind::Pipeline(PipelineStage::LatentPreparation) {
                     self.num_completed_denoise_steps = 0;
                     self.phase = GenerationPhase::DenoiseGen;
                 } else {
@@ -246,21 +246,21 @@ impl super::RequestState {
                     self.replayable = false;
                 }
             }
-            Computation::Pipeline(PipelineStage::ImageDecoding) => {
+            CallKind::Pipeline(PipelineStage::ImageDecoding) => {
                 // Decoding the artifact releases the trajectory, so the request
                 // leaves the flow and its next call enters at step zero.
                 self.num_completed_denoise_steps = 0;
-                self.feedback_source = operation.image_output.clone();
+                self.feedback_source = call.image_output.clone();
                 self.feedback_encoder_index = 0;
                 self.feedback_features = None;
                 self.phase = GenerationPhase::FeedbackEncode;
                 self.replayable = false;
             }
-            Computation::Pipeline(PipelineStage::VisionEncoding)
-            | Computation::Pipeline(PipelineStage::LatentEncoding)
-                if is_feedback_computation(operation) =>
+            CallKind::Pipeline(PipelineStage::VisionEncoding)
+            | CallKind::Pipeline(PipelineStage::LatentEncoding)
+                if is_feedback_computation(call) =>
             {
-                self.feedback_features = operation.encoder_output.clone();
+                self.feedback_features = call.encoder_output.clone();
                 self.phase = GenerationPhase::FeedbackState;
                 self.replayable = false;
             }
@@ -270,7 +270,7 @@ impl super::RequestState {
     }
 }
 
-/// Builds the immutable auxiliary feature product produced by an encode operation.
+/// Builds the immutable auxiliary feature product produced by an encode call.
 fn encoder_output(
     step: ImageIngestStep,
     limits: &uniserve_core::GenerationLimits,
@@ -287,7 +287,7 @@ fn encoder_output(
 }
 
 /// Builds one immutable image-latent generation. The output remains addressed by its
-/// exact operation identity and logical generation until the scheduler releases
+/// exact call identity and logical generation until the scheduler releases
 /// it after all registered readers have fenced.
 fn latent_output(output_index: u16, bytes: u64, dtype: DType) -> Result<TensorRef, PlanningError> {
     Ok(bounded_tensor(
@@ -298,12 +298,12 @@ fn latent_output(output_index: u16, bytes: u64, dtype: DType) -> Result<TensorRe
 }
 
 /// Builds the actual computation before assigning storage and execution identities.
-fn computation(request: &GenerationRequest, code: Computation) -> ScheduledRequest {
-    ScheduledRequest {
+fn computation(request: &GenerationRequest, code: CallKind) -> Call {
+    Call {
         token_input: None,
 
         request_key: RequestKey::new(0, request.request_id, 0),
-        op_id: ComputationId::new(0, 0),
+        call_id: CallId::new(0, 0),
         predecessor: None,
         coordinates: CallCoordinates::default(),
         entry: "model".into(),
@@ -340,7 +340,7 @@ pub(super) fn plan_prompt(
     start: u32,
     end: u32,
     sampling_state: Option<SamplingState>,
-) -> Result<ScheduledRequest, PlanningError> {
+) -> Result<Call, PlanningError> {
     if start >= end || end as usize > request.prompt_token_ids.len() {
         return Err(PlanningError::InvalidPromptRange {
             start,
@@ -348,16 +348,16 @@ pub(super) fn plan_prompt(
             prompt_tokens: request.prompt_token_ids.len(),
         });
     }
-    let mut operation = computation(request, Computation::Forward(ForwardMode::Prefill));
-    operation.bounds.max_tokens = end.saturating_sub(start);
-    operation.input_token_ids = request.prompt_token_ids[start as usize..end as usize].to_vec();
-    operation.token_output = Some(output_tensor(0, DType::I64));
-    operation.transition_output = sampling_state
+    let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
+    call.bounds.max_tokens = end.saturating_sub(start);
+    call.input_token_ids = request.prompt_token_ids[start as usize..end as usize].to_vec();
+    call.token_output = Some(output_tensor(0, DType::I64));
+    call.transition_output = sampling_state
         .as_ref()
         .is_some_and(|state| !state.transition_token_ids.is_empty())
         .then(|| output_tensor(3, DType::U8));
-    operation.sampling_state = sampling_state;
-    operation.rng = Some(Rng {
+    call.sampling_state = sampling_state;
+    call.rng = Some(Rng {
         seed: request.sampling.seed.unwrap_or(0),
         semantic_index_base: u64::from(end),
         draw_layout: DrawLayout::TargetSampling,
@@ -368,7 +368,7 @@ pub(super) fn plan_prompt(
     } else {
         0
     };
-    finish_plan(request, operation, prompt_positions)
+    finish_plan(request, call, prompt_positions)
 }
 
 /// Plans a sampled continuation; relay inputs leave host token values empty.
@@ -379,32 +379,32 @@ pub(super) fn plan_decode(
     input_token: u32,
     relay_input: bool,
     sampling_state: Option<SamplingState>,
-) -> Result<ScheduledRequest, PlanningError> {
+) -> Result<Call, PlanningError> {
     let draft_count = spec_token_ids.as_ref().map_or(0, Vec::len);
     let code = if draft_count == 0 {
-        Computation::Forward(ForwardMode::Decode)
+        CallKind::Forward(ForwardMode::Decode)
     } else {
-        Computation::Forward(ForwardMode::Verify)
+        CallKind::Forward(ForwardMode::Verify)
     };
-    let mut operation = computation(request, code);
-    operation.bounds.max_tokens = (1 + draft_count).min(u32::MAX as usize) as u32;
-    operation.input_token_ids = match spec_token_ids {
+    let mut call = computation(request, code);
+    call.bounds.max_tokens = (1 + draft_count).min(u32::MAX as usize) as u32;
+    call.input_token_ids = match spec_token_ids {
         Some(drafts) if !drafts.is_empty() => drafts,
         _ if relay_input => Vec::new(),
         _ => vec![input_token],
     };
-    operation.token_output = Some(output_tensor(0, DType::I64));
-    operation.transition_output = sampling_state
+    call.token_output = Some(output_tensor(0, DType::I64));
+    call.transition_output = sampling_state
         .as_ref()
         .is_some_and(|state| !state.transition_token_ids.is_empty())
         .then(|| output_tensor(3, DType::U8));
-    operation.sampling_state = sampling_state;
-    operation.rng = Some(Rng {
+    call.sampling_state = sampling_state;
+    call.rng = Some(Rng {
         seed: request.sampling.seed.unwrap_or(0),
         semantic_index_base: u64::from(logical_position.saturating_add(1)),
         draw_layout: DrawLayout::TargetSampling,
     });
-    finish_plan(request, operation, 0)
+    finish_plan(request, call, 0)
 }
 
 /// Plans a feature write, retaining an exact token count only when the encoder supplies one.
@@ -418,30 +418,30 @@ pub(super) fn plan_image_extend(
     sample_continuation: bool,
     sampling_state: Option<SamplingState>,
     sampling_index: Option<u64>,
-) -> Result<ScheduledRequest, PlanningError> {
+) -> Result<Call, PlanningError> {
     let capacity = encoder.kv_token_capacity(limits)?;
-    let mut operation = computation(request, Computation::Forward(ForwardMode::Prefill));
-    operation.bounds.max_tokens = capacity;
+    let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
+    call.bounds.max_tokens = capacity;
     match encoder.encoder {
-        ImageIngestStep::VitEncode => operation.vision_input = Some(feature),
-        ImageIngestStep::VaeEncode => operation.latent_feature_input = Some(feature),
+        ImageIngestStep::VitEncode => call.vision_input = Some(feature),
+        ImageIngestStep::VaeEncode => call.latent_feature_input = Some(feature),
     }
-    operation.completion_output = feedback.then(|| output_tensor(0, DType::U8));
-    operation.token_output = sample_continuation.then(|| output_tensor(1, DType::I64));
-    operation.transition_output = (sample_continuation
+    call.completion_output = feedback.then(|| output_tensor(0, DType::U8));
+    call.token_output = sample_continuation.then(|| output_tensor(1, DType::I64));
+    call.transition_output = (sample_continuation
         && sampling_state
             .as_ref()
             .is_some_and(|state| !state.transition_token_ids.is_empty()))
     .then(|| output_tensor(3, DType::U8));
-    operation.sampling_state = sampling_state;
-    if operation.token_output.is_some() {
-        operation.rng = sampling_index.map(|semantic_index_base| Rng {
+    call.sampling_state = sampling_state;
+    if call.token_output.is_some() {
+        call.rng = sampling_index.map(|semantic_index_base| Rng {
             seed: request.sampling.seed.unwrap_or(0),
             semantic_index_base,
             draw_layout: DrawLayout::TargetSampling,
         });
     }
-    finish_plan(request, operation, 0)
+    finish_plan(request, call, 0)
 }
 
 /// Encodes host image bytes or an existing device image into a feature tensor.
@@ -452,7 +452,7 @@ pub(super) fn plan_encode(
     image_base64: String,
     source: Option<TensorRef>,
     feedback: bool,
-) -> Result<ScheduledRequest, PlanningError> {
+) -> Result<Call, PlanningError> {
     if feedback {
         if !request.feeds_back_images() || request.image_generation.feedback_source.is_none() {
             return Err(PlanningError::FeedbackDisabled);
@@ -461,19 +461,19 @@ pub(super) fn plan_encode(
         return Err(PlanningError::MissingImageInput);
     }
     let code = match step {
-        ImageIngestStep::VaeEncode => Computation::Pipeline(PipelineStage::LatentEncoding),
-        ImageIngestStep::VitEncode => Computation::Pipeline(PipelineStage::VisionEncoding),
+        ImageIngestStep::VaeEncode => CallKind::Pipeline(PipelineStage::LatentEncoding),
+        ImageIngestStep::VitEncode => CallKind::Pipeline(PipelineStage::VisionEncoding),
     };
-    let mut operation = computation(request, code);
+    let mut call = computation(request, code);
     if source.is_none() && !image_base64.is_empty() {
-        operation.input_image = Some(image_base64.into());
+        call.input_image = Some(image_base64.into());
     }
-    operation.image_input = source;
-    operation.encoder_output = Some(encoder_output(step, limits)?);
+    call.image_input = source;
+    call.encoder_output = Some(encoder_output(step, limits)?);
     if feedback {
-        operation.completion_output = Some(output_tensor(1, DType::U8));
+        call.completion_output = Some(output_tensor(1, DType::U8));
     }
-    finish_plan(request, operation, 0)
+    finish_plan(request, call, 0)
 }
 
 /// Writes the closing token into KV before publication, without sampling another token.
@@ -481,13 +481,13 @@ pub(super) fn plan_close_kv(
     request: &GenerationRequest,
     token: u32,
     relay_input: bool,
-) -> Result<ScheduledRequest, PlanningError> {
-    let mut operation = computation(request, Computation::Forward(ForwardMode::Prefill));
+) -> Result<Call, PlanningError> {
+    let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
     if !relay_input {
-        operation.input_token_ids.push(token);
+        call.input_token_ids.push(token);
     }
-    operation.completion_output = Some(output_tensor(0, DType::U8));
-    finish_plan(request, operation, 0)
+    call.completion_output = Some(output_tensor(0, DType::U8));
+    finish_plan(request, call, 0)
 }
 
 /// Declares the physically visible KV range as a transferable input to diffusion.
@@ -495,23 +495,23 @@ pub(super) fn plan_kv_publish(
     kv_bytes_per_token: u64,
     request: &GenerationRequest,
     physical_kv_len: u32,
-) -> Result<ScheduledRequest, PlanningError> {
+) -> Result<Call, PlanningError> {
     if physical_kv_len == 0 || kv_bytes_per_token == 0 {
         return Err(PlanningError::MissingProductBound);
     }
-    let mut operation = computation(request, Computation::Transfer(TransferMode::KvPublish));
-    operation.bounds.max_tokens = 0;
-    operation.bounds.max_transfer_bytes = kv_bytes_per_token
+    let mut call = computation(request, CallKind::Transfer(TransferMode::KvPublish));
+    call.bounds.max_tokens = 0;
+    call.bounds.max_transfer_bytes = kv_bytes_per_token
         .checked_mul(u64::from(physical_kv_len))
         .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
-    operation.kv_output = Some(BufferId {
-        owner: operation.request_key,
-        producer_op_id: operation.op_id,
+    call.kv_output = Some(BufferId {
+        owner: call.request_key,
+        producer_call_id: call.call_id,
         output_index: 0,
         generation: 0,
     });
-    operation.completion_output = Some(output_tensor(1, DType::U8));
-    finish_plan(request, operation, 0)
+    call.completion_output = Some(output_tensor(1, DType::U8));
+    finish_plan(request, call, 0)
 }
 
 /// Creates initial noise from the image's deterministic RNG coordinate and conditioning.
@@ -521,27 +521,27 @@ pub(super) fn plan_diffusion_prepare(
     request: &GenerationRequest,
     image_id: u32,
     conditioning: BufferId,
-) -> Result<ScheduledRequest, PlanningError> {
+) -> Result<Call, PlanningError> {
     if !request.generates_images() {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let mut operation = computation(
+    let mut call = computation(
         request,
-        Computation::Pipeline(PipelineStage::LatentPreparation),
+        CallKind::Pipeline(PipelineStage::LatentPreparation),
     );
-    operation.kv_input = Some(conditioning);
-    operation.latent_output = Some(latent_output(
+    call.kv_input = Some(conditioning);
+    call.latent_output = Some(latent_output(
         0,
         request.image_latent_bytes(limits)?,
         latent_dtype.ok_or(PlanningError::MissingLatentDType)?,
     )?);
-    operation.completion_output = Some(output_tensor(1, DType::U8));
-    operation.rng = Some(Rng {
+    call.completion_output = Some(output_tensor(1, DType::U8));
+    call.rng = Some(Rng {
         seed: request.image.seed.unwrap_or(0),
         semantic_index_base: u64::from(image_id),
         draw_layout: DrawLayout::FlowNoise,
     });
-    finish_plan(request, operation, 0)
+    finish_plan(request, call, 0)
 }
 
 /// Plans an exact denoising interval against its input latent and conditioning tensors.
@@ -552,72 +552,72 @@ pub(super) fn plan_diffusion_step(
     step_count: u16,
     conditioning: BufferId,
     latent: TensorRef,
-) -> Result<ScheduledRequest, PlanningError> {
+) -> Result<Call, PlanningError> {
     if !request.generates_images() {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let mut operation = computation(request, Computation::Pipeline(PipelineStage::Denoising));
-    operation.bounds.max_tokens = u32::from(step_count.max(1));
-    operation.kv_input = Some(conditioning);
-    operation.latent_input = Some(latent);
-    operation.latent_output = Some(latent_output(
+    let mut call = computation(request, CallKind::Pipeline(PipelineStage::Denoising));
+    call.bounds.max_tokens = u32::from(step_count.max(1));
+    call.kv_input = Some(conditioning);
+    call.latent_input = Some(latent);
+    call.latent_output = Some(latent_output(
         0,
         request.image_latent_bytes(limits)?,
         latent_dtype.ok_or(PlanningError::MissingLatentDType)?,
     )?);
-    operation.completion_output = Some(output_tensor(1, DType::U8));
-    finish_plan(request, operation, 0)
+    call.completion_output = Some(output_tensor(1, DType::U8));
+    finish_plan(request, call, 0)
 }
 
 /// Decodes the final latent and declares public image bytes and optional feedback data.
 pub(super) fn plan_diffusion_finalize(
     request: &GenerationRequest,
     latent: TensorRef,
-) -> Result<ScheduledRequest, PlanningError> {
+) -> Result<Call, PlanningError> {
     if !request.generates_images() {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let mut operation = computation(request, Computation::Pipeline(PipelineStage::ImageDecoding));
-    operation.latent_input = Some(latent);
-    operation.image_output = feedback_image_output(request)?;
-    operation.completion_output = Some(output_tensor(2, DType::U8));
-    finish_plan(request, operation, 0)
+    let mut call = computation(request, CallKind::Pipeline(PipelineStage::ImageDecoding));
+    call.latent_input = Some(latent);
+    call.image_output = feedback_image_output(request)?;
+    call.completion_output = Some(output_tensor(2, DType::U8));
+    finish_plan(request, call, 0)
 }
 
 /// Derives storage bounds directly from the computation's actual inputs and outputs.
 fn finish_plan(
     request: &GenerationRequest,
-    mut operation: ScheduledRequest,
+    mut call: Call,
     prompt_positions: u32,
-) -> Result<ScheduledRequest, PlanningError> {
-    let max_latent_bytes = operation
+) -> Result<Call, PlanningError> {
+    let max_latent_bytes = call
         .encoder_output
         .iter()
-        .chain(operation.latent_output.iter())
-        .chain(operation.image_output.iter())
+        .chain(call.latent_output.iter())
+        .chain(call.image_output.iter())
         .map(TensorRef::max_bytes)
         .max()
         .unwrap_or(0);
     let image_completion_bytes =
-        if operation.code == Computation::Pipeline(PipelineStage::ImageDecoding) {
+        if call.code == CallKind::Pipeline(PipelineStage::ImageDecoding) {
             png_base64_bound(request.image.width, request.image.height)?
         } else {
             0
         };
-    let logprob_bytes = if operation.token_output.is_some() {
+    let logprob_bytes = if call.token_output.is_some() {
         logprob_result_bytes(&request.sampling, prompt_positions)?.unwrap_or(0)
     } else {
         0
     };
-    let max_transfer_bytes = operation.bounds.max_transfer_bytes;
-    operation.bounds = Bounds {
-        max_tokens: operation.bounds.max_tokens,
+    let max_transfer_bytes = call.bounds.max_transfer_bytes;
+    call.bounds = Bounds {
+        max_tokens: call.bounds.max_tokens,
         max_kv_pages: 0,
         max_latent_bytes,
         max_completion_bytes: logprob_bytes.saturating_add(image_completion_bytes),
         max_transfer_bytes,
     };
-    Ok(operation)
+    Ok(call)
 }
 
 /// Declares the device image retained for a subsequent feedback encoder.
@@ -643,7 +643,7 @@ fn feedback_image_output(request: &GenerationRequest) -> Result<Option<TensorRef
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-/// Failure while constructing the next worker operation.
+/// Failure while constructing the next worker call.
 pub(crate) enum PlanningError {
     #[error(transparent)]
     Capacity(#[from] uniserve_core::GenerationResourceError),
@@ -671,19 +671,19 @@ pub(crate) enum PlanningError {
 
 /// Assigns final identities to the selected computation and its allocated outputs.
 /// Identity exhaustion is checked before changing the shared generation counter.
-pub(super) fn register_operation(
-    operation: &mut ScheduledRequest,
+pub(super) fn register_call(
+    call: &mut Call,
     request_key: RequestKey,
-    predecessor: ComputationId,
+    predecessor: CallId,
     next_product_generation: &mut u64,
 ) -> Result<(), PlanningError> {
-    let op_id = operation.op_id;
-    let required_generations = operation
+    let call_id = call.call_id;
+    let required_generations = call
         .tensor_outputs()
         .filter(|product| product.generation == 0)
         .count()
         + usize::from(
-            operation
+            call
                 .kv_output
                 .is_some_and(|output| output.generation == 0),
         );
@@ -702,18 +702,18 @@ pub(super) fn register_operation(
         *next_product_generation = u64::from(generation) + 1;
         generation
     };
-    operation.request_key = request_key;
-    operation.predecessor = Some(predecessor);
-    if let Some(output) = &mut operation.kv_output {
+    call.request_key = request_key;
+    call.predecessor = Some(predecessor);
+    if let Some(output) = &mut call.kv_output {
         output.owner = request_key;
-        output.producer_op_id = op_id;
+        output.producer_call_id = call_id;
         if output.generation == 0 {
             output.generation = acquire_generation();
         }
     }
-    for product in operation.tensor_outputs_mut() {
+    for product in call.tensor_outputs_mut() {
         product.request_key = request_key;
-        product.producer_op_id = op_id;
+        product.producer_call_id = call_id;
         if product.generation == 0 {
             product.generation = acquire_generation();
         }
@@ -723,7 +723,7 @@ pub(super) fn register_operation(
 
 /// Validates a result against submitted inputs and immutable request limits.
 pub(crate) fn validate_generation_result(
-    operation: &ScheduledRequest,
+    call: &Call,
     image_kv: Option<(u32, Option<u32>)>,
     start_step: Option<u32>,
     state: &super::RequestState,
@@ -731,18 +731,18 @@ pub(crate) fn validate_generation_result(
     media: Option<&uniserve_core::SharedMedia>,
 ) -> Result<(), GenerationResultError> {
     let request = &state.req;
-    if record.request_key != operation.request_key {
+    if record.request_key != call.request_key {
         return Err(GenerationResultError::Identity {
             detail: "request_mismatch",
         });
     }
-    if operation.op_id.batch_id == 0 || record.op_id != operation.op_id {
+    if call.call_id.batch_id == 0 || record.call_id != call.call_id {
         return Err(GenerationResultError::Identity {
-            detail: "operation_id_mismatch",
+            detail: "call_id_mismatch",
         });
     }
-    if record.status == OpStatus::Predicated {
-        if operation.predicate.as_ref().is_none()
+    if record.status == CallStatus::Predicated {
+        if call.predicate.as_ref().is_none()
             || !record.committed_tokens.as_slice().is_empty()
             || !record.product_generations.is_empty()
         {
@@ -752,18 +752,18 @@ pub(crate) fn validate_generation_result(
         }
         return Ok(());
     }
-    let operation_variant = operation.code;
-    if record.status != OpStatus::Ok {
+    let call_variant = call.code;
+    if record.status != CallStatus::Ok {
         return Err(GenerationResultError::Status {
-            detail: "operation_failed",
+            detail: "call_failed",
         });
     }
-    if operation.code == Computation::Pipeline(PipelineStage::Denoising) {
+    if call.code == CallKind::Pipeline(PipelineStage::Denoising) {
         let expected_step = start_step
             .ok_or(GenerationResultError::Progress {
                 detail: "denoise_input_step_missing",
             })?
-            .saturating_add(operation.bounds.max_tokens);
+            .saturating_add(call.bounds.max_tokens);
         if record.num_completed_steps != expected_step {
             return Err(GenerationResultError::Progress {
                 detail: "denoise_step_mismatch",
@@ -774,7 +774,7 @@ pub(crate) fn validate_generation_result(
         .product_generations
         .iter()
         .copied()
-        .eq(operation.tensor_outputs().map(|tensor| tensor.generation))
+        .eq(call.tensor_outputs().map(|tensor| tensor.generation))
     {
         return Err(GenerationResultError::Product {
             detail: "tensor_generation_mismatch",
@@ -783,8 +783,8 @@ pub(crate) fn validate_generation_result(
     // Read the PNG header to check the requested dimensions. Full image
     // decoding belongs to the image consumer, outside result processing.
     let image_png = media.and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
-    if operation_variant == Computation::Pipeline(PipelineStage::ImageDecoding) {
-        if media.is_some_and(|value| value.len() as u64 > operation.bounds.max_completion_bytes) {
+    if call_variant == CallKind::Pipeline(PipelineStage::ImageDecoding) {
+        if media.is_some_and(|value| value.len() as u64 > call.bounds.max_completion_bytes) {
             return Err(GenerationResultError::Product {
                 detail: "image_capacity_exceeded",
             });
@@ -801,14 +801,14 @@ pub(crate) fn validate_generation_result(
             });
         }
     }
-    if consumes_image_features(operation) {
+    if consumes_image_features(call) {
         let (start, num_kv_tokens) = image_kv.ok_or(GenerationResultError::Progress {
             detail: "image_kv_input_missing",
         })?;
         let actual = record.kv_visible_len;
         if num_kv_tokens.is_some_and(|tokens| actual != start.saturating_add(tokens))
             || (num_kv_tokens.is_none()
-                && (actual < start || actual > start.saturating_add(operation.bounds.max_tokens)))
+                && (actual < start || actual > start.saturating_add(call.bounds.max_tokens)))
         {
             return Err(GenerationResultError::Progress {
                 detail: "image_kv_mismatch",
@@ -816,8 +816,8 @@ pub(crate) fn validate_generation_result(
         }
     }
     let sampled_tokens = record.committed_tokens.as_slice();
-    let produces_token = operation.token_output.is_some();
-    let allowed_tokens = operation
+    let produces_token = call.token_output.is_some();
+    let allowed_tokens = call
         .sampling_state
         .as_ref()
         .and_then(|sampling| sampling.allowed_token_ids.as_deref())
@@ -832,8 +832,8 @@ pub(crate) fn validate_generation_result(
             detail: "missing_sampled_token",
         });
     }
-    if operation_variant == Computation::Forward(ForwardMode::Verify) {
-        let drafts = operation.input_token_ids.as_slice();
+    if call_variant == CallKind::Forward(ForwardMode::Verify) {
+        let drafts = call.input_token_ids.as_slice();
         let listed = record.committed_tokens.as_slice();
         let terminal_prefix = !listed.is_empty()
             && listed.len() <= drafts.len()
@@ -854,8 +854,8 @@ pub(crate) fn validate_generation_result(
         }
     }
     if produces_token {
-        let max_tokens = if operation_variant == Computation::Forward(ForwardMode::Verify) {
-            operation.bounds.max_tokens as usize
+        let max_tokens = if call_variant == CallKind::Forward(ForwardMode::Verify) {
+            call.bounds.max_tokens as usize
         } else {
             1
         };
@@ -880,10 +880,10 @@ pub(crate) fn validate_generation_result(
         produces_token
             && request.sampling.generated_logprobs_requested()
             && matches!(
-                operation_variant,
-                Computation::Forward(ForwardMode::Prefill)
-                    | Computation::Forward(ForwardMode::Decode)
-                    | Computation::Forward(ForwardMode::Verify)
+                call_variant,
+                CallKind::Forward(ForwardMode::Prefill)
+                    | CallKind::Forward(ForwardMode::Decode)
+                    | CallKind::Forward(ForwardMode::Verify)
             ),
         sampled_token,
         generated_candidates.is_empty(),
@@ -920,11 +920,11 @@ pub(crate) fn validate_generation_result(
     // Prefill's sampling coordinate is its exclusive prompt-token end, so
     // the first input can be identified even while a cancelled request drains.
     let prompt_tokens =
-        (is_prompt_extend(operation) && request.sampling.prompt_logprobs_requested()).then(|| {
-            &operation.input_token_ids[usize::from(
-                operation.rng.as_ref().is_some_and(|rng| {
-                    rng.semantic_index_base == operation.input_token_ids.len() as u64
-                }) && !operation.input_token_ids.is_empty(),
+        (is_prompt_extend(call) && request.sampling.prompt_logprobs_requested()).then(|| {
+            &call.input_token_ids[usize::from(
+                call.rng.as_ref().is_some_and(|rng| {
+                    rng.semantic_index_base == call.input_token_ids.len() as u64
+                }) && !call.input_token_ids.is_empty(),
             )..]
         });
     match (
@@ -973,9 +973,9 @@ pub(crate) fn validate_generation_result(
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 /// Invalid execution identity, numerical result, or produced value.
 pub(crate) enum GenerationResultError {
-    #[error("operation has no registered identity")]
-    MissingOperationId,
-    #[error("generation operation produced no latent product")]
+    #[error("call has no registered identity")]
+    MissingCallId,
+    #[error("generation call produced no latent product")]
     MissingLatentProduct,
     #[error("worker status invalid: {detail}")]
     Status { detail: &'static str },
@@ -1001,7 +1001,7 @@ impl GenerationResultError {
             | Self::Product { detail }
             | Self::Token { detail }
             | Self::Logprob { detail } => detail,
-            Self::MissingOperationId => "missing_operation_id",
+            Self::MissingCallId => "missing_call_id",
             Self::MissingLatentProduct => "missing_latent_product",
         }
     }

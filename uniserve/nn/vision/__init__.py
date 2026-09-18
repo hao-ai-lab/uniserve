@@ -1,4 +1,4 @@
-"""Shared spatial embedding and coordinate operations."""
+"""Shared spatial embedding and coordinate calls."""
 
 from .modules import MLPConnector, PatchEmbed
 from .position import PositionEmbedding

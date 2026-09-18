@@ -186,7 +186,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         self.prepared_inputs.move_to_end(key)
         return self.prepared_inputs[key]
 
-    def _operation(self, inputs, schedules, state, key):
+    def _call(self, inputs, schedules, state, key):
         if self._closed:
             raise RuntimeError("denoising runner is closed")
         context = self.prepared_inputs[key]
@@ -212,16 +212,14 @@ class DenoisingRunner(Generic[InputT, SizeT]):
 
         its samples.
         """
-        context, operation = self._operation(
-            inputs, schedules, state, input_key
-        )
+        context, call = self._call(inputs, schedules, state, input_key)
         if context.stream is not None:
             context.stream.wait_stream(torch.cuda.current_stream(self.device))
 
         with context.activate():
             restore = restore_samples(inputs)
             try:
-                operation()
+                call()
             finally:
                 restore()
 
@@ -306,7 +304,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                             for name, values in inputs.latents.items()
                         },
                     )
-                    operation = DenoisingStep(
+                    call = DenoisingStep(
                         self.model,
                         bound,
                         staged[0],
@@ -315,7 +313,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                         context.workspace,
                     )
                     restore = restore_samples(inputs)
-                graph.capture(operation, restore=restore)
+                graph.capture(call, restore=restore)
             except BaseException:
                 graph.close()
                 raise
@@ -364,11 +362,9 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         the worker separately commits request progress.
         """
         if self.capture_stream is None:
-            context, operation = self._operation(
-                inputs, schedules, state, input_key
-            )
+            context, call = self._call(inputs, schedules, state, input_key)
             with context.activate():
-                return operation(), "eager"
+                return call(), "eager"
 
         graph, staged, temporal, context, captured = self._resident_ladder(
             inputs, schedules, state=state, slot=slot, input_key=input_key

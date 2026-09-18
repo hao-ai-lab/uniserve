@@ -1,4 +1,4 @@
-//! Worker identity, supported operations, and startup capacity handshake.
+//! Worker identity, supported calls, and startup capacity handshake.
 
 use super::*;
 
@@ -167,11 +167,11 @@ pub struct WorkerInfo {
     /// Finalized component membership and logical degrees.
     #[serde(default)]
     pub components: Vec<EntryInfo>,
-    /// Operation families accepted by the worker.
-    pub supported_ops: Vec<Computation>,
+    /// Call families accepted by the worker.
+    pub supported_ops: Vec<CallKind>,
     /// Maximum unresolved physical runs.
     pub queue_depth: u32,
-    /// Maximum operations in one run.
+    /// Maximum calls in one run.
     pub max_batch_ops: u32,
     /// Maximum text tokens represented in one run.
     pub max_batch_tokens: u32,
@@ -189,7 +189,7 @@ pub struct WorkerInfo {
     pub encoder_cache_entries: u32,
     /// Maximum bytes in one encoder feature product, independent of pool size.
     pub encoder_entry_bytes: u64,
-    /// Maximum unresolved operations per request lineage.
+    /// Maximum unresolved calls per request lineage.
     pub max_unresolved_ops: u32,
     /// Concurrent host-lane tasks this rank's bounded host executor admits.
     #[serde(default)]
@@ -223,7 +223,7 @@ impl WorkerInfo {
         self.kv_cache.is_some()
     }
 
-    /// Validates worker identity, capacity, operation, and rank invariants.
+    /// Validates worker identity, capacity, call, and rank invariants.
     pub fn validate(&self) -> ValidationResult<()> {
         self.endpoint.validate()?;
         ensure_valid!(
@@ -310,7 +310,7 @@ impl WorkerInfo {
                         self.pipeline_components
                             .get(stage)
                             .is_some_and(|entry| !entry.is_empty())
-                            && self.supported_ops.contains(&Computation::Pipeline(*stage))
+                            && self.supported_ops.contains(&CallKind::Pipeline(*stage))
                     }),
                 "video components or diffusion step count are incomplete"
             );
@@ -323,13 +323,13 @@ impl WorkerInfo {
             "worker info declare a zero scheduling bound"
         );
         ensure_valid!(self.queue_depth > 0, "worker queue depth must be positive");
-        // Advertised operation families require their corresponding pools.
+        // Advertised call families require their corresponding pools.
         let requires_kv = self.supported_ops.iter().any(|variant| {
             matches!(
                 variant,
-                Computation::Forward(ForwardMode::Prefill)
-                    | Computation::Forward(ForwardMode::Decode)
-                    | Computation::Forward(ForwardMode::Verify)
+                CallKind::Forward(ForwardMode::Prefill)
+                    | CallKind::Forward(ForwardMode::Decode)
+                    | CallKind::Forward(ForwardMode::Verify)
             )
         });
         ensure_valid!(
@@ -372,8 +372,8 @@ impl Default for WorkerInfo {
             configuration_id: String::new(),
             components: Vec::new(),
             supported_ops: vec![
-                Computation::Forward(ForwardMode::Prefill),
-                Computation::Forward(ForwardMode::Decode),
+                CallKind::Forward(ForwardMode::Prefill),
+                CallKind::Forward(ForwardMode::Decode),
             ],
             queue_depth: 1,
             max_batch_ops: 1,

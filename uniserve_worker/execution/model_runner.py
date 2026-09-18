@@ -53,20 +53,20 @@ from uniserve_worker.foundation.errors import (
     classify,
     invalid_descriptor,
 )
-from uniserve_worker.protocol.identity import ComputationId
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
+    Call,
     ForwardMode,
     ImageParams,
     PipelineStage,
-    ScheduledRequest,
 )
+from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.runtime.results import resolve_outputs
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
 from ..bootstrap.components import (
     bind_components,
-    call_operations,
+    call_kinds,
     describe_components,
 )
 from ..bootstrap.config import ComponentConfig
@@ -260,7 +260,7 @@ class ModelRunner:
                             device=device,
                         )
 
-                    if not call_operations((call,)):
+                    if not call_kinds((call,)):
                         continue
                     key = (name, call.path, call.entry.method)
                     self._module_entries[key] = (binding, call)
@@ -330,7 +330,7 @@ class ModelRunner:
         calls = [
             call
             for _, call in self._module_entries.values()
-            if kind in call_operations((call,))
+            if kind in call_kinds((call,))
             and (
                 capability_type is None
                 or isinstance(call.module, capability_type)
@@ -349,11 +349,11 @@ class ModelRunner:
         """
         entries = [
             (binding, call)
-            for (entry, _, operation), (
+            for (entry, _, entry_method), (
                 binding,
                 call,
             ) in self._module_entries.items()
-            if entry == name and (method is None or operation == method)
+            if entry == name and (method is None or entry_method == method)
         ]
         if len(entries) != 1:
             raise InputError(
@@ -413,15 +413,15 @@ class ModelRunner:
         self._initialize_streams(event_slots=2)
         key = (name, call.path, call.entry.method)
         if key not in self._module_streams:
-            # A standalone entry forks the lane stream that covers its
-            # computations, or creates a full-device stream when lanes are off.
-            computations = call_operations((call,))
+            # A standalone entry forks the lane stream that covers its call
+            # kinds, or creates a full-device stream when lanes are off.
+            entry_kinds = call_kinds((call,))
             parents = tuple(
                 stream
                 for lane, stream in self._lane_streams
                 if stream.device == binding.device
                 and (
-                    lane is None or computations.intersection(lane.computations)
+                    lane is None or entry_kinds.intersection(lane.call_kinds)
                 )
             )
             if len(parents) > 1:
@@ -454,41 +454,37 @@ class ModelRunner:
             self._module_streams[key] = owner
         return self._module_streams[key].stream
 
-    def operation_stream(self, operation):
+    def call_stream(self, call):
         """Select a standalone capability's stream.
 
         staged batches bind their own lanes.
         """
-        if (operation.entry, operation.kind) in self._forward_entries:
+        if (call.entry, call.kind) in self._forward_entries:
             return None
         if (
-            operation.kind is PipelineStage.LATENT_PREPARATION
-            and (operation.entry, PipelineStage.DENOISING)
-            in self._forward_entries
+            call.kind is PipelineStage.LATENT_PREPARATION
+            and (call.entry, PipelineStage.DENOISING) in self._forward_entries
         ):
             return None
         calls = tuple(
             call
             for (name, _, _), (_, call) in self._module_entries.items()
-            if name == operation.entry
-            and operation.kind in call_operations((call,))
+            if name == call.entry and call.kind in call_kinds((call,))
         )
         if not calls:
             return None
 
-        if operation.kind is PipelineStage.LATENT_PREPARATION:
+        if call.kind is PipelineStage.LATENT_PREPARATION:
             # Preparation composes the denoiser's initialization with optional
-            # conditioning encoders. The denoiser owns this operation's stream;
+            # conditioning encoders. The denoiser owns this call's stream;
             # its encoder calls retain their ordinary input/output dependencies.
             calls = tuple(
                 call for call in calls if isinstance(call.module, Denoiser)
             )
 
         if len(calls) != 1:
-            raise InputError(
-                "operation requires one bound numerical capability"
-            )
-        return self.module_stream(operation.entry, method=calls[0].entry.method)
+            raise InputError("call requires one bound numerical capability")
+        return self.module_stream(call.entry, method=calls[0].entry.method)
 
     def _initialize_streams(self, *, event_slots):
         """Realize execution grants for both staged and standalone.
@@ -724,7 +720,7 @@ class ModelRunner:
     def output_layout(
         self, entry, output_index, media, decode, num_prompt_tokens
     ):
-        """Resolve the published layout of one operation output on this rank.
+        """Resolve the published layout of one call output on this rank.
 
         Returns None for outputs this rank does not publish: non-output ranks,
         degenerate denoiser slices, and empty temporal-unit shares of a
@@ -799,7 +795,7 @@ class ModelRunner:
         kv_cache,
         latent_pool,
         decode_predicates,
-        max_operations,
+        max_calls,
         request_slots,
         max_tokens,
         latent_capacity_units,
@@ -829,7 +825,7 @@ class ModelRunner:
         config = self.worker_config
         self._initialize_streams(event_slots=max_inflight + 1)
 
-        max_rows = min(max_operations, request_slots)
+        max_rows = min(max_calls, request_slots)
         decode_sizes = tuple(
             value
             for value in config.decode_graph_batch_sizes
@@ -853,7 +849,7 @@ class ModelRunner:
                 config.flow_graph_shapes,
                 config.flow_graph_batch_sizes,
                 self.flow_cfg_branches,
-                max_operations=max_rows,
+                max_calls=max_rows,
                 max_tokens=input_config.max_tokens,
                 per_image_capacity=latent_capacity_units,
                 latent_capacity=latent_pool.capacity_units,
@@ -884,13 +880,13 @@ class ModelRunner:
             placement,
             call,
         ) in self._module_entries.items():
-            operations = call_operations((call,)) & staged
-            if not operations:
+            staged_kinds = call_kinds((call,)) & staged
+            if not staged_kinds:
                 continue
 
             target = (
                 canonical_device(config.generation_device or config.device)
-                if operations
+                if staged_kinds
                 & {PipelineStage.LATENT_ENCODING, PipelineStage.IMAGE_DECODING}
                 else placement.device
             )
@@ -901,9 +897,9 @@ class ModelRunner:
             ]
             for lane, stream in streams or ((None, None),):
                 kinds = (
-                    operations
+                    staged_kinds
                     if lane is None
-                    else operations.intersection(lane.computations)
+                    else staged_kinds.intersection(lane.call_kinds)
                 )
                 if not kinds:
                     continue
@@ -911,7 +907,7 @@ class ModelRunner:
                 rows = (
                     max_rows
                     if lane is None
-                    else min(max_rows, lane.max_batch_operations or max_rows)
+                    else min(max_rows, lane.max_batch_calls or max_rows)
                 )
                 tokens = (
                     input_config.max_tokens
@@ -957,7 +953,7 @@ class ModelRunner:
                     placement.mesh,
                     target,
                     calls=(call,),
-                    computations=tuple(kinds),
+                    call_kinds=tuple(kinds),
                     cuda_stream=stream,
                 )
                 try:
@@ -1296,20 +1292,20 @@ class ModelRunner:
             ),
         )
 
-    def operation_devices(self, operation):
-        """Return ``(compute, staged, output)`` devices for one operation.
+    def call_devices(self, call):
+        """Return ``(compute, staged, output)`` devices for one call.
 
         Media-generation kinds run on the generation device when one is
         configured. The staged device is the bound execution entry's device,
-        or the compute device when the operation has no staged binding.
+        or the compute device when the call has no staged binding.
         """
-        binding = self.bindings.get(operation.entry)
+        binding = self.bindings.get(call.entry)
         source = (
             canonical_device(self.worker_config.device)
             if binding is None
             else binding.device
         )
-        if self.image_builder is not None and operation.kind in {
+        if self.image_builder is not None and call.kind in {
             PipelineStage.LATENT_PREPARATION,
             PipelineStage.DENOISING,
             PipelineStage.IMAGE_DECODING,
@@ -1319,7 +1315,7 @@ class ModelRunner:
                 or self.worker_config.device
             )
 
-        entry = self._forward_entries.get((operation.entry, operation.kind))
+        entry = self._forward_entries.get((call.entry, call.kind))
         return source, source if entry is None else entry.device, source
 
     def warmup(self, storage):
@@ -1352,7 +1348,7 @@ class ModelRunner:
                 forward = partial(self.batch_forward, entry)
                 if (
                     phase == "prefill"
-                    and ForwardMode.PREFILL in entry.computations
+                    and ForwardMode.PREFILL in entry.call_kinds
                 ):
                     shapes = (
                         self.prefill_shapes[entry]
@@ -1365,12 +1361,12 @@ class ModelRunner:
                     )
                 elif (
                     phase == "decode"
-                    and ForwardMode.DECODE in entry.computations
+                    and ForwardMode.DECODE in entry.call_kinds
                 ):
                     prepare_decode(self, entry, entry.input_buffers, forward)
                 elif (
                     phase == "flow"
-                    and PipelineStage.DENOISING in entry.computations
+                    and PipelineStage.DENOISING in entry.call_kinds
                 ):
                     from .flow import prepare_flow
 
@@ -1430,7 +1426,7 @@ class ModelRunner:
     def close_graphs(self):
         """The caller drains all borrowed output readers before this.
 
-        operation.
+        call.
         """
         actions = [
             graph.graph.close
@@ -1516,7 +1512,7 @@ class ModelRunner:
 
         then join device order.
 
-        Sources and destinations must remain reserved through this operation's
+        Sources and destinations must remain reserved through this call's
         physical completion. The final stream wait also covers failed compute,
         so completion and request retirement cannot overtake the input copies.
         """
@@ -1551,17 +1547,15 @@ class ModelRunner:
             )
 
     def image_processor(self) -> ImageProcessor:
-        """Require image preprocessing settings for the active operation."""
+        """Require image preprocessing settings for the active call."""
         value = self.processor
         if not isinstance(value, ImageProcessor):
-            raise invalid_descriptor(
-                "operation requires model image processing"
-            )
+            raise invalid_descriptor("call requires model image processing")
         return value
 
     def forward(
         self,
-        tasks: tuple[tuple[ForwardRow, ScheduledRequest], ...],
+        tasks: tuple[tuple[ForwardRow, Call], ...],
         *,
         cache: CacheManager | None,
         tables: BlockTables | None,
@@ -1572,7 +1566,7 @@ class ModelRunner:
         yielding results at their original indexes.
 
         A failed model call identifies every participating row. The caller owns
-        completion groups and decides which dependent operations to suppress.
+        completion groups and decides which dependent calls to suppress.
         Fatal failures propagate immediately because later device work is
         unsafe.
         """
@@ -1580,16 +1574,14 @@ class ModelRunner:
         # one homogeneous numerical call.
         grouped: dict[tuple[object, ...], list[int]] = defaultdict(list)
         bindings: dict[int, ModelEntry] = {}
-        for index, (task, operation) in enumerate(tasks):
-            entry = self._forward_entries.get(
-                (operation.entry, task.forward_mode)
-            )
+        for index, (task, call) in enumerate(tasks):
+            entry = self._forward_entries.get((call.entry, task.forward_mode))
             if entry is None:
                 yield (
                     (index,),
                     invalid_descriptor(
-                        f"execution has no {operation.kind.value!r} binding "
-                        f"for {operation.entry!r}"
+                        f"execution has no {call.kind.value!r} binding "
+                        f"for {call.entry!r}"
                     ),
                 )
                 continue
@@ -1612,7 +1604,7 @@ class ModelRunner:
                 forward_started = time.perf_counter_ns()
                 result = self.run_forward_group(
                     rows,
-                    operations=tuple(tasks[index][1] for index in indexes),
+                    calls=tuple(tasks[index][1] for index in indexes),
                     cache=cache,
                     tables=tables,
                     states=states,
@@ -1659,7 +1651,7 @@ class ModelRunner:
         self,
         rows: tuple[ForwardRow, ...],
         *,
-        operations: tuple[ScheduledRequest, ...],
+        calls: tuple[Call, ...],
         cache: CacheManager | None,
         tables: BlockTables | None,
         states: DecodeState | None,
@@ -1681,27 +1673,27 @@ class ModelRunner:
         modes = frozenset(task.forward_mode for task in tasks)
         if len(modes) != 1:
             raise ValueError(
-                "one numerical call requires homogeneous computations"
+                "one numerical call requires homogeneous call kinds"
             )
         forward_mode = next(iter(modes))
 
-        operation_keys = tuple(
+        call_keys = tuple(
             (
-                operation.request_key.engine_id,
-                operation.request_key.request_id,
-                operation.request_key.request_epoch,
-                operation.op_id,
+                call.request_key.engine_id,
+                call.request_key.request_id,
+                call.request_key.request_epoch,
+                call.call_id,
             )
-            for operation in operations
+            for call in calls
         )
-        entry = self._forward_entries.get((operations[0].entry, forward_mode))
+        entry = self._forward_entries.get((calls[0].entry, forward_mode))
         if entry is None:
             raise InputError(
-                f"model runner has no {operations[0].kind.value!r} binding "
-                f"for {operations[0].entry!r}",
+                f"model runner has no {calls[0].kind.value!r} binding "
+                f"for {calls[0].entry!r}",
                 phase="input_staging",
                 route=forward_mode.value,
-                operations=operation_keys,
+                calls=call_keys,
             )
 
         target = entry.device
@@ -1713,7 +1705,7 @@ class ModelRunner:
         # timeline, so the range opens before input staging.
         with profile_range(
             f"uniserve.model.forward rank={self.worker_config.rank} "
-            f"work={operations[0].entry}.{forward_mode.value}"
+            f"work={calls[0].entry}.{forward_mode.value}"
         ):
             try:
                 if lane_runtime is not None:
@@ -1738,9 +1730,7 @@ class ModelRunner:
                 )
                 if output_event is not None:
                     torch.cuda.current_stream(target).wait_event(output_event)
-                raise _input_failure(
-                    error, forward_mode, operation_keys
-                ) from error
+                raise _input_failure(error, forward_mode, call_keys) from error
 
             def invoke(value: InputBatch) -> ExecutionOutput:
                 return self.batch_forward(entry, value)
@@ -1801,7 +1791,7 @@ class ModelRunner:
                 if output_event is not None:
                     torch.cuda.current_stream(target).wait_event(output_event)
                 raise _execution_failure(
-                    error, forward_mode, operation_keys
+                    error, forward_mode, call_keys
                 ) from error
 
 
@@ -1853,9 +1843,9 @@ def _validate_outputs(
 def _input_failure(
     error: BaseException,
     forward_mode: ForwardMode | PipelineStage,
-    operations: tuple[tuple[int, int, int, ComputationId], ...],
+    calls: tuple[tuple[int, int, int, CallId], ...],
 ) -> InputError:
-    """Classify invalid model inputs with their phase and operation.
+    """Classify invalid model inputs with their phase and call.
 
     identities.
     """
@@ -1865,16 +1855,16 @@ def _input_failure(
         str(error) or type(error).__name__,
         phase="input_staging",
         route=forward_mode.value,
-        operations=operations,
+        calls=calls,
     )
 
 
 def _execution_failure(
     error: BaseException,
     forward_mode: ForwardMode | PipelineStage,
-    operations: tuple[tuple[int, int, int, ComputationId], ...],
+    calls: tuple[tuple[int, int, int, CallId], ...],
 ) -> WorkerError:
-    """Classify a model failure and attach the active phase and operation.
+    """Classify a model failure and attach the active phase and call.
 
     identities.
     """
@@ -1889,12 +1879,12 @@ def _execution_failure(
             str(error) or type(error).__name__,
             phase="graph_or_device",
             route=forward_mode.value,
-            operations=operations,
+            calls=calls,
             fatal=classified.fatal,
         )
     return ComputeError(
         str(error) or type(error).__name__,
         phase="neural_execution",
         route=forward_mode.value,
-        operations=operations,
+        calls=calls,
     )

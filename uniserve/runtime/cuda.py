@@ -8,7 +8,7 @@ import torch
 
 
 class CUDAError(RuntimeError):
-    """A CUDA resource or operation could not satisfy its requirements."""
+    """A CUDA resource or call could not satisfy its requirements."""
 
     def __init__(self, message: str, *, code: int | None = None):
         super().__init__(message)
@@ -29,11 +29,11 @@ def driver() -> Any:
     except (
         ImportError
     ) as error:  # pragma: no cover - CUDA configurations install cuda-python.
-        raise CUDAError("CUDA driver operations require cuda-python") from error
+        raise CUDAError("CUDA driver calls require cuda-python") from error
     return driver
 
 
-def cuda_status(result: tuple[Any, ...], operation: str) -> None:
+def cuda_status(result: tuple[Any, ...], call: str) -> None:
     """Validate a CUDA driver result.
 
     Validate a CUDA driver result, raising CUDAError with the decoded
@@ -55,14 +55,12 @@ def cuda_status(result: tuple[Any, ...], operation: str) -> None:
         if message_result[0] == cu.CUresult.CUDA_SUCCESS
         else name
     )
-    raise CUDAError(
-        f"{operation} failed: {name}: {message}", code=int(result[0])
-    )
+    raise CUDAError(f"{call} failed: {name}: {message}", code=int(result[0]))
 
 
-def cuda_value(result: tuple[Any, ...], operation: str) -> Any:
+def cuda_value(result: tuple[Any, ...], call: str) -> Any:
     """Extract the sole value from a successful CUDA driver result."""
-    cuda_status(result, operation)
+    cuda_status(result, call)
     return result[1]
 
 
@@ -113,6 +111,6 @@ def verify_graph_context(
             )
         kernels += 1
 
-    # Empty token partitions and copy-only computations are valid graphs.
+    # Empty token partitions and copy-only call kinds are valid graphs.
     # Their lack of kernels does not violate device-context containment.
     return kernels

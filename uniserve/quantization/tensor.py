@@ -29,8 +29,8 @@ class QuantizedTensor(torch.Tensor):
     """A logical floating tensor backed by encoded values and their scales.
 
     The encoding is immutable; the returned backing views remain writable by
-    their storage owner. Ordinary numerical operations return dense tensors
-    unless they have a representation-aware implementation. Linear operations
+    their storage owner. Ordinary numerical calls return dense tensors
+    unless they have a representation-aware implementation. Linear calls
     consume the encoded representation directly.
     """
 
@@ -202,7 +202,7 @@ class QuantizedTensor(torch.Tensor):
         kwargs = kwargs or {}
         aten = torch.ops.aten
 
-        # View-like operations rebuild the wrapper over transformed buffers.
+        # View-like calls rebuild the wrapper over transformed buffers.
         if func in (
             aten.detach.default,
             aten.alias.default,
@@ -262,11 +262,11 @@ class QuantizedTensor(torch.Tensor):
 
         if func._schema.is_mutable:
             raise NotImplementedError(
-                f"quantized in-place operation {func} requires an "
+                f"quantized in-place call {func} requires an "
                 "encoding-aware implementation"
             )
 
-        # Remaining operations decode their operands and produce dense results.
+        # Remaining calls decode their operands and produce dense results.
         def dense(value):
             return (
                 value.dequantize()

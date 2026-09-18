@@ -64,9 +64,9 @@ def test_nonmember_can_inspect_topology_without_executable_groups():
     mesh = DeviceMesh(ranks=(2, 4), shape=(2,), axes=("tensor",), rank=0)
     assert mesh.coordinate(4) == (1,)
     assert mesh.members(("tensor",)) == ((2, 4),)
-    for operation in (mesh.get_group, mesh.submesh):
+    for call in (mesh.get_group, mesh.submesh):
         with pytest.raises(ValueError, match="nonparticipating"):
-            operation(("tensor",))
+            call(("tensor",))
 
 
 @pytest.mark.parametrize(

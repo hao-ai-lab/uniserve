@@ -36,7 +36,7 @@ def _scatter_kernel(
 def scatter_blocks(target, indices, snapshot):
     """Write selected blocks without materializing a host selection.
 
-    Index validation precedes this operation. Bounds are also masked here so
+    Index validation precedes this call. Bounds are also masked here so
     invalid asynchronous inputs cannot access outside the allocated backing.
     Target fields may be strided; index_select supplies a contiguous snapshot.
     """

@@ -5,14 +5,14 @@ use std::sync::Arc;
 use thiserror::Error;
 use thiserror_ext::Macro;
 
-/// Result type returned by engine-client operations.
+/// Result type returned by engine-client calls.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Public error type for the engine client.
 #[derive(Debug, Error, Macro)]
 pub enum Error {
     #[error("io error")]
-    /// An operating-system or transport operation failed.
+    /// An operating-system or transport call failed.
     Io(#[from] std::io::Error),
     #[error("request `{request_id}` is already in flight")]
     /// A live request already owns the supplied identifier.
@@ -30,7 +30,7 @@ pub enum Error {
     /// The engine rejected request submission.
     Submit(#[from] uniserve_engine::SubmitError),
     #[error("engine client is closed: {message}")]
-    /// The client closed before completing the requested operation.
+    /// The client closed before completing the requested call.
     ClientClosed {
         /// Human-readable closure context.
         message: String,

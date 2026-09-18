@@ -45,9 +45,9 @@ class TokenSelection(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class SamplingMetadata:
-    """Numerical sampling controls for an operation's candidate logits.
+    """Numerical sampling controls for an call's candidate logits.
 
-    Parameters and terminal policy apply to the complete operation. Only allowed
+    Parameters and terminal policy apply to the complete call. Only allowed
     tokens, penalty histories, and RNG draws vary along a speculative chain;
     those columns align with the first dimension of logits.
     """
@@ -138,9 +138,9 @@ class SamplerOutput:
 
 @dataclass(frozen=True, slots=True)
 class SamplerRow:
-    """One operation's selection within a retained numerical sampling batch.
+    """One call's selection within a retained numerical sampling batch.
 
-    Request slots and transition payloads come from operation metadata. Scalar
+    Request slots and transition payloads come from call metadata. Scalar
     selection views are created only for consumers that actually need one row.
     """
 
@@ -184,7 +184,7 @@ SampleColumn = Literal[
 def sample_columns(
     rows: Sequence[SamplerRow], names: tuple[SampleColumn, ...]
 ) -> tuple[torch.Tensor, ...]:
-    """Read aligned columns in operation order.
+    """Read aligned columns in call order.
 
     retaining contiguous batch spans.
 

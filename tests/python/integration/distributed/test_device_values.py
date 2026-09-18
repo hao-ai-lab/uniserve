@@ -1,4 +1,4 @@
-"""Public numerical operations follow tensor devices.
+"""Public numerical calls follow tensor devices.
 
 They also preserve caller state.
 """

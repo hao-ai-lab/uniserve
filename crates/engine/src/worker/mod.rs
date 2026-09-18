@@ -38,7 +38,7 @@ pub struct WorkerProcessArgs {
     /// whose placement node matches it, so a placement may name its host
     /// explicitly instead of relying on a reserved local name.
     pub host: String,
-    /// Computation entry membership and parallel geometry.
+    /// CallKind entry membership and parallel geometry.
     pub entries: std::collections::BTreeMap<String, crate::ComponentConfig>,
     /// Launch the worker without model weights, using its deterministic test
     /// model. Only the engine's own IPC and process tests set this; the serving
@@ -54,8 +54,8 @@ pub struct WorkerProcessArgs {
     pub kv_token_capacity: Option<u64>,
     /// Tokens represented by one physical KV cache block.
     pub block_size: u32,
-    /// Maximum operations accepted in one worker run.
-    pub max_batch_operations: u32,
+    /// Maximum calls accepted in one worker run.
+    pub max_batch_calls: u32,
     /// Maximum tokens accepted in one worker run.
     pub max_batch_tokens: u32,
     /// Attention implementation selected for model execution.

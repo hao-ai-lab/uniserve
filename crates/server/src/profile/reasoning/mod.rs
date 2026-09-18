@@ -9,7 +9,7 @@ use thiserror::Error;
 pub use self::delimited::DelimitedReasoningParser;
 pub use self::qwen3::Qwen3ReasoningParser;
 
-/// Result alias for reasoning parser operations.
+/// Result alias for reasoning parser calls.
 pub type Result<T> = std::result::Result<T, ReasoningError>;
 
 /// One parsed streaming delta split into reasoning and visible content.

@@ -1,4 +1,4 @@
-"""Operations on transport registrations held by their storage owners."""
+"""Calls on transport registrations held by their storage owners."""
 
 from __future__ import annotations
 

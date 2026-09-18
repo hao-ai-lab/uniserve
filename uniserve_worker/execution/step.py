@@ -8,7 +8,7 @@ import traceback
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from uniserve_worker.execution import operations
+from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch_state import BatchState
 from uniserve_worker.execution.commit import _commit_group, _discard_group
 from uniserve_worker.execution.prepare import _open_group
@@ -20,7 +20,7 @@ from uniserve_worker.foundation.errors import (
     should_capture_trace,
 )
 from uniserve_worker.profiling import _forward_stats
-from uniserve_worker.protocol.operation import ErrorCode, OpStatus
+from uniserve_worker.protocol.call import CallStatus, ErrorCode
 from uniserve_worker.protocol.output import (
     FinishFlags,
     ForwardStats,
@@ -65,7 +65,7 @@ def _completion_error_code(code: WorkerErrorCode) -> ErrorCode:
         WorkerErrorCode.FATAL_WORKER_FAILURE,
     }:
         return ErrorCode.INTERNAL
-    return ErrorCode.INVALID_OPERATION
+    return ErrorCode.INVALID_CALL
 
 
 def execute_batch(
@@ -105,18 +105,17 @@ def execute_batch(
     started = time.perf_counter_ns()
 
     required_predicates = {
-        operations.operation_identity(operation)
-        for operation in batch.operations
-        if operation.predicate is not None
-        and operation.predicate.dtype is DType.U8
+        calls.call_identity(call)
+        for call in batch.calls
+        if call.predicate is not None and call.predicate.dtype is DType.U8
     }
     if required_predicates != set(predicate_values):
         raise invalid_descriptor(
-            "completion-predicated operations require exact prepared predicate "
+            "completion-predicated calls require exact prepared predicate "
             "values"
         )
 
-    if not batch.operations:
+    if not batch.calls:
         state.launched = True
         return
 
@@ -366,22 +365,22 @@ def _classify_group_failure(
 ) -> WorkerError:
     """Classify a pre-publication completion group failure with complete.
 
-    operation and route context.
+    call and route context.
     """
     scheduled = tuple(
         (
-            int(operation.request_key.engine_id),
-            int(operation.request_key.request_id),
-            int(operation.request_key.request_epoch),
-            operation.op_id,
+            int(call.request_key.engine_id),
+            int(call.request_key.request_id),
+            int(call.request_key.request_epoch),
+            call.call_id,
         )
-        for operation in state.group_operations(completion_group)
+        for call in state.group_calls(completion_group)
     )
 
-    # Attach request coordinates when the group holds exactly one operation.
+    # Attach request coordinates when the group holds exactly one call.
     sole = (
-        state.group_operations(completion_group)[0]
-        if len(state.group_operations(completion_group)) == 1
+        state.group_calls(completion_group)[0]
+        if len(state.group_calls(completion_group)) == 1
         else None
     )
 
@@ -389,9 +388,9 @@ def _classify_group_failure(
         error,
         context=phase,
         phase=phase,
-        operations=scheduled,
+        calls=scheduled,
         req_id=None if sole is None else int(sole.request_key.request_id),
-        op_id=None if sole is None else sole.op_id,
+        call_id=None if sole is None else sole.call_id,
         op_kind=None if sole is None else sole.kind.value,
         route=str(0),
     )
@@ -411,12 +410,12 @@ def _published_group_failure(
     """
     scheduled = tuple(
         (
-            int(operation.request_key.engine_id),
-            int(operation.request_key.request_id),
-            int(operation.request_key.request_epoch),
-            operation.op_id,
+            int(call.request_key.engine_id),
+            int(call.request_key.request_id),
+            int(call.request_key.request_epoch),
+            call.call_id,
         )
-        for operation in state.group_operations(completion_group)
+        for call in state.group_calls(completion_group)
     )
     classified = WorkerError(
         code=WorkerErrorCode.INVARIANT_VIOLATION,
@@ -427,7 +426,7 @@ def _published_group_failure(
         fatal=True,
         phase="completion group publication",
         route=str(0),
-        operations=scheduled,
+        calls=scheduled,
     )
     _log_group_failure(completion_group, classified, cause=error)
     return classified
@@ -446,13 +445,12 @@ def _log_group_failure(
     capture_trace = should_capture_trace(error.code)
     log = logger.error if capture_trace else logger.warning
     log(
-        "completion group failed: %s [code=%s group_id=%s route=%s "
-        "operations=%s]",
+        "completion group failed: %s [code=%s group_id=%s route=%s calls=%s]",
         error.message,
         error.code,
         completion_group,
         0,
-        error.operations,
+        error.calls,
         exc_info=(type(cause), cause, cause.__traceback__)
         if capture_trace and cause is not None
         else None,
@@ -483,27 +481,27 @@ def _error_outputs(
     """
     completion_code = _completion_error_code(error.code)
     records: list[RequestOutput] = []
-    for operation in state.group_operations(completion_group):
+    for call in state.group_calls(completion_group):
         # Report execution coordinates only for the matching admitted epoch;
         # a stale descriptor cannot observe a replacement request slot.
-        request = request_pool.peek(operation.request_key.request_id)
+        request = request_pool.peek(call.request_key.request_id)
         if (
             request is None
-            or request.request_key != operation.request_key
-            or operation.predecessor is None
+            or request.request_key != call.request_key
+            or call.predecessor is None
         ):
             runtime = None
         else:
             runtime = request.accepted_progress
 
         placeholder = RequestOutput(
-            request_key=operation.request_key,
-            op_id=operation.op_id,
-            status=OpStatus.ERROR,
+            request_key=call.request_key,
+            call_id=call.call_id,
+            status=CallStatus.ERROR,
             product_generations=(),
             error_code=completion_code,
             timing_counters=TimingCounters(),
-            kind=operation.kind,
+            kind=call.kind,
             position=(0 if runtime is None else int(runtime.logical_position)),
             kv_visible_len=(
                 0 if runtime is None else int(runtime.kv_visible_len)

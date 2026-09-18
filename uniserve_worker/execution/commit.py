@@ -1,4 +1,4 @@
-"""Commit completed operations and retire the resources of failed logical.
+"""Commit completed calls and retire the resources of failed logical.
 
 groups.
 """
@@ -20,10 +20,10 @@ from uniserve_worker.execution.transfer import _release_locators
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.profiling import _forward_stats, record_component
 from uniserve_worker.protocol.batch import TensorPublication
-from uniserve_worker.protocol.operation import (
-    OpStatus,
+from uniserve_worker.protocol.call import (
+    Call,
+    CallStatus,
     PipelineStage,
-    ScheduledRequest,
 )
 from uniserve_worker.transfer.exports import validate_exports
 
@@ -67,7 +67,7 @@ def _commit_group(
     """
     with state.group_scope(completion_group):
         commit_started = time.perf_counter_ns()
-        operations = state.group_operations(completion_group)
+        calls = state.group_calls(completion_group)
 
         # All device reads must finish and every staged resource must validate
         # before completion storage becomes immutable or any publication becomes
@@ -94,24 +94,24 @@ def _commit_group(
         # Prepare the execution result without mutating resident state.
         records: list[PendingOutput] = []
         report_products: list[TensorPublication] = []
-        for row, (operation, request, outcome) in enumerate(
+        for row, (call, request, outcome) in enumerate(
             zip(
-                operations,
+                calls,
                 state.pending_outputs(completion_group),
                 outcomes,
                 strict=True,
             )
         ):
-            _validate_completion_products(operation, outcome.products)
+            _validate_completion_products(call, outcome.products)
 
             if outcome.kv_output is not None:
-                if outcome.kv_output.source != operation.kv_output:
+                if outcome.kv_output.source != call.kv_output:
                     raise invalid_descriptor(
                         "KV publication differs from its declared output"
                     )
                 if (
                     sum(tensor.nbytes for tensor in outcome.kv_output.tensors)
-                    > operation.bounds.max_transfer_bytes
+                    > call.bounds.max_transfer_bytes
                 ):
                     raise invalid_descriptor(
                         "KV publication exceeds its transfer-byte bound"
@@ -128,20 +128,16 @@ def _commit_group(
                 4 + 12 * logprob_entries(outcome, span)
                 for span in outcome.prompt_logprob_ranges
             )
-            if logprob_bytes > operation.bounds.max_completion_bytes:
+            if logprob_bytes > call.bounds.max_completion_bytes:
                 raise invalid_descriptor(
                     "logprob result exceeds its registered completion capacity"
                 )
 
-            reports_output = config.rank == worker_info.output_rank(
-                operation.entry
-            )
+            reports_output = config.rank == worker_info.output_rank(call.entry)
             report_products.extend(outcome.products)
             pending = request
             if outcome is not pending:
-                raise RuntimeError(
-                    "operation completion lost its prepared output"
-                )
+                raise RuntimeError("call completion lost its prepared output")
             pending._reports_output = reports_output
 
             # All ranks retain their score ranges until the output buffer
@@ -369,9 +365,9 @@ def _discard_group(
             pending.abandon()
 
         if media_mux is not None:
-            for operation in state.group_operations(completion_group):
-                if operation.kind is PipelineStage.LATENT_PREPARATION:
-                    media_mux.drop(int(operation.request_key.request_id))
+            for call in state.group_calls(completion_group):
+                if call.kind is PipelineStage.LATENT_PREPARATION:
+                    media_mux.drop(int(call.request_key.request_id))
 
         state.group_buffers[completion_group].abandon()
 
@@ -385,9 +381,9 @@ def _discard_group(
 
         if kv_cache is not None:
             kv_cache.release_buffers(
-                operation.kv_output
-                for operation in state.group_operations(completion_group)
-                if operation.kv_output is not None
+                call.kv_output
+                for call in state.group_calls(completion_group)
+                if call.kv_output is not None
             )
 
         imported_slots = tuple(
@@ -402,8 +398,8 @@ def _discard_group(
             latent_pool.release_buffers(
                 tuple(
                     product.buffer_id
-                    for operation in state.group_operations(completion_group)
-                    for product in operation.tensor_outputs()
+                    for call in state.group_calls(completion_group)
+                    for product in call.tensor_outputs()
                 )
             )
 
@@ -421,19 +417,19 @@ def _discard_group(
 
 
 def _validate_completion_products(
-    operation: ScheduledRequest,
+    call: Call,
     products: tuple[TensorPublication, ...],
 ) -> None:
     """Validate completion payloads against every product declared by the.
 
-    operation.
+    call.
     """
-    declared = {output: output for output in operation.tensor_outputs()}
+    declared = {output: output for output in call.tensor_outputs()}
     for product in products:
         reference = declared.get(product.product)
         if reference is None:
             raise invalid_descriptor(
-                "completion carries a product not declared by its operation"
+                "completion carries a product not declared by its call"
             )
         product.encoded_size_bound()
 
@@ -441,14 +437,14 @@ def _validate_completion_products(
 def _publish_predicates(
     completion_group: int, *, state: BatchState, tensor_store: TensorStore
 ) -> None:
-    """Publish predicate outputs after their producing operations have.
+    """Publish predicate outputs after their producing calls have.
 
     resolved.
     """
     writes = tuple(
         request.completion_write
         for request in state.pending_outputs(completion_group)
-        if request.status is not OpStatus.PREDICATED
+        if request.status is not CallStatus.PREDICATED
         and request.completion_write is not None
         and not request.completion_write.producer_recorded
     )
@@ -472,7 +468,7 @@ def _publish_predicates(
 def _finish_device_reads(
     completion_group: int, *, state: BatchState, tensor_store: TensorStore
 ) -> None:
-    """Complete actual consumer reads using that operation's producer fence."""
+    """Complete actual consumer reads using that call's producer fence."""
     reads = tuple(
         read
         for request in state.pending_outputs(completion_group)
@@ -480,7 +476,7 @@ def _finish_device_reads(
     )
     if reads:
         # A source may belong to another request. Its reader's completion is
-        # ordered by the consuming operation's output, never by source identity.
+        # ordered by the consuming call's output, never by source identity.
         after_writes = tuple(
             request.producer_write
             for request in state.pending_outputs(completion_group)

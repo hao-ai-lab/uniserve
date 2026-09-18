@@ -8,17 +8,17 @@ use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RequestId, SamplingParam
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds,
-    BufferAllocation, BufferId, CachePageAllocation, CallCoordinates, Computation, ComputationId,
+    BufferAllocation, BufferId, CachePageAllocation, CallCoordinates, CallKind, CallId,
     DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode,
-    ErrorOperationIdentity, FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats,
-    KvCacheInfo, KvTransfer, LatentParams, Locator, MediaOutput, NewRequest, OpStatus,
+    ErrorCallIdentity, FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats,
+    KvCacheInfo, KvTransfer, LatentParams, Locator, MediaOutput, NewRequest, CallStatus,
     PipelineStage, RegistrationAck, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
-    SamplingState, ScheduledRequest, ShapeBound, TensorPublication, TensorRef, TensorTransfer,
+    SamplingState, Call, ShapeBound, TensorPublication, TensorRef, TensorTransfer,
     TimingCounters, TransferHandle, TransferMode, TransferTransport, UmmRequestParams,
     WorkerEndpoint, WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
-/// Result type returned by FlatBuffers codec operations.
+/// Result type returned by FlatBuffers codec calls.
 pub type CodecResult<T> = std::result::Result<T, CodecError>;
 
 /// FlatBuffers construction, verification, and protocol validation failures.
@@ -134,20 +134,20 @@ pub fn decode_response(bytes: &[u8]) -> CodecResult<WorkerResponse> {
 /// Decodes a verified FlatBuffers table into an owned request value.
 fn request_from_table(request: fbs::WorkerRequest<'_>) -> CodecResult<WorkerRequest> {
     let kind = request_kind_from_fb(request.kind())?;
-    let call_id = request.call_id();
+    let message_id = request.message_id();
     let batch = request.batch().map(batch_from_table).transpose()?;
     Ok(match kind {
         RequestKind::Info => {
             codec_ensure!(batch.is_none(), "info carries a payload");
-            WorkerRequest::Info { call_id }
+            WorkerRequest::Info { message_id }
         }
         RequestKind::Submit => WorkerRequest::Submit {
-            call_id,
+            message_id,
             batch: batch.context("submit request has no batch")?,
         },
         RequestKind::Close => {
             codec_ensure!(batch.is_none(), "close carries a payload");
-            WorkerRequest::Close { call_id }
+            WorkerRequest::Close { message_id }
         }
     })
 }
@@ -157,7 +157,7 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
     // Decode every optional branch before dispatch so each response kind can
     // enforce exclusivity between success payloads and structured error data.
     let kind = response_kind_from_fb(response.kind())?;
-    let call_id = response.call_id();
+    let message_id = response.message_id();
     let info = response.info().map(info_from_table).transpose()?;
     let result = response.result().map(run_result_from_table).transpose()?;
     let payload_count = usize::from(info.is_some()) + usize::from(result.is_some());
@@ -168,12 +168,12 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
     let fatal = response.fatal();
     let phase = response.phase().map(str::to_owned);
     let route = response.route().map(str::to_owned);
-    let operations: Vec<ErrorOperationIdentity> = response
-        .operations()
+    let calls: Vec<ErrorCallIdentity> = response
+        .calls()
         .map(|items| {
             items
                 .iter()
-                .map(error_operation_from_table)
+                .map(error_call_from_table)
                 .collect::<CodecResult<_>>()
         })
         .transpose()?
@@ -183,7 +183,7 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
         || fatal.is_some()
         || phase.is_some()
         || route.is_some()
-        || !operations.is_empty();
+        || !calls.is_empty();
 
     // The response discriminator defines the exact legal field combination.
     Ok(match kind {
@@ -193,7 +193,7 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
                 "invalid info response"
             );
             WorkerResponse::Info {
-                call_id,
+                message_id,
                 info: info.context("info response has no info")?,
             }
         }
@@ -203,13 +203,13 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
                 "invalid result response"
             );
             WorkerResponse::Result {
-                call_id,
+                message_id,
                 result: result.context("result response has no result")?,
             }
         }
         ResponseKind::Ok => {
             codec_ensure!(payload_count == 0 && !carries_error, "invalid ok response");
-            WorkerResponse::Ok { call_id }
+            WorkerResponse::Ok { message_id }
         }
         ResponseKind::Error => {
             codec_ensure!(
@@ -221,35 +221,35 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
                 .context("error response has no message")?;
             let code = code.filter(|value| !value.is_empty());
             WorkerResponse::Error {
-                call_id,
+                message_id,
                 error: WorkerResponseError {
                     message,
                     code,
                     fatal: fatal.context("error response has no fatal flag")?,
                     phase,
                     route,
-                    operations,
+                    calls,
                 },
             }
         }
     })
 }
 
-/// Decodes an owned run and validates all nested operation and params contracts.
+/// Decodes an owned run and validates all nested call and params contracts.
 fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
-    // Preserve wire order for operations, controls, and products because later
+    // Preserve wire order for calls, controls, and products because later
     // validation and execution interpret those collections positionally.
     let run = Batch {
         batch_id: run.batch_id(),
         collective_seq: run.collective_seq(),
 
         // Decode executable graph records in their submitted order.
-        operations: run
-            .operations()
+        calls: run
+            .calls()
             .map(|items| {
                 items
                     .iter()
-                    .map(operation_from_table)
+                    .map(call_from_table)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
@@ -265,8 +265,8 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             .map(|items| items.iter().map(cache_page_allocation_from_table).collect())
             .unwrap_or_default(),
         forward: ForwardBatch {
-            operation_indices: run
-                .forward_operation_indices()
+            call_indices: run
+                .forward_call_indices()
                 .map(|items| items.iter().collect())
                 .unwrap_or_default(),
             request_pool_indices: run
@@ -447,11 +447,11 @@ fn cache_page_allocation_from_table(
     }
 }
 
-/// Decodes a latent-page params bound to a request operation.
+/// Decodes a latent-page params bound to a request call.
 fn latent_params_from_table(params: fbs::LatentParams<'_>) -> CodecResult<LatentParams> {
     Ok(LatentParams {
         request_key: request_key_from_table(params.request_key(), "latent params.request_key")?,
-        op_id: computation_id_from_fb(params.op_id())?,
+        call_id: computation_id_from_fb(params.call_id())?,
         page_table: params
             .page_table()
             .map(|items| items.iter().collect())
@@ -464,11 +464,11 @@ fn latent_params_from_table(params: fbs::LatentParams<'_>) -> CodecResult<Latent
     })
 }
 
-/// Decodes a diffusion decoder params bound to a request operation.
+/// Decodes a diffusion decoder params bound to a request call.
 fn decode_range_from_table(params: fbs::DecodeRange<'_>) -> CodecResult<DecodeRange> {
     Ok(DecodeRange {
         request_key: request_key_from_table(params.request_key(), "decode params.request_key")?,
-        op_id: computation_id_from_fb(params.op_id())?,
+        call_id: computation_id_from_fb(params.call_id())?,
         cursor: params.cursor(),
         max_units: params.max_units(),
     })
@@ -492,7 +492,7 @@ fn buffer_allocation_from_table(
 /// Reads the coordinates a call states. Every call states them, so absence is a
 /// malformed frame rather than an origin default.
 fn coordinates_from_table(table: Option<fbs::CallCoordinates<'_>>) -> CodecResult<CallCoordinates> {
-    let value = table.context("operation.coordinates")?;
+    let value = table.context("call.coordinates")?;
     Ok(CallCoordinates {
         logical_position: value.logical_position(),
         kv_visible_len: value.kv_visible_len(),
@@ -512,22 +512,22 @@ fn coordinates_to_fb(value: CallCoordinates) -> fbs::CallCoordinatesT {
 }
 
 /// Decodes one computation and its entry binding.
-fn operation_from_table(operation: fbs::ScheduledRequest<'_>) -> CodecResult<ScheduledRequest> {
-    let operation = ScheduledRequest {
-        request_key: request_key_from_table(operation.request_key(), "operation.request_key")?,
-        op_id: computation_id_from_fb(operation.op_id())?,
-        coordinates: coordinates_from_table(operation.coordinates())?,
-        input_image: operation.input_image().map(std::sync::Arc::from),
-        kv_input: operation.kv_input().map(buffer_id_from_table).transpose()?,
-        kv_output: operation
+fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
+    let call = Call {
+        request_key: request_key_from_table(call.request_key(), "call.request_key")?,
+        call_id: computation_id_from_fb(call.call_id())?,
+        coordinates: coordinates_from_table(call.coordinates())?,
+        input_image: call.input_image().map(std::sync::Arc::from),
+        kv_input: call.kv_input().map(buffer_id_from_table).transpose()?,
+        kv_output: call
             .kv_output()
             .map(buffer_id_from_table)
             .transpose()?,
-        input_token_ids: operation
+        input_token_ids: call
             .input_token_ids()
             .map(|ids| ids.iter().collect())
             .unwrap_or_default(),
-        sampling_state: operation.sampling_state().map(|state| SamplingState {
+        sampling_state: call.sampling_state().map(|state| SamplingState {
             // A missing whitelist and an empty whitelist have different semantics.
             allowed_token_ids: state.allowed_token_ids().map(|ids| ids.iter().collect()),
             suppressed_token_ids: state
@@ -544,20 +544,20 @@ fn operation_from_table(operation: fbs::ScheduledRequest<'_>) -> CodecResult<Sch
                 .unwrap_or_default(),
             force_finish: state.force_finish(),
         }),
-        predecessor: operation
+        predecessor: call
             .predecessor()
             .map(|id| computation_id_from_fb(Some(id)))
             .transpose()?,
-        entry: operation.entry().to_owned(),
-        code: computation_from_fb(operation.code())?,
+        entry: call.entry().to_owned(),
+        code: computation_from_fb(call.code())?,
         bounds: Bounds {
-            max_tokens: operation.max_tokens(),
-            max_kv_pages: operation.max_kv_pages(),
-            max_latent_bytes: operation.max_latent_bytes(),
-            max_completion_bytes: operation.max_completion_bytes(),
-            max_transfer_bytes: operation.max_transfer_bytes(),
+            max_tokens: call.max_tokens(),
+            max_kv_pages: call.max_kv_pages(),
+            max_latent_bytes: call.max_latent_bytes(),
+            max_completion_bytes: call.max_completion_bytes(),
+            max_transfer_bytes: call.max_transfer_bytes(),
         },
-        inputs: operation
+        inputs: call
             .inputs()
             .map(|items| {
                 items
@@ -567,7 +567,7 @@ fn operation_from_table(operation: fbs::ScheduledRequest<'_>) -> CodecResult<Sch
             })
             .transpose()?
             .unwrap_or_default(),
-        outputs: operation
+        outputs: call
             .outputs()
             .map(|items| {
                 items
@@ -577,58 +577,58 @@ fn operation_from_table(operation: fbs::ScheduledRequest<'_>) -> CodecResult<Sch
             })
             .transpose()?
             .unwrap_or_default(),
-        token_input: operation
+        token_input: call
             .token_input()
             .map(tensor_ref_from_table)
             .transpose()?,
-        token_output: operation
+        token_output: call
             .token_output()
             .map(tensor_ref_from_table)
             .transpose()?,
-        vision_input: operation
+        vision_input: call
             .vision_input()
             .map(tensor_ref_from_table)
             .transpose()?,
-        latent_feature_input: operation
+        latent_feature_input: call
             .latent_feature_input()
             .map(tensor_ref_from_table)
             .transpose()?,
-        encoder_output: operation
+        encoder_output: call
             .encoder_output()
             .map(tensor_ref_from_table)
             .transpose()?,
-        latent_input: operation
+        latent_input: call
             .latent_input()
             .map(tensor_ref_from_table)
             .transpose()?,
-        latent_output: operation
+        latent_output: call
             .latent_output()
             .map(tensor_ref_from_table)
             .transpose()?,
-        image_input: operation
+        image_input: call
             .image_input()
             .map(tensor_ref_from_table)
             .transpose()?,
-        image_output: operation
+        image_output: call
             .image_output()
             .map(tensor_ref_from_table)
             .transpose()?,
-        completion_output: operation
+        completion_output: call
             .completion_output()
             .map(tensor_ref_from_table)
             .transpose()?,
-        transition_output: operation
+        transition_output: call
             .transition_output()
             .map(tensor_ref_from_table)
             .transpose()?,
-        predicate: operation
+        predicate: call
             .predicate()
             .map(tensor_ref_from_table)
             .transpose()?,
-        rng: operation.rng().map(rng_from_table).transpose()?,
+        rng: call.rng().map(rng_from_table).transpose()?,
     };
-    operation.validate()?;
-    Ok(operation)
+    call.validate()?;
+    Ok(call)
 }
 
 /// Decodes one control-command union and validates its lineage constraints.
@@ -727,7 +727,7 @@ fn tensor_ref_from_table(reference: fbs::TensorRef<'_>) -> CodecResult<TensorRef
     let id = buffer_id_from_table(reference.id())?;
     let tensor = TensorRef {
         request_key: id.owner,
-        producer_op_id: id.producer_op_id,
+        producer_call_id: id.producer_call_id,
         output_index: id.output_index,
         generation: id.generation,
         dtype: dtype_from_fb(reference.dtype())?,
@@ -839,7 +839,7 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
             })
             .unwrap_or_default(),
         request_key: request_key_from_table(record.request_key(), "completion.request_key")?,
-        op_id: computation_id_from_fb(record.op_id())?,
+        call_id: computation_id_from_fb(record.call_id())?,
         status: op_status_from_fb(record.status())?,
         product_generations: record
             .product_generations()
@@ -897,16 +897,16 @@ fn tensor_publication_from_table(
     Ok(payload)
 }
 
-/// Decodes the request and operation identity attached to a worker error.
-fn error_operation_from_table(
-    operation: fbs::ErrorOperationIdentity<'_>,
-) -> CodecResult<ErrorOperationIdentity> {
-    Ok(ErrorOperationIdentity {
+/// Decodes the request and call identity attached to a worker error.
+fn error_call_from_table(
+    call: fbs::ErrorCallIdentity<'_>,
+) -> CodecResult<ErrorCallIdentity> {
+    Ok(ErrorCallIdentity {
         request_key: request_key_from_table(
-            operation.request_key(),
-            "error operation.request_key",
+            call.request_key(),
+            "error call.request_key",
         )?,
-        op_id: computation_id_from_fb(operation.op_id())?,
+        call_id: computation_id_from_fb(call.call_id())?,
     })
 }
 
@@ -1224,7 +1224,7 @@ fn request_to_fb(request: &WorkerRequest) -> CodecResult<fbs::WorkerRequestT> {
     };
     Ok(fbs::WorkerRequestT {
         kind: request_kind_to_fb(request.kind()),
-        call_id: request.call_id(),
+        message_id: request.message_id(),
         batch: batch.map(batch_to_fb).transpose()?.map(Box::new),
     })
 }
@@ -1240,7 +1240,7 @@ fn response_to_fb(response: &WorkerResponse) -> CodecResult<fbs::WorkerResponseT
     };
     Ok(fbs::WorkerResponseT {
         kind: response_kind_to_fb(response.kind()),
-        call_id: response.call_id(),
+        message_id: response.message_id(),
         info: info.map(info_to_fb).transpose()?.map(Box::new),
         result: result.map(run_result_to_fb).transpose()?.map(Box::new),
         message: error.map(|error| error.message.clone()),
@@ -1248,11 +1248,11 @@ fn response_to_fb(response: &WorkerResponse) -> CodecResult<fbs::WorkerResponseT
         fatal: error.map(|error| error.fatal),
         phase: error.and_then(|error| error.phase.clone()),
         route: error.and_then(|error| error.route.clone()),
-        operations: Some(
+        calls: Some(
             error
                 .into_iter()
-                .flat_map(|error| &error.operations)
-                .map(error_operation_to_fb)
+                .flat_map(|error| &error.calls)
+                .map(error_call_to_fb)
                 .collect(),
         ),
     })
@@ -1266,10 +1266,10 @@ fn batch_to_fb(run: &Batch) -> CodecResult<fbs::BatchT> {
         collective_seq: run.collective_seq,
 
         // Preserve executable graph order in the serialized vectors.
-        operations: Some(
-            run.operations
+        calls: Some(
+            run.calls
                 .iter()
-                .map(operation_to_fb)
+                .map(call_to_fb)
                 .collect::<CodecResult<_>>()?,
         ),
 
@@ -1281,7 +1281,7 @@ fn batch_to_fb(run: &Batch) -> CodecResult<fbs::BatchT> {
                 .map(cache_page_allocation_to_fb)
                 .collect(),
         ),
-        forward_operation_indices: Some(run.forward.operation_indices.clone()),
+        forward_call_indices: Some(run.forward.call_indices.clone()),
         request_pool_indices: Some(run.forward.request_pool_indices.clone()),
         seq_lens: Some(run.forward.seq_lens.clone()),
         query_lens: Some(run.forward.query_lens.clone()),
@@ -1386,7 +1386,7 @@ fn cache_page_allocation_to_fb(allocation: &CachePageAllocation) -> fbs::CachePa
 fn latent_params_to_fb(params: &LatentParams) -> fbs::LatentParamsT {
     fbs::LatentParamsT {
         request_key: Some(Box::new(request_key_to_fb(params.request_key))),
-        op_id: Some(computation_id_to_fb(params.op_id)),
+        call_id: Some(computation_id_to_fb(params.call_id)),
         page_table: Some(params.page_table.clone()),
         latent_units: params.latent_units,
         height: params.height,
@@ -1400,7 +1400,7 @@ fn latent_params_to_fb(params: &LatentParams) -> fbs::LatentParamsT {
 fn decode_range_to_fb(params: &DecodeRange) -> fbs::DecodeRangeT {
     fbs::DecodeRangeT {
         request_key: Some(Box::new(request_key_to_fb(params.request_key))),
-        op_id: Some(computation_id_to_fb(params.op_id)),
+        call_id: Some(computation_id_to_fb(params.call_id)),
         cursor: params.cursor,
         max_units: params.max_units,
     }
@@ -1416,17 +1416,17 @@ fn buffer_allocation_to_fb(params: &BufferAllocation) -> fbs::BufferAllocationT 
 }
 
 /// Encodes one validated computation directly into its wire table.
-fn operation_to_fb(operation: &ScheduledRequest) -> CodecResult<fbs::ScheduledRequestT> {
-    operation.validate()?;
-    Ok(fbs::ScheduledRequestT {
-        request_key: Some(Box::new(request_key_to_fb(operation.request_key))),
-        op_id: Some(computation_id_to_fb(operation.op_id)),
-        coordinates: Some(Box::new(coordinates_to_fb(operation.coordinates))),
-        input_token_ids: Some(operation.input_token_ids.clone()),
-        input_image: operation.input_image.as_deref().map(str::to_owned),
-        kv_input: operation.kv_input.map(buffer_id_to_fb).map(Box::new),
-        kv_output: operation.kv_output.map(buffer_id_to_fb).map(Box::new),
-        sampling_state: operation.sampling_state.as_ref().map(|state| {
+fn call_to_fb(call: &Call) -> CodecResult<fbs::CallT> {
+    call.validate()?;
+    Ok(fbs::CallT {
+        request_key: Some(Box::new(request_key_to_fb(call.request_key))),
+        call_id: Some(computation_id_to_fb(call.call_id)),
+        coordinates: Some(Box::new(coordinates_to_fb(call.coordinates))),
+        input_token_ids: Some(call.input_token_ids.clone()),
+        input_image: call.input_image.as_deref().map(str::to_owned),
+        kv_input: call.kv_input.map(buffer_id_to_fb).map(Box::new),
+        kv_output: call.kv_output.map(buffer_id_to_fb).map(Box::new),
+        sampling_state: call.sampling_state.as_ref().map(|state| {
             Box::new(fbs::SamplingStateT {
                 allowed_token_ids: state.allowed_token_ids.clone(),
                 suppressed_token_ids: Some(state.suppressed_token_ids.clone()),
@@ -1435,101 +1435,101 @@ fn operation_to_fb(operation: &ScheduledRequest) -> CodecResult<fbs::ScheduledRe
                 force_finish: state.force_finish,
             })
         }),
-        predecessor: operation.predecessor.map(computation_id_to_fb),
-        entry: operation.entry.clone(),
-        code: computation_to_fb(operation.code),
-        max_tokens: operation.bounds.max_tokens,
-        max_kv_pages: operation.bounds.max_kv_pages,
-        max_latent_bytes: operation.bounds.max_latent_bytes,
-        max_completion_bytes: operation.bounds.max_completion_bytes,
-        max_transfer_bytes: operation.bounds.max_transfer_bytes,
+        predecessor: call.predecessor.map(computation_id_to_fb),
+        entry: call.entry.clone(),
+        code: computation_to_fb(call.code),
+        max_tokens: call.bounds.max_tokens,
+        max_kv_pages: call.bounds.max_kv_pages,
+        max_latent_bytes: call.bounds.max_latent_bytes,
+        max_completion_bytes: call.bounds.max_completion_bytes,
+        max_transfer_bytes: call.bounds.max_transfer_bytes,
         inputs: Some(
-            operation
+            call
                 .inputs
                 .iter()
                 .map(tensor_ref_to_fb)
                 .collect::<CodecResult<_>>()?,
         ),
         outputs: Some(
-            operation
+            call
                 .outputs
                 .iter()
                 .map(tensor_ref_to_fb)
                 .collect::<CodecResult<_>>()?,
         ),
-        token_input: operation
+        token_input: call
             .token_input
             .as_ref()
             .map(tensor_ref_to_fb)
             .transpose()?
             .map(Box::new),
-        token_output: operation
+        token_output: call
             .token_output
             .as_ref()
             .map(tensor_ref_to_fb)
             .transpose()?
             .map(Box::new),
-        vision_input: operation
+        vision_input: call
             .vision_input
             .as_ref()
             .map(tensor_ref_to_fb)
             .transpose()?
             .map(Box::new),
-        latent_feature_input: operation
+        latent_feature_input: call
             .latent_feature_input
             .as_ref()
             .map(tensor_ref_to_fb)
             .transpose()?
             .map(Box::new),
-        encoder_output: operation
+        encoder_output: call
             .encoder_output
             .as_ref()
             .map(tensor_ref_to_fb)
             .transpose()?
             .map(Box::new),
-        latent_input: operation
+        latent_input: call
             .latent_input
             .as_ref()
             .map(tensor_ref_to_fb)
             .transpose()?
             .map(Box::new),
-        latent_output: operation
+        latent_output: call
             .latent_output
             .as_ref()
             .map(tensor_ref_to_fb)
             .transpose()?
             .map(Box::new),
-        image_input: operation
+        image_input: call
             .image_input
             .as_ref()
             .map(tensor_ref_to_fb)
             .transpose()?
             .map(Box::new),
-        image_output: operation
+        image_output: call
             .image_output
             .as_ref()
             .map(tensor_ref_to_fb)
             .transpose()?
             .map(Box::new),
-        completion_output: operation
+        completion_output: call
             .completion_output
             .as_ref()
             .map(tensor_ref_to_fb)
             .transpose()?
             .map(Box::new),
-        transition_output: operation
+        transition_output: call
             .transition_output
             .as_ref()
             .map(tensor_ref_to_fb)
             .transpose()?
             .map(Box::new),
-        predicate: operation
+        predicate: call
             .predicate
             .as_ref()
             .map(tensor_ref_to_fb)
             .transpose()?
             .map(Box::new),
-        rng: operation.rng.as_ref().map(rng_to_fb).map(Box::new),
+        rng: call.rng.as_ref().map(rng_to_fb).map(Box::new),
     })
 }
 
@@ -1566,13 +1566,13 @@ fn command_to_fb(command: &BatchCommand) -> fbs::BatchCommandT {
 }
 
 /// Decodes a logical computation identity without depending on physical run numbering.
-fn computation_id_from_fb(id: Option<&fbs::ComputationId>) -> CodecResult<ComputationId> {
+fn computation_id_from_fb(id: Option<&fbs::CallId>) -> CodecResult<CallId> {
     let id = id.context("computation identity is missing")?;
-    Ok(ComputationId::new(id.batch_id(), id.request_index()))
+    Ok(CallId::new(id.batch_id(), id.request_index()))
 }
 
-fn computation_id_to_fb(id: ComputationId) -> fbs::ComputationIdT {
-    fbs::ComputationIdT {
+fn computation_id_to_fb(id: CallId) -> fbs::CallIdT {
+    fbs::CallIdT {
         batch_id: id.batch_id,
         request_index: id.request_index,
     }
@@ -1591,7 +1591,7 @@ fn request_key_to_fb(request_key: RequestKey) -> fbs::RequestKeyT {
 fn buffer_id_from_table(buffer: fbs::BufferId<'_>) -> CodecResult<BufferId> {
     let id = BufferId {
         owner: request_key_from_table(buffer.owner(), "buffer_id.owner")?,
-        producer_op_id: computation_id_from_fb(buffer.producer_op_id())?,
+        producer_call_id: computation_id_from_fb(buffer.producer_call_id())?,
         output_index: buffer.output_index(),
         generation: buffer.generation(),
     };
@@ -1603,7 +1603,7 @@ fn buffer_id_from_table(buffer: fbs::BufferId<'_>) -> CodecResult<BufferId> {
 fn buffer_id_to_fb(buffer: BufferId) -> fbs::BufferIdT {
     fbs::BufferIdT {
         owner: Some(Box::new(request_key_to_fb(buffer.owner))),
-        producer_op_id: Some(computation_id_to_fb(buffer.producer_op_id)),
+        producer_call_id: Some(computation_id_to_fb(buffer.producer_call_id)),
         output_index: buffer.output_index,
         generation: buffer.generation,
     }
@@ -1716,7 +1716,7 @@ fn completion_record_to_fb(record: &RequestOutput) -> fbs::RequestOutputT {
                 .collect(),
         ),
         request_key: Some(Box::new(request_key_to_fb(record.request_key))),
-        op_id: Some(computation_id_to_fb(record.op_id)),
+        call_id: Some(computation_id_to_fb(record.call_id)),
         status: op_status_to_fb(record.status),
         product_generations: Some(record.product_generations.clone()),
         error_code: record.error_code.map(error_code_to_fb),
@@ -1772,11 +1772,11 @@ fn tensor_publication_to_fb(payload: &TensorPublication) -> CodecResult<fbs::Ten
     })
 }
 
-/// Converts an error's request and operation identity into its wire table.
-fn error_operation_to_fb(operation: &ErrorOperationIdentity) -> fbs::ErrorOperationIdentityT {
-    fbs::ErrorOperationIdentityT {
-        request_key: Some(Box::new(request_key_to_fb(operation.request_key))),
-        op_id: Some(computation_id_to_fb(operation.op_id)),
+/// Converts an error's request and call identity into its wire table.
+fn error_call_to_fb(call: &ErrorCallIdentity) -> fbs::ErrorCallIdentityT {
+    fbs::ErrorCallIdentityT {
+        request_key: Some(Box::new(request_key_to_fb(call.request_key))),
+        call_id: Some(computation_id_to_fb(call.call_id)),
     }
 }
 
@@ -2271,18 +2271,18 @@ fn transfer_mode_from_fb(value: fbs::TransferMode) -> CodecResult<TransferMode> 
 }
 
 /// Encode exactly one classification in a three-byte inline wire struct.
-fn computation_to_fb(value: Computation) -> fbs::ComputationT {
-    let mut encoded = fbs::ComputationT::default();
+fn computation_to_fb(value: CallKind) -> fbs::CallKindT {
+    let mut encoded = fbs::CallKindT::default();
     match value {
-        Computation::Forward(mode) => encoded.forward_mode = forward_mode_to_fb(mode),
-        Computation::Pipeline(stage) => encoded.stage = pipeline_stage_to_fb(stage),
-        Computation::Transfer(mode) => encoded.transfer = transfer_mode_to_fb(mode),
+        CallKind::Forward(mode) => encoded.forward_mode = forward_mode_to_fb(mode),
+        CallKind::Pipeline(stage) => encoded.stage = pipeline_stage_to_fb(stage),
+        CallKind::Transfer(mode) => encoded.transfer = transfer_mode_to_fb(mode),
     }
     encoded
 }
 
 /// Reject missing, conflicting, and unknown tags at the transport boundary.
-fn computation_from_fb(value: &fbs::Computation) -> CodecResult<Computation> {
+fn computation_from_fb(value: &fbs::CallKind) -> CodecResult<CallKind> {
     let present = u8::from(value.forward_mode() != fbs::ForwardMode::None)
         + u8::from(value.stage() != fbs::PipelineStage::None)
         + u8::from(value.transfer() != fbs::TransferMode::None);
@@ -2290,15 +2290,15 @@ fn computation_from_fb(value: &fbs::Computation) -> CodecResult<Computation> {
         codec_bail!("computation must select exactly one classification");
     }
     if value.forward_mode() != fbs::ForwardMode::None {
-        Ok(Computation::Forward(forward_mode_from_fb(
+        Ok(CallKind::Forward(forward_mode_from_fb(
             value.forward_mode(),
         )?))
     } else if value.stage() != fbs::PipelineStage::None {
-        Ok(Computation::Pipeline(pipeline_stage_from_fb(
+        Ok(CallKind::Pipeline(pipeline_stage_from_fb(
             value.stage(),
         )?))
     } else {
-        Ok(Computation::Transfer(transfer_mode_from_fb(
+        Ok(CallKind::Transfer(transfer_mode_from_fb(
             value.transfer(),
         )?))
     }
@@ -2617,21 +2617,21 @@ fn draw_layout_from_fb(layout: fbs::DrawLayout) -> CodecResult<DrawLayout> {
     })
 }
 
-/// Maps an operation status to its stable FlatBuffers discriminant.
-fn op_status_to_fb(status: OpStatus) -> fbs::OpStatus {
+/// Maps an call status to its stable FlatBuffers discriminant.
+fn op_status_to_fb(status: CallStatus) -> fbs::CallStatus {
     match status {
-        OpStatus::Ok => fbs::OpStatus::Ok,
-        OpStatus::Predicated => fbs::OpStatus::Predicated,
-        OpStatus::Error => fbs::OpStatus::Error,
+        CallStatus::Ok => fbs::CallStatus::Ok,
+        CallStatus::Predicated => fbs::CallStatus::Predicated,
+        CallStatus::Error => fbs::CallStatus::Error,
     }
 }
 
-/// Decodes a supported FlatBuffers operation status.
-fn op_status_from_fb(status: fbs::OpStatus) -> CodecResult<OpStatus> {
+/// Decodes a supported FlatBuffers call status.
+fn op_status_from_fb(status: fbs::CallStatus) -> CodecResult<CallStatus> {
     Ok(match status {
-        fbs::OpStatus::Ok => OpStatus::Ok,
-        fbs::OpStatus::Predicated => OpStatus::Predicated,
-        fbs::OpStatus::Error => OpStatus::Error,
+        fbs::CallStatus::Ok => CallStatus::Ok,
+        fbs::CallStatus::Predicated => CallStatus::Predicated,
+        fbs::CallStatus::Error => CallStatus::Error,
         other => codec_bail!("unknown completion status {}", other.0),
     })
 }
@@ -2639,7 +2639,7 @@ fn op_status_from_fb(status: fbs::OpStatus) -> CodecResult<OpStatus> {
 /// Maps a worker error code to its stable FlatBuffers discriminant.
 fn error_code_to_fb(code: ErrorCode) -> fbs::ErrorCode {
     match code {
-        ErrorCode::InvalidOperation => fbs::ErrorCode::InvalidOperation,
+        ErrorCode::InvalidCall => fbs::ErrorCode::InvalidCall,
         ErrorCode::ResourceExhausted => fbs::ErrorCode::ResourceExhausted,
         ErrorCode::ComputeError => fbs::ErrorCode::ComputeError,
         ErrorCode::Cancelled => fbs::ErrorCode::Cancelled,
@@ -2650,7 +2650,7 @@ fn error_code_to_fb(code: ErrorCode) -> fbs::ErrorCode {
 /// Decodes a supported FlatBuffers worker error code.
 fn error_code_from_fb(code: fbs::ErrorCode) -> CodecResult<ErrorCode> {
     Ok(match code {
-        fbs::ErrorCode::InvalidOperation => ErrorCode::InvalidOperation,
+        fbs::ErrorCode::InvalidCall => ErrorCode::InvalidCall,
         fbs::ErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
         fbs::ErrorCode::ComputeError => ErrorCode::ComputeError,
         fbs::ErrorCode::Cancelled => ErrorCode::Cancelled,

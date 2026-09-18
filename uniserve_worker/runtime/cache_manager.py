@@ -19,7 +19,7 @@ from uniserve.runtime import PrefixCache
 from uniserve_worker.bootstrap.worker_info import KVCacheInfo
 
 from ..foundation.errors import invalid_descriptor, resource_error
-from ..protocol.identity import BufferId, ComputationId, RequestKey
+from ..protocol.identity import BufferId, CallId, RequestKey
 from ..protocol.transfer import KvTransfer, Locator, TensorTransfer
 from ..transfer.exports import ExportLocations, release_exports
 from ..transfer.tickets import Transport, publish_tensor
@@ -345,7 +345,7 @@ class CacheManager:
         # Free retires a publication, not the request's resident KV pages.
         # Unrelated products can share that request while later computation
         # still reads its prefix. Only request retirement waits for all such
-        # computations; physical page reuse separately checks their ranges.
+        # call kinds; physical page reuse separately checks their ranges.
         with self._execution_lock:
             executions = tuple(
                 execution
@@ -1083,8 +1083,8 @@ class CacheManager:
                 publication.published_extent,
             )
 
-    def release_operations(
-        self, releases: Sequence[tuple[RequestKey, ComputationId]]
+    def release_calls(
+        self, releases: Sequence[tuple[RequestKey, CallId]]
     ) -> tuple[BufferId, ...]:
         """Forget semantic publications and identify buffers.
 
@@ -1094,11 +1094,11 @@ class CacheManager:
         their semantic record does not release a remote publisher's
         storage.
         """
-        identities = {(key, op_id) for key, op_id in releases}
+        identities = {(key, call_id) for key, call_id in releases}
         publications_by_buffer = tuple(
             buffer
             for buffer in self._publications
-            if (buffer.owner, buffer.producer_op_id) in identities
+            if (buffer.owner, buffer.producer_call_id) in identities
         )
         for buffer in publications_by_buffer:
             del self._publications[buffer]

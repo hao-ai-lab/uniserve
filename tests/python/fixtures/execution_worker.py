@@ -27,7 +27,7 @@ def execution_worker(
     execution: WorkerConfig | None = None,
     max_batch_tokens: int = 8192,
     max_request_pool_size: int = 128,
-    max_batch_operations: int | None = None,
+    max_batch_calls: int | None = None,
     components: tuple[tuple[str, ComponentConfig], ...] = (),
     bindings: Mapping[str, ModelEntry] | None = None,
 ) -> Worker:
@@ -37,10 +37,10 @@ def execution_worker(
         device=device,
         max_request_pool_size=max_request_pool_size,
     )
-    if max_batch_operations is not None:
+    if max_batch_calls is not None:
         worker_config = replace(
             worker_config,
-            max_batch_operations=int(max_batch_operations),
+            max_batch_calls=int(max_batch_calls),
         )
     policy = (
         WorkerConfig(
@@ -64,7 +64,7 @@ def execution_worker(
         attention_backend=worker_config.attention_backend,
         max_request_pool_size=worker_config.max_request_pool_size,
         encoder_cache_entries=worker_config.encoder_cache_entries,
-        max_batch_operations=worker_config.max_batch_operations,
+        max_batch_calls=worker_config.max_batch_calls,
         max_batch_tokens=worker_config.max_batch_tokens,
     )
     worker = Worker(

@@ -70,5 +70,5 @@ pub enum Error {
     Text(#[from] crate::serving::text::Error),
 }
 
-/// Result type returned by chat operations.
+/// Result type returned by chat calls.
 pub type Result<T> = std::result::Result<T, Error>;

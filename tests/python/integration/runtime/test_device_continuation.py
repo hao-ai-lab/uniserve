@@ -11,20 +11,20 @@ from tests.python.fixtures.depth_one import (
     finalized_report,
     record_completion,
     root_parent,
-    token_operation,
+    token_call,
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
 from uniserve.sampling import SamplingParams
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.protocol.identity import ComputationId
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
+    CallStatus,
     DrawLayout,
     ForwardMode,
-    OpStatus,
     Rng,
     SamplingState,
 )
+from uniserve_worker.protocol.identity import CallId
 
 pytestmark = [
     pytest.mark.integration,
@@ -35,7 +35,7 @@ pytestmark = [
 
 
 @pytest.mark.parametrize("graphs", [False, True])
-@pytest.mark.parametrize("finish_policy", ["admission", "operation", "force"])
+@pytest.mark.parametrize("finish_policy", ["admission", "call", "force"])
 def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
     graphs, finish_policy
 ) -> None:
@@ -58,9 +58,9 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
         device="cuda:0", queue_depth=3, execution=policy
     ) as worker:
         parents = tuple(
-            token_operation(
+            token_call(
                 admission.request_key,
-                op_id=ComputationId(1, index),
+                call_id=CallId(1, index),
                 predecessor=root_parent(admission),
                 mode=ForwardMode.PREFILL,
                 tokens=(3, 4),
@@ -69,14 +69,14 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
         )
         parent_report = worker.submit(
             execution_batch(
-                batch_id=1, admissions=(first, second), operations=parents
+                batch_id=1, admissions=(first, second), calls=parents
             )
         )
         decodes = tuple(
-            token_operation(
+            token_call(
                 parent.request_key,
-                op_id=ComputationId(2, index),
-                predecessor=parent.op_id,
+                call_id=CallId(2, index),
+                predecessor=parent.call_id,
                 mode=ForwardMode.DECODE,
                 tokens=(0,),
                 predicate=parent.token_output,
@@ -89,7 +89,7 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
                     decodes[0],
                     sampling_state=SamplingState(
                         finish_token_ids=(terminal,)
-                        if finish_policy == "operation"
+                        if finish_policy == "call"
                         else (),
                         force_finish=finish_policy == "force",
                     ),
@@ -97,13 +97,13 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
                 decodes[1],
             )
         decode_report = worker.submit(
-            execution_batch(batch_id=2, operations=decodes)
+            execution_batch(batch_id=2, calls=decodes)
         )
         successors = tuple(
-            token_operation(
+            token_call(
                 decode.request_key,
-                op_id=ComputationId(3, index),
-                predecessor=decode.op_id,
+                call_id=CallId(3, index),
+                predecessor=decode.call_id,
                 mode=ForwardMode.DECODE,
                 tokens=(0,),
                 predicate=decode.token_output,
@@ -112,7 +112,7 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
         )
         # Queue the dependent work before consuming either parent's host result.
         successor_report = worker.submit(
-            execution_batch(batch_id=3, operations=successors)
+            execution_batch(batch_id=3, calls=successors)
         )
         finalized_report(worker, parent_report)
         selected = finalized_report(worker, decode_report).completions
@@ -122,9 +122,9 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
             (terminal,),
             (terminal,),
         )
-        assert following[0].status is OpStatus.PREDICATED
+        assert following[0].status is CallStatus.PREDICATED
         assert following[0].committed_tokens == ()
-        assert following[1].status is OpStatus.OK
+        assert following[1].status is CallStatus.OK
         assert following[1].committed_tokens == (expected_successor(terminal),)
 
 
@@ -132,9 +132,9 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
     device = "cuda:0"
     worker = execution_worker(device=device, queue_depth=2)
     warm_admission = ar_params(30, block_ids=(1,))
-    warm_operation = token_operation(
+    warm_call = token_call(
         warm_admission.request_key,
-        op_id=ComputationId(100, 0),
+        call_id=CallId(100, 0),
         predecessor=root_parent(warm_admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -143,16 +143,16 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
         execution_batch(
             batch_id=0,
             admissions=(warm_admission,),
-            operations=(warm_operation,),
+            calls=(warm_call,),
         )
     )
     torch.cuda.synchronize()
     worker.drop_request(30)
 
     admission = ar_params(31, block_ids=(0,))
-    predecessor = token_operation(
+    predecessor = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -162,13 +162,13 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
         execution_batch(
             batch_id=1,
             admissions=(admission,),
-            operations=(predecessor,),
+            calls=(predecessor,),
         )
     )
-    device_parent = predecessor.op_id
-    successor_template = token_operation(
+    device_parent = predecessor.call_id
+    successor_template = token_call(
         admission.request_key,
-        op_id=ComputationId(2, 0),
+        call_id=CallId(2, 0),
         predecessor=device_parent,
         mode=ForwardMode.DECODE,
         tokens=(0,),
@@ -180,7 +180,7 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
         execution_batch(
             batch_id=2,
             admissions=(),
-            operations=(successor,),
+            calls=(successor,),
         )
     )
 
@@ -198,9 +198,9 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
 def test_device_continuation_chain_matches_serial_token_sequence() -> None:
     worker = execution_worker(device="cuda:0", queue_depth=4)
     admission = ar_params(32, block_ids=(0,))
-    operation = token_operation(
+    call = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -210,18 +210,18 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(operation,),
+                calls=(call,),
             )
         )
     ]
-    operations = [operation]
+    calls = [call]
 
     for batch_id in range(2, 5):
-        predecessor = operations[-1]
-        operation = token_operation(
+        predecessor = calls[-1]
+        call = token_call(
             admission.request_key,
-            op_id=ComputationId(batch_id, 0),
-            predecessor=predecessor.op_id,
+            call_id=CallId(batch_id, 0),
+            predecessor=predecessor.call_id,
             mode=ForwardMode.DECODE,
             tokens=(0,),
             predicate=predecessor.token_output,
@@ -231,11 +231,11 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
                 execution_batch(
                     batch_id=batch_id,
                     admissions=(),
-                    operations=(operation,),
+                    calls=(call,),
                 )
             )
         )
-        operations.append(operation)
+        calls.append(call)
 
     torch.cuda.synchronize()
     completions = tuple(
@@ -257,9 +257,9 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
 def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
     worker = execution_worker(device="cuda:0", queue_depth=3)
     admission = ar_params(33, block_ids=(0,))
-    operation = token_operation(
+    call = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -269,17 +269,17 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(operation,),
+                calls=(call,),
             )
         )
     ]
-    operations = [operation]
+    calls = [call]
     for batch_id in range(2, 5):
-        predecessor = operations[-1]
-        operation = token_operation(
+        predecessor = calls[-1]
+        call = token_call(
             admission.request_key,
-            op_id=ComputationId(batch_id, 0),
-            predecessor=predecessor.op_id,
+            call_id=CallId(batch_id, 0),
+            predecessor=predecessor.call_id,
             mode=ForwardMode.DECODE,
             tokens=(0,),
             predicate=predecessor.token_output,
@@ -288,11 +288,11 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
             worker.submit(
                 execution_batch(
                     batch_id=batch_id,
-                    operations=(operation,),
+                    calls=(call,),
                 )
             )
         )
-        operations.append(operation)
+        calls.append(call)
 
     torch.cuda.synchronize()
     tokens = tuple(
@@ -313,9 +313,9 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
     worker = execution_worker(device="cuda:0", queue_depth=2)
     sampling = SamplingParams(temperature=0.8, top_k=32, top_p=0.93, seed=917)
     pipelined = ar_params(41, block_ids=(2,), sampling=sampling)
-    predecessor = token_operation(
+    predecessor = token_call(
         pipelined.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(pipelined),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -329,13 +329,13 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         execution_batch(
             batch_id=1,
             admissions=(pipelined,),
-            operations=(predecessor,),
+            calls=(predecessor,),
         )
     )
-    successor = token_operation(
+    successor = token_call(
         pipelined.request_key,
-        op_id=ComputationId(2, 0),
-        predecessor=predecessor.op_id,
+        call_id=CallId(2, 0),
+        predecessor=predecessor.call_id,
         mode=ForwardMode.DECODE,
         tokens=(0,),
         predicate=predecessor.token_output,
@@ -349,7 +349,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         execution_batch(
             batch_id=2,
             admissions=(),
-            operations=(successor,),
+            calls=(successor,),
         )
     )
 
@@ -361,9 +361,9 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
 
     serial_worker = execution_worker(device="cuda:0", queue_depth=1)
     serial = ar_params(41, block_ids=(2,), sampling=sampling)
-    serial_parent = token_operation(
+    serial_parent = token_call(
         serial.request_key,
-        op_id=ComputationId(11, 0),
+        call_id=CallId(11, 0),
         predecessor=root_parent(serial),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -377,17 +377,17 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         execution_batch(
             batch_id=11,
             admissions=(serial,),
-            operations=(serial_parent,),
+            calls=(serial_parent,),
         )
     )
     torch.cuda.synchronize()
     serial_parent_report = finalized_report(serial_worker, serial_parent_report)
     serial_first = serial_parent_report.completions[0].committed_tokens[0]
     observation = record_completion(serial_parent, serial_parent_report)
-    serial_successor = token_operation(
+    serial_successor = token_call(
         serial.request_key,
-        op_id=ComputationId(12, 0),
-        predecessor=observation.op_id,
+        call_id=CallId(12, 0),
+        predecessor=observation.call_id,
         mode=ForwardMode.DECODE,
         tokens=(serial_first,),
         rng=Rng(
@@ -400,7 +400,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         execution_batch(
             batch_id=12,
             admissions=(),
-            operations=(serial_successor,),
+            calls=(serial_successor,),
             commands=(),
         )
     )
@@ -431,9 +431,9 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
     )
     worker = execution_worker(device="cuda:0", queue_depth=2)
     pipelined = ar_params(57, block_ids=(3,), sampling=sampling)
-    predecessor = token_operation(
+    predecessor = token_call(
         pipelined.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(pipelined),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -447,13 +447,13 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         execution_batch(
             batch_id=1,
             admissions=(pipelined,),
-            operations=(predecessor,),
+            calls=(predecessor,),
         )
     )
-    successor = token_operation(
+    successor = token_call(
         pipelined.request_key,
-        op_id=ComputationId(2, 0),
-        predecessor=predecessor.op_id,
+        call_id=CallId(2, 0),
+        predecessor=predecessor.call_id,
         mode=ForwardMode.DECODE,
         tokens=(0,),
         predicate=predecessor.token_output,
@@ -467,7 +467,7 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         execution_batch(
             batch_id=2,
             admissions=(),
-            operations=(successor,),
+            calls=(successor,),
         )
     )
 
@@ -479,9 +479,9 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
 
     serial_worker = execution_worker(device="cuda:0", queue_depth=1)
     serial = ar_params(57, block_ids=(3,), sampling=sampling)
-    serial_parent = token_operation(
+    serial_parent = token_call(
         serial.request_key,
-        op_id=ComputationId(11, 0),
+        call_id=CallId(11, 0),
         predecessor=root_parent(serial),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -495,17 +495,17 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         execution_batch(
             batch_id=11,
             admissions=(serial,),
-            operations=(serial_parent,),
+            calls=(serial_parent,),
         )
     )
     torch.cuda.synchronize()
     serial_parent_report = finalized_report(serial_worker, serial_parent_report)
     serial_first = serial_parent_report.completions[0].committed_tokens[0]
     observation = record_completion(serial_parent, serial_parent_report)
-    serial_successor = token_operation(
+    serial_successor = token_call(
         serial.request_key,
-        op_id=ComputationId(12, 0),
-        predecessor=observation.op_id,
+        call_id=CallId(12, 0),
+        predecessor=observation.call_id,
         mode=ForwardMode.DECODE,
         tokens=(serial_first,),
         rng=Rng(
@@ -518,7 +518,7 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         execution_batch(
             batch_id=12,
             admissions=(),
-            operations=(serial_successor,),
+            calls=(serial_successor,),
             commands=(),
         )
     )

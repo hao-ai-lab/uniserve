@@ -22,7 +22,7 @@ def response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
     # only override declared fields, leaving the rest at their null defaults.
     response: dict[str, Any] = {
         "kind": kind.value,
-        "call_id": None,
+        "message_id": None,
         "info": None,
         "result": None,
         "message": None,
@@ -30,7 +30,7 @@ def response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
         "fatal": None,
         "phase": None,
         "route": None,
-        "operations": [],
+        "calls": [],
     }
 
     unknown = set(payload) - set(response)
@@ -84,11 +84,11 @@ def request_kind(request: Mapping[str, Any]) -> RequestKind:
 def batch_requests(batch: Batch) -> frozenset[int]:
     """Collect request identifiers referenced by a batch.
 
-    Admissions, operations, and commands each reference request keys.
+    Admissions, calls, and commands each reference request keys.
     """
     keys = (
         *(admission.request_key for admission in batch.admissions),
-        *(operation.request_key for operation in batch.operations),
+        *(call.request_key for call in batch.calls),
         *(command.request_key for command in batch.commands),
     )
     return frozenset(int(key.request_id) for key in keys)
@@ -106,11 +106,11 @@ def raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
     if not isinstance(batch, Mapping):
         return frozenset(requests)
 
-    # Walk the raw wire form: operation and command items may wrap their
+    # Walk the raw wire form: call and command items may wrap their
     # payload in a "value" key, and a request key may nest under a "request"
     # payload (as in admission commands).
     groups: list[object] = [
-        batch.get("operations", ()),
+        batch.get("calls", ()),
         batch.get("commands", ()),
     ]
     for group in groups:
@@ -170,13 +170,13 @@ class PendingResponse:
     batch: BatchState | None = None
 
 
-def with_call_id(
+def with_message_id(
     response: dict[str, Any], request: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Copy the caller correlation identifier onto a response when present."""
-    call_id = request.get("call_id")
-    if call_id is not None:
-        response["call_id"] = call_id
+    message_id = request.get("message_id")
+    if message_id is not None:
+        response["message_id"] = message_id
     return response
 
 
@@ -189,4 +189,4 @@ def error_response(
     """
     fields = error.to_mapping()
     fields.pop("kind", None)
-    return with_call_id(response(ResponseKind.ERROR, **fields), request)
+    return with_message_id(response(ResponseKind.ERROR, **fields), request)

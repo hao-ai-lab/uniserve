@@ -34,7 +34,7 @@ pub enum ApiError {
         /// Parser failure message.
         message: String,
     },
-    /// A valid control operation conflicts with the current runtime state.
+    /// A valid control call conflicts with the current runtime state.
     Conflict {
         /// Human-readable conflict description.
         message: String,

@@ -27,10 +27,10 @@ from ..transfer.tickets import TransferTicket
 
 @dataclass(frozen=True, slots=True)
 class LatentStaging:
-    """Fixed-address page-table and contiguous value views for one operation."""
+    """Fixed-address page-table and contiguous value views for one call."""
 
     page_table: tuple[int, ...]
-    # Device page indices for this operation, [len(page_table)] int64.
+    # Device page indices for this call, [len(page_table)] int64.
     pages: torch.Tensor
     # Contiguous staged values, [len(page_table) * page_units, latent_width].
     value: torch.Tensor
@@ -187,7 +187,7 @@ class LatentPool:
         try:
             yield views
         finally:
-            # The buffer is borrowed again by the first admitted operation, so
+            # The buffer is borrowed again by the first admitted call, so
             # startup writes must be complete before control returns.
             if self.device.type == "cuda":
                 torch.cuda.current_stream(self.device).synchronize()
@@ -226,7 +226,7 @@ class LatentPool:
             page for item in occupied for page in item.page_table
         ):
             raise invalid_descriptor(
-                "latent staging page tables overlap live operations"
+                "latent staging page tables overlap live calls"
             )
 
         # Place this batch in the lowest free range past every occupied view.

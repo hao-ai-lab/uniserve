@@ -29,7 +29,7 @@ def transform_timeline(
 ) -> None:
     """Create a complete interval and relationship database from one export.
 
-    NVTX containment supplies request and operation identity, while CUDA
+    NVTX containment supplies request and call identity, while CUDA
     correlation records connect host API intervals to device activity.
     """
     source = Path(source)
@@ -48,7 +48,7 @@ def transform_timeline(
         if require_cuda and "CUPTI_ACTIVITY_KIND_RUNTIME" not in tables:
             raise RuntimeError("nsys export is missing CUDA runtime intervals")
 
-        # NVTX ranges establish the request and operation hierarchy inherited by
+        # NVTX ranges establish the request and call hierarchy inherited by
         # nested CPU and GPU activity.
         ranges_by_thread: dict[int, list[dict[str, Any]]] = defaultdict(list)
         ranges_by_process: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -81,7 +81,7 @@ def transform_timeline(
                 request_id=fields.get("request"),
                 step_id=fields.get("step"),
                 partition_id=fields.get("partition"),
-                operation_id=fields.get("op"),
+                call_id=fields.get("op"),
                 work_kind=fields.get("work"),
                 source_table="NVTX_EVENTS",
             )
@@ -333,7 +333,7 @@ def _create_schema(db: sqlite3.Connection) -> None:
             request_id TEXT,
             step_id INTEGER,
             partition_id INTEGER,
-            operation_id INTEGER,
+            call_id INTEGER,
             work_kind TEXT,
             source_table TEXT NOT NULL
         );
@@ -360,8 +360,8 @@ def _create_indexes(db: sqlite3.Connection) -> None:
         """
         CREATE INDEX events_time ON events(start_ns, end_ns);
         CREATE INDEX events_gpu ON events(device_id, stream_id, start_ns);
-        CREATE INDEX events_operation
-            ON events(request_id, operation_id, start_ns);
+        CREATE INDEX events_call
+            ON events(request_id, call_id, start_ns);
         CREATE INDEX events_correlation ON events(process_id, correlation_id);
         """
     )
@@ -387,7 +387,7 @@ def _insert_gpu_table(
     enum_copy = _enum(raw, "ENUM_CUDA_MEMCPY_OPER")
     enum_sync = _enum(raw, "ENUM_CUPTI_SYNC_TYPE")
     for row in _rows(raw, table):
-        # Correlation records inherit the request and operation identity already
+        # Correlation records inherit the request and call identity already
         # attached to the matching CUDA runtime call.
         start, end = _interval(row)
         global_pid, pid, process_name = _process_identity(row, processes)
@@ -625,7 +625,7 @@ def _insert_event(db: sqlite3.Connection, **values: Any) -> int:
         "request_id",
         "step_id",
         "partition_id",
-        "operation_id",
+        "call_id",
         "work_kind",
         "source_table",
     )
@@ -633,7 +633,7 @@ def _insert_event(db: sqlite3.Connection, **values: Any) -> int:
     end = max(start, int(values["end_ns"]))
     values["start_ns"] = start
     values["end_ns"] = end
-    numeric = {"rank", "step_id", "partition_id", "operation_id"}
+    numeric = {"rank", "step_id", "partition_id", "call_id"}
     row = []
     for column in columns:
         value = values.get(column)
@@ -671,7 +671,7 @@ def _link(
 
 
 def _inherited(parent: dict[str, Any] | None) -> dict[str, Any]:
-    """Extract operation identity inherited from a containing range."""
+    """Extract call identity inherited from a containing range."""
     if parent is None:
         return {}
     return {
@@ -679,7 +679,7 @@ def _inherited(parent: dict[str, Any] | None) -> dict[str, Any]:
         "request_id": parent.get("request"),
         "step_id": parent.get("step"),
         "partition_id": parent.get("partition"),
-        "operation_id": parent.get("op"),
+        "call_id": parent.get("op"),
         "work_kind": parent.get("work"),
     }
 
@@ -695,7 +695,7 @@ def _enrich_nvtx(
         "request": "request_id",
         "step": "step_id",
         "partition": "partition_id",
-        "op": "operation_id",
+        "op": "call_id",
         "work": "work_kind",
     }
     for ranges in ranges_by_thread.values():

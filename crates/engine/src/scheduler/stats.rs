@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 /// General loop counters that do not belong to a more specific group.
 #[derive(Default)]
 pub struct GeneralStats {
-    /// Largest number of operations observed in one submitted batch.
+    /// Largest number of calls observed in one submitted batch.
     pub peak_ops: AtomicUsize,
     /// Number of scheduler loop iterations completed.
     pub steps: AtomicU64,
@@ -15,7 +15,7 @@ pub struct GeneralStats {
     pub running: AtomicUsize,
     /// Current number of requests waiting for admission.
     pub pending: AtomicUsize,
-    /// Current number of submitted operations awaiting completion.
+    /// Current number of submitted calls awaiting completion.
     pub in_flight: AtomicUsize,
 }
 
@@ -78,18 +78,18 @@ pub struct TimingStats {
 /// Cumulative accounting for one physical execution domain.
 #[derive(Default)]
 pub struct DomainStats {
-    /// Credits currently held by in-flight operations.
+    /// Credits currently held by in-flight calls.
     pub active_credits: AtomicUsize,
     /// Maximum number of concurrently held credits.
     pub peak_credits: AtomicUsize,
-    /// Cumulative operations submitted to the domain.
-    pub launched_operations: AtomicU64,
-    /// Cumulative operations completed by the domain.
-    pub completed_operations: AtomicU64,
-    /// Cumulative operations skipped by a false predicate.
-    pub predicated_operations: AtomicU64,
-    /// Cumulative operations completed with an error.
-    pub error_operations: AtomicU64,
+    /// Cumulative calls submitted to the domain.
+    pub launched_calls: AtomicU64,
+    /// Cumulative calls completed by the domain.
+    pub completed_calls: AtomicU64,
+    /// Cumulative calls skipped by a false predicate.
+    pub predicated_calls: AtomicU64,
+    /// Cumulative calls completed with an error.
+    pub error_calls: AtomicU64,
     /// Cumulative submissions rejected by executor backpressure.
     pub backpressure_events: AtomicU64,
     /// Cumulative credits recovered after terminal execution failure.
@@ -118,20 +118,20 @@ pub struct ExecutionDomainStats {
 }
 
 impl ExecutionDomainStats {
-    /// Public metrics aggregate concrete computations into three stable labels.
+    /// Public metrics aggregate concrete call kinds into three stable labels.
     /// This index is used only for counters, never for execution or lane routing.
-    pub(super) const fn index(computation: uniserve_worker_ipc::Computation) -> usize {
-        use uniserve_worker_ipc::{Computation, ForwardMode, PipelineStage};
+    pub(super) const fn index(computation: uniserve_worker_ipc::CallKind) -> usize {
+        use uniserve_worker_ipc::{CallKind, ForwardMode, PipelineStage};
         match computation {
-            Computation::Forward(ForwardMode::Decode | ForwardMode::Verify) => 1,
-            Computation::Forward(_)
-            | Computation::Transfer(_)
-            | Computation::Pipeline(
+            CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify) => 1,
+            CallKind::Forward(_)
+            | CallKind::Transfer(_)
+            | CallKind::Pipeline(
                 PipelineStage::TextEncoding
                 | PipelineStage::VisionEncoding
                 | PipelineStage::LatentEncoding,
             ) => 0,
-            Computation::Pipeline(_) => 2,
+            CallKind::Pipeline(_) => 2,
         }
     }
 
@@ -145,7 +145,7 @@ impl ExecutionDomainStats {
     }
 
     /// Returns the public metrics counters for an actual computation.
-    pub fn get(&self, computation: uniserve_worker_ipc::Computation) -> &DomainStats {
+    pub fn get(&self, computation: uniserve_worker_ipc::CallKind) -> &DomainStats {
         self.groups()[Self::index(computation)].1
     }
 }

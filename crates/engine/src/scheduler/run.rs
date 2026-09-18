@@ -10,20 +10,20 @@ fn resolve_generation_limits(
 ) -> uniserve_core::GenerationLimits {
     let supports = |kind| info.supported_ops.contains(&kind);
     let mut available = uniserve_core::GenerationFeatures::empty();
-    if supports(Computation::Forward(ForwardMode::Prefill))
-        && supports(Computation::Forward(ForwardMode::Decode))
+    if supports(CallKind::Forward(ForwardMode::Prefill))
+        && supports(CallKind::Forward(ForwardMode::Decode))
     {
         available.insert(uniserve_core::GenerationFeatures::UNDERSTANDING);
     }
-    if supports(Computation::Pipeline(PipelineStage::VisionEncoding)) {
+    if supports(CallKind::Pipeline(PipelineStage::VisionEncoding)) {
         available.insert(uniserve_core::GenerationFeatures::VISION_ENCODE);
     }
-    if supports(Computation::Pipeline(PipelineStage::LatentEncoding)) {
+    if supports(CallKind::Pipeline(PipelineStage::LatentEncoding)) {
         available.insert(uniserve_core::GenerationFeatures::LATENT_ENCODE);
     }
-    if supports(Computation::Pipeline(PipelineStage::LatentPreparation))
-        && supports(Computation::Pipeline(PipelineStage::Denoising))
-        && supports(Computation::Pipeline(PipelineStage::ImageDecoding))
+    if supports(CallKind::Pipeline(PipelineStage::LatentPreparation))
+        && supports(CallKind::Pipeline(PipelineStage::Denoising))
+        && supports(CallKind::Pipeline(PipelineStage::ImageDecoding))
     {
         available.insert(uniserve_core::GenerationFeatures::IMAGE_GENERATION);
     }
@@ -91,13 +91,13 @@ impl Scheduler {
         // Capability families are mutually ordered from diffusion-only through
         // unified multimodal support to autoregressive-only execution.
         let work = &info.supported_ops;
-        let family = if work.contains(&Computation::Pipeline(PipelineStage::LatentPreparation))
-            && !work.contains(&Computation::Forward(ForwardMode::Decode))
+        let family = if work.contains(&CallKind::Pipeline(PipelineStage::LatentPreparation))
+            && !work.contains(&CallKind::Forward(ForwardMode::Decode))
         {
             RuntimeFamily::Diffusion
-        } else if work.contains(&Computation::Pipeline(PipelineStage::Denoising))
-            || (work.contains(&Computation::Pipeline(PipelineStage::VisionEncoding))
-                || work.contains(&Computation::Pipeline(PipelineStage::LatentEncoding)))
+        } else if work.contains(&CallKind::Pipeline(PipelineStage::Denoising))
+            || (work.contains(&CallKind::Pipeline(PipelineStage::VisionEncoding))
+                || work.contains(&CallKind::Pipeline(PipelineStage::LatentEncoding)))
         {
             RuntimeFamily::Umm
         } else {
@@ -173,7 +173,7 @@ impl Scheduler {
             info.uses_kv()
                 && info
                     .supported_ops
-                    .contains(&Computation::Pipeline(PipelineStage::Denoising)),
+                    .contains(&CallKind::Pipeline(PipelineStage::Denoising)),
         );
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity
@@ -266,7 +266,7 @@ impl Scheduler {
             num_pending_transfers: 0,
             batch_id: 0,
             next_arrival_seq: 1,
-            pending_operations: HashMap::new(),
+            pending_calls: HashMap::new(),
             pending_completions: HashMap::new(),
             pending_finishes: HashMap::new(),
             pending_batches: HashMap::new(),
@@ -330,7 +330,7 @@ impl Scheduler {
                 && self
                     .info
                     .supported_ops
-                    .contains(&Computation::Pipeline(PipelineStage::Denoising)),
+                    .contains(&CallKind::Pipeline(PipelineStage::Denoising)),
         );
         let capacity = self
             .request_pool

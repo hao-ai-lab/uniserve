@@ -18,7 +18,7 @@ from uniserve.runtime import CUDAGraph, ExecutionContext, PrefixCache
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.sampling import greedy
 from uniserve.tensors import adjacent_view
-from uniserve_worker.protocol.operation import ForwardMode
+from uniserve_worker.protocol.call import ForwardMode
 
 from .batch import ExecutionOutput, InputBatch
 from .sampling import TOKEN_CONTINUATION_BIT, SamplerOutput, TokenSelection
@@ -50,7 +50,7 @@ def select_flow_captures(
     request_counts: Sequence[int],
     cfg_branches: Sequence[int],
     *,
-    max_operations: int,
+    max_calls: int,
     max_tokens: int,
     per_image_capacity: int,
     latent_capacity: int,
@@ -66,7 +66,7 @@ def select_flow_captures(
         for height, width in shapes
         for rows in request_counts
         for branches in cfg_branches
-        if 0 < rows <= max_operations
+        if 0 < rows <= max_calls
         and rows * physical_tokens(height, width) * branches <= max_tokens
         and image_tokens(height, width) <= per_image_capacity
         and rows * image_tokens(height, width) <= latent_capacity

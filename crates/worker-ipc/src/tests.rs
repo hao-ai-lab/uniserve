@@ -11,14 +11,14 @@ fn request_key() -> RequestKey {
     RequestKey::new(4, RequestId(7), 2)
 }
 
-fn admission_predecessor() -> ComputationId {
-    ComputationId::new(0, 0)
+fn admission_predecessor() -> CallId {
+    CallId::new(0, 0)
 }
 
-fn output_product(op: ComputationId) -> TensorRef {
+fn output_product(call: CallId) -> TensorRef {
     TensorRef {
         request_key: request_key(),
-        producer_op_id: op,
+        producer_call_id: call,
         output_index: 0,
         generation: 3,
         dtype: DType::I64,
@@ -26,9 +26,9 @@ fn output_product(op: ComputationId) -> TensorRef {
     }
 }
 
-fn ar_decode_operation() -> ScheduledRequest {
-    let kind = Computation::Forward(ForwardMode::Decode);
-    ScheduledRequest {
+fn ar_decode_call() -> Call {
+    let kind = CallKind::Forward(ForwardMode::Decode);
+    Call {
         token_input: None,
         coordinates: CallCoordinates {
             logical_position: 7,
@@ -37,7 +37,7 @@ fn ar_decode_operation() -> ScheduledRequest {
             flow_step: 0,
         },
 
-        token_output: Some(output_product(ComputationId::new(11, 0))),
+        token_output: Some(output_product(CallId::new(11, 0))),
         vision_input: None,
         latent_feature_input: None,
         encoder_output: None,
@@ -54,7 +54,7 @@ fn ar_decode_operation() -> ScheduledRequest {
         input_token_ids: Vec::new(),
         sampling_state: None,
         request_key: request_key(),
-        op_id: ComputationId::new(11, 0),
+        call_id: CallId::new(11, 0),
         predecessor: Some(admission_predecessor()),
         entry: "model".into(),
         code: kind,
@@ -74,8 +74,8 @@ fn ar_decode_operation() -> ScheduledRequest {
     }
 }
 
-fn operation_for(kind: Computation, op_id: ComputationId) -> ScheduledRequest {
-    ScheduledRequest {
+fn call_for(kind: CallKind, call_id: CallId) -> Call {
+    Call {
         coordinates: CallCoordinates::default(),
         token_input: None,
 
@@ -91,26 +91,26 @@ fn operation_for(kind: Computation, op_id: ComputationId) -> ScheduledRequest {
         transition_output: None,
 
         input_image: None,
-        kv_input: (kind == Computation::Transfer(TransferMode::KvInstall)).then_some(BufferId {
+        kv_input: (kind == CallKind::Transfer(TransferMode::KvInstall)).then_some(BufferId {
             owner: request_key(),
-            producer_op_id: ComputationId::new(1, 0),
+            producer_call_id: CallId::new(1, 0),
             output_index: 0,
             generation: 1,
         }),
         kv_output: matches!(
             kind,
-            Computation::Transfer(TransferMode::KvPublish | TransferMode::KvInstall)
+            CallKind::Transfer(TransferMode::KvPublish | TransferMode::KvInstall)
         )
         .then_some(BufferId {
             owner: request_key(),
-            producer_op_id: op_id,
+            producer_call_id: call_id,
             output_index: 0,
             generation: 2,
         }),
         input_token_ids: Vec::new(),
         sampling_state: None,
         request_key: request_key(),
-        op_id,
+        call_id,
         predecessor: Some(admission_predecessor()),
         entry: "model".into(),
         code: kind,
@@ -143,14 +143,14 @@ fn completion_record() -> RequestOutput {
             rank: 2,
         }]],
         request_key: request_key(),
-        op_id: ComputationId::new(11, 0),
+        call_id: CallId::new(11, 0),
 
-        status: OpStatus::Ok,
+        status: CallStatus::Ok,
 
         product_generations: vec![3, 4],
         error_code: None,
         timing_counters: TimingCounters::default(),
-        code: Computation::Forward(ForwardMode::Decode),
+        code: CallKind::Forward(ForwardMode::Decode),
         position: 5,
         kv_visible_len: 5,
         kv_computed_len: 5,
@@ -201,15 +201,15 @@ fn execute_round_trip(batch: Batch) -> Batch {
 
 #[test]
 fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
-    let operation = operation_for(
-        Computation::Pipeline(PipelineStage::Denoising),
-        ComputationId::new(11, 0),
+    let call = call_for(
+        CallKind::Pipeline(PipelineStage::Denoising),
+        CallId::new(11, 0),
     );
-    let mut run = batch_with_operations(3, vec![], vec![operation]);
+    let mut run = batch_with_calls(3, vec![], vec![call]);
     // One alternative-prefix write followed by two denoising rows. Prefix
     // plus query lengths form total attention lengths even for read-only rows.
     run.forward = ForwardBatch {
-        operation_indices: vec![0, 0, 0],
+        call_indices: vec![0, 0, 0],
         request_pool_indices: vec![2, 1, 2],
         seq_lens: vec![2, 17, 6],
         query_lens: vec![2, 4, 4],
@@ -225,56 +225,56 @@ fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
     short_sequence.forward.seq_lens[2] = 3;
     assert!(encode_request(&WorkerRequest::submit(short_sequence)).is_err());
 
-    run.forward.operation_indices[2] = 1;
+    run.forward.call_indices[2] = 1;
     assert!(encode_request(&WorkerRequest::submit(run)).is_err());
 }
 
 #[test]
 fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
     let batch_id = u64::MAX - 7;
-    let first = operation_for(
-        Computation::Pipeline(PipelineStage::TextEncoding),
-        ComputationId::new(batch_id, u32::MAX - 1),
+    let first = call_for(
+        CallKind::Pipeline(PipelineStage::TextEncoding),
+        CallId::new(batch_id, u32::MAX - 1),
     );
-    let mut second = operation_for(
-        Computation::Pipeline(PipelineStage::TextEncoding),
-        ComputationId::new(batch_id, u32::MAX),
+    let mut second = call_for(
+        CallKind::Pipeline(PipelineStage::TextEncoding),
+        CallId::new(batch_id, u32::MAX),
     );
     second.request_key = key_for_request(101);
-    let run = batch_with_operations(3, vec![], vec![first.clone(), second]);
+    let run = batch_with_calls(3, vec![], vec![first.clone(), second]);
     assert_eq!(execute_round_trip(run.clone()), run);
 
     // A rank's projection of a batch can hold sparse logical indices. The
     // projection neither renumbers them nor narrows their unsigned range.
-    let projection = batch_with_operations(4, vec![], vec![first.clone()]);
+    let projection = batch_with_calls(4, vec![], vec![first.clone()]);
     assert_eq!(
-        execute_round_trip(projection).operations[0].op_id,
-        first.op_id
+        execute_round_trip(projection).calls[0].call_id,
+        first.call_id
     );
 
     let mut collision = run;
-    collision.operations[1].op_id = first.op_id;
+    collision.calls[1].call_id = first.call_id;
     assert!(encode_request(&WorkerRequest::submit(collision)).is_err());
 
     let mut invalid_parent = first;
-    invalid_parent.predecessor = Some(ComputationId::new(0, 1));
+    invalid_parent.predecessor = Some(CallId::new(0, 1));
     assert!(invalid_parent.validate().is_err());
 }
 
-fn batch_with_operations(
+fn batch_with_calls(
     batch_id: u64,
     admissions: Vec<NewRequest>,
-    operations: Vec<ScheduledRequest>,
+    calls: Vec<Call>,
 ) -> Batch {
-    // Operations name the batch they belong to.
-    let batch_id = operations
+    // Calls name the batch they belong to.
+    let batch_id = calls
         .first()
-        .map_or(batch_id, |operation| operation.op_id.batch_id);
-    let mut run = Batch::new(batch_id, admissions, operations);
+        .map_or(batch_id, |call| call.call_id.batch_id);
+    let mut run = Batch::new(batch_id, admissions, calls);
     run.collective_seq = batch_id.max(1);
     let mut next_buffer_offset = 0_u64;
-    for (operation_index, operation) in run.operations.iter().enumerate() {
-        for output in operation.buffer_outputs() {
+    for (call_index, call) in run.calls.iter().enumerate() {
+        for output in call.buffer_outputs() {
             next_buffer_offset = next_buffer_offset.div_ceil(256) * 256;
             let bytes = output.max_bytes();
             run.buffer_allocations.push(BufferAllocation {
@@ -284,15 +284,15 @@ fn batch_with_operations(
             });
             next_buffer_offset += bytes;
         }
-        let capacity_pages = operation.bounds.max_kv_pages;
+        let capacity_pages = call.bounds.max_kv_pages;
         if capacity_pages > 0 {
-            let request_pool_idx = u32::try_from(operation.request_key.request_id.0).unwrap();
+            let request_pool_idx = u32::try_from(call.request_key.request_id.0).unwrap();
             let page_ids = (1..=capacity_pages).map(BlockId).collect::<Vec<_>>();
             run.block_tables.push(BlockTable {
                 request_pool_idx,
                 group_id: 0,
                 page_ids: page_ids.clone(),
-                allocated_tokens: operation.bounds.max_tokens.max(1),
+                allocated_tokens: call.bounds.max_tokens.max(1),
             });
             run.new_cache_pages.push(CachePageAllocation {
                 request_pool_idx,
@@ -300,35 +300,35 @@ fn batch_with_operations(
                 page_ids,
             });
             run.forward.push(
-                operation_index as u32,
+                call_index as u32,
                 request_pool_idx,
-                operation.bounds.max_tokens.max(1),
-                operation.bounds.max_tokens.max(1),
+                call.bounds.max_tokens.max(1),
+                call.bounds.max_tokens.max(1),
                 true,
             );
         }
         if matches!(
-            operation.code,
-            Computation::Pipeline(PipelineStage::LatentPreparation)
-                | Computation::Pipeline(PipelineStage::Denoising)
-        ) || operation.latent_input.is_some()
+            call.code,
+            CallKind::Pipeline(PipelineStage::LatentPreparation)
+                | CallKind::Pipeline(PipelineStage::Denoising)
+        ) || call.latent_input.is_some()
         {
             run.latent_params.push(LatentParams {
-                request_key: operation.request_key,
-                op_id: operation.op_id,
-                page_table: vec![u32::try_from(operation_index + 1).unwrap()],
+                request_key: call.request_key,
+                call_id: call.call_id,
+                page_table: vec![u32::try_from(call_index + 1).unwrap()],
                 latent_units: 1,
                 height: 1,
                 width: 1,
                 start_step: 0,
                 step_count: u32::from(
-                    operation.code == Computation::Pipeline(PipelineStage::Denoising),
+                    call.code == CallKind::Pipeline(PipelineStage::Denoising),
                 ),
             });
         }
         if matches!(
-            operation.code,
-            Computation::Pipeline(
+            call.code,
+            CallKind::Pipeline(
                 PipelineStage::VideoDecoding
                     | PipelineStage::VideoEncoding
                     | PipelineStage::AudioDecoding
@@ -336,8 +336,8 @@ fn batch_with_operations(
             )
         ) {
             run.decode_ranges.push(DecodeRange {
-                request_key: operation.request_key,
-                op_id: operation.op_id,
+                request_key: call.request_key,
+                call_id: call.call_id,
                 cursor: 0,
                 max_units: 1,
             });
@@ -357,7 +357,7 @@ fn lane_report(
     BatchOutput {
         batch_id: completions
             .first()
-            .map_or(batch_id, |record| record.op_id.batch_id),
+            .map_or(batch_id, |record| record.call_id.batch_id),
         completions,
         products,
         registration: RegistrationAck { visible },
@@ -368,15 +368,15 @@ fn lane_report(
 
 #[test]
 fn every_work_variant_round_trips_through_ipc() {
-    let variants = Computation::ALL;
+    let variants = CallKind::ALL;
     for (index, work) in variants.into_iter().enumerate() {
-        let operation = operation_for(work, ComputationId::new(100 + index as u64, 0));
-        let batch = execute_round_trip(batch_with_operations(
+        let call = call_for(work, CallId::new(100 + index as u64, 0));
+        let batch = execute_round_trip(batch_with_calls(
             1,
             Vec::new(),
-            vec![operation.clone()],
+            vec![call.clone()],
         ));
-        assert_eq!(batch.operations().next().unwrap(), &operation);
+        assert_eq!(batch.calls().next().unwrap(), &call);
     }
 }
 
@@ -384,21 +384,21 @@ fn every_work_variant_round_trips_through_ipc() {
 fn decoder_requires_one_concrete_computation() {
     use crate::schema::uniserve::ipc as fbs;
 
-    let run = batch_with_operations(1, Vec::new(), vec![ar_decode_operation()]);
+    let run = batch_with_calls(1, Vec::new(), vec![ar_decode_call()]);
     let bytes = encode_request(&WorkerRequest::submit(run)).unwrap();
     let frame = fbs::root_as_worker_request(&bytes).unwrap().unpack();
     let invalid = [
-        fbs::ComputationT::default(),
-        fbs::ComputationT {
+        fbs::CallKindT::default(),
+        fbs::CallKindT {
             forward_mode: fbs::ForwardMode::Decode,
             stage: fbs::PipelineStage::Denoising,
             transfer: fbs::TransferMode::None,
         },
-        fbs::ComputationT {
+        fbs::CallKindT {
             forward_mode: fbs::ForwardMode(255),
             ..Default::default()
         },
-        fbs::ComputationT {
+        fbs::CallKindT {
             stage: fbs::PipelineStage(255),
             ..Default::default()
         },
@@ -409,7 +409,7 @@ fn decoder_requires_one_concrete_computation() {
             .batch
             .as_mut()
             .unwrap()
-            .operations
+            .calls
             .as_mut()
             .unwrap()[0]
             .code = code;
@@ -423,7 +423,7 @@ fn decoder_requires_one_concrete_computation() {
 #[test]
 fn every_computation_variant_round_trips_in_its_own_batch() {
     let batches = comprehensive_batches();
-    assert_eq!(batches.len(), Computation::ALL.len());
+    assert_eq!(batches.len(), CallKind::ALL.len());
     for batch in batches {
         assert_eq!(execute_round_trip(batch.clone()), batch);
     }
@@ -431,44 +431,44 @@ fn every_computation_variant_round_trips_in_its_own_batch() {
 
 #[test]
 fn a_batch_carries_one_computation_through_one_entry() {
-    let decode = operation_for(
-        Computation::Forward(ForwardMode::Decode),
-        ComputationId::new(1, 0),
+    let decode = call_for(
+        CallKind::Forward(ForwardMode::Decode),
+        CallId::new(1, 0),
     );
-    let prefill = operation_for(
-        Computation::Forward(ForwardMode::Prefill),
-        ComputationId::new(1, 1),
+    let prefill = call_for(
+        CallKind::Forward(ForwardMode::Prefill),
+        CallId::new(1, 1),
     );
-    let mixed = batch_with_operations(1, Vec::new(), vec![decode.clone(), prefill]);
+    let mixed = batch_with_calls(1, Vec::new(), vec![decode.clone(), prefill]);
     let error = mixed.validate().unwrap_err().to_string();
-    assert!(error.contains("mixes computations or entries"), "{error}");
+    assert!(error.contains("mixes call kinds or entries"), "{error}");
 
-    let mut other_entry = operation_for(
-        Computation::Forward(ForwardMode::Decode),
-        ComputationId::new(1, 1),
+    let mut other_entry = call_for(
+        CallKind::Forward(ForwardMode::Decode),
+        CallId::new(1, 1),
     );
     other_entry.entry = "encoder".into();
-    let split = batch_with_operations(1, Vec::new(), vec![decode, other_entry]);
+    let split = batch_with_calls(1, Vec::new(), vec![decode, other_entry]);
     let error = split.validate().unwrap_err().to_string();
-    assert!(error.contains("mixes computations or entries"), "{error}");
+    assert!(error.contains("mixes call kinds or entries"), "{error}");
 }
 
 #[test]
 fn decoder_requires_every_call_to_state_its_coordinates() {
     use crate::schema::uniserve::ipc as fbs;
 
-    let run = batch_with_operations(1, Vec::new(), vec![ar_decode_operation()]);
+    let run = batch_with_calls(1, Vec::new(), vec![ar_decode_call()]);
     let bytes = encode_request(&WorkerRequest::submit(run)).unwrap();
     let frame = fbs::root_as_worker_request(&bytes).unwrap().unpack();
 
     let mut absent = frame.clone();
-    absent.batch.as_mut().unwrap().operations.as_mut().unwrap()[0].coordinates = None;
+    absent.batch.as_mut().unwrap().calls.as_mut().unwrap()[0].coordinates = None;
     let mut builder = flatbuffers::FlatBufferBuilder::new();
     let root = absent.pack(&mut builder);
     builder.finish(root, None);
     let error = decode_request(builder.finished_data()).unwrap_err();
     assert!(
-        error.to_string().contains("operation.coordinates"),
+        error.to_string().contains("call.coordinates"),
         "absent coordinates must be named: {error}"
     );
 
@@ -477,7 +477,7 @@ fn decoder_requires_every_call_to_state_its_coordinates() {
         .batch
         .as_mut()
         .unwrap()
-        .operations
+        .calls
         .as_mut()
         .unwrap()[0]
         .coordinates
@@ -498,11 +498,11 @@ fn decoder_requires_every_call_to_state_its_coordinates() {
 
 #[test]
 fn solver_parameters_round_trip_with_request_or_paged_storage() {
-    let operation = operation_for(
-        Computation::Pipeline(PipelineStage::Denoising),
-        ComputationId::new(101, 0),
+    let call = call_for(
+        CallKind::Pipeline(PipelineStage::Denoising),
+        CallId::new(101, 0),
     );
-    let mut run = batch_with_operations(1, Vec::new(), vec![operation]);
+    let mut run = batch_with_calls(1, Vec::new(), vec![call]);
     assert_eq!(execute_round_trip(run.clone()), run);
     run.latent_params[0].page_table.clear();
     run.latent_params[0].latent_units = 0;
@@ -516,7 +516,7 @@ fn solver_parameters_round_trip_with_request_or_paged_storage() {
 
 #[test]
 fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
-    let mut latent = output_product(ComputationId::new(55, 0));
+    let mut latent = output_product(CallId::new(55, 0));
     latent.dtype = DType::F32;
     latent.shape_bound = ShapeBound {
         dims: vec![DimBound::Static(8), DimBound::Static(32)],
@@ -528,7 +528,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
     .iter()
     .enumerate()
     {
-        let operation = ScheduledRequest {
+        let call = Call {
             coordinates: CallCoordinates::default(),
             token_input: None,
 
@@ -549,17 +549,17 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             input_token_ids: Vec::new(),
             sampling_state: None,
             request_key: request_key(),
-            op_id: ComputationId::new(56 + index as u64, 0),
+            call_id: CallId::new(56 + index as u64, 0),
             predecessor: None,
             entry: (*entry).into(),
-            code: Computation::Pipeline(*stage),
+            code: CallKind::Pipeline(*stage),
             bounds: Bounds::default(),
             inputs: vec![latent.clone()],
             outputs: Vec::new(),
             predicate: None,
             rng: None,
         };
-        let mut run = batch_with_operations(index as u64 + 1, Vec::new(), vec![operation]);
+        let mut run = batch_with_calls(index as u64 + 1, Vec::new(), vec![call]);
         if index == 0 {
             run.decode_ranges[0].cursor = 3;
             run.decode_ranges[0].max_units = 2;
@@ -575,16 +575,16 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
 }
 
 #[test]
-fn block_table_allocation_round_trips_with_the_operation() {
-    let base = ar_decode_operation();
-    let batch = execute_round_trip(batch_with_operations(9, Vec::new(), vec![base.clone()]));
-    assert_eq!(batch.operations().next().unwrap(), &base);
+fn block_table_allocation_round_trips_with_the_call() {
+    let base = ar_decode_call();
+    let batch = execute_round_trip(batch_with_calls(9, Vec::new(), vec![base.clone()]));
+    assert_eq!(batch.calls().next().unwrap(), &base);
     assert_eq!(batch.block_tables[0].page_ids, vec![BlockId(1)]);
 }
 
 #[test]
 fn publication_round_trips_its_registered_view_and_endpoint() {
-    let mut product = output_product(ComputationId::new(11, 0));
+    let mut product = output_product(CallId::new(11, 0));
     product.dtype = DType::F32;
     product.shape_bound = ShapeBound {
         dims: vec![DimBound::Static(4)],
@@ -670,7 +670,7 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
 
 #[test]
 fn tensor_publication_preserves_static_axes_within_dynamic_capacity() {
-    let mut reference = output_product(ComputationId::new(11, 0));
+    let mut reference = output_product(CallId::new(11, 0));
     reference.dtype = DType::F32;
     reference.shape_bound.dims = vec![DimBound::Static(2), DimBound::Device { max: 4 }];
     for (shape, valid) in [
@@ -717,14 +717,14 @@ fn tensor_publication_preserves_static_axes_within_dynamic_capacity() {
 fn unchanged_kv_publication_round_trips_without_physical_tensors() {
     let source = BufferId {
         owner: request_key(),
-        producer_op_id: ComputationId::new(11, 0),
+        producer_call_id: CallId::new(11, 0),
         output_index: 0,
         generation: 3,
     };
     let mut report = lane_report(
         5,
         vec![RequestOutput {
-            code: Computation::Transfer(TransferMode::KvPublish),
+            code: CallKind::Transfer(TransferMode::KvPublish),
             kv_output: Some(KvTransfer {
                 tensors: Vec::new(),
                 source: source,
@@ -787,7 +787,7 @@ fn tensor_coverage_preserves_replicas_and_detects_missing_regions() {
 fn raw_kv_publication_round_trips_page_representation_and_exact_lineage() {
     let source = BufferId {
         owner: request_key(),
-        producer_op_id: ComputationId::new(11, 0),
+        producer_call_id: CallId::new(11, 0),
         output_index: 0,
         generation: 3,
     };
@@ -824,7 +824,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_lineage() {
         let report = lane_report(
             5,
             vec![RequestOutput {
-                code: Computation::Transfer(TransferMode::KvPublish),
+                code: CallKind::Transfer(TransferMode::KvPublish),
                 kv_output: Some(KvTransfer {
                     tensors,
                     source: source,
@@ -875,7 +875,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_lineage() {
 #[test]
 fn error_completion_round_trips_with_its_error_code() {
     let mut record = completion_record();
-    record.status = OpStatus::Error;
+    record.status = CallStatus::Error;
     record.error_code = Some(ErrorCode::ComputeError);
     let report = lane_report(6, vec![record.clone()], Vec::new(), false, None, None);
     let decoded =
@@ -890,7 +890,7 @@ fn error_completion_round_trips_with_its_error_code() {
 fn request_retirement_requires_unique_buffers_from_its_lineage() {
     let product = tensor_for(
         request_key(),
-        ComputationId::new(7, 0),
+        CallId::new(7, 0),
         0,
         DType::F16,
         ShapeBound {
@@ -910,7 +910,7 @@ fn request_retirement_requires_unique_buffers_from_its_lineage() {
         };
         assert!(
             encode_request(&WorkerRequest::submit(
-                batch_with_operations(3, vec![admission()], vec![ar_decode_operation()])
+                batch_with_calls(3, vec![admission()], vec![ar_decode_call()])
                     .with_commands(vec![command]),
             ))
             .is_err()
@@ -925,7 +925,7 @@ fn every_batch_command_variant_round_trips_through_ipc() {
         retained_buffers: vec![
             tensor_for(
                 request_key(),
-                ComputationId::new(7, 0),
+                CallId::new(7, 0),
                 0,
                 DType::F16,
                 ShapeBound {
@@ -938,7 +938,7 @@ fn every_batch_command_variant_round_trips_through_ipc() {
     let free = BatchCommand::Free {
         buffer: tensor_for(
             request_key(),
-            ComputationId::new(8, 0),
+            CallId::new(8, 0),
             0,
             DType::F16,
             ShapeBound {
@@ -947,7 +947,7 @@ fn every_batch_command_variant_round_trips_through_ipc() {
         )
         .buffer_id(),
     };
-    let batch = batch_with_operations(3, vec![admission()], vec![ar_decode_operation()])
+    let batch = batch_with_calls(3, vec![admission()], vec![ar_decode_call()])
         .with_commands(vec![finish.clone(), free.clone()]);
     let decoded = execute_round_trip(batch);
     assert_eq!(
@@ -964,10 +964,10 @@ fn every_batch_command_variant_round_trips_through_ipc() {
 
 #[test]
 fn new_request_round_trips() {
-    let batch = execute_round_trip(batch_with_operations(
+    let batch = execute_round_trip(batch_with_calls(
         4,
         vec![admission()],
-        vec![ar_decode_operation()],
+        vec![ar_decode_call()],
     ));
     assert_eq!(batch.admissions().next(), Some(&admission()));
 }
@@ -976,12 +976,12 @@ fn new_request_round_trips() {
 fn maximum_media_prompt_round_trips() {
     let prompt_token_ids = (0..16_384_u32).map(|index| 100_000 + index).collect();
     let admission = media_admission(prompt_token_ids);
-    let request = WorkerRequest::submit(batch_with_operations(
+    let request = WorkerRequest::submit(batch_with_calls(
         5,
         vec![admission.clone()],
-        vec![operation_for(
-            Computation::Pipeline(PipelineStage::LatentPreparation),
-            ComputationId::new(12, 0),
+        vec![call_for(
+            CallKind::Pipeline(PipelineStage::LatentPreparation),
+            CallId::new(12, 0),
         )],
     ));
 
@@ -993,30 +993,30 @@ fn maximum_media_prompt_round_trips() {
 }
 
 #[test]
-fn validation_rejects_an_output_owned_by_another_operation() {
-    let mut operation = ar_decode_operation();
-    operation.token_output.as_mut().unwrap().producer_op_id = ComputationId::new(999, 0);
-    assert!(operation.validate().is_err());
+fn validation_rejects_an_output_owned_by_another_call() {
+    let mut call = ar_decode_call();
+    call.token_output.as_mut().unwrap().producer_call_id = CallId::new(999, 0);
+    assert!(call.validate().is_err());
 }
 
 #[test]
 fn validation_allows_shared_encoder_features_and_rejects_foreign_lineage_state() {
     let foreign_key = RequestKey::new(4, RequestId(8), 2);
-    let mut feature = output_product(ComputationId::new(3, 0));
+    let mut feature = output_product(CallId::new(3, 0));
     feature.request_key = foreign_key;
-    let mut operation = ar_decode_operation();
-    operation.vision_input = Some(feature);
-    operation.validate().unwrap();
+    let mut call = ar_decode_call();
+    call.vision_input = Some(feature);
+    call.validate().unwrap();
 
-    operation
+    call
         .inputs
-        .push(operation.vision_input.take().unwrap());
-    assert!(operation.validate().is_err());
+        .push(call.vision_input.take().unwrap());
+    assert!(call.validate().is_err());
 }
 
 #[test]
 fn product_validation_enforces_generation_and_shape_bounds() {
-    let mut product = output_product(ComputationId::new(11, 0));
+    let mut product = output_product(CallId::new(11, 0));
     product.generation = 0;
     assert!(product.validate().is_err());
     product.generation = 1;
@@ -1025,11 +1025,11 @@ fn product_validation_enforces_generation_and_shape_bounds() {
 }
 
 #[test]
-fn batch_rejects_two_operations_for_one_request() {
+fn batch_rejects_two_calls_for_one_request() {
     let batch = Batch {
         batch_id: 1,
         collective_seq: 1,
-        operations: vec![ar_decode_operation(), ar_decode_operation()],
+        calls: vec![ar_decode_call(), ar_decode_call()],
         block_tables: Vec::new(),
         new_cache_pages: Vec::new(),
         forward: ForwardBatch::default(),
@@ -1046,30 +1046,30 @@ fn batch_rejects_two_operations_for_one_request() {
 #[test]
 fn token_inputs_preserve_order_and_enforce_capacity() {
     for tokens in [vec![], vec![42], vec![1, 2, 3, 4, 5], vec![u32::MAX, 0, 7]] {
-        let mut operation = ar_decode_operation();
-        operation.bounds.max_tokens = 5;
-        operation.input_token_ids = tokens.clone();
-        let decoded = execute_round_trip(batch_with_operations(1, Vec::new(), vec![operation]));
-        assert_eq!(decoded.operations[0].input_token_ids, tokens);
+        let mut call = ar_decode_call();
+        call.bounds.max_tokens = 5;
+        call.input_token_ids = tokens.clone();
+        let decoded = execute_round_trip(batch_with_calls(1, Vec::new(), vec![call]));
+        assert_eq!(decoded.calls[0].input_token_ids, tokens);
     }
-    let mut operation = ar_decode_operation();
-    operation.bounds.max_tokens = 1;
-    operation.input_token_ids = vec![7, 8];
-    assert!(operation.validate().is_err());
+    let mut call = ar_decode_call();
+    call.bounds.max_tokens = 1;
+    call.input_token_ids = vec![7, 8];
+    assert!(call.validate().is_err());
 }
 
 #[test]
-fn operation_sampling_state_preserves_whitelist_presence() {
+fn call_sampling_state_preserves_whitelist_presence() {
     for allowed_token_ids in [None, Some(Vec::new()), Some(vec![2, 7])] {
-        let mut operation = ar_decode_operation();
-        operation.sampling_state = Some(SamplingState {
+        let mut call = ar_decode_call();
+        call.sampling_state = Some(SamplingState {
             allowed_token_ids,
             suppressed_token_ids: vec![3, 9],
             finish_token_ids: vec![5, 11],
             transition_token_ids: vec![13, 29],
             force_finish: true,
         });
-        let request = WorkerRequest::submit(batch_with_operations(1, Vec::new(), vec![operation]));
+        let request = WorkerRequest::submit(batch_with_calls(1, Vec::new(), vec![call]));
         assert_eq!(
             decode_request(&encode_request(&request).unwrap()).unwrap(),
             request
@@ -1079,32 +1079,32 @@ fn operation_sampling_state_preserves_whitelist_presence() {
 
 #[test]
 fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
-    let mut operation = ar_decode_operation();
-    operation.code = Computation::Pipeline(PipelineStage::VisionEncoding);
-    operation.input_image = Some("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGN0SGhgIAUwkaR6VMOohiGlAQCjvQFA6eri4wAAAABJRU5ErkJggg==".into());
-    operation.token_output = None;
-    let batch = batch_with_operations(1, vec![admission()], vec![operation.clone()]);
+    let mut call = ar_decode_call();
+    call.code = CallKind::Pipeline(PipelineStage::VisionEncoding);
+    call.input_image = Some("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGN0SGhgIAUwkaR6VMOohiGlAQCjvQFA6eri4wAAAABJRU5ErkJggg==".into());
+    call.token_output = None;
+    let batch = batch_with_calls(1, vec![admission()], vec![call.clone()]);
     let decoded = execute_round_trip(batch);
     assert_eq!(
-        decoded.operations().next().unwrap().input_image,
-        operation.input_image
+        decoded.calls().next().unwrap().input_image,
+        call.input_image
     );
 
     for (code, image) in [
         (
-            Computation::Forward(ForwardMode::Decode),
-            operation.input_image.clone(),
+            CallKind::Forward(ForwardMode::Decode),
+            call.input_image.clone(),
         ),
         (
-            Computation::Pipeline(PipelineStage::VisionEncoding),
+            CallKind::Pipeline(PipelineStage::VisionEncoding),
             Some(String::new().into()),
         ),
     ] {
-        let mut invalid = operation.clone();
+        let mut invalid = call.clone();
         invalid.code = code;
         invalid.input_image = image;
         let request =
-            WorkerRequest::submit(batch_with_operations(1, vec![admission()], vec![invalid]));
+            WorkerRequest::submit(batch_with_calls(1, vec![admission()], vec![invalid]));
         assert!(encode_request(&request).is_err());
     }
 }
@@ -1117,7 +1117,7 @@ fn batch_rejects_a_conflicting_command_identity() {
     };
     let buffer = tensor_for(
         request_key(),
-        ComputationId::new(7, 0),
+        CallId::new(7, 0),
         0,
         DType::F16,
         ShapeBound {
@@ -1125,7 +1125,7 @@ fn batch_rejects_a_conflicting_command_identity() {
         },
     )
     .buffer_id();
-    let batch = batch_with_operations(1, vec![admission()], vec![ar_decode_operation()])
+    let batch = batch_with_calls(1, vec![admission()], vec![ar_decode_call()])
         .with_commands(vec![finish(vec![]), finish(vec![buffer])]);
     assert!(batch.validate().is_err());
 }
@@ -1136,7 +1136,7 @@ fn batch_allows_a_duplicate_identical_command() {
         request_key: request_key(),
         retained_buffers: vec![],
     };
-    let batch = batch_with_operations(1, vec![admission()], vec![ar_decode_operation()])
+    let batch = batch_with_calls(1, vec![admission()], vec![ar_decode_call()])
         .with_commands(vec![finish.clone(), finish]);
     assert!(batch.validate().is_ok());
 }
@@ -1213,7 +1213,7 @@ fn kv_free_worker_info_round_trips() {
         num_inference_steps: 4,
         supported_ops: PipelineStage::VIDEO
             .into_iter()
-            .map(Computation::Pipeline)
+            .map(CallKind::Pipeline)
             .collect(),
         kv_cache: None,
         latent_page_units: 64,
@@ -1233,9 +1233,9 @@ fn kv_free_worker_info_round_trips() {
 fn worker_info_rejects_duplicate_set_members() {
     let info = WorkerInfo {
         supported_ops: vec![
-            Computation::Forward(ForwardMode::Prefill),
-            Computation::Forward(ForwardMode::Decode),
-            Computation::Forward(ForwardMode::Prefill),
+            CallKind::Forward(ForwardMode::Prefill),
+            CallKind::Forward(ForwardMode::Decode),
+            CallKind::Forward(ForwardMode::Prefill),
         ],
         ..Default::default()
     };
@@ -1255,14 +1255,14 @@ fn key_for_request(request: u64) -> RequestKey {
 
 fn tensor_for(
     key: RequestKey,
-    op: ComputationId,
+    call: CallId,
     output_index: u16,
     dtype: DType,
     shape_bound: ShapeBound,
 ) -> TensorRef {
     TensorRef {
         request_key: key,
-        producer_op_id: op,
+        producer_call_id: call,
         output_index,
         generation: 3 + u32::from(output_index),
         dtype,
@@ -1314,7 +1314,7 @@ fn full_image() -> ImageParams {
     }
 }
 
-/// One batch per closed `Computation` variant, each carrying that variant's
+/// One batch per closed `CallKind` variant, each carrying that variant's
 /// single call on its own request key; the first two keys also carry
 /// admissions. A batch is one numerical call on one component, so the variants
 /// cannot share one.
@@ -1340,18 +1340,18 @@ fn comprehensive_batches() -> Vec<Batch> {
         }),
     )
     .unwrap();
-    let variants = Computation::ALL;
+    let variants = CallKind::ALL;
     let mut batches = Vec::new();
     for (index, kind) in variants.into_iter().enumerate() {
-        let mut operations = Vec::new();
+        let mut calls = Vec::new();
         let key = key_for_request(100 + index as u64);
-        let op_id = ComputationId::new(42 + index as u64, 0);
+        let call_id = CallId::new(42 + index as u64, 0);
         let predecessor = if index % 2 == 0 {
-            ComputationId::new(0, 0)
+            CallId::new(0, 0)
         } else {
-            ComputationId::new(9, 0)
+            CallId::new(9, 0)
         };
-        operations.push(ScheduledRequest {
+        calls.push(Call {
             coordinates: CallCoordinates::default(),
             token_input: None,
 
@@ -1367,28 +1367,28 @@ fn comprehensive_batches() -> Vec<Batch> {
             transition_output: None,
 
             input_image: None,
-            kv_input: (kind == Computation::Transfer(TransferMode::KvInstall)).then_some(
+            kv_input: (kind == CallKind::Transfer(TransferMode::KvInstall)).then_some(
                 BufferId {
                     owner: key,
-                    producer_op_id: ComputationId::new(2, 0),
+                    producer_call_id: CallId::new(2, 0),
                     output_index: 0,
                     generation: 1,
                 },
             ),
             kv_output: matches!(
                 kind,
-                Computation::Transfer(TransferMode::KvPublish | TransferMode::KvInstall)
+                CallKind::Transfer(TransferMode::KvPublish | TransferMode::KvInstall)
             )
             .then_some(BufferId {
                 owner: key,
-                producer_op_id: op_id,
+                producer_call_id: call_id,
                 output_index: 1,
                 generation: 2,
             }),
             input_token_ids: Vec::new(),
             sampling_state: None,
             request_key: key,
-            op_id,
+            call_id,
             predecessor: Some(predecessor),
             entry: "model".into(),
             code: kind,
@@ -1401,7 +1401,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             },
             inputs: vec![tensor_for(
                 key,
-                ComputationId::new(2, 0),
+                CallId::new(2, 0),
                 0,
                 DType::F16,
                 ShapeBound {
@@ -1411,7 +1411,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             outputs: Vec::new(),
             predicate: Some(tensor_for(
                 key,
-                ComputationId::new(3, 0),
+                CallId::new(3, 0),
                 0,
                 DType::U8,
                 ShapeBound::default(),
@@ -1429,15 +1429,15 @@ fn comprehensive_batches() -> Vec<Batch> {
         // The admissions ride on the first batch of the pass, as a scheduler
         // places them ahead of the calls that use them.
         let admissions = if index == 0 {
-            operations[0].input_token_ids = vec![7, 8, 9, 10];
+            calls[0].input_token_ids = vec![7, 8, 9, 10];
             vec![ar_params.clone(), umm_params.clone()]
         } else {
             Vec::new()
         };
-        batches.push(batch_with_operations(
+        batches.push(batch_with_calls(
             42 + index as u64,
             admissions,
-            operations,
+            calls,
         ));
     }
     // The pass's retirement rides on its last batch, so no earlier call loses
@@ -1468,7 +1468,7 @@ fn full_caps() -> WorkerInfo {
         encoder_entry_bytes: 128 << 20,
         pipeline_components: video_components(),
         num_inference_steps: 4,
-        supported_ops: Computation::ALL.to_vec(),
+        supported_ops: CallKind::ALL.to_vec(),
         kv_cache: Some(KvCacheInfo {
             groups: vec![
                 KvCacheGroup {
@@ -1565,9 +1565,9 @@ fn full_run_result() -> BatchOutput {
         top_logprobs: Vec::new(),
         prompt_logprobs: Vec::new(),
         request_key: key_for_request(100),
-        op_id: ComputationId::new(11, 0),
+        call_id: CallId::new(11, 0),
 
-        status: OpStatus::Ok,
+        status: CallStatus::Ok,
 
         product_generations: vec![3, 5],
         error_code: None,
@@ -1577,7 +1577,7 @@ fn full_run_result() -> BatchOutput {
             copy_us: 43,
             host_us: 44,
         },
-        code: Computation::Forward(ForwardMode::Decode),
+        code: CallKind::Forward(ForwardMode::Decode),
         position: 5,
         kv_visible_len: 6,
         num_completed_steps: 7,
@@ -1594,15 +1594,15 @@ fn full_run_result() -> BatchOutput {
     };
     let mut predicated_record = ok_record.clone();
     predicated_record.request_key = key_for_request(101);
-    predicated_record.op_id = ComputationId::new(11, 1);
-    predicated_record.status = OpStatus::Predicated;
+    predicated_record.call_id = CallId::new(11, 1);
+    predicated_record.status = CallStatus::Predicated;
     predicated_record.committed_tokens.clear();
     predicated_record.finish_flags = FinishFlags::default();
     predicated_record.product_generations = Vec::new();
     let mut error_record = ok_record.clone();
     error_record.request_key = key_for_request(102);
-    error_record.op_id = ComputationId::new(11, 2);
-    error_record.status = OpStatus::Error;
+    error_record.call_id = CallId::new(11, 2);
+    error_record.status = CallStatus::Error;
     error_record.error_code = Some(ErrorCode::ResourceExhausted);
     error_record.finish_flags = FinishFlags {
         eos: false,
@@ -1631,34 +1631,34 @@ fn full_run_result() -> BatchOutput {
 fn response_fixtures() -> Vec<WorkerResponse> {
     vec![
         WorkerResponse::Info {
-            call_id: None,
+            message_id: None,
             info: WorkerInfo::default(),
         },
         WorkerResponse::Info {
-            call_id: Some(17),
+            message_id: Some(17),
             info: full_caps(),
         },
         WorkerResponse::Result {
-            call_id: Some(17),
+            message_id: Some(17),
             result: full_run_result(),
         },
-        WorkerResponse::Ok { call_id: Some(17) },
+        WorkerResponse::Ok { message_id: Some(17) },
         WorkerResponse::Error {
-            call_id: Some(17),
+            message_id: Some(17),
             error: WorkerResponseError {
                 message: "device fault on decode".into(),
                 code: Some("compute_error".into()),
                 fatal: false,
                 phase: Some("execute".into()),
                 route: Some("und.decode".into()),
-                operations: vec![
-                    ErrorOperationIdentity {
+                calls: vec![
+                    ErrorCallIdentity {
                         request_key: key_for_request(100),
-                        op_id: ComputationId::new(11, 0),
+                        call_id: CallId::new(11, 0),
                     },
-                    ErrorOperationIdentity {
+                    ErrorCallIdentity {
                         request_key: key_for_request(101),
-                        op_id: ComputationId::new(12, 0),
+                        call_id: CallId::new(12, 0),
                     },
                 ],
             },

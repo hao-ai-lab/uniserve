@@ -1,4 +1,4 @@
-"""Validated descriptions of individual worker computations."""
+"""Validated descriptions of individual worker call kinds."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ class TransferMode(StrEnum):
     KV_INSTALL = "kv_install"
 
 
-Computation: TypeAlias = ForwardMode | PipelineStage | TransferMode
+CallKind: TypeAlias = ForwardMode | PipelineStage | TransferMode
 
 # The stage sequence of a video generation pipeline, in execution order.
 VIDEO_STAGES = (
@@ -75,7 +75,7 @@ VIDEO_STAGES = (
     PipelineStage.MUXING,
 )
 
-COMPUTATIONS: tuple[Computation, ...] = (
+CALL_KINDS: tuple[CallKind, ...] = (
     ForwardMode.PREFILL,
     ForwardMode.DECODE,
     ForwardMode.VERIFY,
@@ -84,11 +84,11 @@ COMPUTATIONS: tuple[Computation, ...] = (
 )
 
 
-def computation(value: object, where: str) -> Computation:
+def computation(value: object, where: str) -> CallKind:
     """Decode one concrete computation, excluding mixed model-batch metadata."""
     if (
         isinstance(value, (ForwardMode, PipelineStage, TransferMode))
-        and value in COMPUTATIONS
+        and value in CALL_KINDS
     ):
         return value
     if type(value) is str:
@@ -98,8 +98,8 @@ def computation(value: object, where: str) -> Computation:
     raise invalid_descriptor(f"{where} is not a supported computation")
 
 
-class OpStatus(StrEnum):
-    """Classifies an operation result.
+class CallStatus(StrEnum):
+    """Classifies an call result.
 
     The result is successful, predicated away, or failed.
     """
@@ -112,7 +112,7 @@ class OpStatus(StrEnum):
 class ErrorCode(StrEnum):
     """Classifies bounded execution failures returned to the scheduler."""
 
-    INVALID_OPERATION = "invalid_operation"
+    INVALID_CALL = "invalid_call"
     RESOURCE_EXHAUSTED = "resource_exhausted"
     COMPUTE_ERROR = "compute_error"
     CANCELLED = "cancelled"
@@ -144,7 +144,7 @@ _STATE_ADVANCING_WORK = frozenset(
     }
 )
 
-_COMPUTATION_BY_VALUE = {member.value: member for member in COMPUTATIONS}
+_COMPUTATION_BY_VALUE = {member.value: member for member in CALL_KINDS}
 
 
 def _sampling_params_from_mapping(
@@ -391,9 +391,9 @@ class ImageParams:
 
 @dataclass(frozen=True, slots=True)
 class Bounds:
-    """Scheduler-enforced resource ceilings for one operation.
+    """Scheduler-enforced resource ceilings for one call.
 
-    Zero means the corresponding resource is not used by the operation.
+    Zero means the corresponding resource is not used by the call.
     """
 
     max_tokens: int = 0
@@ -404,7 +404,7 @@ class Bounds:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "bounds") -> Bounds:
-        """Parse scheduler-enforced resource ceilings for one operation."""
+        """Parse scheduler-enforced resource ceilings for one call."""
         bounds = _fast_bounds(value)
         if bounds is not None:
             return bounds
@@ -427,7 +427,7 @@ class Bounds:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize all operation resource ceilings for IPC."""
+        """Serialize all call resource ceilings for IPC."""
         return {
             "max_tokens": self.max_tokens,
             "max_kv_pages": self.max_kv_pages,
@@ -445,7 +445,7 @@ class Rng:
     """
 
     seed: int
-    # First semantic position index covered by this operation's draws.
+    # First semantic position index covered by this call's draws.
     semantic_index_base: int
     draw_layout: DrawLayout
 
@@ -536,20 +536,20 @@ class CallCoordinates:
 
 
 @dataclass(frozen=True, slots=True)
-class ScheduledRequest:
+class Call:
     """One computation with its request identity and dependencies.
 
     Also carries the computation's output limits.
     """
 
     request_key: identity.RequestKey
-    op_id: identity.ComputationId
-    # Immediate dependency within the request; must precede op_id and is
+    call_id: identity.CallId
+    # Immediate dependency within the request; must precede call_id and is
     # required for state-advancing work and KV installation.
-    predecessor: identity.ComputationId | None
+    predecessor: identity.CallId | None
     # Coordinates this call executes at, stated by the engine.
     coordinates: CallCoordinates
-    kind: Computation
+    kind: CallKind
     bounds: Bounds
     # Name of the worker model component that executes this computation.
     entry: str = "model"
@@ -576,7 +576,7 @@ class ScheduledRequest:
     rng: Rng | None = None
     sampling_state: SamplingState | None = None
     input_token_ids: tuple[int, ...] = ()
-    # Encoded source image payload for a vision or latent encoding operation.
+    # Encoded source image payload for a vision or latent encoding call.
     input_image: str | None = None
 
     # KV cache transfer endpoints, as persistent buffer identities.
@@ -586,7 +586,7 @@ class ScheduledRequest:
     def tensor_inputs(self) -> tuple[tensor.TensorRef, ...]:
         """Return tensor inputs from the computation signature.
 
-        Excludes the operation's predicate.
+        Excludes the call's predicate.
         """
         return (
             *self.inputs,
@@ -652,24 +652,22 @@ class ScheduledRequest:
 
     @property
     def advances_state(self) -> bool:
-        """Indicate whether the operation advances accepted request progress."""
+        """Indicate whether the call advances accepted request progress."""
         return self.kind in _STATE_ADVANCING_WORK
 
     def validate(self) -> None:
-        """Enforce operation-family, predecessor, and bound invariants.
+        """Enforce call-family, predecessor, and bound invariants.
 
         Also enforces dataflow, predicate, and RNG invariants.
         """
         # Identity and dependency ordering.
-        if self.op_id.batch_id < 1:
-            raise invalid_descriptor("operation id must be positive")
+        if self.call_id.batch_id < 1:
+            raise invalid_descriptor("call id must be positive")
         self.coordinates.validate()
         if not isinstance(self.entry, str) or not self.entry:
-            raise invalid_descriptor("operation entry must not be empty")
-        if self.kind not in COMPUTATIONS:
-            raise invalid_descriptor(
-                "operation requires a valid computation tag"
-            )
+            raise invalid_descriptor("call entry must not be empty")
+        if self.kind not in CALL_KINDS:
+            raise invalid_descriptor("call requires a valid computation tag")
         if self.predecessor is None:
             if (
                 self.advances_state
@@ -677,10 +675,10 @@ class ScheduledRequest:
                 or self.latent_input is not None
             ):
                 raise invalid_descriptor(
-                    "state-changing operation requires a predecessor"
+                    "state-changing call requires a predecessor"
                 )
-        if self.predecessor is not None and not self.predecessor < self.op_id:
-            raise invalid_descriptor("predecessor must precede operation")
+        if self.predecessor is not None and not self.predecessor < self.call_id:
+            raise invalid_descriptor("predecessor must precede call")
 
         # Token and sampling inputs.
         if len(self.input_token_ids) > self.bounds.max_tokens:
@@ -722,7 +720,7 @@ class ScheduledRequest:
         if self.kv_output is not None:
             if (
                 self.kv_output.owner != self.request_key
-                or self.kv_output.producer_op_id != self.op_id
+                or self.kv_output.producer_call_id != self.call_id
             ):
                 raise invalid_descriptor(
                     "KV output is not owned by its producing computation"
@@ -749,17 +747,17 @@ class ScheduledRequest:
         for product in self.tensor_outputs():
             if (
                 product.request_key != self.request_key
-                or product.producer_op_id != self.op_id
+                or product.producer_call_id != self.call_id
             ):
                 raise invalid_descriptor(
-                    "an output product is not owned by its producing operation"
+                    "an output product is not owned by its producing call"
                 )
             if product.generation < 1:
                 raise invalid_descriptor(
                     "an output product has no logical generation"
                 )
             if product.output_index in output_indices:
-                raise invalid_descriptor("operation repeats an output index")
+                raise invalid_descriptor("call repeats an output index")
             output_indices.add(product.output_index)
         for product in (
             self.encoder_output,
@@ -830,8 +828,8 @@ class ScheduledRequest:
     def from_mapping(
         cls,
         value: object,
-        where: str = "operation",
-    ) -> ScheduledRequest:
+        where: str = "call",
+    ) -> Call:
         """Parse and validate a computation and its identity.
 
         Also validates its execution dependencies.
@@ -847,14 +845,14 @@ class ScheduledRequest:
             request_key = identity.RequestKey.from_mapping(
                 get("request_key"), f"{where}.request_key"
             )
-        op_id = identity.ComputationId.from_mapping(
-            get("op_id"), f"{where}.op_id"
+        call_id = identity.CallId.from_mapping(
+            get("call_id"), f"{where}.call_id"
         )
         predecessor_value = get("predecessor")
         predecessor = (
             None
             if predecessor_value is None
-            else identity.ComputationId.from_mapping(
+            else identity.CallId.from_mapping(
                 predecessor_value, f"{where}.predecessor"
             )
         )
@@ -901,9 +899,9 @@ class ScheduledRequest:
             if rng is None:
                 rng = Rng.from_mapping(rng_raw, f"{where}.rng")
 
-        operation = cls(
+        call = cls(
             request_key=request_key,
-            op_id=op_id,
+            call_id=call_id,
             predecessor=predecessor,
             coordinates=coordinates,
             entry=entry,
@@ -992,8 +990,8 @@ class ScheduledRequest:
                 else SamplingState.from_mapping(get("sampling_state"))
             ),
         )
-        operation.validate()
-        return operation
+        call.validate()
+        return call
 
     def to_mapping(self) -> dict[str, object]:
         """Encode computation fields.
@@ -1002,7 +1000,7 @@ class ScheduledRequest:
         """
         return {
             "request_key": self.request_key.to_mapping(),
-            "op_id": self.op_id.to_mapping(),
+            "call_id": self.call_id.to_mapping(),
             "predecessor": None
             if self.predecessor is None
             else self.predecessor.to_mapping(),
@@ -1067,7 +1065,7 @@ class ScheduledRequest:
 
 @dataclass(frozen=True, slots=True)
 class SamplingState:
-    """Canonical branch-local token processor inputs for one operation.
+    """Canonical branch-local token processor inputs for one call.
 
     Penalty token counts are not carried here: they are a device-resident
     accepted base plus bounded deltas folded when sampling accepts tokens,

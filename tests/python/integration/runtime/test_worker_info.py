@@ -11,7 +11,7 @@ from tests.python.fixtures.worker_config import stub_worker_config
 from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
 from uniserve_worker.config import LaneConfig, WorkerConfig
-from uniserve_worker.protocol.operation import COMPUTATIONS, ForwardMode
+from uniserve_worker.protocol.call import CALL_KINDS, ForwardMode
 from uniserve_worker.worker import Worker
 
 pytestmark = pytest.mark.integration
@@ -94,20 +94,20 @@ def test_worker_info_reports_limits_safe_for_all_bound_lanes(
 ) -> None:
     config = replace(
         stub_worker_config(16, max_batch_tokens=256),
-        max_batch_operations=4,
+        max_batch_calls=4,
         lanes=(
             LaneConfig(
                 "decode",
                 64,
                 (ForwardMode.DECODE, ForwardMode.VERIFY),
-                max_batch_operations=2,
+                max_batch_calls=2,
             ),
             LaneConfig(
                 "compute",
                 64,
                 tuple(
                     kind
-                    for kind in COMPUTATIONS
+                    for kind in CALL_KINDS
                     if kind not in {ForwardMode.DECODE, ForwardMode.VERIFY}
                 ),
                 max_batch_tokens=128,
@@ -128,7 +128,7 @@ def test_worker_info_reports_limits_safe_for_all_bound_lanes(
     assert info.max_batch_tokens == (128 if with_lane_limits else 256)
 
 
-def test_worker_identity_and_capabilities_reflect_enabled_operations() -> None:
+def test_worker_identity_and_capabilities_reflect_enabled_calls() -> None:
     identities = []
     config = replace(
         stub_worker_config(16, max_batch_tokens=256), graph_policy="off"

@@ -177,7 +177,7 @@ impl Scheduler {
                 } else {
                     FinishReason::Cancelled
                 });
-            let drained = !self.has_pending_operations(id);
+            let drained = !self.has_pending_calls(id);
             if drained {
                 self.finish_media(
                     id,
@@ -284,7 +284,7 @@ impl Scheduler {
         }
     }
 
-    /// Returns whether operation tracing is enabled.
+    /// Returns whether call tracing is enabled.
     pub(super) fn trace_enabled(&self) -> bool {
         self.trace_sink.is_some()
     }

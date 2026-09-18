@@ -47,7 +47,7 @@ DEFAULTS: dict[str, Any] = {
     "kv_token_capacity": None,
     "attention_backend": "auto",
     "block_size": 64,
-    "max_batch_operations": 256,
+    "max_batch_calls": 256,
     "max_batch_tokens": 8192,
     "max_model_len": 8192,
     "max_video_seconds": 15.0,

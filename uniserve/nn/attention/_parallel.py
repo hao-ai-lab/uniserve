@@ -1,4 +1,4 @@
-"""Attention communication composed around typed local compute operations."""
+"""Attention communication composed around typed local compute calls."""
 
 from __future__ import annotations
 

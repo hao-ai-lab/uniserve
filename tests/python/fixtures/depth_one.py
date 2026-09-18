@@ -1,9 +1,9 @@
-"""Depth-one ``ScheduledRequest``/``Batch`` builders.
+"""Depth-one ``Call``/``Batch`` builders.
 
 These are builders for worker forward-behavior tests.
 
 Each builder produces the records the scheduler supplies at depth one: an
-:class:`NewRequest`, an :class:`ScheduledRequest` whose ``predecessor``
+:class:`NewRequest`, an :class:`Call` whose ``predecessor``
 names accepted execution progress, and the host-staged token payload
 consumed by token work.
 """
@@ -34,22 +34,22 @@ from uniserve_worker.protocol.batch import (
     Start,
     TensorPublication,
 )
-from uniserve_worker.protocol.identity import (
-    BufferId,
-    ComputationId,
-    RequestKey,
-)
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
     Bounds,
+    Call,
     CallCoordinates,
+    CallStatus,
     DrawLayout,
     ForwardMode,
     ImageParams,
-    OpStatus,
     PipelineStage,
     Rng,
-    ScheduledRequest,
     TransferMode,
+)
+from uniserve_worker.protocol.identity import (
+    BufferId,
+    CallId,
+    RequestKey,
 )
 from uniserve_worker.protocol.output import BatchOutput, RequestOutput
 from uniserve_worker.protocol.tensor import (
@@ -63,13 +63,13 @@ from uniserve_worker.protocol.transfer import KvTransfer
 AUTHORITY = 0
 _BLOCK_TABLES: dict[RequestKey, list[int]] = {}
 _REQUEST_POOL_INDICES: dict[RequestKey, int] = {}
-_PAGES_TO_ZERO: dict[tuple[RequestKey, ComputationId], tuple[int, ...]] = {}
+_PAGES_TO_ZERO: dict[tuple[RequestKey, CallId], tuple[int, ...]] = {}
 _UNBOUND_PAGES: dict[RequestKey, list[int]] = {}
 _IMAGE_PARAMS: dict[RequestKey, ImageParams] = {}
-_OP_KV_LENGTHS: dict[
-    tuple[RequestKey, ComputationId], tuple[int, int, int, int]
+_CALL_KV_LENGTHS: dict[
+    tuple[RequestKey, CallId], tuple[int, int, int, int]
 ] = {}
-_OP_KV_RESULTS: dict[tuple[RequestKey, ComputationId], int] = {}
+_CALL_KV_RESULTS: dict[tuple[RequestKey, CallId], int] = {}
 # Where each request currently stands on one worker, which its next call
 # states. This is the engine's role: it projects a call's effect when it
 # submits the call and replaces the projection with the rank's report when the
@@ -79,7 +79,7 @@ _LEDGERS: weakref.WeakKeyDictionary[object, _Ledger]
 _LEDGERS = weakref.WeakKeyDictionary()
 # What each built call is projected to leave behind. A call whose result only a
 # device selection resolves records nothing and waits for its completion.
-_CALL_PROJECTIONS: dict[tuple[RequestKey, ComputationId], tuple[str, int]] = {}
+_CALL_PROJECTIONS: dict[tuple[RequestKey, CallId], tuple[str, int]] = {}
 # Runs this fixture assembled. A worker also submits its own warmup batches,
 # which state their own coordinates and are left untouched. Each entry holds
 # its run so the identity stays valid until the run is submitted.
@@ -133,8 +133,8 @@ def _reset_request(rk: RequestKey) -> None:
             ledger.submitted.pop(identity, None)
     for table in (
         _PAGES_TO_ZERO,
-        _OP_KV_LENGTHS,
-        _OP_KV_RESULTS,
+        _CALL_KV_LENGTHS,
+        _CALL_KV_RESULTS,
         _CALL_PROJECTIONS,
     ):
         for identity in tuple(
@@ -154,43 +154,43 @@ def _reset_request(rk: RequestKey) -> None:
         buffer for buffer in _BUFFER_ALLOCATIONS if buffer.owner == rk
     ):
         _BUFFER_ALLOCATIONS.pop(buffer, None)
-    _OP_KV_RESULTS[(rk, ComputationId(0, 0))] = 0
+    _CALL_KV_RESULTS[(rk, CallId(0, 0))] = 0
 
 
 def _kv_page(value: int) -> int:
     return int(value) + 1
 
 
-def _latent_params(operation: ScheduledRequest) -> LatentParams:
-    image = _IMAGE_PARAMS[operation.request_key]
+def _latent_params(call: Call) -> LatentParams:
+    image = _IMAGE_PARAMS[call.request_key]
     latent_units = max(
         1,
         (int(image.height) // _LATENT_DOWNSAMPLE)
         * (int(image.width) // _LATENT_DOWNSAMPLE),
     )
     page_count = (latent_units + _LATENT_PAGE_UNITS - 1) // _LATENT_PAGE_UNITS
-    latent_input = operation.latent_input
+    latent_input = call.latent_input
     start_step = (
         0 if latent_input is None else _LATENT_STEPS.get(latent_input, 0)
     )
     return LatentParams(
-        request_key=operation.request_key,
-        op_id=operation.op_id,
+        request_key=call.request_key,
+        call_id=call.call_id,
         page_table=tuple(range(1, page_count + 1)),
         latent_units=latent_units,
         height=int(image.height),
         width=int(image.width),
         start_step=start_step,
         step_count=(
-            int(operation.bounds.max_tokens)
-            if operation.kind is PipelineStage.DENOISING
+            int(call.bounds.max_tokens)
+            if call.kind is PipelineStage.DENOISING
             else 0
         ),
     )
 
 
-def _parent_kv_length(rk: RequestKey, predecessor: ComputationId) -> int:
-    return _OP_KV_RESULTS.get((rk, predecessor), 0)
+def _parent_kv_length(rk: RequestKey, predecessor: CallId) -> int:
+    return _CALL_KV_RESULTS.get((rk, predecessor), 0)
 
 
 def _ledger(worker: object) -> _Ledger:
@@ -198,16 +198,14 @@ def _ledger(worker: object) -> _Ledger:
     return _LEDGERS.setdefault(worker, _Ledger())
 
 
-def _project_tokens(rk: RequestKey, op_id: ComputationId, tokens: int) -> None:
+def _project_tokens(rk: RequestKey, call_id: CallId, tokens: int) -> None:
     """Record a call that adds `tokens` positions and initializes them."""
-    _CALL_PROJECTIONS[(rk, op_id)] = ("tokens", int(tokens))
+    _CALL_PROJECTIONS[(rk, call_id)] = ("tokens", int(tokens))
 
 
-def _project_flow_step(
-    rk: RequestKey, op_id: ComputationId, flow_step: int
-) -> None:
+def _project_flow_step(rk: RequestKey, call_id: CallId, flow_step: int) -> None:
     """Record that a call leaves the request's trajectory at `flow_step`."""
-    _CALL_PROJECTIONS[(rk, op_id)] = ("flow_step", int(flow_step))
+    _CALL_PROJECTIONS[(rk, call_id)] = ("flow_step", int(flow_step))
 
 
 class _Ledger:
@@ -218,12 +216,10 @@ class _Ledger:
 
     def __init__(self) -> None:
         self.current: dict[RequestKey, CallCoordinates] = {}
-        self.submitted: dict[
-            tuple[RequestKey, ComputationId], CallCoordinates
-        ] = {}
+        self.submitted: dict[tuple[RequestKey, CallId], CallCoordinates] = {}
         # Calls with no request predecessor carry no coordinates, so their
         # completions report none and leave the request where it was.
-        self.detached: set[tuple[RequestKey, ComputationId]] = set()
+        self.detached: set[tuple[RequestKey, CallId]] = set()
 
 
 def _projected(
@@ -242,9 +238,9 @@ def _projected(
 
 
 def record_kv_result(
-    rk: RequestKey, op_id: ComputationId, visible_length: int
+    rk: RequestKey, call_id: CallId, visible_length: int
 ) -> None:
-    _OP_KV_RESULTS[(rk, op_id)] = int(visible_length)
+    _CALL_KV_RESULTS[(rk, call_id)] = int(visible_length)
 
 
 def bind_request_allocation(
@@ -265,15 +261,20 @@ def bind_request_allocation(
 
 def _record_existing_kv(
     rk: RequestKey,
-    op_id: ComputationId,
-    predecessor: ComputationId,
+    call_id: CallId,
+    predecessor: CallId,
     input_length: int,
 ) -> int:
     prefix = _parent_kv_length(rk, predecessor)
     resulting = prefix + int(input_length)
     block_table = _BLOCK_TABLES.get(rk, ())
-    _OP_KV_LENGTHS[(rk, op_id)] = (prefix, int(input_length), prefix, resulting)
-    _OP_KV_RESULTS[(rk, op_id)] = resulting
+    _CALL_KV_LENGTHS[(rk, call_id)] = (
+        prefix,
+        int(input_length),
+        prefix,
+        resulting,
+    )
+    _CALL_KV_RESULTS[(rk, call_id)] = resulting
     return len(block_table)
 
 
@@ -350,17 +351,17 @@ def stamp_batch(worker: object, batch: Batch) -> Batch:
             kv_computed_len=prefix,
         )
     stamped = []
-    for operation in batch.operations:
-        identity = (operation.request_key, operation.op_id)
-        entry = ledger.get(operation.request_key, CallCoordinates())
+    for call in batch.calls:
+        identity = (call.request_key, call.call_id)
+        entry = ledger.get(call.request_key, CallCoordinates())
         submitted[identity] = entry
-        if operation.predecessor is None:
+        if call.predecessor is None:
             detached.add(identity)
         rule = _CALL_PROJECTIONS.get(identity)
         if rule is not None:
-            ledger[operation.request_key] = _projected(entry, rule)
-        stamped.append(replace(operation, coordinates=entry))
-    return replace(batch, operations=tuple(stamped))
+            ledger[call.request_key] = _projected(entry, rule)
+        stamped.append(replace(call, coordinates=entry))
+    return replace(batch, calls=tuple(stamped))
 
 
 def submitted_batch(worker: object, batch: Batch) -> Batch:
@@ -377,20 +378,20 @@ def submitted_batch(worker: object, batch: Batch) -> Batch:
 def observe_completions(worker: object, report: BatchOutput) -> None:
     """Advance each request to where its accepted calls left it.
 
-    A rank chains a call from the operation it last accepted, and this is the
+    A rank chains a call from the call it last accepted, and this is the
     same record the engine keeps from the completions it observes. A failed
-    operation accepts nothing, so it leaves the request where it was.
+    call accepts nothing, so it leaves the request where it was.
     """
     ledger = _ledger(worker).current
     submitted = _ledger(worker).submitted
     detached = _ledger(worker).detached
     for record in report.completions:
-        if (record.request_key, record.op_id) in detached:
+        if (record.request_key, record.call_id) in detached:
             continue
-        if record.status is OpStatus.ERROR:
+        if record.status is CallStatus.ERROR:
             # A failed call accepts nothing, so the request stays where it
             # entered that call.
-            entry = submitted.get((record.request_key, record.op_id))
+            entry = submitted.get((record.request_key, record.call_id))
             if entry is not None:
                 ledger[record.request_key] = entry
             continue
@@ -406,7 +407,7 @@ def execution_batch(
     *,
     batch_id: int,
     admissions: Sequence[NewRequest] = (),
-    operations: Sequence[ScheduledRequest] = (),
+    calls: Sequence[Call] = (),
     input_products: Sequence[TensorPublication] = (),
     kv_inputs: Sequence[KvTransfer] = (),
     commands: Sequence[BatchCommand] = (),
@@ -418,7 +419,7 @@ def execution_batch(
     The columns and allocations drive observable worker behavior.
 
     A submission that carries calls takes its identity from them, because a
-    call's ``op_id`` already names the batch that carries it. ``batch_id``
+    call's ``call_id`` already names the batch that carries it. ``batch_id``
     names a command-only submission and orders every submission's
     collectives, so successive submissions to one worker must advance it.
     """
@@ -428,10 +429,10 @@ def execution_batch(
         _REQUEST_POOL_INDICES[admission.request_key] = int(
             admission.request_pool_idx
         )
-    for operation in operations:
+    for call in calls:
         for product in (
-            *operation.buffer_inputs(),
-            *operation.buffer_outputs(),
+            *call.buffer_inputs(),
+            *call.buffer_outputs(),
         ):
             if product.buffer_id in _BUFFER_ALLOCATIONS:
                 continue
@@ -455,49 +456,45 @@ def execution_batch(
         for table in block_tables
     }
 
-    def table_for(operation: ScheduledRequest) -> BlockTable | None:
+    def table_for(call: Call) -> BlockTable | None:
         slot = _REQUEST_POOL_INDICES.get(
-            operation.request_key,
-            int(operation.request_key.request_id) + 1,
+            call.request_key,
+            int(call.request_key.request_id) + 1,
         )
         explicit = explicit_tables.get((slot, 0))
         if explicit is not None:
             return explicit
-        lengths = _OP_KV_LENGTHS.get((operation.request_key, operation.op_id))
+        lengths = _CALL_KV_LENGTHS.get((call.request_key, call.call_id))
         if lengths is None:
             return None
-        pages = tuple(_BLOCK_TABLES.get(operation.request_key, ()))
+        pages = tuple(_BLOCK_TABLES.get(call.request_key, ()))
         return BlockTable(slot, 0, pages, len(pages) * _BLOCK_SIZE)
 
     tables: dict[tuple[int, int], BlockTable] = {}
     allocations: dict[tuple[int, int], set[int]] = {}
-    forward_operation_indices: list[int] = []
+    forward_call_indices: list[int] = []
     request_pool_indices: list[int] = []
     seq_lens: list[int] = []
     query_lens: list[int] = []
     write_kv: list[bool] = []
-    for operation_index, operation in enumerate(operations):
-        table = table_for(operation)
+    for call_index, call in enumerate(calls):
+        table = table_for(call)
         if table is not None:
             identity = (table.request_pool_idx, table.group_id)
             tables[identity] = table
-            pages = _PAGES_TO_ZERO.get(
-                (operation.request_key, operation.op_id), ()
-            )
+            pages = _PAGES_TO_ZERO.get((call.request_key, call.call_id), ())
             if pages:
                 allocations.setdefault(identity, set()).update(pages)
-        lengths = _OP_KV_LENGTHS.get((operation.request_key, operation.op_id))
+        lengths = _CALL_KV_LENGTHS.get((call.request_key, call.call_id))
         if lengths is not None and lengths[1] > 0:
-            forward_operation_indices.append(operation_index)
-            request_pool_indices.append(
-                _REQUEST_POOL_INDICES[operation.request_key]
-            )
+            forward_call_indices.append(call_index)
+            request_pool_indices.append(_REQUEST_POOL_INDICES[call.request_key])
             seq_lens.append(lengths[2] + lengths[1])
             query_lens.append(lengths[1])
             write_kv.append(True)
-        if operation.kind is PipelineStage.DENOISING:
-            image = _IMAGE_PARAMS[operation.request_key]
-            main_slot = _REQUEST_POOL_INDICES[operation.request_key]
+        if call.kind is PipelineStage.DENOISING:
+            image = _IMAGE_PARAMS[call.request_key]
+            main_slot = _REQUEST_POOL_INDICES[call.request_key]
             main_len = 0 if lengths is None else lengths[2]
             text_off = abs(float(image.cfg_text_scale) - 1.0) <= 1e-6
             image_off = abs(float(image.cfg_img_scale) - 1.0) <= 1e-6
@@ -516,19 +513,17 @@ def execution_batch(
             )
             alternative: tuple[int, int] | None = None
             if branches > 1:
-                alt_slot = _alternative_slot(operation.request_key)
+                alt_slot = _alternative_slot(call.request_key)
                 negative = next(
                     (
                         admission.generation.negative_token_ids
                         for admission in admissions
-                        if admission.request_key == operation.request_key
+                        if admission.request_key == call.request_key
                         and admission.generation is not None
                     ),
                     (),
                 )
-                alt_pages = _alternative_pages(
-                    operation.request_key, len(negative)
-                )
+                alt_pages = _alternative_pages(call.request_key, len(negative))
                 alt_table = BlockTable(
                     alt_slot,
                     0,
@@ -541,7 +536,7 @@ def execution_batch(
                         alt_pages
                     )
                 if negative:
-                    forward_operation_indices.append(operation_index)
+                    forward_call_indices.append(call_index)
                     request_pool_indices.append(alt_slot)
                     seq_lens.append(len(negative))
                     query_lens.append(len(negative))
@@ -553,7 +548,7 @@ def execution_batch(
                     if branch == 0 or alternative is None
                     else alternative
                 )
-                forward_operation_indices.append(operation_index)
+                forward_call_indices.append(call_index)
                 request_pool_indices.append(slot)
                 seq_lens.append(seq_len + query_len)
                 query_lens.append(query_len)
@@ -565,34 +560,34 @@ def execution_batch(
     # carries calls takes its identity from them; `batch_id` names a
     # command-only submission and orders every submission's collectives.
     run = Batch(
-        batch_id=operations[0].op_id.batch_id if operations else int(batch_id),
+        batch_id=calls[0].call_id.batch_id if calls else int(batch_id),
         collective_seq=int(batch_id) * 1024 + 2,
-        operations=tuple(operations),
+        calls=tuple(calls),
         block_tables=tuple(tables.values()),
         new_cache_pages=tuple(
             CachePageAllocation(slot, group, tuple(sorted(pages)))
             for (slot, group), pages in allocations.items()
             if pages
         ),
-        forward_operation_indices=tuple(forward_operation_indices),
+        forward_call_indices=tuple(forward_call_indices),
         request_pool_indices=tuple(request_pool_indices),
         seq_lens=tuple(seq_lens),
         query_lens=tuple(query_lens),
         write_kv=tuple(write_kv),
         latent_params=tuple(
-            _latent_params(operation)
-            for operation in operations
-            if operation.kind
+            _latent_params(call)
+            for call in calls
+            if call.kind
             in {PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING}
-            or operation.latent_input is not None
+            or call.latent_input is not None
         ),
         buffer_allocations=tuple(
             {
                 product.buffer_id: _BUFFER_ALLOCATIONS[product.buffer_id]
-                for operation in operations
+                for call in calls
                 for product in (
-                    *operation.buffer_inputs(),
-                    *operation.buffer_outputs(),
+                    *call.buffer_inputs(),
+                    *call.buffer_outputs(),
                 )
             }.values()
         ),
@@ -622,7 +617,7 @@ def ar_params(
     _BLOCK_TABLES[rk] = [_kv_page(value) for value in block_ids]
     _UNBOUND_PAGES[rk] = list(_BLOCK_TABLES[rk])
     _REQUEST_POOL_INDICES[rk] = request_id + 1
-    _OP_KV_RESULTS[(rk, ComputationId(0, 0))] = int(prefix_len)
+    _CALL_KV_RESULTS[(rk, CallId(0, 0))] = int(prefix_len)
     return NewRequest(
         rk,
         request_pool_idx=request_id + 1,
@@ -651,9 +646,9 @@ def umm_params(
     )
 
 
-def root_parent(admission: NewRequest) -> ComputationId:
-    """The ordering sentinel for a request's first state operation."""
-    return ComputationId(0, 0)
+def root_parent(admission: NewRequest) -> CallId:
+    """The ordering sentinel for a request's first state call."""
+    return CallId(0, 0)
 
 
 def finalized_report(worker: Worker, state: BatchState) -> BatchOutput:
@@ -670,9 +665,7 @@ def finalized_report(worker: Worker, state: BatchState) -> BatchOutput:
         time.sleep(0.00005)
 
 
-def record_completion(
-    operation: ScheduledRequest, report: BatchOutput
-) -> RequestOutput:
+def record_completion(call: Call, report: BatchOutput) -> RequestOutput:
     """Observe accepted output and carry its visible KV extent.
 
     The extent is carried into the next test input.
@@ -681,30 +674,28 @@ def record_completion(
     matches = tuple(
         record
         for record in resolved.completions
-        if record.request_key == operation.request_key
-        and record.op_id == operation.op_id
+        if record.request_key == call.request_key
+        and record.call_id == call.call_id
     )
-    if len(matches) != 1 or matches[0].status is not OpStatus.OK:
-        raise ValueError("operation has no unique successful completion")
+    if len(matches) != 1 or matches[0].status is not CallStatus.OK:
+        raise ValueError("call has no unique successful completion")
     record = matches[0]
-    record_kv_result(
-        operation.request_key, operation.op_id, record.kv_visible_len
-    )
+    record_kv_result(call.request_key, call.call_id, record.kv_visible_len)
     return record
 
 
-def token_operation(
+def token_call(
     rk: RequestKey,
     *,
-    op_id: ComputationId,
-    predecessor: ComputationId,
+    call_id: CallId,
+    predecessor: CallId,
     mode: ForwardMode,
     tokens: Sequence[int],
     block_table_delta: Sequence[int] = (),
     predicate: TensorRef | None = None,
     logprobs: bool = False,
     rng: Rng | None = None,
-) -> ScheduledRequest:
+) -> Call:
     """Build a token computation with its actual model input IDs."""
     block_table = _BLOCK_TABLES.setdefault(rk, [])
     added = [_kv_page(value) for value in block_table_delta]
@@ -713,31 +704,31 @@ def token_operation(
     block_table.extend(added)
     pending = _UNBOUND_PAGES.setdefault(rk, [])
     pending.extend(added)
-    _PAGES_TO_ZERO[(rk, op_id)] = tuple(pending)
+    _PAGES_TO_ZERO[(rk, call_id)] = tuple(pending)
     pending.clear()
     prefix_length = _parent_kv_length(rk, predecessor)
     input_length = len(tokens)
-    _OP_KV_LENGTHS[(rk, op_id)] = (
+    _CALL_KV_LENGTHS[(rk, call_id)] = (
         prefix_length,
         input_length,
         prefix_length,
         prefix_length + input_length,
     )
     if mode is not ForwardMode.VERIFY:
-        _OP_KV_RESULTS[(rk, op_id)] = prefix_length + input_length
-        _project_tokens(rk, op_id, input_length)
+        _CALL_KV_RESULTS[(rk, call_id)] = prefix_length + input_length
+        _project_tokens(rk, call_id, input_length)
 
     token_output = TensorRef(
         request_key=rk,
-        producer_op_id=op_id,
+        producer_call_id=call_id,
         output_index=0,
-        generation=op_id.batch_id * 4 + 1,
+        generation=call_id.batch_id * 4 + 1,
         dtype=DType.I64,
         shape_bound=ShapeBound(),
     )
-    operation = ScheduledRequest(
+    call = Call(
         request_key=rk,
-        op_id=op_id,
+        call_id=call_id,
         predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=mode,
@@ -751,19 +742,19 @@ def token_operation(
         predicate=predicate,
         rng=rng,
     )
-    return operation
+    return call
 
 
-def encode_operation(
+def encode_call(
     rk: RequestKey,
     *,
-    op_id: ComputationId,
-    predecessor: ComputationId,
+    call_id: CallId,
+    predecessor: CallId,
     image_base64: str | None,
     encoder_handle: int,
     mode: PipelineStage = PipelineStage.VISION_ENCODING,
     source_product: TensorRef | None = None,
-) -> ScheduledRequest:
+) -> Call:
     """An encoder computation with an encoded image or a resident image source.
 
     The scheduler stamps the encode output reference's ``generation`` with the
@@ -771,18 +762,18 @@ def encode_operation(
     ``completion.product_generations``.
     """
     if (image_base64 is None) == (source_product is None):
-        raise ValueError("encode operation requires exactly one image source")
+        raise ValueError("encode call requires exactly one image source")
     output_ref = TensorRef(
         request_key=rk,
-        producer_op_id=op_id,
+        producer_call_id=call_id,
         output_index=0,
         generation=int(encoder_handle),
         dtype=DType.BF16,
         shape_bound=ShapeBound((DeviceDim(4_096),)),
     )
-    operation = ScheduledRequest(
+    call = Call(
         request_key=rk,
-        op_id=op_id,
+        call_id=call_id,
         predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=mode,
@@ -791,24 +782,24 @@ def encode_operation(
         image_input=source_product,
         encoder_output=output_ref,
     )
-    return operation
+    return call
 
 
-def diffusion_prepare_operation(
+def diffusion_prepare_call(
     rk: RequestKey,
     *,
-    op_id: ComputationId,
-    predecessor: ComputationId,
+    call_id: CallId,
+    predecessor: CallId,
     conditioning: BufferId,
     seed: int = 29,
     image_index: int = 1,
-) -> tuple[ScheduledRequest, TensorRef]:
+) -> tuple[Call, TensorRef]:
     image = _IMAGE_PARAMS[rk]
     latent = TensorRef(
         request_key=rk,
-        producer_op_id=op_id,
+        producer_call_id=call_id,
         output_index=0,
-        generation=op_id.batch_id * 3 + 1,
+        generation=call_id.batch_id * 3 + 1,
         dtype=DType.BF16,
         shape_bound=ShapeBound(
             (DeviceDim(3 * int(image.height) * int(image.width)),)
@@ -816,17 +807,17 @@ def diffusion_prepare_operation(
     )
     ready = TensorRef(
         request_key=rk,
-        producer_op_id=op_id,
+        producer_call_id=call_id,
         output_index=1,
-        generation=op_id.batch_id * 3 + 2,
+        generation=call_id.batch_id * 3 + 2,
         dtype=DType.U8,
         shape_bound=ShapeBound(),
     )
-    _record_existing_kv(rk, op_id, predecessor, 0)
-    _project_flow_step(rk, op_id, 0)
-    operation = ScheduledRequest(
+    _record_existing_kv(rk, call_id, predecessor, 0)
+    _project_flow_step(rk, call_id, 0)
+    call = Call(
         request_key=rk,
-        op_id=op_id,
+        call_id=call_id,
         predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=PipelineStage.LATENT_PREPARATION,
@@ -841,31 +832,31 @@ def diffusion_prepare_operation(
         ),
     )
     _LATENT_STEPS[latent] = 0
-    return operation, latent
+    return call, latent
 
 
-def diffusion_step_operation(
+def diffusion_step_call(
     rk: RequestKey,
     *,
-    op_id: ComputationId,
-    predecessor: ComputationId,
+    call_id: CallId,
+    predecessor: CallId,
     conditioning: BufferId,
     latent: TensorRef,
     steps: int,
-) -> tuple[ScheduledRequest, TensorRef]:
+) -> tuple[Call, TensorRef]:
     output = TensorRef(
         request_key=rk,
-        producer_op_id=op_id,
+        producer_call_id=call_id,
         output_index=0,
-        generation=op_id.batch_id * 3 + 1,
+        generation=call_id.batch_id * 3 + 1,
         dtype=DType.BF16,
         shape_bound=latent.shape_bound,
     )
-    _record_existing_kv(rk, op_id, predecessor, 0)
-    _project_flow_step(rk, op_id, _LATENT_STEPS.get(latent, 0) + int(steps))
-    operation = ScheduledRequest(
+    _record_existing_kv(rk, call_id, predecessor, 0)
+    _project_flow_step(rk, call_id, _LATENT_STEPS.get(latent, 0) + int(steps))
+    call = Call(
         request_key=rk,
-        op_id=op_id,
+        call_id=call_id,
         predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=PipelineStage.DENOISING,
@@ -875,56 +866,56 @@ def diffusion_step_operation(
         latent_output=output,
     )
     _LATENT_STEPS[output] = _LATENT_STEPS.get(latent, 0) + int(steps)
-    return operation, output
+    return call, output
 
 
-def kv_publication_operation(
+def kv_publication_call(
     rk: RequestKey,
     *,
-    op_id: ComputationId,
-    predecessor: ComputationId,
-) -> tuple[ScheduledRequest, BufferId]:
+    call_id: CallId,
+    predecessor: CallId,
+) -> tuple[Call, BufferId]:
     product = BufferId(
         owner=rk,
-        producer_op_id=op_id,
+        producer_call_id=call_id,
         output_index=0,
-        generation=op_id.batch_id * 3 + 1,
+        generation=call_id.batch_id * 3 + 1,
     )
-    _record_existing_kv(rk, op_id, predecessor, 0)
-    operation = ScheduledRequest(
+    _record_existing_kv(rk, call_id, predecessor, 0)
+    call = Call(
         request_key=rk,
-        op_id=op_id,
+        call_id=call_id,
         predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=TransferMode.KV_PUBLISH,
         bounds=Bounds(max_transfer_bytes=1 << 20),
         kv_output=product,
     )
-    return operation, product
+    return call, product
 
 
-def diffusion_finalize_operation(
+def diffusion_finalize_call(
     rk: RequestKey,
     *,
-    op_id: ComputationId,
-    predecessor: ComputationId,
+    call_id: CallId,
+    predecessor: CallId,
     latent: TensorRef,
     feedback_source: bool = False,
-) -> ScheduledRequest:
+) -> Call:
     image_output = None
     if feedback_source:
         image_output = TensorRef(
             request_key=rk,
-            producer_op_id=op_id,
+            producer_call_id=call_id,
             output_index=1,
-            generation=op_id.batch_id * 3 + 1,
+            generation=call_id.batch_id * 3 + 1,
             dtype=DType.BF16,
             shape_bound=ShapeBound((DeviceDim(3 * 16 * 16),)),
         )
-    _project_flow_step(rk, op_id, 0)
-    return ScheduledRequest(
+    _project_flow_step(rk, call_id, 0)
+    return Call(
         request_key=rk,
-        op_id=op_id,
+        call_id=call_id,
         predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=PipelineStage.IMAGE_DECODING,
@@ -937,20 +928,20 @@ def diffusion_finalize_operation(
     )
 
 
-def visual_state_operation(
+def visual_state_call(
     rk: RequestKey,
     *,
-    op_id: ComputationId,
-    predecessor: ComputationId,
+    call_id: CallId,
+    predecessor: CallId,
     feature: TensorRef,
     sample_continuation: bool,
     max_tokens: int,
-) -> ScheduledRequest:
+) -> Call:
     completion = TensorRef(
         request_key=rk,
-        producer_op_id=op_id,
+        producer_call_id=call_id,
         output_index=0,
-        generation=op_id.batch_id * 3,
+        generation=call_id.batch_id * 3,
         dtype=DType.U8,
         shape_bound=ShapeBound(),
     )
@@ -958,16 +949,16 @@ def visual_state_operation(
     if sample_continuation:
         token = TensorRef(
             request_key=rk,
-            producer_op_id=op_id,
+            producer_call_id=call_id,
             output_index=1,
-            generation=op_id.batch_id * 3 + 1,
+            generation=call_id.batch_id * 3 + 1,
             dtype=DType.I64,
             shape_bound=ShapeBound(),
         )
-    _record_existing_kv(rk, op_id, predecessor, max_tokens)
-    return ScheduledRequest(
+    _record_existing_kv(rk, call_id, predecessor, max_tokens)
+    return Call(
         request_key=rk,
-        op_id=op_id,
+        call_id=call_id,
         predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=ForwardMode.PREFILL,
@@ -982,21 +973,21 @@ __all__ = [
     "AUTHORITY",
     "bind_request_allocation",
     "record_completion",
-    "encode_operation",
+    "encode_call",
     "execution_batch",
     "finalized_report",
-    "diffusion_step_operation",
-    "diffusion_prepare_operation",
+    "diffusion_step_call",
+    "diffusion_prepare_call",
     "umm_params",
-    "diffusion_finalize_operation",
-    "kv_publication_operation",
+    "diffusion_finalize_call",
+    "kv_publication_call",
     "observe_completions",
     "stamp_batch",
     "submitted_batch",
     "record_kv_result",
     "request_key",
     "root_parent",
-    "token_operation",
+    "token_call",
     "ar_params",
-    "visual_state_operation",
+    "visual_state_call",
 ]

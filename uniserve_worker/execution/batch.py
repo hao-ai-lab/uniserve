@@ -11,7 +11,7 @@ import torch
 from uniserve.model.logits import Logits, VocabShard
 from uniserve.tensors import OutputLayout, adjacent_view
 from uniserve_worker.execution.sampling import TokenSelection
-from uniserve_worker.protocol.operation import ForwardMode, PipelineStage
+from uniserve_worker.protocol.call import ForwardMode, PipelineStage
 from uniserve_worker.protocol.output import ForwardStats
 
 if TYPE_CHECKING:

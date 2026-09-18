@@ -15,7 +15,7 @@ import torch
 from uniserve.runtime.resources import close_resources
 from uniserve_worker.execution.output import OutputBuffer, PendingOutput
 from uniserve_worker.execution.rows import (
-    OperationIdentity,
+    CallIdentity,
 )
 from uniserve_worker.foundation.errors import WorkerError, invalid_descriptor
 from uniserve_worker.protocol.batch import (
@@ -23,8 +23,8 @@ from uniserve_worker.protocol.batch import (
     RegistrationAck,
     TensorPublication,
 )
+from uniserve_worker.protocol.call import Call, CallStatus
 from uniserve_worker.protocol.identity import BufferId, RequestKey
-from uniserve_worker.protocol.operation import OpStatus, ScheduledRequest
 from uniserve_worker.protocol.output import (
     BatchOutput,
     ForwardStats,
@@ -58,14 +58,12 @@ class BatchState:
 
     # Completion predicates staged in a sealed buffer and read as booleans.
     predicate_buffer: OutputBuffer | None = None
-    predicate_entries: list[tuple[OperationIdentity, tuple[int, int], int]] = (
-        field(default_factory=list)
+    predicate_entries: list[tuple[CallIdentity, tuple[int, int], int]] = field(
+        default_factory=list
     )
-    predicate_transfers: tuple[
-        tuple[OperationIdentity, BufferId, int], ...
-    ] = ()
+    predicate_transfers: tuple[tuple[CallIdentity, BufferId, int], ...] = ()
     predicates_sealed: bool = False
-    _predicate_values: dict[OperationIdentity, bool] | None = None
+    _predicate_values: dict[CallIdentity, bool] | None = None
 
     # Declared physical inputs and their outstanding transfer dependencies.
     storage_dependencies: tuple[Future[None], ...] = ()
@@ -79,7 +77,7 @@ class BatchState:
     complete: bool = False
     error: WorkerError | None = None
 
-    # Final values addressed by original operation index and completion group.
+    # Final values addressed by original call index and completion group.
     outputs: list[PendingOutput | RequestOutput | None] = field(
         default_factory=list
     )
@@ -95,9 +93,9 @@ class BatchState:
         default_factory=dict
     )
     group_component_us: dict[int, dict[str, int]] = field(default_factory=dict)
-    group_forward_indices: dict[
-        int, dict[OperationIdentity, tuple[int, ...]]
-    ] = field(default_factory=dict)
+    group_forward_indices: dict[int, dict[CallIdentity, tuple[int, ...]]] = (
+        field(default_factory=dict)
+    )
     group_registered: dict[int, bool] = field(default_factory=dict)
     group_published: dict[int, bool] = field(default_factory=dict)
     request_locations: dict[int, tuple[int, int]] = field(default_factory=dict)
@@ -122,13 +120,11 @@ class BatchState:
     result_sent: bool = False
 
     def __post_init__(self) -> None:
-        self.outputs = [None] * len(self.batch.operations)
+        self.outputs = [None] * len(self.batch.calls)
 
         groups: dict[tuple[object, str], list[int]] = {}
-        for index, operation in enumerate(self.batch.operations):
-            groups.setdefault((operation.kind, operation.entry), []).append(
-                index
-            )
+        for index, call in enumerate(self.batch.calls):
+            groups.setdefault((call.kind, call.entry), []).append(index)
 
         self.output_groups = {
             group: tuple(indexes)
@@ -137,18 +133,18 @@ class BatchState:
         # Resolve group ownership alongside the output index. Looking up one
         # request must not scan the other requests in its completion group.
         self.request_locations = {
-            self.batch.operations[index].request_key.request_id: (group, index)
+            self.batch.calls[index].request_key.request_id: (group, index)
             for group, indexes in self.output_groups.items()
             for index in indexes
         }
 
-    def group_operations(self, group: int) -> tuple[ScheduledRequest, ...]:
-        """Borrow original operation values belonging to one completion.
+    def group_calls(self, group: int) -> tuple[Call, ...]:
+        """Borrow original call values belonging to one completion.
 
         group.
         """
         return tuple(
-            self.batch.operations[index] for index in self.output_groups[group]
+            self.batch.calls[index] for index in self.output_groups[group]
         )
 
     def group_scope(self, group: int):
@@ -166,22 +162,22 @@ class BatchState:
         buffer: OutputBuffer,
         started_ns: int,
     ) -> None:
-        """Bind reserved outputs to original operation indexes before resource.
+        """Bind reserved outputs to original call indexes before resource.
 
         preparation.
         """
         for index, output in zip(
             self.output_groups[group], outputs, strict=True
         ):
-            operation = self.batch.operations[index]
+            call = self.batch.calls[index]
             if self.outputs[index] is not None:
-                raise RuntimeError("operation output is already reserved")
-            if (output.request_key, output.op_id) != (
-                operation.request_key,
-                operation.op_id,
+                raise RuntimeError("call output is already reserved")
+            if (output.request_key, output.call_id) != (
+                call.request_key,
+                call.call_id,
             ):
                 raise invalid_descriptor(
-                    "reserved output does not match its operation"
+                    "reserved output does not match its call"
                 )
             self.outputs[index] = output
 
@@ -229,7 +225,7 @@ class BatchState:
             key.request_id
             for key in (
                 *(admission.request_key for admission in self.batch.admissions),
-                *(operation.request_key for operation in self.batch.operations),
+                *(call.request_key for call in self.batch.calls),
                 *(command.request_key for command in self.batch.commands),
             )
         )
@@ -255,7 +251,7 @@ class BatchState:
             )
         )
 
-    def predicate_values(self) -> dict[OperationIdentity, bool]:
+    def predicate_values(self) -> dict[CallIdentity, bool]:
         """Read validated predicate scalars and index them by semantic product.
 
         reference.
@@ -270,7 +266,7 @@ class BatchState:
                 "prepared predicates were observed before readiness"
             )
 
-        values: dict[OperationIdentity, bool] = {}
+        values: dict[CallIdentity, bool] = {}
         generation = buffer.generation
         try:
             for identity, capture, row in sorted(
@@ -279,7 +275,7 @@ class BatchState:
                 captured = buffer.read_tokens(*capture)
                 if len(captured) != 1 or captured[0] not in {0, 1}:
                     raise invalid_descriptor(
-                        "operation predicate is not a canonical boolean"
+                        "call predicate is not a canonical boolean"
                     )
                 values[identity] = bool(captured[0])
                 buffer.observe(row, generation)
@@ -416,7 +412,7 @@ class BatchState:
         execution_us: int,
         stats: ForwardStats,
     ) -> None:
-        """Retain original operation outputs and statistics at their completion.
+        """Retain original call outputs and statistics at their completion.
 
         boundary.
         """
@@ -425,7 +421,7 @@ class BatchState:
 
         indexes = self.output_groups[group]
         for index, output in zip(indexes, outputs, strict=True):
-            operation = self.batch.operations[index]
+            call = self.batch.calls[index]
             previous = self.outputs[index]
             if (
                 isinstance(output, PendingOutput)
@@ -433,18 +429,20 @@ class BatchState:
                 and previous is not output
             ):
                 raise RuntimeError("result replaced another reserved output")
-            if (output.request_key, output.op_id) != (
-                operation.request_key,
-                operation.op_id,
+            if (output.request_key, output.call_id) != (
+                call.request_key,
+                call.call_id,
             ):
                 raise invalid_descriptor(
-                    "result does not match its submitted operation"
+                    "result does not match its submitted call"
                 )
             self.outputs[index] = output
 
-        identities = {(output.request_key, output.op_id) for output in outputs}
+        identities = {
+            (output.request_key, output.call_id) for output in outputs
+        }
         if any(
-            (value.product.request_key, value.product.producer_op_id)
+            (value.product.request_key, value.product.producer_call_id)
             not in identities
             for value in products
         ):
@@ -495,9 +493,9 @@ class BatchState:
                 values.append(value)
 
         successful = {
-            (value.request_key, value.op_id)
+            (value.request_key, value.call_id)
             for value in values
-            if value.status is OpStatus.OK
+            if value.status is CallStatus.OK
         }
 
         return BatchOutput(
@@ -507,7 +505,7 @@ class BatchState:
                 value
                 for group in groups
                 for value in self.group_products[group]
-                if (value.product.request_key, value.product.producer_op_id)
+                if (value.product.request_key, value.product.producer_call_id)
                 in successful
             ),
             registration=RegistrationAck(

@@ -56,7 +56,7 @@ pub enum Error {
     Invalid(String),
 }
 
-/// Result type returned by model-asset operations.
+/// Result type returned by model-asset calls.
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {

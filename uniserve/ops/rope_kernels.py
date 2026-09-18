@@ -496,7 +496,7 @@ if triton is not None:
         block_a: tl.constexpr,
         block_b: tl.constexpr,
     ):
-        """Apply the split head/tail row operation across Q and K ranges."""
+        """Apply the split head/tail row call across Q and K ranges."""
         pid = tl.program_id(0)
 
         # Query rows occupy the leading program-id range.
@@ -795,7 +795,7 @@ def try_triton_rotary_factors(positions, frequencies, scale, *, dtype):
 
     if total:
         # Triton launches on the thread's current device, whereas this public
-        # numerical operation follows its input tensors, as PyTorch does.
+        # numerical call follows its input tensors, as PyTorch does.
         with torch.cuda.device(positions.device):
             _rotary_factors_kernel[(triton.cdiv(total, 256),)](
                 positions,
@@ -1497,7 +1497,7 @@ class _EagerPackedRope:
     def is_eligible(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> bool:
-        """Return ``True`` because tensor operations handle the general case."""
+        """Return ``True`` because tensor calls handle the general case."""
         return True
 
     def run(

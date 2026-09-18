@@ -89,10 +89,10 @@ def test_h3_worker_advertises_bounded_media_products():
     from uniserve_models.minimax_h3 import Config, Model
     from uniserve_worker.bootstrap.components import (
         media_components,
-        supported_operations,
+        supported_calls,
     )
     from uniserve_worker.config import WorkerConfig
-    from uniserve_worker.protocol.operation import (
+    from uniserve_worker.protocol.call import (
         VIDEO_STAGES,
         PipelineStage,
         TransferMode,
@@ -109,7 +109,7 @@ def test_h3_worker_advertises_bounded_media_products():
         min_request_pool_size=2,
     )
     outputs = resolve_outputs(model, config)
-    assert set(supported_operations(model)) == {
+    assert set(supported_calls(model)) == {
         *VIDEO_STAGES,
         TransferMode.TENSOR,
     }

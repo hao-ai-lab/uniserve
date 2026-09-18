@@ -25,7 +25,7 @@ pub use events::{
 /// Default namespace prefix for per-worker iceoryx2 services.
 pub const DEFAULT_SERVICE_PREFIX: &str = "uniserve/worker";
 
-/// Result type returned by worker transport operations.
+/// Result type returned by worker transport calls.
 pub type IpcResult<T> = std::result::Result<T, IpcError>;
 
 /// Codec, transport, timeout, and protocol failures at the IPC boundary.
@@ -34,7 +34,7 @@ pub enum IpcError {
     /// Payload encoding, decoding, or semantic validation failed.
     #[error(transparent)]
     Codec(#[from] CodecError),
-    /// Shared-memory transport setup or operation failed.
+    /// Shared-memory transport setup or call failed.
     #[error("worker IPC error: {0}")]
     Transport(String),
 }
@@ -46,7 +46,7 @@ impl IpcError {
     }
 }
 
-/// Extension methods for attaching transport context to fallible operations.
+/// Extension methods for attaching transport context to fallible calls.
 trait IpcContext<T> {
     /// Replaces a missing value or source error with fixed transport context.
     fn context(self, message: &str) -> IpcResult<T>;
@@ -128,7 +128,7 @@ pub struct Header {
     /// Batch identity, or zero for frames that carry no batch.
     pub batch_id: u64,
     /// Request-response correlation identity.
-    pub call_id: u64,
+    pub message_id: u64,
     /// Encoded payload length in bytes.
     pub len: u32,
     /// Reserved protocol word, emitted as zero.
@@ -148,7 +148,7 @@ impl Default for Header {
     fn default() -> Self {
         Self {
             batch_id: 0,
-            call_id: 0,
+            message_id: 0,
             len: 0,
             reserved0: 0,
             reserved1: 0,
@@ -389,7 +389,7 @@ pub struct ServerEndpoint {
     _node: Node<IxService>,
     /// Request-response port used to receive and answer request frames.
     server: IxServer,
-    /// Active requests retained until their matching `call_id` is answered.
+    /// Active requests retained until their matching `message_id` is answered.
     active: VecDeque<(u64, IxActive)>,
     /// Directional wake ports paired with the request-response service.
     events: ServerEvents,
@@ -456,12 +456,12 @@ impl ServerEndpoint {
         let header = *active.user_header();
         let payload = active.payload().to_vec();
         verify_header_len(header, payload.len())?;
-        // Retain transport ownership until a response with this call id arrives.
-        self.active.push_back((header.call_id, active));
+        // Retain transport ownership until a response with this message id arrives.
+        self.active.push_back((header.message_id, active));
         Ok(Some(Frame { header, payload }))
     }
 
-    /// Waits for and receives one request before the operation deadline.
+    /// Waits for and receives one request before the call deadline.
     pub fn recv(&mut self) -> IpcResult<Frame> {
         loop {
             if let Some(frame) = self.try_recv()? {
@@ -497,11 +497,11 @@ impl ServerEndpoint {
         let pos = self
             .active
             .iter()
-            .position(|(call_id, _)| *call_id == header.call_id)
+            .position(|(message_id, _)| *message_id == header.message_id)
             .with_context(|| {
                 format!(
-                    "respond called for unknown active request call_id {}",
-                    header.call_id
+                    "respond called for unknown active request message_id {}",
+                    header.message_id
                 )
             })?;
         let active = self
@@ -521,7 +521,7 @@ impl ServerEndpoint {
         Ok(())
     }
 
-    /// Returns the worker-side deadline used by blocking receive operations.
+    /// Returns the worker-side deadline used by blocking receive calls.
     fn connect_timeout(&self) -> Duration {
         Duration::from_secs(300)
     }
@@ -529,13 +529,13 @@ impl ServerEndpoint {
 
 /// Builds the IPC header that accompanies `req`.
 ///
-/// `call_id` is the authoritative request/response correlation key. The
+/// `message_id` is the authoritative request/response correlation key. The
 /// `batch_id` field is a diagnostic hint populated from the batch; the decoded
-/// payload is authoritative for the operation identities it carries.
+/// payload is authoritative for the call identities it carries.
 pub fn header_for_request(req: &WorkerRequest) -> Header {
     let mut h = Header {
         kind: request_kind_code(req.kind()),
-        call_id: req.call_id().unwrap_or_default(),
+        message_id: req.message_id().unwrap_or_default(),
         ..Default::default()
     };
     if let Some(batch) = req.batch() {
@@ -546,13 +546,13 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
 
 /// Builds the IPC header that accompanies `resp`.
 ///
-/// `call_id` is the authoritative request/response correlation key. The
+/// `message_id` is the authoritative request/response correlation key. The
 /// `batch_id` field is a diagnostic hint populated from the result; the decoded
-/// payload is authoritative for the operation identities it carries.
+/// payload is authoritative for the call identities it carries.
 pub fn header_for_response(resp: &WorkerResponse) -> Header {
     let mut h = Header {
         kind: response_kind_code(resp.kind()),
-        call_id: resp.call_id().unwrap_or_default(),
+        message_id: resp.message_id().unwrap_or_default(),
         ..Default::default()
     };
     if let Some(report) = resp.report() {

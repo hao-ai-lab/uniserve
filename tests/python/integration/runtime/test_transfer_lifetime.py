@@ -14,7 +14,7 @@ from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import BufferAllocation
-from uniserve_worker.protocol.identity import ComputationId, RequestKey
+from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.tensor import (
     DType,
     ShapeBound,
@@ -850,7 +850,7 @@ def test_cancelled_shard_reads_retain_destination_and_capacity_until_physical_re
         )
     product = TensorRef(
         request_key=RequestKey(1, 1, 1),
-        producer_op_id=ComputationId(1, 0),
+        producer_call_id=CallId(1, 0),
         output_index=0,
         generation=1,
         dtype=DType.F32,

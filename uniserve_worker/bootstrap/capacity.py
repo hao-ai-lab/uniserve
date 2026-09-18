@@ -31,7 +31,7 @@ from ..execution.input_buffers import InputBufferConfig
 from ..execution.model_entry import ModelEntry
 from ..execution.resources import media_state_buffers
 from ..foundation.errors import unsupported_setup
-from ..protocol.operation import PipelineStage
+from ..protocol.call import PipelineStage
 from ..protocol.tensor import DeviceDim, OutputInfo
 from ..runtime.cache_manager import CacheManager
 from ..runtime.results import resolve_outputs
@@ -39,7 +39,7 @@ from ..runtime.tensor_store import TensorStore, device_product_capacity_bytes
 from .components import media_components
 from .inputs import capability, image_builder, media_builder
 
-_DEVICE_PRODUCTS_PER_OPERATION = 6
+_DEVICE_PRODUCTS_PER_CALL = 6
 _DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
 _MAX_TRANSFER_ENTRIES = 256
 _HOST_LANE_INFLIGHT = 256
@@ -60,7 +60,7 @@ def input_buffer_config(
 ) -> InputBufferConfig:
     """Size staging for the admitted text span.
 
-    Staging also covers one atomic image or CFG operation.
+    Staging also covers one atomic image or CFG call.
     """
     text = capability(model, CausalLM)
     if text is None:
@@ -68,9 +68,9 @@ def input_buffer_config(
 
     max_rows = min(
         config.max_request_pool_size,
-        config.max_batch_operations,
+        config.max_batch_calls,
         *(
-            lane.max_batch_operations or config.max_batch_operations
+            lane.max_batch_calls or config.max_batch_calls
             for lane in config.lanes
         ),
     )
@@ -283,10 +283,10 @@ def local_product_storage_bytes(
             if not produces and not consumes:
                 continue
 
-        units_per_operation = 1
+        units_per_call = 1
         if producer is not None and entry in streamed:
             config = producer.config
-            units_per_operation = len(config.ranks) * config.units_per_rank
+            units_per_call = len(config.ranks) * config.units_per_rank
 
         for output in outputs:
             size = output.max_bytes
@@ -305,10 +305,10 @@ def local_product_storage_bytes(
                     live_groups = max_units
                 else:
                     group_bytes = (
-                        size // max_units * min(max_units, units_per_operation)
+                        size // max_units * min(max_units, units_per_call)
                     )
                     live_groups = min(
-                        ceil_div(max_units, units_per_operation),
+                        ceil_div(max_units, units_per_call),
                         max_unresolved_ops,
                     )
                 size = live_groups * ceil_div(group_bytes, 256) * 256
@@ -389,16 +389,16 @@ class ArenaCapacity:
     host_lane_inflight: int
 
 
-def operation_window(queue_depth: int, max_operations: int) -> int:
-    """Bound simultaneously live operations.
+def call_window(queue_depth: int, max_calls: int) -> int:
+    """Bound simultaneously live calls.
 
     The bound follows pipeline depth and per-batch capacity.
     """
     depth = int(queue_depth)
-    operations = int(max_operations)
-    if depth < 1 or operations < 1:
-        raise ValueError("operation-window sizing requires positive bounds")
-    return min(depth * operations, max(2, depth))
+    calls = int(max_calls)
+    if depth < 1 or calls < 1:
+        raise ValueError("call-window sizing requires positive bounds")
+    return min(depth * calls, max(2, depth))
 
 
 def request_tensor_arena_capacity(
@@ -411,17 +411,17 @@ def request_tensor_arena_capacity(
     """Bound product, relay and transfer storage for fixed request tensors.
 
     ``concurrent_imports`` is how many remote product regions one request's
-    calls can have in flight at once beyond its operation window, which is what
+    calls can have in flight at once beyond its call window, which is what
     the artifact's assembly costs: it reads every encode round of the request,
     and each round was written by every rank that held a media unit in it.
     """
     depth = int(queue_depth)
-    max_operations = int(worker_config.max_batch_operations)
+    max_calls = int(worker_config.max_batch_calls)
     state_slots = int(worker_config.max_request_pool_size)
-    slots = max(depth * max_operations, state_slots * int(concurrent_imports))
+    slots = max(depth * max_calls, state_slots * int(concurrent_imports))
     unresolved_window = request_tensor_window(depth, state_slots)
-    tensor_store = _DEVICE_PRODUCTS_PER_OPERATION * (
-        slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
+    tensor_store = _DEVICE_PRODUCTS_PER_CALL * (
+        slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_calls
     )
     relay_bytes = (
         (state_slots + 1)
@@ -488,11 +488,11 @@ def model_arena_capacity(
     """
     depth = int(queue_depth)
     payload_bytes = int(completion_payload_bytes)
-    max_operations = int(worker_config.max_batch_operations)
-    if depth < 1 or payload_bytes < 1 or max_operations < 1:
+    max_calls = int(worker_config.max_batch_calls)
+    if depth < 1 or payload_bytes < 1 or max_calls < 1:
         raise ValueError("model arena sizing requires positive runtime bounds")
 
-    slots = depth * max_operations
+    slots = depth * max_calls
     if state_buffers is None:
         state_buffers = media_state_buffers(
             model, bindings or {}, worker_config
@@ -552,9 +552,9 @@ def model_arena_capacity(
     )
 
     device_product_slots = (
-        slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
+        slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_calls
     )
-    tensor_store = _DEVICE_PRODUCTS_PER_OPERATION * device_product_slots
+    tensor_store = _DEVICE_PRODUCTS_PER_CALL * device_product_slots
     device_count = len(
         {
             str(worker_config.device),
@@ -571,10 +571,7 @@ def model_arena_capacity(
     )
     device_product_bytes += (
         (int(request_pool_size) + 1)
-        * (
-            operation_window(depth, max_operations)
-            + _REQUEST_RELAY_RETIREMENT_LANES
-        )
+        * (call_window(depth, max_calls) + _REQUEST_RELAY_RETIREMENT_LANES)
         * _REQUEST_RELAY_ROW_BYTES
         * device_count
     )
@@ -712,7 +709,7 @@ __all__ = [
     "latent_pool_capacity_bytes",
     "latent_trajectory_bytes",
     "model_arena_capacity",
-    "operation_window",
+    "call_window",
 ]
 
 
@@ -750,9 +747,7 @@ def resolve_request_capacity(
                 capacity_config = replace(
                     worker_config,
                     max_request_pool_size=count,
-                    max_batch_operations=min(
-                        count, worker_config.max_batch_operations
-                    ),
+                    max_batch_calls=min(count, worker_config.max_batch_calls),
                     max_batch_tokens=min(count, worker_config.max_batch_tokens),
                 )
                 product_bytes = local_product_storage_bytes(
@@ -783,9 +778,7 @@ def resolve_request_capacity(
             worker_config = replace(
                 worker_config,
                 max_request_pool_size=slots,
-                max_batch_operations=min(
-                    slots, worker_config.max_batch_operations
-                ),
+                max_batch_calls=min(slots, worker_config.max_batch_calls),
                 max_batch_tokens=min(slots, worker_config.max_batch_tokens),
             )
     return worker_config

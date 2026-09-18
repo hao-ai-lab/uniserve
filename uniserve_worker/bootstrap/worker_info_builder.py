@@ -18,7 +18,7 @@ from uniserve.processing import ImageProcessor
 from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.protocol.operation import COMPUTATIONS, Computation
+from uniserve_worker.protocol.call import CALL_KINDS, CallKind
 
 from ..config import graph_memory_budget_bytes, graph_padding_block_count
 from ..execution.input_buffers import InputBufferConfig
@@ -34,18 +34,18 @@ from .cache import cache_info, resize_cache
 from .capacity import (
     ArenaCapacity,
     active_latent_capacity_tokens,
+    call_window,
     derive_runtime_kv_capacity,
     device_total_bytes,
     input_buffer_config,
     latent_pool_capacity_bytes,
     local_product_storage_bytes,
     model_arena_capacity,
-    operation_window,
     product_storage_bytes,
     request_tensor_window,
     vision_tokens,
 )
-from .components import media_components, supported_operations
+from .components import media_components, supported_calls
 from .config import ComponentConfig
 from .inputs import capability, image_builder, media_builder
 from .worker_info import EntryInfo, WorkerInfo
@@ -156,7 +156,7 @@ def build_worker_layout(
     completion_payload_bytes: int = 1 << 20,
     endpoint: WorkerEndpoint | None = None,
     capacity_group: Communicator | None = None,
-    allowed_work_variants: frozenset[Computation] | None = None,
+    allowed_work_variants: frozenset[CallKind] | None = None,
     transfer_backends: tuple[str, ...] = ("local",),
     components: tuple[tuple[str, ComponentConfig], ...] = (),
     attention_identity: str | None = None,
@@ -166,7 +166,7 @@ def build_worker_layout(
     """Resolve resource dimensions and the capacity report used by the worker.
 
     Model dimensions determine storage reservations. Admission additionally
-    obeys the configured operation set and every lane's bounds; these
+    obeys the configured call set and every lane's bounds; these
     restrictions do not shrink the storage needed by warmup and graph
     capture.
     """
@@ -176,7 +176,7 @@ def build_worker_layout(
     if completion_payload_bytes <= 0:
         raise ValueError("completion payload capacity must be positive")
 
-    supported_ops = supported_operations(model)
+    supported_ops = supported_calls(model)
     if allowed_work_variants is not None:
         supported_ops = supported_ops & allowed_work_variants
 
@@ -225,23 +225,21 @@ def build_worker_layout(
     # A shared admission limit must be safe on every eligible lane. Keep it
     # in the layout so runtime allocation and the IPC handshake read the
     # same value.
-    max_operations = layout.info.max_batch_ops
+    max_calls = layout.info.max_batch_ops
     max_tokens = layout.info.max_batch_tokens
 
     for lane in worker_config.lanes:
-        max_operations = min(
-            max_operations, lane.max_batch_operations or max_operations
-        )
+        max_calls = min(max_calls, lane.max_batch_calls or max_calls)
         max_tokens = min(max_tokens, lane.max_batch_tokens or max_tokens)
 
     outputs = resolve_outputs(model, worker_config)
     info = replace(
         layout.info,
         supported_ops=tuple(
-            code for code in COMPUTATIONS if code in supported_ops
+            code for code in CALL_KINDS if code in supported_ops
         ),
         transfer_backends=transfer_backends,
-        max_batch_ops=max_operations,
+        max_batch_ops=max_calls,
         max_batch_tokens=max_tokens,
         encoder_cache_entries=layout.encoder_cache_entries,
         encoder_entry_bytes=max(
@@ -341,8 +339,8 @@ def _token_worker_layout(
     )
 
     capacity = None
-    unresolved_window = operation_window(
-        int(queue_depth), int(worker_config.max_batch_operations)
+    unresolved_window = call_window(
+        int(queue_depth), int(worker_config.max_batch_calls)
     )
     buffer_pool_bytes = (encoder_cache_entries + 1) * max(
         max_latent_feature_bytes, max_vision_feature_bytes
@@ -461,7 +459,7 @@ def _token_worker_layout(
             )
 
     supported_ops = tuple(
-        code for code in COMPUTATIONS if code in supported_operations(model)
+        code for code in CALL_KINDS if code in supported_calls(model)
     )
     info = WorkerInfo(
         model_name=model_name,
@@ -470,7 +468,7 @@ def _token_worker_layout(
         world_size=int(worker_config.world_size),
         supported_ops=supported_ops,
         queue_depth=int(queue_depth),
-        max_batch_ops=int(worker_config.max_batch_operations),
+        max_batch_ops=int(worker_config.max_batch_calls),
         max_batch_tokens=int(worker_config.max_batch_tokens),
         request_slots=int(worker_config.max_request_pool_size),
         kv_cache=(
@@ -535,7 +533,7 @@ def _request_tensor_worker_layout(
     slots = int(worker_config.max_request_pool_size)
     depth = int(queue_depth)
     unresolved_window = request_tensor_window(depth, slots)
-    max_operations = min(slots, int(worker_config.max_batch_operations))
+    max_calls = min(slots, int(worker_config.max_batch_calls))
 
     info = WorkerInfo(
         model_name=model_name,
@@ -543,11 +541,11 @@ def _request_tensor_worker_layout(
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),
         supported_ops=tuple(
-            code for code in COMPUTATIONS if code in supported_operations(model)
+            code for code in CALL_KINDS if code in supported_calls(model)
         ),
         queue_depth=depth,
-        max_batch_ops=max_operations,
-        max_batch_tokens=max_operations,
+        max_batch_ops=max_calls,
+        max_batch_tokens=max_calls,
         request_slots=slots,
         kv_cache=None,
         latent_page_units=0,

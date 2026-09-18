@@ -169,7 +169,7 @@ def _send_recv(
         if bound is not None:
             bound.send_recv(output, value, dst, src)
             return
-        operations = [
+        calls = [
             dist.P2POp(
                 dist.isend, value.reshape(-1).view(torch.uint8), dst, group
             ),
@@ -177,7 +177,7 @@ def _send_recv(
                 dist.irecv, output.reshape(-1).view(torch.uint8), src, group
             ),
         ]
-        for work in dist.batch_isend_irecv(operations):
+        for work in dist.batch_isend_irecv(calls):
             _finish(work, value)
 
 
@@ -212,7 +212,7 @@ class Communicator:
 
     The distributed runtime supplies the backend and owns its lifetime. Torch
     sorts process-group ranks; this interface preserves worker_config order even
-    when it differs from backend order. Singleton operations need no backend.
+    when it differs from backend order. Singleton calls need no backend.
     """
 
     ranks: tuple[int, ...] = (0,)
@@ -281,12 +281,12 @@ class Communicator:
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Reduce in place, or into matching output storage when supplied."""
-        operations = {
+        calls = {
             "sum": dist.ReduceOp.SUM,
             "min": dist.ReduceOp.MIN,
             "max": dist.ReduceOp.MAX,
         }
-        if op not in operations:
+        if op not in calls:
             raise ValueError(f"unsupported reduction {op!r}")
 
         result = (
@@ -304,7 +304,7 @@ class Communicator:
             elif op == "max":
                 _all_reduce_max(result, group.group_name)
             else:
-                dist.all_reduce(result, op=operations[op], group=group)
+                dist.all_reduce(result, op=calls[op], group=group)
         return result
 
     def all_gather(

@@ -92,7 +92,7 @@ def test_automatic_capacity_charges_request_and_input_storage() -> None:
         _worker_config(token_capacity=None),
         pool_memory_bytes=32 * 1024**3,
         max_request_pool_size=4,
-        max_batch_operations=4,
+        max_batch_calls=4,
         max_batch_tokens=64,
     )
     small = build_worker_layout(model, config).info
@@ -115,7 +115,7 @@ def test_explicit_pages_cannot_displace_resident_encoder_storage() -> None:
         _worker_config(token_capacity=64),
         pool_memory_bytes=32 * 1024**3,
         max_request_pool_size=4,
-        max_batch_operations=4,
+        max_batch_calls=4,
         max_batch_tokens=64,
     )
     processor = image_processor()

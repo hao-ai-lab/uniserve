@@ -1,9 +1,9 @@
-//! Request identities, operation descriptors, admissions, and execution batches.
+//! Request identities, call descriptors, admissions, and execution batches.
 
 use super::*;
 
 /// `(engine_id, request_id, request_epoch)`. The epoch advances whenever an admitted
-/// identity is reused, so no operation or product reference aliases across
+/// identity is reused, so no call or product reference aliases across
 /// requests or epochs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestKey {
@@ -138,7 +138,7 @@ impl TransferMode {
 /// forward, pipeline, and storage contracts without parallel opcode metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum Computation {
+pub enum CallKind {
     Forward(ForwardMode),
     Pipeline(PipelineStage),
     Transfer(TransferMode),
@@ -255,7 +255,7 @@ impl<'de> Deserialize<'de> for AttentionBackend {
 #[error("unsupported attention backend {0:?}")]
 pub struct AttentionBackendParseError(String);
 
-impl Computation {
+impl CallKind {
     /// Computations accepted as individual scheduled request items.
     pub const ALL: [Self; 17] = [
         Self::Forward(ForwardMode::Prefill),
@@ -294,12 +294,12 @@ impl Computation {
     }
 }
 
-/// Hard resource maxima the scheduler reserves before an operation runs.
+/// Hard resource maxima the scheduler reserves before an call runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Bounds {
-    /// Maximum tokens the operation may process or produce.
+    /// Maximum tokens the call may process or produce.
     pub max_tokens: u32,
-    /// Maximum paged-KV blocks the operation may consume.
+    /// Maximum paged-KV blocks the call may consume.
     pub max_kv_pages: u32,
     /// Maximum latent storage in bytes.
     pub max_latent_bytes: u64,
@@ -322,24 +322,24 @@ pub enum DrawLayout {
     FlowNoise = 2,
 }
 
-/// Deterministic random-draw coordinates for one operation.
+/// Deterministic random-draw coordinates for one call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Rng {
     /// Request-level random seed.
     pub seed: u64,
-    /// First semantic draw index assigned to the operation.
+    /// First semantic draw index assigned to the call.
     pub semantic_index_base: u64,
     /// Mapping from semantic work to deterministic draws.
     pub draw_layout: DrawLayout,
 }
 
-/// Branch-local token processor inputs for one sampling operation.
+/// Branch-local token processor inputs for one sampling call.
 ///
 /// Token ids in every field are strictly increasing. `allowed_token_ids`
 /// distinguishes no whitelist (`None`) from a present empty whitelist, which
 /// deterministically represents an invalid all-masked distribution. Penalty
 /// token counts are not carried here: they are a device-resident committed base
-/// plus bounded per-operation deltas folded after sampling accepts tokens, so no host
+/// plus bounded per-call deltas folded after sampling accepts tokens, so no host
 /// token history participates in a successor's sampling input.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SamplingState {
@@ -373,7 +373,7 @@ impl SamplingState {
 
 /// The coordinates one call executes at.
 ///
-/// A rank would otherwise derive these by chaining from the operations that
+/// A rank would otherwise derive these by chaining from the calls that
 /// preceded it. The engine holds the request state they come from, so it states
 /// them and the rank asserts its own ledger agrees.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,19 +401,19 @@ impl CallCoordinates {
 
 /// One immutable computation with its identity, data dependencies, and output limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScheduledRequest {
-    /// Request lineage that owns the operation.
+pub struct Call {
+    /// Request lineage that owns the call.
     pub request_key: RequestKey,
     /// Logical batch and selection ordinal of the completed computation.
-    pub op_id: ComputationId,
+    pub call_id: CallId,
     /// Execution-order dependency; zero identifies admission, absent for independent work.
-    pub predecessor: Option<ComputationId>,
+    pub predecessor: Option<CallId>,
     /// Coordinates this call executes at, so a rank does not derive them.
     pub coordinates: CallCoordinates,
-    /// Computation entry bound within the selected Worker.
+    /// CallKind entry bound within the selected Worker.
     pub entry: String,
-    /// Computation performed by this operation.
-    pub code: Computation,
+    /// CallKind performed by this call.
+    pub code: CallKind,
     /// Scheduler-declared limits for the computation and its outputs.
     pub bounds: Bounds,
     /// Data dependencies consumed in input order.
@@ -460,7 +460,7 @@ pub struct ScheduledRequest {
     pub kv_output: Option<BufferId>,
 }
 
-impl ScheduledRequest {
+impl Call {
     /// Tensor dependencies in the computation signature, excluding its predicate.
     pub fn tensor_inputs(&self) -> impl Iterator<Item = &TensorRef> {
         self.inputs
@@ -534,17 +534,17 @@ impl ScheduledRequest {
     }
     /// Validates family-specific products, bounds, predicates, and RNG state.
     pub fn validate(&self) -> ValidationResult<()> {
-        // Establish operation identity, family, lineage, and declared capacity.
-        ensure_valid!(self.op_id.batch_id > 0, "operation id must be positive");
-        ensure_valid!(!self.entry.is_empty(), "operation entry must not be empty");
+        // Establish call identity, family, lineage, and declared capacity.
+        ensure_valid!(self.call_id.batch_id > 0, "call id must be positive");
+        ensure_valid!(!self.entry.is_empty(), "call entry must not be empty");
         self.coordinates.validate()?;
 
         ensure_valid!(
             !(self.advances_state()
-                || self.code == Computation::Transfer(TransferMode::KvInstall)
+                || self.code == CallKind::Transfer(TransferMode::KvInstall)
                 || self.latent_input.is_some())
                 || self.predecessor.is_some(),
-            "state-changing operation requires a predecessor"
+            "state-changing call requires a predecessor"
         );
         if let Some(predecessor) = self.predecessor {
             ensure_valid!(
@@ -552,8 +552,8 @@ impl ScheduledRequest {
                 "admission predecessor must use index zero"
             );
             ensure_valid!(
-                predecessor < self.op_id,
-                "predecessor must precede operation"
+                predecessor < self.call_id,
+                "predecessor must precede call"
             );
         }
         ensure_valid!(
@@ -582,7 +582,7 @@ impl ScheduledRequest {
                 !image.is_empty()
                     && matches!(
                         self.code,
-                        Computation::Pipeline(
+                        CallKind::Pipeline(
                             PipelineStage::VisionEncoding | PipelineStage::LatentEncoding
                         )
                     )
@@ -592,11 +592,11 @@ impl ScheduledRequest {
         }
 
         // Every output must be uniquely owned by this producer and fit the
-        // resource class reserved for the operation.
+        // resource class reserved for the call.
         let mut output_indices = HashSet::with_capacity(self.outputs.len());
         let publishes_kv = matches!(
             self.code,
-            Computation::Transfer(TransferMode::KvPublish | TransferMode::KvInstall)
+            CallKind::Transfer(TransferMode::KvPublish | TransferMode::KvInstall)
         );
         ensure_valid!(
             self.kv_output.is_some() == publishes_kv,
@@ -605,15 +605,15 @@ impl ScheduledRequest {
         if let Some(output) = self.kv_output {
             output.validate()?;
             ensure_valid!(
-                output.owner == self.request_key && output.producer_op_id == self.op_id,
+                output.owner == self.request_key && output.producer_call_id == self.call_id,
                 "KV output is not owned by its producing computation"
             );
             output_indices.insert(output.output_index);
         }
         let consumes_kv = matches!(
             self.code,
-            Computation::Transfer(TransferMode::KvInstall)
-                | Computation::Pipeline(
+            CallKind::Transfer(TransferMode::KvInstall)
+                | CallKind::Pipeline(
                     PipelineStage::LatentPreparation | PipelineStage::Denoising
                 )
         );
@@ -625,15 +625,15 @@ impl ScheduledRequest {
             );
         }
         ensure_valid!(
-            self.code != Computation::Transfer(TransferMode::KvInstall) || self.kv_input.is_some(),
+            self.code != CallKind::Transfer(TransferMode::KvInstall) || self.kv_input.is_some(),
             "KV installation requires a source publication"
         );
 
         for output in self.tensor_outputs() {
             output.validate()?;
             ensure_valid!(
-                output.request_key == self.request_key && output.producer_op_id == self.op_id,
-                "an output product is not owned by its producing operation"
+                output.request_key == self.request_key && output.producer_call_id == self.call_id,
+                "an output product is not owned by its producing call"
             );
             ensure_valid!(
                 output.generation > 0,
@@ -641,7 +641,7 @@ impl ScheduledRequest {
             );
             ensure_valid!(
                 output_indices.insert(output.output_index),
-                "operation repeats an output index"
+                "call repeats an output index"
             );
         }
 
@@ -658,7 +658,7 @@ impl ScheduledRequest {
         }
         if let Some(input) = &self.token_input {
             ensure_valid!(
-                self.code == Computation::Transfer(TransferMode::Tensor),
+                self.code == CallKind::Transfer(TransferMode::Tensor),
                 "token transfer input requires a tensor-transfer computation"
             );
             ensure_valid!(
@@ -709,14 +709,14 @@ impl ScheduledRequest {
     }
 }
 
-/// Terminal status of one operation's completion.
+/// Terminal status of one call's completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
-pub enum OpStatus {
+pub enum CallStatus {
     /// Execution completed successfully.
     Ok = 0,
-    /// The operation was skipped because its predicate was false.
+    /// The call was skipped because its predicate was false.
     Predicated = 1,
     /// Execution failed with a deterministic error code.
     Error = 2,
@@ -727,9 +727,9 @@ pub enum OpStatus {
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum ErrorCode {
-    /// Operation metadata or product declarations are invalid.
-    InvalidOperation = 0,
-    /// A reserved or physical resource could not satisfy the operation.
+    /// Call metadata or product declarations are invalid.
+    InvalidCall = 0,
+    /// A reserved or physical resource could not satisfy the call.
     ResourceExhausted = 1,
     /// Device computation failed.
     ComputeError = 2,
@@ -739,7 +739,7 @@ pub enum ErrorCode {
     Internal = 4,
 }
 
-/// Device-observed finish candidates for a token operation.
+/// Device-observed finish candidates for a token call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct FinishFlags {
     /// Whether an end-of-sequence token was selected.
@@ -750,7 +750,7 @@ pub struct FinishFlags {
     pub stop: bool,
 }
 
-/// Per-operation timing counters. Accounting only; never state identity.
+/// Per-call timing counters. Accounting only; never state identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct TimingCounters {
     /// Time spent waiting for worker execution, in microseconds.
@@ -796,24 +796,24 @@ pub struct MediaOutput {
     pub bytes: u64,
 }
 
-/// The fixed-layout record a worker emits once for every operation, after its
+/// The fixed-layout record a worker emits once for every call, after its
 /// copy event is query-ready and its pinned fields are validated on the host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestOutput {
-    /// Request lineage completed by the operation.
+    /// Request lineage completed by the call.
     pub request_key: RequestKey,
-    /// Request-local operation identifier.
-    pub op_id: ComputationId,
+    /// Request-local call identifier.
+    pub call_id: CallId,
     /// Terminal execution status.
-    pub status: OpStatus,
-    /// Allocation generations for products emitted by the operation.
+    pub status: CallStatus,
+    /// Allocation generations for products emitted by the call.
     pub product_generations: Vec<u32>,
-    /// Error classification when `status` is [`OpStatus::Error`].
+    /// Error classification when `status` is [`CallStatus::Error`].
     pub error_code: Option<ErrorCode>,
-    /// Worker timing measurements for the operation.
+    /// Worker timing measurements for the call.
     pub timing_counters: TimingCounters,
-    /// Computation that produced this result; must match the submitted operation.
-    pub code: Computation,
+    /// CallKind that produced this result; must match the submitted call.
+    pub code: CallKind,
     /// Model position for the next input, including image-feedback position advances.
     pub position: u32,
     /// Accepted KV prefix available to a successor.
@@ -841,14 +841,14 @@ pub struct RequestOutput {
 impl RequestOutput {
     /// Validates completion identity, status, accepted lengths, and product generations.
     pub fn validate(&self) -> ValidationResult<()> {
-        ensure_valid!(self.op_id.batch_id > 0, "completion op id must be positive");
+        ensure_valid!(self.call_id.batch_id > 0, "completion call id must be positive");
         if let Some(publication) = &self.kv_output {
             publication.validate()?;
             ensure_valid!(
-                self.status == OpStatus::Ok
-                    && self.code == Computation::Transfer(TransferMode::KvPublish)
+                self.status == CallStatus::Ok
+                    && self.code == CallKind::Transfer(TransferMode::KvPublish)
                     && publication.source.owner == self.request_key
-                    && publication.source.producer_op_id == self.op_id,
+                    && publication.source.producer_call_id == self.call_id,
                 "KV publication does not belong to its successful completion"
             );
         }
@@ -858,16 +858,16 @@ impl RequestOutput {
             "completion selected KV length exceeds computed length"
         );
         match self.status {
-            OpStatus::Error => ensure_valid!(
+            CallStatus::Error => ensure_valid!(
                 self.error_code.is_some(),
                 "an error completion must carry an error code"
             ),
-            OpStatus::Ok | OpStatus::Predicated => ensure_valid!(
+            CallStatus::Ok | CallStatus::Predicated => ensure_valid!(
                 self.error_code.is_none(),
                 "a non-error completion must not carry an error code"
             ),
         }
-        if self.status == OpStatus::Predicated {
+        if self.status == CallStatus::Predicated {
             ensure_valid!(
                 self.committed_tokens.as_slice().is_empty() && self.product_generations.is_empty(),
                 "a predicated completion must select its parent without semantic output"
@@ -892,7 +892,7 @@ impl RequestOutput {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum BatchCommand {
-    /// Establish one request lineage before its first operation on a pool.
+    /// Establish one request lineage before its first call on a pool.
     Start {
         /// Static request state installed by the worker.
         request: NewRequest,
@@ -962,7 +962,7 @@ impl BatchCommand {
 /// Autoregressive request parameters fixed for the worker request lifetime.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArRequestParams {
-    /// Sampling policy shared by autoregressive operations.
+    /// Sampling policy shared by autoregressive calls.
     pub sampling: SamplingParams,
     /// Token identifiers used for negative-conditioning input.
     pub negative_token_ids: Vec<u32>,
@@ -982,7 +982,7 @@ pub struct UmmRequestParams {
 pub use uniserve_core::DiffusionSamplingParams;
 
 /// Request-start framing. Carries the per-domain parameters a request
-/// needs before its operations run.
+/// needs before its calls run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewRequest {
     /// Globally unique request lineage identity.
@@ -1145,9 +1145,9 @@ impl CachePageAllocation {
 /// Aligned columns defining the model's forward rows, independent of wire framing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardBatch {
-    /// Physical operation index for each row; logical computation IDs remain unchanged.
-    #[serde(rename = "forward_operation_indices")]
-    pub operation_indices: Vec<u32>,
+    /// Physical call index for each row; logical computation IDs remain unchanged.
+    #[serde(rename = "forward_call_indices")]
+    pub call_indices: Vec<u32>,
     /// Scheduler-owned request slots, including alternative CFG prefixes.
     pub request_pool_indices: Vec<u32>,
     /// Total attention lengths (cached prefix plus query), not allocated capacities.
@@ -1162,13 +1162,13 @@ impl ForwardBatch {
     /// Append one model row to every column in the same order.
     pub fn push(
         &mut self,
-        operation_index: u32,
+        call_index: u32,
         request_pool_index: u32,
         seq_len: u32,
         query_len: u32,
         write_kv: bool,
     ) {
-        self.operation_indices.push(operation_index);
+        self.call_indices.push(call_index);
         self.request_pool_indices.push(request_pool_index);
         self.seq_lens.push(seq_len);
         self.query_lens.push(query_len);
@@ -1176,12 +1176,12 @@ impl ForwardBatch {
     }
 
     /// Move forward inputs into a physical batch, offsetting only physical row ownership.
-    pub fn append(&mut self, other: Self, operation_offset: u32) {
-        self.operation_indices
-            .extend(other.operation_indices.into_iter().map(|index| {
+    pub fn append(&mut self, other: Self, call_offset: u32) {
+        self.call_indices
+            .extend(other.call_indices.into_iter().map(|index| {
                 index
-                    .checked_add(operation_offset)
-                    .expect("physical operation index fits u32")
+                    .checked_add(call_offset)
+                    .expect("physical call index fits u32")
             }));
         self.request_pool_indices.extend(other.request_pool_indices);
         self.seq_lens.extend(other.seq_lens);
@@ -1189,13 +1189,13 @@ impl ForwardBatch {
         self.write_kv.extend(other.write_kv);
     }
 
-    /// Select a rank's operations and map their forward rows to the local operation array.
-    pub fn select(&self, operations: &[usize]) -> Self {
+    /// Select a rank's calls and map their forward rows to the local call array.
+    pub fn select(&self, calls: &[usize]) -> Self {
         let mut selected = Self::default();
-        for (row, index) in self.operation_indices.iter().enumerate() {
-            if let Some(local) = operations
+        for (row, index) in self.call_indices.iter().enumerate() {
+            if let Some(local) = calls
                 .iter()
-                .position(|operation| *operation == *index as usize)
+                .position(|call| *call == *index as usize)
             {
                 selected.push(
                     local as u32,
@@ -1210,8 +1210,8 @@ impl ForwardBatch {
     }
 
     /// Validate column alignment and numerical ranges before indexing model inputs.
-    pub fn validate(&self, operation_count: usize) -> ValidationResult<()> {
-        let rows = self.operation_indices.len();
+    pub fn validate(&self, call_count: usize) -> ValidationResult<()> {
+        let rows = self.call_indices.len();
         ensure_valid!(
             self.request_pool_indices.len() == rows
                 && self.seq_lens.len() == rows
@@ -1220,10 +1220,10 @@ impl ForwardBatch {
             "forward input columns have different lengths"
         );
         ensure_valid!(
-            self.operation_indices
+            self.call_indices
                 .iter()
-                .all(|index| (*index as usize) < operation_count),
-            "forward operation index is outside its batch"
+                .all(|index| (*index as usize) < call_count),
+            "forward call index is outside its batch"
         );
         ensure_valid!(
             self.request_pool_indices.iter().all(|slot| *slot > 0),
@@ -1249,8 +1249,8 @@ impl ForwardBatch {
 pub struct LatentParams {
     /// Request lineage that owns the trajectory.
     pub request_key: RequestKey,
-    /// Operation that addresses the trajectory.
-    pub op_id: ComputationId,
+    /// Call that addresses the trajectory.
+    pub call_id: CallId,
     /// Physical latent pages in logical order; empty for request-owned tensors.
     pub page_table: Vec<u32>,
     /// Logical units stored in pages; zero when the trajectory uses request tensors.
@@ -1259,9 +1259,9 @@ pub struct LatentParams {
     pub height: u32,
     /// Output width in pixels.
     pub width: u32,
-    /// First denoising step assigned to the operation.
+    /// First denoising step assigned to the call.
     pub start_step: u32,
-    /// Number of denoising steps assigned to the operation.
+    /// Number of denoising steps assigned to the call.
     pub step_count: u32,
 }
 
@@ -1269,8 +1269,8 @@ impl LatentParams {
     /// Validates latent page identities, shape, and byte bounds.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            self.op_id.batch_id > 0,
-            "latent params operation id must be positive"
+            self.call_id.batch_id > 0,
+            "latent params call id must be positive"
         );
         ensure_valid!(
             self.height > 0 && self.width > 0,
@@ -1286,16 +1286,16 @@ impl LatentParams {
     }
 }
 
-/// Cursor and unit bounds for one diffusion decode operation.
+/// Cursor and unit bounds for one diffusion decode call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecodeRange {
     /// Request lineage that owns the media output.
     pub request_key: RequestKey,
-    /// Decode operation receiving the params.
-    pub op_id: ComputationId,
-    /// First decoder unit assigned to the operation.
+    /// Decode call receiving the params.
+    pub call_id: CallId,
+    /// First decoder unit assigned to the call.
     pub cursor: u32,
-    /// Maximum decoder units the operation may process.
+    /// Maximum decoder units the call may process.
     pub max_units: u32,
 }
 
@@ -1303,8 +1303,8 @@ impl DecodeRange {
     /// Validates decode identity and unit capacity.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            self.op_id.batch_id > 0,
-            "decode params operation id must be positive"
+            self.call_id.batch_id > 0,
+            "decode params call id must be positive"
         );
         ensure_valid!(
             self.max_units > 0,
@@ -1314,7 +1314,7 @@ impl DecodeRange {
     }
 }
 
-/// Scheduler-selected address span for one cross-operation persistent buffer.
+/// Scheduler-selected address span for one cross-call persistent buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferAllocation {
     /// Persistent buffer identity receiving the address span.
@@ -1348,9 +1348,9 @@ pub struct Batch {
     pub batch_id: u64,
     /// Monotonic sequence shared by collective participants.
     pub collective_seq: u64,
-    /// Operations executed by this invocation.
-    pub operations: Vec<ScheduledRequest>,
-    /// Complete scheduler-owned KV page tables required by the operations.
+    /// Calls executed by this invocation.
+    pub calls: Vec<Call>,
+    /// Complete scheduler-owned KV page tables required by the calls.
     pub block_tables: Vec<BlockTable>,
     /// Physical KV pages newly allocated for this invocation.
     pub new_cache_pages: Vec<CachePageAllocation>,
@@ -1361,27 +1361,27 @@ pub struct Batch {
     pub latent_params: Vec<LatentParams>,
     /// Scheduler-owned media decode allocations.
     pub decode_ranges: Vec<DecodeRange>,
-    /// Address spans for persistent cross-operation buffers.
+    /// Address spans for persistent cross-call buffers.
     pub buffer_allocations: Vec<BufferAllocation>,
     /// Ordered request-state and buffer-lifetime commands.
     pub commands: Vec<BatchCommand>,
     /// Host-supplied input product values matched by `TensorRef` identity.
     pub input_products: Vec<TensorPublication>,
-    /// Imported KV publications consumed by explicit cache installation computations.
+    /// Imported KV publications consumed by explicit cache installation call kinds.
     pub kv_inputs: Vec<KvTransfer>,
 }
 
 impl Batch {
-    /// Constructs a run with admissions and operations using default metadata.
+    /// Constructs a run with admissions and calls using default metadata.
     pub fn new(
         batch_id: u64,
         admissions: Vec<NewRequest>,
-        operations: Vec<ScheduledRequest>,
+        calls: Vec<Call>,
     ) -> Self {
         Self {
             batch_id,
             collective_seq: batch_id.max(1),
-            operations,
+            calls,
             block_tables: Vec::new(),
             new_cache_pages: Vec::new(),
             forward: ForwardBatch::default(),
@@ -1397,14 +1397,14 @@ impl Batch {
         }
     }
 
-    /// Iterates over operations in submission order.
-    pub fn operations(&self) -> impl Iterator<Item = &ScheduledRequest> {
-        self.operations.iter()
+    /// Iterates over calls in submission order.
+    pub fn calls(&self) -> impl Iterator<Item = &Call> {
+        self.calls.iter()
     }
 
-    /// Returns the number of operations in this run.
-    pub fn operation_count(&self) -> usize {
-        self.operations.len()
+    /// Returns the number of calls in this run.
+    pub fn call_count(&self) -> usize {
+        self.calls.len()
     }
 
     /// Attaches ordered control commands to the run.
@@ -1431,23 +1431,23 @@ impl Batch {
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish the run envelope before validating relationships within it.
         ensure_valid!(
-            !self.operations.is_empty() || !self.commands.is_empty(),
-            "a submission batch must carry at least one operation or control"
+            !self.calls.is_empty() || !self.commands.is_empty(),
+            "a submission batch must carry at least one call or control"
         );
         ensure_valid!(
             self.collective_seq > 0,
             "run collective sequence must be positive"
         );
 
-        let mut computation_ids = HashSet::with_capacity(self.operations.len());
-        for operation in &self.operations {
-            operation.validate()?;
+        let mut computation_ids = HashSet::with_capacity(self.calls.len());
+        for call in &self.calls {
+            call.validate()?;
             ensure_valid!(
-                operation.op_id.batch_id == self.batch_id,
+                call.call_id.batch_id == self.batch_id,
                 "computation identity belongs to another logical batch"
             );
             ensure_valid!(
-                computation_ids.insert(operation.op_id),
+                computation_ids.insert(call.call_id),
                 "a submission batch repeats a computation identity"
             );
         }
@@ -1455,16 +1455,16 @@ impl Batch {
         // performs the same computation through the same entry, so a rank
         // executes it as a single homogeneous group and returns one result.
         ensure_valid!(
-            self.operations
+            self.calls
                 .windows(2)
                 .all(|pair| { pair[0].code == pair[1].code && pair[0].entry == pair[1].entry }),
-            "a submission batch mixes computations or entries"
+            "a submission batch mixes call kinds or entries"
         );
 
-        let operations = self
-            .operations
+        let calls = self
+            .calls
             .iter()
-            .map(|operation| ((operation.request_key, operation.op_id), operation))
+            .map(|call| ((call.request_key, call.call_id), call))
             .collect::<HashMap<_, _>>();
 
         // KV allocations are subsets of unique block tables for the same pool group.
@@ -1504,26 +1504,26 @@ impl Batch {
             );
         }
 
-        self.forward.validate(self.operations.len())?;
+        self.forward.validate(self.calls.len())?;
 
         // Latent pages are exclusive across every trajectory placed in a run.
         let mut latent_ids = HashSet::with_capacity(self.latent_params.len());
         let mut latent_pages = HashSet::new();
         for params in &self.latent_params {
             params.validate()?;
-            let identity = (params.request_key, params.op_id);
+            let identity = (params.request_key, params.call_id);
             ensure_valid!(
                 latent_ids.insert(identity),
                 "run repeats a latent params identity"
             );
-            let operation = operations
+            let call = calls
                 .get(&identity)
-                .ok_or_else(|| invalid_message!("latent params does not name a run operation"))?;
+                .ok_or_else(|| invalid_message!("latent params does not name a run call"))?;
             let addresses_trajectory = matches!(
-                operation.code,
-                Computation::Pipeline(PipelineStage::LatentPreparation)
-                    | Computation::Pipeline(PipelineStage::Denoising)
-            ) || operation.latent_input.is_some();
+                call.code,
+                CallKind::Pipeline(PipelineStage::LatentPreparation)
+                    | CallKind::Pipeline(PipelineStage::Denoising)
+            ) || call.latent_input.is_some();
             ensure_valid!(
                 addresses_trajectory,
                 "latent params names work without a trajectory"
@@ -1537,34 +1537,34 @@ impl Batch {
             );
         }
 
-        for operation in &self.operations {
+        for call in &self.calls {
             let needs_latent = matches!(
-                operation.code,
-                Computation::Pipeline(PipelineStage::LatentPreparation)
-                    | Computation::Pipeline(PipelineStage::Denoising)
-            ) || operation.latent_input.is_some();
+                call.code,
+                CallKind::Pipeline(PipelineStage::LatentPreparation)
+                    | CallKind::Pipeline(PipelineStage::Denoising)
+            ) || call.latent_input.is_some();
             ensure_valid!(
-                !needs_latent || latent_ids.contains(&(operation.request_key, operation.op_id)),
-                "operation that addresses a trajectory has no latent params"
+                !needs_latent || latent_ids.contains(&(call.request_key, call.call_id)),
+                "call that addresses a trajectory has no latent params"
             );
         }
 
-        // Decode params is restricted to operations that materialize media.
+        // Decode params is restricted to calls that materialize media.
         let mut decode_ids = HashSet::with_capacity(self.decode_ranges.len());
         for params in &self.decode_ranges {
             params.validate()?;
-            let identity = (params.request_key, params.op_id);
+            let identity = (params.request_key, params.call_id);
             ensure_valid!(
                 decode_ids.insert(identity),
                 "run repeats a decode params identity"
             );
-            let operation = operations
+            let call = calls
                 .get(&identity)
-                .ok_or_else(|| invalid_message!("decode params does not name a run operation"))?;
+                .ok_or_else(|| invalid_message!("decode params does not name a run call"))?;
             ensure_valid!(
                 matches!(
-                    operation.code,
-                    Computation::Pipeline(
+                    call.code,
+                    CallKind::Pipeline(
                         PipelineStage::VideoDecoding
                             | PipelineStage::AudioDecoding
                             | PipelineStage::VideoEncoding
@@ -1578,25 +1578,25 @@ impl Batch {
             // them all, so an audio decode range starts at the first unit.
             ensure_valid!(
                 !matches!(
-                    operation.code,
-                    Computation::Pipeline(PipelineStage::AudioDecoding)
+                    call.code,
+                    CallKind::Pipeline(PipelineStage::AudioDecoding)
                 ) || (params.cursor == 0 && params.max_units >= 1),
                 "audio decode range must start at the first media unit"
             );
             // Audio encoding consumes the assembled track as one host call.
             ensure_valid!(
                 !matches!(
-                    operation.code,
-                    Computation::Pipeline(PipelineStage::AudioEncoding)
+                    call.code,
+                    CallKind::Pipeline(PipelineStage::AudioEncoding)
                 ) || (params.cursor == 0 && params.max_units == 1),
                 "audio encode range must address its single sample stream"
             );
         }
 
-        for operation in &self.operations {
+        for call in &self.calls {
             let needs_range = matches!(
-                operation.code,
-                Computation::Pipeline(
+                call.code,
+                CallKind::Pipeline(
                     PipelineStage::VideoDecoding
                         | PipelineStage::AudioDecoding
                         | PipelineStage::VideoEncoding
@@ -1604,8 +1604,8 @@ impl Batch {
                 )
             );
             ensure_valid!(
-                !needs_range || decode_ids.contains(&(operation.request_key, operation.op_id)),
-                "media reconstruction operation has no decode range"
+                !needs_range || decode_ids.contains(&(call.request_key, call.call_id)),
+                "media reconstruction call has no decode range"
             );
         }
 
@@ -1630,14 +1630,14 @@ impl Batch {
             "run buffer allocations overlap"
         );
 
-        for operation in &self.operations {
-            for output in operation.buffer_outputs() {
+        for call in &self.calls {
+            for output in call.buffer_outputs() {
                 let params = self
                     .buffer_allocations
                     .iter()
                     .find(|params| params.buffer == output.buffer_id())
                     .ok_or_else(|| {
-                        invalid_message!("persistent operation output has no buffer params")
+                        invalid_message!("persistent call output has no buffer params")
                     })?;
                 ensure_valid!(
                     params.bytes >= output.max_bytes(),
@@ -1646,12 +1646,12 @@ impl Batch {
             }
         }
 
-        // Submission depth is one runnable operation per request.
-        let mut request_keys = HashSet::with_capacity(self.operation_count());
-        for operation in &self.operations {
+        // Submission depth is one runnable call per request.
+        let mut request_keys = HashSet::with_capacity(self.call_count());
+        for call in &self.calls {
             ensure_valid!(
-                request_keys.insert(operation.request_key),
-                "a submission batch carries multiple operations for one request"
+                request_keys.insert(call.request_key),
+                "a submission batch carries multiple calls for one request"
             );
         }
 
@@ -1697,11 +1697,11 @@ impl Batch {
         }
 
         let declared_inputs = self
-            .operations()
-            .flat_map(|operation| {
-                operation
+            .calls()
+            .flat_map(|call| {
+                call
                     .tensor_inputs()
-                    .chain(operation.predicate.as_ref().into_iter())
+                    .chain(call.predicate.as_ref().into_iter())
             })
             .collect::<HashSet<_>>();
 
@@ -1709,7 +1709,7 @@ impl Batch {
         for payload in &self.input_products {
             ensure_valid!(
                 declared_inputs.contains(&payload.product),
-                "an input product payload is not declared by any operation"
+                "an input product payload is not declared by any call"
             );
             ensure_valid!(
                 supplied_inputs.insert(&payload.product),
@@ -1726,12 +1726,12 @@ impl Batch {
                 "run repeats a KV input"
             );
             let consumers = self
-                .operations()
-                .filter(|operation| operation.kv_input == Some(publication.source))
+                .calls()
+                .filter(|call| call.kv_input == Some(publication.source))
                 .collect::<Vec<_>>();
             ensure_valid!(
                 consumers.len() == 1
-                    && consumers[0].code == Computation::Transfer(TransferMode::KvInstall),
+                    && consumers[0].code == CallKind::Transfer(TransferMode::KvInstall),
                 "KV transfer requires one installation consumer"
             );
             let bytes = publication.tensors.iter().try_fold(0_u64, |sum, tensor| {
@@ -1752,9 +1752,9 @@ impl Batch {
 pub struct BatchOutput {
     /// Batch identity copied from the submission.
     pub batch_id: u64,
-    /// Operation completions, one per call the batch carried.
+    /// Call completions, one per call the batch carried.
     pub completions: Vec<RequestOutput>,
-    /// Product values published by completed operations.
+    /// Product values published by completed calls.
     pub products: Vec<TensorPublication>,
     /// Visibility result for atomic product registration.
     pub registration: RegistrationAck,
@@ -1765,7 +1765,7 @@ pub struct BatchOutput {
 }
 
 impl BatchOutput {
-    /// Iterates over operation completions in report order.
+    /// Iterates over call completions in report order.
     pub fn completions(&self) -> impl Iterator<Item = &RequestOutput> {
         self.completions.iter()
     }
@@ -1781,12 +1781,12 @@ impl BatchOutput {
         for completion in &self.completions {
             completion.validate()?;
             ensure_valid!(
-                completion.op_id.batch_id == self.batch_id,
+                completion.call_id.batch_id == self.batch_id,
                 "completion identity belongs to another logical batch"
             );
             ensure_valid!(
-                identities.insert(completion.op_id),
-                "completion report repeats an operation"
+                identities.insert(completion.call_id),
+                "completion report repeats an call"
             );
         }
         for payload in &self.products {

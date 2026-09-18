@@ -1,4 +1,4 @@
-"""Borrowed prefix state and complete-block numerical operations."""
+"""Borrowed prefix state and complete-block numerical calls."""
 
 from __future__ import annotations
 

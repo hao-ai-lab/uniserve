@@ -16,10 +16,10 @@ use uniserve_core::codec::stats::{
 struct DomainCumulative {
     active_credits: u64,
     peak_credits: u64,
-    launched_operations: u64,
-    completed_operations: u64,
-    predicated_operations: u64,
-    error_operations: u64,
+    launched_calls: u64,
+    completed_calls: u64,
+    predicated_calls: u64,
+    error_calls: u64,
     backpressure_events: u64,
     reclaimed_credits: u64,
     completed_batches: u64,
@@ -139,18 +139,18 @@ impl SchedulerStatsReporter {
                     domain: name.to_string(),
                     active_credits: current.active_credits,
                     peak_credits: current.peak_credits,
-                    launched_operations: current
-                        .launched_operations
-                        .saturating_sub(previous.launched_operations),
-                    completed_operations: current
-                        .completed_operations
-                        .saturating_sub(previous.completed_operations),
-                    predicated_operations: current
-                        .predicated_operations
-                        .saturating_sub(previous.predicated_operations),
-                    error_operations: current
-                        .error_operations
-                        .saturating_sub(previous.error_operations),
+                    launched_calls: current
+                        .launched_calls
+                        .saturating_sub(previous.launched_calls),
+                    completed_calls: current
+                        .completed_calls
+                        .saturating_sub(previous.completed_calls),
+                    predicated_calls: current
+                        .predicated_calls
+                        .saturating_sub(previous.predicated_calls),
+                    error_calls: current
+                        .error_calls
+                        .saturating_sub(previous.error_calls),
                     backpressure_events: current
                         .backpressure_events
                         .saturating_sub(previous.backpressure_events),
@@ -183,10 +183,10 @@ fn domain_cumulative(stats: &crate::scheduler::DomainStats) -> DomainCumulative 
     DomainCumulative {
         active_credits: stats.active_credits.load(Ordering::Relaxed) as u64,
         peak_credits: stats.peak_credits.load(Ordering::Relaxed) as u64,
-        launched_operations: stats.launched_operations.load(Ordering::Relaxed),
-        completed_operations: stats.completed_operations.load(Ordering::Relaxed),
-        predicated_operations: stats.predicated_operations.load(Ordering::Relaxed),
-        error_operations: stats.error_operations.load(Ordering::Relaxed),
+        launched_calls: stats.launched_calls.load(Ordering::Relaxed),
+        completed_calls: stats.completed_calls.load(Ordering::Relaxed),
+        predicated_calls: stats.predicated_calls.load(Ordering::Relaxed),
+        error_calls: stats.error_calls.load(Ordering::Relaxed),
         backpressure_events: stats.backpressure_events.load(Ordering::Relaxed),
         reclaimed_credits: stats.reclaimed_credits.load(Ordering::Relaxed),
         completed_batches: stats.completed_batches.load(Ordering::Relaxed),

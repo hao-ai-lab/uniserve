@@ -13,7 +13,7 @@ from uniserve.model import EntryPoint
 from uniserve.runtime import CUDAStream
 
 from ..bootstrap.config import ComponentConfig
-from ..protocol.operation import Computation
+from ..protocol.call import CallKind
 from ..protocol.tensor import OutputInfo
 
 if TYPE_CHECKING:
@@ -73,7 +73,7 @@ class ModelEntry:
     forward: Callable[..., TensorOutput | ExecutionOutput] | None = None
     groups: tuple[Communicator, ...] = ()
     outputs: tuple[OutputInfo, ...] = ()
-    computations: tuple[Computation, ...] = ()
+    call_kinds: tuple[CallKind, ...] = ()
     component: str = ""
     calls: tuple[Call, ...] = ()
     context: ExecutionContext | None = None

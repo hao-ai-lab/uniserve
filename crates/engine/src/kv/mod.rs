@@ -85,7 +85,7 @@ pub(crate) enum BlockState {
     Cached,
 }
 
-/// Cache observation emitted by a block-pool operation.
+/// Cache observation emitted by a block-pool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CacheEvent {
     BlockStored { hash: u64, block: BlockId },

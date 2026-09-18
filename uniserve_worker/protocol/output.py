@@ -9,10 +9,10 @@ from typing import Any, cast
 from ..foundation.errors import invalid_descriptor
 from . import identity, transfer
 from .batch import RegistrationAck, TensorPublication
-from .operation import (
-    Computation,
+from .call import (
+    CallKind,
+    CallStatus,
     ErrorCode,
-    OpStatus,
     TransferMode,
     computation,
 )
@@ -185,18 +185,18 @@ class MediaOutput:
 
 @dataclass(frozen=True, slots=True)
 class RequestOutput:
-    """An operation completion with accepted progress and tokens.
+    """An call completion with accepted progress and tokens.
 
     Also carries products and timing.
     """
 
     request_key: identity.RequestKey
-    op_id: identity.ComputationId
-    status: OpStatus
+    call_id: identity.CallId
+    status: CallStatus
     product_generations: tuple[int, ...]
     error_code: ErrorCode | None
     timing_counters: TimingCounters
-    kind: Computation
+    kind: CallKind
     position: int
     kv_visible_len: int
     kv_computed_len: int
@@ -215,13 +215,13 @@ class RequestOutput:
         Status, products, errors, and timing must form a coherent
         completion.
         """
-        if self.op_id.batch_id < 1:
-            raise invalid_descriptor("completion op id must be positive")
+        if self.call_id.batch_id < 1:
+            raise invalid_descriptor("completion call id must be positive")
         if self.kv_output is not None and (
-            self.status is not OpStatus.OK
+            self.status is not CallStatus.OK
             or self.kind is not TransferMode.KV_PUBLISH
             or self.kv_output.source.owner != self.request_key
-            or self.kv_output.source.producer_op_id != self.op_id
+            or self.kv_output.source.producer_call_id != self.call_id
         ):
             raise invalid_descriptor(
                 "KV publication does not belong to its successful completion"
@@ -243,7 +243,7 @@ class RequestOutput:
             raise invalid_descriptor(
                 "completion execution coordinates must be non-negative"
             )
-        if self.status is OpStatus.ERROR:
+        if self.status is CallStatus.ERROR:
             if self.error_code is None:
                 raise invalid_descriptor(
                     "an error completion must carry an error code"
@@ -252,7 +252,7 @@ class RequestOutput:
             raise invalid_descriptor(
                 "a non-error completion must not carry an error code"
             )
-        if self.status is OpStatus.PREDICATED and (
+        if self.status is CallStatus.PREDICATED and (
             self.committed_tokens
             or self.sampled_logprob is not None
             or self.top_logprobs
@@ -280,10 +280,10 @@ class RequestOutput:
             request_key=identity.RequestKey.from_mapping(
                 data.get("request_key"), f"{where}.request_key"
             ),
-            op_id=identity.ComputationId.from_mapping(
-                data.get("op_id"), f"{where}.op_id"
+            call_id=identity.CallId.from_mapping(
+                data.get("call_id"), f"{where}.call_id"
             ),
-            status=_enum(OpStatus, data.get("status"), f"{where}.status"),
+            status=_enum(CallStatus, data.get("status"), f"{where}.status"),
             product_generations=_uints(
                 data.get("product_generations", ()),
                 f"{where}.product_generations",
@@ -341,7 +341,7 @@ class RequestOutput:
         return record
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode one operation completion.
+        """Encode one call completion.
 
         Includes accepted progress, products, timing, and error metadata.
         """
@@ -355,7 +355,7 @@ class RequestOutput:
                 "request_id": key.request_id,
                 "request_epoch": key.request_epoch,
             },
-            "op_id": self.op_id.to_mapping(),
+            "call_id": self.call_id.to_mapping(),
             "status": self.status.value,
             "code": self.kind.value,
             "position": self.position,

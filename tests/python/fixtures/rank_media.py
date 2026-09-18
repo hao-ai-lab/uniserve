@@ -29,18 +29,18 @@ def main():
             while True:
                 request = endpoint.recv()
                 kind = request["kind"]
-                call_id = request["call_id"]
+                message_id = request["message_id"]
                 if kind == "info":
                     endpoint.respond(
                         {
                             "kind": "info",
-                            "call_id": call_id,
+                            "message_id": message_id,
                             "info": worker.info.to_mapping(),
                         }
                     )
                     continue
                 if kind == "close":
-                    endpoint.respond({"kind": "ok", "call_id": call_id})
+                    endpoint.respond({"kind": "ok", "message_id": message_id})
                     break
                 if kind == "submit":
                     report = finalized_report(
@@ -64,13 +64,17 @@ def main():
                             bytes=len(payload)
                             + (1 if media_case == "short-storage" else 0),
                         ).to_mapping()
-                        if media_case == "unknown-operation":
-                            completion["op_id"] = {
-                                **completion["op_id"],
+                        if media_case == "unknown-call":
+                            completion["call_id"] = {
+                                **completion["call_id"],
                                 "request_index": 1000,
                             }
                     endpoint.respond(
-                        {"kind": "result", "call_id": call_id, "result": report}
+                        {
+                            "kind": "result",
+                            "message_id": message_id,
+                            "result": report,
+                        }
                     )
                 else:
                     raise ValueError(f"unsupported worker request {kind}")

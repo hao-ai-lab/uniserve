@@ -31,11 +31,11 @@ use uniserve_worker_ipc::{ServerEndpoint, WakeSender};
 #[pyclass(name = "Server")]
 /// Python-facing owner of one worker-side IPC endpoint.
 struct PyServer {
-    /// Endpoint held outside the mutex while a blocking operation releases the GIL.
+    /// Endpoint held outside the mutex while a blocking call releases the GIL.
     inner: Mutex<ServerState>,
 }
 
-/// The endpoint may be borrowed by an operation; both fields are empty after close.
+/// The endpoint may be borrowed by an call; both fields are empty after close.
 struct ServerState {
     endpoint: Option<ServerEndpoint>,
     /// Wake source used by CPU, transfer, and device completion callbacks.
@@ -286,8 +286,8 @@ impl PyServer {
         Ok(())
     }
 
-    /// Releases the service after its caller has stopped all endpoint operations.
-    /// Repeated close is harmless; closing during a blocking operation is rejected.
+    /// Releases the service after its caller has stopped all endpoint calls.
+    /// Repeated close is harmless; closing during a blocking call is rejected.
     fn close(&self) -> PyResult<()> {
         let mut state = self
             .inner
@@ -406,7 +406,7 @@ impl PyServer {
 /// Converts a request through the typed submit path or schema-derived fallback.
 fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyAny>> {
     // Submitted runs use the typed converter, which constructs the worker's
-    // Python operation objects directly after Rust validation.
+    // Python call objects directly after Rust validation.
     if request.kind() == RequestKind::Submit {
         let object = convert::execute_request_to_py(py, request)?;
         return Ok(object.into_any().unbind());
@@ -417,7 +417,7 @@ fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyA
 }
 
 impl PyServer {
-    /// Takes exclusive endpoint ownership for an operation that releases the GIL.
+    /// Takes exclusive endpoint ownership for an call that releases the GIL.
     fn take_endpoint(&self) -> PyResult<ServerEndpoint> {
         let mut guard = self
             .inner
@@ -432,7 +432,7 @@ impl PyServer {
         })
     }
 
-    /// Restores endpoint ownership after a GIL-free operation.
+    /// Restores endpoint ownership after a GIL-free call.
     fn replace_endpoint(&self, endpoint: ServerEndpoint) -> PyResult<()> {
         let mut guard = self
             .inner
@@ -442,7 +442,7 @@ impl PyServer {
         Ok(())
     }
 
-    /// Borrows a wake source independently of a pending receive operation.
+    /// Borrows a wake source independently of a pending receive call.
     fn completion_wake(&self) -> PyResult<WakeSender> {
         let state = self
             .inner

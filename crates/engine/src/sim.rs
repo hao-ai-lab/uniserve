@@ -1,6 +1,6 @@
 //! GPU-free executor for scheduler and frontend behavior.
 //!
-//! The simulator consumes the same typed admissions and operations as worker
+//! The simulator consumes the same typed admissions and calls as worker
 //! executors. It enforces request identity, lifecycle, and dependency invariants
 //! and reports accepted tokens, progress, and synthetic media.
 
@@ -23,8 +23,8 @@ use uniserve_core::{
     try_apply_sampling_counts,
 };
 use uniserve_worker_ipc::{
-    BatchOutput, Computation, DrawLayout, ErrorCode, FinishFlags, NewRequest, OpStatus,
-    RegistrationAck, RequestOutput, SamplingState, ScheduledRequest, TensorRef, TimingCounters,
+    BatchOutput, CallKind, DrawLayout, ErrorCode, FinishFlags, NewRequest, CallStatus,
+    RegistrationAck, RequestOutput, SamplingState, Call, TensorRef, TimingCounters,
     WorkerInfo,
 };
 
@@ -212,7 +212,7 @@ impl Executor for SimExecutor {
             batch
                 .requests
                 .iter()
-                .flat_map(|(operation, _)| operation.tensor_outputs().cloned()),
+                .flat_map(|(call, _)| call.tensor_outputs().cloned()),
         );
         self.to_worker.send(Job::Batch(batch)).map_err(|_| {
             ExecutorSubmitError::Failed(anyhow::anyhow!("sim executor thread gone"))
@@ -221,7 +221,7 @@ impl Executor for SimExecutor {
         Ok(())
     }
 
-    /// Polls for the next completed worker operation.
+    /// Polls for the next completed worker call.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
         let Some((result, commands)) = self.poll_batch(timeout)? else {
             return Ok(None);
@@ -290,7 +290,7 @@ struct SimRequestState {
     ///
     /// Each generated token folds in during execution, allowing a successor to
     /// observe it before the predecessor is host-visible. Device executors encode
-    /// the same state as a resident count tensor plus per-operation deltas.
+    /// the same state as a resident count tensor plus per-call deltas.
     penalty_counts: BTreeMap<u32, u32>,
 }
 
@@ -353,7 +353,7 @@ impl SimEngine {
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
         let info = WorkerInfo {
-            supported_ops: Computation::ALL.to_vec(),
+            supported_ops: CallKind::ALL.to_vec(),
             latent_page_units: 64,
             latent_pages: 1_025,
             buffer_pool_bytes: 257_u64 * (256 << 20),
@@ -405,32 +405,32 @@ impl SimEngine {
         vocab: usize,
         text_len: usize,
         fake_eos: u32,
-        operation: &ScheduledRequest,
+        call: &Call,
         request: &SimRequestState,
         index: usize,
         state: Option<&SamplingState>,
     ) -> anyhow::Result<Option<SampleOutput>> {
-        let request_id = operation.request_key.request_id;
+        let request_id = call.request_key.request_id;
         let mut logits = Self::synth_logits(vocab, text_len, fake_eos, request_id, index);
         match request.sampling() {
             Some(sampling) => {
                 let draw = if sampling.temperature > 0.0 {
-                    let rng = operation.rng.ok_or_else(|| {
-                        anyhow::anyhow!("stochastic sampling operation has no RNG coordinates")
+                    let rng = call.rng.ok_or_else(|| {
+                        anyhow::anyhow!("stochastic sampling call has no RNG coordinates")
                     })?;
                     anyhow::ensure!(
                         rng.draw_layout == DrawLayout::TargetSampling,
-                        "stochastic sampling operation uses the wrong RNG layout"
+                        "stochastic sampling call uses the wrong RNG layout"
                     );
                     anyhow::ensure!(
                         rng.seed == sampling.seed.unwrap_or(0),
-                        "operation RNG seed disagrees with admitted sampling"
+                        "call RNG seed disagrees with admitted sampling"
                     );
                     let key = philox::sampling_key(
                         rng.seed,
-                        operation.request_key.engine_id,
+                        call.request_key.engine_id,
                         request_id.0,
-                        operation.request_key.request_epoch,
+                        call.request_key.request_epoch,
                         philox::DRAW_LAYOUT_TARGET,
                     );
                     philox::sampling_uniform(key, rng.semantic_index_base, 0, 0)
@@ -449,7 +449,7 @@ impl SimEngine {
                 let suppress = state
                     .map(|value| value.suppressed_token_ids.as_slice())
                     .filter(|tokens| !tokens.is_empty());
-                // Processor step 2 forced-token constraint: a decode operation
+                // Processor step 2 forced-token constraint: a decode call
                 // samples a single span point, so its forced token is the first
                 // entry of the schedule and overrides any allowed-token mask.
                 let forced = sampling
@@ -480,21 +480,21 @@ impl SimEngine {
         }
     }
 
-    /// Executes one operation against its request, producing the terminal
+    /// Executes one call against its request, producing the terminal
     /// [`RequestOutput`] and any resolved output-product values.
-    fn execute_operation(
+    fn execute_call(
         vocab: usize,
         text_len: usize,
         fake_eos: u32,
-        operation: &ScheduledRequest,
+        call: &Call,
         request: &mut SimRequestState,
     ) -> anyhow::Result<RequestOutput> {
         // A call states the coordinates it executes at. The simulator holds the
         // same request state a rank does, so a disagreement is a scheduling
         // failure and not a condition it can execute through. A call with no
         // request predecessor carries no coordinates.
-        if operation.predecessor.is_some() {
-            let stated = operation.coordinates;
+        if call.predecessor.is_some() {
+            let stated = call.coordinates;
             if request.positions_from_model {
                 request.logical_position = stated.logical_position;
             }
@@ -506,24 +506,24 @@ impl SimEngine {
             };
             anyhow::ensure!(
                 stated == held,
-                "operation {:?} states coordinates {stated:?} that disagree with the request's own progress {held:?}",
-                operation.op_id
+                "call {:?} states coordinates {stated:?} that disagree with the request's own progress {held:?}",
+                call.call_id
             );
         }
         let mut record = RequestOutput {
             sampled_logprob: None,
             top_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
-            request_key: operation.request_key,
-            op_id: operation.op_id,
-            status: OpStatus::Ok,
-            product_generations: operation
+            request_key: call.request_key,
+            call_id: call.call_id,
+            status: CallStatus::Ok,
+            product_generations: call
                 .tensor_outputs()
                 .map(|out| out.generation)
                 .collect(),
             error_code: None,
             timing_counters: TimingCounters::default(),
-            code: operation.code,
+            code: call.code,
             position: 0,
             kv_visible_len: 0,
             kv_computed_len: 0,
@@ -536,45 +536,45 @@ impl SimEngine {
         record.position = request.logical_position;
         set_kv_lengths(&mut record, request.kv_visible_len);
 
-        match operation.code {
-            work @ (Computation::Forward(ForwardMode::Prefill)
-            | Computation::Forward(ForwardMode::Decode)
-            | Computation::Forward(ForwardMode::Verify)) => {
+        match call.code {
+            work @ (CallKind::Forward(ForwardMode::Prefill)
+            | CallKind::Forward(ForwardMode::Decode)
+            | CallKind::Forward(ForwardMode::Verify)) => {
                 let visual_state =
-                    operation.vision_input.is_some() || operation.latent_feature_input.is_some();
-                let samples_token = operation.token_output.is_some();
+                    call.vision_input.is_some() || call.latent_feature_input.is_some();
+                let samples_token = call.token_output.is_some();
                 if visual_state {
                     request.positions_from_model = true;
                     request.kv_visible_len = request
                         .kv_visible_len
-                        .saturating_add(operation.bounds.max_tokens);
+                        .saturating_add(call.bounds.max_tokens);
                     set_kv_lengths(&mut record, request.kv_visible_len);
-                    if operation.completion_output.is_some() {
+                    if call.completion_output.is_some() {
                         request.emitted = 0;
                     }
                 }
                 if !visual_state && !samples_token {
                     request.kv_visible_len = request
                         .kv_visible_len
-                        .saturating_add(operation.bounds.max_tokens);
+                        .saturating_add(call.bounds.max_tokens);
                     record.position = request.logical_position;
                     set_kv_lengths(&mut record, request.kv_visible_len);
                 } else if samples_token {
                     let index = request.emitted;
-                    let sampling_state = operation.sampling_state.as_ref();
+                    let sampling_state = call.sampling_state.as_ref();
                     let Some(output) = Self::sample(
                         vocab,
                         text_len,
                         fake_eos,
-                        operation,
+                        call,
                         request,
                         index,
                         sampling_state,
                     )?
                     else {
-                        record.status = OpStatus::Error;
+                        record.status = CallStatus::Error;
                         record.product_generations.clear();
-                        record.error_code = Some(ErrorCode::InvalidOperation);
+                        record.error_code = Some(ErrorCode::InvalidCall);
                         return Ok(record);
                     };
                     record.finish_flags.eos = output.token == fake_eos;
@@ -594,7 +594,7 @@ impl SimEngine {
                             !state.force_finish
                                 && state.finish_token_ids.binary_search(&output.token).is_err()
                         });
-                    if let Some(token_product) = operation.token_output.as_ref() {
+                    if let Some(token_product) = call.token_output.as_ref() {
                         request
                             .predicate_values
                             .insert(token_product.clone(), continuation);
@@ -605,7 +605,7 @@ impl SimEngine {
                             .binary_search(&output.token)
                             .is_ok()
                     });
-                    for completion in operation.transition_output.iter() {
+                    for completion in call.transition_output.iter() {
                         request
                             .predicate_values
                             .insert(completion.clone(), transition);
@@ -613,11 +613,11 @@ impl SimEngine {
                     record.position = 1;
                     if !visual_state {
                         let query_tokens = match work {
-                            Computation::Forward(ForwardMode::Prefill) => {
-                                operation.bounds.max_tokens
+                            CallKind::Forward(ForwardMode::Prefill) => {
+                                call.bounds.max_tokens
                             }
-                            Computation::Forward(ForwardMode::Decode)
-                            | Computation::Forward(ForwardMode::Verify) => 1,
+                            CallKind::Forward(ForwardMode::Decode)
+                            | CallKind::Forward(ForwardMode::Verify) => 1,
                             _ => unreachable!(),
                         };
                         request.logical_position =
@@ -628,18 +628,18 @@ impl SimEngine {
                         set_kv_lengths(&mut record, request.kv_visible_len);
                     }
                     match work {
-                        Computation::Forward(ForwardMode::Prefill) => {
+                        CallKind::Forward(ForwardMode::Prefill) => {
                             request.emitted = request.emitted.max(1)
                         }
-                        Computation::Forward(ForwardMode::Decode)
-                        | Computation::Forward(ForwardMode::Verify) => {
+                        CallKind::Forward(ForwardMode::Decode)
+                        | CallKind::Forward(ForwardMode::Verify) => {
                             request.emitted = request.emitted.saturating_add(1)
                         }
                         _ => unreachable!(),
                     }
                     record.committed_tokens = vec![output.token];
                     // Fold the generated token into the device-resident penalty
-                    // base so the next operation's penalties see it before this
+                    // base so the next call's penalties see it before this
                     // one is host-observed. A false-predicate no-op never reaches
                     // this branch, so a retracted point is never folded.
                     request.fold_penalty_token(output.token);
@@ -658,17 +658,17 @@ impl SimEngine {
                         .collect();
                 }
             }
-            Computation::Pipeline(PipelineStage::TextEncoding)
-            | Computation::Pipeline(PipelineStage::VisionEncoding)
-            | Computation::Pipeline(PipelineStage::LatentEncoding) => {}
-            Computation::Transfer(TransferMode::Tensor)
-            | Computation::Transfer(TransferMode::KvPublish)
-            | Computation::Transfer(TransferMode::KvInstall) => {
+            CallKind::Pipeline(PipelineStage::TextEncoding)
+            | CallKind::Pipeline(PipelineStage::VisionEncoding)
+            | CallKind::Pipeline(PipelineStage::LatentEncoding) => {}
+            CallKind::Transfer(TransferMode::Tensor)
+            | CallKind::Transfer(TransferMode::KvPublish)
+            | CallKind::Transfer(TransferMode::KvInstall) => {
                 set_kv_lengths(&mut record, request.kv_visible_len);
             }
-            Computation::Pipeline(PipelineStage::LatentPreparation) => {}
-            Computation::Pipeline(PipelineStage::Denoising) => {
-                let steps = operation.bounds.max_tokens.max(1) as u16;
+            CallKind::Pipeline(PipelineStage::LatentPreparation) => {}
+            CallKind::Pipeline(PipelineStage::Denoising) => {
+                let steps = call.bounds.max_tokens.max(1) as u16;
                 request.flow_step = request.flow_step.saturating_add(steps);
                 let total = request
                     .image()
@@ -679,14 +679,14 @@ impl SimEngine {
                 // advanced through every scheduled step.
                 record.finish_flags.length = request.flow_step >= total;
             }
-            Computation::Pipeline(
+            CallKind::Pipeline(
                 PipelineStage::VideoDecoding
                 | PipelineStage::AudioDecoding
                 | PipelineStage::VideoEncoding
                 | PipelineStage::AudioEncoding
                 | PipelineStage::Muxing,
             ) => {}
-            Computation::Pipeline(PipelineStage::ImageDecoding) => {
+            CallKind::Pipeline(PipelineStage::ImageDecoding) => {
                 request.flow_step = 0;
                 if let Some(image) = request.image().cloned() {
                     let (height, width) = if image.height > 0 && image.width > 0 {
@@ -711,10 +711,10 @@ impl SimEngine {
             }
         }
 
-        for completion in operation
+        for completion in call
             .completion_output
             .iter()
-            .chain(operation.transition_output.iter())
+            .chain(call.transition_output.iter())
         {
             request
                 .predicate_values
@@ -725,22 +725,22 @@ impl SimEngine {
         Ok(record)
     }
 
-    /// Builds a completion for an operation resolved entirely by its execution predicate.
+    /// Builds a completion for an call resolved entirely by its execution predicate.
     fn predicated_completion(
-        operation: &ScheduledRequest,
+        call: &Call,
         request: &SimRequestState,
     ) -> RequestOutput {
         RequestOutput {
             sampled_logprob: None,
             top_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
-            request_key: operation.request_key,
-            op_id: operation.op_id,
-            status: OpStatus::Predicated,
+            request_key: call.request_key,
+            call_id: call.call_id,
+            status: CallStatus::Predicated,
             product_generations: Vec::new(),
             error_code: None,
             timing_counters: TimingCounters::default(),
-            code: operation.code,
+            code: call.code,
             position: request.logical_position,
             kv_visible_len: request.kv_visible_len,
             kv_computed_len: request.kv_visible_len,
@@ -869,7 +869,7 @@ impl SimEngine {
         &self.info
     }
 
-    /// Executes selected computations in order against deterministic model state.
+    /// Executes selected call kinds in order against deterministic model state.
     fn execute(&mut self, batch: ExecutionBatch) -> anyhow::Result<BatchOutput> {
         batch.validate()?;
         let batch_id = batch.id;
@@ -910,22 +910,22 @@ impl SimEngine {
         let text_len = self.text_len;
         let fake_eos = self.fake_eos;
         let mut completions = Vec::with_capacity(batch.requests.len());
-        for (operation, _) in batch.requests {
+        for (call, _) in batch.requests {
             let request = self
                 .requests
-                .get_mut(&operation.request_key.request_id)
+                .get_mut(&call.request_key.request_id)
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "request {} has no admission",
-                        operation.request_key.request_id.0
+                        call.request_key.request_id.0
                     )
                 })?;
             anyhow::ensure!(
-                operation.request_key == request.admission.request_key,
-                "operation identity {:?} does not match its admitted lineage",
-                operation.request_key
+                call.request_key == request.admission.request_key,
+                "call identity {:?} does not match its admitted lineage",
+                call.request_key
             );
-            let predicate_value = operation
+            let predicate_value = call
                 .predicate
                 .as_ref()
                 .as_ref()
@@ -937,34 +937,34 @@ impl SimEngine {
                         .ok_or_else(|| {
                             anyhow::anyhow!(
                                 "computation {:?} predicate names an unresolved product",
-                                operation.op_id
+                                call.call_id
                             )
                         })
                 })
                 .transpose()?;
             // Binding the input captures its value. The producer relay then has
             // no future acquisition owner, just as in the physical Worker.
-            if let Some(predecessor) = operation.predecessor {
+            if let Some(predecessor) = call.predecessor {
                 request
                     .predicate_values
-                    .retain(|product, _| product.producer_op_id != predecessor);
+                    .retain(|product, _| product.producer_call_id != predecessor);
             }
-            if let Some(predicate) = operation.predicate.as_ref() {
+            if let Some(predicate) = call.predicate.as_ref() {
                 request.predicate_values.remove(predicate);
             }
             if let Some(predicate_value) = predicate_value {
                 if !predicate_value {
-                    for output in operation.tensor_outputs() {
+                    for output in call.tensor_outputs() {
                         request.predicate_values.insert(output.clone(), false);
                     }
-                    let completion = Self::predicated_completion(&operation, request);
+                    let completion = Self::predicated_completion(&call, request);
                     completions.push(completion);
                     continue;
                 }
             }
 
             let completion =
-                Self::execute_operation(vocab, text_len, fake_eos, &operation, request)?;
+                Self::execute_call(vocab, text_len, fake_eos, &call, request)?;
             completions.push(completion);
         }
         let report = BatchOutput {
@@ -998,7 +998,7 @@ impl SimEngine {
 mod tests {
     use super::*;
     use uniserve_worker_ipc::{
-        ArRequestParams, Bounds, ComputationId, DType, ForwardBatch, RequestKey, ShapeBound,
+        ArRequestParams, Bounds, CallId, DType, ForwardBatch, RequestKey, ShapeBound,
         TensorRef,
     };
 
@@ -1021,10 +1021,10 @@ mod tests {
         .expect("admission")
     }
 
-    fn token_output(op_id: ComputationId) -> TensorRef {
+    fn token_output(call_id: CallId) -> TensorRef {
         TensorRef {
             request_key: request_key(),
-            producer_op_id: op_id,
+            producer_call_id: call_id,
             output_index: 0,
             generation: 1,
             dtype: DType::I64,
@@ -1035,12 +1035,12 @@ mod tests {
     fn batch(batch_id: u64, request_index: u32) -> ExecutionBatch {
         let request_key = request_key();
         let admission = admission();
-        let parent = ComputationId::new(0, 0);
-        let operation = ScheduledRequest {
+        let parent = CallId::new(0, 0);
+        let call = Call {
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
 
-            token_output: Some(token_output(ComputationId::new(batch_id, request_index))),
+            token_output: Some(token_output(CallId::new(batch_id, request_index))),
             vision_input: None,
             latent_feature_input: None,
             encoder_output: None,
@@ -1057,10 +1057,10 @@ mod tests {
             input_token_ids: Vec::new(),
             sampling_state: None,
             request_key,
-            op_id: ComputationId::new(batch_id, request_index),
+            call_id: CallId::new(batch_id, request_index),
             predecessor: Some(parent),
             entry: "model".into(),
-            code: Computation::Forward(ForwardMode::Prefill),
+            code: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
                 max_tokens: 2,
                 ..Bounds::default()
@@ -1073,7 +1073,7 @@ mod tests {
         ExecutionBatch::new(
             batch_id,
             vec![(
-                operation,
+                call,
                 crate::executor::RequestPlacement {
                     worker: WorkerId("sim".into()),
                     block_tables: Vec::new(),
@@ -1094,7 +1094,7 @@ mod tests {
         let mut executor = SimExecutor::new(SimEngine::new());
         let mut selected = batch(1, 3);
         let mut successor = batch(1, 4).requests.remove(0);
-        successor.0.predecessor = Some(ComputationId::new(1, 3));
+        successor.0.predecessor = Some(CallId::new(1, 3));
         // The selected prompt covers two positions, so its successor in the
         // same batch enters where it left off.
         successor.0.coordinates = uniserve_worker_ipc::CallCoordinates {
@@ -1118,9 +1118,9 @@ mod tests {
         assert_eq!(
             outputs
                 .iter()
-                .map(|output| output.op_id)
+                .map(|output| output.call_id)
                 .collect::<Vec<_>>(),
-            vec![ComputationId::new(1, 3), ComputationId::new(1, 4)]
+            vec![CallId::new(1, 3), CallId::new(1, 4)]
         );
         // Greedy synthetic tokens are 1000 + request_id * 7 + accepted index.
         assert_eq!(outputs[0].committed_tokens, vec![1063]);

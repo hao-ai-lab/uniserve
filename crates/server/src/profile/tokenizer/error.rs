@@ -3,7 +3,7 @@
 use thiserror::Error;
 use thiserror_ext::Macro;
 
-/// Result type returned by tokenizer operations.
+/// Result type returned by tokenizer calls.
 pub type Result<T> = std::result::Result<T, TokenizerError>;
 
 #[derive(Debug, Error, Macro)]

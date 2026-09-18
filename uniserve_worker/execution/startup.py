@@ -10,7 +10,7 @@ import torch
 
 from uniserve.math import ceil_div
 from uniserve_worker.execution.sampling import TokenSelection
-from uniserve_worker.protocol.operation import ForwardMode
+from uniserve_worker.protocol.call import ForwardMode
 
 from ..runtime.cache_manager import CacheManager
 from .attention import from_blocks

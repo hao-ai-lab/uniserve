@@ -34,7 +34,7 @@ REQUIRED_FIELDS = (
     "publish_backends",
     "attention_backend",
     "block_size",
-    "max_batch_operations",
+    "max_batch_calls",
     "max_batch_tokens",
     "max_model_len",
     "max_video_seconds",

@@ -17,10 +17,10 @@ from tests.python.fixtures.depth_one import (
     finalized_report,
     record_completion,
     root_parent,
-    token_operation,
+    token_call,
 )
 from tests.python.fixtures.depth_one import (
-    kv_publication_operation as _publication_operation,
+    kv_publication_call as _publication_call,
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
@@ -31,15 +31,15 @@ from uniserve_worker.protocol.batch import (
     Free,
     NewRequest,
 )
-from uniserve_worker.protocol.identity import BufferId, ComputationId
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
     Bounds,
+    Call,
     CallCoordinates,
+    CallStatus,
     ForwardMode,
-    OpStatus,
-    ScheduledRequest,
     TransferMode,
 )
+from uniserve_worker.protocol.identity import BufferId, CallId
 from uniserve_worker.protocol.output import BatchOutput
 from uniserve_worker.protocol.transfer import (
     KvTransfer,
@@ -82,9 +82,9 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 (producer, incoming, (8, 9)),
                 (worker, admission, (3, 4)),
             ):
-                extend = token_operation(
+                extend = token_call(
                     request.request_key,
-                    op_id=ComputationId(1, 0),
+                    call_id=CallId(1, 0),
                     predecessor=root_parent(request),
                     mode=ForwardMode.PREFILL,
                     tokens=tokens,
@@ -95,21 +95,21 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                         execution_batch(
                             batch_id=1,
                             admissions=(request,),
-                            operations=(extend,),
+                            calls=(extend,),
                         )
                     ),
                 )
                 observation = record_completion(extend, extended)
-                publication, _product = _publication_operation(
+                publication, _product = _publication_call(
                     request.request_key,
-                    op_id=ComputationId(2, 0),
-                    predecessor=observation.op_id,
+                    call_id=CallId(2, 0),
+                    predecessor=observation.call_id,
                 )
                 published = finalized_report(
                     owner,
                     owner.submit(
                         execution_batch(
-                            batch_id=2, operations=(publication,), commands=()
+                            batch_id=2, calls=(publication,), commands=()
                         )
                     ),
                 )
@@ -181,16 +181,16 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 finish = Finish(
                     admission.request_key,
                 )
-                installation, installed = _installation_operation(
+                installation, installed = _installation_call(
                     incoming,
-                    op_id=ComputationId(4, 0),
+                    call_id=CallId(4, 0),
                     predecessor=root_parent(incoming),
                     source=source.source,
                 )
                 independent = ar_params(46, block_ids=(1,))
-                operation = token_operation(
+                call = token_call(
                     independent.request_key,
-                    op_id=ComputationId(5, 0),
+                    call_id=CallId(5, 0),
                     predecessor=root_parent(independent),
                     mode=ForwardMode.PREFILL,
                     tokens=(6, 7),
@@ -200,21 +200,21 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     execution_batch(
                         batch_id=4,
                         admissions=(incoming,),
-                        operations=(installation,),
+                        calls=(installation,),
                         kv_inputs=(incoming_payload,),
                         **_installation_allocation(installation, 2),
                     ),
                     execution_batch(
                         batch_id=5,
                         admissions=(independent,),
-                        operations=(operation,),
+                        calls=(call,),
                     ),
                 )
                 ipc = QueuedWorkerIpc(
                     tuple(
                         {
                             "kind": "submit",
-                            "call_id": run.batch_id,
+                            "message_id": run.batch_id,
                             "batch": run,
                         }
                         for run in runs
@@ -226,15 +226,15 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 reader_held = True
                 try:
                     response = ipc.receive()
-                    assert response["call_id"] == 5, response
+                    assert response["message_id"] == 5, response
                     completed = BatchOutput.from_mapping(response["result"])
-                    assert completed.completions[0].status is OpStatus.OK
+                    assert completed.completions[0].status is CallStatus.OK
 
                     reader.sendall(b"A")
                     assert reader.recv(1) == b"D"
                     reader_held = False
                     response = ipc.receive()
-                    assert response["call_id"] == 3, response
+                    assert response["message_id"] == 3, response
                     assert accepted.wait(5), (
                         "retiring storage did not start the dependent read"
                     )
@@ -243,9 +243,9 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     # No new IPC request drives this transition: the completed
                     # physical import must wake the sleeping process itself.
                     response = ipc.receive()
-                    assert response["call_id"] == 4, response
+                    assert response["message_id"] == 4, response
                     report = BatchOutput.from_mapping(response["result"])
-                    assert report.completions[0].status is OpStatus.OK
+                    assert report.completions[0].status is CallStatus.OK
                     assert report.completions[0].kv_visible_len == 2
                     serving.result(timeout=5)
                     for layer in worker.kv_cache.layers:
@@ -264,29 +264,29 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     if reader_held:
                         reader.sendall(b"A")
                         assert reader.recv(1) == b"D"
-                    ipc.submit({"kind": "close", "call_id": 6})
+                    ipc.submit({"kind": "close", "message_id": 6})
                     processing.result(timeout=10)
         finally:
             grant.set()
 
 
-def _installation_operation(
+def _installation_call(
     admission: NewRequest,
     *,
-    op_id: ComputationId,
-    predecessor: ComputationId,
+    call_id: CallId,
+    predecessor: CallId,
     source: BufferId,
-) -> tuple[ScheduledRequest, BufferId]:
+) -> tuple[Call, BufferId]:
     product = BufferId(
         owner=admission.request_key,
-        producer_op_id=op_id,
+        producer_call_id=call_id,
         output_index=0,
-        generation=op_id.batch_id * 10 + 1,
+        generation=call_id.batch_id * 10 + 1,
     )
     return (
-        ScheduledRequest(
+        Call(
             request_key=admission.request_key,
-            op_id=op_id,
+            call_id=call_id,
             predecessor=predecessor,
             coordinates=CallCoordinates(),
             kind=TransferMode.KV_INSTALL,
@@ -298,10 +298,8 @@ def _installation_operation(
     )
 
 
-def _installation_allocation(
-    operation: ScheduledRequest, length: int
-) -> dict[str, object]:
-    request_pool_idx = int(operation.request_key.request_id) + 1
+def _installation_allocation(call: Call, length: int) -> dict[str, object]:
+    request_pool_idx = int(call.request_key.request_id) + 1
     return {
         "block_tables": (
             BlockTable(request_pool_idx, 0, (1,), max(1, int(length))),
@@ -313,9 +311,9 @@ def _installation_allocation(
 def test_tail_closure_precedes_exact_incremental_publication() -> None:
     worker = execution_worker()
     admission = ar_params(41, block_ids=(0,))
-    extend = token_operation(
+    extend = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -324,21 +322,21 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         execution_batch(
             batch_id=1,
             admissions=(admission,),
-            operations=(extend,),
+            calls=(extend,),
         )
     )
     first_result = finalized_report(worker, first_result)
     first_observation = record_completion(extend, first_result)
-    closure_template = token_operation(
+    closure_template = token_call(
         admission.request_key,
-        op_id=ComputationId(2, 0),
-        predecessor=first_observation.op_id,
+        call_id=CallId(2, 0),
+        predecessor=first_observation.call_id,
         mode=ForwardMode.PREFILL,
         tokens=(5,),
     )
-    closure = ScheduledRequest(
+    closure = Call(
         request_key=closure_template.request_key,
-        op_id=closure_template.op_id,
+        call_id=closure_template.call_id,
         predecessor=closure_template.predecessor,
         coordinates=closure_template.coordinates,
         kind=closure_template.kind,
@@ -353,7 +351,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
             execution_batch(
                 batch_id=2,
                 admissions=(),
-                operations=(closure,),
+                calls=(closure,),
                 commands=(),
             )
         ),
@@ -364,10 +362,10 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     assert closure_record.kv_computed_len == 3
 
     second_observation = record_completion(closure, closure_result)
-    publication, publication_product = _publication_operation(
+    publication, publication_product = _publication_call(
         admission.request_key,
-        op_id=ComputationId(3, 0),
-        predecessor=second_observation.op_id,
+        call_id=CallId(3, 0),
+        predecessor=second_observation.call_id,
     )
     publication_result = finalized_report(
         worker,
@@ -375,7 +373,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
             execution_batch(
                 batch_id=3,
                 admissions=(),
-                operations=(publication,),
+                calls=(publication,),
                 commands=(),
             )
         ),
@@ -388,16 +386,16 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     assert snapshot.base_extent == 0
     assert snapshot.published_extent == 3
 
-    suffix_template = token_operation(
+    suffix_template = token_call(
         admission.request_key,
-        op_id=ComputationId(4, 0),
-        predecessor=second_observation.op_id,
+        call_id=CallId(4, 0),
+        predecessor=second_observation.call_id,
         mode=ForwardMode.PREFILL,
         tokens=(6,),
     )
-    suffix_closure = ScheduledRequest(
+    suffix_closure = Call(
         request_key=suffix_template.request_key,
-        op_id=suffix_template.op_id,
+        call_id=suffix_template.call_id,
         predecessor=suffix_template.predecessor,
         coordinates=suffix_template.coordinates,
         kind=suffix_template.kind,
@@ -412,17 +410,17 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
             execution_batch(
                 batch_id=4,
                 admissions=(),
-                operations=(suffix_closure,),
+                calls=(suffix_closure,),
             )
         ),
     )
     assert suffix_result.completions[0].kv_visible_len == 4
 
     suffix_observation = record_completion(suffix_closure, suffix_result)
-    incremental, incremental_product = _publication_operation(
+    incremental, incremental_product = _publication_call(
         admission.request_key,
-        op_id=ComputationId(5, 0),
-        predecessor=suffix_observation.op_id,
+        call_id=CallId(5, 0),
+        predecessor=suffix_observation.call_id,
     )
     incremental_result = finalized_report(
         worker,
@@ -430,7 +428,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
             execution_batch(
                 batch_id=5,
                 admissions=(),
-                operations=(incremental,),
+                calls=(incremental,),
                 commands=(),
             )
         ),
@@ -448,9 +446,9 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
     consumer = execution_worker(transfer_backends=("shm",))
     released_consumer = execution_worker(transfer_backends=("shm",))
     admission = ar_params(42, block_ids=(0,))
-    extend = token_operation(
+    extend = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -460,37 +458,37 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(extend,),
+                calls=(extend,),
             )
         )
         extended = finalized_report(producer, extended)
         observation = record_completion(extend, extended)
-        publication, source = _publication_operation(
+        publication, source = _publication_call(
             admission.request_key,
-            op_id=ComputationId(2, 0),
-            predecessor=observation.op_id,
+            call_id=CallId(2, 0),
+            predecessor=observation.call_id,
         )
         published = finalized_report(
             producer,
             producer.submit(
                 execution_batch(
                     batch_id=2,
-                    operations=(publication,),
+                    calls=(publication,),
                     commands=(),
                 )
             ),
         )
         assert isinstance(published.completions[0].kv_output, KvTransfer)
-        installation, installed = _installation_operation(
+        installation, installed = _installation_call(
             admission,
-            op_id=ComputationId(3, 0),
+            call_id=CallId(3, 0),
             predecessor=root_parent(admission),
             source=source,
         )
         batch = execution_batch(
             batch_id=3,
             admissions=(admission,),
-            operations=(installation,),
+            calls=(installation,),
             kv_inputs=(published.completions[0].kv_output,),
             **_installation_allocation(installation, 2),
         )
@@ -508,26 +506,26 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
 
         # Republishing an unchanged visible extent carries a valid empty suffix.
         # Installation must preserve the cache and acknowledge its new product.
-        repeated_publication, repeated_source = _publication_operation(
+        repeated_publication, repeated_source = _publication_call(
             admission.request_key,
-            op_id=ComputationId(4, 0),
-            predecessor=observation.op_id,
+            call_id=CallId(4, 0),
+            predecessor=observation.call_id,
         )
         repeated = finalized_report(
             producer,
             producer.submit(
-                execution_batch(batch_id=4, operations=(repeated_publication,))
+                execution_batch(batch_id=4, calls=(repeated_publication,))
             ),
         )
-        repeated_install, repeated_installed = _installation_operation(
+        repeated_install, repeated_installed = _installation_call(
             admission,
-            op_id=ComputationId(5, 0),
+            call_id=CallId(5, 0),
             predecessor=root_parent(admission),
             source=repeated_source,
         )
         repeated_batch = execution_batch(
             batch_id=5,
-            operations=(repeated_install,),
+            calls=(repeated_install,),
             kv_inputs=(repeated.completions[0].kv_output,),
             block_tables=(BlockTable(admission.request_pool_idx, 0, (1,), 2),),
         )
@@ -547,9 +545,9 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
                 )
             ),
         )
-        expired_install, _ = _installation_operation(
+        expired_install, _ = _installation_call(
             admission,
-            op_id=ComputationId(4, 0),
+            call_id=CallId(4, 0),
             predecessor=root_parent(admission),
             source=source,
         )
@@ -557,7 +555,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             execution_batch(
                 batch_id=5,
                 admissions=(admission,),
-                operations=(expired_install,),
+                calls=(expired_install,),
                 kv_inputs=(published.completions[0].kv_output,),
                 **_installation_allocation(expired_install, 2),
             )
@@ -583,9 +581,9 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
     producer = execution_worker(transfer_backends=("shm",))
     consumer = execution_worker(transfer_backends=("shm",))
     admission = ar_params(43, block_ids=(0,))
-    extend = token_operation(
+    extend = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(7, 8),
@@ -595,22 +593,22 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(extend,),
+                calls=(extend,),
             )
         )
         extended = finalized_report(producer, extended)
         observation = record_completion(extend, extended)
-        publication, source = _publication_operation(
+        publication, source = _publication_call(
             admission.request_key,
-            op_id=ComputationId(2, 0),
-            predecessor=observation.op_id,
+            call_id=CallId(2, 0),
+            predecessor=observation.call_id,
         )
         published = (
             finalized_report(
                 producer,
                 producer.submit(
                     execution_batch(
-                        batch_id=2, operations=(publication,), commands=()
+                        batch_id=2, calls=(publication,), commands=()
                     )
                 ),
             )
@@ -635,9 +633,9 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             ),
         )
         payload = broken
-        installation, _installed = _installation_operation(
+        installation, _installed = _installation_call(
             admission,
-            op_id=ComputationId(3, 0),
+            call_id=CallId(3, 0),
             predecessor=root_parent(admission),
             source=source,
         )
@@ -645,7 +643,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             execution_batch(
                 batch_id=3,
                 admissions=(admission,),
-                operations=(installation,),
+                calls=(installation,),
                 kv_inputs=(payload,),
                 **_installation_allocation(installation, 2),
             )
@@ -663,9 +661,9 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
         assert report.completions[0].status.value == "error"
         assert report.completions[0].error_code is not None
 
-        retry, installed = _installation_operation(
+        retry, installed = _installation_call(
             admission,
-            op_id=ComputationId(4, 0),
+            call_id=CallId(4, 0),
             predecessor=root_parent(admission),
             source=source,
         )
@@ -673,7 +671,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             execution_batch(
                 batch_id=4,
                 admissions=(admission,),
-                operations=(retry,),
+                calls=(retry,),
                 kv_inputs=(published,),
                 **_installation_allocation(retry, 2),
             )

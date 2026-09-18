@@ -18,7 +18,7 @@ from uniserve.runtime.device import fill_cpu_bools, fill_cpu_ints
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig, adjacent_view
 from uniserve_worker.ops.staging import gather_request_decode_inputs
-from uniserve_worker.protocol.operation import ForwardMode, PipelineStage
+from uniserve_worker.protocol.call import ForwardMode, PipelineStage
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
 from .attention import cache_pages, columns
@@ -185,7 +185,7 @@ class InputBuffers:
             )
             for row in rows
         ):
-            raise ValueError("one input call requires homogeneous computations")
+            raise ValueError("one input call requires homogeneous call kinds")
 
         requests, finish = self._requests(rows)
 

@@ -41,14 +41,14 @@ pub struct LaneConfig {
     pub lane_id: String,
     /// Streaming-multiprocessor budget assigned to the lane.
     pub sm_budget: u32,
-    /// Public JSON capability selectors resolved to computations by worker startup.
+    /// Public JSON capability selectors resolved to call kinds by worker startup.
     pub domains: Vec<String>,
     /// Optional lane-local KV capacity in tokens.
     pub kv_capacity_tokens: Option<u64>,
     /// Optional lane-local latent capacity in allocation units.
     pub latent_capacity_units: Option<u64>,
-    /// Optional operation-count limit per batch.
-    pub max_batch_operations: Option<u32>,
+    /// Optional call-count limit per batch.
+    pub max_batch_calls: Option<u32>,
     /// Optional token-count limit per batch.
     pub max_batch_tokens: Option<u32>,
     /// Optional unresolved-run limit.
@@ -86,7 +86,7 @@ impl LaneConfig {
             "domains": self.domains,
             "kv_capacity_tokens": self.kv_capacity_tokens,
             "latent_capacity_units": self.latent_capacity_units,
-            "max_batch_operations": self.max_batch_operations,
+            "max_batch_calls": self.max_batch_calls,
             "max_batch_tokens": self.max_batch_tokens,
             "max_inflight": self.max_inflight,
         })
@@ -153,7 +153,7 @@ impl Default for WorkerProcessArgs {
             resp_slot_cap: 8 << 20,
             kv_token_capacity: None,
             block_size: 64,
-            max_batch_operations: 128,
+            max_batch_calls: 128,
             max_batch_tokens: 16_384,
             attention_backend: uniserve_worker_ipc::AttentionBackend::Auto,
             capability_groups: Vec::new(),
@@ -297,8 +297,8 @@ impl WorkerProcessArgs {
         );
         fields.insert("block_size".into(), json!(self.block_size));
         fields.insert(
-            "max_batch_operations".into(),
-            json!(self.max_batch_operations),
+            "max_batch_calls".into(),
+            json!(self.max_batch_calls),
         );
         fields.insert("max_batch_tokens".into(), json!(self.max_batch_tokens));
         fields.insert("max_model_len".into(), json!(self.max_model_len));
@@ -367,7 +367,7 @@ pub(super) struct RankProcess {
     expected_components: std::collections::BTreeMap<String, uniserve_core::ComponentConfig>,
     pending: HashMap<u64, PendingRecord>,
     ready: VecDeque<WorkerResult>,
-    next_call_id: u64,
+    next_message_id: u64,
     command_wake_pending: bool,
     shutdown_sent: bool,
     /// Edge-triggered worker-death watcher: fires the scheduler park's death
@@ -575,7 +575,7 @@ impl PendingRank {
             expected_components: components,
             pending: HashMap::new(),
             ready: VecDeque::new(),
-            next_call_id: 1,
+            next_message_id: 1,
             command_wake_pending: false,
             shutdown_sent: false,
             death_watcher,
@@ -597,9 +597,9 @@ impl Drop for PendingRank {
 impl RankProcess {
     /// Publish capabilities only after model resources and warmup are ready.
     pub(crate) fn finish_startup(&mut self) -> anyhow::Result<()> {
-        let call_id = self.alloc_call_id();
+        let message_id = self.alloc_call_id();
         let mut request = WorkerRequest::info();
-        request.set_call_id(Some(call_id));
+        request.set_call_id(Some(message_id));
         let pending =
             self.send_request_with_timeout(&request, "Worker startup", WORKER_CONNECT_TIMEOUT)?;
         let response = self
@@ -651,10 +651,10 @@ impl RankProcess {
         Ok(())
     }
 
-    /// Allocates the next worker call identifier.
+    /// Allocates the next worker message identifier.
     fn alloc_call_id(&mut self) -> u64 {
-        let id = self.next_call_id;
-        self.next_call_id += 1;
+        let id = self.next_message_id;
+        self.next_message_id += 1;
         id
     }
 
@@ -753,30 +753,30 @@ impl RankProcess {
         let wakes = self.client.drain_wakes()?;
         let ids = self.pending.keys().copied().collect::<Vec<_>>();
         let mut drained = 0usize;
-        for call_id in ids {
-            let Some(record) = self.pending.get(&call_id) else {
+        for message_id in ids {
+            let Some(record) = self.pending.get(&message_id) else {
                 continue;
             };
             let Some(frame) = self.client.try_recv_response(&record.pending)? else {
                 continue;
             };
-            let record = self.pending.remove(&call_id).ok_or_else(|| {
-                anyhow::anyhow!("pending record {call_id} disappeared while routing response")
+            let record = self.pending.remove(&message_id).ok_or_else(|| {
+                anyhow::anyhow!("pending record {message_id} disappeared while routing response")
             })?;
             // Consuming the response ends this IPC request. Release its
             // iceoryx active-request slot before routing the result.
             let kind = release_consumed_request(record);
-            self.route(call_id, kind, frame)?;
+            self.route(message_id, kind, frame)?;
             drained += 1;
         }
         Ok((drained, wakes))
     }
 
     /// Acquires output storage before validating response correlation.
-    fn route(&mut self, call_id: u64, kind: OutstandingKind, frame: Frame) -> anyhow::Result<()> {
+    fn route(&mut self, message_id: u64, kind: OutstandingKind, frame: Frame) -> anyhow::Result<()> {
         let OutstandingKind::Batch { batch_id } = kind;
         let response = frame.decode_response()?;
-        let echoed = response.call_id();
+        let echoed = response.message_id();
         let report = match response {
             WorkerResponse::Result { result, .. } => Ok(WorkerResult::receive(result)),
             WorkerResponse::Error { error, .. } => Err(WorkerExecError {
@@ -786,7 +786,7 @@ impl RankProcess {
                 message: error.message,
                 phase: error.phase,
                 route: error.route,
-                operations: error.operations,
+                calls: error.calls,
             }
             .into()),
             other => Err(anyhow::anyhow!(
@@ -794,16 +794,16 @@ impl RankProcess {
                 other.kind()
             )),
         };
-        if frame.header.call_id != 0 && frame.header.call_id != call_id {
+        if frame.header.message_id != 0 && frame.header.message_id != message_id {
             bail!(
-                "worker response call id mismatch: expected {call_id}, got {}",
-                frame.header.call_id
+                "worker response call id mismatch: expected {message_id}, got {}",
+                frame.header.message_id
             );
         }
         if let Some(echoed) = echoed
-            && echoed != call_id
+            && echoed != message_id
         {
-            bail!("worker response echoed call id {echoed}, expected {call_id}");
+            bail!("worker response echoed call id {echoed}, expected {message_id}");
         }
         let report = report?;
         for product in &report.products {
@@ -836,21 +836,21 @@ impl RankProcess {
         &self.info
     }
 
-    /// Submits one physical run and records its outstanding operation identities.
+    /// Submits one physical run and records its outstanding call identities.
     pub(super) fn submit_batch(&mut self, batch: Batch) -> Result<(), BatchSubmitError> {
         self.drain_ready().map_err(BatchSubmitError::Failed)?;
         if self.pending.len() >= self.depth {
             return Err(BatchSubmitError::WouldBlock(batch));
         }
         let batch_id = batch.batch_id;
-        let call_id = self.alloc_call_id();
+        let message_id = self.alloc_call_id();
         let mut req = WorkerRequest::submit(batch);
-        req.set_call_id(Some(call_id));
+        req.set_call_id(Some(message_id));
         let pending = self
             .send_request_checked(&req, "batch submit")
             .map_err(BatchSubmitError::Failed)?;
         self.pending.insert(
-            call_id,
+            message_id,
             PendingRecord {
                 kind: OutstandingKind::Batch { batch_id },
                 pending,
@@ -947,9 +947,9 @@ impl RankProcess {
                 }
             }
             if matches!(self.child.try_wait(), Ok(None)) {
-                let call_id = self.alloc_call_id();
+                let message_id = self.alloc_call_id();
                 let mut req = WorkerRequest::close();
-                req.set_call_id(Some(call_id));
+                req.set_call_id(Some(message_id));
                 if let Ok(pending) = self.send_request_checked(&req, "shutdown") {
                     let _ = self
                         .client

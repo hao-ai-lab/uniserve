@@ -19,8 +19,8 @@ from ..protocol.batch import (
     NewRequest,
     Start,
 )
-from ..protocol.identity import ComputationId, RequestKey
-from ..protocol.operation import ImageParams, OpStatus, ScheduledRequest
+from ..protocol.call import Call, CallStatus, ImageParams
+from ..protocol.identity import CallId, RequestKey
 
 if TYPE_CHECKING:
     from ..execution.diffusion_state import ImageState, VideoState
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 class RequestProgress:
     """Immutable accepted or projected coordinates for a state-consuming.
 
-    operation.
+    call.
     """
 
     logical_position: int = 0
@@ -69,7 +69,7 @@ class RequestState:
     negative_token_ids: tuple[int, ...]
     finish_token_ids: tuple[int, ...]
     accepted_progress: RequestProgress
-    accepted_op_id: ComputationId = ComputationId(0, 0)
+    accepted_call_id: CallId = CallId(0, 0)
     # State one call produces and a later call reads, which the engine does not
     # track: it lives with the request rather than in a call's stated
     # coordinates. rng_counter is the request's sampling position and is not
@@ -78,9 +78,7 @@ class RequestState:
     prompt_logits_ready: bool = False
     rng_counter: int = 0
     diffusion: ImageState | VideoState | None = None
-    pending_operations: dict[ComputationId, PendingOutput] = field(
-        default_factory=dict
-    )
+    pending_calls: dict[CallId, PendingOutput] = field(default_factory=dict)
     closed: bool = False
     retired: bool = False
 
@@ -148,7 +146,7 @@ class RequestPool:
         for row in self._rows:
             if row is not None:
                 row.diffusion = None
-                row.pending_operations.clear()
+                row.pending_calls.clear()
         self._rows.clear()
         self._slots_by_request.clear()
         self.tensor_slots = ()
@@ -168,23 +166,21 @@ class RequestPool:
 
     def create_outputs(
         self,
-        operations: Sequence[ScheduledRequest],
+        calls: Sequence[Call],
         request_pool_indices: Sequence[int],
         buffer: OutputBuffer,
     ) -> tuple[PendingOutput, ...]:
-        """Validate scheduler ownership and capture each operation's stable.
+        """Validate scheduler ownership and capture each call's stable.
 
         predecessor.
         """
         from ..execution.output import PendingOutput
 
-        if len(operations) != len(request_pool_indices):
+        if len(calls) != len(request_pool_indices):
             raise invalid_descriptor(
-                "request-pool indices are not aligned with operations"
+                "request-pool indices are not aligned with calls"
             )
-        if len({operation.request_key for operation in operations}) != len(
-            operations
-        ):
+        if len({call.request_key for call in calls}) != len(calls):
             raise invalid_descriptor("a completion group repeats a request")
 
         slots = tuple(
@@ -196,30 +192,26 @@ class RequestPool:
             )
 
         outputs = []
-        for index, (operation, slot) in enumerate(
-            zip(operations, slots, strict=True)
-        ):
-            request = self.get(operation.request_key.request_id)
-            if request.request_key != operation.request_key:
+        for index, (call, slot) in enumerate(zip(calls, slots, strict=True)):
+            request = self.get(call.request_key.request_id)
+            if request.request_key != call.request_key:
                 raise invalid_descriptor(
-                    f"operation {operation.op_id} has a stale request key"
+                    f"call {call.call_id} has a stale request key"
                 )
             if (
                 self._rows[slot] is not request
                 or request.request_pool_idx != slot
             ):
                 raise invalid_descriptor(
-                    f"operation {operation.op_id} has a stale request slot"
+                    f"call {call.call_id} has a stale request slot"
                 )
             if request.closed:
                 raise invalid_descriptor(
-                    f"operation {operation.op_id} targets a closed request"
+                    f"call {call.call_id} targets a closed request"
                 )
-            if operation.op_id in request.pending_operations:
-                raise invalid_descriptor(
-                    "request operation is already executing"
-                )
-            outputs.append(PendingOutput(operation, request, buffer, index))
+            if call.call_id in request.pending_calls:
+                raise invalid_descriptor("request call is already executing")
+            outputs.append(PendingOutput(call, request, buffer, index))
         return tuple(outputs)
 
     def validate_pending(self, outputs: Sequence[PendingOutput]) -> None:
@@ -234,19 +226,19 @@ class RequestPool:
                 or request.request_key != output.request_key
             ):
                 raise RuntimeError("request publication lost its admitted slot")
-            if output.op_id in request.pending_operations:
+            if output.call_id in request.pending_calls:
                 raise RuntimeError(
-                    "request publication repeats an executing operation"
+                    "request publication repeats an executing call"
                 )
 
     def add_pending(self, outputs: Sequence[PendingOutput]) -> None:
         """Install the same output objects used by execution.
 
-        and dependent operations.
+        and dependent calls.
         """
         self.validate_pending(outputs)
         for output in outputs:
-            output.request.pending_operations[output.op_id] = output
+            output.request.pending_calls[output.call_id] = output
 
     def apply_outputs(self, outputs: Sequence[PendingOutput]) -> None:
         """Apply actual acceptance; a late output never replaces newer state.
@@ -257,19 +249,19 @@ class RequestPool:
         """
         for output in outputs:
             request = output.request
-            if request.pending_operations.get(output.op_id) is not output:
+            if request.pending_calls.get(output.call_id) is not output:
                 continue
             if output.value is None:
                 raise RuntimeError("request output has not been materialized")
-            del request.pending_operations[output.op_id]
+            del request.pending_calls[output.call_id]
 
             if self.peek(request.request_id) is request:
                 if (
                     output.accepted_progress is not None
-                    and output.op_id > request.accepted_op_id
+                    and output.call_id > request.accepted_call_id
                 ):
                     request.accepted_progress = output.accepted_progress
-                    request.accepted_op_id = output.op_id
+                    request.accepted_call_id = output.call_id
                     # The device state a call produced becomes visible to the
                     # request's later calls only here, so a completion group
                     # that fails never exposes a partial trajectory.
@@ -277,7 +269,7 @@ class RequestPool:
                         output.accepted_progress.prompt_logits_ready
                     )
                     request.rng_counter = output.accepted_progress.rng_counter
-                if output.value.status is OpStatus.ERROR:
+                if output.value.status is CallStatus.ERROR:
                     request.closed = True
 
     def cancel_outputs(self, outputs: Sequence[PendingOutput]) -> None:
@@ -287,7 +279,7 @@ class RequestPool:
         """
         for output in outputs:
             request = output.request
-            request.pending_operations.pop(output.op_id, None)
+            request.pending_calls.pop(output.call_id, None)
             request.closed = True
 
     def start(self, admission: NewRequest) -> int | None:
@@ -317,9 +309,7 @@ class RequestPool:
         return (
             request is None
             or request.request_key != request_key
-            or all(
-                output.ready() for output in request.pending_operations.values()
-            )
+            or all(output.ready() for output in request.pending_calls.values())
         )
 
     def drop(self, request_id: int) -> None:
@@ -336,7 +326,7 @@ class RequestPool:
             raise RuntimeError(
                 "request retirement requires closed, completed execution"
             )
-        row.pending_operations.clear()
+        row.pending_calls.clear()
         row.diffusion = None
         row.retired = True
 

@@ -150,7 +150,7 @@ def calibrated_weight_config(
                 Quantizer("nvfp4", calibrated_amax=float(amax)),
             )
 
-    # Calibrated VAE boundaries and unselected decoder operations are BF16;
+    # Calibrated VAE boundaries and unselected decoder calls are BF16;
     # convolutional/residual owners retain their declared FP32 accumulation.
     base = weight_config(preset="quality", video_vae="bf16")
     return replace(base, quantization=quantization)

@@ -5,39 +5,39 @@ from dataclasses import replace
 
 from tests.python.fixtures.depth_one import (
     ar_params,
-    diffusion_prepare_operation,
+    diffusion_prepare_call,
     execution_batch,
     finalized_report,
-    kv_publication_operation,
+    kv_publication_call,
     record_completion,
     root_parent,
-    token_operation,
+    token_call,
     umm_params,
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
 from uniserve_worker.protocol.batch import Finish, Free, NewRequest
-from uniserve_worker.protocol.identity import ComputationId
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
+    Call,
+    CallStatus,
     ForwardMode,
     ImageParams,
-    OpStatus,
     SamplingState,
-    ScheduledRequest,
 )
+from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
 
 
 def _with_transition_predicate(
-    operation: ScheduledRequest,
+    call: Call,
     token_id: int,
-) -> ScheduledRequest:
-    selected = operation
+) -> Call:
+    selected = call
     transition = TensorRef(
         request_key=selected.request_key,
-        producer_op_id=selected.op_id,
+        producer_call_id=selected.call_id,
         output_index=3,
-        generation=selected.op_id.batch_id * 8 + 8,
+        generation=selected.call_id.batch_id * 8 + 8,
         dtype=DType.U8,
         shape_bound=ShapeBound(),
     )
@@ -48,22 +48,19 @@ def _with_transition_predicate(
     )
 
 
-def _release_relay_outputs(worker, *operations: ScheduledRequest) -> None:
+def _release_relay_outputs(worker, *calls: Call) -> None:
     finalized_report(
         worker,
         worker.submit(
             execution_batch(
-                batch_id=max(
-                    operation.op_id.batch_id for operation in operations
-                )
-                + 1,
+                batch_id=max(call.call_id.batch_id for call in calls) + 1,
                 commands=tuple(
                     Free(output.buffer_id)
-                    for operation in operations
+                    for call in calls
                     for output in (
-                        operation.token_output,
-                        operation.completion_output,
-                        operation.transition_output,
+                        call.token_output,
+                        call.completion_output,
+                        call.transition_output,
                     )
                     if output is not None
                 ),
@@ -72,14 +69,12 @@ def _release_relay_outputs(worker, *operations: ScheduledRequest) -> None:
     )
 
 
-def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> (
-    None
-):
+def test_feedback_call_publishes_distinct_completion_relay_outputs() -> None:
     worker = execution_worker(device="cpu", queue_depth=2)
     admission = ar_params(50, block_ids=(0,))
-    base = token_operation(
+    base = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -92,13 +87,13 @@ def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> (
     transition = with_transition.transition_output
     completion = TensorRef(
         request_key=base.request_key,
-        producer_op_id=base.op_id,
+        producer_call_id=base.call_id,
         output_index=0,
-        generation=base.op_id.batch_id * 8 + 6,
+        generation=base.call_id.batch_id * 8 + 6,
         dtype=DType.U8,
         shape_bound=ShapeBound(),
     )
-    operation = replace(
+    call = replace(
         with_transition,
         completion_output=completion,
         token_output=token,
@@ -111,18 +106,18 @@ def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> (
             execution_batch(
                 batch_id=1,
                 admissions=(admission,),
-                operations=(operation,),
+                calls=(call,),
             )
         ),
     )
 
-    assert report.completions[0].status is OpStatus.OK
+    assert report.completions[0].status is CallStatus.OK
     assert set(report.completions[0].product_generations) == {
         completion.generation,
         token.generation,
         transition.generation,
     }
-    _release_relay_outputs(worker, operation)
+    _release_relay_outputs(worker, call)
 
 
 def test_false_device_predicate_preserves_parent_cutoff_across_registered_descendants(  # noqa: E501
@@ -136,9 +131,9 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
             base.generation, finish_token_ids=(expected_successor(4),)
         ),
     )
-    predecessor = token_operation(
+    predecessor = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -147,14 +142,14 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         execution_batch(
             batch_id=1,
             admissions=(admission,),
-            operations=(predecessor,),
+            calls=(predecessor,),
         )
     )
     continuation = predecessor.token_output
-    successor = token_operation(
+    successor = token_call(
         admission.request_key,
-        op_id=ComputationId(2, 0),
-        predecessor=predecessor.op_id,
+        call_id=CallId(2, 0),
+        predecessor=predecessor.call_id,
         mode=ForwardMode.DECODE,
         tokens=(0,),
         predicate=continuation,
@@ -163,15 +158,15 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         execution_batch(
             batch_id=2,
             admissions=(),
-            operations=(successor,),
+            calls=(successor,),
         )
     )
     successor_report = finalized_report(worker, successor_report)
     successor_continuation = successor.token_output
-    descendant = token_operation(
+    descendant = token_call(
         admission.request_key,
-        op_id=ComputationId(3, 0),
-        predecessor=successor.op_id,
+        call_id=CallId(3, 0),
+        predecessor=successor.call_id,
         mode=ForwardMode.DECODE,
         tokens=(0,),
         predicate=successor_continuation,
@@ -182,16 +177,16 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
             execution_batch(
                 batch_id=3,
                 admissions=(),
-                operations=(descendant,),
+                calls=(descendant,),
             )
         ),
     )
     completion = successor_report.completions[0]
     completion.validate()
-    assert completion.status is OpStatus.PREDICATED
+    assert completion.status is CallStatus.PREDICATED
     descendant_completion = descendant_report.completions[0]
     descendant_completion.validate()
-    assert descendant_completion.status is OpStatus.PREDICATED
+    assert descendant_completion.status is CallStatus.PREDICATED
     parent_report = finalized_report(worker, parent_report)
     parent_completion = parent_report.completions[0]
     assert completion.position == parent_completion.position
@@ -208,12 +203,12 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         == completion.num_completed_steps
     )
 
-    selected = predecessor.op_id
+    selected = predecessor.call_id
 
     _release_relay_outputs(worker, predecessor, successor, descendant)
-    later = token_operation(
+    later = token_call(
         admission.request_key,
-        op_id=ComputationId(4, 0),
+        call_id=CallId(4, 0),
         predecessor=selected,
         mode=ForwardMode.DECODE,
         tokens=(7,),
@@ -224,18 +219,18 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
             execution_batch(
                 batch_id=5,
                 admissions=(),
-                operations=(later,),
+                calls=(later,),
             )
         ),
     ).completions[0]
-    assert later_completion.status is OpStatus.OK
+    assert later_completion.status is CallStatus.OK
     assert later_completion.position == parent_completion.position + 1
 
     close_report = worker.submit(
         execution_batch(
             batch_id=7,
             admissions=(),
-            operations=(),
+            calls=(),
             commands=(
                 Finish(
                     request_key=admission.request_key,
@@ -260,9 +255,9 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         generation=understanding.generation,
         image=generation.image,
     )
-    initial = token_operation(
+    initial = token_call(
         admission.request_key,
-        op_id=ComputationId(1, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -271,27 +266,27 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         execution_batch(
             batch_id=1,
             admissions=(admission,),
-            operations=(initial,),
+            calls=(initial,),
         )
     )
     initial_report = finalized_report(worker, initial_report)
     initial_observation = record_completion(initial, initial_report)
-    publication, conditioning = kv_publication_operation(
+    publication, conditioning = kv_publication_call(
         admission.request_key,
-        op_id=ComputationId(2, 0),
-        predecessor=initial_observation.op_id,
+        call_id=CallId(2, 0),
+        predecessor=initial_observation.call_id,
     )
     worker.submit(
         execution_batch(
             batch_id=2,
-            operations=(publication,),
+            calls=(publication,),
             commands=(),
         )
     )
-    predecessor = token_operation(
+    predecessor = token_call(
         admission.request_key,
-        op_id=ComputationId(3, 0),
-        predecessor=initial_observation.op_id,
+        call_id=CallId(3, 0),
+        predecessor=initial_observation.call_id,
         mode=ForwardMode.DECODE,
         tokens=(expected_successor(4),),
     )
@@ -299,19 +294,19 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     parent_report = worker.submit(
         execution_batch(
             batch_id=3,
-            operations=(predecessor,),
+            calls=(predecessor,),
         )
     )
     transition_predicate = predecessor.transition_output
-    candidate, _latent = diffusion_prepare_operation(
+    candidate, _latent = diffusion_prepare_call(
         admission.request_key,
-        op_id=ComputationId(4, 0),
-        predecessor=predecessor.op_id,
+        call_id=CallId(4, 0),
+        predecessor=predecessor.call_id,
         conditioning=conditioning,
     )
     candidate = replace(candidate, predicate=transition_predicate)
 
-    candidate_batch = execution_batch(batch_id=4, operations=(candidate,))
+    candidate_batch = execution_batch(batch_id=4, calls=(candidate,))
     prepared = worker.submit(candidate_batch)
     assert prepared is not None
     deadline = time.monotonic() + 1.0
@@ -324,7 +319,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     parent_report = finalized_report(worker, parent_report)
     parent_completion = parent_report.completions[0]
     candidate_completion = candidate_report.completions[0]
-    assert candidate_completion.status is OpStatus.PREDICATED
+    assert candidate_completion.status is CallStatus.PREDICATED
     assert candidate_completion.position == parent_completion.position
     assert (
         candidate_completion.kv_visible_len == parent_completion.kv_visible_len
@@ -341,10 +336,10 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
 
     parent_observation = record_completion(predecessor, parent_report)
     _release_relay_outputs(worker, initial, predecessor, candidate)
-    selected, _selected_latent = diffusion_prepare_operation(
+    selected, _selected_latent = diffusion_prepare_call(
         admission.request_key,
-        op_id=ComputationId(5, 0),
-        predecessor=parent_observation.op_id,
+        call_id=CallId(5, 0),
+        predecessor=parent_observation.call_id,
         conditioning=conditioning,
     )
     selected_report = finalized_report(
@@ -352,10 +347,10 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         worker.submit(
             execution_batch(
                 batch_id=5,
-                operations=(selected,),
+                calls=(selected,),
                 commands=(),
             )
         ),
     )
-    assert selected_report.completions[0].status is OpStatus.OK
+    assert selected_report.completions[0].status is CallStatus.OK
     assert selected_report.completions[0].product_generations

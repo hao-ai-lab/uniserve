@@ -34,15 +34,15 @@ from uniserve_worker.execution.flow import (
 )
 from uniserve_worker.execution.model_entry import ModelEntry
 from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.protocol.identity import ComputationId, RequestKey
-from uniserve_worker.protocol.operation import (
+from uniserve_worker.protocol.call import (
     Bounds,
+    Call,
     CallCoordinates,
     ForwardMode,
     ImageParams,
     PipelineStage,
-    ScheduledRequest,
 )
+from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.runtime.cache_manager import CacheManager
 from uniserve_worker.runtime.latent_pool import LatentPool
 
@@ -116,7 +116,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
         attention_backend="torch",
         block_size=16,
         max_sequence_tokens=32,
-        max_batch_operations=3,
+        max_batch_calls=3,
         max_request_pool_size=3,
         max_batch_tokens=64,
         prefill_cuda_graph=True,
@@ -155,7 +155,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             decode_predicates=torch.tensor(
                 [False, True, True, True], device="cuda:0"
             ),
-            max_operations=3,
+            max_calls=3,
             request_slots=3,
             max_tokens=64,
             latent_capacity_units=16,
@@ -196,11 +196,11 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 for slot, branch in enumerate(branches)
             }
 
-            def operations(mode):
+            def calls(mode):
                 return tuple(
-                    ScheduledRequest(
+                    Call(
                         RequestKey(1, slot, 0),
-                        ComputationId(1, index),
+                        CallId(1, index),
                         None,
                         CallCoordinates(),
                         mode,
@@ -214,7 +214,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                     prefix_row(tokens, (slot + 1, 0, 0, 32))
                     for slot, tokens in enumerate(prefixes)
                 ),
-                operations=operations(ForwardMode.PREFILL),
+                calls=calls(ForwardMode.PREFILL),
                 cache=manager,
                 tables=manager.block_tables,
                 states=None,
@@ -278,7 +278,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             )
             result = runner.run_forward_group(
                 rows,
-                operations=operations(PipelineStage.DENOISING),
+                calls=calls(PipelineStage.DENOISING),
                 cache=manager,
                 tables=manager.block_tables,
                 states=None,
@@ -324,7 +324,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
 def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
     from uniserve.model import EmbeddingReplacement, TextInput
     from uniserve.nn.attention import SequenceLengths, VarlenInput
-    from uniserve_worker.bootstrap.components import supported_operations
+    from uniserve_worker.bootstrap.components import supported_calls
     from uniserve_worker.execution.rows import ForwardRow
     from uniserve_worker.execution.sampling import TokenSelection
     from uniserve_worker.worker import Worker
@@ -357,7 +357,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         block_size=16,
         kv_token_capacity=128,
         max_sequence_tokens=32,
-        max_batch_operations=2,
+        max_batch_calls=2,
         max_request_pool_size=2,
         max_batch_tokens=64,
         prefill_cuda_graph=True,
@@ -382,7 +382,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         bindings=bindings,
         sampling_group=group,
         tokenizer=None,
-        allowed_work_variants=supported_operations(model),
+        allowed_work_variants=supported_calls(model),
         queue_depth=2,
         completion_payload_bytes=1 << 16,
         components=(("model", placement),),
@@ -434,9 +434,9 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 causal=False,
                 selection=selection,
             )
-            operation = ScheduledRequest(
+            call = Call(
                 RequestKey(1, 0, 0),
-                ComputationId(1, 0),
+                CallId(1, 0),
                 None,
                 CallCoordinates(),
                 ForwardMode.PREFILL,
@@ -444,7 +444,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             )
             actual = worker.runner.run_forward_group(
                 (row,),
-                operations=(operation,),
+                calls=(call,),
                 cache=worker.kv_cache,
                 tables=worker.kv_cache.block_tables,
                 states=None,
@@ -472,9 +472,9 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             write_kv=True,
             selection=TokenSelection.LAST_LOGITS,
         )
-        operation = ScheduledRequest(
+        call = Call(
             RequestKey(1, 0, 0),
-            ComputationId(1, 0),
+            CallId(1, 0),
             None,
             CallCoordinates(),
             ForwardMode.PREFILL,
@@ -482,7 +482,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         )
         actual = worker.runner.run_forward_group(
             (row,),
-            operations=(operation,),
+            calls=(call,),
             cache=worker.kv_cache,
             tables=worker.kv_cache.block_tables,
             states=None,
@@ -527,10 +527,10 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                             selection=TokenSelection.LAST_LOGITS,
                         ),
                     ),
-                    operations=(
-                        ScheduledRequest(
+                    calls=(
+                        Call(
                             RequestKey(1, 0, 0),
-                            ComputationId(1, 0),
+                            CallId(1, 0),
                             None,
                             CallCoordinates(),
                             ForwardMode.DECODE,
@@ -554,14 +554,14 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             from tests.python.fixtures.depth_one import (
                 ar_params,
                 configure_physical_pool,
-                encode_operation,
+                encode_call,
                 execution_batch,
                 finalized_report,
                 root_parent,
             )
             from uniserve.model import VisionInput
             from uniserve_worker.execution.image_input import prepare_image
-            from uniserve_worker.protocol.operation import OpStatus
+            from uniserve_worker.protocol.call import CallStatus
             from uniserve_worker.protocol.tensor import DeviceDim, ShapeBound
 
             configure_physical_pool(
@@ -590,9 +590,9 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 )
             )[0]
             admission = ar_params(0)
-            encode = encode_operation(
+            encode = encode_call(
                 admission.request_key,
-                op_id=ComputationId(1, 0),
+                call_id=CallId(1, 0),
                 predecessor=root_parent(admission),
                 image_base64=payload,
                 encoder_handle=11,
@@ -612,13 +612,13 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                     execution_batch(
                         batch_id=1,
                         admissions=(admission,),
-                        operations=(encode,),
+                        calls=(encode,),
                     )
                 ),
             )
-            assert result.completions[0].status is OpStatus.OK
+            assert result.completions[0].status is CallStatus.OK
             read = worker.tensor_store.consume(
-                encode.encoder_output, consumer_op_id=ComputationId(2, 0)
+                encode.encoder_output, consumer_call_id=CallId(2, 0)
             )
             try:
                 torch.testing.assert_close(

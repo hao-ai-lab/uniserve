@@ -1,7 +1,7 @@
 //! Logical execution batches, physical execution, and executor contracts.
 //!
-//! The scheduler submits logical operations through [`Executor`]. Physical
-//! executors lower those operations into worker protocol batches while retaining
+//! The scheduler submits logical calls through [`Executor`]. Physical
+//! executors lower those calls into worker protocol batches while retaining
 //! the request and product identities needed to correlate completions.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -17,13 +17,13 @@ use serde::{Deserialize, Serialize};
 
 use uniserve_worker_ipc::{
     Batch, BatchCommand, BatchOutput, BlockTable, BufferAllocation, CachePageAllocation,
-    Computation, ComputationId, DecodeRange, ForwardBatch, LatentParams, NewRequest, RequestKey,
-    ScheduledRequest, TensorPublication, WorkerInfo,
+    CallKind, CallId, DecodeRange, ForwardBatch, LatentParams, NewRequest, RequestKey,
+    Call, TensorPublication, WorkerInfo,
 };
 
 /// Physical placement selected by the scheduler for a computation.
 ///
-/// The computation itself is the shared IPC `ScheduledRequest`. These fields describe
+/// The computation itself is the shared IPC `Call`. These fields describe
 /// its worker and allocations, which are gathered into physical batch arrays.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestPlacement {
@@ -32,7 +32,7 @@ pub struct RequestPlacement {
     /// KV tables and newly acquired pages used by this computation.
     pub block_tables: Vec<BlockTable>,
     pub new_cache_pages: Vec<CachePageAllocation>,
-    /// Rows use a local operation index until gathered into the physical batch.
+    /// Rows use a local call index until gathered into the physical batch.
     pub forward: ForwardBatch,
     pub latent: Option<LatentParams>,
     pub decode: Option<DecodeRange>,
@@ -45,8 +45,8 @@ pub struct RequestPlacement {
 pub struct ExecutionBatch {
     /// Logical batch identity used to correlate partial completions.
     pub id: u64,
-    /// Shared computations paired with physical placement in scheduler order.
-    pub requests: Vec<(ScheduledRequest, RequestPlacement)>,
+    /// Shared call kinds paired with physical placement in scheduler order.
+    pub requests: Vec<(Call, RequestPlacement)>,
     /// Ordered lifecycle and resource commands.
     pub commands: Vec<BatchCommand>,
     /// Published transfer descriptors supplied by an external storage owner.
@@ -59,7 +59,7 @@ impl ExecutionBatch {
     /// Constructs a logical executor submission.
     pub fn new(
         id: u64,
-        requests: Vec<(ScheduledRequest, RequestPlacement)>,
+        requests: Vec<(Call, RequestPlacement)>,
         commands: Vec<BatchCommand>,
         input_transfers: Vec<TensorPublication>,
     ) -> Self {
@@ -80,13 +80,13 @@ impl ExecutionBatch {
         })
     }
 
-    /// Removes unstarted work for terminated epochs while preserving independent operations.
-    /// Their resource descriptions stay attached to the removed operations. Close commands
+    /// Removes unstarted work for terminated epochs while preserving independent calls.
+    /// Their resource descriptions stay attached to the removed calls. Close commands
     /// retain their physical retirement and reader obligations.
     pub(crate) fn retire_requests(
         &mut self,
         requests: &std::collections::HashSet<RequestKey>,
-    ) -> Vec<(ScheduledRequest, RequestPlacement)> {
+    ) -> Vec<(Call, RequestPlacement)> {
         let (retired, active): (Vec<_>, Vec<_>) = std::mem::take(&mut self.requests)
             .into_iter()
             .partition(|(op, _)| requests.contains(&op.request_key));
@@ -107,35 +107,35 @@ impl ExecutionBatch {
         self.kv_inputs.retain(|publication| {
             self.requests
                 .iter()
-                .any(|(operation, _)| operation.kv_input == Some(publication.source))
+                .any(|(call, _)| call.kv_input == Some(publication.source))
         });
         retired
     }
 
-    /// Validates operation identities, execution ownership, and command payloads.
+    /// Validates call identities, execution ownership, and command payloads.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.requests.is_empty() || !self.commands.is_empty(),
-            "logical batch must carry at least one operation or command"
+            "logical batch must carry at least one call or command"
         );
 
         let mut requests = std::collections::HashSet::with_capacity(self.requests.len());
         let mut identities = std::collections::HashSet::with_capacity(self.requests.len());
-        for (operation, placement) in &self.requests {
-            operation.validate()?;
+        for (call, placement) in &self.requests {
+            call.validate()?;
             anyhow::ensure!(
-                operation.op_id.batch_id == self.id,
+                call.call_id.batch_id == self.id,
                 "computation identity belongs to another logical batch"
             );
-            requests.insert(operation.request_key);
+            requests.insert(call.request_key);
             WorkerId::new(placement.worker.0.clone())?;
             anyhow::ensure!(
-                !operation.entry.is_empty(),
-                "operation requires a computation entry"
+                !call.entry.is_empty(),
+                "call requires a computation entry"
             );
             anyhow::ensure!(
-                identities.insert(operation.op_id),
-                "logical batch repeats an operation identity"
+                identities.insert(call.call_id),
+                "logical batch repeats an call identity"
             );
             placement.forward.validate(1)?;
             for table in &placement.block_tables {
@@ -147,24 +147,24 @@ impl ExecutionBatch {
             if let Some(latent) = &placement.latent {
                 latent.validate()?;
                 anyhow::ensure!(
-                    (latent.request_key, latent.op_id) == (operation.request_key, operation.op_id),
-                    "logical operation carries another operation's latent execution"
+                    (latent.request_key, latent.call_id) == (call.request_key, call.call_id),
+                    "logical call carries another call's latent execution"
                 );
             }
             if let Some(decode) = &placement.decode {
                 decode.validate()?;
                 anyhow::ensure!(
-                    (decode.request_key, decode.op_id) == (operation.request_key, operation.op_id),
-                    "logical operation carries another operation's decode execution"
+                    (decode.request_key, decode.call_id) == (call.request_key, call.call_id),
+                    "logical call carries another call's decode execution"
                 );
             }
             for buffer in &placement.buffers {
                 buffer.validate()?;
                 anyhow::ensure!(
-                    operation
+                    call
                         .buffer_outputs()
                         .any(|output| output.buffer_id() == buffer.buffer),
-                    "logical operation carries a buffer execution for another output"
+                    "logical call carries a buffer execution for another output"
                 );
             }
         }
@@ -178,7 +178,7 @@ impl ExecutionBatch {
             );
             anyhow::ensure!(
                 requests.contains(&admission.request_key),
-                "logical batch starts a request without an operation"
+                "logical batch starts a request without an call"
             );
         }
 
@@ -252,17 +252,17 @@ impl ExecutorInfo {
         }
 
         // Route-specific capacities contribute only when a pool implements the
-        // corresponding operation family.
-        let routed = |variant: Computation| {
+        // corresponding call family.
+        let routed = |variant: CallKind| {
             self.workers
                 .iter()
                 .find(|(_, info)| info.supported_ops.contains(&variant))
                 .map(|(_, info)| info)
         };
         let mut kv_indices = [
-            Computation::Forward(ForwardMode::Prefill),
-            Computation::Forward(ForwardMode::Decode),
-            Computation::Forward(ForwardMode::Verify),
+            CallKind::Forward(ForwardMode::Prefill),
+            CallKind::Forward(ForwardMode::Decode),
+            CallKind::Forward(ForwardMode::Verify),
         ]
         .into_iter()
         .filter_map(|variant| {
@@ -276,16 +276,16 @@ impl ExecutorInfo {
 
         let seed_index = kv_indices.first().copied().unwrap_or(0);
         let mut merged = self.workers[seed_index].1.clone();
-        merged.pipeline_components = routed(Computation::Pipeline(PipelineStage::Denoising))
+        merged.pipeline_components = routed(CallKind::Pipeline(PipelineStage::Denoising))
             .map(|info| info.pipeline_components.clone())
             .unwrap_or_default();
-        merged.num_inference_steps = routed(Computation::Pipeline(PipelineStage::Denoising))
+        merged.num_inference_steps = routed(CallKind::Pipeline(PipelineStage::Denoising))
             .map_or(0, |info| info.num_inference_steps);
         anyhow::ensure!(
             self.workers.iter().all(|(_, info)| {
                 !info
                     .supported_ops
-                    .contains(&Computation::Pipeline(PipelineStage::Denoising))
+                    .contains(&CallKind::Pipeline(PipelineStage::Denoising))
                     || (info.pipeline_components == merged.pipeline_components
                         && info.num_inference_steps == merged.num_inference_steps)
             }),
@@ -337,7 +337,7 @@ impl ExecutorInfo {
         }
 
         // Aggregate global limits conservatively across all physical pools.
-        merged.supported_ops = Computation::ALL
+        merged.supported_ops = CallKind::ALL
             .into_iter()
             .filter(|variant| routed(*variant).is_some())
             .collect();
@@ -375,7 +375,7 @@ impl ExecutorInfo {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
-        let flow = routed(Computation::Pipeline(PipelineStage::Denoising));
+        let flow = routed(CallKind::Pipeline(PipelineStage::Denoising));
         merged.latent_page_units = flow.map_or(0, |info| info.latent_page_units);
         merged.latent_pages = flow.map_or(0, |info| info.latent_pages);
         merged.buffer_pool_bytes = self
@@ -404,7 +404,7 @@ impl ExecutorInfo {
     }
 }
 
-/// One operation result returned from an executor-owned batch.
+/// One call result returned from an executor-owned batch.
 #[derive(Debug, Clone)]
 pub struct OpResult {
     /// Validated completion values; media storage is carried by `media` below.
@@ -427,7 +427,7 @@ pub struct WorkerResult {
 
 impl WorkerResult {
     /// Claims all media before any fallible correlation or aggregation step.
-    /// Acquisition failure belongs to the operation; independent results remain usable.
+    /// Acquisition failure belongs to the call; independent results remain usable.
     pub(crate) fn receive(report: BatchOutput) -> Self {
         let results = report
             .completions
@@ -482,7 +482,7 @@ pub struct CommandResult {
 pub struct BatchResult {
     /// Logical batch identity assigned at submission.
     pub batch_id: u64,
-    /// Operation completions this join reports as ready.
+    /// Call completions this join reports as ready.
     pub results: Vec<OpResult>,
     /// Control commands acknowledged by all target pools.
     pub command_results: Vec<CommandResult>,
@@ -494,7 +494,7 @@ pub struct BatchResult {
     pub forward_stats: Vec<uniserve_worker_ipc::ForwardStats>,
 }
 
-/// Resolves and validates one logical completion against its submitted operation.
+/// Resolves and validates one logical completion against its submitted call.
 pub(crate) fn logical_result(
     report: WorkerResult,
     done: bool,
@@ -872,7 +872,7 @@ impl TransferConfigError {
 /// A worker-reported execution error classified for scheduler failure policy.
 ///
 /// The typed taxonomy and execution context cross the IPC together so failure
-/// policy and diagnostics use the same operation identity.
+/// policy and diagnostics use the same call identity.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("worker execute error: {message}")]
 pub struct WorkerExecError {
@@ -890,8 +890,8 @@ pub struct WorkerExecError {
     pub phase: Option<String>,
     /// Physical route or worker pool associated with the failure.
     pub route: Option<String>,
-    /// Operations affected by the worker failure.
-    pub operations: Vec<uniserve_worker_ipc::ErrorOperationIdentity>,
+    /// Calls affected by the worker failure.
+    pub calls: Vec<uniserve_worker_ipc::ErrorCallIdentity>,
 }
 
 /// Terminal work abandoned by one Worker, with the exact invalidated ownership.
@@ -904,8 +904,8 @@ pub struct WorkerFailure {
     pub endpoints: Vec<uniserve_worker_ipc::WorkerEndpoint>,
     /// Request epochs affected by the failed work or invalidated allocations.
     pub requests: Vec<RequestKey>,
-    /// Accepted logical operations that will no longer produce a device completion.
-    pub retired: Vec<(u64, RequestKey, ComputationId)>,
+    /// Accepted logical calls that will no longer produce a device completion.
+    pub retired: Vec<(u64, RequestKey, CallId)>,
     /// Buffers whose published locations no longer cover their complete logical value.
     pub buffers: Vec<uniserve_worker_ipc::BufferId>,
     /// Classified execution failure, if the ranks returned one before retirement.
@@ -918,7 +918,7 @@ pub struct WorkerFailure {
 pub(crate) fn physical_batch(
     batch_id: u64,
     collective_seq: u64,
-    requests: Vec<(ScheduledRequest, RequestPlacement)>,
+    requests: Vec<(Call, RequestPlacement)>,
     commands: Vec<BatchCommand>,
     input_products: Vec<TensorPublication>,
     kv_inputs: Vec<uniserve_worker_ipc::KvTransfer>,
@@ -929,20 +929,20 @@ pub(crate) fn physical_batch(
     let mut latent_params = Vec::new();
     let mut decode_ranges = Vec::new();
     let mut buffer_allocations = Vec::new();
-    let mut operations = Vec::with_capacity(requests.len());
-    for (operation_index, (operation, placement)) in requests.into_iter().enumerate() {
+    let mut calls = Vec::with_capacity(requests.len());
+    for (call_index, (call, placement)) in requests.into_iter().enumerate() {
         block_tables.extend(placement.block_tables);
         new_cache_pages.extend(placement.new_cache_pages);
-        forward.append(placement.forward, operation_index as u32);
+        forward.append(placement.forward, call_index as u32);
         latent_params.extend(placement.latent);
         decode_ranges.extend(placement.decode);
         buffer_allocations.extend(placement.buffers);
-        operations.push(operation);
+        calls.push(call);
     }
     let batch = Batch {
         batch_id,
         collective_seq,
-        operations,
+        calls,
         block_tables,
         new_cache_pages,
         forward,

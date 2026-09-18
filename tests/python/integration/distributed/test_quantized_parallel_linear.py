@@ -104,8 +104,8 @@ def _run(rank, rendezvous, directory, source):
                 ).model
                 # Positive values make relative gamma bounds meaningful. Every
                 # local BF16 product and TP sum contributes one unit roundoff.
-                operations = group.size + 1
-                gamma = operations * 2**-8 / (1 - operations * 2**-8)
+                calls = group.size + 1
+                gamma = calls * 2**-8 / (1 - calls * 2**-8)
                 stream = torch.cuda.Stream(device=device)
                 stream.wait_stream(torch.cuda.current_stream(device))
                 with ExecutionContext(model, stream=stream) as context:

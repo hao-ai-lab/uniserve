@@ -125,27 +125,27 @@ pub struct WorkerGroup {
     closed: bool,
 }
 
-type OperationIdentity = (u64, u64, u64, uniserve_worker_ipc::ComputationId);
+type CallIdentity = (u64, u64, u64, uniserve_worker_ipc::CallId);
 
 /// A physical batch and its participating ranks share one retirement lifetime.
 struct PendingBatch {
     batch: Batch,
-    remaining: BTreeSet<OperationIdentity>,
+    remaining: BTreeSet<CallIdentity>,
     ranks: BTreeMap<usize, RankResult>,
 }
 
 /// A participating rank's received prefix, independent of transport fragmentation.
 struct RankResult {
-    operations: BTreeMap<OperationIdentity, bool>,
+    calls: BTreeMap<CallIdentity, bool>,
     complete: bool,
     error: Option<WorkerExecError>,
 }
 
-/// Returns the request and operation identifiers carried by a worker operation.
-fn operation_identity(
+/// Returns the request and call identifiers carried by a worker call.
+fn call_identity(
     request: uniserve_worker_ipc::RequestKey,
-    op: uniserve_worker_ipc::ComputationId,
-) -> OperationIdentity {
+    op: uniserve_worker_ipc::CallId,
+) -> CallIdentity {
     (
         request.engine_id,
         request.request_id.0,
@@ -348,30 +348,30 @@ impl WorkerGroup {
                             !progress.complete,
                             "rank {rank} returned after retirement"
                         );
-                        let identities = report_operation_ids(&result);
+                        let identities = report_call_ids(&result);
                         anyhow::ensure!(
                             result.products.iter().all(|product| identities.contains(
-                                &operation_identity(
+                                &call_identity(
                                     product.product.request_key,
-                                    product.product.producer_op_id,
+                                    product.product.producer_call_id,
                                 )
                             )),
-                            "rank {rank} published a product without its operation completion"
+                            "rank {rank} published a product without its call completion"
                         );
                         for identity in identities {
-                            let completed = progress.operations.get_mut(&identity).ok_or_else(|| {
-                                anyhow::anyhow!("rank {rank} returned an unplanned operation for batch {batch_id}")
+                            let completed = progress.calls.get_mut(&identity).ok_or_else(|| {
+                                anyhow::anyhow!("rank {rank} returned an unplanned call for batch {batch_id}")
                             })?;
                             anyhow::ensure!(
                                 !*completed,
-                                "rank {rank} returned an operation more than once for batch {batch_id}"
+                                "rank {rank} returned an call more than once for batch {batch_id}"
                             );
                             *completed = true;
                         }
                         // A batch returns one result, so its every call
                         // completes with it.
                         anyhow::ensure!(
-                            progress.operations.values().all(|completed| *completed),
+                            progress.calls.values().all(|completed| *completed),
                             "rank {rank} ended batch {batch_id} without all completions"
                         );
                         progress.complete = true;
@@ -501,7 +501,7 @@ impl WorkerGroup {
 
     /// Joins mutually agreeing rank reports into one logical physical result.
     fn try_join(&mut self) -> anyhow::Result<Option<WorkerResult>> {
-        let Some((batch_id, output_rank, operation_ids)) = self.joinable_report_key() else {
+        let Some((batch_id, output_rank, call_ids)) = self.joinable_report_key() else {
             // Preserve successful partial results already agreed by every rank
             // before retiring the unresolved remainder of a failed batch.
             self.join_rank_errors()?;
@@ -516,28 +516,28 @@ impl WorkerGroup {
             .ranks
             .iter()
             .filter_map(|(&rank, result)| {
-                (operation_ids.is_empty()
-                    || operation_ids
+                (call_ids.is_empty()
+                    || call_ids
                         .iter()
-                        .all(|id| result.operations.contains_key(id)))
+                        .all(|id| result.calls.contains_key(id)))
                 .then_some(rank)
             })
             .collect::<Vec<_>>();
         let batch = &pending.batch;
         let mut out =
-            take_rank_operations(&mut self.buffers[output_rank], batch, &operation_ids, true)?;
+            take_rank_calls(&mut self.buffers[output_rank], batch, &call_ids, true)?;
         validate_and_order_rank_report(batch, &mut out, output_rank)?;
         for rank in participants.into_iter().filter(|rank| *rank != output_rank) {
             let mut report =
-                take_rank_operations(&mut self.buffers[rank], batch, &operation_ids, false)?;
+                take_rank_calls(&mut self.buffers[rank], batch, &call_ids, false)?;
             validate_and_order_rank_report(batch, &mut report, rank)?;
             merge_rank_report(batch, &mut out, &report, rank)?;
         }
         let remaining = &mut pending.remaining;
-        for identity in &operation_ids {
+        for identity in &call_ids {
             anyhow::ensure!(
                 remaining.remove(identity),
-                "joined batch {batch_id} repeated an operation"
+                "joined batch {batch_id} repeated an call"
             );
         }
         let done = remaining.is_empty() && pending.ranks.values().all(|result| result.complete);
@@ -601,7 +601,7 @@ impl WorkerGroup {
             if pending.ranks.values().any(|result| {
                 result.error.is_none()
                     && result
-                        .operations
+                        .calls
                         .keys()
                         .any(|id| pending.remaining.contains(id))
             }) {
@@ -640,10 +640,10 @@ impl WorkerGroup {
             }
             let pending = &self.pending_batches[&batch_id].remaining;
             let retired = batch
-                .operations
+                .calls
                 .iter()
-                .filter(|op| pending.contains(&operation_identity(op.request_key, op.op_id)))
-                .map(|op| (batch.batch_id, op.request_key, op.op_id))
+                .filter(|op| pending.contains(&call_identity(op.request_key, op.call_id)))
+                .map(|op| (batch.batch_id, op.request_key, op.call_id))
                 .collect::<Vec<_>>();
             let requests = retired
                 .iter()
@@ -676,7 +676,7 @@ impl WorkerGroup {
     }
 
     /// Join one entry's completed work independently of rank and transport framing.
-    fn joinable_report_key(&self) -> Option<(u64, usize, Vec<OperationIdentity>)> {
+    fn joinable_report_key(&self) -> Option<(u64, usize, Vec<CallIdentity>)> {
         for (&batch_id, pending_batch) in &self.pending_batches {
             let pending = &pending_batch.remaining;
             if pending.is_empty() {
@@ -690,34 +690,34 @@ impl WorkerGroup {
                 continue;
             }
             let batch = &self.pending_batches[&batch_id].batch;
-            for operation in &batch.operations {
-                let identity = operation_identity(operation.request_key, operation.op_id);
+            for call in &batch.calls {
+                let identity = call_identity(call.request_key, call.call_id);
                 if !pending.contains(&identity) {
                     continue;
                 }
-                let owner = self.process_args.entries[&operation.entry].ranks[0];
-                let members = self.operation_members(batch_id, identity);
+                let owner = self.process_args.entries[&call.entry].ranks[0];
+                let members = self.call_members(batch_id, identity);
                 for report in self.buffers[owner]
                     .iter()
                     .filter(|report| report.batch_id == batch_id)
                 {
-                    let shared = report_operation_ids(report)
+                    let shared = report_call_ids(report)
                         .into_iter()
                         .filter(|id| {
                             pending.contains(id)
-                                && self.operation_members(batch_id, *id) == members
-                                && batch.operations.iter().any(|candidate| {
-                                    operation_identity(candidate.request_key, candidate.op_id)
+                                && self.call_members(batch_id, *id) == members
+                                && batch.calls.iter().any(|candidate| {
+                                    call_identity(candidate.request_key, candidate.call_id)
                                         == *id
-                                        && candidate.entry == operation.entry
+                                        && candidate.entry == call.entry
                                 })
                                 && members.iter().all(|rank| {
                                     self.buffers[*rank].iter().any(|result| {
                                         result.batch_id == batch_id
                                             && result.results.iter().any(|completion| {
-                                                operation_identity(
+                                                call_identity(
                                                     completion.output.request_key,
-                                                    completion.output.op_id,
+                                                    completion.output.call_id,
                                                 ) == *id
                                             })
                                     })
@@ -733,11 +733,11 @@ impl WorkerGroup {
         None
     }
 
-    fn operation_members(&self, batch_id: u64, identity: OperationIdentity) -> Vec<usize> {
+    fn call_members(&self, batch_id: u64, identity: CallIdentity) -> Vec<usize> {
         self.pending_batches[&batch_id]
             .ranks
             .iter()
-            .filter_map(|(&rank, result)| result.operations.contains_key(&identity).then_some(rank))
+            .filter_map(|(&rank, result)| result.calls.contains_key(&identity).then_some(rank))
             .collect()
     }
 }
@@ -751,18 +751,18 @@ fn rank_projection(
     rank_count: usize,
 ) -> anyhow::Result<Vec<(usize, Batch)>> {
     let members = batch
-        .operations
+        .calls
         .iter()
-        .map(|operation| {
+        .map(|call| {
             let entry = entries
-                .get(&operation.entry)
-                .with_context(|| format!("unknown computation entry {}", operation.entry))?;
+                .get(&call.entry)
+                .with_context(|| format!("unknown computation entry {}", call.entry))?;
             let count = if entry.distribution.is_some() {
                 let range = batch
                     .decode_ranges
                     .iter()
                     .find(|range| {
-                        range.request_key == operation.request_key && range.op_id == operation.op_id
+                        range.request_key == call.request_key && range.call_id == call.call_id
                     })
                     .context("temporally distributed entry requires a decode range")?;
                 (range.max_units as usize)
@@ -784,12 +784,12 @@ fn rank_projection(
         if indices.is_empty() && batch.commands.is_empty() {
             continue;
         }
-        // A rank receives the batch's projection onto the operations it owns,
+        // A rank receives the batch's projection onto the calls it owns,
         // under the same identity: commands travel to every participating rank.
         let mut projection = batch.clone();
-        projection.operations = indices
+        projection.calls = indices
             .iter()
-            .map(|index| batch.operations[*index].clone())
+            .map(|index| batch.calls[*index].clone())
             .collect();
         projection.forward = batch.forward.select(&indices);
         let slots = projection
@@ -805,23 +805,23 @@ fn rank_projection(
             .new_cache_pages
             .retain(|pages| slots.contains(&pages.request_pool_idx));
         let identities = projection
-            .operations
+            .calls
             .iter()
-            .map(|operation| (operation.request_key, operation.op_id))
+            .map(|call| (call.request_key, call.call_id))
             .collect::<HashSet<_>>();
         projection
             .latent_params
-            .retain(|params| identities.contains(&(params.request_key, params.op_id)));
+            .retain(|params| identities.contains(&(params.request_key, params.call_id)));
         projection
             .decode_ranges
-            .retain(|range| identities.contains(&(range.request_key, range.op_id)));
+            .retain(|range| identities.contains(&(range.request_key, range.call_id)));
         let inputs = projection
-            .operations
+            .calls
             .iter()
-            .flat_map(|operation| {
-                operation
+            .flat_map(|call| {
+                call
                     .tensor_inputs()
-                    .chain(operation.predicate.as_ref())
+                    .chain(call.predicate.as_ref())
             })
             .collect::<HashSet<_>>();
         projection
@@ -829,25 +829,25 @@ fn rank_projection(
             .retain(|payload| inputs.contains(&payload.product));
         projection.kv_inputs.retain(|publication| {
             projection
-                .operations
+                .calls
                 .iter()
-                .any(|operation| operation.kv_input == Some(publication.source))
+                .any(|call| call.kv_input == Some(publication.source))
         });
         let buffers = inputs
             .iter()
             .copied()
             .chain(
                 projection
-                    .operations
+                    .calls
                     .iter()
-                    .flat_map(|operation| operation.tensor_outputs()),
+                    .flat_map(|call| call.tensor_outputs()),
             )
             .map(|product| product.buffer_id())
             .collect::<HashSet<_>>();
         projection
             .buffer_allocations
             .retain(|allocation| buffers.contains(&allocation.buffer));
-        if projection.operations.is_empty() && projection.commands.is_empty() {
+        if projection.calls.is_empty() && projection.commands.is_empty() {
             continue;
         }
         projection.validate()?;
@@ -856,13 +856,13 @@ fn rank_projection(
     Ok(batches)
 }
 
-/// Consume selected operations while retaining the rank results that hold the
+/// Consume selected calls while retaining the rank results that hold the
 /// rest. A rank result's aggregate statistics are emitted once, when its final
-/// operation is consumed; they are never divided or copied.
-fn take_rank_operations(
+/// call is consumed; they are never divided or copied.
+fn take_rank_calls(
     buffer: &mut VecDeque<WorkerResult>,
     batch: &Batch,
-    identities: &[OperationIdentity],
+    identities: &[CallIdentity],
     retain_forward_stats: bool,
 ) -> anyhow::Result<WorkerResult> {
     let mut output = WorkerResult {
@@ -878,9 +878,9 @@ fn take_rank_operations(
         .filter(|report| report.batch_id == batch.batch_id)
     {
         let selected = report.results.iter().any(|completion| {
-            identities.contains(&operation_identity(
+            identities.contains(&call_identity(
                 completion.output.request_key,
-                completion.output.op_id,
+                completion.output.call_id,
             ))
         });
         if !selected && !identities.is_empty() {
@@ -890,17 +890,17 @@ fn take_rank_operations(
         output
             .results
             .extend(report.results.extract_if(.., |completion| {
-                identities.contains(&operation_identity(
+                identities.contains(&call_identity(
                     completion.output.request_key,
-                    completion.output.op_id,
+                    completion.output.call_id,
                 ))
             }));
         output
             .products
             .extend(report.products.extract_if(.., |product| {
-                identities.contains(&operation_identity(
+                identities.contains(&call_identity(
                     product.product.request_key,
-                    product.product.producer_op_id,
+                    product.product.producer_call_id,
                 ))
             }));
         if report.results.is_empty() {
@@ -911,7 +911,7 @@ fn take_rank_operations(
             if retain_forward_stats && report.forward_stats.is_some() {
                 anyhow::ensure!(
                     output.forward_stats.is_none(),
-                    "canonical operation selection spans statistics fragments"
+                    "canonical call selection spans statistics fragments"
                 );
                 output.forward_stats = report.forward_stats.take();
             }
@@ -924,17 +924,17 @@ fn take_rank_operations(
     });
     anyhow::ensure!(
         output.results.len() == identities.len(),
-        "rank result omitted selected operations"
+        "rank result omitted selected calls"
     );
     Ok(output)
 }
 
-/// Returns the operation identifiers carried by a rank report.
-fn report_operation_ids(report: &WorkerResult) -> Vec<OperationIdentity> {
+/// Returns the call identifiers carried by a rank report.
+fn report_call_ids(report: &WorkerResult) -> Vec<CallIdentity> {
     let mut ids = report
         .results
         .iter()
-        .map(|output| operation_identity(output.output.request_key, output.output.op_id))
+        .map(|output| call_identity(output.output.request_key, output.output.call_id))
         .collect::<Vec<_>>();
     ids.sort_unstable();
     ids
@@ -971,13 +971,13 @@ fn merge_rank_report(
     {
         anyhow::ensure!(
             batch
-                .operations
+                .calls
                 .iter()
                 .any(
-                    |operation| operation.request_key == canonical.output.request_key
-                        && operation.op_id == canonical.output.op_id
+                    |call| call.request_key == canonical.output.request_key
+                        && call.call_id == canonical.output.call_id
                 ),
-            "rank join received an unplanned operation for batch {batch_id}"
+            "rank join received an unplanned call for batch {batch_id}"
         );
         if let Err(error) = merge_completion_record(canonical, actual) {
             anyhow::bail!(
@@ -988,9 +988,9 @@ fn merge_rank_report(
     for product in &participant_report.products {
         anyhow::ensure!(
             batch
-                .operations
+                .calls
                 .iter()
-                .flat_map(|operation| operation.tensor_outputs())
+                .flat_map(|call| call.tensor_outputs())
                 .any(|output| output == &product.product),
             "rank {rank} published locations for an undeclared product"
         );
@@ -1007,7 +1007,7 @@ fn merge_rank_report(
     Ok(())
 }
 
-/// Validates a rank report and orders completions to match the submitted operation sequence.
+/// Validates a rank report and orders completions to match the submitted call sequence.
 fn validate_and_order_rank_report(
     batch: &Batch,
     report: &mut WorkerResult,
@@ -1020,12 +1020,12 @@ fn validate_and_order_rank_report(
         batch.batch_id
     );
     let report_count = report.results.len();
-    let returned = report_operation_ids(report)
+    let returned = report_call_ids(report)
         .into_iter()
         .collect::<BTreeSet<_>>();
     let mut ordered = Vec::with_capacity(report_count);
-    for planned in &batch.operations {
-        let identity = operation_identity(planned.request_key, planned.op_id);
+    for planned in &batch.calls {
+        let identity = call_identity(planned.request_key, planned.call_id);
         if !returned.contains(&identity) {
             continue;
         }
@@ -1034,29 +1034,29 @@ fn validate_and_order_rank_report(
             .iter()
             .position(|completion| {
                 completion.output.request_key == planned.request_key
-                    && completion.output.op_id == planned.op_id
+                    && completion.output.call_id == planned.call_id
             })
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "rank {rank} omitted an operation for pending_batch {} collective {}",
+                    "rank {rank} omitted an call for pending_batch {} collective {}",
                     batch.batch_id,
                     batch.collective_seq
                 )
             })?;
         let completion = report.results.swap_remove(index);
         anyhow::ensure!(
-            completion.output.status != uniserve_worker_ipc::OpStatus::Predicated
+            completion.output.status != uniserve_worker_ipc::CallStatus::Predicated
                 || report.products.iter().all(|publication| {
                     publication.product.request_key != completion.output.request_key
-                        || publication.product.producer_op_id != completion.output.op_id
+                        || publication.product.producer_call_id != completion.output.call_id
                 }),
-            "predicated operation published a tensor"
+            "predicated call published a tensor"
         );
         if planned.code
-            == uniserve_worker_ipc::Computation::Transfer(
+            == uniserve_worker_ipc::CallKind::Transfer(
                 uniserve_worker_ipc::TransferMode::KvPublish,
             )
-            && completion.output.status == uniserve_worker_ipc::OpStatus::Ok
+            && completion.output.status == uniserve_worker_ipc::CallStatus::Ok
         {
             let publication = completion
                 .output
@@ -1081,7 +1081,7 @@ fn validate_and_order_rank_report(
     }
     anyhow::ensure!(
         ordered.len() == report_count,
-        "rank {rank} returned an unplanned operation for pending_batch {}",
+        "rank {rank} returned an unplanned call for pending_batch {}",
         batch.batch_id
     );
     report.results = ordered;
@@ -1096,7 +1096,7 @@ fn merge_completion_record(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         canonical.output.request_key == rank_completion.output.request_key
-            && canonical.output.op_id == rank_completion.output.op_id,
+            && canonical.output.call_id == rank_completion.output.call_id,
         "completion identity diverged"
     );
     anyhow::ensure!(
@@ -1188,15 +1188,15 @@ impl WorkerGroup {
         &self.process_args.transfer
     }
 
-    /// Exposes accepted operations whose required ranks have not returned their result.
-    pub(crate) fn inflight_operations(
+    /// Exposes accepted calls whose required ranks have not returned their result.
+    pub(crate) fn inflight_calls(
         &self,
-    ) -> impl Iterator<Item = &uniserve_worker_ipc::ScheduledRequest> {
+    ) -> impl Iterator<Item = &uniserve_worker_ipc::Call> {
         self.pending_batches.values().flat_map(|pending| {
-            pending.batch.operations.iter().filter(|operation| {
+            pending.batch.calls.iter().filter(|call| {
                 pending
                     .remaining
-                    .contains(&operation_identity(operation.request_key, operation.op_id))
+                    .contains(&call_identity(call.request_key, call.call_id))
             })
         })
     }
@@ -1206,7 +1206,7 @@ impl WorkerGroup {
         self.workers.get(rank).map(RankProcess::info)
     }
 
-    /// Submit each operation to its entry members and lifetime commands to the rank group.
+    /// Submit each call to its entry members and lifetime commands to the rank group.
     pub fn submit_batch(&mut self, batch: Batch) -> Result<(), BatchSubmitError> {
         if self.closed {
             return Err(BatchSubmitError::Failed(anyhow::anyhow!(
@@ -1245,8 +1245,8 @@ impl WorkerGroup {
             .map_err(BatchSubmitError::Failed)?;
         let batch_id = batch.batch_id;
         let requests = batch
-            .operations()
-            .map(|operation| operation.request_key)
+            .calls()
+            .map(|call| call.request_key)
             .collect::<Vec<_>>();
         self.last_batch_id = Some(batch_id);
         self.resident_requests.extend(requests);
@@ -1261,12 +1261,12 @@ impl WorkerGroup {
                 (
                     *rank,
                     RankResult {
-                        operations: batch
-                            .operations
+                        calls: batch
+                            .calls
                             .iter()
-                            .map(|operation| {
+                            .map(|call| {
                                 (
-                                    operation_identity(operation.request_key, operation.op_id),
+                                    call_identity(call.request_key, call.call_id),
                                     false,
                                 )
                             })
@@ -1281,9 +1281,9 @@ impl WorkerGroup {
             batch_id,
             PendingBatch {
                 remaining: batch
-                    .operations
+                    .calls
                     .iter()
-                    .map(|operation| operation_identity(operation.request_key, operation.op_id))
+                    .map(|call| call_identity(call.request_key, call.call_id))
                     .collect(),
                 batch: batch,
                 ranks,
