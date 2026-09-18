@@ -81,7 +81,15 @@ impl Default for EngineSettings {
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             max_video_seconds: 15.0,
-            workers: vec![WorkerConfig::model(&["localhost".to_owned()], "cuda", 1, 2)],
+            // One local rank running one component, which a serve invocation
+            // replaces with the placement the model being served declared.
+            workers: vec![WorkerConfig::placed(
+                &["localhost".to_owned()],
+                "cuda",
+                1,
+                2,
+                WorkerConfig::single_entry("model", 1),
+            )],
             transfer: TransferConfig::default(),
             worker_process: WorkerProcessArgs {
                 resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,

@@ -23,18 +23,14 @@ from uniserve.nn.attention import AttentionParallelConfig
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizationConfig, Quantizer
 
+from .placement import ARCHITECTURE_PACKAGES
+
 ConfigT = TypeVar("ConfigT")
 ModelT = TypeVar("ModelT", bound=nn.Module)
 
-_catalog: Mapping[str, str] = MappingProxyType(
-    {
-        "Qwen3ForCausalLM": "uniserve_models.qwen3",
-        "Qwen3MoeForCausalLM": "uniserve_models.qwen3",
-        "BagelForConditionalGeneration": "uniserve_models.bagel",
-        "NEOChatModel": "uniserve_models.sensenova_u1",
-        "MiniMaxH3Transformer3DModel": "uniserve_models.minimax_h3",
-    }
-)
+#: An architecture names its implementing package once, beside the entries it
+#: declares for a placement.
+_catalog: Mapping[str, str] = ARCHITECTURE_PACKAGES
 
 
 @dataclass(frozen=True, slots=True)

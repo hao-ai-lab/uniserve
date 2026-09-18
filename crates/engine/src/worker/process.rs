@@ -151,9 +151,14 @@ impl Default for WorkerProcessArgs {
             python: "python3".into(),
             launcher_timeout: std::time::Duration::from_secs(120),
             model: String::new(),
-            ranks: crate::WorkerConfig::model(&["localhost".to_owned()], "cuda", 1, 2).ranks,
+            ranks: vec![crate::WorkerRank {
+                node: "localhost".into(),
+                device: "cuda:0".into(),
+            }],
             host: "localhost".into(),
-            entries: crate::WorkerConfig::model(&["localhost".to_owned()], "cuda", 1, 2).entries,
+            // One local rank running one component. A launch replaces this
+            // with the entries the model being served declared.
+            entries: crate::WorkerConfig::single_entry("model", 1),
             stub: false,
             queue_depth: 2,
             req_slot_cap: 1 << 20,
