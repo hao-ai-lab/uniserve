@@ -125,18 +125,33 @@ impl WorkerConfig {
     }
 
     /// Expands the single-instance CLI shorthand into explicit device membership
-    /// on one named host.
-    pub fn model(host: &str, device: &str, rank_count: usize, queue_depth: usize) -> Self {
-        let ranks = (0..rank_count)
-            .map(|rank| WorkerRank {
-                node: host.into(),
-                device: if matches!(device, "cuda" | "gpu") {
-                    format!("cuda:{rank}")
-                } else {
-                    device.into()
-                },
-            })
-            .collect();
+    /// across the named hosts.
+    ///
+    /// Ranks are assigned in blocks, so the lowest ranks stay on the first
+    /// host, and each host numbers its devices from zero. A placement on one
+    /// host is the same arithmetic with one block.
+    pub fn model(hosts: &[String], device: &str, rank_count: usize, queue_depth: usize) -> Self {
+        // A host takes its share of the ranks, and the first hosts take the
+        // remainder, so a count that does not divide evenly still places every
+        // rank and keeps each host's block contiguous.
+        let host_count = hosts.len().max(1);
+        let share = rank_count / host_count;
+        let remainder = rank_count % host_count;
+        let mut placement = Vec::with_capacity(rank_count);
+        for (index, host) in hosts.iter().enumerate() {
+            let count = share + usize::from(index < remainder);
+            for local in 0..count {
+                placement.push(WorkerRank {
+                    node: host.clone(),
+                    device: if matches!(device, "cuda" | "gpu") {
+                        format!("cuda:{local}")
+                    } else {
+                        device.into()
+                    },
+                });
+            }
+        }
+        let ranks = placement;
         Self {
             id: WorkerId("model".into()),
             ranks,
@@ -155,8 +170,8 @@ impl WorkerConfig {
     }
 
     /// Resolves the explicit device budget into the established H3 Ulysses params.
-    pub fn h3(host: &str, device: &str, rank_count: usize, queue_depth: usize) -> Self {
-        let mut worker = Self::model(host, device, rank_count, queue_depth);
+    pub fn h3(hosts: &[String], device: &str, rank_count: usize, queue_depth: usize) -> Self {
+        let mut worker = Self::model(hosts, device, rank_count, queue_depth);
         let ranks: Vec<_> = (0..rank_count).collect();
         let denoiser = ParallelConfig {
             sequence_parallel: SequenceParallel::Ulysses {
@@ -254,7 +269,7 @@ impl EngineConfig {
     pub fn sim(model: impl Into<String>) -> Self {
         let worker_process = WorkerProcessArgs {
             model: model.into(),
-            ranks: WorkerConfig::model("localhost", "cpu", 1, 2).ranks,
+            ranks: WorkerConfig::model(&["localhost".to_owned()], "cpu", 1, 2).ranks,
             block_size: 64,
             queue_depth: 2,
             max_batch_calls: DEFAULT_MAX_BATCH as u32,
@@ -271,7 +286,7 @@ impl EngineConfig {
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: 8192,
-            workers: vec![WorkerConfig::model("localhost", "cpu", 1, 2)],
+            workers: vec![WorkerConfig::model(&["localhost".to_owned()], "cpu", 1, 2)],
             transfer: TransferConfig::default(),
             worker_process,
             // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
@@ -531,7 +546,7 @@ mod tests {
     fn static_components_validate_their_own_parallel_members() -> anyhow::Result<()> {
         let mut workers = Vec::new();
         for (name, degree) in [("text_encoder", 1), ("denoiser", 4), ("video_decoder", 2)] {
-            let mut worker = WorkerConfig::model("localhost", "cuda", degree, 2);
+            let mut worker = WorkerConfig::model(&["localhost".to_owned()], "cuda", degree, 2);
             worker.id = WorkerId(name.into());
             let entry = worker.entries.remove("model").unwrap();
             worker.entries.insert(name.into(), entry);
@@ -544,8 +559,61 @@ mod tests {
     }
 
     #[test]
+    fn the_shorthand_blocks_ranks_across_the_hosts_it_is_given() {
+        // Section 7's delivering configuration is eight devices over two
+        // four-device hosts, with muxing on rank zero of the head's host, so
+        // the lowest ranks must stay on the first host and each host must
+        // number its own devices from zero.
+        let hosts = ["rank-0".to_owned(), "rank-1".to_owned()];
+        let worker = WorkerConfig::h3(&hosts, "cuda", 8, 2);
+
+        let placement: Vec<_> = worker
+            .ranks
+            .iter()
+            .map(|rank| (rank.node.as_str(), rank.device.as_str()))
+            .collect();
+        assert_eq!(
+            placement,
+            vec![
+                ("rank-0", "cuda:0"),
+                ("rank-0", "cuda:1"),
+                ("rank-0", "cuda:2"),
+                ("rank-0", "cuda:3"),
+                ("rank-1", "cuda:0"),
+                ("rank-1", "cuda:1"),
+                ("rank-1", "cuda:2"),
+                ("rank-1", "cuda:3"),
+            ]
+        );
+        assert!(worker.validate().is_ok());
+
+        // Every component spans all eight ranks but the muxer, which assembles
+        // on rank zero and so stays on the head's host.
+        for entry in ["denoiser", "text_encoder", "video_decoder", "audio_decoder"] {
+            assert_eq!(
+                worker.entries[entry].ranks.len(),
+                8,
+                "{entry} spans the instance"
+            );
+        }
+        assert_eq!(worker.entries["muxer"].ranks, vec![0]);
+    }
+
+    #[test]
+    fn a_rank_count_that_does_not_divide_its_hosts_still_places_every_rank() {
+        // The first hosts take the remainder, which keeps each host's block
+        // contiguous and rank zero on the head's host.
+        let hosts = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let worker = WorkerConfig::model(&hosts, "cuda", 8, 2);
+
+        let nodes: Vec<_> = worker.ranks.iter().map(|rank| rank.node.as_str()).collect();
+        assert_eq!(nodes, vec!["a", "a", "a", "b", "b", "b", "c", "c"]);
+        assert_eq!(worker.ranks.len(), 8);
+    }
+
+    #[test]
     fn entry_geometry_uses_unique_ordered_rank_members() {
-        let mut worker = WorkerConfig::h3("localhost", "cuda", 4, 2);
+        let mut worker = WorkerConfig::h3(&["localhost".to_owned()], "cuda", 4, 2);
         assert!(worker.validate().is_ok());
         worker.entries.get_mut("denoiser").unwrap().ranks.swap(0, 3);
         assert!(worker.validate().is_ok());
@@ -555,7 +623,7 @@ mod tests {
 
     #[test]
     fn static_bindings_reject_duplicate_identities_and_entry_owners() {
-        let worker = WorkerConfig::model("localhost", "cuda", 1, 2);
+        let worker = WorkerConfig::model(&["localhost".to_owned()], "cuda", 1, 2);
         let mut other = worker.clone();
         assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
         other.id = WorkerId("other".into());

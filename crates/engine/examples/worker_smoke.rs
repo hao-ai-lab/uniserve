@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
         worker_id: "local".into(),
         python: "python3".into(),
         model: String::new(),
-        ranks: uniserve_engine::WorkerConfig::model("localhost", "cpu", 1, 2).ranks,
+        ranks: uniserve_engine::WorkerConfig::model(&["localhost".to_owned()], "cpu", 1, 2).ranks,
         queue_depth: 2,
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
