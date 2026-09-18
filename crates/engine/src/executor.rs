@@ -1137,6 +1137,7 @@ mod tests {
                 },
             ],
             worker_ranks: std::collections::BTreeMap::new(),
+            worker_hosts: std::collections::BTreeMap::new(),
         };
         transfer.worker_ranks.insert("decode".to_owned(), 2);
         transfer.worker_ranks.insert("encoder".to_owned(), 3);
