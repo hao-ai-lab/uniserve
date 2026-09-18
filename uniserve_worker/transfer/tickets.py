@@ -2033,9 +2033,22 @@ class CudaVmmTransport(Transport):
 
         handle = locator.transport
         assert isinstance(handle, CudaVmmTransfer)
-        # The grant conveys reader ownership; the allocation handle it used
-        # to carry now travels with the publication.
-        connection = open_reader(locator)
+        # A grant is a connection to an abstract-namespace Unix socket, so it
+        # exists only on the producing rank's host and a consumer elsewhere
+        # cannot acquire one. This is not a choice between mechanisms: the
+        # producer is either reachable that way or it is not.
+        #
+        # Where it is, the grant is taken, because it is what checks that this
+        # locator names a publication the producer still holds — a check no
+        # consumer can make locally. Where it is not, the locator is the
+        # engine's word: the engine binds only locators the producing rank
+        # reported to it, and frees a product's buffer only once the batch
+        # consuming it has completed.
+        connection = (
+            open_reader(locator)
+            if locator.source.node == self.source.node
+            else None
+        )
         mapped = None
         event = None
         # A read in the producer's own address space needs no acknowledgment:
@@ -2138,14 +2151,16 @@ class CudaVmmTransport(Transport):
                 if not ticket._unretired:
                     mapped = None
                     event = None
-                    try:
-                        finish_reader(connection)
-                    except BaseException as cleanup_error:
-                        if failure is not None:
-                            raise failure from cleanup_error
-                        raise
+                    if connection is not None:
+                        try:
+                            finish_reader(connection)
+                        except BaseException as cleanup_error:
+                            if failure is not None:
+                                raise failure from cleanup_error
+                            raise
             finally:
-                connection.close()
+                if connection is not None:
+                    connection.close()
 
     def release(
         self, locator: Locator
