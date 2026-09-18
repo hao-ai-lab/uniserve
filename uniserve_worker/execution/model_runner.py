@@ -1458,6 +1458,15 @@ class ModelRunner:
         if self._text_staging is not None:
             actions.append(self._text_staging.close)
 
+        # A stream's communicator bindings are released with it, because they
+        # are shared by every context that ran on it rather than owned by
+        # whichever one established them.
+        from uniserve.runtime.execution import close_stream_collectives
+
+        actions.extend(
+            partial(close_stream_collectives, owner.stream)
+            for owner in self._module_streams.values()
+        )
         # Streams close in reverse creation order so forks retire before
         # the lane streams they borrow from.
         actions.extend(

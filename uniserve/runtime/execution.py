@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import partial
 from math import prod
 from types import MappingProxyType
 from typing import Generic, TypeVar
+from weakref import WeakKeyDictionary
 
 import torch
 from torch import nn
@@ -47,6 +48,32 @@ def _representation(module, inherited):
         if value.is_floating_point() and not value.is_meta:
             return value.device, value.dtype
     return inherited
+
+
+#: Communicator bindings by the stream they were established on. A binding is
+#: a collective bootstrap, so it is made once per stream and shared by every
+#: context that runs on it.
+_STREAM_COLLECTIVES: MutableMapping[object, dict] = WeakKeyDictionary()
+
+
+def _stream_collectives(stream) -> dict:
+    """Return the bindings established on one stream, creating the record.
+
+    The record is keyed weakly by the stream, so the bindings live exactly as
+    long as the stream that carries them and are released with it rather than
+    with whichever context happened to establish them.
+    """
+    bindings = _STREAM_COLLECTIVES.get(stream)
+    if bindings is None:
+        bindings = {}
+        _STREAM_COLLECTIVES[stream] = bindings
+    return bindings
+
+
+def close_stream_collectives(stream) -> None:
+    """Release every binding established on one stream."""
+    for binding in _STREAM_COLLECTIVES.pop(stream, {}).values():
+        binding.close()
 
 
 def _communicators(module):
@@ -610,7 +637,16 @@ class ExecutionContext(Generic[SizeT]):
         # Active scopes borrow this mapping. Populate it in place so an
         # already-entered context uses the same stream bindings during warmup
         # and capture, including when prepare() discovers more components.
-        self._collectives = {} if stream is not None else None
+        # Bindings belong to the stream, not to this context. A communicator
+        # binding is `ncclCommInitRankConfig` behind a broadcast over the
+        # group, so every member has to reach it, and preparation is not a
+        # point where they all do: contexts are keyed by numerical size and a
+        # rank's media unit count decides which sizes it prepares. One stream
+        # serves every size of one computation, so binding there is reached
+        # once, by every rank, when the computation is first warmed.
+        self._collectives = (
+            _stream_collectives(stream) if stream is not None else None
+        )
         self._entered = None
         self._max_tokens = None
         self._closed = False
@@ -1033,10 +1069,6 @@ class ExecutionContext(Generic[SizeT]):
                 *(binding.close for binding in self._attention.values()),
                 *(binding.close for binding in self._vsa.values()),
                 *(
-                    binding.close
-                    for binding in (self._collectives or {}).values()
-                ),
-                *(
                     allocation.close
                     for allocation in reversed(self._allocations)
                 ),
@@ -1065,8 +1097,9 @@ class ExecutionContext(Generic[SizeT]):
             self._allocations.clear()
             self._scratch.clear()
             self._matmul_scratch.clear()
-            if self._collectives is not None:
-                self._collectives.clear()
+            # Bindings outlive this context: they belong to its stream, and
+            # a later context on the same stream reuses them rather than
+            # issuing a bootstrap its peers have no reason to join.
             self.constants = self.workspace = MappingProxyType({})
             self._max_tokens = None
 
